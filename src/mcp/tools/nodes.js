@@ -292,6 +292,10 @@ async function manageNode(args, emit) {
                 .populate('groups', 'name color');
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
+
+            // Auto-push config to the node if any config-affecting field changed.
+            getSyncService().schedulePush(node._id, updates);
+
             logger.info(`[MCP] Updated node ${node.name}`);
             return { success: true, node };
         }

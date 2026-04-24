@@ -222,7 +222,10 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
                 { $set: { ssh: node.ssh } }
             );
         }
-        
+
+        // Auto-push config to the node if any config-affecting field changed.
+        require('../services/syncService').schedulePush(node._id, updates);
+
         // Инвалидируем кэш
         await invalidateNodesCache();
         

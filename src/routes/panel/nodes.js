@@ -564,6 +564,9 @@ router.post('/nodes/:id', async (req, res) => {
 
         await HyNode.findByIdAndUpdate(nodeId, { $set: updates });
 
+        // Auto-push config to the node if any config-affecting field changed.
+        syncService.schedulePush(nodeId, updates);
+
         // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
         const sshChanged = updates['ssh.password'] !== undefined
             || updates['ssh.privateKey'] !== undefined
@@ -898,7 +901,10 @@ router.post('/nodes/:id/outbounds', async (req, res) => {
         await HyNode.findByIdAndUpdate(req.params.id, {
             $set: { outbounds, aclRules },
         });
-        
+
+        // Auto-push config so ACL/outbound edits take effect without Auto Setup.
+        syncService.schedulePush(req.params.id, { outbounds, aclRules });
+
         logger.info(`[Panel] Outbounds updated for node: ${node.name} (${outbounds.length} outbounds, ${aclRules.length} ACL rules)`);
         
         res.redirect(`/panel/nodes/${req.params.id}/outbounds?message=` + encodeURIComponent('Outbounds сохранены'));

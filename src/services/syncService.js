@@ -31,6 +31,33 @@ const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 // Mark node offline after this many consecutive health check failures (1 check/min)
 const HEALTH_FAILURE_THRESHOLD = 3;
 
+// Fields whose change requires regenerating the runtime config on the node.
+// Anything not listed here (name, groups, flag, rankingCoefficient, ssh.*, ...)
+// is treated as cosmetic and does not trigger an auto-push.
+// Dotted keys (e.g. "xray.realityPrivateKey") are matched via their root.
+const CONFIG_AFFECTING_FIELDS = new Set([
+    // Shared
+    'domain', 'sni', 'port', 'portRange', 'statsPort', 'statsSecret',
+    'useCustomConfig', 'customConfig',
+    // Hysteria
+    'obfs', 'hopInterval', 'acme', 'masquerade', 'bandwidth',
+    'ignoreClientBandwidth', 'speedTest', 'disableUDP', 'udpIdleTimeout',
+    'sniff', 'quic', 'resolver', 'acl', 'aclRules', 'outbounds', 'useTlsFiles',
+    // Xray (any xray.* sub-path triggers regeneration)
+    'xray',
+]);
+
+function hasConfigRelevantUpdates(updates) {
+    // null/undefined means "unknown" — err on the side of pushing.
+    if (!updates) return true;
+    const keys = Object.keys(updates);
+    if (keys.length === 0) return false;
+    return keys.some(k => {
+        const root = k.split('.')[0];
+        return CONFIG_AFFECTING_FIELDS.has(k) || CONFIG_AFFECTING_FIELDS.has(root);
+    });
+}
+
 class SyncService {
     constructor() {
         this.isSyncing = false;
@@ -507,6 +534,40 @@ class SyncService {
             return this.updateXrayNodeConfig(node);
         }
         return this._updateHysteriaNodeConfig(node);
+    }
+
+    /**
+     * Fire-and-forget config push after a settings save.
+     *
+     * Non-blocking: defers to the next tick via setImmediate so the HTTP
+     * response is flushed before any SSH/Agent round-trip starts.
+     *
+     * Silently skipped when:
+     *  - `updates` contains only cosmetic fields (see CONFIG_AFFECTING_FIELDS);
+     *  - node is inactive or acts as a cascade bridge (cascade deploy owns those);
+     *  - node has neither SSH credentials nor an agent token (never set up yet).
+     *
+     * @param {string} nodeId  - Node _id
+     * @param {Object} [updates] - $set payload applied to the node. When omitted,
+     *                             the push is assumed relevant and runs unconditionally.
+     */
+    schedulePush(nodeId, updates = null) {
+        if (!hasConfigRelevantUpdates(updates)) return;
+        setImmediate(async () => {
+            try {
+                const node = await HyNode.findById(nodeId);
+                if (!node || !node.active) return;
+                if (node.cascadeRole === 'bridge') return;
+
+                const hasSsh = !!(node.ssh?.password || node.ssh?.privateKey);
+                const hasAgent = !!(node.xray && node.xray.agentToken);
+                if (!hasSsh && !hasAgent) return;
+
+                await this.updateNodeConfig(node);
+            } catch (error) {
+                logger.warn(`[AutoPush] node ${nodeId}: ${error.message}`);
+            }
+        });
     }
 
     /**
