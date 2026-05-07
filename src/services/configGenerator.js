@@ -408,9 +408,9 @@ function buildXrayStreamSettings(inbound, node = {}) {
     const transport = inbound.transport || 'tcp';
     const security = inbound.security || 'reality';
 
-    // xhttp is called 'splithttp' in Xray config network field
-    const networkName = transport === 'xhttp' ? 'splithttp' : transport;
-    const streamSettings = { network: networkName };
+    // Xray-core 25.x+ renamed 'splithttp' to 'xhttp' (REALITY since 26.x
+    // accepts only RAW/XHTTP/gRPC — the legacy splithttp keyword is rejected).
+    const streamSettings = { network: transport };
 
     if (security === 'reality') {
         streamSettings.security = 'reality';
@@ -451,7 +451,7 @@ function buildXrayStreamSettings(inbound, node = {}) {
             serviceName: inbound.grpcServiceName || 'grpc',
         };
     } else if (transport === 'xhttp') {
-        streamSettings.splithttpSettings = {
+        streamSettings.xhttpSettings = {
             path: inbound.xhttpPath || '/',
             host: inbound.xhttpHost || '',
             mode: inbound.xhttpMode || 'auto',
@@ -1030,7 +1030,9 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
 
 /**
  * Build streamSettings for the cascade tunnel connection between Portal and Bridge.
- * Supports tcp/ws/grpc/splithttp transports and none/tls/reality security.
+ * Supports tcp/ws/grpc/xhttp transports and none/tls/reality security.
+ * Note: Xray-core 25.x+ renamed splithttp to xhttp; old DB rows storing
+ * 'splithttp' are normalized to 'xhttp' here for forward compatibility.
  *
  * @param {Object} link - CascadeLink document
  * @param {Object} [opts] - Options
@@ -1038,14 +1040,14 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
  * @returns {Object} streamSettings
  */
 function buildCascadeTunnelStreamSettings(link, opts = {}) {
-    const transport = link.tunnelTransport || 'tcp';
+    const rawTransport = link.tunnelTransport || 'tcp';
+    const transport = rawTransport === 'splithttp' ? 'xhttp' : rawTransport;
     const security = link.tunnelSecurity || 'none';
-    const networkName = (transport === 'xhttp' || transport === 'splithttp') ? 'splithttp' : transport;
     const realityServerNames = link.realitySni?.length ? link.realitySni : ['www.google.com'];
     const realityServerName = realityServerNames[0] || 'www.google.com';
 
     const stream = {
-        network: networkName,
+        network: transport,
         security: security === 'reality' ? 'reality' : security,
     };
 
@@ -1085,8 +1087,8 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
         stream.grpcSettings = {
             serviceName: link.grpcServiceName || 'cascade',
         };
-    } else if (transport === 'xhttp' || transport === 'splithttp') {
-        stream.splithttpSettings = {
+    } else if (transport === 'xhttp') {
+        stream.xhttpSettings = {
             path: link.xhttpPath || '/cascade',
             host: link.xhttpHost || '',
             mode: link.xhttpMode || 'auto',
