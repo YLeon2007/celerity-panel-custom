@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 
 	proxyman_command "github.com/xtls/xray-core/app/proxyman/command"
 	stats_command "github.com/xtls/xray-core/app/stats/command"
@@ -13,12 +15,50 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// XrayClient wraps the Xray gRPC API
+// xrayConfigPath is the canonical location written by nodeSetup.installXray.
+const xrayConfigPath = "/usr/local/etc/xray/config.json"
+
+// probeFlowFromXrayConfig reads the on-disk Xray config, finds the inbound
+// with the given tag and returns the flow value from its first client.
+// This is a best-effort backward-compat helper for legacy panels that did
+// not write the explicit per-tag Flow into cc-agent config.json.
+func probeFlowFromXrayConfig(tag string) (string, bool) {
+	data, err := os.ReadFile(xrayConfigPath)
+	if err != nil {
+		return "", false
+	}
+
+	var parsed struct {
+		Inbounds []struct {
+			Tag      string `json:"tag"`
+			Settings struct {
+				Clients []struct {
+					Flow string `json:"flow"`
+				} `json:"clients"`
+			} `json:"settings"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", false
+	}
+
+	for _, ib := range parsed.Inbounds {
+		if ib.Tag == tag && len(ib.Settings.Clients) > 0 {
+			return ib.Settings.Clients[0].Flow, true
+		}
+	}
+	return "", false
+}
+
+// XrayClient wraps the Xray gRPC API. It owns the list of VLESS inbounds the
+// agent must keep in sync — every AddUser/RemoveUser call iterates over them.
+// The per-tag Flow value is used as-is when calling AlterInbound, so flow=""
+// is sent for transports where flow is not supported (WS/gRPC/XHTTP).
 type XrayClient struct {
-	conn       *grpc.ClientConn
-	proxyman   proxyman_command.HandlerServiceClient
-	stats      stats_command.StatsServiceClient
-	inboundTag string
+	conn     *grpc.ClientConn
+	proxyman proxyman_command.HandlerServiceClient
+	stats    stats_command.StatsServiceClient
+	inbounds []InboundEntry
 }
 
 func NewXrayClient(cfg *Config) (*XrayClient, error) {
@@ -29,47 +69,64 @@ func NewXrayClient(cfg *Config) (*XrayClient, error) {
 		return nil, fmt.Errorf("grpc.NewClient: %w", err)
 	}
 
+	// LoadConfig guarantees Inbounds is populated (synthesizes a single
+	// entry from the legacy InboundTag when missing). No further fallback
+	// is needed here.
 	return &XrayClient{
-		conn:       conn,
-		proxyman:   proxyman_command.NewHandlerServiceClient(conn),
-		stats:      stats_command.NewStatsServiceClient(conn),
-		inboundTag: cfg.InboundTag,
+		conn:     conn,
+		proxyman: proxyman_command.NewHandlerServiceClient(conn),
+		stats:    stats_command.NewStatsServiceClient(conn),
+		inbounds: cfg.Inbounds,
 	}, nil
 }
 
-// AddUser adds a VLESS user to the Xray inbound via gRPC
+// AddUser adds a VLESS user to every configured Xray inbound via gRPC.
+// Flow is taken from the per-inbound configuration; the value of u.Flow
+// is intentionally ignored — the agent is the source of truth here.
 func (c *XrayClient) AddUser(ctx context.Context, u *User) error {
-	_, err := c.proxyman.AlterInbound(ctx, &proxyman_command.AlterInboundRequest{
-		Tag: c.inboundTag,
-		Operation: serial.ToTypedMessage(&proxyman_command.AddUserOperation{
-			User: &protocol.User{
-				Level: 0,
-				Email: u.Email,
-				Account: serial.ToTypedMessage(&vless.Account{
-					Id:   u.ID,
-					Flow: u.Flow,
-				}),
-			},
-		}),
-	})
-	if err != nil {
-		return fmt.Errorf("AddUser %s: %w", u.Email, err)
+	if len(c.inbounds) == 0 {
+		return fmt.Errorf("AddUser %s: no inbounds configured", u.Email)
 	}
-	return nil
+	var firstErr error
+	for _, ib := range c.inbounds {
+		_, err := c.proxyman.AlterInbound(ctx, &proxyman_command.AlterInboundRequest{
+			Tag: ib.Tag,
+			Operation: serial.ToTypedMessage(&proxyman_command.AddUserOperation{
+				User: &protocol.User{
+					Level: 0,
+					Email: u.Email,
+					Account: serial.ToTypedMessage(&vless.Account{
+						Id:   u.ID,
+						Flow: ib.Flow,
+					}),
+				},
+			}),
+		})
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("AddUser %s on %s: %w", u.Email, ib.Tag, err)
+		}
+	}
+	return firstErr
 }
 
-// RemoveUser removes a user from the Xray inbound via gRPC
+// RemoveUser removes a user from every configured Xray inbound via gRPC.
 func (c *XrayClient) RemoveUser(ctx context.Context, email string) error {
-	_, err := c.proxyman.AlterInbound(ctx, &proxyman_command.AlterInboundRequest{
-		Tag: c.inboundTag,
-		Operation: serial.ToTypedMessage(&proxyman_command.RemoveUserOperation{
-			Email: email,
-		}),
-	})
-	if err != nil {
-		return fmt.Errorf("RemoveUser %s: %w", email, err)
+	if len(c.inbounds) == 0 {
+		return fmt.Errorf("RemoveUser %s: no inbounds configured", email)
 	}
-	return nil
+	var firstErr error
+	for _, ib := range c.inbounds {
+		_, err := c.proxyman.AlterInbound(ctx, &proxyman_command.AlterInboundRequest{
+			Tag: ib.Tag,
+			Operation: serial.ToTypedMessage(&proxyman_command.RemoveUserOperation{
+				Email: email,
+			}),
+		})
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("RemoveUser %s on %s: %w", email, ib.Tag, err)
+		}
+	}
+	return firstErr
 }
 
 // QueryStats fetches traffic stats from Xray matching the given pattern.

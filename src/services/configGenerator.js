@@ -395,32 +395,35 @@ WantedBy=multi-user.target
 // ==================== XRAY ====================
 
 /**
- * Build Xray streamSettings object based on node transport/security config
- * @param {Object} node - Node with xray sub-object
+ * Build Xray streamSettings from a per-inbound config object.
+ * The shape matches both the flat `node.xray` (main inbound) and the items of
+ * `node.xray.extraInbounds[]`. TLS certificate paths fall back to
+ * `node.paths.{cert,key}` and TLS serverName falls back to `node.domain || node.sni`.
+ *
+ * @param {Object} inbound - Per-inbound config (transport, security, reality*, ws*, grpc*, xhttp*, alpn)
+ * @param {Object} [node] - Owning node for certificate paths and TLS serverName fallback
  * @returns {Object} streamSettings
  */
-function buildXrayStreamSettings(node) {
-    const xray = node.xray || {};
-    const transport = xray.transport || 'tcp';
-    const security = xray.security || 'reality';
+function buildXrayStreamSettings(inbound, node = {}) {
+    const transport = inbound.transport || 'tcp';
+    const security = inbound.security || 'reality';
 
     // xhttp is called 'splithttp' in Xray config network field
     const networkName = transport === 'xhttp' ? 'splithttp' : transport;
     const streamSettings = { network: networkName };
 
-    // Security layer
     if (security === 'reality') {
         streamSettings.security = 'reality';
         streamSettings.realitySettings = {
-            dest: xray.realityDest || 'www.google.com:443',
-            serverNames: xray.realitySni && xray.realitySni.length > 0
-                ? xray.realitySni
+            dest: inbound.realityDest || 'www.google.com:443',
+            serverNames: inbound.realitySni && inbound.realitySni.length > 0
+                ? inbound.realitySni
                 : ['www.google.com'],
-            privateKey: xray.realityPrivateKey || '',
-            shortIds: xray.realityShortIds && xray.realityShortIds.length > 0
-                ? xray.realityShortIds
+            privateKey: inbound.realityPrivateKey || '',
+            shortIds: inbound.realityShortIds && inbound.realityShortIds.length > 0
+                ? inbound.realityShortIds
                 : [''],
-            spiderX: xray.realitySpiderX || '/',
+            spiderX: inbound.realitySpiderX || '/',
         };
     } else if (security === 'tls') {
         streamSettings.security = 'tls';
@@ -431,33 +434,76 @@ function buildXrayStreamSettings(node) {
                 keyFile: node.paths?.key || '/usr/local/etc/xray/key.pem',
             }],
         };
-        // Add ALPN if specified
-        if (xray.alpn && xray.alpn.length > 0) {
-            streamSettings.tlsSettings.alpn = xray.alpn;
+        if (inbound.alpn && inbound.alpn.length > 0) {
+            streamSettings.tlsSettings.alpn = inbound.alpn;
         }
     } else {
         streamSettings.security = 'none';
     }
 
-    // Transport-specific settings
     if (transport === 'ws') {
         streamSettings.wsSettings = {
-            path: xray.wsPath || '/',
-            headers: xray.wsHost ? { Host: xray.wsHost } : {},
+            path: inbound.wsPath || '/',
+            headers: inbound.wsHost ? { Host: inbound.wsHost } : {},
         };
     } else if (transport === 'grpc') {
         streamSettings.grpcSettings = {
-            serviceName: xray.grpcServiceName || 'grpc',
+            serviceName: inbound.grpcServiceName || 'grpc',
         };
     } else if (transport === 'xhttp') {
         streamSettings.splithttpSettings = {
-            path: xray.xhttpPath || '/',
-            host: xray.xhttpHost || '',
-            mode: xray.xhttpMode || 'auto',
+            path: inbound.xhttpPath || '/',
+            host: inbound.xhttpHost || '',
+            mode: inbound.xhttpMode || 'auto',
         };
     }
 
     return streamSettings;
+}
+
+/**
+ * Build a VLESS clients array for a given inbound. Flow is added only when the
+ * combination supports it (tcp + reality/tls); otherwise it must be empty,
+ * because Xray rejects non-empty flow on incompatible transports.
+ */
+function buildXrayClients(users, inbound) {
+    const security = inbound.security || 'reality';
+    const transport = inbound.transport || 'tcp';
+    const useFlow = (security === 'reality' || security === 'tls') && transport === 'tcp';
+    return (users || []).map(u => {
+        const client = {
+            id: u.xrayUuid,
+            email: u.userId,
+            level: 0,
+        };
+        if (useFlow) {
+            client.flow = inbound.flow || 'xtls-rprx-vision';
+        }
+        return client;
+    });
+}
+
+/**
+ * Build a VLESS inbound entry from a per-inbound config. Used both for the
+ * main inbound and each item in `extraInbounds[]`.
+ */
+function buildVlessInbound(inbound, users, node) {
+    return {
+        listen: '0.0.0.0',
+        port: inbound.port || 443,
+        protocol: 'vless',
+        tag: inbound.inboundTag,
+        settings: {
+            clients: buildXrayClients(users, inbound),
+            decryption: 'none',
+        },
+        streamSettings: buildXrayStreamSettings(inbound, node),
+        sniffing: {
+            enabled: true,
+            destOverride: ['http', 'tls', 'quic'],
+            routeOnly: true,
+        },
+    };
 }
 
 /**
@@ -469,24 +515,30 @@ function buildXrayStreamSettings(node) {
 function generateXrayConfig(node, users) {
     const xray = node.xray || {};
     const apiPort = xray.apiPort || 61000;
-    const inboundTag = xray.inboundTag || 'vless-in';
-    const transport = xray.transport || 'tcp';
-    const security = xray.security || 'reality';
+    const mainInboundTag = xray.inboundTag || 'vless-in';
 
-    // Build clients list from users
-    // Use only userId as email to ensure consistent add/remove via API
-    const clients = (users || []).map(u => {
-        const client = {
-            id: u.xrayUuid,
-            email: u.userId,
-            level: 0,
-        };
-        // flow only makes sense for tcp+reality or tcp+tls
-        if ((security === 'reality' || security === 'tls') && transport === 'tcp') {
-            client.flow = xray.flow || 'xtls-rprx-vision';
-        }
-        return client;
-    });
+    // Main inbound is described by the flat xray.* fields plus node.port.
+    const mainInbound = {
+        port: node.port || 443,
+        inboundTag: mainInboundTag,
+        transport: xray.transport,
+        security: xray.security,
+        flow: xray.flow,
+        alpn: xray.alpn,
+        realityDest: xray.realityDest,
+        realitySni: xray.realitySni,
+        realityPrivateKey: xray.realityPrivateKey,
+        realityShortIds: xray.realityShortIds,
+        realitySpiderX: xray.realitySpiderX,
+        wsPath: xray.wsPath,
+        wsHost: xray.wsHost,
+        grpcServiceName: xray.grpcServiceName,
+        xhttpPath: xray.xhttpPath,
+        xhttpHost: xray.xhttpHost,
+        xhttpMode: xray.xhttpMode,
+    };
+
+    const extraInbounds = Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [];
 
     const config = {
         log: {
@@ -520,23 +572,8 @@ function generateXrayConfig(node, users) {
                 settings: { address: '127.0.0.1' },
                 tag: 'API_INBOUND',
             },
-            // VLESS inbound
-            {
-                listen: '0.0.0.0',
-                port: node.port || 443,
-                protocol: 'vless',
-                tag: inboundTag,
-                settings: {
-                    clients,
-                    decryption: 'none',
-                },
-                streamSettings: buildXrayStreamSettings(node),
-                sniffing: {
-                    enabled: true,
-                    destOverride: ['http', 'tls', 'quic'],
-                    routeOnly: true,
-                },
-            },
+            buildVlessInbound(mainInbound, users, node),
+            ...extraInbounds.map(extra => buildVlessInbound(extra, users, node)),
         ],
         outbounds: [
             { protocol: 'freedom', tag: 'direct' },
@@ -660,10 +697,13 @@ WantedBy=multi-user.target
  *
  * @param {Object} config - Parsed Xray config object (mutated in place)
  * @param {Array} portalLinks - CascadeLink documents where this node is portalNode
- * @param {string} clientInboundTag - Tag of the client-facing inbound (e.g. 'vless-in')
+ * @param {string|string[]} clientInboundTags - Tag(s) of the client-facing inbound(s).
+ *        A string is accepted for backward compatibility; multiple tags route
+ *        traffic from any of the listed inbounds (main + extras) into the cascade.
  */
-function applyReversePortal(config, portalLinks, clientInboundTag) {
+function applyReversePortal(config, portalLinks, clientInboundTags) {
     if (!portalLinks || portalLinks.length === 0) return;
+    const tags = normalizeInboundTags(clientInboundTags);
 
     config.reverse = config.reverse || {};
     config.reverse.portals = config.reverse.portals || [];
@@ -713,14 +753,14 @@ function applyReversePortal(config, portalLinks, clientInboundTag) {
         }
     }
 
-    if (!clientInboundTag) return;
+    if (tags.length === 0) return;
 
     // Geo-specific routing rules (checked first — order matters in Xray)
     for (const { link, portalTag } of geoLinks) {
         if (link.geoRouting.domains?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: [clientInboundTag],
+                inboundTag: tags,
                 domain: link.geoRouting.domains.map(d =>
                     d.includes(':') ? d : `geosite:${d}`
                 ),
@@ -730,7 +770,7 @@ function applyReversePortal(config, portalLinks, clientInboundTag) {
         if (link.geoRouting.geoip?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: [clientInboundTag],
+                inboundTag: tags,
                 ip: link.geoRouting.geoip.map(g =>
                     g.includes(':') ? g : `geoip:${g}`
                 ),
@@ -751,16 +791,36 @@ function applyReversePortal(config, portalLinks, clientInboundTag) {
         });
         config.routing.rules.push({
             type: 'field',
-            inboundTag: [clientInboundTag],
+            inboundTag: tags,
             balancerTag: 'cascade-balancer',
         });
     } else if (defaultTags.length === 1) {
         config.routing.rules.push({
             type: 'field',
-            inboundTag: [clientInboundTag],
+            inboundTag: tags,
             outboundTag: defaultTags[0],
         });
     }
+}
+
+/**
+ * Normalize a single tag string or array of tags into a deduplicated array of
+ * non-empty strings. Used by cascade entry points so callers can pass either
+ * the legacy single tag or the new multi-tag array (main + extras).
+ */
+function normalizeInboundTags(input) {
+    if (!input) return [];
+    const arr = Array.isArray(input) ? input : [input];
+    const seen = new Set();
+    const out = [];
+    for (const t of arr) {
+        if (typeof t !== 'string') continue;
+        const trimmed = t.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        out.push(trimmed);
+    }
+    return out;
 }
 
 /**
@@ -1061,10 +1121,12 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
  * @param {Array} forwardLinks - Ordered CascadeLink documents for the full
  *                               downstream path starting from this node.
  *                               Must have bridgeNode populated.
- * @param {string} clientInboundTag - Tag of the client-facing inbound
+ * @param {string|string[]} clientInboundTags - Tag(s) of the client-facing inbound(s).
+ *        See applyReversePortal for the same multi-tag semantics.
  */
-function applyForwardChain(config, forwardLinks, clientInboundTag) {
+function applyForwardChain(config, forwardLinks, clientInboundTags) {
     if (!forwardLinks || forwardLinks.length === 0) return;
+    const tags = normalizeInboundTags(clientInboundTags);
 
     config.outbounds = config.outbounds || [];
     config.routing = config.routing || { rules: [] };
@@ -1074,12 +1136,12 @@ function applyForwardChain(config, forwardLinks, clientInboundTag) {
     // relay1, relay2, ..., exit-bridge.
     const sorted = [...forwardLinks];
 
-    const tags = [];
+    const outboundTags = [];
     for (let i = 0; i < sorted.length; i++) {
         const link = sorted[i];
         const bridgeNode = link.bridgeNode;
         const tag = `fwd-${String(link._id).slice(-8)}`;
-        tags.push(tag);
+        outboundTags.push(tag);
 
         const fwdProto = link.tunnelProtocol || 'vless';
         const outbound = {
@@ -1105,17 +1167,17 @@ function applyForwardChain(config, forwardLinks, clientInboundTag) {
         // TLS, while transportLayer=true maps to sockopt.dialerProxy and lets
         // the current outbound apply its own stream security (including REALITY).
         if (i > 0) {
-            outbound.proxySettings = { tag: tags[i - 1], transportLayer: true };
+            outbound.proxySettings = { tag: outboundTags[i - 1], transportLayer: true };
         }
 
         config.outbounds.push(outbound);
     }
 
-    if (!clientInboundTag) return;
+    if (tags.length === 0) return;
 
-    // The routing entry point is the LAST outbound (exit/bridge node).
+    // Routing entry point is the LAST outbound (exit/bridge node).
     // Traffic flows: client -> exit outbound -> (via proxySettings chain) -> internet
-    const exitTag = tags[tags.length - 1];
+    const exitTag = outboundTags[outboundTags.length - 1];
 
     // Geo-specific routing for individual links in the chain
     // (only the exit link's geo-routing makes sense for a sequential chain)
@@ -1124,7 +1186,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTag) {
         if (exitLink.geoRouting.domains?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: [clientInboundTag],
+                inboundTag: tags,
                 domain: exitLink.geoRouting.domains.map(d =>
                     d.includes(':') ? d : `geosite:${d}`
                 ),
@@ -1134,7 +1196,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTag) {
         if (exitLink.geoRouting.geoip?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: [clientInboundTag],
+                inboundTag: tags,
                 ip: exitLink.geoRouting.geoip.map(g =>
                     g.includes(':') ? g : `geoip:${g}`
                 ),
@@ -1145,7 +1207,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTag) {
         // Default: route all client traffic through the forward chain
         config.routing.rules.push({
             type: 'field',
-            inboundTag: [clientInboundTag],
+            inboundTag: tags,
             outboundTag: exitTag,
         });
     }

@@ -41,6 +41,34 @@
             </div>
         </div>
         <div id="nodeInfoError" class="mt-2" style="display:none;"></div>
+
+        <%
+            // Warn admins when extra inbounds are configured but the running
+            // cc-agent is older than 1.2.0 (the version that understands the
+            // multi-inbound config). Only trigger the warning when we can
+            // POSITIVELY parse a semver-shaped version — values like
+            // "installed" / "unknown" / "" mean "not detected yet" and must
+            // not produce a false positive.
+            const _ev = (node.agentVersion || '').replace(/^v/i, '').trim();
+            const _evParts = _ev.split('.').map(n => parseInt(n, 10));
+            const _evParseable = _evParts.length >= 2
+                && Number.isInteger(_evParts[0])
+                && Number.isInteger(_evParts[1]);
+            const _evOk = _evParseable
+                && (_evParts[0] > 1 || (_evParts[0] === 1 && _evParts[1] >= 2));
+            const _hasExtras = Array.isArray(node.xray?.extraInbounds) && node.xray.extraInbounds.length > 0;
+        %>
+        <% if (_hasExtras && _evParseable && !_evOk) { %>
+        <div class="ssh-warning mt-2" role="alert">
+            <i class="ti ti-alert-triangle ssh-warning-icon"></i>
+            <div>
+                <strong><%= t('nodes.agentOutdatedTitle') %></strong>
+                <div style="margin-top:4px;font-weight:400;font-size:12.5px;">
+                    <%= t('nodes.agentOutdatedMessage') %>
+                </div>
+            </div>
+        </div>
+        <% } %>
     </div>
 </div>
 <% } %>

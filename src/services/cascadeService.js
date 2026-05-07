@@ -812,13 +812,19 @@ class CascadeService {
         const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
         const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet);
 
-        const inboundTag = portalNode.xray?.inboundTag || 'vless-in';
+        // Cascade routing applies to ALL client-facing inbounds (main + extras).
+        const inboundTags = [
+            portalNode.xray?.inboundTag || 'vless-in',
+            ...(portalNode.xray?.extraInbounds || [])
+                .map(i => i.inboundTag)
+                .filter(Boolean),
+        ];
 
         if (reverseLinks.length > 0) {
-            configGenerator.applyReversePortal(config, reverseLinks, inboundTag);
+            configGenerator.applyReversePortal(config, reverseLinks, inboundTags);
         }
         if (forwardLinks.length > 0) {
-            configGenerator.applyForwardChain(config, forwardLinks, inboundTag);
+            configGenerator.applyForwardChain(config, forwardLinks, inboundTags);
         }
 
         const forwardHopLinks = (await CascadeLink.find({

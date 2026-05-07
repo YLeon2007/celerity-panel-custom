@@ -246,19 +246,89 @@ function generateURI(user, node, config) {
 }
 
 /**
- * Generate VLESS URI for an Xray node
+ * Build the list of inbound descriptors to advertise in the subscription.
+ * The first entry is the main inbound (port = node.port, name = node label),
+ * followed by every entry of `node.xray.extraInbounds` that has a port. Each
+ * descriptor carries enough state to build a single VLESS URI / Clash proxy
+ * / sing-box outbound / v2ray vnext.
+ *
+ * @param {Object} node - Node document with xray sub-object
+ * @returns {Array<Object>} Inbound descriptors with `{port, nameSuffix, ...inboundFields}`
+ */
+function getXrayPublishedInbounds(node) {
+    const xray = node.xray || {};
+    const main = {
+        port: node.port || 443,
+        nameSuffix: '',
+        transport: xray.transport,
+        security: xray.security,
+        flow: xray.flow,
+        fingerprint: xray.fingerprint,
+        alpn: xray.alpn,
+        realityPublicKey: xray.realityPublicKey,
+        realitySni: xray.realitySni,
+        realityShortIds: xray.realityShortIds,
+        realitySpiderX: xray.realitySpiderX,
+        wsPath: xray.wsPath,
+        wsHost: xray.wsHost,
+        grpcServiceName: xray.grpcServiceName,
+        xhttpPath: xray.xhttpPath,
+        xhttpHost: xray.xhttpHost,
+        xhttpMode: xray.xhttpMode,
+    };
+
+    const extras = (Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [])
+        .filter(i => i && i.port)
+        .map(i => ({
+            port: i.port,
+            // Use a stable, human-readable suffix to disambiguate names inside
+            // the client UI (clients keep server names unique). Prefer the
+            // explicit label, fall back to "<transport>:<port>".
+            nameSuffix: i.label && String(i.label).trim()
+                ? String(i.label).trim()
+                : `${i.transport || 'tcp'}:${i.port}`,
+            transport: i.transport,
+            security: i.security,
+            flow: i.flow,
+            fingerprint: i.fingerprint,
+            alpn: i.alpn,
+            realityPublicKey: i.realityPublicKey,
+            realitySni: i.realitySni,
+            realityShortIds: i.realityShortIds,
+            realitySpiderX: i.realitySpiderX,
+            wsPath: i.wsPath,
+            wsHost: i.wsHost,
+            grpcServiceName: i.grpcServiceName,
+            xhttpPath: i.xhttpPath,
+            xhttpHost: i.xhttpHost,
+            xhttpMode: i.xhttpMode,
+        }));
+
+    return [main, ...extras];
+}
+
+/**
+ * Build a server display name for a single inbound. Main inbound uses the
+ * node label as-is; extras append the suffix in parentheses for clarity.
+ */
+function _xrayInboundName(node, inbound) {
+    const base = `${node.flag || ''} ${node.name}`.trim();
+    return inbound.nameSuffix ? `${base} (${inbound.nameSuffix})` : base;
+}
+
+/**
+ * Generate a VLESS URI for one inbound of an Xray node.
  * vless://{uuid}@{host}:{port}?type={transport}&security={security}&...#{name}
  */
-function generateVlessURI(user, node) {
+function generateVlessURIForInbound(user, node, inbound) {
     const uuid = user.xrayUuid;
     if (!uuid) return null;
 
-    const xray = node.xray || {};
     const host = node.domain || node.ip;
-    const port = node.port || 443;
-    const transport = xray.transport || 'tcp';
-    const security = xray.security || 'reality';
-    const fingerprint = xray.fingerprint || 'chrome';
+    const port = inbound.port || node.port || 443;
+    const transport = inbound.transport || 'tcp';
+    const security = inbound.security || 'reality';
+    const fingerprint = inbound.fingerprint || 'chrome';
 
     const params = new URLSearchParams();
     // xhttp → splithttp in URI type parameter
@@ -266,41 +336,62 @@ function generateVlessURI(user, node) {
     params.set('security', security);
 
     if (security === 'reality') {
-        if (xray.flow && transport === 'tcp') params.set('flow', xray.flow);
-        if (xray.realityPublicKey) params.set('pbk', xray.realityPublicKey);
-        const sni = xray.realitySni && xray.realitySni[0] ? xray.realitySni[0] : '';
+        if (inbound.flow && transport === 'tcp') params.set('flow', inbound.flow);
+        if (inbound.realityPublicKey) params.set('pbk', inbound.realityPublicKey);
+        const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : '';
         if (sni) params.set('sni', sni);
         // Prefer non-empty shortId if available
-        const shortIds = xray.realityShortIds || [''];
+        const shortIds = inbound.realityShortIds || [''];
         const sid = shortIds.find(id => id && id.length > 0) || shortIds[0] || '';
         params.set('sid', sid);
-        if (xray.realitySpiderX) params.set('spx', xray.realitySpiderX);
+        if (inbound.realitySpiderX) params.set('spx', inbound.realitySpiderX);
         params.set('fp', fingerprint);
     } else if (security === 'tls') {
-        if (xray.flow && transport === 'tcp') params.set('flow', xray.flow);
+        if (inbound.flow && transport === 'tcp') params.set('flow', inbound.flow);
         const sni = node.domain || node.sni || '';
         if (sni) params.set('sni', sni);
         params.set('fp', fingerprint);
-        // ALPN
-        if (xray.alpn && xray.alpn.length > 0) {
-            params.set('alpn', xray.alpn.join(','));
+        if (inbound.alpn && inbound.alpn.length > 0) {
+            params.set('alpn', inbound.alpn.join(','));
         }
     }
 
     if (transport === 'ws') {
-        params.set('path', xray.wsPath || '/');
-        if (xray.wsHost) params.set('host', xray.wsHost);
+        params.set('path', inbound.wsPath || '/');
+        if (inbound.wsHost) params.set('host', inbound.wsHost);
     } else if (transport === 'grpc') {
-        params.set('serviceName', xray.grpcServiceName || 'grpc');
+        params.set('serviceName', inbound.grpcServiceName || 'grpc');
         params.set('mode', 'gun');
     } else if (transport === 'xhttp') {
-        params.set('path', xray.xhttpPath || '/');
-        if (xray.xhttpHost) params.set('host', xray.xhttpHost);
-        if (xray.xhttpMode && xray.xhttpMode !== 'auto') params.set('mode', xray.xhttpMode);
+        params.set('path', inbound.xhttpPath || '/');
+        if (inbound.xhttpHost) params.set('host', inbound.xhttpHost);
+        if (inbound.xhttpMode && inbound.xhttpMode !== 'auto') params.set('mode', inbound.xhttpMode);
     }
 
-    const name = `${node.flag || ''} ${node.name}`.trim();
+    const name = _xrayInboundName(node, inbound);
     return `vless://${uuid}@${host}:${port}?${params.toString()}#${encodeURIComponent(name)}`;
+}
+
+/**
+ * Generate VLESS URIs for every published inbound of an Xray node (main + extras).
+ * Returns an array of strings (skip null results when uuid is missing).
+ */
+function generateVlessURIs(user, node) {
+    const uuid = user.xrayUuid;
+    if (!uuid) return [];
+    return getXrayPublishedInbounds(node)
+        .map(inbound => generateVlessURIForInbound(user, node, inbound))
+        .filter(Boolean);
+}
+
+/**
+ * Backward-compatible single-URI helper: returns the URI for the main inbound
+ * only. Existing callers that show one URI per node (preview pages, single-node
+ * helpers) keep working unchanged. New callers should use generateVlessURIs.
+ */
+function generateVlessURI(user, node) {
+    const uris = generateVlessURIs(user, node);
+    return uris.length > 0 ? uris[0] : null;
 }
 
 // ==================== ROUTING RULE CONVERTERS ====================
@@ -635,8 +726,8 @@ function generateURIList(user, nodes) {
     const uris = [];
     nodes.forEach(node => {
         if (node.type === 'xray') {
-            const uri = generateVlessURI(user, node);
-            if (uri) uris.push(uri);
+            // One URI per published inbound (main + extras).
+            generateVlessURIs(user, node).forEach(uri => uris.push(uri));
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 uris.push(generateURI(user, node, cfg));
@@ -646,15 +737,14 @@ function generateURIList(user, nodes) {
     return uris.join('\n');
 }
 
-function _buildClashVlessProxy(user, node) {
-    const xray = node.xray || {};
+function _buildClashVlessProxyForInbound(user, node, inbound) {
     const host = node.domain || node.ip;
-    const transport = xray.transport || 'tcp';
-    const security = xray.security || 'reality';
-    const fingerprint = xray.fingerprint || 'chrome';
-    const name = `${node.flag || ''} ${node.name}`.trim();
+    const transport = inbound.transport || 'tcp';
+    const security = inbound.security || 'reality';
+    const fingerprint = inbound.fingerprint || 'chrome';
+    const name = _xrayInboundName(node, inbound);
 
-    // Clash Meta doesn't support splithttp/xhttp - skip these nodes
+    // Clash Meta doesn't support splithttp/xhttp - skip these inbounds
     if (transport === 'xhttp') {
         return { name, proxy: null };
     }
@@ -662,31 +752,31 @@ function _buildClashVlessProxy(user, node) {
     let proxy = `  - name: "${name}"
     type: vless
     server: ${host}
-    port: ${node.port || 443}
+    port: ${inbound.port || node.port || 443}
     uuid: "${user.xrayUuid}"
     udp: true`;
 
     if (security === 'reality') {
-        const sni = xray.realitySni && xray.realitySni[0] ? xray.realitySni[0] : host;
+        const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host;
         proxy += `
     network: ${transport}
     tls: true
     reality-opts:
-      public-key: "${xray.realityPublicKey || ''}"
-      short-id: "${(xray.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"
+      public-key: "${inbound.realityPublicKey || ''}"
+      short-id: "${(inbound.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"
     servername: ${sni}
     client-fingerprint: ${fingerprint}`;
-        if (transport === 'tcp' && xray.flow) proxy += `\n    flow: ${xray.flow}`;
+        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
     } else if (security === 'tls') {
         proxy += `
     network: ${transport}
     tls: true
     servername: ${node.domain || node.sni || host}
     client-fingerprint: ${fingerprint}`;
-        if (xray.alpn && xray.alpn.length > 0) {
-            proxy += `\n    alpn:\n${xray.alpn.map(a => `      - ${a}`).join('\n')}`;
+        if (inbound.alpn && inbound.alpn.length > 0) {
+            proxy += `\n    alpn:\n${inbound.alpn.map(a => `      - ${a}`).join('\n')}`;
         }
-        if (transport === 'tcp' && xray.flow) proxy += `\n    flow: ${xray.flow}`;
+        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
     } else {
         proxy += `\n    network: ${transport}`;
     }
@@ -694,15 +784,25 @@ function _buildClashVlessProxy(user, node) {
     if (transport === 'ws') {
         proxy += `
     ws-opts:
-      path: "${xray.wsPath || '/'}"`;
-        if (xray.wsHost) proxy += `\n      headers:\n        Host: "${xray.wsHost}"`;
+      path: "${inbound.wsPath || '/'}"`;
+        if (inbound.wsHost) proxy += `\n      headers:\n        Host: "${inbound.wsHost}"`;
     } else if (transport === 'grpc') {
         proxy += `
     grpc-opts:
-      grpc-service-name: "${xray.grpcServiceName || 'grpc'}"`;
+      grpc-service-name: "${inbound.grpcServiceName || 'grpc'}"`;
     }
 
     return { name, proxy };
+}
+
+/**
+ * Build Clash proxies for every published inbound of an Xray node.
+ * Returns an array of `{name, proxy}` items; entries with `proxy === null`
+ * (e.g. xhttp transport not supported by Clash) are filtered by the caller.
+ */
+function _buildClashVlessProxies(user, node) {
+    return getXrayPublishedInbounds(node)
+        .map(inbound => _buildClashVlessProxyForInbound(user, node, inbound));
 }
 
 function generateClashYAML(user, nodes, routing) {
@@ -713,10 +813,12 @@ function generateClashYAML(user, nodes, routing) {
     nodes.forEach(node => {
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
-            const { name, proxy } = _buildClashVlessProxy(user, node);
-            if (!proxy) return; // xhttp not supported by Clash
-            proxyNames.push(name);
-            proxies.push(proxy);
+            // One Clash entry per published inbound (main + extras).
+            _buildClashVlessProxies(user, node).forEach(({ name, proxy }) => {
+                if (!proxy) return; // xhttp not supported by Clash
+                proxyNames.push(name);
+                proxies.push(proxy);
+            });
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const name = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -770,15 +872,14 @@ function generateClashYAML(user, nodes, routing) {
     return yaml;
 }
 
-function _buildSingboxVlessOutbound(user, node) {
-    const xray = node.xray || {};
+function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
     const host = node.domain || node.ip;
-    const transport = xray.transport || 'tcp';
-    const security = xray.security || 'reality';
-    const fingerprint = xray.fingerprint || 'chrome';
-    const tag = `${node.flag || ''} ${node.name}`.trim();
+    const transport = inbound.transport || 'tcp';
+    const security = inbound.security || 'reality';
+    const fingerprint = inbound.fingerprint || 'chrome';
+    const tag = _xrayInboundName(node, inbound);
 
-    // Sing-box doesn't support splithttp/xhttp - skip these nodes
+    // Sing-box doesn't support splithttp/xhttp - skip these inbounds
     if (transport === 'xhttp') {
         return { tag, outbound: null };
     }
@@ -787,23 +888,23 @@ function _buildSingboxVlessOutbound(user, node) {
         type: 'vless',
         tag,
         server: host,
-        server_port: node.port || 443,
+        server_port: inbound.port || node.port || 443,
         uuid: user.xrayUuid,
     };
 
     if (transport === 'tcp' && (security === 'reality' || security === 'tls')) {
-        outbound.flow = xray.flow || 'xtls-rprx-vision';
+        outbound.flow = inbound.flow || 'xtls-rprx-vision';
     }
 
     if (security === 'reality') {
         outbound.tls = {
             enabled: true,
-            server_name: xray.realitySni && xray.realitySni[0] ? xray.realitySni[0] : host,
+            server_name: inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host,
             utls: { enabled: true, fingerprint },
             reality: {
                 enabled: true,
-                public_key: xray.realityPublicKey || '',
-                short_id: (xray.realityShortIds || ['']).find(id => id && id.length > 0) || '',
+                public_key: inbound.realityPublicKey || '',
+                short_id: (inbound.realityShortIds || ['']).find(id => id && id.length > 0) || '',
             },
         };
     } else if (security === 'tls') {
@@ -812,26 +913,34 @@ function _buildSingboxVlessOutbound(user, node) {
             server_name: node.domain || node.sni || host,
             utls: { enabled: true, fingerprint },
         };
-        // ALPN
-        if (xray.alpn && xray.alpn.length > 0) {
-            outbound.tls.alpn = xray.alpn;
+        if (inbound.alpn && inbound.alpn.length > 0) {
+            outbound.tls.alpn = inbound.alpn;
         }
     }
 
     if (transport === 'ws') {
         outbound.transport = {
             type: 'ws',
-            path: xray.wsPath || '/',
-            headers: xray.wsHost ? { Host: xray.wsHost } : {},
+            path: inbound.wsPath || '/',
+            headers: inbound.wsHost ? { Host: inbound.wsHost } : {},
         };
     } else if (transport === 'grpc') {
         outbound.transport = {
             type: 'grpc',
-            service_name: xray.grpcServiceName || 'grpc',
+            service_name: inbound.grpcServiceName || 'grpc',
         };
     }
 
     return { tag, outbound };
+}
+
+/**
+ * Build sing-box outbounds for every published inbound of an Xray node.
+ * Entries with `outbound === null` (xhttp) are skipped by the caller.
+ */
+function _buildSingboxVlessOutbounds(user, node) {
+    return getXrayPublishedInbounds(node)
+        .map(inbound => _buildSingboxVlessOutboundForInbound(user, node, inbound));
 }
 
 /**
@@ -847,57 +956,59 @@ function generateV2rayJSON(user, nodes, routing) {
     nodes.forEach(node => {
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
-            const xray = node.xray || {};
             const host = node.domain || node.ip;
-            const transport = xray.transport || 'tcp';
-            const security = xray.security || 'reality';
-            const tag = `${node.flag || ''} ${node.name}`.trim();
+            // One v2ray outbound per published inbound (main + extras).
+            getXrayPublishedInbounds(node).forEach(inbound => {
+                const transport = inbound.transport || 'tcp';
+                const security = inbound.security || 'reality';
+                const tag = _xrayInboundName(node, inbound);
 
-            const streamSettings = { network: transport === 'xhttp' ? 'splithttp' : transport };
+                const streamSettings = { network: transport === 'xhttp' ? 'splithttp' : transport };
 
-            if (security === 'reality') {
-                const sni = xray.realitySni && xray.realitySni[0] ? xray.realitySni[0] : '';
-                const shortIds = xray.realityShortIds || [''];
-                const sid = shortIds.find(id => id && id.length > 0) || shortIds[0] || '';
-                streamSettings.security = 'reality';
-                streamSettings.realitySettings = {
-                    fingerprint: xray.fingerprint || 'chrome',
-                    serverName: sni,
-                    publicKey: xray.realityPublicKey || '',
-                    shortId: sid,
-                    spiderX: xray.realitySpiderX || '',
-                };
-            } else if (security === 'tls') {
-                streamSettings.security = 'tls';
-                streamSettings.tlsSettings = {
-                    serverName: node.domain || node.sni || host,
-                    fingerprint: xray.fingerprint || 'chrome',
-                };
-                if (xray.alpn && xray.alpn.length > 0) {
-                    streamSettings.tlsSettings.alpn = xray.alpn;
+                if (security === 'reality') {
+                    const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : '';
+                    const shortIds = inbound.realityShortIds || [''];
+                    const sid = shortIds.find(id => id && id.length > 0) || shortIds[0] || '';
+                    streamSettings.security = 'reality';
+                    streamSettings.realitySettings = {
+                        fingerprint: inbound.fingerprint || 'chrome',
+                        serverName: sni,
+                        publicKey: inbound.realityPublicKey || '',
+                        shortId: sid,
+                        spiderX: inbound.realitySpiderX || '',
+                    };
+                } else if (security === 'tls') {
+                    streamSettings.security = 'tls';
+                    streamSettings.tlsSettings = {
+                        serverName: node.domain || node.sni || host,
+                        fingerprint: inbound.fingerprint || 'chrome',
+                    };
+                    if (inbound.alpn && inbound.alpn.length > 0) {
+                        streamSettings.tlsSettings.alpn = inbound.alpn;
+                    }
                 }
-            }
 
-            if (transport === 'ws') {
-                streamSettings.wsSettings = { path: xray.wsPath || '/', headers: xray.wsHost ? { Host: xray.wsHost } : {} };
-            } else if (transport === 'grpc') {
-                streamSettings.grpcSettings = { serviceName: xray.grpcServiceName || 'grpc', multiMode: false };
-            } else if (transport === 'xhttp') {
-                streamSettings.splithttpSettings = { path: xray.xhttpPath || '/', host: xray.xhttpHost || '' };
-            }
+                if (transport === 'ws') {
+                    streamSettings.wsSettings = { path: inbound.wsPath || '/', headers: inbound.wsHost ? { Host: inbound.wsHost } : {} };
+                } else if (transport === 'grpc') {
+                    streamSettings.grpcSettings = { serviceName: inbound.grpcServiceName || 'grpc', multiMode: false };
+                } else if (transport === 'xhttp') {
+                    streamSettings.splithttpSettings = { path: inbound.xhttpPath || '/', host: inbound.xhttpHost || '' };
+                }
 
-            const vnextUser = { id: user.xrayUuid, encryption: 'none' };
-            if (transport === 'tcp' && (security === 'reality' || security === 'tls') && xray.flow) {
-                vnextUser.flow = xray.flow;
-            }
+                const vnextUser = { id: user.xrayUuid, encryption: 'none' };
+                if (transport === 'tcp' && (security === 'reality' || security === 'tls') && inbound.flow) {
+                    vnextUser.flow = inbound.flow;
+                }
 
-            outbounds.push({
-                tag,
-                protocol: 'vless',
-                settings: { vnext: [{ address: host, port: node.port || 443, users: [vnextUser] }] },
-                streamSettings,
+                outbounds.push({
+                    tag,
+                    protocol: 'vless',
+                    settings: { vnext: [{ address: host, port: inbound.port || node.port || 443, users: [vnextUser] }] },
+                    streamSettings,
+                });
+                allTags.push(tag);
             });
-            allTags.push(tag);
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const tag = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -987,10 +1098,12 @@ function generateSingboxJSON(user, nodes, routing) {
     nodes.forEach(node => {
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
-            const { tag, outbound } = _buildSingboxVlessOutbound(user, node);
-            if (!outbound) return; // xhttp not supported by sing-box
-            tags.push(tag);
-            proxyOutbounds.push(outbound);
+            // One sing-box outbound per published inbound (main + extras).
+            _buildSingboxVlessOutbounds(user, node).forEach(({ tag, outbound }) => {
+                if (!outbound) return; // xhttp not supported by sing-box
+                tags.push(tag);
+                proxyOutbounds.push(outbound);
+            });
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const tag = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -1108,15 +1221,21 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
     const allConfigs = [];
     nodes.forEach(node => {
         if (node.type === 'xray') {
-            const uri = generateVlessURI(user, node);
-            if (uri) {
-                allConfigs.push({
-                    location: node.name,
-                    flag: node.flag || '🌐',
-                    name: 'VLESS',
-                    uri,
-                });
-            }
+            // Render one card per published inbound (main + extras).
+            const inbounds = getXrayPublishedInbounds(node);
+            inbounds.forEach(inbound => {
+                const uri = generateVlessURIForInbound(user, node, inbound);
+                if (uri) {
+                    allConfigs.push({
+                        location: inbound.nameSuffix
+                            ? `${node.name} (${inbound.nameSuffix})`
+                            : node.name,
+                        flag: node.flag || '🌐',
+                        name: 'VLESS',
+                        uri,
+                    });
+                }
+            });
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 allConfigs.push({

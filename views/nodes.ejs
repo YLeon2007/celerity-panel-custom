@@ -123,7 +123,16 @@
                         </td>
                         <td><code><%= node.ip %></code></td>
                         <td>
-                            <code><%= node.port %></code>
+                            <% if (node.type === 'xray' && node.xray && Array.isArray(node.xray.extraInbounds) && node.xray.extraInbounds.length > 0) { %>
+                                <div class="port-chip-list">
+                                    <span class="port-chip" title="<%= (node.xray.transport || 'tcp') %>/<%= (node.xray.security || 'reality') %>"><%= node.port %></span>
+                                    <% node.xray.extraInbounds.forEach(function(ei) { %>
+                                        <span class="port-chip port-chip-extra" title="<%= ei.transport %>/<%= ei.security %><%= ei.label ? ' — ' + ei.label : '' %>"><%= ei.port %></span>
+                                    <% }); %>
+                                </div>
+                            <% } else { %>
+                                <code><%= node.port %></code>
+                            <% } %>
                             <% if (node.portRange) { %>
                             <br><small class="text-muted">hop: <%= node.portRange %></small>
                             <% } %>

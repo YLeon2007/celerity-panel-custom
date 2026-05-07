@@ -231,4 +231,28 @@
                            value="<%= node?.xray?.apiPort || 61000 %>" placeholder="61000">
                     <small><%= t('nodes.xrayApiPortHint') %></small>
                 </div>
+
+                <%# ========== Additional VLESS inbounds ========== %>
+                <div class="extra-inbounds-section">
+                    <div class="extra-inbounds-header">
+                        <div>
+                            <div class="extra-inbounds-title"><i class="ti ti-plugger-connected"></i> <%= t('nodes.xrayExtraInboundsTitle') %></div>
+                            <small class="extra-inbounds-hint"><%= t('nodes.xrayExtraInboundsHint') %></small>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-secondary" id="addExtraInboundBtn" onclick="addExtraInbound()">
+                            <i class="ti ti-plus"></i> <%= t('nodes.xrayAddInbound') %>
+                        </button>
+                    </div>
+
+                    <div id="extraInboundsContainer">
+                        <% (node?.xray?.extraInbounds || []).forEach(function(extra, idx) { %>
+                            <%- include('xray-extra-inbound', { extra: extra, idx: idx, t: t }) %>
+                        <% }); %>
+                    </div>
+
+                    <%# Hidden template cloned client-side by addExtraInbound() %>
+                    <template id="extraInboundTemplate">
+                        <%- include('xray-extra-inbound', { extra: {}, idx: 0, t: t }) %>
+                    </template>
+                </div>
             </div>

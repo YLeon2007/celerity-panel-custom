@@ -200,6 +200,54 @@
     border-bottom-right-radius: var(--radius);
 }
 
+/* ── Extra Xray inbounds ── */
+.extra-inbounds-section {
+    margin-top: 24px;
+    padding-top: 18px;
+    border-top: 1px dashed var(--border);
+}
+.extra-inbounds-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+.extra-inbounds-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.extra-inbounds-hint {
+    color: var(--text-muted);
+    font-size: 12px;
+    display: block;
+    margin-top: 4px;
+}
+.extra-inbound-card { margin-bottom: 12px; }
+.extra-inbound-card .extra-inbound-summary {
+    margin-left: 8px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+}
+.extra-inbound-card .extra-inbound-title {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.input-error {
+    border-color: var(--error, #ff6b6b) !important;
+    box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.15);
+}
+
 /* ── SNI Scanner modal ── */
 .sni-modal-overlay {
     position: fixed;
@@ -417,16 +465,58 @@ const i18nConfig = {
 
 const PANEL_DOMAIN = '<%= panelDomain %>';
 
+// Agent port is not exposed in the form, but we still need it in the
+// conflict set so a default extra port never lands on the agent socket.
+// Declared here so checkXrayPortConflict (below) sees it without TDZ risk.
+const XRAY_AGENT_PORT = <%- JSON.stringify(node?.xray?.agentPort || 62080) %>;
+
 function checkXrayPortConflict() {
     const warn = document.getElementById('xrayPortConflictWarn');
-    if (!warn) return;
     const proto = document.querySelector('input[name="type"]:checked')?.value || 'hysteria';
     const ip = (document.getElementById('ip')?.value || '').trim().toLowerCase();
     const port = parseInt(document.getElementById('port')?.value || '443', 10);
     const panelHostname = PANEL_DOMAIN.split(':')[0].toLowerCase();
     const isSameServer = ip === 'localhost' || ip === '127.0.0.1' || ip === '::1' || ip === panelHostname;
     const isConflictPort = port === 443 || port === 80;
-    warn.style.display = (proto === 'xray' && isSameServer && isConflictPort) ? '' : 'none';
+    if (warn) {
+        warn.style.display = (proto === 'xray' && isSameServer && isConflictPort) ? '' : 'none';
+    }
+
+    // Flag duplicates among main port, API port, agent port and extras.
+    const apiPort = parseInt(document.getElementById('xrayApiPort')?.value || '0', 10);
+    const counts = new Map();
+    const bump = (p) => {
+        if (Number.isFinite(p) && p > 0) counts.set(p, (counts.get(p) || 0) + 1);
+    };
+    bump(port);
+    bump(apiPort);
+    bump(XRAY_AGENT_PORT);
+    document.querySelectorAll('input[name="xray_extra_port"]').forEach(input => {
+        const inputPort = parseInt(input.value, 10);
+        bump(inputPort);
+        const card = input.closest('details.extra-inbound-card');
+        if (card) {
+            // Mark dup ports with an outline; also mark tag duplicates below.
+            const isDup = Number.isFinite(inputPort) && (counts.get(inputPort) || 0) > 1;
+            input.classList.toggle('input-error', isDup);
+        }
+    });
+
+    const tagCounts = new Map();
+    // JSON.stringify guarantees a valid JS string literal even when the tag
+    // contains special characters (defense-in-depth — the schema pattern
+    // already restricts tags, but never trust render context).
+    const mainTag = <%- JSON.stringify(node?.xray?.inboundTag || 'vless-in') %>;
+    tagCounts.set(mainTag, 1);
+    document.querySelectorAll('input[name="xray_extra_inboundTag"]').forEach(input => {
+        const v = (input.value || '').trim();
+        if (v) tagCounts.set(v, (tagCounts.get(v) || 0) + 1);
+    });
+    document.querySelectorAll('input[name="xray_extra_inboundTag"]').forEach(input => {
+        const v = (input.value || '').trim();
+        const isDup = !!v && (tagCounts.get(v) || 0) > 1;
+        input.classList.toggle('input-error', isDup);
+    });
 }
 
 function switchProto(proto) {
@@ -503,6 +593,169 @@ function updateXraySecurityUI() {
     document.getElementById('realityFields').style.display = security === 'reality' ? '' : 'none';
     document.getElementById('alpnGroup').style.display = security === 'tls' ? '' : 'none';
 }
+
+// ==================== Xray extra inbounds ====================
+
+// Pick the next free port for a new extra inbound. Defaults follow the
+// well-known TLS ports clients usually accept on restrictive networks.
+function nextFreeXrayPort() {
+    const taken = new Set();
+    const mainPort = parseInt(document.getElementById('port')?.value || '443', 10);
+    if (Number.isFinite(mainPort)) taken.add(mainPort);
+    const apiPort = parseInt(document.getElementById('xrayApiPort')?.value || '0', 10);
+    if (Number.isFinite(apiPort) && apiPort > 0) taken.add(apiPort);
+    if (Number.isFinite(XRAY_AGENT_PORT) && XRAY_AGENT_PORT > 0) taken.add(XRAY_AGENT_PORT);
+    document.querySelectorAll('input[name="xray_extra_port"]').forEach(input => {
+        const p = parseInt(input.value, 10);
+        if (Number.isFinite(p) && p > 0) taken.add(p);
+    });
+    const candidates = [8443, 2053, 2083, 2087, 2096, 8080, 8880];
+    for (const c of candidates) {
+        if (!taken.has(c)) return c;
+    }
+    let p = 10000;
+    while (taken.has(p) && p < 65535) p++;
+    return p;
+}
+
+// Compute the next default tag like vless-extra-N where N is the smallest
+// integer not yet used. Keeps tags stable when adding/removing inbounds.
+function nextFreeXrayTag() {
+    const taken = new Set();
+    document.querySelectorAll('input[name="xray_extra_inboundTag"]').forEach(input => {
+        const m = String(input.value || '').match(/^vless-extra-(\d+)$/);
+        if (m) taken.add(parseInt(m[1], 10));
+    });
+    let n = 1;
+    while (taken.has(n)) n++;
+    return `vless-extra-${n}`;
+}
+
+// Add a new extra inbound by cloning the structure of an existing card or
+// building one from scratch. Uses a hidden <template> populated below.
+function addExtraInbound() {
+    const container = document.getElementById('extraInboundsContainer');
+    if (!container) return;
+
+    const port = nextFreeXrayPort();
+    const tag = nextFreeXrayTag();
+    const id = (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : 'extra-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+
+    const tpl = document.getElementById('extraInboundTemplate');
+    if (!tpl) return;
+    const node = tpl.content.cloneNode(true);
+    const root = node.querySelector('details');
+    root.dataset.extraIdx = String(container.children.length);
+
+    root.querySelector('input[name="xray_extra_id"]').value = id;
+    root.querySelector('input[name="xray_extra_port"]').value = port;
+    root.querySelector('input[name="xray_extra_inboundTag"]').value = tag;
+
+    const titleSpan = root.querySelector('.extra-inbound-title');
+    if (titleSpan) titleSpan.textContent = (i18n.xrayExtraInbound || 'Extra inbound') + ' #' + (container.children.length + 1);
+    const summarySpan = root.querySelector('.extra-inbound-summary');
+    if (summarySpan) summarySpan.textContent = 'TCP / reality : ' + port;
+
+    root.open = true;
+    container.appendChild(node);
+    checkXrayPortConflict();
+}
+
+function removeExtraInbound(btn) {
+    const card = btn.closest('details.extra-inbound-card');
+    if (!card) return;
+    if (!confirm(i18n.xrayRemoveInboundConfirm || 'Remove this inbound?')) return;
+    card.remove();
+    checkXrayPortConflict();
+}
+
+function _findExtraCard(el) {
+    return el.closest ? el.closest('details.extra-inbound-card') : null;
+}
+
+function updateExtraXrayTransportUI(selectEl) {
+    const card = _findExtraCard(selectEl);
+    if (!card) return;
+    const transport = selectEl.value;
+    const ws = card.querySelector('.extra-ws-fields');
+    const grpc = card.querySelector('.extra-grpc-fields');
+    const xhttp = card.querySelector('.extra-xhttp-fields');
+    const flow = card.querySelector('.extra-flow-group');
+    if (ws) ws.style.display = transport === 'ws' ? '' : 'none';
+    if (grpc) grpc.style.display = transport === 'grpc' ? '' : 'none';
+    if (xhttp) xhttp.style.display = transport === 'xhttp' ? '' : 'none';
+    if (flow) flow.style.display = transport === 'tcp' ? '' : 'none';
+}
+
+function updateExtraXraySecurityUI(selectEl) {
+    const card = _findExtraCard(selectEl);
+    if (!card) return;
+    const security = selectEl.value;
+    const reality = card.querySelector('.extra-reality-fields');
+    const alpn = card.querySelector('.extra-alpn-group');
+    if (reality) reality.style.display = security === 'reality' ? '' : 'none';
+    if (alpn) alpn.style.display = security === 'tls' ? '' : 'none';
+}
+
+// Live-update the collapsed summary of an inbound card so admins can see
+// transport / security / port without opening every card.
+function updateExtraInboundSummary(el) {
+    const card = _findExtraCard(el);
+    if (!card) return;
+    const transport = card.querySelector('select[name="xray_extra_transport"]')?.value || 'tcp';
+    const security = card.querySelector('select[name="xray_extra_security"]')?.value || 'reality';
+    const port = card.querySelector('input[name="xray_extra_port"]')?.value || '';
+    const summary = card.querySelector('.extra-inbound-summary');
+    if (summary) summary.textContent = transport.toUpperCase() + ' / ' + security + ' : ' + port;
+}
+
+function updateExtraInboundTitle(input) {
+    const card = _findExtraCard(input);
+    if (!card) return;
+    const title = card.querySelector('.extra-inbound-title');
+    if (title) {
+        const v = String(input.value || '').trim();
+        const idx = parseInt(card.dataset.extraIdx || '0', 10);
+        title.textContent = v || ((i18n.xrayExtraInbound || 'Extra inbound') + ' #' + (idx + 1));
+    }
+}
+
+<% if (node?._id && node.type === 'xray') { %>
+async function generateExtraXrayKeys(btn) {
+    const card = _findExtraCard(btn);
+    if (!card) return;
+    if (!confirm(i18n.xrayGenerateKeysConfirm)) return;
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="ti ti-loader-2"></i>';
+    try {
+        const res = await fetch('/api/nodes/<%= node._id %>/generate-xray-keys', {
+            method: 'POST',
+            credentials: 'include',
+        });
+        const data = await res.json();
+        if (data && data.success) {
+            const priv = card.querySelector('.extra-reality-priv');
+            const pub = card.querySelector('.extra-reality-pub');
+            if (priv) priv.value = data.privateKey;
+            if (pub) pub.value = data.publicKey;
+        } else {
+            alert(i18n.error + ': ' + ((data && data.error) || 'Unknown error'));
+        }
+    } catch (err) {
+        alert(i18n.error + ': ' + err.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    }
+}
+<% } else { %>
+function generateExtraXrayKeys() {
+    alert(i18n.saveFirst || 'Save the node first to generate Reality keys.');
+}
+<% } %>
 
 // ==================== Hysteria helpers ====================
 
@@ -931,6 +1184,15 @@ async function generateXrayKeys() {
         updateXrayTransportUI();
         updateXraySecurityUI();
     }
+
+    // Live duplicate-port / duplicate-tag detection across extra inbounds.
+    document.addEventListener('input', function(ev) {
+        const target = ev.target;
+        if (!target || !target.name) return;
+        if (target.name === 'xray_extra_port' || target.name === 'xray_extra_inboundTag' || target.id === 'xrayApiPort') {
+            checkXrayPortConflict();
+        }
+    });
 })();
 
 // SSH private key file upload

@@ -23,7 +23,8 @@ const axios = require('axios');
 const https = require('https');
 const config = require('../../config');
 const webhook = require('./webhookService');
-const { getPanelCertificates, isSameVpsAsPanel } = require('./nodeSetup');
+const nodeSetup = require('./nodeSetup');
+const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -302,16 +303,24 @@ class SyncService {
 
                     if (allPortalLinks.length > 0 || forwardHopLinks.length > 0) {
                         const configObj = JSON.parse(configContent);
-                        const inboundTag = node.xray?.inboundTag || 'vless-in';
+                        // Cascade routing applies to ALL client-facing inbounds
+                        // (main + extras), so traffic from any inbound goes
+                        // into the cascade.
+                        const inboundTags = [
+                            node.xray?.inboundTag || 'vless-in',
+                            ...(node.xray?.extraInbounds || [])
+                                .map(i => i.inboundTag)
+                                .filter(Boolean),
+                        ];
 
                         const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
                         const forwardLinks = await this._getForwardChainLinks(node._id);
 
                         if (reverseLinks.length > 0) {
-                            configGenerator.applyReversePortal(configObj, reverseLinks, inboundTag);
+                            configGenerator.applyReversePortal(configObj, reverseLinks, inboundTags);
                         }
                         if (forwardLinks.length > 0) {
-                            configGenerator.applyForwardChain(configObj, forwardLinks, inboundTag);
+                            configGenerator.applyForwardChain(configObj, forwardLinks, inboundTags);
                         }
                         if (forwardHopLinks.length > 0) {
                             configGenerator.applyForwardHopInbound(configObj, forwardHopLinks);
@@ -337,6 +346,17 @@ class SyncService {
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
                 await ssh.uploadContent(configContent, xrayConfigPath);
                 logger.info(`[Xray Sync] Node ${node.name}: config uploaded to ${xrayConfigPath}`);
+
+                // Also refresh cc-agent config when extra inbounds may have
+                // changed, so the agent picks up new tag→flow mapping. The
+                // helper restarts cc-agent via systemctl; safe to call always.
+                if (node.xray?.agentToken) {
+                    try {
+                        await nodeSetup.reloadCcAgent(node, ssh);
+                    } catch (reloadErr) {
+                        logger.warn(`[Xray Sync] Node ${node.name}: cc-agent reload failed: ${reloadErr.message}`);
+                    }
+                }
             } catch (error) {
                 logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
             } finally {
@@ -403,7 +423,7 @@ class SyncService {
 
     /**
      * Collect traffic stats from Xray node via Agent GET /stats.
-     * Response shape (agent v2.0.0+):
+     * Response shape (agent v1.1.0+):
      *   { users: { <userId>: { tx, rx } }, node: { tx, rx } }
      * Node tx/rx come from Xray outbound stats (real traffic that traversed
      * Xray), not from summing per-user counters.

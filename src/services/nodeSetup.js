@@ -786,8 +786,41 @@ echo "Done: Directory /usr/local/etc/xray ready"
 `;
 
 /**
- * Generate x25519 keys for Xray Reality via SSH
- * Supports multiple output formats:
+ * Generate x25519 keypair for Xray Reality LOCALLY (no SSH).
+ * Uses Node's native crypto module (`crypto.generateKeyPairSync('x25519')`)
+ * so the panel can mint keys for new nodes / additional inbounds before any
+ * SSH connection has been established.
+ *
+ * Xray uses raw 32-byte keys encoded as base64url WITHOUT padding. We strip
+ * the fixed PKCS8/SPKI ASN.1 prefixes (16 bytes for private, 12 for public)
+ * to get the raw 32-byte payload, then base64url-encode.
+ *
+ * @returns {{ privateKey: string, publicKey: string }}
+ */
+function generateX25519KeysLocal() {
+    const crypto = require('crypto');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+
+    // PKCS8 DER for x25519 private = 16-byte ASN.1 prefix + 32-byte raw key.
+    // SPKI  DER for x25519 public  = 12-byte ASN.1 prefix + 32-byte raw key.
+    const privDer = privateKey.export({ format: 'der', type: 'pkcs8' });
+    const pubDer  = publicKey .export({ format: 'der', type: 'spki'  });
+    const privRaw = privDer.subarray(privDer.length - 32);
+    const pubRaw  = pubDer .subarray(pubDer .length - 32);
+
+    const b64url = (buf) => buf.toString('base64')
+        .replace(/=+$/, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+
+    return { privateKey: b64url(privRaw), publicKey: b64url(pubRaw) };
+}
+
+/**
+ * Generate x25519 keys for Xray Reality via SSH (calls `xray x25519` on the
+ * remote node). Use generateX25519KeysLocal() instead when no SSH session is
+ * available; both produce keys in the exact same Xray format.
+ * Supports multiple `xray x25519` output formats:
  * - Old: "Private key: xxx\nPublic key: xxx"
  * - New: "PrivateKey: xxx\nPublicKey: xxx"
  * @returns {{ privateKey: string, publicKey: string } | null}
@@ -933,20 +966,29 @@ async function setupXrayNode(node, options = {}) {
         logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
         logs.push('--- End config preview ---');
 
-        // Open firewall ports
+        // Collect all client-facing ports: main inbound + extra inbounds.
+        // apiPort is local-only (127.0.0.1) and does not need a firewall rule.
         const mainPort = node.port || 443;
         const apiPort = (node.xray || {}).apiPort || 61000;
-        log(`Opening firewall ports (${mainPort}, api:${apiPort})...`);
+        const extraPorts = ((node.xray || {}).extraInbounds || [])
+            .map(i => parseInt(i.port, 10))
+            .filter(p => Number.isInteger(p) && p > 0 && p < 65536 && p !== mainPort);
+        const allPorts = [mainPort, ...extraPorts];
+
+        log(`Opening firewall ports (${allPorts.join(', ')}, api:${apiPort})...`);
+        const portRules = allPorts.map(p => `
+    iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport ${p} -j ACCEPT 2>/dev/null || true`).join('');
+        const ufwRules = allPorts.map(p => `
+    ufw allow ${p}/tcp 2>/dev/null || true
+    ufw allow ${p}/udp 2>/dev/null || true`).join('');
+
         const firewallResult = await execSSH(conn, `
 echo "=== Opening firewall ports ==="
-if command -v iptables &> /dev/null; then
-    iptables -I INPUT -p tcp --dport ${mainPort} -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport ${mainPort} -j ACCEPT 2>/dev/null || true
+if command -v iptables &> /dev/null; then${portRules}
     echo "Done: iptables rules added"
 fi
-if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow ${mainPort}/tcp 2>/dev/null || true
-    ufw allow ${mainPort}/udp 2>/dev/null || true
+if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then${ufwRules}
     echo "Done: UFW rules added"
 fi
 ${IPTABLES_SAVE_SNIPPET}
@@ -1107,21 +1149,8 @@ async function installCCAgent(conn, node, token, panelSource, sameVps, log) {
     const agentPort = (node.xray || {}).agentPort || 62080;
     const useTls = (node.xray || {}).agentTls !== false;
     const apiPort = (node.xray || {}).apiPort || 61000;
-    const inboundTag = (node.xray || {}).inboundTag || 'vless-in';
 
-    const agentConfig = {
-        listen: `0.0.0.0:${agentPort}`,
-        token: token,
-        xray_api: `127.0.0.1:${apiPort}`,
-        inbound_tag: inboundTag,
-        data_dir: '/var/lib/cc-agent',
-        tls: {
-            enabled: useTls,
-            cert: '/etc/cc-agent/cert.pem',
-            key: '/etc/cc-agent/key.pem',
-        },
-    };
-
+    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls);
     const configJson = JSON.stringify(agentConfig, null, 2);
 
     // Build firewall rules based on setup type
@@ -1336,6 +1365,103 @@ async function setupXrayNodeWithAgent(node, options = {}) {
     return result;
 }
 
+/**
+ * Compute the XTLS flow value for a given inbound config block.
+ * Flow only applies to tcp + reality/tls; for other transports it must be
+ * empty, otherwise Xray rejects user additions.
+ *
+ * @param {Object} inbound - Object with `transport`, `security`, `flow` fields
+ * @returns {string} The flow string or '' when flow is not applicable
+ */
+function computeInboundFlow(inbound) {
+    if (!inbound) return '';
+    const transport = inbound.transport || 'tcp';
+    const security = inbound.security || 'reality';
+    if ((security === 'reality' || security === 'tls') && transport === 'tcp') {
+        return inbound.flow || 'xtls-rprx-vision';
+    }
+    return '';
+}
+
+/**
+ * Build the JSON config object written to /etc/cc-agent/config.json on the
+ * remote node. Includes both the legacy `inbound_tag` (for old agents) and
+ * the new `inbounds[]` array describing per-tag flow for all VLESS inbounds
+ * (main + extras). Old agents read inbound_tag; new agents read inbounds[].
+ */
+function buildAgentConfig(node, token, agentPort, apiPort, useTls) {
+    const xray = node.xray || {};
+    const mainTag = xray.inboundTag || 'vless-in';
+
+    const inbounds = [
+        { tag: mainTag, flow: computeInboundFlow(xray) },
+        ...(Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [])
+            .filter(i => i && i.inboundTag)
+            .map(i => ({ tag: i.inboundTag, flow: computeInboundFlow(i) })),
+    ];
+
+    return {
+        listen: `0.0.0.0:${agentPort}`,
+        token: token,
+        xray_api: `127.0.0.1:${apiPort}`,
+        // Legacy single-tag field kept for backward compatibility with cc-agent
+        // versions that do not understand `inbounds`.
+        inbound_tag: mainTag,
+        inbounds,
+        data_dir: '/var/lib/cc-agent',
+        tls: {
+            enabled: useTls,
+            cert: '/etc/cc-agent/cert.pem',
+            key: '/etc/cc-agent/key.pem',
+        },
+    };
+}
+
+/**
+ * Refresh /etc/cc-agent/config.json on the remote node to reflect the current
+ * set of Xray inbounds (main + extras), then restart the agent so it picks
+ * up the new tag→flow mapping. Safe to call on every config sync — the
+ * payload is idempotent.
+ *
+ * Uses sftp uploadFile (no shell-substitution of user input) and a fixed
+ * `systemctl restart cc-agent` command — no injection surface.
+ *
+ * @param {Object} node - Node document with xray.agentToken/agentPort/...
+ * @param {NodeSSH} ssh - Already-connected NodeSSH wrapper from syncService
+ */
+async function reloadCcAgent(node, ssh) {
+    const xray = node.xray || {};
+    const token = xray.agentToken;
+    if (!token) {
+        return; // Agent not provisioned — nothing to refresh
+    }
+    const agentPort = xray.agentPort || 62080;
+    const apiPort = xray.apiPort || 61000;
+    const useTls = xray.agentTls !== false;
+
+    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls);
+    const configJson = JSON.stringify(agentConfig, null, 2);
+
+    await ssh.uploadContent(configJson, '/etc/cc-agent/config.json');
+    await ssh.exec('chmod 600 /etc/cc-agent/config.json');
+    // Wait for systemd to confirm cc-agent is active again before returning,
+    // so the caller (syncService) can immediately POST /restart to it without
+    // racing the bring-up. The loop polls for up to ~5 s and exits 0 as soon
+    // as the unit is active again, exit 1 on timeout.
+    const waitResult = await ssh.exec(
+        'systemctl restart cc-agent && '
+        + 'for i in 1 2 3 4 5; do '
+        + '  systemctl is-active cc-agent >/dev/null 2>&1 && exit 0; '
+        + '  sleep 1; '
+        + 'done; '
+        + 'exit 1'
+    );
+    if (waitResult && typeof waitResult.code === 'number' && waitResult.code !== 0) {
+        logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active within ~5s (will continue anyway)`);
+    }
+    logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
+}
+
 module.exports = {
     setupNode,
     checkNodeStatus,
@@ -1346,9 +1472,12 @@ module.exports = {
     setupXrayNode,
     setupXrayNodeWithAgent,
     installCCAgent,
+    buildAgentConfig,
+    reloadCcAgent,
     generateAgentToken,
     ensureXrayAgentToken,
     generateX25519Keys,
+    generateX25519KeysLocal,
     checkXrayNodeStatus,
     getXrayNodeLogs,
     getPanelCertificates,

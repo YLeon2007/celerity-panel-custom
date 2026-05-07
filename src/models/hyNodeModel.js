@@ -106,6 +106,40 @@ const quicSchema = new mongoose.Schema({
     disablePathMTUDiscovery: { type: Boolean, default: false },
 }, { _id: false });
 
+// Per-inbound stream/security settings shared by the main inbound and extras.
+// Extras add `id`, `label`, `port` and reuse their own `inboundTag` instead of
+// the node-level fields.
+const xrayExtraInboundSchema = new mongoose.Schema({
+    // Stable client-generated id (uuid) used to track edits across form submits
+    id: { type: String, required: true },
+    label: { type: String, default: '' },
+    port: { type: Number, required: true },
+    inboundTag: { type: String, required: true },
+
+    transport: { type: String, enum: ['tcp', 'ws', 'grpc', 'xhttp'], default: 'tcp' },
+    security: { type: String, enum: ['reality', 'tls', 'none'], default: 'reality' },
+    flow: { type: String, default: 'xtls-rprx-vision' },
+
+    fingerprint: { type: String, default: 'chrome' },
+    alpn: { type: [String], default: [] },
+
+    realityDest: { type: String, default: 'www.google.com:443' },
+    realitySni: { type: [String], default: ['www.google.com'] },
+    realityPrivateKey: { type: String, default: '' },
+    realityPublicKey: { type: String, default: '' },
+    realityShortIds: { type: [String], default: [''] },
+    realitySpiderX: { type: String, default: '/' },
+
+    wsPath: { type: String, default: '/' },
+    wsHost: { type: String, default: '' },
+
+    grpcServiceName: { type: String, default: 'grpc' },
+
+    xhttpPath: { type: String, default: '/' },
+    xhttpHost: { type: String, default: '' },
+    xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up'], default: 'auto' },
+}, { _id: false });
+
 const xrayConfigSchema = new mongoose.Schema({
     // Transport: tcp, ws, grpc, xhttp (splithttp)
     transport: { type: String, enum: ['tcp', 'ws', 'grpc', 'xhttp'], default: 'tcp' },
@@ -149,6 +183,11 @@ const xrayConfigSchema = new mongoose.Schema({
     agentPort: { type: Number, default: 62080 },
     agentToken: { type: String, default: '' },
     agentTls: { type: Boolean, default: true },
+
+    // Additional VLESS inbounds running alongside the main one with their own
+    // ports and transports (Reality TCP + WS+TLS + gRPC, etc). Optional, the
+    // main inbound is still defined by the flat fields above.
+    extraInbounds: { type: [xrayExtraInboundSchema], default: [] },
 }, { _id: false });
 
 const hyNodeSchema = new mongoose.Schema({

@@ -3094,3 +3094,29 @@ p {
 .btn, .btn-icon, .nav-menu a, .card, .stat-card, .action-btn {
     transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
+/* Port chips for the Nodes table — used when an Xray node has multiple
+ * client-facing inbounds (main + extras). */
+.port-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+}
+.port-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: help;
+}
+.port-chip-extra {
+    background: var(--accent-glow, rgba(99, 102, 241, 0.12));
+    border-color: var(--accent, #6366f1);
+    color: var(--accent, #6366f1);
+}

@@ -23,6 +23,8 @@ const logger = require('../../utils/logger');
 const {
     render,
     parseXrayFormFields,
+    validateXrayFormFields,
+    ensureExtraInboundRealityKeys,
     parseBool,
     parseHysteriaFormFields,
     getHysteriaAclInlineState,
@@ -306,6 +308,13 @@ router.post('/nodes', async (req, res) => {
 
         if (nodeType === 'xray') {
             nodeData.xray = parseXrayFormFields(req.body);
+            const xrayError = validateXrayFormFields(nodeData.xray, nodeData);
+            if (xrayError) {
+                return res.redirect(`/panel/nodes/add?error=${encodeURIComponent(xrayError)}`);
+            }
+            // Mint Reality keys for any extra inbound that arrived empty.
+            // Removes the "save first, then click Generate" round-trip.
+            ensureExtraInboundRealityKeys(nodeData.xray, nodeSetup);
             if (nodeData.cascadeRole !== 'bridge' && !nodeData.xray.agentToken) {
                 nodeData.xray.agentToken = nodeSetup.generateAgentToken();
             }
@@ -535,6 +544,14 @@ router.post('/nodes/:id', async (req, res) => {
                     : (existingNode.xray || {})),
                 ...parseXrayFormFields(req.body),
             };
+            // Validate using merged xray + the about-to-save node fields.
+            const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
+            const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate });
+            if (xrayError) {
+                return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}`);
+            }
+            // Mint Reality keys for any extra inbound that arrived empty.
+            ensureExtraInboundRealityKeys(updates.xray, nodeSetup);
             if ((req.body.cascadeRole || 'standalone') !== 'bridge' && !updates.xray.agentToken) {
                 updates.xray.agentToken = nodeSetup.generateAgentToken();
             }

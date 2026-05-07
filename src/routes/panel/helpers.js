@@ -72,13 +72,126 @@ function connectNodeSSH(node) {
 
 // ─── Form Parsers ────────────────────────────────────────────────────────────
 
+// Whitelists used by parseXrayFormFields/parseExtraInbounds.
+// Any value outside the whitelist is replaced with the default to keep the
+// stored config strictly within the schema enum (defense-in-depth).
+const XRAY_TRANSPORT_VALUES = ['tcp', 'ws', 'grpc', 'xhttp'];
+const XRAY_SECURITY_VALUES = ['reality', 'tls', 'none'];
+const XRAY_XHTTP_MODE_VALUES = ['auto', 'packet-up', 'stream-up'];
+const XRAY_FINGERPRINT_VALUES = [
+    'chrome', 'firefox', 'safari', 'ios', 'android',
+    'edge', 'random', 'randomized',
+];
+
+function _pickEnum(value, allowed, fallback) {
+    return allowed.includes(value) ? value : fallback;
+}
+
+function _splitCsv(raw, { keepEmpty = false } = {}) {
+    if (raw === undefined || raw === null) return null;
+    const list = String(raw).split(',').map(s => s.trim());
+    return keepEmpty ? list : list.filter(Boolean);
+}
+
+/**
+ * Parse the `xray.extraInbounds[]` array out of parallel form arrays
+ * (xray_extra_id[], xray_extra_port[], xray_extra_*[]). Each index across the
+ * arrays describes a single inbound. Indices with a missing/invalid port are
+ * dropped. Returns [] when no extra inbounds were submitted.
+ */
+function parseExtraInbounds(body) {
+    const ids = body.xray_extra_id;
+    if (!ids) return [];
+    const idArr = Array.isArray(ids) ? ids : [ids];
+    if (idArr.length === 0) return [];
+
+    const arr = (key) => {
+        const v = body[key];
+        if (v === undefined) return [];
+        return Array.isArray(v) ? v : [v];
+    };
+    const ports = arr('xray_extra_port');
+    const labels = arr('xray_extra_label');
+    const tags = arr('xray_extra_inboundTag');
+    const transports = arr('xray_extra_transport');
+    const securities = arr('xray_extra_security');
+    const flows = arr('xray_extra_flow');
+    const fingerprints = arr('xray_extra_fingerprint');
+    const alpns = arr('xray_extra_alpn');
+    const realityDests = arr('xray_extra_realityDest');
+    const realitySnis = arr('xray_extra_realitySni');
+    const realityPriv = arr('xray_extra_realityPrivateKey');
+    const realityPub = arr('xray_extra_realityPublicKey');
+    const realityShortIds = arr('xray_extra_realityShortIds');
+    const realitySpiderX = arr('xray_extra_realitySpiderX');
+    const wsPaths = arr('xray_extra_wsPath');
+    const wsHosts = arr('xray_extra_wsHost');
+    const grpcServiceNames = arr('xray_extra_grpcServiceName');
+    const xhttpPaths = arr('xray_extra_xhttpPath');
+    const xhttpHosts = arr('xray_extra_xhttpHost');
+    const xhttpModes = arr('xray_extra_xhttpMode');
+
+    const result = [];
+    for (let i = 0; i < idArr.length; i++) {
+        const port = parseInt(ports[i], 10);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            // Mismatched parallel arrays or browser-side `required` bypass.
+            // Drop silently from the model but warn in the log so admins can
+            // diagnose disappearing rows.
+            logger.warn(`[parseExtraInbounds] Dropping row #${i + 1}: invalid or missing port (raw=${JSON.stringify(ports[i])})`);
+            continue;
+        }
+
+        const transport = _pickEnum(transports[i], XRAY_TRANSPORT_VALUES, 'tcp');
+        const security = _pickEnum(securities[i], XRAY_SECURITY_VALUES, 'reality');
+
+        const inbound = {
+            id: String(idArr[i] || '').trim() || `extra-${i + 1}`,
+            label: String(labels[i] || '').trim().slice(0, 64),
+            port,
+            inboundTag: String(tags[i] || '').trim() || `vless-extra-${i + 1}`,
+            transport,
+            security,
+            flow: String(flows[i] !== undefined ? flows[i] : 'xtls-rprx-vision'),
+            fingerprint: _pickEnum(fingerprints[i], XRAY_FINGERPRINT_VALUES, 'chrome'),
+            alpn: alpns[i] !== undefined ? (_splitCsv(alpns[i]) || []) : [],
+            realityDest: String(realityDests[i] || 'www.google.com:443'),
+            realitySni: realitySnis[i] !== undefined
+                ? (_splitCsv(realitySnis[i]) || ['www.google.com'])
+                : ['www.google.com'],
+            realityPrivateKey: String(realityPriv[i] || ''),
+            realityPublicKey: String(realityPub[i] || ''),
+            realityShortIds: realityShortIds[i] !== undefined
+                ? (_splitCsv(realityShortIds[i], { keepEmpty: true }) || [''])
+                : [''],
+            realitySpiderX: String(realitySpiderX[i] || '/'),
+            wsPath: String(wsPaths[i] || '/'),
+            wsHost: String(wsHosts[i] || ''),
+            grpcServiceName: String(grpcServiceNames[i] || 'grpc'),
+            xhttpPath: String(xhttpPaths[i] || '/'),
+            xhttpHost: String(xhttpHosts[i] || ''),
+            xhttpMode: _pickEnum(xhttpModes[i], XRAY_XHTTP_MODE_VALUES, 'auto'),
+        };
+        // Empty short-id list is invalid for Reality; restore the empty marker.
+        if (inbound.realityShortIds.length === 0) inbound.realityShortIds = [''];
+        result.push(inbound);
+    }
+    return result;
+}
+
 function parseXrayFormFields(body) {
     const xray = {};
 
-    if (body['xray.transport']) xray.transport = body['xray.transport'];
-    if (body['xray.security']) xray.security = body['xray.security'];
+    if (body['xray.transport']) {
+        xray.transport = _pickEnum(body['xray.transport'], XRAY_TRANSPORT_VALUES, 'tcp');
+    }
+    if (body['xray.security']) {
+        xray.security = _pickEnum(body['xray.security'], XRAY_SECURITY_VALUES, 'reality');
+    }
     if (body['xray.flow'] !== undefined) xray.flow = body['xray.flow'];
-    if (body['xray.fingerprint']) xray.fingerprint = body['xray.fingerprint'];
+    if (body['xray.fingerprint']) {
+        xray.fingerprint = _pickEnum(body['xray.fingerprint'], XRAY_FINGERPRINT_VALUES, 'chrome');
+    }
 
     if (body['xray.alpn'] !== undefined) {
         const alpnStr = body['xray.alpn'].trim();
@@ -105,10 +218,106 @@ function parseXrayFormFields(body) {
     if (body['xray.grpcServiceName']) xray.grpcServiceName = body['xray.grpcServiceName'];
     if (body['xray.xhttpPath'] !== undefined) xray.xhttpPath = body['xray.xhttpPath'];
     if (body['xray.xhttpHost'] !== undefined) xray.xhttpHost = body['xray.xhttpHost'];
-    if (body['xray.xhttpMode']) xray.xhttpMode = body['xray.xhttpMode'];
+    if (body['xray.xhttpMode']) {
+        xray.xhttpMode = _pickEnum(body['xray.xhttpMode'], XRAY_XHTTP_MODE_VALUES, 'auto');
+    }
     if (body['xray.apiPort']) xray.apiPort = parseInt(body['xray.apiPort']) || 61000;
 
+    // Always parse extra inbounds — pass [] explicitly when none submitted so
+    // the route can persist a "delete-all" intent. Callers that do not want to
+    // touch extras can just delete the field from the result.
+    xray.extraInbounds = parseExtraInbounds(body);
+
     return xray;
+}
+
+/**
+ * Server-side validation for the parsed xray block. Mirrors the client-side
+ * checks (see views/partials/node-form/scripts.ejs) to provide a fail-safe
+ * defense layer (Rule #2). Returns the first error message or null when valid.
+ *
+ * Validates:
+ *  - Each extra inbound port is a valid number in 1..65535
+ *  - Ports are unique across: node.port, xray.apiPort, xray.agentPort, extras
+ *  - Inbound tags are non-empty, alphanumeric/dash/underscore, unique,
+ *    and do not collide with the main inbound tag
+ *
+ * @param {Object} xray - Parsed xray sub-object (already through parseXrayFormFields)
+ * @param {Object} node - The node form payload (for `port`); xray fields take
+ *                       precedence when both are provided.
+ * @returns {string|null}
+ */
+function validateXrayFormFields(xray, node) {
+    if (!xray || !Array.isArray(xray.extraInbounds) || xray.extraInbounds.length === 0) {
+        return null;
+    }
+
+    const mainPort = parseInt(node?.port, 10);
+    const apiPort = parseInt(xray.apiPort, 10);
+    const agentPort = parseInt(xray.agentPort, 10);
+    const reservedPorts = new Map();
+    if (Number.isInteger(mainPort)) reservedPorts.set(mainPort, 'main inbound');
+    if (Number.isInteger(apiPort)) reservedPorts.set(apiPort, 'API');
+    if (Number.isInteger(agentPort)) reservedPorts.set(agentPort, 'agent');
+
+    const mainTag = (xray.inboundTag || 'vless-in').trim();
+    const seenTags = new Map();
+    seenTags.set(mainTag, 'main inbound');
+
+    const tagPattern = /^[A-Za-z0-9_-]{1,64}$/;
+
+    for (let i = 0; i < xray.extraInbounds.length; i++) {
+        const inbound = xray.extraInbounds[i];
+        const idx = i + 1;
+
+        if (!Number.isInteger(inbound.port) || inbound.port < 1 || inbound.port > 65535) {
+            return `Extra inbound #${idx}: invalid port (must be 1..65535)`;
+        }
+        if (reservedPorts.has(inbound.port)) {
+            return `Extra inbound #${idx}: port ${inbound.port} is already used by ${reservedPorts.get(inbound.port)}`;
+        }
+        reservedPorts.set(inbound.port, `extra inbound #${idx}`);
+
+        const tag = (inbound.inboundTag || '').trim();
+        if (!tagPattern.test(tag)) {
+            return `Extra inbound #${idx}: tag must match [A-Za-z0-9_-]{1,64}`;
+        }
+        if (seenTags.has(tag)) {
+            return `Extra inbound #${idx}: tag "${tag}" is already used by ${seenTags.get(tag)}`;
+        }
+        seenTags.set(tag, `extra inbound #${idx}`);
+
+        if (!XRAY_TRANSPORT_VALUES.includes(inbound.transport)) {
+            return `Extra inbound #${idx}: invalid transport`;
+        }
+        if (!XRAY_SECURITY_VALUES.includes(inbound.security)) {
+            return `Extra inbound #${idx}: invalid security`;
+        }
+        // Reality private key is auto-generated server-side when missing
+        // (see ensureExtraInboundReality in panel/nodes.js), so we do NOT
+        // reject submissions with empty privateKey here.
+    }
+
+    return null;
+}
+
+/**
+ * Fill in missing Reality keys for extra inbounds before persisting them.
+ * Mutates each inbound in place. Used by the create/edit node routes so
+ * admins can add Reality extras without manually clicking "Generate keys".
+ *
+ * @param {Object} xray - Parsed xray object (with extraInbounds[])
+ * @param {Object} nodeSetup - The nodeSetup module (passed to avoid cycles)
+ */
+function ensureExtraInboundRealityKeys(xray, nodeSetup) {
+    if (!xray || !Array.isArray(xray.extraInbounds)) return;
+    for (const inbound of xray.extraInbounds) {
+        if (inbound.security === 'reality' && !inbound.realityPrivateKey) {
+            const keys = nodeSetup.generateX25519KeysLocal();
+            inbound.realityPrivateKey = keys.privateKey;
+            inbound.realityPublicKey = keys.publicKey;
+        }
+    }
 }
 
 function parseBool(body, key, defaultValue = false) {
@@ -794,6 +1003,9 @@ module.exports = {
     buildSshKeyFilename,
     connectNodeSSH,
     parseXrayFormFields,
+    parseExtraInbounds,
+    validateXrayFormFields,
+    ensureExtraInboundRealityKeys,
     parseBool,
     parseHeaderMap,
     parseHysteriaFormFields,

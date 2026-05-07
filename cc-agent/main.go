@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const Version = "2.0.0"
+const Version = "1.2.0"
 
 var startTime = time.Now()
 
