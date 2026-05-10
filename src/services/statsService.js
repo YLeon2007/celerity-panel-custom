@@ -111,9 +111,9 @@ class StatsService {
             
             let host = {};
             try {
-                host = hostMetrics.getSnapshot();
+                host = hostMetrics.consumeSnapshot();
             } catch (e) {
-                logger.warn(`[Stats] hostMetrics.getSnapshot failed: ${e.message}`);
+                logger.warn(`[Stats] hostMetrics.consumeSnapshot failed: ${e.message}`);
             }
 
             return {
@@ -135,15 +135,18 @@ class StatsService {
     
     async saveHourlySnapshot() {
         try {
-            const snapshot = await this.collectSnapshot();
-            if (!snapshot) return;
-            
             const timestamp = this.roundTo5Minutes(new Date());
-            
+
+            // Dedupe BEFORE collectSnapshot — otherwise the host metrics
+            // accumulator inside hostMetricsService.consumeSnapshot would be
+            // burnt for nothing on the duplicate call.
             if (this.lastHourlySnapshot?.getTime() === timestamp.getTime()) {
                 return;
             }
-            
+
+            const snapshot = await this.collectSnapshot();
+            if (!snapshot) return;
+
             await StatsSnapshot.upsertSnapshot('hourly', timestamp, snapshot);
             
             this.lastHourlySnapshot = timestamp;
