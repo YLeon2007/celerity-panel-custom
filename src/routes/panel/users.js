@@ -232,7 +232,13 @@ router.post('/users', async (req, res) => {
                 logger.error(`[Panel] Xray addUser error for ${userId}: ${err.message}`);
             });
         }
-        
+
+        webhookService.emit(webhookService.EVENTS.USER_CREATED, {
+            userId,
+            username: username || '',
+            groups,
+        });
+
         res.redirect(`/panel/users/${userId}`);
     } catch (error) {
         res.status(500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);

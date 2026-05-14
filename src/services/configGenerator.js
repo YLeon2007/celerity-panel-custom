@@ -3,6 +3,7 @@
  */
 
 const yaml = require('yaml');
+const logger = require('../utils/logger');
 
 /**
  * Parse a host:port string, handling IPv6 brackets (e.g. [::1]:8080).
@@ -637,24 +638,51 @@ function generateXrayConfig(node, users) {
         }
     }
 
-    // Apply ACL rules as routing rules
+    // Apply ACL rules as routing rules.
+    //
+    // Accepted action grammar: <action>(<target>) where action is one of the
+    // built-ins (reject / direct / proxy) OR the name of a custom outbound
+    // declared above (e.g. `ukr(all)` -> route to the `ukr` SOCKS5/HTTP
+    // outbound). The `proxy` keyword is kept for backward compatibility and
+    // resolves to the first custom outbound. Target `all` becomes a catch-all
+    // field-rule with no domain/ip filter, matching every connection from the
+    // VLESS inbounds (issue #75).
+    const customOutboundNames = new Set(customOutbounds.map(o => o && o.name).filter(Boolean));
     const aclRules = node.aclRules || [];
     for (const rule of aclRules) {
-        const match = rule.match(/^(reject|direct|proxy)\((.+)\)$/);
-        if (!match) continue;
-        const [, action, target] = match;
-        const routingRule = { type: 'field' };
-        if (target.startsWith('geoip:')) {
-            routingRule.ip = [target];
-        } else if (target.startsWith('geosite:')) {
-            routingRule.domain = [target];
-        } else {
-            routingRule.domain = [`full:${target}`];
+        const match = rule.match(/^([\w\-]+)\((.+)\)$/);
+        if (!match) {
+            if (rule.trim()) logger.warn(`[Xray ACL] Skipping unparsable rule: "${rule}"`);
+            continue;
         }
-        if (action === 'reject') routingRule.outboundTag = 'block';
-        else if (action === 'direct') routingRule.outboundTag = 'direct';
-        else if (action === 'proxy' && customOutbounds[0]) routingRule.outboundTag = customOutbounds[0].name;
-        else continue;
+        const [, action, target] = match;
+
+        let outboundTag;
+        if (action === 'reject') {
+            outboundTag = 'block';
+        } else if (action === 'direct') {
+            outboundTag = 'direct';
+        } else if (action === 'proxy') {
+            outboundTag = customOutbounds[0]?.name;
+        } else if (customOutboundNames.has(action)) {
+            outboundTag = action;
+        }
+
+        if (!outboundTag) {
+            logger.warn(`[Xray ACL] Skipping rule with unknown action "${action}": "${rule}"`);
+            continue;
+        }
+
+        const routingRule = { type: 'field', outboundTag };
+        if (target !== 'all') {
+            if (target.startsWith('geoip:')) {
+                routingRule.ip = [target];
+            } else if (target.startsWith('geosite:')) {
+                routingRule.domain = [target];
+            } else {
+                routingRule.domain = [`full:${target}`];
+            }
+        }
 
         config.routing.rules.push(routingRule);
     }
@@ -1330,17 +1358,32 @@ function ensurePrivateIpBlock(config) {
     if (!config.routing) config.routing = { rules: [] };
     if (!config.routing.rules) config.routing.rules = [];
 
-    // Remove any existing geoip:private rules
     config.routing.rules = config.routing.rules.filter(r =>
         !(r.type === 'field' && r.ip && r.ip.length === 1 && r.ip[0] === 'geoip:private')
     );
 
-    // Append as the very last rule
-    config.routing.rules.push({
+    const privateRule = {
         type: 'field',
         ip: ['geoip:private'],
         outboundTag: config.outbounds?.some(o => o.tag === 'block') ? 'block' : 'blackhole',
-    });
+    };
+
+    // Catch-all ACL rules (no ip/domain/inboundTag/protocol filters) must run
+    // AFTER the private-network block, otherwise LAN traffic would leak
+    // through a user-defined proxy like `ukr(all)` (issue #75).
+    const isCatchAll = (r) => r && r.type === 'field'
+        && !r.ip && !r.domain
+        && !r.inboundTag && !r.protocol
+        && !r.port && !r.network && !r.source;
+
+    const tail = [];
+    const head = [];
+    for (const r of config.routing.rules) {
+        if (isCatchAll(r)) tail.push(r);
+        else head.push(r);
+    }
+
+    config.routing.rules = [...head, privateRule, ...tail];
 }
 
 function generateBridgeSystemdService() {

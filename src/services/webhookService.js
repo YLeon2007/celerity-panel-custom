@@ -142,16 +142,51 @@ function clearDeviceLimitNotified(userId) {
     _deviceLimitNotified.delete(userId);
 }
 
+// Sample payload builders for each known event. Functions (not literals) so
+// timestamps reflect the moment of the test, not module load time.
+const _SAMPLE_BUILDERS = {
+    'user.created': () => ({ userId: 'sample-user', username: 'sample', groups: [] }),
+    'user.updated': () => ({ userId: 'sample-user', updates: { trafficLimit: 10737418240 } }),
+    'user.deleted': () => ({ userId: 'sample-user' }),
+    'user.enabled': () => ({ userId: 'sample-user' }),
+    'user.disabled': () => ({ userId: 'sample-user' }),
+    'user.traffic_exceeded': () => ({ userId: 'sample-user', usedBytes: 10737418240, limitBytes: 10737418240 }),
+    'user.expired': () => ({ userId: 'sample-user', expireAt: new Date().toISOString() }),
+    'user.device_added': () => ({ userId: 'sample-user', hwid: 'sample-hwid', userAgent: 'Sample/1.0' }),
+    'user.device_limit_reached': () => ({ userId: 'sample-user', maxDevices: 2 }),
+    'node.online': () => ({ nodeId: 'sample-node', name: 'Sample Node' }),
+    'node.offline': () => ({ nodeId: 'sample-node', name: 'Sample Node', lastError: 'connection refused' }),
+    'node.error': () => ({ nodeId: 'sample-node', name: 'Sample Node', error: 'sample error' }),
+    'sync.completed': () => ({ ok: 1, failed: 0, totalUsers: 1 }),
+};
+
+function _sampleDataFor(event) {
+    const build = _SAMPLE_BUILDERS[event];
+    return build ? build() : { message: 'Test webhook from C³ CELERITY' };
+}
+
 /**
  * Test webhook delivery (used by UI "Test" button).
  * Returns { success, status, error }
+ *
+ * @param {string} url    - Receiver URL
+ * @param {string} secret - HMAC secret (plaintext)
+ * @param {string} [event] - Optional event name; when set and known, the
+ *        request mirrors the production payload (including X-Webhook-Event)
+ *        so admins can validate the real shape per event.
  */
-async function test(url, secret) {
+async function test(url, secret, event) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
+    const isKnownEvent = !!(event && Object.values(EVENTS).includes(event));
+    const eventName = isKnownEvent ? event : 'test';
+    const data = isKnownEvent
+        ? _sampleDataFor(event)
+        : { message: 'Test webhook from C³ CELERITY' };
+
     const payload = JSON.stringify({
-        event: 'test',
+        event: eventName,
         timestamp: new Date().toISOString(),
-        data: { message: 'Test webhook from C³ CELERITY' },
+        data,
     });
 
     const signature = sign(secret || '', timestamp, payload);
@@ -161,7 +196,7 @@ async function test(url, secret) {
             timeout: WEBHOOK_TIMEOUT_MS,
             headers: {
                 'Content-Type': 'application/json',
-                'X-Webhook-Event': 'test',
+                'X-Webhook-Event': eventName,
                 'X-Webhook-Timestamp': timestamp,
                 'X-Webhook-Signature': signature,
                 'User-Agent': 'C3-Celerity-Webhook/1.0',

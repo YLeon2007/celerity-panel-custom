@@ -113,6 +113,9 @@ const xrayExtraInboundSchema = new mongoose.Schema({
     // Stable client-generated id (uuid) used to track edits across form submits
     id: { type: String, required: true },
     label: { type: String, default: '' },
+    // When true, the subscription server name is just the label (issue #74)
+    // instead of "<node name> (<label>)".
+    uniqueName: { type: Boolean, default: false },
     port: { type: Number, required: true },
     inboundTag: { type: String, required: true },
 

@@ -372,6 +372,46 @@ async function listS3Backups(settings) {
 }
 
 /**
+ * Get a readable stream for an S3 backup object (for HTTP download).
+ * Returns { stream, contentLength, contentType }.
+ */
+async function getS3BackupStream(settings, key) {
+    const client = getS3Client(settings);
+    if (!client) {
+        throw new Error('S3 client not available');
+    }
+
+    const { GetObjectCommand } = require('@aws-sdk/client-s3');
+    const bucket = settings.backup.s3.bucket;
+
+    const response = await client.send(new GetObjectCommand({
+        Bucket: bucket,
+        Key: key,
+    }));
+
+    return {
+        stream: response.Body,
+        contentLength: response.ContentLength,
+        contentType: response.ContentType || 'application/gzip',
+    };
+}
+
+/**
+ * Resolve absolute path of a local backup file by name (with safety checks).
+ */
+function getLocalBackupPath(name) {
+    const backupDir = path.join(__dirname, '../../backups');
+    const safeName = path.basename(name || '');
+    if (!safeName || safeName === '.' || safeName === '..') {
+        throw new Error('Invalid backup name');
+    }
+    if (!safeName.startsWith('hysteria-backup-') || !safeName.endsWith('.tar.gz')) {
+        throw new Error('Invalid backup name');
+    }
+    return path.join(backupDir, safeName);
+}
+
+/**
  * Download backup from S3 for restore
  */
 async function downloadFromS3(settings, key) {
@@ -492,6 +532,8 @@ module.exports = {
     listBackups,
     listS3Backups,
     downloadFromS3,
+    getS3BackupStream,
+    getLocalBackupPath,
     restoreBackup,
     shouldRunBackup,
     scheduledBackup,
