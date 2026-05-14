@@ -658,6 +658,13 @@ function addExtraInbound() {
     root.querySelector('input[name="xray_extra_id"]').value = id;
     root.querySelector('input[name="xray_extra_port"]').value = port;
     root.querySelector('input[name="xray_extra_inboundTag"]').value = tag;
+    // Keep unique-name checkbox value in sync with the row id (the parser
+    // identifies checked rows by id, since unchecked checkboxes are not sent).
+    const uniqueNameCb = root.querySelector('input[name="xray_extra_uniqueName"]');
+    if (uniqueNameCb) {
+        uniqueNameCb.value = id;
+        uniqueNameCb.checked = false;
+    }
 
     const titleSpan = root.querySelector('.extra-inbound-title');
     if (titleSpan) titleSpan.textContent = (i18n.xrayExtraInbound || 'Extra inbound') + ' #' + (container.children.length + 1);

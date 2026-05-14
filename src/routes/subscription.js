@@ -290,6 +290,9 @@ function getXrayPublishedInbounds(node) {
             nameSuffix: i.label && String(i.label).trim()
                 ? String(i.label).trim()
                 : `${i.transport || 'tcp'}:${i.port}`,
+            // When uniqueName is set the label fully replaces the node name
+            // in the published server name (issue #74).
+            uniqueName: !!i.uniqueName,
             transport: i.transport,
             security: i.security,
             flow: i.flow,
@@ -312,10 +315,15 @@ function getXrayPublishedInbounds(node) {
 
 /**
  * Build a server display name for a single inbound. Main inbound uses the
- * node label as-is; extras append the suffix in parentheses for clarity.
+ * node label as-is; extras append the suffix in parentheses unless the inbound
+ * is marked as `uniqueName`, in which case the label replaces the node name.
  */
 function _xrayInboundName(node, inbound) {
-    const base = `${node.flag || ''} ${node.name}`.trim();
+    const flag = node.flag || '';
+    if (inbound.uniqueName && inbound.nameSuffix) {
+        return `${flag} ${inbound.nameSuffix}`.trim();
+    }
+    const base = `${flag} ${node.name}`.trim();
     return inbound.nameSuffix ? `${base} (${inbound.nameSuffix})` : base;
 }
 
@@ -1240,10 +1248,16 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
             inbounds.forEach(inbound => {
                 const uri = generateVlessURIForInbound(user, node, inbound);
                 if (uri) {
+                    let location;
+                    if (inbound.uniqueName && inbound.nameSuffix) {
+                        location = inbound.nameSuffix;
+                    } else if (inbound.nameSuffix) {
+                        location = `${node.name} (${inbound.nameSuffix})`;
+                    } else {
+                        location = node.name;
+                    }
                     allConfigs.push({
-                        location: inbound.nameSuffix
-                            ? `${node.name} (${inbound.nameSuffix})`
-                            : node.name,
+                        location,
                         flag: node.flag || '🌐',
                         name: 'VLESS',
                         uri,

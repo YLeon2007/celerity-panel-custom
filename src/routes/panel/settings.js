@@ -604,6 +604,88 @@ router.get('/settings/backups-s3', async (req, res) => {
     }
 });
 
+// GET /settings/backups/download - Download a local backup file
+// Query: ?name=hysteria-backup-YYYY-MM-DDTHH-mm-ss.tar.gz
+router.get('/settings/backups/download', async (req, res) => {
+    try {
+        const backupService = require('../../services/backupService');
+        const fsSync = require('fs');
+
+        const name = String(req.query.name || '');
+        const localPath = backupService.getLocalBackupPath(name);
+
+        let stats;
+        try {
+            stats = await require('fs').promises.stat(localPath);
+        } catch {
+            return res.status(404).json({ error: 'Backup file not found' });
+        }
+
+        const safeName = require('path').basename(localPath);
+        res.setHeader('Content-Type', 'application/gzip');
+        res.setHeader('Content-Length', stats.size);
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+        res.setHeader('Cache-Control', 'no-store');
+
+        const stream = fsSync.createReadStream(localPath);
+        stream.on('error', (err) => {
+            logger.error(`[Backup] Local download stream error: ${err.message}`);
+            if (!res.headersSent) res.status(500).end();
+            else res.destroy(err);
+        });
+        stream.pipe(res);
+
+        logger.info(`[Panel] Backup download (local): ${safeName} by ${req.session.adminUsername}`);
+    } catch (error) {
+        logger.error(`[Panel] Backup download error: ${error.message}`);
+        if (!res.headersSent) res.status(400).json({ error: error.message });
+    }
+});
+
+// GET /settings/backups-s3/download - Download an S3 backup file
+// Query: ?key=<full S3 object key>
+router.get('/settings/backups-s3/download', async (req, res) => {
+    try {
+        const backupService = require('../../services/backupService');
+        const path = require('path');
+
+        const key = String(req.query.key || '').trim();
+        if (!key) return res.status(400).json({ error: 'Key is required' });
+
+        const settings = await Settings.get();
+        if (!settings?.backup?.s3?.enabled) {
+            return res.status(400).json({ error: 'S3 not configured' });
+        }
+
+        // Sanity check: key must live in the configured prefix to prevent
+        // arbitrary object reads from the bucket via this endpoint.
+        const prefix = (settings.backup.s3.prefix || 'backups').replace(/\/+$/, '');
+        if (!key.startsWith(`${prefix}/hysteria-backup-`) || !key.endsWith('.tar.gz')) {
+            return res.status(400).json({ error: 'Invalid backup key' });
+        }
+
+        const { stream, contentLength, contentType } = await backupService.getS3BackupStream(settings, key);
+
+        const safeName = path.basename(key);
+        res.setHeader('Content-Type', contentType || 'application/gzip');
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+        res.setHeader('Cache-Control', 'no-store');
+
+        stream.on('error', (err) => {
+            logger.error(`[Backup] S3 download stream error: ${err.message}`);
+            if (!res.headersSent) res.status(500).end();
+            else res.destroy(err);
+        });
+        stream.pipe(res);
+
+        logger.info(`[Panel] Backup download (S3): ${safeName} by ${req.session.adminUsername}`);
+    } catch (error) {
+        logger.error(`[Panel] S3 backup download error: ${error.message}`);
+        if (!res.headersSent) res.status(500).json({ error: error.message });
+    }
+});
+
 // POST /settings/restore-backup - Restore from backup (local or S3)
 router.post('/settings/restore-backup', async (req, res) => {
     try {
@@ -714,16 +796,20 @@ router.post('/api-keys/:id/delete', async (req, res) => {
 // POST /settings/test-webhook - Send test webhook
 router.post('/settings/test-webhook', async (req, res) => {
     try {
-        const { url, secret } = req.body;
+        const { url, secret, event } = req.body;
 
         if (!url || !url.trim()) {
             return res.status(400).json({ error: 'URL is required' });
         }
 
-        const result = await webhookService.test(url.trim(), secret || '');
+        // Whitelist event against EVENTS to prevent spoofing arbitrary headers.
+        const knownEvents = Object.values(webhookService.EVENTS);
+        const safeEvent = event && knownEvents.includes(event) ? event : undefined;
+
+        const result = await webhookService.test(url.trim(), secret || '', safeEvent);
 
         if (result.success) {
-            logger.info(`[Panel] Webhook test OK: ${url} (HTTP ${result.status})`);
+            logger.info(`[Panel] Webhook test OK: ${url} (HTTP ${result.status})${safeEvent ? ` event=${safeEvent}` : ''}`);
             res.json({ success: true, status: result.status });
         } else {
             res.status(400).json({ success: false, error: result.error, status: result.status });

@@ -365,9 +365,15 @@
                 <div id="webhookFields" style="<%= settings?.webhook?.enabled ? '' : 'display:none;' %>">
                     <div class="form-group">
                         <label><%= t('webhooks.url') || 'Webhook URL' %></label>
-                        <div style="display:flex; gap:0.5rem;">
+                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
                             <input type="url" name="webhook.url" id="webhookUrl" placeholder="https://example.com/webhook"
-                                   value="<%= settings?.webhook?.url || '' %>" style="flex:1;">
+                                   value="<%= settings?.webhook?.url || '' %>" style="flex:1; min-width:240px;">
+                            <select id="webhookTestEvent" style="max-width:220px;" title="<%= t('webhooks.testEventHint') || 'Send a sample payload for this event' %>">
+                                <option value=""><%= t('webhooks.testEventDefault') || 'Generic test' %></option>
+                                <% (webhookEvents || []).forEach(ev => { %>
+                                <option value="<%= ev %>"><%= ev %></option>
+                                <% }) %>
+                            </select>
                             <button type="button" class="btn btn-sm" onclick="testWebhook()"><%= t('webhooks.test') || 'Test' %></button>
                         </div>
                     </div>
@@ -603,6 +609,7 @@ document.getElementById('webhookEnabled')?.addEventListener('change', function()
 async function testWebhook() {
     const url = document.getElementById('webhookUrl').value.trim();
     const secret = document.querySelector('[name="webhook.secret"]')?.value || '';
+    const eventName = document.getElementById('webhookTestEvent')?.value || '';
     if (!url) { alert('<%= t("webhooks.urlRequired") || "Enter a URL first" %>'); return; }
 
     const btn = event.target;
@@ -610,7 +617,9 @@ async function testWebhook() {
     btn.textContent = '...';
 
     try {
-        const body = new URLSearchParams({ url, secret });
+        const params = { url, secret };
+        if (eventName) params.event = eventName;
+        const body = new URLSearchParams(params);
         const res = await fetch('/panel/settings/test-webhook', { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
         const data = await res.json();
         if (data.success) {

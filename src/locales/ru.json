@@ -461,6 +461,8 @@
     "xrayExtraInbound": "Дополнительный inbound",
     "xrayInboundLabel": "Метка",
     "xrayInboundLabelPlaceholder": "Например: Mobile, CDN, Backup",
+    "xrayInboundUniqueName": "Уникальное имя",
+    "xrayInboundUniqueNameHint": "Если включено, в подписке используется только метка вместо «Имя ноды (метка)»",
     "xrayInboundTag": "Тег inbound'а",
     "xrayInboundPortConflict": "Этот порт уже занят другим inbound'ом или API",
     "xrayInboundTagConflict": "Этот тег уже используется другим inbound'ом",
@@ -1096,7 +1098,9 @@
     "events": "События",
     "eventsHint": "пусто = все события",
     "test": "Тест",
-    "urlRequired": "Сначала введите URL"
+    "urlRequired": "Сначала введите URL",
+    "testEventDefault": "Обычный тест",
+    "testEventHint": "Отправить пример пейлоада для выбранного события"
   },
   "network": {
     "title": "Карта сети",

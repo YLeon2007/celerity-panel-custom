@@ -461,6 +461,8 @@
     "xrayExtraInbound": "Extra inbound",
     "xrayInboundLabel": "Label",
     "xrayInboundLabelPlaceholder": "e.g. Mobile, CDN, Backup",
+    "xrayInboundUniqueName": "Unique name",
+    "xrayInboundUniqueNameHint": "When enabled, the subscription uses just the label instead of \"Node name (label)\"",
     "xrayInboundTag": "Inbound tag",
     "xrayInboundPortConflict": "This port is already used by another inbound or the API",
     "xrayInboundTagConflict": "This tag is already used by another inbound",
@@ -1096,7 +1098,9 @@
     "events": "Events",
     "eventsHint": "empty = all events",
     "test": "Test",
-    "urlRequired": "Enter a URL first"
+    "urlRequired": "Enter a URL first",
+    "testEventDefault": "Generic test",
+    "testEventHint": "Send a sample payload for this event"
   },
   "network": {
     "title": "Network Map",

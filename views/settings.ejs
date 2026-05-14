@@ -94,7 +94,11 @@ const i18n = {
     restoreError: <%- JSON.stringify(t("settings.restoreError") || "Ошибка восстановления") %>,
     noBackups: <%- JSON.stringify(t("settings.noBackups") || "Нет доступных бэкапов") %>,
     localBackups: <%- JSON.stringify(t("settings.localBackups") || "Локальные") %>,
-    s3Backups: <%- JSON.stringify(t("settings.s3Backups") || "S3") %>
+    s3Backups: <%- JSON.stringify(t("settings.s3Backups") || "S3") %>,
+    restoreBtn: <%- JSON.stringify(t("settings.restoreBtn") || t("common.restore") || "Восстановить") %>,
+    downloadBtn: <%- JSON.stringify(t("settings.downloadBtn") || t("common.download") || "Скачать") %>,
+    loading: <%- JSON.stringify(t("common.loading") || "Загрузка...") %>,
+    downloadError: <%- JSON.stringify(t("settings.downloadError") || "Ошибка скачивания") %>
 };
 
 // ==================== TABS ====================
@@ -226,7 +230,7 @@ async function loadBackupsList() {
     const btn = document.getElementById('refreshBackupsBtn');
     
     btn.disabled = true;
-        container.innerHTML = '<p style="color: var(--text-muted);"><i class="ti ti-loader-2"></i> Загрузка...</p>';
+    container.innerHTML = `<p style="color: var(--text-muted);"><i class="ti ti-loader-2"></i> ${i18n.loading}</p>`;
     
     try {
         const [localRes, s3Res] = await Promise.all([
@@ -253,15 +257,21 @@ async function loadBackupsList() {
             html += '<div style="display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem;">';
             for (const b of localBackups) {
                 const date = new Date(b.created).toLocaleString();
+                const dlUrl = `/panel/settings/backups/download?name=${encodeURIComponent(b.name)}`;
                 html += `
                     <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0.75rem; background: var(--bg-tertiary); border-radius: 6px;">
                         <div>
                             <div style="font-size: 13px; font-weight: 500;">${b.name}</div>
                             <div style="font-size: 11px; color: var(--text-muted);">${date} • ${b.sizeMB} MB</div>
                         </div>
-                        <button class="btn btn-warning btn-sm" onclick="restoreBackup('local', '${b.name}')" style="padding: 4px 10px; font-size: 11px;">
-                            Restore
-                        </button>
+                        <div style="display: flex; gap: 6px;">
+                            <a class="btn btn-sm" href="${dlUrl}" download style="padding: 4px 10px; font-size: 11px;">
+                                <i class="ti ti-download"></i> ${i18n.downloadBtn}
+                            </a>
+                            <button class="btn btn-warning btn-sm" onclick="restoreBackup('local', '${b.name}')" style="padding: 4px 10px; font-size: 11px;">
+                                ${i18n.restoreBtn}
+                            </button>
+                        </div>
                     </div>
                 `;
             }
@@ -273,15 +283,21 @@ async function loadBackupsList() {
             html += '<div style="display: flex; flex-direction: column; gap: 0.5rem;">';
             for (const b of s3Backups) {
                 const date = new Date(b.created).toLocaleString();
+                const dlUrl = `/panel/settings/backups-s3/download?key=${encodeURIComponent(b.key)}`;
                 html += `
                     <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0.75rem; background: var(--bg-tertiary); border-radius: 6px;">
                         <div>
                             <div style="font-size: 13px; font-weight: 500;">${b.name}</div>
                             <div style="font-size: 11px; color: var(--text-muted);">${date} • ${b.sizeMB} MB</div>
                         </div>
-                        <button class="btn btn-warning btn-sm" onclick="restoreBackup('s3', '${b.key}')" style="padding: 4px 10px; font-size: 11px;">
-                            Restore
-                        </button>
+                        <div style="display: flex; gap: 6px;">
+                            <a class="btn btn-sm" href="${dlUrl}" download style="padding: 4px 10px; font-size: 11px;">
+                                <i class="ti ti-download"></i> ${i18n.downloadBtn}
+                            </a>
+                            <button class="btn btn-warning btn-sm" onclick="restoreBackup('s3', '${b.key}')" style="padding: 4px 10px; font-size: 11px;">
+                                ${i18n.restoreBtn}
+                            </button>
+                        </div>
                     </div>
                 `;
             }

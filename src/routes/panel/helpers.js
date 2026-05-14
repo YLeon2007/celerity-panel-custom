@@ -112,6 +112,9 @@ function parseExtraInbounds(body) {
     };
     const ports = arr('xray_extra_port');
     const labels = arr('xray_extra_label');
+    // Unchecked checkboxes are not submitted, so we identify "uniqueName" rows
+    // by the inbound id used as the checkbox value (kept stable on the form).
+    const uniqueNameIds = new Set(arr('xray_extra_uniqueName').map(v => String(v || '')));
     const tags = arr('xray_extra_inboundTag');
     const transports = arr('xray_extra_transport');
     const securities = arr('xray_extra_security');
@@ -145,9 +148,11 @@ function parseExtraInbounds(body) {
         const transport = _pickEnum(transports[i], XRAY_TRANSPORT_VALUES, 'tcp');
         const security = _pickEnum(securities[i], XRAY_SECURITY_VALUES, 'reality');
 
+        const id = String(idArr[i] || '').trim() || `extra-${i + 1}`;
         const inbound = {
-            id: String(idArr[i] || '').trim() || `extra-${i + 1}`,
+            id,
             label: String(labels[i] || '').trim().slice(0, 64),
+            uniqueName: uniqueNameIds.has(id),
             port,
             inboundTag: String(tags[i] || '').trim() || `vless-extra-${i + 1}`,
             transport,
