@@ -131,7 +131,7 @@ const xrayExtraInboundSchema = new mongoose.Schema({
     realityPrivateKey: { type: String, default: '' },
     realityPublicKey: { type: String, default: '' },
     realityShortIds: { type: [String], default: [''] },
-    realitySpiderX: { type: String, default: '/' },
+    realitySpiderX: { type: String, default: '' },
 
     wsPath: { type: String, default: '/' },
     wsHost: { type: String, default: '' },
@@ -162,7 +162,7 @@ const xrayConfigSchema = new mongoose.Schema({
     realityPrivateKey: { type: String, default: '' },
     realityPublicKey: { type: String, default: '' },
     realityShortIds: { type: [String], default: [''] },
-    realitySpiderX: { type: String, default: '/' },
+    realitySpiderX: { type: String, default: '' },
 
     // WebSocket-specific
     wsPath: { type: String, default: '/' },

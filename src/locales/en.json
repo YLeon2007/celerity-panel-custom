@@ -442,6 +442,8 @@
     "xrayPublicKey": "Public Key",
     "xrayShortIds": "Short IDs",
     "xrayShortIdsHint": "Comma-separated hex strings (0-16 chars). Empty string is valid.",
+    "xraySpiderX": "Spider X (spider start path)",
+    "xraySpiderXHint": "Starting URL for the REALITY spider on active probe. Best left empty (REALITY uses a random path) or set to a realistic path matching your SNI (e.g. /r/programming/ for www.reddit.com, /search?q=cloud for www.bing.com). Avoid identical values across nodes — that creates a signature.",
     "xrayWsPath": "WebSocket Path",
     "xrayWsHost": "WebSocket Host Header",
     "xrayWsHostHint": "For CDN (Cloudflare). Leave empty if not using CDN.",

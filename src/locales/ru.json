@@ -442,6 +442,8 @@
     "xrayPublicKey": "Публичный ключ",
     "xrayShortIds": "Short IDs",
     "xrayShortIdsHint": "Hex-строки через запятую (0-16 символов). Пустая строка допустима.",
+    "xraySpiderX": "Spider X (стартовый путь паука)",
+    "xraySpiderXHint": "Стартовый URL паука REALITY при активной пробе. Лучше оставить пустым (REALITY использует случайный путь) или указать реалистичный путь под выбранный SNI (например /r/programming/ для www.reddit.com, /search?q=cloud для www.bing.com). Не используйте одинаковое значение на разных нодах — это создаёт сигнатуру.",
     "xrayWsPath": "WebSocket Path",
     "xrayWsHost": "WebSocket Host Header",
     "xrayWsHostHint": "Для CDN (Cloudflare). Оставьте пустым если не используете CDN.",

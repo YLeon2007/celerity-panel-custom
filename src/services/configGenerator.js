@@ -571,8 +571,13 @@ function buildXrayStreamSettings(inbound, node = {}) {
             shortIds: inbound.realityShortIds && inbound.realityShortIds.length > 0
                 ? inbound.realityShortIds
                 : [''],
-            spiderX: inbound.realitySpiderX || '/',
         };
+        // spiderX is a client-side hint (only consumed by REALITY's UClient on
+        // failed verification). Emit the field only when explicitly set so an
+        // empty value doesn't pin all nodes to the predictable "/" default.
+        if (inbound.realitySpiderX) {
+            streamSettings.realitySettings.spiderX = inbound.realitySpiderX;
+        }
     } else if (security === 'tls') {
         // tlsSource lives on the node (not per-inbound) so extra inbounds inherit
         // the same certificate strategy as the main one — matches Marzban's

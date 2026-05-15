@@ -123,7 +123,11 @@
                 <label><%= t('nodes.xrayShortIds') %></label>
                 <input type="text" name="xray_extra_realityShortIds" value="<%= (e.realityShortIds || ['']).join(', ') %>" placeholder=", 0123456789abcdef">
             </div>
-            <input type="hidden" name="xray_extra_realitySpiderX" value="<%= e.realitySpiderX || '/' %>">
+            <div class="form-group">
+                <label><%= t('nodes.xraySpiderX') %></label>
+                <input type="text" name="xray_extra_realitySpiderX" value="<%= e.realitySpiderX || '' %>" placeholder="/r/programming/">
+                <small><%= t('nodes.xraySpiderXHint') %></small>
+            </div>
         </div>
 
         <%# WebSocket fields %>

@@ -181,7 +181,7 @@ function parseExtraInbounds(body) {
             realityShortIds: realityShortIds[i] !== undefined
                 ? (_splitCsv(realityShortIds[i], { keepEmpty: true }) || [''])
                 : [''],
-            realitySpiderX: String(realitySpiderX[i] || '/'),
+            realitySpiderX: String(realitySpiderX[i] || ''),
             wsPath: String(wsPaths[i] || '/'),
             wsHost: String(wsHosts[i] || ''),
             grpcServiceName: String(grpcServiceNames[i] || 'grpc'),

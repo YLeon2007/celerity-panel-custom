@@ -700,7 +700,7 @@ const expected = 'sha256=' + crypto
 | `realityPrivateKey` | String   | Приватный ключ x25519             |
 | `realityPublicKey`  | String   | Публичный ключ                    |
 | `realityShortIds`   | [String] | Short IDs                         |
-| `realitySpiderX`    | String   | Spider X path (default: /)        |
+| `realitySpiderX`    | String   | Стартовый URL REALITY-паука при пробе (по умолчанию пусто; рекомендуется уникальное значение на ноду) |
 | `wsPath`            | String   | WebSocket путь                    |
 | `wsHost`            | String   | WebSocket host header             |
 | `grpcServiceName`   | String   | gRPC service name                 |

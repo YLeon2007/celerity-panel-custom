@@ -662,7 +662,7 @@ const expected = 'sha256=' + crypto
 | `realityPrivateKey` | String | x25519 private key |
 | `realityPublicKey` | String | Public key |
 | `realityShortIds` | [String] | Short IDs |
-| `realitySpiderX` | String | Spider X path (default: /) |
+| `realitySpiderX` | String | Spider X path — start URL for the REALITY spider on probe (empty by default; per-node value recommended) |
 | `wsPath` | String | WebSocket path |
 | `wsHost` | String | WebSocket host header |
 | `grpcServiceName` | String | gRPC service name |
