@@ -94,22 +94,26 @@
                     </form>
                 </div>
             </div>
+        </div>
+    </div>
 
-            <%
-                const hp = locals.homepageInfo || { mode: 'nginx', hasCustom: false, customSize: 0, maxBytes: 262144 };
-                const hpMaxKB = Math.round(hp.maxBytes / 1024);
-                const hpCustomKB = hp.customSize ? (hp.customSize / 1024).toFixed(1) : '0';
-            %>
-            <div class="card" style="margin-top: 16px;">
-                <div class="card-header">
-                    <h2><i class="ti ti-mask"></i> <%= t('settings.homepage') || 'Маскировка домена' %></h2>
-                </div>
-                <div class="card-body">
-                    <p class="hint" style="margin-bottom: 12px;">
-                        <%= t('settings.homepageHint') || 'Что отдавать по корню домена. Маскирует панель от сканеров: вместо редиректа на /panel посетитель видит обычную страничку.' %>
-                    </p>
+    <%
+        const hp = locals.homepageInfo || { mode: 'nginx', hasCustom: false, customSize: 0, maxBytes: 262144 };
+        const hpMaxKB = Math.round(hp.maxBytes / 1024);
+        const hpCustomKB = hp.customSize ? (hp.customSize / 1024).toFixed(1) : '0';
+    %>
+    <div class="card" style="margin-top: 16px;">
+        <div class="card-header">
+            <h2><i class="ti ti-mask"></i> <%= t('settings.homepage') || 'Маскировка домена' %></h2>
+        </div>
+        <div class="card-body">
+            <p class="hint" style="margin-bottom: 16px;">
+                <%= t('settings.homepageHint') || 'Что отдавать по корню домена. Маскирует панель от сканеров: вместо редиректа на /panel посетитель видит обычную страничку.' %>
+            </p>
 
-                    <form method="POST" action="/panel/settings" style="margin-bottom: 12px;">
+            <div class="row">
+                <div class="col-6">
+                    <form method="POST" action="/panel/settings">
                         <input type="hidden" name="_homepageSettings" value="1">
 
                         <label class="checkbox-label" style="margin-bottom: 8px;">
@@ -139,11 +143,10 @@
                             <i class="ti ti-device-floppy"></i> <%= t('settings.homepageSaveMode') || 'Сохранить режим' %>
                         </button>
                     </form>
+                </div>
 
-                    <hr class="settings-divider">
-
-                    <form method="POST" action="/panel/settings/homepage/upload" enctype="multipart/form-data"
-                          style="margin-bottom: 12px;">
+                <div class="col-6">
+                    <form method="POST" action="/panel/settings/homepage/upload" enctype="multipart/form-data">
                         <label for="homepageFile" style="display: block; margin-bottom: 6px; font-weight: 500;">
                             <%= t('settings.homepageUpload') || 'Загрузить HTML файл' %>
                         </label>
@@ -154,19 +157,19 @@
                             <button type="submit" class="btn btn-primary btn-sm">
                                 <i class="ti ti-upload"></i> <%= t('common.upload') || 'Загрузить' %>
                             </button>
+                            <% if (hp.hasCustom) { %>
+                            <button type="button" class="btn btn-warning btn-sm"
+                                    onclick="if(confirm('<%= t('settings.homepageResetConfirm') || 'Удалить загруженную страницу и вернуться к дефолту?' %>')) document.getElementById('homepageResetForm').submit();">
+                                <i class="ti ti-trash"></i> <%= t('settings.homepageReset') || 'Сбросить' %>
+                            </button>
+                            <% } %>
                         </div>
                         <small class="hint" style="display: block; margin-top: 6px;">
                             <%= (t('settings.homepageUploadHint') || 'Максимум {kb} KB. После загрузки режим автоматически переключится на «Своя HTML».').replace('{kb}', hpMaxKB) %>
                         </small>
                     </form>
-
                     <% if (hp.hasCustom) { %>
-                    <form method="POST" action="/panel/settings/homepage/reset"
-                          onsubmit="return confirm('<%= t('settings.homepageResetConfirm') || 'Удалить загруженную страницу и вернуться к дефолту?' %>');">
-                        <button type="submit" class="btn btn-warning btn-sm">
-                            <i class="ti ti-trash"></i> <%= t('settings.homepageReset') || 'Сбросить на дефолт' %>
-                        </button>
-                    </form>
+                    <form id="homepageResetForm" method="POST" action="/panel/settings/homepage/reset" style="display: none;"></form>
                     <% } %>
                 </div>
             </div>
