@@ -77,6 +77,17 @@
                         <small class="hint" style="display: block; margin-top: 6px;">
                             <%= t('settings.hideOverloadedHint') %>
                         </small>
+
+                        <hr class="settings-divider">
+
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="loadBalancing.hideOffline"
+                                   <%= (settings?.loadBalancing?.hideOffline !== false) ? 'checked' : '' %>>
+                            <span><%= t('settings.hideOffline') %></span>
+                        </label>
+                        <small class="hint" style="display: block; margin-top: 6px;">
+                            <%= t('settings.hideOfflineHint') %>
+                        </small>
                     </div>
                 </div>
             </div>

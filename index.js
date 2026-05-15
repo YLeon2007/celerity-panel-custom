@@ -27,6 +27,7 @@ const statsService = require('./src/services/statsService');
 const HyUser = require('./src/models/hyUserModel');
 const HyNode = require('./src/models/hyNodeModel');
 const backupService = require('./src/services/backupService');
+const homepageService = require('./src/services/homepageService');
 
 const usersRoutes = require('./src/routes/users');
 const nodesRoutes = require('./src/routes/nodes');
@@ -414,9 +415,10 @@ if (config.API_DOCS_ENABLED) {
 
 app.use('/panel', panelRoutes);
 
-app.get('/', (req, res) => {
-    res.redirect('/panel');
-});
+// Public root: serves a configurable decoy/landing page (see homepageService).
+// Hot path is in-memory only; no DB/disk reads per request.
+app.get('/', (req, res) => homepageService.respond(req, res));
+app.head('/', (req, res) => homepageService.respond(req, res));
 
 // ==================== ERROR HANDLING ====================
 
@@ -495,6 +497,30 @@ async function startServer() {
             logger.info(`[Migration] Generated xrayUuid for ${usersWithoutUuid.length} existing users`);
         }
 
+        // Migration: backfill xray.tlsSource for legacy Xray nodes that were
+        // created before the TLS-source picker existed. Any TLS node without
+        // an explicit source defaults to 'panel' — matches the new default
+        // and keeps existing setups working without manual intervention.
+        try {
+            const tlsBackfill = await HyNode.updateMany(
+                {
+                    type: 'xray',
+                    'xray.security': 'tls',
+                    $or: [
+                        { 'xray.tlsSource': { $exists: false } },
+                        { 'xray.tlsSource': null },
+                        { 'xray.tlsSource': '' },
+                    ],
+                },
+                { $set: { 'xray.tlsSource': 'panel' } }
+            );
+            if (tlsBackfill?.modifiedCount > 0) {
+                logger.info(`[Migration] Backfilled xray.tlsSource='panel' on ${tlsBackfill.modifiedCount} legacy node(s)`);
+            }
+        } catch (migErr) {
+            logger.warn(`[Migration] Xray tlsSource backfill warning: ${migErr.message}`);
+        }
+
         // Migration: mark onboarding as completed for existing installations
         // Prevents the wizard from showing to users who already have nodes set up
         try {
@@ -522,6 +548,7 @@ async function startServer() {
         require('./src/models/userDeviceModel');
 
         await reloadSettings();
+        await homepageService.init();
         
         const PORT = process.env.PORT || 3000;
         const useCaddy = process.env.USE_CADDY === 'true';
@@ -828,6 +855,18 @@ function setupCronJobs() {
             await cascadeService.healthCheckAll();
         } catch (error) {
             logger.error(`[Cron] Cascade health check failed: ${error.message}`);
+        }
+    });
+
+    // Panel cert rotation watcher — every 5 minutes.
+    // Detects fresh LE cert on disk (Caddy/Greenlock) and re-pushes config.json
+    // to every Xray node that masquerades under the panel domain so the inline
+    // PEM stays in sync. No-op for setups without a panel domain.
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            await syncService.checkPanelCertRotation();
+        } catch (error) {
+            logger.error(`[Cron] Panel cert rotation watcher failed: ${error.message}`);
         }
     });
     

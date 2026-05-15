@@ -25,6 +25,8 @@ const {
     parseXrayFormFields,
     validateXrayFormFields,
     ensureExtraInboundRealityKeys,
+    resolveManualKeyPlaceholder,
+    sanitizeXrayForRender,
     parseBool,
     parseHysteriaFormFields,
     getHysteriaAclInlineState,
@@ -440,8 +442,13 @@ router.post('/nodes/preview-config', async (req, res) => {
 router.get('/nodes/:id', async (req, res) => {
     try {
         const CascadeLink = require('../../models/cascadeLinkModel');
+        // Pull manualKey explicitly (schema marks it select:false) so we can
+        // populate the manualKeySet flag in the rendered form. The actual
+        // PEM is then stripped via sanitizeXrayForRender before reaching EJS.
         const [node, groups, cascadeLinks, settings] = await Promise.all([
-            HyNode.findById(req.params.id).populate('groups', 'name color'),
+            HyNode.findById(req.params.id)
+                .select('+xray.manualKey')
+                .populate('groups', 'name color'),
             getActiveGroups(),
             CascadeLink.find({
                 $or: [{ portalNode: req.params.id }, { bridgeNode: req.params.id }],
@@ -468,10 +475,15 @@ router.get('/nodes/:id', async (req, res) => {
             }
         }
 
+        // Project node to a plain object whose xray sub-block has the secret
+        // PEM replaced by ***SET*** (or empty). Sibling fields are unchanged.
+        const renderNode = (typeof node.toObject === 'function') ? node.toObject() : { ...node };
+        renderNode.xray = sanitizeXrayForRender(node.xray);
+
         render(res, 'node-form', {
             title: `${res.locals.t('nodes.editNode')}: ${node.name}`,
             page: 'nodes',
-            node,
+            node: renderNode,
             nodeConfigPreview,
             groups,
             cascadeLinks: cascadeLinks || [],
@@ -488,7 +500,8 @@ router.get('/nodes/:id', async (req, res) => {
 router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
-        const existingNode = await HyNode.findById(nodeId).select('type xray');
+        // Full doc (not partial) — we .save() it below; +manualKey is select:false.
+        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey');
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }
@@ -538,15 +551,21 @@ router.post('/nodes/:id', async (req, res) => {
         }
 
         if (nodeType === 'xray') {
+            const existingXray = (existingNode.xray && typeof existingNode.xray.toObject === 'function')
+                ? existingNode.xray.toObject()
+                : (existingNode.xray || {});
+            // resolveManualKeyPlaceholder runs BEFORE the merge so the
+            // existing key is restored when the operator did not change it.
+            const parsedXray = resolveManualKeyPlaceholder(parseXrayFormFields(req.body), existingXray);
             updates.xray = {
-                ...((existingNode.xray && typeof existingNode.xray.toObject === 'function')
-                    ? existingNode.xray.toObject()
-                    : (existingNode.xray || {})),
-                ...parseXrayFormFields(req.body),
+                ...existingXray,
+                ...parsedXray,
             };
             // Validate using merged xray + the about-to-save node fields.
+            // Pass `domain` so manual TLS validation can check it.
             const portForValidate = parseInt(req.body.port, 10) || existingNode.port;
-            const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate });
+            const domainForValidate = String(req.body.domain || '').trim();
+            const xrayError = validateXrayFormFields(updates.xray, { port: portForValidate, domain: domainForValidate });
             if (xrayError) {
                 return res.redirect(`/panel/nodes/${nodeId}?error=${encodeURIComponent(xrayError)}`);
             }
@@ -579,9 +598,10 @@ router.post('/nodes/:id', async (req, res) => {
             updates['ssh.privateKey'] = cryptoService.encrypt(rawKey);
         }
 
-        await HyNode.findByIdAndUpdate(nodeId, { $set: updates });
+        // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
+        existingNode.set(updates);
+        await existingNode.save();
 
-        // Auto-push config to the node if any config-affecting field changed.
         syncService.schedulePush(nodeId, updates);
 
         // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)

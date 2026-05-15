@@ -46,6 +46,102 @@
                     </div>
                 </div>
 
+                <%# ─── TLS Source (only when security==='tls') ───
+                    Three strategies for provisioning the server certificate:
+                      • panel       — masquerade under PANEL_DOMAIN, inline LE cert from panel disk
+                      • manual      — operator pastes a custom domain (set in Network section) + PEM
+                      • self-signed — auto-generated on the node, requires allowInsecure on clients
+                %>
+                <% var _tlsSource = node?.xray?.tlsSource || 'panel'; %>
+                <% var _panelDomain = (typeof panelDomain === 'string' ? panelDomain : '') || ''; %>
+                <% var _hasManualKey = !!(node?.xray && (node.xray.manualKeySet === true || node.xray.manualKey)); %>
+                <% var _anyTls = node?.xray?.security === 'tls' || (node?.xray?.extraInbounds || []).some(function(i){ return i && i.security === 'tls'; }); %>
+                <div class="form-group xray-tls-config" id="xrayTlsConfig" style="<%= _anyTls ? '' : 'display:none' %>">
+                    <label class="block-label"><i class="ti ti-certificate"></i> <%= t('nodes.xrayTlsSourceLabel') %></label>
+                    <small class="hint" style="display:block;margin-bottom:8px;"><%= t('nodes.xrayTlsSourceScopeHint') %></small>
+                    <div class="radio-group" role="radiogroup" aria-label="<%= t('nodes.xrayTlsSourceLabel') %>">
+                        <label class="radio-row">
+                            <input type="radio" name="xray.tlsSource" value="panel" <%= _tlsSource === 'panel' ? 'checked' : '' %> onchange="updateXrayTlsSourceUI()">
+                            <span class="badge badge-success"><%= t('nodes.xrayTlsRecommended') %></span>
+                            <span class="radio-label">
+                                <strong><%= t('nodes.xrayTlsSourcePanel') %></strong>
+                                <small class="radio-hint"><%= t('nodes.xrayTlsSourcePanelHint') %></small>
+                            </span>
+                        </label>
+                        <label class="radio-row">
+                            <input type="radio" name="xray.tlsSource" value="manual" <%= _tlsSource === 'manual' ? 'checked' : '' %> onchange="updateXrayTlsSourceUI()">
+                            <span class="radio-label">
+                                <strong><%= t('nodes.xrayTlsSourceManual') %></strong>
+                                <small class="radio-hint"><%= t('nodes.xrayTlsSourceManualHint') %></small>
+                            </span>
+                        </label>
+                        <label class="radio-row">
+                            <input type="radio" name="xray.tlsSource" value="self-signed" <%= _tlsSource === 'self-signed' ? 'checked' : '' %> onchange="updateXrayTlsSourceUI()">
+                            <span class="badge badge-warning"><%= t('nodes.xrayTlsTesting') %></span>
+                            <span class="radio-label">
+                                <strong><%= t('nodes.xrayTlsSourceSelfSigned') %></strong>
+                                <small class="radio-hint"><%= t('nodes.xrayTlsSourceSelfSignedHint') %></small>
+                            </span>
+                        </label>
+                    </div>
+
+                    <%# Panel-domain info block %>
+                    <div class="tls-source-panel" id="xrayTlsPanelInfo" style="<%= _tlsSource === 'panel' ? '' : 'display:none' %>">
+                        <div class="info-card">
+                            <i class="ti ti-info-circle"></i>
+                            <div>
+                                <div><strong><%= t('nodes.xrayTlsEffectiveSni') %>:</strong> <code><%= _panelDomain || t('nodes.xrayTlsPanelDomainUnset') %></code></div>
+                                <small><%= t('nodes.xrayTlsPanelInfoLine') %></small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <%# Manual PEM block %>
+                    <div class="tls-source-manual" id="xrayTlsManualBlock" style="<%= _tlsSource === 'manual' ? '' : 'display:none' %>">
+                        <div class="info-card">
+                            <i class="ti ti-bulb"></i>
+                            <div>
+                                <small><%= t('nodes.xrayTlsManualDomainHint') %></small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="xrayManualCert"><%= t('nodes.xrayManualCertLabel') %></label>
+                            <textarea id="xrayManualCert" name="xray.manualCert" rows="6" class="code-textarea pem-textarea"
+                                      placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+                                      autocomplete="off" spellcheck="false"
+                                      aria-describedby="xrayManualCertStatus"
+                                      onblur="validateXrayPemField(this, 'cert')"
+                                      oninput="validateXrayPemField(this, 'cert')"><%= node?.xray?.manualCert || '' %></textarea>
+                            <small id="xrayManualCertStatus" class="pem-status" aria-live="polite"></small>
+                            <small><%= t('nodes.xrayManualCertHint') %></small>
+                        </div>
+                        <div class="form-group">
+                            <label for="xrayManualKey"><%= t('nodes.xrayManualKeyLabel') %></label>
+                            <textarea id="xrayManualKey" name="xray.manualKey" rows="6" class="code-textarea pem-textarea"
+                                      placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
+                                      autocomplete="off" spellcheck="false"
+                                      aria-describedby="xrayManualKeyStatus"
+                                      data-has-stored-key="<%= _hasManualKey ? '1' : '0' %>"
+                                      onfocus="onXrayManualKeyFocus(this)"
+                                      onblur="validateXrayPemField(this, 'key')"
+                                      oninput="validateXrayPemField(this, 'key')"><%= _hasManualKey ? '***SET***' : '' %></textarea>
+                            <small id="xrayManualKeyStatus" class="pem-status" aria-live="polite"></small>
+                            <small><%= _hasManualKey ? t('nodes.xrayManualKeyMaskedHint') : t('nodes.xrayManualKeyHint') %></small>
+                        </div>
+                    </div>
+
+                    <%# Self-signed warning block %>
+                    <div class="tls-source-selfsigned" id="xrayTlsSelfSignedInfo" style="<%= _tlsSource === 'self-signed' ? '' : 'display:none' %>">
+                        <div class="info-card info-card-warning">
+                            <i class="ti ti-alert-triangle"></i>
+                            <div>
+                                <strong><%= t('nodes.xrayTlsSelfSignedWarning') %></strong>
+                                <small><%= t('nodes.xrayTlsSelfSignedHint') %></small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <%# Flow — TCP only %>
                 <div class="form-group" id="xrayFlowGroup" style="<%= node?.xray?.transport && node.xray.transport !== 'tcp' ? 'display:none' : '' %>">
                     <label for="xrayFlow"><%= t('nodes.xrayFlow') %></label>
@@ -220,6 +316,7 @@
                             <option value="auto" <%= node?.xray?.xhttpMode === 'auto' || !node?.xray?.xhttpMode ? 'selected' : '' %>>Auto</option>
                             <option value="packet-up" <%= node?.xray?.xhttpMode === 'packet-up' ? 'selected' : '' %>>Packet Up</option>
                             <option value="stream-up" <%= node?.xray?.xhttpMode === 'stream-up' ? 'selected' : '' %>>Stream Up</option>
+                            <option value="stream-one" <%= node?.xray?.xhttpMode === 'stream-one' ? 'selected' : '' %>>Stream One</option>
                         </select>
                         <small><%= t('nodes.xrayXhttpModeHint') %></small>
                     </div>

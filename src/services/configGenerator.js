@@ -3,7 +3,154 @@
  */
 
 const yaml = require('yaml');
+const fs = require('fs');
+const path = require('path');
 const logger = require('../utils/logger');
+const appConfig = require('../../config');
+
+// ─── Panel TLS certificate inlining (Marzban-style) ──────────────────────────
+//
+// When a Xray node is configured with tlsSource==='panel', we read the panel's
+// LE certificate from disk on every config generation and inline the PEM blocks
+// as `certificate[]`/`key[]` arrays into `tlsSettings.certificates[0]`. This
+// keeps remote nodes free of any local cert files: the cert lives only on the
+// panel, gets shipped inside config.json over SSH, and is automatically rotated
+// whenever Caddy/Greenlock writes a new fullchain.
+//
+// We cache by mtime to avoid re-reading the file once per node when generating
+// configs for many nodes in the same sync cycle. The cache TTL is bounded so a
+// stalled mtime check (e.g. mounted FS oddity) cannot pin a stale value forever.
+const _panelCertCache = {
+    cert: null,
+    key: null,
+    mtimeMs: 0,
+    cachedAt: 0,
+    sourcePath: '',
+};
+const PANEL_CERT_CACHE_TTL_MS = 30_000;
+
+function _panelCertCandidates(domain) {
+    const safe = String(domain || '').trim();
+    if (!safe) return [];
+    return [
+        // Caddy (Docker/production)
+        {
+            cert: path.join('/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory', safe, `${safe}.crt`),
+            key: path.join('/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory', safe, `${safe}.key`),
+        },
+        // Greenlock (standalone dev)
+        {
+            cert: path.join(__dirname, '../../greenlock.d/live', safe, 'fullchain.pem'),
+            key: path.join(__dirname, '../../greenlock.d/live', safe, 'privkey.pem'),
+        },
+    ];
+}
+
+/**
+ * Convert a PEM-string into the array-of-lines shape Xray expects in
+ * `tlsSettings.certificates[].certificate` / `.key`. Strips empty lines and
+ * trailing whitespace; the result is a tight JSON array.
+ *
+ * @param {string} pem
+ * @returns {string[]}
+ */
+function parsePemBlock(pem) {
+    return String(pem || '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map(line => line.trimEnd())
+        .filter(line => line.length > 0);
+}
+
+/**
+ * Read panel certificate/key (Caddy or Greenlock) and return the PEM split
+ * into Xray inline arrays, with a small in-process cache keyed on mtime.
+ * Returns null when no cert is available — the caller decides the fallback.
+ *
+ * Performance: a single fs.statSync per call (microseconds). The PEM is only
+ * re-read from disk when the file's mtime changed since the last call, so
+ * generating configs for N nodes does at most one read per cert rotation.
+ *
+ * @returns {{ certificate: string[], key: string[], domain: string, mtimeMs: number } | null}
+ */
+function buildPanelInlineCertificate() {
+    const domain = appConfig?.PANEL_DOMAIN || '';
+    if (!domain) return null;
+
+    const candidates = _panelCertCandidates(domain);
+    let chosen = null;
+    let mtimeMs = 0;
+    for (const cand of candidates) {
+        try {
+            const certStat = fs.statSync(cand.cert);
+            const keyStat = fs.statSync(cand.key);
+            chosen = cand;
+            mtimeMs = Math.max(certStat.mtimeMs || 0, keyStat.mtimeMs || 0);
+            break;
+        } catch (_) {
+            // Try next candidate
+        }
+    }
+    if (!chosen) {
+        if (_panelCertCache.cert) {
+            // Cert source disappeared (mount glitch?). Surface a warning but
+            // do not return stale PEM — config without certs is safer.
+            logger.warn(`[configGenerator] Panel certificate path missing for ${domain}; cleared inline cache`);
+            _panelCertCache.cert = null;
+            _panelCertCache.key = null;
+            _panelCertCache.mtimeMs = 0;
+            _panelCertCache.cachedAt = 0;
+            _panelCertCache.sourcePath = '';
+        }
+        return null;
+    }
+
+    const now = Date.now();
+    const fresh = _panelCertCache.cert &&
+        _panelCertCache.sourcePath === chosen.cert &&
+        _panelCertCache.mtimeMs === mtimeMs &&
+        (now - _panelCertCache.cachedAt) < PANEL_CERT_CACHE_TTL_MS;
+    if (fresh) {
+        return {
+            certificate: _panelCertCache.cert,
+            key: _panelCertCache.key,
+            domain,
+            mtimeMs,
+        };
+    }
+
+    try {
+        const certPem = fs.readFileSync(chosen.cert, 'utf8');
+        const keyPem = fs.readFileSync(chosen.key, 'utf8');
+        const certificate = parsePemBlock(certPem);
+        const key = parsePemBlock(keyPem);
+        if (certificate.length === 0 || key.length === 0) {
+            logger.warn(`[configGenerator] Panel cert/key looks empty (${chosen.cert})`);
+            return null;
+        }
+        _panelCertCache.cert = certificate;
+        _panelCertCache.key = key;
+        _panelCertCache.mtimeMs = mtimeMs;
+        _panelCertCache.cachedAt = now;
+        _panelCertCache.sourcePath = chosen.cert;
+        return { certificate, key, domain, mtimeMs };
+    } catch (err) {
+        logger.error(`[configGenerator] Failed to read panel certificate at ${chosen.cert}: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * Forget the cached panel certificate. Called by the cert-rotation watcher
+ * after detecting a new mtime so the next config build performs a fresh read.
+ */
+function invalidatePanelCertCache() {
+    _panelCertCache.cert = null;
+    _panelCertCache.key = null;
+    _panelCertCache.mtimeMs = 0;
+    _panelCertCache.cachedAt = 0;
+    _panelCertCache.sourcePath = '';
+}
 
 /**
  * Parse a host:port string, handling IPv6 brackets (e.g. [::1]:8080).
@@ -427,17 +574,60 @@ function buildXrayStreamSettings(inbound, node = {}) {
             spiderX: inbound.realitySpiderX || '/',
         };
     } else if (security === 'tls') {
-        streamSettings.security = 'tls';
-        streamSettings.tlsSettings = {
-            serverName: node.domain || node.sni || '',
-            certificates: [{
+        // tlsSource lives on the node (not per-inbound) so extra inbounds inherit
+        // the same certificate strategy as the main one — matches Marzban's
+        // per-node provisioning model.
+        const tlsSource = (node?.xray?.tlsSource) || 'panel';
+        let certificates;
+        let serverName;
+        if (tlsSource === 'panel') {
+            const panelCert = buildPanelInlineCertificate();
+            serverName = appConfig?.PANEL_DOMAIN || node.domain || node.sni || '';
+            if (panelCert) {
+                certificates = [{
+                    ocspStapling: 3600,
+                    certificate: panelCert.certificate,
+                    key: panelCert.key,
+                }];
+            } else {
+                const reason = (appConfig?.PANEL_DOMAIN || '').trim()
+                    ? `panel certificate file unreadable for ${appConfig.PANEL_DOMAIN}`
+                    : 'PANEL_DOMAIN env var is not set';
+                const err = new Error(`PANEL_CERT_UNAVAILABLE: ${reason}`);
+                err.code = 'PANEL_CERT_UNAVAILABLE';
+                throw err;
+            }
+        } else if (tlsSource === 'manual') {
+            serverName = node.domain || node.sni || '';
+            const certificate = parsePemBlock(node?.xray?.manualCert);
+            const key = parsePemBlock(node?.xray?.manualKey);
+            if (certificate.length === 0 || key.length === 0) {
+                const err = new Error(`MANUAL_CERT_UNAVAILABLE: manual TLS PEM missing for node ${node?.name || node?.ip || ''}`);
+                err.code = 'MANUAL_CERT_UNAVAILABLE';
+                throw err;
+            }
+            certificates = [{
+                ocspStapling: 3600,
+                certificate,
+                key,
+            }];
+        } else {
+            // self-signed: cert lives as files on the remote node (nodeSetup
+            // generates them via openssl on install).
+            serverName = node.domain || node.sni || '';
+            certificates = [{
                 certificateFile: node.paths?.cert || '/usr/local/etc/xray/cert.pem',
                 keyFile: node.paths?.key || '/usr/local/etc/xray/key.pem',
-            }],
-        };
-        if (inbound.alpn && inbound.alpn.length > 0) {
-            streamSettings.tlsSettings.alpn = inbound.alpn;
+            }];
         }
+        streamSettings.security = 'tls';
+        streamSettings.tlsSettings = {
+            serverName,
+            minVersion: '1.2',
+            certificates,
+        };
+        const alpn = (inbound.alpn && inbound.alpn.length > 0) ? inbound.alpn : ['h2', 'http/1.1'];
+        streamSettings.tlsSettings.alpn = alpn;
     } else {
         streamSettings.security = 'none';
     }
@@ -1080,7 +1270,43 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
     };
 
     if (security === 'tls') {
-        stream.tlsSettings = { allowInsecure: true };
+        // Inline panel cert when tlsServerName matches PANEL_DOMAIN; otherwise
+        // fall back to file paths and keep allowInsecure on the client side.
+        const panelDomain = (appConfig?.PANEL_DOMAIN || '').trim();
+        const wantPanelCert = !!panelDomain && link.tlsServerName === panelDomain;
+
+        if (opts.server) {
+            let certificates;
+            if (wantPanelCert) {
+                const panelCert = buildPanelInlineCertificate();
+                if (panelCert) {
+                    certificates = [{
+                        ocspStapling: 3600,
+                        certificate: panelCert.certificate,
+                        key: panelCert.key,
+                    }];
+                } else {
+                    const err = new Error(`PANEL_CERT_UNAVAILABLE: cascade link "${link?.name || link?._id}" expects panel cert for ${panelDomain} but it is not readable on disk`);
+                    err.code = 'PANEL_CERT_UNAVAILABLE';
+                    throw err;
+                }
+            } else {
+                logger.warn(`[configGenerator] Cascade TLS link "${link?.name || link?._id}" uses tlsServerName="${link.tlsServerName || ''}" — using file paths; ensure cert/key exist on the bridge node`);
+                certificates = [{
+                    certificateFile: '/usr/local/etc/xray/cert.pem',
+                    keyFile: '/usr/local/etc/xray/key.pem',
+                }];
+            }
+            stream.tlsSettings = {
+                serverName: link.tlsServerName || panelDomain || '',
+                minVersion: '1.2',
+                certificates,
+            };
+        } else {
+            stream.tlsSettings = {};
+            if (link.tlsServerName) stream.tlsSettings.serverName = link.tlsServerName;
+            if (!wantPanelCert) stream.tlsSettings.allowInsecure = true;
+        }
     } else if (security === 'reality') {
         if (opts.server) {
             stream.realitySettings = {
@@ -1424,4 +1650,7 @@ module.exports = {
     generateForwardHopConfig,
     applyForwardHopInbound,
     ensurePrivateIpBlock,
+    parsePemBlock,
+    buildPanelInlineCertificate,
+    invalidatePanelCertCache,
 };

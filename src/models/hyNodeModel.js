@@ -140,7 +140,7 @@ const xrayExtraInboundSchema = new mongoose.Schema({
 
     xhttpPath: { type: String, default: '/' },
     xhttpHost: { type: String, default: '' },
-    xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up'], default: 'auto' },
+    xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up', 'stream-one'], default: 'auto' },
 }, { _id: false });
 
 const xrayConfigSchema = new mongoose.Schema({
@@ -174,7 +174,23 @@ const xrayConfigSchema = new mongoose.Schema({
     // xhttp (splithttp) specific
     xhttpPath: { type: String, default: '/' },
     xhttpHost: { type: String, default: '' },
-    xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up'], default: 'auto' },
+    xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up', 'stream-one'], default: 'auto' },
+
+    // TLS certificate provisioning strategy (only relevant when security==='tls'):
+    //   panel       — masquerade under PANEL_DOMAIN; LE cert read from panel disk
+    //                 (Caddy/Greenlock) and inlined into the node's config.json.
+    //                 Requires no cert files on the remote node.
+    //   manual      — operator pastes a custom domain (node.domain) plus full PEM
+    //                 cert + private key in the form; PEM is inlined into config.json.
+    //   self-signed — nodeSetup generates a self-signed cert on the node; client
+    //                 must connect with allowInsecure=true (testing only).
+    tlsSource: { type: String, enum: ['panel', 'manual', 'self-signed'], default: 'panel' },
+    // Public PEM (full chain) for tlsSource==='manual'. Stored as-is; safe to return.
+    manualCert: { type: String, default: '' },
+    // Private key PEM for tlsSource==='manual'. select:false → never returned by
+    // .find()/.findOne() unless explicitly selected. API responses must use a
+    // ***SET*** placeholder when surfacing the field to the form (see routes).
+    manualKey: { type: String, default: '', select: false },
 
     // gRPC API port for user management (local, not exposed)
     apiPort: { type: Number, default: 61000 },

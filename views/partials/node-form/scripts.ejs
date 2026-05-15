@@ -539,6 +539,9 @@ function switchProto(proto) {
         labelHysteria.classList.remove('active');
         hysteriaOnlyEls.forEach(el => el.style.display = 'none');
         onCascadeRoleChange();
+        // Domain group is shared (no longer .hysteria-only). Its visibility
+        // depends on the current Xray TLS source — defer to updateXrayTlsSourceUI.
+        updateXrayTlsSourceUI();
     } else {
         xraySection.style.display = 'none';
         if (cascadeSection) cascadeSection.style.display = 'none';
@@ -554,6 +557,13 @@ function switchProto(proto) {
         toggleQuicFields();
         toggleResolverFields();
         toggleAclFields();
+        // Restore Hysteria-default visibility for the domain group.
+        const domainGroup = document.getElementById('domainGroup');
+        if (domainGroup) domainGroup.style.display = '';
+        const domainHintHy = document.getElementById('domainHintHysteria');
+        const domainHintXr = document.getElementById('domainHintXrayManual');
+        if (domainHintHy) domainHintHy.style.display = '';
+        if (domainHintXr) domainHintXr.style.display = 'none';
     }
     checkXrayPortConflict();
 }
@@ -594,10 +604,109 @@ function updateXrayTransportUI() {
     if (flowGroup) flowGroup.style.display = transport === 'tcp' ? '' : 'none';
 }
 
+// True if main or any extra inbound uses TLS — drives #xrayTlsConfig visibility.
+function _anyXrayTlsInboundActive() {
+    const main = document.getElementById('xraySecurity')?.value || '';
+    if (main === 'tls') return true;
+    const extras = document.querySelectorAll('select[name="xray_extra_security"]');
+    for (const el of extras) {
+        if (el.value === 'tls') return true;
+    }
+    return false;
+}
+
 function updateXraySecurityUI() {
     const security = document.getElementById('xraySecurity').value;
     document.getElementById('realityFields').style.display = security === 'reality' ? '' : 'none';
     document.getElementById('alpnGroup').style.display = security === 'tls' ? '' : 'none';
+    const tlsConfig = document.getElementById('xrayTlsConfig');
+    if (tlsConfig) tlsConfig.style.display = _anyXrayTlsInboundActive() ? '' : 'none';
+    updateXrayTlsSourceUI();
+}
+
+// Picks one of three TLS-source sub-blocks based on the radio selection,
+// and toggles the shared #domainGroup in the network section so that
+// tlsSource==='manual' makes the operator domain field visible.
+function updateXrayTlsSourceUI() {
+    const proto = document.querySelector('input[name="type"]:checked')?.value || 'hysteria';
+    const checked = document.querySelector('input[name="xray.tlsSource"]:checked');
+    const source = checked ? checked.value : 'panel';
+    const panelInfo = document.getElementById('xrayTlsPanelInfo');
+    const manualBlock = document.getElementById('xrayTlsManualBlock');
+    const selfSignedInfo = document.getElementById('xrayTlsSelfSignedInfo');
+    if (panelInfo) panelInfo.style.display = source === 'panel' ? '' : 'none';
+    if (manualBlock) manualBlock.style.display = source === 'manual' ? '' : 'none';
+    if (selfSignedInfo) selfSignedInfo.style.display = source === 'self-signed' ? '' : 'none';
+
+    // Domain visibility: hysteria always; xray only when manual TLS source.
+    const domainGroup = document.getElementById('domainGroup');
+    const domainHintHy = document.getElementById('domainHintHysteria');
+    const domainHintXr = document.getElementById('domainHintXrayManual');
+    if (domainGroup) {
+        const showForXrayManual = (proto === 'xray' && _anyXrayTlsInboundActive() && source === 'manual');
+        const showForHysteria = (proto !== 'xray');
+        domainGroup.style.display = (showForXrayManual || showForHysteria) ? '' : 'none';
+        if (domainHintHy) domainHintHy.style.display = showForHysteria ? '' : 'none';
+        if (domainHintXr) domainHintXr.style.display = showForXrayManual ? '' : 'none';
+    }
+}
+
+// Lightweight client-side PEM check; authoritative validation happens
+// server-side. Backreference forces matching BEGIN/END prefixes.
+const _PEM_CERT_RE = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/;
+const _PEM_KEY_RE = /-----BEGIN (RSA |EC |ECDSA |)PRIVATE KEY-----[\s\S]+?-----END \1PRIVATE KEY-----/;
+const _MANUAL_KEY_PLACEHOLDER = '***SET***';
+// Localized labels are injected at render time so the inline status string
+// matches the operator's language without round-tripping through any global
+// translation cache (which is server-only in this template).
+const _PEM_LABELS = {
+    valid:   <%- JSON.stringify(t('nodes.xrayPemValid'))   %>,
+    invalid: <%- JSON.stringify(t('nodes.xrayPemInvalid')) %>,
+    stored:  <%- JSON.stringify(t('nodes.xrayPemStored'))  %>,
+};
+
+function validateXrayPemField(textarea, kind) {
+    if (!textarea) return;
+    const status = document.getElementById(textarea.getAttribute('aria-describedby'));
+    if (!status) return;
+    const value = (textarea.value || '').trim();
+    if (!value) {
+        status.textContent = '';
+        status.classList.remove('is-valid', 'is-invalid');
+        return;
+    }
+    if (kind === 'key' && value === _MANUAL_KEY_PLACEHOLDER) {
+        status.textContent = _PEM_LABELS.stored;
+        status.classList.remove('is-invalid');
+        status.classList.add('is-valid');
+        return;
+    }
+    const ok = (kind === 'cert' ? _PEM_CERT_RE : _PEM_KEY_RE).test(value);
+    status.textContent = ok ? _PEM_LABELS.valid : _PEM_LABELS.invalid;
+    status.classList.toggle('is-valid', ok);
+    status.classList.toggle('is-invalid', !ok);
+}
+
+// When the operator clicks into the masked manualKey textarea the first time,
+// clear the ***SET*** placeholder so they can paste a replacement. If they
+// blur without entering anything, restore the placeholder so the form submit
+// continues to mean "keep the stored key".
+function onXrayManualKeyFocus(textarea) {
+    if (!textarea) return;
+    const stored = textarea.getAttribute('data-has-stored-key') === '1';
+    if (!stored) return;
+    if ((textarea.value || '').trim() === _MANUAL_KEY_PLACEHOLDER) {
+        textarea.value = '';
+        // One-shot restore handler — re-attach a blur listener that runs once.
+        const restore = function() {
+            if ((textarea.value || '').trim() === '') {
+                textarea.value = _MANUAL_KEY_PLACEHOLDER;
+                validateXrayPemField(textarea, 'key');
+            }
+            textarea.removeEventListener('blur', restore);
+        };
+        textarea.addEventListener('blur', restore);
+    }
 }
 
 // ==================== Xray extra inbounds ====================
@@ -674,6 +783,7 @@ function addExtraInbound() {
     root.open = true;
     container.appendChild(node);
     checkXrayPortConflict();
+    if (typeof updateXraySecurityUI === 'function') updateXraySecurityUI();
 }
 
 function removeExtraInbound(btn) {
@@ -682,6 +792,7 @@ function removeExtraInbound(btn) {
     if (!confirm(i18n.xrayRemoveInboundConfirm || 'Remove this inbound?')) return;
     card.remove();
     checkXrayPortConflict();
+    if (typeof updateXraySecurityUI === 'function') updateXraySecurityUI();
 }
 
 function _findExtraCard(el) {
@@ -710,6 +821,7 @@ function updateExtraXraySecurityUI(selectEl) {
     const alpn = card.querySelector('.extra-alpn-group');
     if (reality) reality.style.display = security === 'reality' ? '' : 'none';
     if (alpn) alpn.style.display = security === 'tls' ? '' : 'none';
+    if (typeof updateXraySecurityUI === 'function') updateXraySecurityUI();
 }
 
 // Live-update the collapsed summary of an inbound card so admins can see
@@ -1196,6 +1308,12 @@ async function generateXrayKeys() {
     if (proto === 'xray') {
         updateXrayTransportUI();
         updateXraySecurityUI();
+        // Run an initial PEM validation pass for any pre-filled textarea so
+        // the operator sees the inline status icon without having to focus.
+        const certTa = document.getElementById('xrayManualCert');
+        const keyTa = document.getElementById('xrayManualKey');
+        if (certTa) validateXrayPemField(certTa, 'cert');
+        if (keyTa) validateXrayPemField(keyTa, 'key');
     }
 
     // Live duplicate-port / duplicate-tag detection across extra inbounds.

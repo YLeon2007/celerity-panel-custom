@@ -956,8 +956,24 @@ async function setupXrayNode(node, options = {}) {
         log('Generating Xray config...');
         const configGenerator = require('./configGenerator');
         const syncService = require('./syncService');
+        // Lazy-load manualKey for nodes using tlsSource==='manual' since the
+        // private key is select:false at the schema layer.
+        if (typeof syncService.ensureManualKeyLoaded === 'function') {
+            await syncService.ensureManualKeyLoaded(node);
+        }
         const users = await syncService._getUsersForNode(node);
-        const configContent = configGenerator.generateXrayConfig(node, users);
+        let configContent;
+        try {
+            configContent = configGenerator.generateXrayConfig(node, users);
+        } catch (genErr) {
+            if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
+                const human = genErr.code === 'PANEL_CERT_UNAVAILABLE'
+                    ? `Panel certificate is not available on disk yet — issue/renew the panel cert (${config.PANEL_DOMAIN || '<PANEL_DOMAIN unset>'}) and re-run install.`
+                    : 'Manual TLS PEM is missing — paste both certificate and private key in the node form before installing.';
+                throw new Error(human);
+            }
+            throw genErr;
+        }
         const configPath = '/usr/local/etc/xray/config.json';
 
         await uploadFile(conn, configContent, configPath);
@@ -965,6 +981,46 @@ async function setupXrayNode(node, options = {}) {
         logs.push('--- Config preview ---');
         logs.push(configContent.substring(0, 500) + (configContent.length > 500 ? '\n...' : ''));
         logs.push('--- End config preview ---');
+
+        // Self-signed TLS: openssl is only invoked when explicitly requested.
+        // For tlsSource=panel/manual the certificate is inlined into config.json
+        // by configGenerator and never written to disk on the remote node.
+        if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'self-signed') {
+            log('Generating self-signed TLS certificate (testing only)...');
+            // Strip shell metacharacters from CN (node.sni is admin-only but
+            // not strictly validated) and cap at the X.509 64-char CN limit.
+            const rawCn = String(node.domain || node.sni || node.ip || 'xray');
+            const cn = (rawCn.replace(/[^A-Za-z0-9.\-:]/g, '').slice(0, 64)) || 'xray';
+            const certResult = await execSSH(conn, `
+mkdir -p /usr/local/etc/xray
+if [ ! -f /usr/local/etc/xray/cert.pem ] || [ ! -s /usr/local/etc/xray/cert.pem ] \\
+   || [ ! -f /usr/local/etc/xray/key.pem ] || [ ! -s /usr/local/etc/xray/key.pem ]; then
+    if openssl ecparam -name prime256v1 -genkey -noout -out /usr/local/etc/xray/key.pem 2>/dev/null; then
+        openssl req -x509 -new -key /usr/local/etc/xray/key.pem \\
+            -out /usr/local/etc/xray/cert.pem \\
+            -subj "/CN=${cn}" -days 36500 2>&1 || true
+    fi
+    if [ ! -s /usr/local/etc/xray/cert.pem ]; then
+        # Fallback to RSA for ancient OpenSSL builds without prime256v1
+        openssl req -x509 -nodes -newkey rsa:2048 \\
+            -keyout /usr/local/etc/xray/key.pem \\
+            -out /usr/local/etc/xray/cert.pem \\
+            -subj "/CN=${cn}" -days 36500 2>&1 || true
+    fi
+    chmod 600 /usr/local/etc/xray/key.pem
+    chmod 644 /usr/local/etc/xray/cert.pem
+    echo "OK: Self-signed certificate generated for CN=${cn}"
+else
+    echo "Skipped: certificate already exists"
+fi
+`);
+            logs.push(certResult.output);
+            if (!certResult.success) {
+                log(`Self-signed cert generation warning: ${certResult.error}`);
+            }
+        } else if (xrayCfg.security === 'tls') {
+            log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
+        }
 
         // Collect all client-facing ports: main inbound + extra inbounds.
         // apiPort is local-only (127.0.0.1) and does not need a firewall rule.

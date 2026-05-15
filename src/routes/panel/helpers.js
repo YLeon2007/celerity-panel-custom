@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const ejs = require('ejs');
 const { Client: SSHClient } = require('ssh2');
 
@@ -77,11 +78,22 @@ function connectNodeSSH(node) {
 // stored config strictly within the schema enum (defense-in-depth).
 const XRAY_TRANSPORT_VALUES = ['tcp', 'ws', 'grpc', 'xhttp'];
 const XRAY_SECURITY_VALUES = ['reality', 'tls', 'none'];
-const XRAY_XHTTP_MODE_VALUES = ['auto', 'packet-up', 'stream-up'];
+const XRAY_XHTTP_MODE_VALUES = ['auto', 'packet-up', 'stream-up', 'stream-one'];
+const XRAY_TLS_SOURCE_VALUES = ['panel', 'manual', 'self-signed'];
 const XRAY_FINGERPRINT_VALUES = [
     'chrome', 'firefox', 'safari', 'ios', 'android',
     'edge', 'random', 'randomized',
 ];
+
+// Sentinel value rendered into the manualKey textarea when an existing key is
+// already stored in the database, so the operator can edit other fields without
+// the actual private key reaching the browser. When the form is submitted with
+// this exact value, the route must keep the previously stored manualKey.
+const MANUAL_KEY_PLACEHOLDER = '***SET***';
+
+// Loose hostname check used for tlsSource==='manual' — accepts standard DNS
+// labels, dotted FQDNs and lowercase ASCII. Avoids ReDoS by limiting length.
+const HOSTNAME_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i;
 
 function _pickEnum(value, allowed, fallback) {
     return allowed.includes(value) ? value : fallback;
@@ -228,6 +240,23 @@ function parseXrayFormFields(body) {
     }
     if (body['xray.apiPort']) xray.apiPort = parseInt(body['xray.apiPort']) || 61000;
 
+    // TLS source / manual cert+key (only meaningful when security==='tls').
+    // Parsed unconditionally so toggling security back to tls preserves prior
+    // operator input, and dropped server-side via validation when irrelevant.
+    if (body['xray.tlsSource']) {
+        xray.tlsSource = _pickEnum(body['xray.tlsSource'], XRAY_TLS_SOURCE_VALUES, 'panel');
+    }
+    if (body['xray.manualCert'] !== undefined) {
+        // Normalize CRLF, drop a trailing newline; keep PEM block as-is.
+        xray.manualCert = String(body['xray.manualCert']).replace(/\r\n?/g, '\n').trim();
+    }
+    if (body['xray.manualKey'] !== undefined) {
+        // Submission may contain MANUAL_KEY_PLACEHOLDER when the operator did
+        // not retype the key. The route layer is responsible for replacing
+        // this sentinel with the previously stored value before persisting.
+        xray.manualKey = String(body['xray.manualKey']).replace(/\r\n?/g, '\n').trim();
+    }
+
     // Always parse extra inbounds — pass [] explicitly when none submitted so
     // the route can persist a "delete-all" intent. Callers that do not want to
     // touch extras can just delete the field from the result.
@@ -253,6 +282,67 @@ function parseXrayFormFields(body) {
  * @returns {string|null}
  */
 function validateXrayFormFields(xray, node) {
+    // TLS-source-specific validation is independent of extra inbounds, run
+    // it first so the early-return below does not mask manual-PEM mistakes.
+    const tlsSecurity = (xray?.security === 'tls');
+    if (tlsSecurity && xray?.tlsSource === 'manual') {
+        const domain = String(node?.domain || '').trim().toLowerCase();
+        if (!domain) {
+            return 'Manual TLS requires a domain — fill in the Domain field in the Network section.';
+        }
+        if (!HOSTNAME_RE.test(domain)) {
+            return 'Manual TLS: domain looks invalid (expected an FQDN like example.com).';
+        }
+        const certPem = String(xray.manualCert || '');
+        const keyPem = String(xray.manualKey || '');
+        if (!certPem || !/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.test(certPem)) {
+            return 'Manual TLS: certificate PEM is missing or malformed (expected -----BEGIN CERTIFICATE----- block).';
+        }
+        // The key is allowed to be the placeholder during edits — the route
+        // restores the previous DB value before validation runs in that case.
+        // Backreference forces matching prefixes between BEGIN and END markers.
+        if (!keyPem || keyPem === MANUAL_KEY_PLACEHOLDER ||
+            !/-----BEGIN (RSA |EC |ECDSA |)PRIVATE KEY-----[\s\S]+?-----END \1PRIVATE KEY-----/.test(keyPem)) {
+            return 'Manual TLS: private key PEM is missing or malformed.';
+        }
+        // Authoritative cert/key match check using node:crypto. Wrap in
+        // try/catch — never let a malformed PEM crash the request thread.
+        try {
+            // eslint-disable-next-line no-new
+            new crypto.X509Certificate(certPem);
+        } catch (err) {
+            // Do NOT surface stack/raw err.message verbatim (may include PEM
+            // fragments). Log the digest for debugging instead.
+            const digest = crypto.createHash('sha256').update(certPem).digest('hex').slice(0, 8);
+            logger.warn(`[validateXrayFormFields] Invalid certificate PEM (sha256=${digest}): ${err.code || 'parse error'}`);
+            return 'Manual TLS: certificate PEM could not be parsed.';
+        }
+        try {
+            const keyObj = crypto.createPrivateKey(keyPem);
+            const cert = new crypto.X509Certificate(certPem);
+            // Prefer cert.checkPrivateKey (Node ≥18.7); fall back to comparing
+            // the SubjectPublicKeyInfo DER of cert.publicKey vs the public key
+            // derived from keyObj.
+            let matches;
+            if (typeof cert.checkPrivateKey === 'function') {
+                matches = cert.checkPrivateKey(keyObj);
+            } else {
+                const certPubDer = cert.publicKey.export({ type: 'spki', format: 'der' });
+                const derivedPubDer = crypto.createPublicKey(keyObj).export({ type: 'spki', format: 'der' });
+                matches = Buffer.isBuffer(certPubDer)
+                    && Buffer.isBuffer(derivedPubDer)
+                    && certPubDer.equals(derivedPubDer);
+            }
+            if (!matches) {
+                return 'Manual TLS: certificate and private key do not match.';
+            }
+        } catch (err) {
+            const digest = crypto.createHash('sha256').update(keyPem).digest('hex').slice(0, 8);
+            logger.warn(`[validateXrayFormFields] Invalid private key PEM (sha256=${digest}): ${err.code || 'parse error'}`);
+            return 'Manual TLS: private key PEM could not be parsed.';
+        }
+    }
+
     if (!xray || !Array.isArray(xray.extraInbounds) || xray.extraInbounds.length === 0) {
         return null;
     }
@@ -304,6 +394,48 @@ function validateXrayFormFields(xray, node) {
     }
 
     return null;
+}
+
+/**
+ * Replace the manualKey sentinel with the previously stored private key
+ * before validation/persist. Operators editing an existing node see the
+ * placeholder ***SET*** in the textarea instead of the real PEM, so the key
+ * never round-trips through the browser. When they hit Save without changing
+ * the field, the placeholder lands here and we restore the prior value.
+ *
+ * Pure function: returns a new xray object, never mutates inputs.
+ *
+ * @param {Object} parsedXray  - Result of parseXrayFormFields() (caller's pick)
+ * @param {Object} existingXray - Current xray subdoc fetched WITH manualKey
+ * @returns {Object} parsedXray with manualKey resolved
+ */
+function resolveManualKeyPlaceholder(parsedXray, existingXray) {
+    if (!parsedXray) return parsedXray;
+    if (parsedXray.manualKey === MANUAL_KEY_PLACEHOLDER) {
+        return { ...parsedXray, manualKey: (existingXray && existingXray.manualKey) || '' };
+    }
+    return parsedXray;
+}
+
+/**
+ * Strip secret material from an xray object before sending it to the browser
+ * (form render). Returns a deep-ish copy — leaves nested arrays/objects alone
+ * since none of the other fields are sensitive.
+ *
+ * @param {Object|null|undefined} xray - Mongoose subdoc or plain object
+ * @returns {Object|null}
+ */
+function sanitizeXrayForRender(xray) {
+    if (!xray) return xray;
+    const plain = (typeof xray.toObject === 'function') ? xray.toObject() : { ...xray };
+    if (plain.manualKey) {
+        plain.manualKeySet = true;
+        plain.manualKey = MANUAL_KEY_PLACEHOLDER;
+    } else {
+        plain.manualKeySet = false;
+        plain.manualKey = '';
+    }
+    return plain;
 }
 
 /**
@@ -689,7 +821,8 @@ const checkIpWhitelist = (req, res, next) => {
         : (req.ip || req.connection.remoteAddress || '');
     if (!isIpAllowed(clientIp, whitelist)) {
         logger.warn(`[Panel] Access denied for IP: ${clientIp}`);
-        return res.status(403).send('Access denied. Your IP is not whitelisted.');
+        // Generic response — do not leak that an IP whitelist exists.
+        return res.status(403).type('text/plain').send('Forbidden');
     }
     next();
 };
@@ -1011,6 +1144,11 @@ module.exports = {
     parseExtraInbounds,
     validateXrayFormFields,
     ensureExtraInboundRealityKeys,
+    resolveManualKeyPlaceholder,
+    sanitizeXrayForRender,
+    MANUAL_KEY_PLACEHOLDER,
+    XRAY_TLS_SOURCE_VALUES,
+    XRAY_XHTTP_MODE_VALUES,
     parseBool,
     parseHeaderMap,
     parseHysteriaFormFields,

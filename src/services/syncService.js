@@ -59,6 +59,167 @@ function hasConfigRelevantUpdates(updates) {
     });
 }
 
+/**
+ * The manualKey field is select:false at the schema level. When sync code
+ * receives a node loaded by another caller (panel route, scheduled job),
+ * the private key is therefore absent. For nodes using tlsSource==='manual'
+ * we must lazy-load it before generating config — without it the inlined
+ * tlsSettings.certificates[0].key would be empty and Xray would refuse to
+ * start with a TLS handshake error.
+ *
+ * Mutates `node.xray.manualKey` in place when needed; otherwise no-op.
+ *
+ * @param {Object} node - HyNode document or plain object
+ */
+async function ensureManualKeyLoaded(node) {
+    const xray = node?.xray;
+    if (!xray) return;
+    if (xray.tlsSource !== 'manual') return;
+    if (xray.manualKey && String(xray.manualKey).trim().length > 0) return;
+    try {
+        const fresh = await HyNode.findById(node._id).select('+xray.manualKey').lean();
+        const key = fresh?.xray?.manualKey || '';
+        if (key) {
+            // node.xray may be a Mongoose subdoc — assign directly.
+            xray.manualKey = key;
+        }
+    } catch (err) {
+        logger.warn(`[Sync] Failed to lazy-load manualKey for node ${node.name || node._id}: ${err.message}`);
+    }
+}
+
+// ─── Panel certificate rotation watcher ──────────────────────────────────────
+//
+// When Caddy/Greenlock renews the panel's LE certificate the on-disk file
+// changes. Xray nodes that masquerade under the panel domain
+// (xray.tlsSource === 'panel') need to receive an updated config.json with the
+// new inline PEM, otherwise their TLS cert grows stale within ~24h of expiry.
+//
+// Poll cert mtime on cron; on change, invalidate cache and re-push to all
+// panel-source nodes. mtime advances only when every push succeeds; failed
+// nodes are retried with exponential backoff (capped) on subsequent ticks.
+let _lastPanelCertMtime = null;
+const _failedNodeBackoff = new Map(); // nodeId -> { attempts, nextAttemptAt }
+const _MAX_RETRY_ATTEMPTS = 6;
+const _BACKOFF_BASE_MS = 5 * 60 * 1000;
+
+async function checkPanelCertRotation(syncInstance) {
+    const fs = require('fs');
+    const path = require('path');
+    const domain = (config?.PANEL_DOMAIN || '').trim();
+    if (!domain) return;
+    const candidates = [
+        path.join('/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory', domain, `${domain}.crt`),
+        path.join(__dirname, '../../greenlock.d/live', domain, 'fullchain.pem'),
+    ];
+    let currentMtime = 0;
+    let foundPath = '';
+    for (const candidate of candidates) {
+        try {
+            const stat = fs.statSync(candidate);
+            currentMtime = stat.mtimeMs;
+            foundPath = candidate;
+            break;
+        } catch (_) { /* try next */ }
+    }
+    if (!foundPath) return;
+
+    if (_lastPanelCertMtime === null) {
+        _lastPanelCertMtime = currentMtime;
+        return;
+    }
+
+    // Fresh cert → full sweep; same mtime + pending retries → retry-only sweep.
+    const certIsFresh = currentMtime > _lastPanelCertMtime;
+    const hasPendingRetries = _failedNodeBackoff.size > 0;
+    if (!certIsFresh && !hasPendingRetries) return;
+
+    if (certIsFresh) {
+        logger.info(`[CertWatch] Panel certificate mtime changed (${foundPath}), pushing config to panel-source Xray nodes`);
+        try {
+            const configGen = require('./configGenerator');
+            if (typeof configGen.invalidatePanelCertCache === 'function') {
+                configGen.invalidatePanelCertCache();
+            }
+        } catch (_) { /* configGen may not be loaded yet at first invocation */ }
+    } else {
+        logger.info(`[CertWatch] Retrying ${_failedNodeBackoff.size} previously-failed cert push(es)`);
+    }
+
+    let nodes;
+    try {
+        nodes = await HyNode.find({
+            type: 'xray',
+            active: true,
+            'xray.security': 'tls',
+            'xray.tlsSource': 'panel',
+        });
+    } catch (err) {
+        logger.error(`[CertWatch] Failed to list panel-source nodes: ${err.message}`);
+        return;
+    }
+    if (!nodes || nodes.length === 0) {
+        logger.info('[CertWatch] No panel-source Xray nodes to update');
+        if (certIsFresh) _lastPanelCertMtime = currentMtime;
+        _failedNodeBackoff.clear();
+        return;
+    }
+
+    const now = Date.now();
+    let targets;
+    if (certIsFresh) {
+        _failedNodeBackoff.clear();
+        targets = nodes;
+    } else {
+        targets = nodes.filter(n => {
+            const entry = _failedNodeBackoff.get(String(n._id));
+            return entry && entry.nextAttemptAt <= now;
+        });
+        if (targets.length === 0) return;
+    }
+
+    const CONCURRENCY = 4;
+    let cursor = 0;
+    const total = targets.length;
+    let failures = 0;
+    const stillPending = new Set();
+    const worker = async () => {
+        while (cursor < total) {
+            const idx = cursor++;
+            const node = targets[idx];
+            const id = String(node._id);
+            try {
+                await syncInstance.updateXrayNodeConfig(node);
+                _failedNodeBackoff.delete(id);
+                logger.info(`[CertWatch] Pushed renewed cert to ${node.name} (${node.ip})`);
+            } catch (err) {
+                failures++;
+                const prev = _failedNodeBackoff.get(id) || { attempts: 0, nextAttemptAt: 0 };
+                const attempts = prev.attempts + 1;
+                const delay = _BACKOFF_BASE_MS * Math.min(16, Math.pow(2, Math.max(0, attempts - 1)));
+                _failedNodeBackoff.set(id, { attempts, nextAttemptAt: now + delay });
+                stillPending.add(id);
+                if (attempts >= _MAX_RETRY_ATTEMPTS) {
+                    logger.error(`[CertWatch] Push failed for ${node.name} (${node.ip}) [attempt ${attempts}, giving up until next rotation]: ${err.message}`);
+                } else {
+                    logger.warn(`[CertWatch] Push failed for ${node.name} (${node.ip}) [attempt ${attempts}, retry in ${Math.round(delay / 1000)}s]: ${err.message}`);
+                }
+            }
+        }
+    };
+    const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, () => worker());
+    await Promise.all(workers);
+
+    // Advance mtime only on a fully clean sweep so the next tick re-enters
+    // when any node still has pending failures.
+    if (failures === 0) {
+        _lastPanelCertMtime = currentMtime;
+        logger.info(`[CertWatch] Panel cert rotation push completed for ${total} node(s)`);
+    } else {
+        logger.warn(`[CertWatch] ${failures}/${total} cert push(es) failed; will retry on next tick (mtime kept at ${_lastPanelCertMtime})`);
+    }
+}
+
 class SyncService {
     constructor() {
         this.isSyncing = false;
@@ -286,14 +447,37 @@ class SyncService {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
+        // Pull the operator-supplied private key if the node uses manual TLS;
+        // it is intentionally hidden from default queries (select:false).
+        await ensureManualKeyLoaded(node);
+
         const users = await this._getUsersForNode(node);
+
+        // Bail out early on cert-availability errors — pushing a broken
+        // config would silently crash Xray on the node.
+        let configContent;
+        try {
+            configContent = configGenerator.generateXrayConfig(node, users);
+        } catch (genErr) {
+            if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
+                logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
+                await HyNode.updateOne({ _id: node._id }, {
+                    $set: {
+                        status: 'error',
+                        lastSync: new Date(),
+                        lastError: genErr.message,
+                    },
+                });
+                return false;
+            }
+            throw genErr;
+        }
 
         // Step 1: Upload config.json via SSH (only if SSH is configured)
         if (node.ssh?.password || node.ssh?.privateKey) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
-                let configContent = configGenerator.generateXrayConfig(node, users);
 
                 // Apply cascade settings (reverse-portal + forward-chain + forward-hop inbounds)
                 try {
@@ -1001,4 +1185,9 @@ class SyncService {
     }
 }
 
-module.exports = new SyncService();
+const _service = new SyncService();
+_service.ensureManualKeyLoaded = ensureManualKeyLoaded;
+_service.checkPanelCertRotation = function() {
+    return checkPanelCertRotation(_service);
+};
+module.exports = _service;

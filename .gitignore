@@ -24,6 +24,10 @@ greenlock.d/staging/
 # Backups (contain user data)
 backups/
 
+# User-uploaded homepage HTML
+data/homepage/custom.html
+data/homepage/custom.html.tmp
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -15,6 +15,7 @@ const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
 const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
+const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
 const uaStats = require('../services/uaStatsService');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
@@ -142,6 +143,17 @@ async function getActiveNodes(user) {
         });
         if (nodes.length < beforeFilter) {
             logger.debug(`[Sub] Filtered out ${beforeFilter - nodes.length} overloaded nodes`);
+        }
+    }
+
+    // Filter offline/error nodes flagged by the health checker.
+    // Keeps the subscription free of dead servers that stall urltest /
+    // shared DNS resolver in HAPP, v2rayTun, sing-box, Clash, etc.
+    if (lb.hideOffline !== false) {
+        const beforeFilter = nodes.length;
+        nodes = nodes.filter(n => n.status !== 'offline' && n.status !== 'error');
+        if (nodes.length < beforeFilter) {
+            logger.debug(`[Sub] Filtered out ${beforeFilter - nodes.length} offline/error nodes`);
         }
     }
     
@@ -328,6 +340,40 @@ function _xrayInboundName(node, inbound) {
 }
 
 /**
+ * Resolve TLS-related client knobs (server name, host header for transports
+ * that masquerade as HTTP, allowInsecure flag) based on node.xray.tlsSource.
+ *
+ *   panel       → masquerade under PANEL_DOMAIN (Marzban-style); the cert is
+ *                 the panel's LE cert inlined into config.json.
+ *   manual      → use the operator-supplied node.domain (PEM is inlined too).
+ *   self-signed → fall back to node.domain || node.sni and signal the client
+ *                 to skip cert verification.
+ *
+ * Returns { sni, host, allowInsecure } where any value may be empty.
+ *
+ * @param {Object} node
+ * @returns {{ sni: string, host: string, allowInsecure: boolean, source: string }}
+ */
+function _resolveXrayTlsClientHints(node) {
+    const tlsSource = node?.xray?.tlsSource || 'panel';
+    const fallbackSni = node?.domain || node?.sni || '';
+    if (tlsSource === 'panel') {
+        const panelDomain = (appConfig?.PANEL_DOMAIN || '').trim();
+        if (panelDomain) {
+            return { sni: panelDomain, host: panelDomain, allowInsecure: false, source: 'panel' };
+        }
+        // Operator forgot to set PANEL_DOMAIN — degrade gracefully to node fields.
+        return { sni: fallbackSni, host: fallbackSni, allowInsecure: false, source: 'panel' };
+    }
+    if (tlsSource === 'manual') {
+        const dom = (node?.domain || '').trim();
+        return { sni: dom, host: dom, allowInsecure: false, source: 'manual' };
+    }
+    // self-signed
+    return { sni: fallbackSni, host: fallbackSni, allowInsecure: true, source: 'self-signed' };
+}
+
+/**
  * Generate a VLESS URI for one inbound of an Xray node.
  * vless://{uuid}@{host}:{port}?type={transport}&security={security}&...#{name}
  */
@@ -361,23 +407,30 @@ function generateVlessURIForInbound(user, node, inbound) {
         params.set('fp', fingerprint);
     } else if (security === 'tls') {
         if (inbound.flow && transport === 'tcp') params.set('flow', inbound.flow);
-        const sni = node.domain || node.sni || '';
-        if (sni) params.set('sni', sni);
+        const tls = _resolveXrayTlsClientHints(node);
+        if (tls.sni) params.set('sni', tls.sni);
         params.set('fp', fingerprint);
         if (inbound.alpn && inbound.alpn.length > 0) {
             params.set('alpn', inbound.alpn.join(','));
         }
+        if (tls.allowInsecure) params.set('allowInsecure', '1');
     }
 
     if (transport === 'ws') {
         params.set('path', inbound.wsPath || '/');
-        if (inbound.wsHost) params.set('host', inbound.wsHost);
+        // For TLS inbounds without an explicit wsHost we mirror the SNI so the
+        // server's masquerade matches the Host header (panel/manual scenarios).
+        const wsHost = inbound.wsHost || (security === 'tls' ? _resolveXrayTlsClientHints(node).host : '');
+        if (wsHost) params.set('host', wsHost);
     } else if (transport === 'grpc') {
         params.set('serviceName', inbound.grpcServiceName || 'grpc');
         params.set('mode', 'gun');
     } else if (transport === 'xhttp') {
         params.set('path', inbound.xhttpPath || '/');
-        if (inbound.xhttpHost) params.set('host', inbound.xhttpHost);
+        // Same reasoning as ws — use the masquerade domain as a Host hint when
+        // the operator did not set xhttpHost explicitly.
+        const xhttpHost = inbound.xhttpHost || (security === 'tls' ? _resolveXrayTlsClientHints(node).host : '');
+        if (xhttpHost) params.set('host', xhttpHost);
         if (inbound.xhttpMode && inbound.xhttpMode !== 'auto') params.set('mode', inbound.xhttpMode);
     }
 
@@ -776,11 +829,13 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
     client-fingerprint: ${fingerprint}`;
         if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
     } else if (security === 'tls') {
+        const tls = _resolveXrayTlsClientHints(node);
         proxy += `
     network: ${transport}
     tls: true
-    servername: ${node.domain || node.sni || host}
+    servername: ${tls.sni || host}
     client-fingerprint: ${fingerprint}`;
+        if (tls.allowInsecure) proxy += `\n    skip-cert-verify: true`;
         if (inbound.alpn && inbound.alpn.length > 0) {
             proxy += `\n    alpn:\n${inbound.alpn.map(a => `      - ${a}`).join('\n')}`;
         }
@@ -789,11 +844,14 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
         proxy += `\n    network: ${transport}`;
     }
 
+    const tlsHints = security === 'tls' ? _resolveXrayTlsClientHints(node) : null;
+
     if (transport === 'ws') {
         proxy += `
     ws-opts:
       path: "${inbound.wsPath || '/'}"`;
-        if (inbound.wsHost) proxy += `\n      headers:\n        Host: "${inbound.wsHost}"`;
+        const wsHost = inbound.wsHost || (tlsHints ? tlsHints.host : '');
+        if (wsHost) proxy += `\n      headers:\n        Host: "${wsHost}"`;
     } else if (transport === 'grpc') {
         proxy += `
     grpc-opts:
@@ -804,7 +862,8 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
     xhttp-opts:
       path: "${inbound.xhttpPath || '/'}"
       mode: "${inbound.xhttpMode || 'auto'}"`;
-        if (inbound.xhttpHost) proxy += `\n      host: "${inbound.xhttpHost}"`;
+        const xhttpHost = inbound.xhttpHost || (tlsHints ? tlsHints.host : '');
+        if (xhttpHost) proxy += `\n      host: "${xhttpHost}"`;
     }
 
     return { name, proxy };
@@ -917,9 +976,11 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
             },
         };
     } else if (security === 'tls') {
+        const tls = _resolveXrayTlsClientHints(node);
         outbound.tls = {
             enabled: true,
-            server_name: node.domain || node.sni || host,
+            server_name: tls.sni || host,
+            insecure: tls.allowInsecure,
             utls: { enabled: true, fingerprint },
         };
         if (inbound.alpn && inbound.alpn.length > 0) {
@@ -927,11 +988,14 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
         }
     }
 
+    const tlsHints = security === 'tls' ? _resolveXrayTlsClientHints(node) : null;
+
     if (transport === 'ws') {
+        const wsHost = inbound.wsHost || (tlsHints ? tlsHints.host : '');
         outbound.transport = {
             type: 'ws',
             path: inbound.wsPath || '/',
-            headers: inbound.wsHost ? { Host: inbound.wsHost } : {},
+            headers: wsHost ? { Host: wsHost } : {},
         };
     } else if (transport === 'grpc') {
         outbound.transport = {
@@ -945,8 +1009,9 @@ function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
             path: inbound.xhttpPath || '/',
             mode: inbound.xhttpMode || 'auto',
         };
-        if (inbound.xhttpHost) {
-            outbound.transport.host = inbound.xhttpHost;
+        const xhttpHost = inbound.xhttpHost || (tlsHints ? tlsHints.host : '');
+        if (xhttpHost) {
+            outbound.transport.host = xhttpHost;
         }
     }
 
@@ -996,24 +1061,29 @@ function generateV2rayJSON(user, nodes, routing) {
                         spiderX: inbound.realitySpiderX || '',
                     };
                 } else if (security === 'tls') {
+                    const tls = _resolveXrayTlsClientHints(node);
                     streamSettings.security = 'tls';
                     streamSettings.tlsSettings = {
-                        serverName: node.domain || node.sni || host,
+                        serverName: tls.sni || host,
                         fingerprint: inbound.fingerprint || 'chrome',
+                        allowInsecure: tls.allowInsecure,
                     };
                     if (inbound.alpn && inbound.alpn.length > 0) {
                         streamSettings.tlsSettings.alpn = inbound.alpn;
                     }
                 }
 
+                const tlsHints = security === 'tls' ? _resolveXrayTlsClientHints(node) : null;
+
                 if (transport === 'ws') {
-                    streamSettings.wsSettings = { path: inbound.wsPath || '/', headers: inbound.wsHost ? { Host: inbound.wsHost } : {} };
+                    const wsHost = inbound.wsHost || (tlsHints ? tlsHints.host : '');
+                    streamSettings.wsSettings = { path: inbound.wsPath || '/', headers: wsHost ? { Host: wsHost } : {} };
                 } else if (transport === 'grpc') {
                     streamSettings.grpcSettings = { serviceName: inbound.grpcServiceName || 'grpc', multiMode: false };
                 } else if (transport === 'xhttp') {
                     streamSettings.xhttpSettings = {
                         path: inbound.xhttpPath || '/',
-                        host: inbound.xhttpHost || '',
+                        host: inbound.xhttpHost || (tlsHints ? tlsHints.host : ''),
                         mode: inbound.xhttpMode || 'auto',
                     };
                 }
