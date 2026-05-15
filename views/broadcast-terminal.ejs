@@ -3,362 +3,596 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><%= typeof t !== 'undefined' ? t('broadcast.title') : 'Broadcast Terminal' %></title>
+    <meta name="theme-color" content="#6366f1">
+    <title><%= typeof t !== 'undefined' ? t('broadcast.title') : 'Broadcast Terminal' %> | C³ CELERITY</title>
     <%- include('partials/favicon') %>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/css/style.min.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; }
 
         body {
-            background: #0d1117;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            height: 100vh;
+            background:
+                radial-gradient(1200px 600px at 100% -10%, rgba(124, 58, 237, 0.10), transparent 60%),
+                radial-gradient(900px 500px at -10% 110%, rgba(99, 102, 241, 0.10), transparent 60%),
+                var(--bg-primary);
+            min-height: 100vh;
             display: flex;
             flex-direction: column;
-            color: #c9d1d9;
         }
 
-        /* ── Header ── */
+        /* ── Header ──────────────────────────────────────────────────────── */
         .header {
-            background: #161b22;
-            border-bottom: 1px solid #30363d;
-            padding: 12px 20px;
+            background: rgba(17, 17, 19, 0.72);
+            border-bottom: 1px solid var(--glass-border);
+            backdrop-filter: var(--glass-blur);
+            -webkit-backdrop-filter: var(--glass-blur);
+            padding: 14px 24px;
             display: flex;
             align-items: center;
             justify-content: space-between;
+            gap: 16px;
             flex-shrink: 0;
+            position: sticky;
+            top: 0;
+            z-index: 50;
         }
 
         .header-left {
             display: flex;
             align-items: center;
-            gap: 15px;
+            gap: 18px;
+            min-width: 0;
+        }
+
+        .header-logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-primary);
+            text-decoration: none;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            font-size: 15px;
+        }
+
+        .header-logo .logo-icon {
+            font-size: 20px;
+            filter: drop-shadow(0 0 12px var(--accent-glow));
+        }
+
+        .header-logo .logo-text {
+            background: linear-gradient(135deg, var(--accent) 0%, #a855f7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-divider {
+            width: 1px;
+            height: 22px;
+            background: var(--glass-border);
         }
 
         .header h1 {
-            color: #c9d1d9;
-            font-size: 16px;
-            font-weight: 500;
+            color: var(--text-primary);
+            font-size: 15px;
+            font-weight: 600;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
+            letter-spacing: -0.005em;
+        }
+
+        .header h1 i {
+            width: 30px;
+            height: 30px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: var(--radius-sm);
+            font-size: 16px;
+            background: linear-gradient(135deg, rgba(99,102,241,0.22), rgba(168,85,247,0.16));
+            color: #c7d2fe;
+            border: 1px solid rgba(99, 102, 241, 0.25);
         }
 
         .header-right {
             display: flex;
-            gap: 8px;
+            gap: 10px;
             align-items: center;
+            flex-shrink: 0;
         }
 
         .status {
-            display: flex;
+            display: inline-flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
             font-size: 12px;
-            color: #8b949e;
+            color: var(--text-secondary);
+            font-weight: 500;
         }
 
         .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: #f85149;
+            background: var(--danger);
+            box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
         }
-        .status-dot.connected { background: #3fb950; }
-        .status-dot.connecting { background: #d29922; animation: pulse 1s infinite; }
+        .status-dot.connected  { background: var(--success); box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18); }
+        .status-dot.connecting { background: var(--warning); box-shadow: 0 0 0 3px rgba(234, 179, 8, 0.18); animation: pulse 1.2s infinite; }
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            50%      { opacity: 0.45; }
         }
 
-        /* ── Buttons ── */
-        .btn {
-            padding: 6px 12px;
-            border: 1px solid #30363d;
-            border-radius: 6px;
-            background: #21262d;
-            color: #c9d1d9;
-            font-size: 12px;
-            cursor: pointer;
-            transition: background 0.15s;
+        /* ── Broadcast-only button variant ───────────────────────────────── */
+        .btn-ghost-danger {
+            background: transparent;
+            border-color: rgba(239, 68, 68, 0.4);
+            color: #fca5a5;
+        }
+        .btn-ghost-danger:hover {
+            background: rgba(239, 68, 68, 0.12);
+            border-color: var(--danger);
+            color: #fff;
+        }
+
+        /* ── Layout ──────────────────────────────────────────────────────── */
+        .page {
+            padding: 18px 24px 18px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        /* ── Glass surface utility ───────────────────────────────────────── */
+        .glass-surface {
+            position: relative;
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius);
+            box-shadow: var(--glass-shadow);
+            backdrop-filter: var(--glass-blur-sm);
+            -webkit-backdrop-filter: var(--glass-blur-sm);
+            overflow: hidden;
+        }
+        .glass-surface::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(180deg,
+                rgba(255, 255, 255, 0.05) 0%,
+                rgba(255, 255, 255, 0.0) 28%,
+                transparent 100%);
+            border-radius: inherit;
+        }
+        .glass-surface > * { position: relative; z-index: 1; }
+
+        /* ── Control bar ─────────────────────────────────────────────────── */
+        .control-bar {
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .node-selector-block {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .node-selector-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .node-selector-title {
             display: inline-flex;
             align-items: center;
-            gap: 5px;
-            text-decoration: none;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
         }
-        .btn:hover { background: #30363d; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
-        .btn-primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-        .btn-primary:hover { background: #388bfd; }
-        .btn-danger { border-color: #f85149; color: #f85149; }
-        .btn-danger:hover { background: rgba(248, 81, 73, 0.13); }
 
-        /* ── Control bar ── */
-        .control-bar {
-            background: #161b22;
-            border-bottom: 1px solid #30363d;
-            padding: 12px 20px;
-            flex-shrink: 0;
+        .node-selector-title .count-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(99, 102, 241, 0.15);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: #c7d2fe;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: none;
+            letter-spacing: 0;
+        }
+
+        .node-selector-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .node-selector {
-            margin-bottom: 10px;
             display: flex;
             flex-wrap: wrap;
             gap: 6px;
             align-items: center;
-        }
-
-        .node-selector-label {
-            font-size: 12px;
-            color: #8b949e;
-            margin-right: 4px;
+            padding: 10px;
+            border-radius: var(--radius-sm);
+            background: rgba(10, 10, 11, 0.45);
+            border: 1px solid var(--glass-border);
+            max-height: 144px;
+            overflow-y: auto;
         }
 
         .node-chip {
             display: inline-flex;
             align-items: center;
-            gap: 5px;
-            padding: 3px 10px;
-            border-radius: 12px;
-            border: 1px solid #30363d;
-            background: #21262d;
-            font-size: 12px;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 999px;
+            border: 1px solid var(--glass-border);
+            background: rgba(255, 255, 255, 0.03);
+            font-size: 12.5px;
+            color: var(--text-secondary);
             cursor: pointer;
             user-select: none;
-            transition: background 0.15s, border-color 0.15s;
+            transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
+            line-height: 1.2;
         }
-        .node-chip:hover { background: #30363d; }
-        .node-chip.selected { border-color: #1f6feb; background: rgba(31, 111, 235, 0.15); color: #79c0ff; }
-        .node-chip.error { border-color: #f85149; }
-        .node-chip.running { border-color: #d29922; }
-        .node-chip.done-ok { border-color: #3fb950; }
-        .node-chip.done-fail { border-color: #f85149; }
+        .node-chip:hover     { background: rgba(255, 255, 255, 0.06); color: var(--text-primary); }
+        .node-chip:active    { transform: scale(0.97); }
+        .node-chip .chip-flag { font-size: 13px; line-height: 1; }
+        .node-chip .chip-name { font-weight: 500; }
+
+        .node-chip.selected {
+            border-color: rgba(99, 102, 241, 0.55);
+            background: rgba(99, 102, 241, 0.16);
+            color: #c7d2fe;
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.10);
+        }
+        .node-chip.error    { border-color: rgba(239, 68, 68, 0.55); color: #fca5a5; }
+        .node-chip.running  { border-color: rgba(234, 179, 8, 0.55); color: #fde68a; }
+        .node-chip.done-ok  { border-color: rgba(34, 197, 94, 0.55); color: #86efac; }
+        .node-chip.done-fail{ border-color: rgba(239, 68, 68, 0.55); color: #fca5a5; }
 
         .chip-dot {
             width: 6px;
             height: 6px;
             border-radius: 50%;
-            background: #8b949e;
+            background: var(--text-muted);
             flex-shrink: 0;
         }
-        .node-chip.selected .chip-dot { background: #79c0ff; }
-        .node-chip.running .chip-dot { background: #d29922; animation: pulse 1s infinite; }
-        .node-chip.done-ok .chip-dot { background: #3fb950; }
-        .node-chip.done-fail .chip-dot { background: #f85149; }
-        .node-chip.error .chip-dot { background: #f85149; }
+        .node-chip.selected   .chip-dot { background: #a5b4fc; }
+        .node-chip.running    .chip-dot { background: var(--warning); animation: pulse 1.2s infinite; }
+        .node-chip.done-ok    .chip-dot { background: var(--success); }
+        .node-chip.done-fail  .chip-dot,
+        .node-chip.error      .chip-dot { background: var(--danger); }
 
-        .select-all-btn {
-            font-size: 11px;
-            padding: 3px 8px;
-            border-radius: 10px;
-        }
-
+        /* ── Command input ───────────────────────────────────────────────── */
         .command-row {
             display: flex;
-            gap: 8px;
-            align-items: flex-start;
+            gap: 10px;
+            align-items: stretch;
         }
 
         .command-input {
             flex: 1;
-            background: #0d1117;
-            border: 1px solid #30363d;
-            border-radius: 6px;
-            padding: 8px 12px;
-            color: #c9d1d9;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            background: rgba(10, 10, 11, 0.55);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-sm);
+            padding: 11px 14px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
             font-size: 13px;
             outline: none;
-            transition: border-color 0.15s;
+            transition: all 0.18s ease;
             resize: none;
             overflow: hidden;
-            min-height: 36px;
-            max-height: 200px;
+            min-height: 44px;
+            max-height: 220px;
             line-height: 1.5;
         }
-        .command-input:focus { border-color: #58a6ff; }
-        .command-input::placeholder { color: #6e7681; }
-        .command-input:disabled { opacity: 0.5; }
+        .command-input:focus {
+            background: rgba(10, 10, 11, 0.8);
+            border-color: rgba(99, 102, 241, 0.55);
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.18);
+        }
+        .command-input::placeholder { color: var(--text-muted); }
+        .command-input:disabled     { opacity: 0.55; cursor: not-allowed; }
 
         .command-actions {
             display: flex;
             flex-direction: column;
-            gap: 4px;
-            align-items: flex-end;
+            gap: 6px;
+            align-items: stretch;
+            justify-content: flex-start;
             flex-shrink: 0;
+            min-width: 132px;
         }
+
+        .command-actions .btn { width: 100%; }
 
         .hint {
             font-size: 11px;
-            color: #484f58;
-            flex-shrink: 0;
+            color: var(--text-muted);
+            text-align: center;
+            font-family: 'JetBrains Mono', monospace;
+            letter-spacing: 0.02em;
         }
 
-        /* ── Output area ── */
+        /* ── Output area ─────────────────────────────────────────────────── */
         .output-area {
             flex: 1;
+            min-height: 0;
             overflow-y: auto;
-            padding: 12px 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
+            padding: 4px 2px;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 12px;
+            align-content: start;
         }
 
-        .empty-state {
-            flex: 1;
+        .output-area.is-empty {
             display: flex;
             align-items: center;
             justify-content: center;
-            color: #484f58;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
             font-size: 14px;
             text-align: center;
-            flex-direction: column;
-            gap: 8px;
+            gap: 12px;
+            padding: 60px 20px;
         }
-        .empty-state i { font-size: 32px; }
+        .empty-state i {
+            font-size: 44px;
+            color: var(--text-muted);
+            opacity: 0.7;
+            background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(168,85,247,0.08));
+            border: 1px solid var(--glass-border);
+            width: 80px;
+            height: 80px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 24px;
+        }
 
-        /* ── Node cards ── */
+        /* ── Node cards ──────────────────────────────────────────────────── */
         .node-card {
-            border: 1px solid #30363d;
-            border-radius: 8px;
-            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
         }
 
         .node-card-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 8px 14px;
-            background: #161b22;
+            padding: 10px 14px;
             cursor: pointer;
             user-select: none;
             gap: 10px;
+            transition: background 0.15s;
         }
-        .node-card-header:hover { background: #1c2128; }
+        .node-card-header:hover { background: rgba(255, 255, 255, 0.03); }
 
         .node-card-title {
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 13px;
-            font-weight: 500;
+            font-size: 13.5px;
+            font-weight: 600;
             flex: 1;
             min-width: 0;
+            color: var(--text-primary);
+            letter-spacing: -0.005em;
+        }
+
+        .node-card-title .card-flag { font-size: 15px; line-height: 1; flex-shrink: 0; }
+
+        .node-card-title .card-name {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .node-card-ip {
-            color: #8b949e;
-            font-size: 12px;
+            color: var(--text-muted);
+            font-size: 11.5px;
             font-weight: 400;
+            font-family: 'JetBrains Mono', monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .node-card-badge {
             font-size: 11px;
-            padding: 2px 8px;
-            border-radius: 10px;
+            padding: 3px 9px;
+            border-radius: 999px;
             border: 1px solid transparent;
             white-space: nowrap;
             flex-shrink: 0;
+            font-weight: 500;
+            letter-spacing: 0.01em;
+            font-family: 'JetBrains Mono', monospace;
         }
-        .badge-connecting { border-color: #d29922; color: #d29922; }
-        .badge-connected  { border-color: #8b949e;  color: #8b949e; }
-        .badge-running    { border-color: #d29922;  color: #d29922; }
-        .badge-ok         { border-color: #3fb950;  color: #3fb950; }
-        .badge-fail       { border-color: #f85149;  color: #f85149; }
-        .badge-error      { border-color: #f85149;  color: #f85149; }
-        .badge-timeout    { border-color: #ff7b72;  color: #ff7b72; }
+        .badge-connecting { border-color: rgba(234,179,8,0.5);  color: #fde68a; background: rgba(234,179,8,0.10); }
+        .badge-connected  { border-color: var(--glass-border);  color: var(--text-secondary); background: rgba(255,255,255,0.04); }
+        .badge-running    { border-color: rgba(234,179,8,0.5);  color: #fde68a; background: rgba(234,179,8,0.10); }
+        .badge-ok         { border-color: rgba(34,197,94,0.5);  color: #86efac; background: rgba(34,197,94,0.10); }
+        .badge-fail       { border-color: rgba(239,68,68,0.5);  color: #fca5a5; background: rgba(239,68,68,0.10); }
+        .badge-error      { border-color: rgba(239,68,68,0.5);  color: #fca5a5; background: rgba(239,68,68,0.10); }
+        .badge-timeout    { border-color: rgba(255,123,114,0.5);color: #fecaca; background: rgba(239,68,68,0.10); }
 
         .node-card-toggle {
-            color: #8b949e;
+            color: var(--text-muted);
             font-size: 14px;
             transition: transform 0.2s;
+            flex-shrink: 0;
         }
         .node-card.collapsed .node-card-toggle { transform: rotate(-90deg); }
 
         .node-card-body {
-            background: #0d1117;
-            border-top: 1px solid #30363d;
-            padding: 10px 14px;
+            background: rgba(10, 10, 11, 0.55);
+            border-top: 1px solid var(--glass-border);
+            padding: 10px 14px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
         }
         .node-card.collapsed .node-card-body { display: none; }
 
         .node-output {
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-family: 'JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
             font-size: 12px;
-            line-height: 1.6;
+            line-height: 1.55;
             white-space: pre-wrap;
             word-break: break-all;
-            color: #c9d1d9;
-            max-height: 300px;
+            color: #d4d4d8;
+            max-height: 280px;
             overflow-y: auto;
-            min-height: 24px;
+            min-height: 22px;
+            padding: 2px 0;
         }
-        .node-output .stderr { color: #ff7b72; }
+        .node-output:empty::before {
+            content: '—';
+            color: var(--text-muted);
+            opacity: 0.5;
+        }
+        .node-output .stderr { color: #fca5a5; }
 
         .node-footer {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-top: 6px;
             font-size: 11px;
-            color: #484f58;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
         }
 
-        /* ── Summary bar ── */
+        /* ── Summary bar ─────────────────────────────────────────────────── */
         .summary-bar {
-            padding: 8px 20px;
-            background: #161b22;
-            border-top: 1px solid #30363d;
-            font-size: 12px;
-            color: #8b949e;
+            padding: 10px 16px;
+            font-size: 12.5px;
+            color: var(--text-secondary);
             display: flex;
-            gap: 16px;
+            gap: 18px;
             flex-shrink: 0;
+            align-items: center;
+            flex-wrap: wrap;
         }
-        .summary-bar .ok { color: #3fb950; }
-        .summary-bar .fail { color: #f85149; }
+        .summary-stat {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 999px;
+            border: 1px solid var(--glass-border);
+            background: rgba(255,255,255,0.03);
+            font-weight: 500;
+        }
+        .summary-stat strong { font-weight: 700; color: var(--text-primary); }
+        .summary-stat.ok      { border-color: rgba(34,197,94,0.4);  background: rgba(34,197,94,0.08); }
+        .summary-stat.ok strong{ color: #86efac; }
+        .summary-stat.fail    { border-color: rgba(239,68,68,0.4);  background: rgba(239,68,68,0.08); }
+        .summary-stat.fail strong{ color: #fca5a5; }
 
-        /* ── Overlay ── */
+        /* ── Overlay ─────────────────────────────────────────────────────── */
         .overlay {
             position: fixed;
             inset: 0;
-            background: rgba(0,0,0,0.8);
+            background: rgba(8, 8, 10, 0.65);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
             display: flex;
             align-items: center;
             justify-content: center;
             z-index: 100;
         }
         .overlay.hidden { display: none; }
-        .overlay-content { text-align: center; color: #c9d1d9; }
-        .overlay-content h2 { font-size: 18px; margin-bottom: 10px; }
-        .overlay-content p { color: #8b949e; font-size: 14px; }
+        .overlay-content {
+            background: var(--glass-bg-strong);
+            border: 1px solid var(--glass-border-strong);
+            border-radius: var(--radius);
+            box-shadow: var(--glass-shadow-lg);
+            padding: 28px 32px;
+            text-align: center;
+            color: var(--text-primary);
+            max-width: 420px;
+            backdrop-filter: var(--glass-blur);
+            -webkit-backdrop-filter: var(--glass-blur);
+        }
+        .overlay-content h2 { font-size: 17px; margin-bottom: 8px; font-weight: 600; }
+        .overlay-content p  { color: var(--text-secondary); font-size: 13px; }
         .spinner {
-            width: 40px; height: 40px;
-            border: 3px solid #30363d;
-            border-top-color: #58a6ff;
+            width: 42px; height: 42px;
+            border: 3px solid var(--glass-border);
+            border-top-color: var(--accent);
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
+            margin: 0 auto 16px;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
 
         .error-box {
-            background: rgba(248,81,73,0.13);
-            border: 1px solid #f85149;
-            border-radius: 6px;
-            padding: 15px;
-            color: #f85149;
-            max-width: 400px;
+            background: rgba(239, 68, 68, 0.10);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            border-radius: var(--radius-sm);
+            padding: 16px;
+            color: #fca5a5;
         }
-        .error-box h2 { font-size: 15px; margin-bottom: 6px; }
+        .error-box h2 { font-size: 14.5px; margin-bottom: 6px; color: #fca5a5; display: inline-flex; align-items: center; gap: 8px; }
+        .error-box p  { color: var(--text-secondary); font-size: 13px; }
 
-        /* ── Scrollbar ── */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: #0d1117; }
-        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+        /* ── Scrollbar ───────────────────────────────────────────────────── */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+        /* ── Responsive ──────────────────────────────────────────────────── */
+        @media (max-width: 768px) {
+            .page { padding: 12px; gap: 10px; }
+            .header { padding: 12px 14px; }
+            .header-divider { display: none; }
+            .header h1 { font-size: 14px; }
+            .output-area { grid-template-columns: 1fr; }
+            .command-actions { min-width: 0; flex-direction: row; }
+            .command-actions .btn { flex: 1; }
+            .hint { display: none; }
+            .node-selector { max-height: 120px; }
+        }
     </style>
 </head>
 <body>
@@ -391,73 +625,90 @@
     <!-- Header -->
     <div class="header">
         <div class="header-left">
+            <a href="/panel/nodes" class="header-logo" title="C³ CELERITY">
+                <span class="logo-icon">⚡</span>
+                <span class="logo-text">C³ CELERITY</span>
+            </a>
+            <div class="header-divider"></div>
             <h1><i class="ti ti-broadcast"></i> <%- i18nKeys.title %></h1>
+        </div>
+        <div class="header-right">
             <div class="status">
                 <div class="status-dot connecting" id="statusDot"></div>
                 <span id="statusText"><%- i18nKeys.connecting %></span>
             </div>
-        </div>
-        <div class="header-right">
-            <button class="btn btn-danger" onclick="doDisconnect()">
+            <button class="btn btn-ghost-danger" onclick="doDisconnect()">
                 <i class="ti ti-x"></i> <%- i18nKeys.disconnect %>
             </button>
         </div>
     </div>
 
-    <!-- Control bar -->
-    <div class="control-bar">
-        <!-- Node selector -->
-        <div class="node-selector" id="nodeSelector">
-            <span class="node-selector-label"><%- i18nKeys.nodesLabel %></span>
-            <button class="btn select-all-btn" id="btnSelectAll" onclick="toggleSelectAll()"><%- i18nKeys.selectAll %></button>
-            <% nodes.forEach(function(node) { %>
-            <div class="node-chip selected"
-                 id="chip-<%= node._id %>"
-                 onclick="toggleNode('<%= node._id %>')"
-                 title="<%= node.ip %>:<%= node.sshPort %> (<%= node.sshUsername %>)">
-                <span class="chip-dot"></span>
-                <% if (node.flag) { %><span><%= node.flag %></span><% } %>
-                <%= node.name %>
+    <div class="page">
+        <!-- Control bar -->
+        <div class="glass-surface control-bar">
+            <!-- Node selector -->
+            <div class="node-selector-block">
+                <div class="node-selector-head">
+                    <div class="node-selector-title">
+                        <i class="ti ti-server-2" style="font-size:14px"></i>
+                        <span><%- i18nKeys.nodesLabel %></span>
+                        <span class="count-pill" id="selectedCount">0 / <%= nodes.length %></span>
+                    </div>
+                    <div class="node-selector-actions">
+                        <button class="btn btn-sm" id="btnSelectAll" onclick="toggleSelectAll()"><%- i18nKeys.deselectAll %></button>
+                    </div>
+                </div>
+                <div class="node-selector" id="nodeSelector">
+                    <% nodes.forEach(function(node) { %>
+                    <div class="node-chip selected"
+                         id="chip-<%= node._id %>"
+                         onclick="toggleNode('<%= node._id %>')"
+                         title="<%= node.ip %>:<%= node.sshPort %> (<%= node.sshUsername %>)">
+                        <span class="chip-dot"></span>
+                        <% if (node.flag) { %><span class="chip-flag"><%= node.flag %></span><% } %>
+                        <span class="chip-name"><%= node.name %></span>
+                    </div>
+                    <% }); %>
+                </div>
             </div>
-            <% }); %>
-        </div>
-        <!-- Command input -->
-        <div class="command-row">
-            <textarea
-                class="command-input"
-                id="cmdInput"
-                placeholder="<%- i18nKeys.cmdPlaceholder %>"
-                rows="1"
-                autocomplete="off"
-                autocorrect="off"
-                autocapitalize="off"
-                spellcheck="false"
-            ></textarea>
-            <div class="command-actions">
-                <button class="btn btn-primary" id="btnExecute" onclick="doExecute()" disabled>
-                    <i class="ti ti-player-play"></i> <%- i18nKeys.execute %>
-                </button>
-                <button class="btn btn-danger" id="btnCancel" onclick="doCancel()" style="display:none">
-                    <i class="ti ti-player-stop"></i> <%- i18nKeys.cancel %>
-                </button>
-                <span class="hint">Ctrl+Enter</span>
+            <!-- Command input -->
+            <div class="command-row">
+                <textarea
+                    class="command-input"
+                    id="cmdInput"
+                    placeholder="<%- i18nKeys.cmdPlaceholder %>"
+                    rows="1"
+                    autocomplete="off"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    spellcheck="false"
+                ></textarea>
+                <div class="command-actions">
+                    <button class="btn btn-primary" id="btnExecute" onclick="doExecute()" disabled>
+                        <i class="ti ti-player-play"></i> <%- i18nKeys.execute %>
+                    </button>
+                    <button class="btn btn-danger" id="btnCancel" onclick="doCancel()" style="display:none">
+                        <i class="ti ti-player-stop"></i> <%- i18nKeys.cancel %>
+                    </button>
+                    <span class="hint">Ctrl + Enter</span>
+                </div>
             </div>
         </div>
-    </div>
 
-    <!-- Output area -->
-    <div class="output-area" id="outputArea">
-        <div class="empty-state" id="emptyState">
-            <i class="ti ti-terminal-2"></i>
-            <span><%- i18nKeys.empty %></span>
+        <!-- Output area -->
+        <div class="output-area is-empty" id="outputArea">
+            <div class="empty-state" id="emptyState">
+                <i class="ti ti-terminal-2"></i>
+                <span><%- i18nKeys.empty %></span>
+            </div>
         </div>
-    </div>
 
-    <!-- Summary bar (hidden until first run) -->
-    <div class="summary-bar" id="summaryBar" style="display:none">
-        <span><%- i18nKeys.summaryTotal %> <span id="sumTotal">0</span></span>
-        <span class="ok"><%- i18nKeys.summaryOk %> <span id="sumOk">0</span></span>
-        <span class="fail"><%- i18nKeys.summaryFailed %> <span id="sumFailed">0</span></span>
+        <!-- Summary bar (hidden until first run) -->
+        <div class="glass-surface summary-bar" id="summaryBar" style="display:none">
+            <span class="summary-stat"><%- i18nKeys.summaryTotal %> <strong id="sumTotal">0</strong></span>
+            <span class="summary-stat ok"><%- i18nKeys.summaryOk %> <strong id="sumOk">0</strong></span>
+            <span class="summary-stat fail"><%- i18nKeys.summaryFailed %> <strong id="sumFailed">0</strong></span>
+        </div>
     </div>
 
     <!-- Connecting overlay -->
@@ -474,10 +725,10 @@
             <div class="error-box">
                 <h2><i class="ti ti-alert-circle"></i> <%- i18nKeys.wsError %></h2>
                 <p id="errorText"></p>
-                <button class="btn" onclick="doReconnect()" style="margin-top:12px">
-                    <i class="ti ti-refresh"></i> <%- typeof t !== 'undefined' ? t('terminal.tryAgain') : 'Try Again' %>
-                </button>
             </div>
+            <button class="btn btn-primary" onclick="doReconnect()" style="margin-top:14px">
+                <i class="ti ti-refresh"></i> <%- typeof t !== 'undefined' ? t('terminal.tryAgain') : 'Try Again' %>
+            </button>
         </div>
     </div>
 
@@ -576,6 +827,8 @@
         function syncSelectAllBtn() {
             document.getElementById('btnSelectAll').textContent =
                 selectedNodeIds.size === ALL_NODES.length ? i18n.deselectAll : i18n.selectAll;
+            const counter = document.getElementById('selectedCount');
+            if (counter) counter.textContent = `${selectedNodeIds.size} / ${ALL_NODES.length}`;
         }
 
         // ── Execute / Cancel ──────────────────────────────────────────────
@@ -583,8 +836,9 @@
             const cmd = document.getElementById('cmdInput').value.trim();
             if (!cmd || running || !ws || ws.readyState !== WebSocket.OPEN) return;
             if (selectedNodeIds.size === 0) {
-                document.getElementById('nodeSelector').style.animation = 'pulse 0.4s';
-                setTimeout(() => document.getElementById('nodeSelector').style.animation = '', 400);
+                const sel = document.getElementById('nodeSelector');
+                sel.style.animation = 'pulse 0.4s';
+                setTimeout(() => sel.style.animation = '', 400);
                 return;
             }
 
@@ -674,6 +928,7 @@
         function clearOutput() {
             const area = document.getElementById('outputArea');
             area.innerHTML = '';
+            area.classList.remove('is-empty');
             cardMap.clear();
             document.getElementById('summaryBar').style.display = 'none';
             ALL_NODES.forEach(n => {
@@ -687,6 +942,7 @@
             // Remove empty state if present
             const emptyEl = document.getElementById('emptyState');
             if (emptyEl) emptyEl.remove();
+            document.getElementById('outputArea').classList.remove('is-empty');
 
             // Find node info
             const node = ALL_NODES.find(n => String(n._id) === nodeId);
@@ -694,13 +950,13 @@
             const displayIp   = ip   || node?.ip   || '';
 
             const card = document.createElement('div');
-            card.className = 'node-card';
+            card.className = 'glass-surface node-card';
             card.id = 'card-' + nodeId;
             card.innerHTML = `
                 <div class="node-card-header" onclick="toggleCard('${nodeId}')">
                     <div class="node-card-title">
-                        ${node?.flag ? `<span>${escHtml(node.flag)}</span>` : ''}
-                        <span>${escHtml(displayName)}</span>
+                        ${node?.flag ? `<span class="card-flag">${escHtml(node.flag)}</span>` : ''}
+                        <span class="card-name">${escHtml(displayName)}</span>
                         <span class="node-card-ip">${escHtml(displayIp)}</span>
                     </div>
                     <span class="node-card-badge badge-connecting" id="badge-${nodeId}">${i18n.connecting}</span>
@@ -785,9 +1041,9 @@
         function autoResize(el) {
             el.style.height = 'auto';
             el.style.overflow = 'hidden';
-            const next = Math.min(el.scrollHeight, 200);
+            const next = Math.min(el.scrollHeight, 220);
             el.style.height = next + 'px';
-            if (el.scrollHeight > 200) el.style.overflow = 'auto';
+            if (el.scrollHeight > 220) el.style.overflow = 'auto';
         }
 
         // ── Keyboard shortcuts ────────────────────────────────────────────
@@ -826,6 +1082,7 @@
                 }
             });
 
+            syncSelectAllBtn();
             connect();
         });
     </script>
