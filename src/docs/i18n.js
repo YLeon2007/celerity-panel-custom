@@ -65,6 +65,19 @@ JSON-эндпоинты возвращают ошибки в таком форм
 \`\`\`
 
 Частые коды: \`400\` неверный ввод, \`401\` нет аутентификации, \`403\` не хватает скоупа или IP заблокирован, \`404\` не найдено, \`409\` конфликт, \`429\` превышен лимит, \`500\` внутренняя ошибка.
+
+Многие тексты ошибок валидации и «не найдено» приходят на русском (например, \`userId обязателен\`, \`Пользователь не найден\`). Поле \`error\` всегда в одном формате.
+
+**Production:** при \`NODE_ENV !== 'development'\` все \`5xx\` ответы заменяются на \`{ "error": "Internal Server Error" }\` независимо от исходного сообщения. Примеры \`5xx\` в этой документации отражают вывод в режиме разработки; в production клиентам стоит считать тело \`5xx\` непрозрачным.
+
+## Эндпоинты вне /api
+
+Эти эндпоинты не находятся под \`/api\` и не входят в эту спецификацию:
+
+- \`GET /health\` — публичный health-check (возвращает \`{ status, uptime, lastSync, isSyncing, cache }\`), используется мониторингом; без аутентификации.
+- \`GET /\`, \`HEAD /\` — публичная посадочная/маскировочная страница (настраивается под каждую установку).
+- \`/panel/*\` — админ-панель (cookie-сессия, HTML).
+- \`/ws/terminal/{nodeId}\`, \`/ws/logs\`, \`/ws/broadcast\` — WebSocket-каналы только для админ-сессии (cookie).
             `.trim(),
         },
         tags: [
@@ -116,7 +129,7 @@ JSON-эндпоинты возвращают ошибки в таком форм
             },
             'POST /users': {
                 summary: 'Создать пользователя',
-                description: 'Создаёт пользователя, генерирует пароль и возвращает запись с токеном подписки. Требуется скоуп `users:write`.',
+                description: 'Создаёт пользователя, генерирует `password` и `xrayUuid` и возвращает запись с токеном подписки. `groups` и `nodes` отдаются как строки ObjectId (без populate). Требуется скоуп `users:write`.',
             },
             'GET /users/{userId}': {
                 summary: 'Получить пользователя по ID',
@@ -132,11 +145,11 @@ JSON-эндпоинты возвращают ошибки в таком форм
             },
             'POST /users/{userId}/enable': {
                 summary: 'Включить пользователя',
-                description: 'Включает пользователя и добавляет его на Xray-ноды в фоне. Требуется скоуп `users:write`.',
+                description: 'Включает пользователя и добавляет его на Xray-ноды в фоне. Возвращает обновлённого пользователя; `groups` и `nodes` отдаются как строки ObjectId (без populate). Требуется скоуп `users:write`.',
             },
             'POST /users/{userId}/disable': {
                 summary: 'Отключить пользователя',
-                description: 'Отключает пользователя и удаляет его с Xray-нод в фоне. Требуется скоуп `users:write`.',
+                description: 'Отключает пользователя и удаляет его с Xray-нод в фоне. Возвращает обновлённого пользователя; `groups` и `nodes` отдаются как строки ObjectId (без populate). Требуется скоуп `users:write`.',
             },
             'POST /users/{userId}/groups': {
                 summary: 'Добавить пользователя в группы',
@@ -168,7 +181,7 @@ JSON-эндпоинты возвращают ошибки в таком форм
             },
             'POST /nodes': {
                 summary: 'Создать ноду',
-                description: 'Создаёт Hysteria или Xray ноду и инвалидирует кеш подписок. Требуется скоуп `nodes:write`.',
+                description: 'Создаёт Hysteria или Xray ноду; `statsSecret` генерируется сервером. 409 — если на том же IP уже есть нода того же `type`. Требуется скоуп `nodes:write`.',
             },
             'GET /nodes/{id}': {
                 summary: 'Получить ноду по ID',
@@ -204,15 +217,15 @@ JSON-эндпоинты возвращают ошибки в таком форм
             },
             'POST /nodes/{id}/setup': {
                 summary: 'Автонастройка ноды через SSH',
-                description: 'Полная однокнопочная настройка Hysteria/Xray ноды. Запрос может выполняться 30 секунд - 2 минуты.',
+                description: 'Настройка через SSH: для Hysteria — установка бинарника, конфиг, port hopping, перезапуск `hysteria-server`; для Xray — setup агента (из body используется только `restartService`). Обычно 30 секунд — 2 минуты; таймаут клиента ≥ 3 минуты. Нужны SSH-данные на ноде. Успех: `{ success, logs }`, ошибка: `500` с `{ success: false, error, logs }`.',
             },
             'GET /nodes/{id}/config': {
                 summary: 'Получить сгенерированный конфиг ноды',
-                description: 'Возвращает YAML-конфиг, который будет применён к ноде.',
+                description: 'Возвращает YAML-конфиг сервера Hysteria 2 (`text/yaml`). Для Xray используется другой pipeline конфигурации.',
             },
             'GET /nodes/{id}/users': {
                 summary: 'Список пользователей на ноде',
-                description: 'Возвращает включённых пользователей, назначенных на указанную ноду. Требуется скоуп `nodes:read`.',
+                description: 'Возвращает включённых пользователей на ноде только с полями `userId`, `username` и `traffic`. Требуется скоуп `nodes:read`.',
             },
             'POST /nodes/{id}/groups': {
                 summary: 'Добавить ноду в группы',
@@ -320,6 +333,12 @@ JSON-эндпоинты возвращают ошибки в таком форм
             'Resource not found': 'Ресурс не найден',
             'Rate limit exceeded': 'Превышен лимит запросов',
             'Bytes, 0 = unlimited': 'Байты, 0 = без лимита',
+            'VPN password (auto-generated on create; returned on read/write responses)': 'Пароль VPN (генерируется при создании; возвращается в ответах чтения/записи)',
+            'VLESS UUID for Xray nodes': 'UUID VLESS для Xray-нод',
+            'Present on `GET /users` and `GET /users/{userId}`; omitted on enable/disable/groups responses': 'Присутствует в `GET /users` и `GET /users/{userId}`; отсутствует в ответах enable/disable/groups',
+            'Returns the updated user. `groups` and `nodes` are returned as ObjectId strings (no populate); call `GET /users/{userId}` for populated objects.': 'Возвращает обновлённого пользователя. `groups` и `nodes` отдаются как строки ObjectId (без populate); используйте `GET /users/{userId}` для разворачивания.',
+            'Auto-generates `password` and `xrayUuid` on first save. Returns the new user; `groups` and `nodes` are returned as ObjectId strings (no populate).': 'Автоматически генерирует `password` и `xrayUuid` при первом сохранении. Возвращает нового пользователя; `groups` и `nodes` отдаются как строки ObjectId (без populate).',
+            'Present on unhandled exceptions': 'Присутствует только при необработанных исключениях',
             'Bytes uploaded': 'Отправлено байт',
             'Bytes downloaded': 'Получено байт',
             'Bytes used': 'Использовано байт',
@@ -468,6 +487,31 @@ JSON-эндпоинты возвращают ошибки в таком форм
             'List MCP tools': 'Список инструментов MCP',
             'JSON-RPC response': 'JSON-RPC ответ',
             'Generic JSON response': 'Общий JSON-ответ',
+            'Invalid request body or parameters': 'Неверное тело запроса или параметры',
+            'Missing credentials, invalid/expired API key, or failed login': 'Нет учётных данных, API-ключ неверен/истёк или ошибка входа',
+            'Missing required scope or API key IP not in allowlist': 'Не хватает скоупа или IP API-ключа не в allowlist',
+            'API key or login rate limit exceeded (JSON body)': 'Превышен лимит API-ключа или входа (тело JSON)',
+            'Subscription endpoint rate limit exceeded (plain text body)': 'Превышен лимит подписки (тело plain text)',
+            'Page size (no hard server maximum; use reasonable values)': 'Размер страницы (жёсткого лимита на сервере нет; используйте разумные значения)',
+            'Missing userId': 'Отсутствует userId',
+            'Duplicate IP for this protocol type': 'Дубликат IP для этого типа протокола',
+            'Validation error': 'Ошибка валидации',
+            'Subset of user fields returned by GET /nodes/{id}/users': 'Подмножество полей пользователя из GET /nodes/{id}/users',
+            'Returns enabled users on this node with `userId`, `username`, and `traffic` only.': 'Возвращает включённых пользователей на ноде только с `userId`, `username` и `traffic`.',
+            'Hysteria 2 server config (YAML)': 'Конфиг сервера Hysteria 2 (YAML)',
+            'Creates a Hysteria or Xray node. `statsSecret` is generated by the server. Returns 409 if the same IP already has a node of the same `type`.': 'Создаёт Hysteria или Xray ноду. `statsSecret` генерируется сервером. Возвращает 409, если на том же IP уже есть нода того же `type`.',
+            'Admin login response (200)': 'Ответ входа администратора (200)',
+            'Admin login pending TOTP (202)': 'Ожидание TOTP при входе (202)',
+            'Logout response': 'Ответ выхода',
+            'Node auth accepted': 'Аутентификация на ноде принята',
+            'Node auth rejected': 'Аутентификация на ноде отклонена',
+            'Paginated users': 'Постраничный список пользователей',
+            'Users on a node': 'Пользователи на ноде',
+            'Bulk sync result': 'Результат массовой синхронизации',
+            'Node setup completed': 'Настройка ноды завершена',
+            'Node deleted': 'Нода удалена',
+            'User kicked': 'Пользователь отключён',
+            'Success with message': 'Успех с сообщением',
         },
     },
 };
