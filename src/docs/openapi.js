@@ -114,6 +114,15 @@ function addCommonSchemas(target) {
                 prompts: { type: 'array', items: { type: 'object' } },
             },
         },
+        NodeUserSummary: {
+            type: 'object',
+            description: 'Subset of user fields returned by GET /nodes/{id}/users',
+            properties: {
+                userId: { type: 'string', example: '123456789' },
+                username: { type: 'string', example: 'JohnDoe' },
+                traffic: { $ref: '#/components/schemas/Traffic' },
+            },
+        },
     });
 
     schemas.User.properties.traffic = { $ref: '#/components/schemas/Traffic' };
@@ -143,8 +152,64 @@ function addCommonExamples(target) {
             value: { token: '123456' },
         },
         LoginResponse: {
-            summary: 'Admin login response',
+            summary: 'Admin login response (200)',
             value: { success: true, username: 'admin', message: 'Authentication successful. Use cookies for subsequent requests.' },
+        },
+        LoginPendingResponse: {
+            summary: 'Admin login pending TOTP (202)',
+            value: { success: false, requiresTwoFactor: true, message: 'Two-factor verification required' },
+        },
+        LogoutResponse: {
+            summary: 'Logout response',
+            value: { success: true },
+        },
+        NodeAuthOkResponse: {
+            summary: 'Node auth accepted',
+            value: { ok: true, id: '123456789' },
+        },
+        NodeAuthFailResponse: {
+            summary: 'Node auth rejected',
+            value: { ok: false },
+        },
+        UserUpdateRequest: {
+            summary: 'Update user fields',
+            value: {
+                enabled: false,
+                maxDevices: 3,
+                hwidMode: 'strict',
+                trafficLimit: 10737418240,
+            },
+        },
+        UserListResponse: {
+            summary: 'Paginated users',
+            value: {
+                users: [{ userId: '123456789', username: 'JohnDoe', enabled: true, traffic: { tx: 0, rx: 0 } }],
+                pagination: { page: 1, limit: 50, total: 1, pages: 1 },
+            },
+        },
+        NodeUsersOnNodeResponse: {
+            summary: 'Users on a node',
+            value: [{ userId: '123456789', username: 'JohnDoe', traffic: { tx: 1024, rx: 2048 } }],
+        },
+        SyncFromMainResponse: {
+            summary: 'Bulk sync result',
+            value: { created: 2, updated: 5, errors: 0 },
+        },
+        NodeSetupSuccessResponse: {
+            summary: 'Node setup completed',
+            value: { success: true, logs: ['Installing Hysteria...', 'Restarting hysteria-server'] },
+        },
+        NodeDeleteResponse: {
+            summary: 'Node deleted',
+            value: { success: true, message: 'Нода удалена' },
+        },
+        KickResponse: {
+            summary: 'User kicked',
+            value: { success: true },
+        },
+        SyncStartedResponse: {
+            summary: 'Sync started',
+            value: { message: 'Sync started' },
         },
         UserCreateRequest: {
             summary: 'Create an enabled user',
@@ -163,6 +228,8 @@ function addCommonExamples(target) {
                 _id: '64a1b2c3d4e5f6a7b8c9d0e9',
                 userId: '123456789',
                 username: 'JohnDoe',
+                password: 'aB3xK9mP2q',
+                xrayUuid: '550e8400-e29b-41d4-a716-446655440000',
                 enabled: true,
                 groups: [{ _id: '64a1b2c3d4e5f6a7b8c9d0e1', name: 'Default', color: '#6366f1' }],
                 nodes: [],
@@ -185,6 +252,15 @@ function addCommonExamples(target) {
                 domain: 'de.example.com',
                 port: 443,
                 portRange: '20000-50000',
+                groups: ['64a1b2c3d4e5f6a7b8c9d0e1'],
+            },
+        },
+        NodeUpdateRequest: {
+            summary: 'Update node fields',
+            value: {
+                domain: 'de.example.com',
+                port: 443,
+                active: true,
                 groups: ['64a1b2c3d4e5f6a7b8c9d0e1'],
             },
         },
@@ -240,8 +316,87 @@ function addCommonExamples(target) {
             },
         },
         SuccessResponse: {
-            summary: 'Success',
-            value: { success: true, message: 'Operation completed' },
+            summary: 'Success only',
+            value: { success: true },
+        },
+        SuccessWithMessageResponse: {
+            summary: 'Success with message',
+            value: { success: true, message: 'Пользователь удалён' },
+        },
+        GroupsListResponse: {
+            summary: 'Groups list',
+            value: [{ _id: '64a1b2c3d4e5f6a7b8c9d0e1', name: 'Default' }],
+        },
+        NodesListResponse: {
+            summary: 'Nodes list',
+            value: [{ _id: '64a1b2c3d4e5f6a7b8c9d0e2', name: 'Germany 1', type: 'hysteria', ip: '203.0.113.10', status: 'online', active: true }],
+        },
+        CascadeLinksListResponse: {
+            summary: 'Cascade links list',
+            value: [{ _id: '64a1b2c3d4e5f6a7b8c9d0e4', name: 'DE portal to NL bridge', status: 'pending', active: true }],
+        },
+        NodeSyncStartedResponse: {
+            summary: 'Node sync started',
+            value: { success: true, message: 'Синхронизация запущена' },
+        },
+        NodeResetStatusResponse: {
+            summary: 'Node status reset',
+            value: { success: true, message: 'Статус сброшен', node: { _id: '64a1b2c3d4e5f6a7b8c9d0e2', name: 'Germany 1', status: 'online' } },
+        },
+        XrayKeysResponse: {
+            summary: 'Generated Xray REALITY keys',
+            value: { success: true, privateKey: 'base64-private', publicKey: 'base64-public' },
+        },
+        ConfigUpdatedResponse: {
+            summary: 'Config updated on node',
+            value: { success: true, message: 'Конфиг обновлён' },
+        },
+        PortHoppingConfiguredResponse: {
+            summary: 'Port hopping configured',
+            value: { success: true, message: 'Port hopping настроен' },
+        },
+        UserDeviceListExample: {
+            summary: 'HWID device list',
+            value: {
+                userId: '123456789',
+                count: 1,
+                limit: 3,
+                devices: [{ hwid: 'abc123', platform: 'Android', lastSeenAt: '2026-05-18T17:00:00.000Z' }],
+            },
+        },
+        CascadeDeployResponse: {
+            summary: 'Cascade link deployed',
+            value: { success: true, message: 'Cascade link deployed' },
+        },
+        CascadeUndeployResponse: {
+            summary: 'Cascade link undeployed',
+            value: { success: true, message: 'Cascade link undeployed' },
+        },
+        CascadeDeleteResponse: {
+            summary: 'Cascade link deleted',
+            value: { success: true, message: 'Cascade link deleted' },
+        },
+        CascadeChainDeployResponse: {
+            summary: 'Cascade chain deployed',
+            value: { success: true, message: 'Chain deployed: 3 nodes', deployed: 3 },
+        },
+        NodeStatusResponse: {
+            summary: 'Stored node status',
+            value: {
+                name: 'Germany 1',
+                status: 'online',
+                onlineUsers: 12,
+                lastError: '',
+                lastSync: '2026-05-18T17:00:00.000Z',
+            },
+        },
+        McpToolsResponse: {
+            summary: 'MCP tools list',
+            value: { tools: [{ name: 'list_users', description: 'List panel users' }] },
+        },
+        McpPromptsResponse: {
+            summary: 'MCP prompts list',
+            value: { prompts: [{ name: 'panel_overview', description: 'Panel overview prompt' }] },
         },
         JsonRpcToolsListRequest: {
             summary: 'List MCP tools',
@@ -259,64 +414,74 @@ function addCommonExamples(target) {
 }
 
 const OPERATION_METADATA = {
-    'POST /login': { public: true, rateLimit: '10 attempts per 15 minutes', requestExample: 'LoginRequest', responseExample: 'LoginResponse' },
-    'POST /login/totp': { public: true, rateLimit: '8 attempts per 10 minutes', requestExample: 'TotpRequest', responseExample: 'LoginResponse' },
-    'POST /logout': { public: true, responseExample: 'SuccessResponse' },
-    'POST /auth': { public: true, responseExample: 'SuccessResponse' },
+    'POST /login': {
+        public: true,
+        rateLimit: '10 attempts per 15 minutes',
+        requestExample: 'LoginRequest',
+        responseExamples: { 200: 'LoginResponse', 202: 'LoginPendingResponse' },
+    },
+    'POST /login/totp': {
+        public: true,
+        rateLimit: '8 attempts per 10 minutes',
+        requestExample: 'TotpRequest',
+        responseExample: 'LoginResponse',
+    },
+    'POST /logout': { public: true, responseExample: 'LogoutResponse' },
+    'POST /auth': { public: true, skipGenericExamples: true },
     'GET /files/{token}': { public: true, rateLimit: 'Configured by subscription rate limit settings' },
     'GET /info/{token}': { public: true, rateLimit: 'Configured by subscription rate limit settings' },
     'GET /stats': { scopes: ['stats:read'], responseExample: 'StatsResponse' },
-    'GET /groups': { scopes: ['stats:read'] },
-    'GET /users': { scopes: ['users:read'], responseExample: 'UserResponse' },
+    'GET /groups': { scopes: ['stats:read'], responseExample: 'GroupsListResponse' },
+    'GET /users': { scopes: ['users:read'], responseExample: 'UserListResponse' },
     'POST /users': { scopes: ['users:write'], requestExample: 'UserCreateRequest', responseExample: 'UserResponse' },
     'GET /users/{userId}': { scopes: ['users:read'], responseExample: 'UserResponse' },
-    'PUT /users/{userId}': { scopes: ['users:write'], requestExample: 'UserCreateRequest', responseExample: 'UserResponse' },
-    'DELETE /users/{userId}': { scopes: ['users:write'], responseExample: 'SuccessResponse' },
-    'GET /users/{userId}/devices': { scopes: ['users:read'] },
+    'PUT /users/{userId}': { scopes: ['users:write'], requestExample: 'UserUpdateRequest', responseExample: 'UserResponse' },
+    'DELETE /users/{userId}': { scopes: ['users:write'], responseExample: 'SuccessWithMessageResponse' },
+    'GET /users/{userId}/devices': { scopes: ['users:read'], responseExample: 'UserDeviceListExample' },
     'DELETE /users/{userId}/devices': { scopes: ['users:write'], responseExample: 'SuccessResponse' },
     'DELETE /users/{userId}/devices/{hwid}': { scopes: ['users:write'], responseExample: 'SuccessResponse' },
     'POST /users/{userId}/enable': { scopes: ['users:write'], responseExample: 'UserResponse' },
     'POST /users/{userId}/disable': { scopes: ['users:write'], responseExample: 'UserResponse' },
     'POST /users/{userId}/groups': { scopes: ['users:write'], responseExample: 'UserResponse' },
     'DELETE /users/{userId}/groups/{groupId}': { scopes: ['users:write'], responseExample: 'UserResponse' },
-    'POST /users/sync-from-main': { scopes: ['users:write'] },
-    'GET /nodes': { scopes: ['nodes:read'], responseExample: 'NodeResponse' },
+    'POST /users/sync-from-main': { scopes: ['users:write'], responseExample: 'SyncFromMainResponse' },
+    'GET /nodes': { scopes: ['nodes:read'], responseExample: 'NodesListResponse' },
     'POST /nodes': { scopes: ['nodes:write'], requestExample: 'NodeCreateRequest', responseExample: 'NodeResponse' },
     'GET /nodes/check-ip': { scopes: ['nodes:read'] },
     'GET /nodes/{id}': { scopes: ['nodes:read'], responseExample: 'NodeResponse' },
-    'PUT /nodes/{id}': { scopes: ['nodes:write'], requestExample: 'NodeCreateRequest', responseExample: 'NodeResponse' },
-    'DELETE /nodes/{id}': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'GET /nodes/{id}/status': { scopes: ['nodes:read'] },
-    'POST /nodes/{id}/reset-status': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
+    'PUT /nodes/{id}': { scopes: ['nodes:write'], requestExample: 'NodeUpdateRequest', responseExample: 'NodeResponse' },
+    'DELETE /nodes/{id}': { scopes: ['nodes:write'], responseExample: 'NodeDeleteResponse' },
+    'GET /nodes/{id}/status': { scopes: ['nodes:read'], responseExample: 'NodeStatusResponse', skipGenericExamples: true },
+    'POST /nodes/{id}/reset-status': { scopes: ['nodes:write'], responseExample: 'NodeResetStatusResponse', skipGenericExamples: true },
     'GET /nodes/{id}/agent-info': { scopes: ['nodes:read'] },
-    'POST /nodes/{id}/sync': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'POST /nodes/{id}/setup': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
+    'POST /nodes/{id}/sync': { scopes: ['nodes:write'], responseExample: 'NodeSyncStartedResponse' },
+    'POST /nodes/{id}/setup': { scopes: ['nodes:write'], responseExample: 'NodeSetupSuccessResponse', skipGenericExamples: true },
     'GET /nodes/{id}/config': { scopes: ['nodes:read'] },
-    'GET /nodes/{id}/users': { scopes: ['nodes:read'], responseExample: 'UserResponse' },
+    'GET /nodes/{id}/users': { scopes: ['nodes:read'], responseExample: 'NodeUsersOnNodeResponse' },
     'POST /nodes/{id}/groups': { scopes: ['nodes:write'], responseExample: 'NodeResponse' },
     'DELETE /nodes/{id}/groups/{groupId}': { scopes: ['nodes:write'], responseExample: 'NodeResponse' },
-    'POST /nodes/{id}/setup-port-hopping': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'POST /nodes/{id}/update-config': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'POST /nodes/{id}/generate-xray-keys': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'GET /cascade/links': { scopes: ['nodes:read'], responseExample: 'CascadeLinkResponse' },
+    'POST /nodes/{id}/setup-port-hopping': { scopes: ['nodes:write'], responseExample: 'PortHoppingConfiguredResponse' },
+    'POST /nodes/{id}/update-config': { scopes: ['nodes:write'], responseExample: 'ConfigUpdatedResponse' },
+    'POST /nodes/{id}/generate-xray-keys': { scopes: ['nodes:write'], responseExample: 'XrayKeysResponse', skipGenericExamples: true },
+    'GET /cascade/links': { scopes: ['nodes:read'], responseExample: 'CascadeLinksListResponse' },
     'POST /cascade/links': { scopes: ['nodes:write'], requestExample: 'CascadeLinkRequest', responseExample: 'CascadeLinkResponse' },
     'GET /cascade/links/{id}': { scopes: ['nodes:read'], responseExample: 'CascadeLinkResponse' },
     'PUT /cascade/links/{id}': { scopes: ['nodes:write'], requestExample: 'CascadeLinkRequest', responseExample: 'CascadeLinkResponse' },
     'PATCH /cascade/links/{id}/reconnect': { scopes: ['nodes:write'], responseExample: 'CascadeLinkResponse' },
-    'DELETE /cascade/links/{id}': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
-    'POST /cascade/links/{id}/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'SuccessResponse' },
-    'POST /cascade/links/{id}/undeploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'SuccessResponse' },
-    'POST /cascade/chain/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'SuccessResponse' },
+    'DELETE /cascade/links/{id}': { scopes: ['nodes:write'], responseExample: 'CascadeDeleteResponse' },
+    'POST /cascade/links/{id}/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeDeployResponse', skipGenericExamples: true },
+    'POST /cascade/links/{id}/undeploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeUndeployResponse', skipGenericExamples: true },
+    'POST /cascade/chain/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeChainDeployResponse', skipGenericExamples: true },
     'GET /cascade/links/{id}/health': { scopes: ['nodes:read'] },
     'GET /cascade/topology': { scopes: ['nodes:read'] },
     'POST /cascade/topology/positions': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
     'POST /mcp': { scopes: ['mcp:enabled'], requestExample: 'JsonRpcToolsListRequest', responseExample: 'JsonRpcResponse' },
     'GET /mcp/sse': { scopes: ['mcp:enabled'] },
     'POST /mcp/messages': { scopes: ['mcp:enabled'], requestExample: 'JsonRpcToolsListRequest' },
-    'GET /mcp/tools': { scopes: ['mcp:enabled'] },
-    'GET /mcp/prompts': { scopes: ['mcp:enabled'] },
-    'POST /sync': { scopes: ['sync:write'], responseExample: 'SuccessResponse' },
-    'POST /kick/{userId}': { scopes: ['sync:write'], responseExample: 'SuccessResponse' },
+    'GET /mcp/tools': { scopes: ['mcp:enabled'], responseExample: 'McpToolsResponse', skipGenericExamples: true },
+    'GET /mcp/prompts': { scopes: ['mcp:enabled'], responseExample: 'McpPromptsResponse', skipGenericExamples: true },
+    'POST /sync': { scopes: ['sync:write'], responseExample: 'SyncStartedResponse' },
+    'POST /kick/{userId}': { scopes: ['sync:write'], responseExample: 'KickResponse' },
 };
 
 function enhanceOperations(target) {
@@ -376,26 +541,43 @@ function applyRequestExample(op, meta) {
 
 function applyResponseExamples(op, meta) {
     for (const [status, response] of Object.entries(op.responses || {})) {
-        if (String(status).startsWith('2') && !response.content && !/text\/plain|text\/event-stream/.test(JSON.stringify(response))) {
-            response.content = {
-                'application/json': {
-                    schema: { $ref: '#/components/schemas/Success' },
-                    examples: { GenericResponse: { $ref: '#/components/examples/GenericResponse' } },
-                },
-            };
+        const json = response.content?.['application/json'];
+        if (!json || !String(status).startsWith('2')) continue;
+
+        if (json.examples && Object.keys(json.examples).length > 0) {
+            continue;
         }
 
-        const json = response.content?.['application/json'];
-        if (!json) continue;
-        if (String(status).startsWith('2')) {
-            const exampleName = meta.responseExample;
-            if (exampleName && spec.components.examples[exampleName]) {
-                json.examples = { [exampleName]: { $ref: `#/components/examples/${exampleName}` } };
-            } else if (!json.examples && json.example === undefined) {
-                json.examples = { GenericResponse: { $ref: '#/components/examples/GenericResponse' } };
-            }
+        const perStatus = meta.responseExamples?.[status] || meta.responseExamples?.[String(status)];
+        const exampleName = perStatus || (status === '200' || status === '201' ? meta.responseExample : null);
+
+        if (exampleName && spec.components.examples[exampleName]) {
+            json.examples = { [exampleName]: { $ref: `#/components/examples/${exampleName}` } };
+            continue;
+        }
+
+        if (meta.skipGenericExamples || hasSpecificResponseSchema(json)) {
+            continue;
+        }
+
+        if (!json.examples && json.example === undefined) {
+            json.examples = { GenericResponse: { $ref: '#/components/examples/GenericResponse' } };
         }
     }
+}
+
+function hasSpecificResponseSchema(json) {
+    const schema = json.schema;
+    if (!schema) return false;
+    if (schema.type === 'array') return true;
+    if (schema.$ref && !schema.$ref.endsWith('/Success')) return true;
+    const props = schema.properties;
+    if (!props) return false;
+    const keys = Object.keys(props);
+    if (keys.includes('ok') || keys.includes('users') || keys.includes('logs') || keys.includes('created')) return true;
+    if (keys.includes('jsonrpc') || keys.includes('tools') || keys.includes('prompts')) return true;
+    if (keys.includes('privateKey') || keys.includes('publicKey') || keys.includes('node')) return true;
+    return false;
 }
 
 function applyCodeSamples(op, method, path, meta) {
@@ -523,6 +705,19 @@ Errors use JSON whenever the endpoint is JSON-based:
 \`\`\`
 
 Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` missing scope or blocked IP, \`404\` not found, \`409\` conflict, \`429\` rate-limited, \`500\` internal failure.
+
+Many validation and not-found messages are returned in Russian (e.g. \`userId обязателен\`, \`Пользователь не найден\`). The \`error\` field shape is always the same.
+
+**Production note:** when \`NODE_ENV !== 'development'\` the panel sanitizes all \`5xx\` responses to \`{ "error": "Internal Server Error" }\` regardless of the original message. The \`5xx\` examples in this reference reflect development output; production callers should treat all \`5xx\` bodies as opaque.
+
+## Non-API endpoints
+
+These endpoints are not under \`/api\` and are not part of this specification:
+
+- \`GET /health\` — public health check (returns \`{ status, uptime, lastSync, isSyncing, cache }\`) used by monitoring; no auth.
+- \`GET /\`, \`HEAD /\` — public landing/decoy page (configurable per installation).
+- \`/panel/*\` — admin web UI (cookie session, HTML).
+- \`/ws/terminal/{nodeId}\`, \`/ws/logs\`, \`/ws/broadcast\` — admin-only WebSocket transports (cookie session).
         `.trim(),
         contact: {
             name: 'Click Connect',
@@ -588,6 +783,8 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                     _id:               { type: 'string', example: '64a1b2c3d4e5f6a7b8c9d0e1' },
                     userId:            { type: 'string', example: '123456789' },
                     username:          { type: 'string', example: 'JohnDoe' },
+                    password:          { type: 'string', description: 'VPN password (auto-generated on create; returned on read/write responses)' },
+                    xrayUuid:          { type: 'string', format: 'uuid', description: 'VLESS UUID for Xray nodes' },
                     enabled:           { type: 'boolean', example: true },
                     groups:            { type: 'array', items: { $ref: '#/components/schemas/GroupRef' } },
                     nodes:             { type: 'array', items: { $ref: '#/components/schemas/NodeRef' } },
@@ -791,9 +988,10 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             GroupRef: {
                 type: 'object',
                 properties: {
-                    _id:   { type: 'string' },
-                    name:  { type: 'string', example: 'Europe' },
-                    color: { type: 'string', example: '#6366f1' },
+                    _id:        { type: 'string' },
+                    name:       { type: 'string', example: 'Europe' },
+                    color:      { type: 'string', example: '#6366f1' },
+                    maxDevices: { type: 'integer', description: 'Present on `GET /users` and `GET /users/{userId}`; omitted on enable/disable/groups responses' },
                 },
             },
             NodeRef: {
@@ -911,25 +1109,79 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
         },
 
         responses: {
+            BadRequest: {
+                description: 'Invalid request body or parameters',
+                content: {
+                    'application/json': {
+                        schema: { $ref: '#/components/schemas/Error' },
+                        examples: {
+                            missingField: { value: { error: 'Username and password required' } },
+                            invalidArray: { value: { error: 'users должен быть массивом' } },
+                        },
+                    },
+                },
+            },
             Unauthorized: {
-                description: 'Invalid or missing API key',
-                content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+                description: 'Missing credentials, invalid/expired API key, or failed login',
+                content: {
+                    'application/json': {
+                        schema: { $ref: '#/components/schemas/Error' },
+                        examples: {
+                            noAuth: { value: { error: 'Authentication required' } },
+                            badApiKey: { value: { error: 'Invalid or expired API key' } },
+                            badLogin: { value: { error: 'Invalid username or password' } },
+                        },
+                    },
+                },
             },
             Forbidden: {
-                description: 'Missing required scope or IP not in allowlist',
-                content: { 'application/json': { schema: { $ref: '#/components/schemas/ScopeError' } } },
+                description: 'Missing required scope or API key IP not in allowlist',
+                content: {
+                    'application/json': {
+                        schema: { $ref: '#/components/schemas/ScopeError' },
+                        examples: {
+                            scope: { value: { error: 'Insufficient permissions', required: 'users:write' } },
+                            ip: { value: { error: 'IP address not allowed for this API key' } },
+                        },
+                    },
+                },
             },
             NotFound: {
                 description: 'Resource not found',
-                content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+                content: {
+                    'application/json': {
+                        schema: { $ref: '#/components/schemas/Error' },
+                        examples: {
+                            user: { value: { error: 'Пользователь не найден' } },
+                            node: { value: { error: 'Node not found' } },
+                            token: { value: { error: 'Not found' } },
+                        },
+                    },
+                },
             },
             RateLimited: {
-                description: 'Rate limit exceeded',
+                description: 'API key or login rate limit exceeded (JSON body)',
                 headers: {
                     'X-RateLimit-Limit':     { schema: { type: 'integer' } },
                     'X-RateLimit-Remaining': { schema: { type: 'integer' } },
                 },
-                content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+                content: {
+                    'application/json': {
+                        schema: { $ref: '#/components/schemas/RateLimitError' },
+                        examples: {
+                            apiKey: { value: { error: 'Rate limit exceeded for this API key' } },
+                            login: { value: { error: 'Too many attempts. Try again in 15 minutes.' } },
+                        },
+                    },
+                },
+            },
+            SubscriptionRateLimited: {
+                description: 'Subscription endpoint rate limit exceeded (plain text body)',
+                content: {
+                    'text/plain': {
+                        schema: { type: 'string', example: '# Too many requests' },
+                    },
+                },
             },
         },
 
@@ -995,9 +1247,10 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 responses: {
                     200: { description: 'Authenticated', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResult' } } } },
                     202: { description: 'Two-factor verification required', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResult' } } } },
-                    400: { $ref: '#/components/responses/Unauthorized' },
+                    400: { $ref: '#/components/responses/BadRequest' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     429: { $ref: '#/components/responses/RateLimited' },
+                    500: { description: 'Internal error', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
                 },
             },
         },
@@ -1024,9 +1277,10 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 },
                 responses: {
                     200: { description: 'Authenticated', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResult' } } } },
-                    400: { $ref: '#/components/responses/Unauthorized' },
+                    400: { $ref: '#/components/responses/BadRequest' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     429: { $ref: '#/components/responses/RateLimited' },
+                    500: { description: 'Internal error', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
                 },
             },
         },
@@ -1058,6 +1312,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                                 properties: {
                                     addr: { type: 'string', example: '1.2.3.4:12345', description: 'Client IP:port' },
                                     auth: { type: 'string', example: 'userId:password' },
+                                    tx: { type: 'integer', description: 'Optional client bandwidth hint from Hysteria (bytes/s)' },
                                 },
                             },
                         },
@@ -1065,15 +1320,20 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 },
                 responses: {
                     200: {
-                        description: 'Auth result',
+                        description: 'Auth result (always HTTP 200; check `ok`)',
                         content: {
                             'application/json': {
                                 schema: {
                                     type: 'object',
+                                    required: ['ok'],
                                     properties: {
                                         ok: { type: 'boolean', example: true },
                                         id: { type: 'string', example: '123456789', description: 'userId (only when ok=true)' },
                                     },
+                                },
+                                examples: {
+                                    accepted: { $ref: '#/components/examples/NodeAuthOkResponse' },
+                                    rejected: { $ref: '#/components/examples/NodeAuthFailResponse' },
                                 },
                             },
                         },
@@ -1107,7 +1367,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                     200: { description: 'Subscription config or browser HTML page' },
                     403: { description: 'Subscription disabled, expired, traffic limit reached, or HWID soft-block response' },
                     404: { description: 'Token not found' },
-                    429: { description: 'Subscription rate limit exceeded' },
+                    429: { $ref: '#/components/responses/SubscriptionRateLimited' },
                     503: { description: 'No servers available' },
                 },
             },
@@ -1191,7 +1451,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 description: 'Supports pagination, filtering, and sorting.',
                 parameters: [
                     { name: 'page',      in: 'query', schema: { type: 'integer', default: 1 } },
-                    { name: 'limit',     in: 'query', schema: { type: 'integer', default: 50, maximum: 500 } },
+                    { name: 'limit',     in: 'query', schema: { type: 'integer', default: 50 }, description: 'Page size (no hard server maximum; use reasonable values)' },
                     { name: 'sortBy',    in: 'query', schema: { type: 'string', enum: ['createdAt', 'userId', 'username', 'enabled', 'traffic'], default: 'createdAt' } },
                     { name: 'sortOrder', in: 'query', schema: { type: 'string', enum: ['asc', 'desc'], default: 'desc' } },
                     { name: 'enabled',   in: 'query', schema: { type: 'boolean' }, description: 'Filter by enabled status' },
@@ -1221,6 +1481,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Users'],
                 summary: 'Create user',
+                description: 'Auto-generates `password` and `xrayUuid` on first save. Returns the new user; `groups` and `nodes` are returned as ObjectId strings (no populate).',
                 requestBody: {
                     required: true,
                     content: {
@@ -1234,8 +1495,24 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                         description: 'Created user',
                         content: { 'application/json': { schema: { $ref: '#/components/schemas/User' } } },
                     },
-                    400: { description: 'userId is required' },
-                    409: { description: 'User already exists' },
+                    400: {
+                        description: 'Missing userId',
+                        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, examples: { missing: { value: { error: 'userId обязателен' } } } } },
+                    },
+                    409: {
+                        description: 'User already exists',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        error: { type: 'string', example: 'Пользователь уже существует' },
+                                        user: { $ref: '#/components/schemas/User' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                 },
@@ -1332,6 +1609,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Users'],
                 summary: 'Enable user',
+                description: 'Returns the updated user. `groups` and `nodes` are returned as ObjectId strings (no populate); call `GET /users/{userId}` for populated objects.',
                 responses: {
                     200: { description: 'Updated user', content: { 'application/json': { schema: { $ref: '#/components/schemas/User' } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
@@ -1346,6 +1624,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Users'],
                 summary: 'Disable user',
+                description: 'Returns the updated user. `groups` and `nodes` are returned as ObjectId strings (no populate); call `GET /users/{userId}` for populated objects.',
                 responses: {
                     200: { description: 'Updated user', content: { 'application/json': { schema: { $ref: '#/components/schemas/User' } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
@@ -1447,7 +1726,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 summary: 'List nodes',
                 parameters: [
                     { name: 'active', in: 'query', schema: { type: 'boolean' }, description: 'Filter by active status' },
-                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['online', 'offline', 'error'] } },
+                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['online', 'offline', 'error', 'syncing'] } },
                     { name: 'group',  in: 'query', schema: { type: 'string' }, description: 'Filter by group ObjectId' },
                 ],
                 responses: {
@@ -1459,32 +1738,41 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Nodes'],
                 summary: 'Create node',
+                description: 'Creates a Hysteria or Xray node. `statsSecret` is generated by the server. Returns 409 if the same IP already has a node of the same `type`.',
                 requestBody: {
                     required: true,
                     content: {
                         'application/json': {
-                            schema: {
-                                type: 'object',
-                                required: ['name', 'ip'],
-                                properties: {
-                                    name:          { type: 'string', example: 'Germany' },
-                                    ip:            { type: 'string', example: '1.2.3.4' },
-                                    domain:        { type: 'string', example: 'de.example.com' },
-                                    port:          { type: 'integer', example: 443 },
-                                    portRange:     { type: 'string', example: '20000-50000' },
-                                    statsPort:     { type: 'integer', example: 9999 },
-                                    statsSecret:   { type: 'string', example: 'secret' },
-                                    groups:        { type: 'array', items: { type: 'string' } },
-                                    maxOnlineUsers: { type: 'integer', example: 0 },
-                                },
-                            },
+                            schema: { $ref: '#/components/schemas/NodeCreate' },
                         },
                     },
                 },
                 responses: {
                     201: { description: 'Created node', content: { 'application/json': { schema: { $ref: '#/components/schemas/Node' } } } },
+                    400: {
+                        description: 'Validation error',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/Error' },
+                                examples: {
+                                    required: { value: { error: 'name и ip обязательны' } },
+                                    badType: { value: { error: 'type must be hysteria or xray' } },
+                                },
+                            },
+                        },
+                    },
+                    409: {
+                        description: 'Duplicate IP for this protocol type',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/Error' },
+                                examples: { duplicate: { value: { error: 'A hysteria node with this IP already exists' } } },
+                            },
+                        },
+                    },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
+                    500: { description: 'Internal error', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
                 },
             },
         },
@@ -1527,7 +1815,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 summary: 'Update node',
                 requestBody: {
                     required: true,
-                    content: { 'application/json': { schema: { type: 'object' } } },
+                    content: { 'application/json': { schema: { $ref: '#/components/schemas/NodeUpdate' } } },
                 },
                 responses: {
                     200: { description: 'Updated node', content: { 'application/json': { schema: { $ref: '#/components/schemas/Node' } } } },
@@ -1541,10 +1829,24 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 tags: ['Nodes'],
                 summary: 'Delete node',
                 responses: {
-                    200: { description: 'Deleted' },
+                    200: {
+                        description: 'Deleted',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        message: { type: 'string', example: 'Нода удалена' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
+                    500: { description: 'Internal error', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
                 },
             },
         },
@@ -1563,7 +1865,8 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                                 schema: {
                                     type: 'object',
                                     properties: {
-                                        status:      { type: 'string', enum: ['online', 'offline', 'error'] },
+                                        name:        { type: 'string', example: 'Germany 1' },
+                                        status:      { type: 'string', enum: ['online', 'offline', 'error', 'syncing'] },
                                         onlineUsers: { type: 'integer' },
                                         lastError:   { type: 'string' },
                                         lastSync:    { type: 'string', format: 'date-time', nullable: true },
@@ -1586,7 +1889,21 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 summary: 'Reset node status',
                 description: 'Marks a node as online and clears the last error/health failure counter.',
                 responses: {
-                    200: { description: 'Status reset', content: { 'application/json': { schema: { $ref: '#/components/schemas/Success' } } } },
+                    200: {
+                        description: 'Status reset',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        message: { type: 'string', example: 'Статус сброшен' },
+                                        node: { $ref: '#/components/schemas/Node' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
@@ -1602,7 +1919,7 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
                 description: 'Fetches live info from the CC Agent for an Xray node.',
                 responses: {
                     200: { description: 'Agent info', content: { 'application/json': { schema: { type: 'object' } } } },
-                    400: { description: 'Node is not an Xray node' },
+                    400: { description: 'Node is not Xray', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, examples: { notXray: { value: { error: 'Not an Xray node' } } } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
@@ -1616,9 +1933,22 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Nodes'],
                 summary: 'Sync specific node',
-                description: 'Pushes the current config to this node via SSH.',
+                description: 'Marks the node as `syncing` and starts `updateNodeConfig` in the background (SSH or agent depending on node type). Response is returned immediately.',
                 responses: {
-                    200: { description: 'Sync started/completed' },
+                    200: {
+                        description: 'Sync started',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        message: { type: 'string', example: 'Синхронизация запущена' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
@@ -1631,20 +1961,15 @@ Common status codes: \`400\` invalid input, \`401\` unauthenticated, \`403\` mis
             post: {
                 tags: ['Nodes'],
                 summary: 'Auto-setup node via SSH',
-                description: `Full one-click node provisioning — same as the **⚙️ Auto Setup** button in the web panel.
+                description: `One-click provisioning via SSH — same as **⚙️ Auto Setup** in the panel.
 
-**Steps performed:**
-1. Install Hysteria 2 binary (if not installed)
-2. Generate TLS certificate (self-signed, or prepare ACME dir if domain is set)
-3. Upload \`/etc/hysteria/config.yaml\`
-4. Configure iptables port hopping rules
-5. Open firewall ports
-6. Enable and restart \`hysteria-server\` systemd unit
+**Hysteria nodes** (\`type=hysteria\`, default): optional body flags \`installHysteria\`, \`setupPortHopping\`, \`restartService\` (all default \`true\`). Installs/updates Hysteria, uploads config, configures port hopping, restarts \`hysteria-server\`.
 
-**⚠️ Long-running:** this request can take **30 seconds to 2 minutes** depending on the server.  
-Set your HTTP client timeout to at least **3 minutes**.
+**Xray nodes** (\`type=xray\`): runs Xray agent setup; only \`restartService\` from the body is used.
 
-**Requires SSH credentials** to be configured on the node (password or private key).`,
+**⚠️ Long-running:** typically **30 seconds to 2 minutes**. Set client timeout to at least **3 minutes**.
+
+**Requires SSH credentials** on the node (password or private key). Returns \`{ success, logs }\` on success or \`500\` with \`{ success: false, error, logs }\` on failure.`,
                 requestBody: {
                     content: {
                         'application/json': {
@@ -1707,9 +2032,9 @@ Set your HTTP client timeout to at least **3 minutes**.
             get: {
                 tags: ['Nodes'],
                 summary: 'Get generated node config',
-                description: 'Returns the YAML config that would be applied to this node.',
+                description: 'Returns generated **Hysteria 2** server YAML for the node (`text/yaml`). Intended for Hysteria nodes; Xray nodes use a different config pipeline.',
                 responses: {
-                    200: { description: 'Hysteria 2 config YAML', content: { 'text/plain': { schema: { type: 'string' } } } },
+                    200: { description: 'Hysteria 2 server config (YAML)', content: { 'text/yaml': { schema: { type: 'string' } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
@@ -1722,8 +2047,9 @@ Set your HTTP client timeout to at least **3 minutes**.
             get: {
                 tags: ['Nodes'],
                 summary: 'List users assigned to node',
+                description: 'Returns enabled users on this node with `userId`, `username`, and `traffic` only.',
                 responses: {
-                    200: { description: 'User list', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/User' } } } } },
+                    200: { description: 'User list', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/NodeUserSummary' } } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
@@ -1929,13 +2255,39 @@ Set your HTTP client timeout to at least **3 minutes**.
                 tags: ['Cascade'],
                 summary: 'Deploy cascade link',
                 responses: {
-                    200: { description: 'Deployed', content: { 'application/json': { schema: { $ref: '#/components/schemas/Success' } } } },
+                    200: {
+                        description: 'Deployed',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        message: { type: 'string', example: 'Cascade link deployed' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     400: { description: 'Invalid link ID' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
                     429: { $ref: '#/components/responses/RateLimited' },
-                    500: { description: 'Deploy failed' },
+                    500: {
+                        description: 'Deploy failed',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: false },
+                                        error: { type: 'string' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -1946,7 +2298,20 @@ Set your HTTP client timeout to at least **3 minutes**.
                 tags: ['Cascade'],
                 summary: 'Undeploy cascade link',
                 responses: {
-                    200: { description: 'Undeployed', content: { 'application/json': { schema: { $ref: '#/components/schemas/Success' } } } },
+                    200: {
+                        description: 'Undeployed',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        message: { type: 'string', example: 'Cascade link undeployed' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     400: { description: 'Invalid link ID' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
@@ -1968,7 +2333,22 @@ Set your HTTP client timeout to at least **3 minutes**.
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     429: { $ref: '#/components/responses/RateLimited' },
-                    500: { description: 'Chain deploy failed' },
+                    500: {
+                        description: 'Chain deploy failed',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: false },
+                                        deployed: { type: 'integer' },
+                                        errors: { type: 'array', items: { type: 'string' } },
+                                        error: { type: 'string', description: 'Present on unhandled exceptions' },
+                                    },
+                                },
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -2008,7 +2388,7 @@ Set your HTTP client timeout to at least **3 minutes**.
                 requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['positions'], properties: { positions: { type: 'array', items: { type: 'object' } } } } } } },
                 responses: {
                     200: { description: 'Saved', content: { 'application/json': { schema: { $ref: '#/components/schemas/Success' } } } },
-                    400: { description: '`positions` must be an array' },
+                    400: { description: 'positions must be an array', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, examples: { invalid: { value: { error: 'positions must be an array' } } } } } },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                 },
