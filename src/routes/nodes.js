@@ -8,18 +8,9 @@ const HyNode = require('../models/hyNodeModel');
 const HyUser = require('../models/hyUserModel');
 const ServerGroup = require('../models/serverGroupModel');
 const cryptoService = require('../services/cryptoService');
-const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
-
-/**
- * Инвалидация кэша при изменении нод
- */
-async function invalidateNodesCache() {
-    await cache.invalidateNodes();
-    await cache.invalidateAllSubscriptions();
-    await cache.invalidateDashboardCounts();
-}
+const { invalidateNodesCache } = require('../utils/helpers');
 
 /**
  * GET /nodes - Список всех нод
@@ -313,6 +304,8 @@ router.post('/:id/reset-status', requireScope('nodes:write'), async (req, res) =
             return res.status(404).json({ error: 'Node not found' });
         }
         
+        await invalidateNodesCache();
+        
         logger.info(`[Nodes API] Node ${node.name} status reset to online`);
         
         res.json({ success: true, message: 'Статус сброшен', node });
@@ -354,6 +347,8 @@ router.post('/:id/sync', requireScope('nodes:write'), async (req, res) => {
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
         }
+        
+        await invalidateNodesCache();
         
         const syncService = require('../services/syncService');
         syncService.updateNodeConfig(node).catch(err => {

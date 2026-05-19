@@ -18,6 +18,7 @@ const Settings = require('../models/settingsModel');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
+const { invalidateNodesCache } = require('../utils/helpers');
 const logger = require('../utils/logger');
 const axios = require('axios');
 const https = require('https');
@@ -294,16 +295,23 @@ class SyncService {
             const response = await this._agentRequest(node, 'GET', '/info');
             const data = response.data || {};
 
-            await HyNode.updateOne({ _id: node._id }, {
-                $set: {
-                    xrayVersion: data.xray_version || '',
-                    agentVersion: data.agent_version || '',
-                    agentStatus: 'online',
-                    agentLastSeen: new Date(),
-                    status: 'online',
-                    healthFailures: 0,
-                },
-            });
+            const prevNode = await HyNode.findOneAndUpdate(
+                { _id: node._id },
+                {
+                    $set: {
+                        xrayVersion: data.xray_version || '',
+                        agentVersion: data.agent_version || '',
+                        agentStatus: 'online',
+                        agentLastSeen: new Date(),
+                        status: 'online',
+                        healthFailures: 0,
+                    },
+                }
+            );
+
+            if (prevNode && prevNode.status !== 'online') {
+                await invalidateNodesCache();
+            }
 
             return { online: true, xrayVersion: data.xray_version };
         } catch (error) {
@@ -321,6 +329,7 @@ class SyncService {
 
             if (failures >= HEALTH_FAILURE_THRESHOLD && prevNode?.status === 'online') {
                 await HyNode.updateOne({ _id: node._id }, { $set: { status: 'offline', onlineUsers: 0 } });
+                await invalidateNodesCache();
                 webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: error.message });
                 logger.warn(`[Agent] ${node.name}: marked offline after ${failures} consecutive failures`);
             }
@@ -468,6 +477,7 @@ class SyncService {
                         lastError: genErr.message,
                     },
                 });
+                await invalidateNodesCache();
                 return false;
             }
             throw genErr;
@@ -593,6 +603,7 @@ class SyncService {
             const health = await this.checkXrayAgentHealth(node);
             if (!health.online && hasAgent) {
                 await HyNode.updateOne({ _id: node._id }, { $set: { status: 'error', lastSync: new Date(), healthFailures: 0 } });
+                await invalidateNodesCache();
                 return false;
             }
         } catch (_) {}
@@ -600,6 +611,7 @@ class SyncService {
         await HyNode.updateOne({ _id: node._id }, {
             $set: { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 },
         });
+        await invalidateNodesCache();
 
         logger.info(`[Xray Sync] Node ${node.name}: sync complete, ${users.length} users`);
         return true;
@@ -702,6 +714,7 @@ class SyncService {
             );
 
             if (prevNode && prevNode.status !== 'online') {
+                await invalidateNodesCache();
                 webhook.emit(webhook.EVENTS.NODE_ONLINE, { nodeId: node._id, name: node.name });
             }
 
@@ -721,6 +734,7 @@ class SyncService {
 
             if (failures >= HEALTH_FAILURE_THRESHOLD && prevNode?.status === 'online') {
                 await HyNode.updateOne({ _id: node._id }, { $set: { status: 'offline', onlineUsers: 0 } });
+                await invalidateNodesCache();
                 webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: error.message });
                 logger.warn(`[Agent] ${node.name}: marked offline after ${failures} consecutive failures`);
             }
@@ -847,6 +861,7 @@ class SyncService {
                         }
                     }
                 );
+                await invalidateNodesCache();
                 
                 logger.info(`[Sync] Node ${node.name}: config updated`);
                 return true;
@@ -859,6 +874,7 @@ class SyncService {
                 { _id: node._id },
                 { $set: { status: 'error', lastError: error.message, healthFailures: 0 } }
             );
+            await invalidateNodesCache();
             webhook.emit(webhook.EVENTS.NODE_ERROR, { nodeId: node._id, name: node.name, error: error.message });
             return false;
         } finally {
@@ -1020,6 +1036,7 @@ class SyncService {
             );
 
             if (prevNode && prevNode.status !== 'online') {
+                await invalidateNodesCache();
                 webhook.emit(webhook.EVENTS.NODE_ONLINE, { nodeId: node._id, name: node.name });
             }
             
@@ -1042,6 +1059,7 @@ class SyncService {
 
             if (failures >= HEALTH_FAILURE_THRESHOLD && prevNode?.status === 'online') {
                 await HyNode.updateOne({ _id: node._id }, { $set: { status: 'offline', onlineUsers: 0 } });
+                await invalidateNodesCache();
                 webhook.emit(webhook.EVENTS.NODE_OFFLINE, { nodeId: node._id, name: node.name, lastError: error.message });
                 logger.warn(`[Stats] ${node.name}: marked offline after ${failures} consecutive failures`);
             }

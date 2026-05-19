@@ -93,12 +93,57 @@ async function invalidateGroupsCache() {
     await cache.invalidateGroups();
 }
 
+async function invalidateNodesCache() {
+    await Promise.all([
+        cache.invalidateNodes(),
+        cache.invalidateAllSubscriptions(),
+        cache.invalidateDashboardCounts(),
+    ]);
+}
+
+async function invalidateUserCache(userId, subscriptionToken) {
+    const tasks = [
+        cache.invalidateUser(userId),
+        cache.clearDeviceIPs(userId),
+        cache.invalidateDashboardCounts(),
+    ];
+    if (subscriptionToken) {
+        tasks.push(cache.invalidateSubscription(subscriptionToken));
+    }
+    await Promise.all(tasks);
+}
+
+async function invalidateUsersBulkCache(users) {
+    if (!Array.isArray(users) || users.length === 0) {
+        await cache.invalidateDashboardCounts();
+        return;
+    }
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < users.length; i += BATCH_SIZE) {
+        const batch = users.slice(i, i + BATCH_SIZE);
+        const tasks = [];
+        for (const u of batch) {
+            if (!u || !u.userId) continue;
+            tasks.push(cache.invalidateUser(u.userId));
+            tasks.push(cache.clearDeviceIPs(u.userId));
+            if (u.subscriptionToken) {
+                tasks.push(cache.invalidateSubscription(u.subscriptionToken));
+            }
+        }
+        await Promise.all(tasks);
+    }
+    await cache.invalidateDashboardCounts();
+}
+
 module.exports = {
     getSettings,
     invalidateSettingsCache,
     getNodesByGroups,
     getActiveGroups,
     invalidateGroupsCache,
+    invalidateNodesCache,
+    invalidateUserCache,
+    invalidateUsersBulkCache,
     parseDurationSeconds,
     normalizeHopInterval,
 };

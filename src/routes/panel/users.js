@@ -6,11 +6,10 @@ const HyNode = require('../../models/hyNodeModel');
 const ServerGroup = require('../../models/serverGroupModel');
 const cryptoService = require('../../services/cryptoService');
 const syncService = require('../../services/syncService');
-const cache = require('../../services/cacheService');
 const hwidDeviceService = require('../../services/hwidDeviceService');
 const webhookService = require('../../services/webhookService');
 const { render } = require('./helpers');
-const { getActiveGroups, invalidateGroupsCache, getSettings } = require('../../utils/helpers');
+const { getActiveGroups, invalidateGroupsCache, getSettings, invalidateUserCache, invalidateNodesCache } = require('../../utils/helpers');
 const logger = require('../../utils/logger');
 
 // Whether the global HWID feature is enabled (permissive/strict).
@@ -227,6 +226,8 @@ router.post('/users', async (req, res) => {
             nodes: [],
         });
 
+        await invalidateUserCache(userId, newUser.subscriptionToken);
+
         if (newUser.enabled) {
             syncService.addUserToAllXrayNodes(newUser.toObject()).catch(err => {
                 logger.error(`[Panel] Xray addUser error for ${userId}: ${err.message}`);
@@ -333,12 +334,7 @@ router.post('/users/:userId', async (req, res) => {
 
         await HyUser.findOneAndUpdate({ userId: req.params.userId }, { $set: updates });
 
-        await cache.invalidateUser(req.params.userId);
-        if (user.subscriptionToken) {
-            await cache.invalidateSubscription(user.subscriptionToken);
-        }
-        await cache.clearDeviceIPs(req.params.userId);
-        await cache.invalidateDashboardCounts();
+        await invalidateUserCache(req.params.userId, user.subscriptionToken);
 
         const limitTouched = updates.maxDevices !== user.maxDevices;
         const modeChanged = updates.hwidMode !== undefined && updates.hwidMode !== user.hwidMode;
@@ -483,7 +479,10 @@ router.post('/groups', async (req, res) => {
             subscriptionTitle: subscriptionTitle?.trim() || '',
         });
         
-        await invalidateGroupsCache();
+        await Promise.all([
+            invalidateGroupsCache(),
+            invalidateNodesCache(),
+        ]);
         
         res.redirect('/panel/groups');
     } catch (error) {
@@ -510,7 +509,10 @@ router.post('/groups/:id', async (req, res) => {
             }
         });
         
-        await invalidateGroupsCache();
+        await Promise.all([
+            invalidateGroupsCache(),
+            invalidateNodesCache(),
+        ]);
         
         res.redirect('/panel/groups');
     } catch (error) {
@@ -527,7 +529,10 @@ router.post('/groups/:id/delete', async (req, res) => {
             ServerGroup.findByIdAndDelete(req.params.id),
         ]);
         
-        await invalidateGroupsCache();
+        await Promise.all([
+            invalidateGroupsCache(),
+            invalidateNodesCache(),
+        ]);
         
         res.redirect('/panel/groups');
     } catch (error) {

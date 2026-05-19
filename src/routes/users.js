@@ -9,24 +9,11 @@ const HyNode = require('../models/hyNodeModel');
 const UserDevice = require('../models/userDeviceModel');
 const ServerGroup = require('../models/serverGroupModel');
 const cryptoService = require('../services/cryptoService');
-const cache = require('../services/cacheService');
 const hwidDeviceService = require('../services/hwidDeviceService');
 const logger = require('../utils/logger');
-const { getNodesByGroups } = require('../utils/helpers');
+const { getNodesByGroups, invalidateUserCache, invalidateUsersBulkCache } = require('../utils/helpers');
 const { requireScope } = require('../middleware/auth');
 const webhook = require('../services/webhookService');
-
-/**
- * Инвалидация кэша пользователя
- */
-async function invalidateUserCache(userId, subscriptionToken) {
-    await cache.invalidateUser(userId);
-    if (subscriptionToken) {
-        await cache.invalidateSubscription(subscriptionToken);
-    }
-    await cache.clearDeviceIPs(userId);
-    await cache.invalidateDashboardCounts();
-}
 
 /**
  * Lazy-load syncService to avoid circular dependency
@@ -278,6 +265,8 @@ router.post('/', requireScope('users:write'), async (req, res) => {
         });
         
         await user.save();
+
+        await invalidateUserCache(userId, user.subscriptionToken);
 
         logger.info(`[Users API] Created user ${userId}, groups: ${userGroups.length}`);
         webhook.emit(webhook.EVENTS.USER_CREATED, { userId, username: username || '', groups: userGroups });
@@ -536,6 +525,7 @@ router.post('/sync-from-main', requireScope('users:write'), async (req, res) => 
         }
         
         let created = 0, updated = 0, errors = 0;
+        const changed = [];
         
         for (const userData of users) {
             try {
@@ -558,13 +548,14 @@ router.post('/sync-from-main', requireScope('users:write'), async (req, res) => 
                     
                     if (Object.keys(updates).length > 0) {
                         await HyUser.updateOne({ userId }, { $set: updates });
+                        changed.push({ userId, subscriptionToken: existing.subscriptionToken });
                         updated++;
                     }
                 } else {
                     // Создаём нового
                     const password = cryptoService.generatePassword(userId);
                     
-                    await HyUser.create({
+                    const createdUser = await HyUser.create({
                         userId,
                         username: username || '',
                         password,
@@ -572,12 +563,17 @@ router.post('/sync-from-main', requireScope('users:write'), async (req, res) => 
                         enabled: enabled || false,
                         nodes: [],
                     });
+                    changed.push({ userId, subscriptionToken: createdUser.subscriptionToken });
                     created++;
                 }
             } catch (err) {
                 logger.error(`[Sync] Error for userId ${userData.userId}: ${err.message}`);
                 errors++;
             }
+        }
+        
+        if (changed.length > 0) {
+            await invalidateUsersBulkCache(changed);
         }
         
         logger.info(`[Sync] Sync: created ${created}, updated ${updated}, errors ${errors}`);

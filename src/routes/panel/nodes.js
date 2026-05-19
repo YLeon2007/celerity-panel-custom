@@ -16,7 +16,7 @@ const cache = require('../../services/cacheService');
 const cascadeService = require('../../services/cascadeService');
 const statsService = require('../../services/statsService');
 const uaStatsService = require('../../services/uaStatsService');
-const { getActiveGroups } = require('../../utils/helpers');
+const { getActiveGroups, invalidateNodesCache } = require('../../utils/helpers');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 
@@ -217,10 +217,7 @@ router.patch('/nodes/reorder', async (req, res) => {
             return res.status(400).json({ success: false, error: `No nodes matched (${bulk.length} ops sent)` });
         }
 
-        await Promise.all([
-            cache.invalidateNodes(),
-            cache.invalidateAllSubscriptions(),
-        ]);
+        await invalidateNodesCache();
 
         res.json({ success: true, matched: result.matchedCount, modified: result.modifiedCount });
     } catch (error) {
@@ -335,11 +332,8 @@ router.post('/nodes', async (req, res) => {
 
         const newNode = await HyNode.create(nodeData);
         logger.info(`[Panel] Created ${nodeType} node ${name} (${ip})`);
-        // Invalidate active-nodes and all subscription caches so changes are reflected immediately
-        await Promise.all([
-            cache.invalidateNodes(),
-            cache.invalidateAllSubscriptions(),
-        ]);
+        // Invalidate active-nodes, subscription, and dashboard caches so changes are reflected immediately
+        await invalidateNodesCache();
         res.redirect(`/panel/nodes/${newNode._id}`);
     } catch (error) {
         logger.error(`[Panel] Create node error: ${error.message}`);
@@ -625,11 +619,8 @@ router.post('/nodes/:id', async (req, res) => {
             }
         }
 
-        // Invalidate active-nodes and all subscription caches so ranking/config changes apply immediately
-        await Promise.all([
-            cache.invalidateNodes(),
-            cache.invalidateAllSubscriptions(),
-        ]);
+        // Invalidate active-nodes, subscription, and dashboard caches so ranking/config changes apply immediately
+        await invalidateNodesCache();
         res.redirect('/panel/nodes');
     } catch (error) {
         logger.error(`[Panel] Update node error: ${error.message}`);
@@ -675,6 +666,7 @@ router.post('/nodes/:id/setup', async (req, res) => {
             if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
             if (node.cascadeRole === 'bridge') updateFields.status = 'offline';
             await HyNode.findByIdAndUpdate(req.params.id, { $set: updateFields });
+            await invalidateNodesCache();
 
             if (node.type === 'xray' && node.cascadeRole !== 'bridge') {
                 const CascadeLink = require('../../models/cascadeLinkModel');
@@ -696,6 +688,7 @@ router.post('/nodes/:id/setup', async (req, res) => {
             await HyNode.findByIdAndUpdate(req.params.id, { 
                 $set: { status: 'error', lastError: result.error, healthFailures: 0 } 
             });
+            await invalidateNodesCache();
             res.status(500).json({ success: false, error: result.error, logs: result.logs || [] });
         }
     } catch (error) {
@@ -944,6 +937,7 @@ router.post('/nodes/:id/outbounds', async (req, res) => {
         await HyNode.findByIdAndUpdate(req.params.id, {
             $set: { outbounds, aclRules },
         });
+        await invalidateNodesCache();
 
         // Auto-push config so ACL/outbound edits take effect without Auto Setup.
         syncService.schedulePush(req.params.id, { outbounds, aclRules });
@@ -1152,6 +1146,7 @@ router.post('/nodes/:id/restart', async (req, res) => {
         await HyNode.findByIdAndUpdate(req.params.id, {
             $set: { status: isActive ? 'online' : 'error', lastSync: new Date() }
         });
+        await invalidateNodesCache();
 
         res.json({ success: isActive, output: result.output });
     } catch (error) {

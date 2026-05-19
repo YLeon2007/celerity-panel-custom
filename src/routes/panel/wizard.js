@@ -17,11 +17,10 @@ const Settings = require('../../models/settingsModel');
 const cryptoService = require('../../services/cryptoService');
 const sshKeyService = require('../../services/sshKeyService');
 const nodeSetup = require('../../services/nodeSetup');
-const cache = require('../../services/cacheService');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { invalidateOnboardingCache } = require('./helpers');
-const { invalidateGroupsCache } = require('../../utils/helpers');
+const { invalidateGroupsCache, invalidateNodesCache } = require('../../utils/helpers');
 
 // In-memory map of active bootstrap tasks: taskId -> { logs, done, error }
 const _bootstrapTasks = new Map();
@@ -130,8 +129,7 @@ async function ensureStarterAccessBundle(nodeIds) {
 
     await Promise.all([
         invalidateGroupsCache(),
-        cache.invalidateNodes(),
-        cache.invalidateAllSubscriptions(),
+        invalidateNodesCache(),
     ]);
 
     return {
@@ -319,10 +317,7 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
             }
         }
 
-        await Promise.all([
-            cache.invalidateNodes(),
-            cache.invalidateAllSubscriptions(),
-        ]);
+        await invalidateNodesCache();
 
         // Create a task and redirect to progress page
         const taskId = crypto.randomUUID();
@@ -355,6 +350,7 @@ async function _runBootstrap(taskId, nodeIds) {
     const pushLog = (line) => { task.logs.push(line); };
 
     let allSuccess = true;
+    let statusChanged = false;
 
     try {
         const starterBundle = await ensureStarterAccessBundle(nodeIds);
@@ -405,12 +401,18 @@ async function _runBootstrap(taskId, nodeIds) {
             const updateFields = { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 };
             if (node.type !== 'xray') updateFields.useTlsFiles = result.useTlsFiles;
             await HyNode.findByIdAndUpdate(nodeId, { $set: updateFields });
+            statusChanged = true;
             pushLog(`[OK] ${node.type.toUpperCase()} node setup completed`);
         } else {
             await HyNode.findByIdAndUpdate(nodeId, { $set: { status: 'error', lastError: result.error } });
+            statusChanged = true;
             pushLog(`[FAIL] ${node.type.toUpperCase()} node setup failed: ${result.error}`);
             allSuccess = false;
         }
+    }
+
+    if (statusChanged) {
+        await invalidateNodesCache();
     }
 
     if (allSuccess) {
