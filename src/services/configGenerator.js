@@ -617,12 +617,12 @@ function buildXrayStreamSettings(inbound, node = {}) {
                 key,
             }];
         } else {
-            // self-signed: cert lives as files on the remote node (nodeSetup
-            // generates them via openssl on install).
+            // acme + self-signed — cert files live on the node at fixed paths.
+            // node.paths is Hysteria-only, do not reuse here. Default catch-all.
             serverName = node.domain || node.sni || '';
             certificates = [{
-                certificateFile: node.paths?.cert || '/usr/local/etc/xray/cert.pem',
-                keyFile: node.paths?.key || '/usr/local/etc/xray/key.pem',
+                certificateFile: '/usr/local/etc/xray/cert.pem',
+                keyFile: '/usr/local/etc/xray/key.pem',
             }];
         }
         streamSettings.security = 'tls';
@@ -684,15 +684,23 @@ function buildXrayClients(users, inbound) {
  * main inbound and each item in `extraInbounds[]`.
  */
 function buildVlessInbound(inbound, users, node) {
+    const settings = {
+        clients: buildXrayClients(users, inbound),
+        decryption: 'none',
+    };
+
+    // VLESS fallbacks: TCP+TLS only per Xray spec.
+    const fallbackDest = (inbound.fallbackDest || '').trim();
+    if (fallbackDest && inbound.transport === 'tcp' && inbound.security === 'tls') {
+        settings.fallbacks = [{ dest: fallbackDest }];
+    }
+
     return {
         listen: '0.0.0.0',
         port: inbound.port || 443,
         protocol: 'vless',
         tag: inbound.inboundTag,
-        settings: {
-            clients: buildXrayClients(users, inbound),
-            decryption: 'none',
-        },
+        settings,
         streamSettings: buildXrayStreamSettings(inbound, node),
         sniffing: {
             enabled: true,
@@ -732,6 +740,7 @@ function generateXrayConfig(node, users) {
         xhttpPath: xray.xhttpPath,
         xhttpHost: xray.xhttpHost,
         xhttpMode: xray.xhttpMode,
+        fallbackDest: xray.fallbackDest,
     };
 
     const extraInbounds = Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [];

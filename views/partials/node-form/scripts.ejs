@@ -595,6 +595,15 @@ function onCascadeRoleChange() {
 
 // ==================== Xray UI ====================
 
+// VLESS fallbacks: tcp+tls only.
+function _refreshMainFallbackVisibility() {
+    const fb = document.getElementById('xrayFallbackGroup');
+    if (!fb) return;
+    const transport = document.getElementById('xrayTransport')?.value || 'tcp';
+    const security = document.getElementById('xraySecurity')?.value || 'reality';
+    fb.style.display = (transport === 'tcp' && security === 'tls') ? '' : 'none';
+}
+
 function updateXrayTransportUI() {
     const transport = document.getElementById('xrayTransport').value;
     document.getElementById('wsFields').style.display = transport === 'ws' ? '' : 'none';
@@ -602,6 +611,7 @@ function updateXrayTransportUI() {
     document.getElementById('xhttpFields').style.display = transport === 'xhttp' ? '' : 'none';
     const flowGroup = document.getElementById('xrayFlowGroup');
     if (flowGroup) flowGroup.style.display = transport === 'tcp' ? '' : 'none';
+    _refreshMainFallbackVisibility();
 }
 
 // True if main or any extra inbound uses TLS — drives #xrayTlsConfig visibility.
@@ -621,33 +631,35 @@ function updateXraySecurityUI() {
     document.getElementById('alpnGroup').style.display = security === 'tls' ? '' : 'none';
     const tlsConfig = document.getElementById('xrayTlsConfig');
     if (tlsConfig) tlsConfig.style.display = _anyXrayTlsInboundActive() ? '' : 'none';
+    _refreshMainFallbackVisibility();
     updateXrayTlsSourceUI();
 }
 
-// Picks one of three TLS-source sub-blocks based on the radio selection,
-// and toggles the shared #domainGroup in the network section so that
-// tlsSource==='manual' makes the operator domain field visible.
+// Picks one of four TLS-source sub-blocks; manual+acme also reveal #domainGroup.
 function updateXrayTlsSourceUI() {
     const proto = document.querySelector('input[name="type"]:checked')?.value || 'hysteria';
     const checked = document.querySelector('input[name="xray.tlsSource"]:checked');
     const source = checked ? checked.value : 'panel';
     const panelInfo = document.getElementById('xrayTlsPanelInfo');
+    const acmeBlock = document.getElementById('xrayTlsAcmeBlock');
     const manualBlock = document.getElementById('xrayTlsManualBlock');
     const selfSignedInfo = document.getElementById('xrayTlsSelfSignedInfo');
     if (panelInfo) panelInfo.style.display = source === 'panel' ? '' : 'none';
+    if (acmeBlock) acmeBlock.style.display = source === 'acme' ? '' : 'none';
     if (manualBlock) manualBlock.style.display = source === 'manual' ? '' : 'none';
     if (selfSignedInfo) selfSignedInfo.style.display = source === 'self-signed' ? '' : 'none';
 
-    // Domain visibility: hysteria always; xray only when manual TLS source.
+    // Domain visibility: hysteria always; xray only when manual/acme TLS source.
     const domainGroup = document.getElementById('domainGroup');
     const domainHintHy = document.getElementById('domainHintHysteria');
     const domainHintXr = document.getElementById('domainHintXrayManual');
     if (domainGroup) {
-        const showForXrayManual = (proto === 'xray' && _anyXrayTlsInboundActive() && source === 'manual');
+        const xrayNeedsDomain = (source === 'manual' || source === 'acme');
+        const showForXrayDomain = (proto === 'xray' && _anyXrayTlsInboundActive() && xrayNeedsDomain);
         const showForHysteria = (proto !== 'xray');
-        domainGroup.style.display = (showForXrayManual || showForHysteria) ? '' : 'none';
+        domainGroup.style.display = (showForXrayDomain || showForHysteria) ? '' : 'none';
         if (domainHintHy) domainHintHy.style.display = showForHysteria ? '' : 'none';
-        if (domainHintXr) domainHintXr.style.display = showForXrayManual ? '' : 'none';
+        if (domainHintXr) domainHintXr.style.display = showForXrayDomain ? '' : 'none';
     }
 }
 
@@ -799,6 +811,15 @@ function _findExtraCard(el) {
     return el.closest ? el.closest('details.extra-inbound-card') : null;
 }
 
+// VLESS fallbacks: tcp+tls only (extra inbound).
+function _refreshExtraFallbackVisibility(card) {
+    const fb = card.querySelector('.extra-fallback-group');
+    if (!fb) return;
+    const transport = card.querySelector('select[name="xray_extra_transport"]')?.value || 'tcp';
+    const security = card.querySelector('select[name="xray_extra_security"]')?.value || 'reality';
+    fb.style.display = (transport === 'tcp' && security === 'tls') ? '' : 'none';
+}
+
 function updateExtraXrayTransportUI(selectEl) {
     const card = _findExtraCard(selectEl);
     if (!card) return;
@@ -811,6 +832,7 @@ function updateExtraXrayTransportUI(selectEl) {
     if (grpc) grpc.style.display = transport === 'grpc' ? '' : 'none';
     if (xhttp) xhttp.style.display = transport === 'xhttp' ? '' : 'none';
     if (flow) flow.style.display = transport === 'tcp' ? '' : 'none';
+    _refreshExtraFallbackVisibility(card);
 }
 
 function updateExtraXraySecurityUI(selectEl) {
@@ -821,6 +843,7 @@ function updateExtraXraySecurityUI(selectEl) {
     const alpn = card.querySelector('.extra-alpn-group');
     if (reality) reality.style.display = security === 'reality' ? '' : 'none';
     if (alpn) alpn.style.display = security === 'tls' ? '' : 'none';
+    _refreshExtraFallbackVisibility(card);
     if (typeof updateXraySecurityUI === 'function') updateXraySecurityUI();
 }
 

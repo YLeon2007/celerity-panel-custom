@@ -79,7 +79,12 @@ function connectNodeSSH(node) {
 const XRAY_TRANSPORT_VALUES = ['tcp', 'ws', 'grpc', 'xhttp'];
 const XRAY_SECURITY_VALUES = ['reality', 'tls', 'none'];
 const XRAY_XHTTP_MODE_VALUES = ['auto', 'packet-up', 'stream-up', 'stream-one'];
-const XRAY_TLS_SOURCE_VALUES = ['panel', 'manual', 'self-signed'];
+const XRAY_TLS_SOURCE_VALUES = ['panel', 'acme', 'manual', 'self-signed'];
+
+const ACME_EMAIL_RE = /^(?=.{3,254}$)[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/;
+
+// VLESS fallbacks[].dest: port | host:port | [v6]:port | unix:/path
+const FALLBACK_DEST_RE = /^(?:\d{1,5}|[A-Za-z0-9._\-]{1,253}:\d{1,5}|\[[0-9A-Fa-f:]{2,45}\]:\d{1,5}|unix:\/[^\0\s]{1,250})$/;
 const XRAY_FINGERPRINT_VALUES = [
     'chrome', 'firefox', 'safari', 'ios', 'android',
     'edge', 'random', 'randomized',
@@ -145,6 +150,7 @@ function parseExtraInbounds(body) {
     const xhttpPaths = arr('xray_extra_xhttpPath');
     const xhttpHosts = arr('xray_extra_xhttpHost');
     const xhttpModes = arr('xray_extra_xhttpMode');
+    const fallbackDests = arr('xray_extra_fallbackDest');
 
     const result = [];
     for (let i = 0; i < idArr.length; i++) {
@@ -188,6 +194,7 @@ function parseExtraInbounds(body) {
             xhttpPath: String(xhttpPaths[i] || '/'),
             xhttpHost: String(xhttpHosts[i] || ''),
             xhttpMode: _pickEnum(xhttpModes[i], XRAY_XHTTP_MODE_VALUES, 'auto'),
+            fallbackDest: String(fallbackDests[i] || '').trim().slice(0, 253),
         };
         // Empty short-id list is invalid for Reality; restore the empty marker.
         if (inbound.realityShortIds.length === 0) inbound.realityShortIds = [''];
@@ -240,6 +247,10 @@ function parseXrayFormFields(body) {
     }
     if (body['xray.apiPort']) xray.apiPort = parseInt(body['xray.apiPort']) || 61000;
 
+    if (body['xray.fallbackDest'] !== undefined) {
+        xray.fallbackDest = String(body['xray.fallbackDest']).trim().slice(0, 253);
+    }
+
     // TLS source / manual cert+key (only meaningful when security==='tls').
     // Parsed unconditionally so toggling security back to tls preserves prior
     // operator input, and dropped server-side via validation when irrelevant.
@@ -255,6 +266,10 @@ function parseXrayFormFields(body) {
         // not retype the key. The route layer is responsible for replacing
         // this sentinel with the previously stored value before persisting.
         xray.manualKey = String(body['xray.manualKey']).replace(/\r\n?/g, '\n').trim();
+    }
+    if (body['xray.acmeEmail'] !== undefined) {
+        // Empty = fall back to panel-wide ACME_EMAIL at install time.
+        xray.acmeEmail = String(body['xray.acmeEmail']).trim().slice(0, 254);
     }
 
     // Always parse extra inbounds — pass [] explicitly when none submitted so
@@ -285,6 +300,19 @@ function validateXrayFormFields(xray, node) {
     // TLS-source-specific validation is independent of extra inbounds, run
     // it first so the early-return below does not mask manual-PEM mistakes.
     const tlsSecurity = (xray?.security === 'tls');
+    if (tlsSecurity && xray?.tlsSource === 'acme') {
+        const domain = String(node?.domain || '').trim().toLowerCase();
+        if (!domain) {
+            return 'ACME mode requires a domain — fill in the Domain field in the Network section.';
+        }
+        if (!HOSTNAME_RE.test(domain)) {
+            return 'ACME mode: domain looks invalid (expected an FQDN like node1.example.com).';
+        }
+        const email = String(xray?.acmeEmail || '').trim();
+        if (email && !ACME_EMAIL_RE.test(email)) {
+            return 'ACME mode: email looks invalid (expected admin@example.com).';
+        }
+    }
     if (tlsSecurity && xray?.tlsSource === 'manual') {
         const domain = String(node?.domain || '').trim().toLowerCase();
         if (!domain) {
@@ -343,6 +371,17 @@ function validateXrayFormFields(xray, node) {
         }
     }
 
+    const validateFallbackDest = (value, label) => {
+        const v = String(value || '').trim();
+        if (!v) return null;
+        if (!FALLBACK_DEST_RE.test(v)) {
+            return `${label}: fallback dest "${v}" is invalid (expected port / host:port / [v6]:port / unix:/path).`;
+        }
+        return null;
+    };
+    const mainFallbackErr = validateFallbackDest(xray?.fallbackDest, 'Main inbound');
+    if (mainFallbackErr) return mainFallbackErr;
+
     if (!xray || !Array.isArray(xray.extraInbounds) || xray.extraInbounds.length === 0) {
         return null;
     }
@@ -388,6 +427,8 @@ function validateXrayFormFields(xray, node) {
         if (!XRAY_SECURITY_VALUES.includes(inbound.security)) {
             return `Extra inbound #${idx}: invalid security`;
         }
+        const extraFallbackErr = validateFallbackDest(inbound.fallbackDest, `Extra inbound #${idx}`);
+        if (extraFallbackErr) return extraFallbackErr;
         // Reality private key is auto-generated server-side when missing
         // (see ensureExtraInboundReality in panel/nodes.js), so we do NOT
         // reject submissions with empty privateKey here.

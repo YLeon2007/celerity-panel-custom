@@ -141,6 +141,9 @@ const xrayExtraInboundSchema = new mongoose.Schema({
     xhttpPath: { type: String, default: '/' },
     xhttpHost: { type: String, default: '' },
     xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up', 'stream-one'], default: 'auto' },
+
+    // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
+    fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
 }, { _id: false });
 
 const xrayConfigSchema = new mongoose.Schema({
@@ -176,15 +179,17 @@ const xrayConfigSchema = new mongoose.Schema({
     xhttpHost: { type: String, default: '' },
     xhttpMode: { type: String, enum: ['auto', 'packet-up', 'stream-up', 'stream-one'], default: 'auto' },
 
-    // TLS certificate provisioning strategy (only relevant when security==='tls'):
-    //   panel       — masquerade under PANEL_DOMAIN; LE cert read from panel disk
-    //                 (Caddy/Greenlock) and inlined into the node's config.json.
-    //                 Requires no cert files on the remote node.
-    //   manual      — operator pastes a custom domain (node.domain) plus full PEM
-    //                 cert + private key in the form; PEM is inlined into config.json.
-    //   self-signed — nodeSetup generates a self-signed cert on the node; client
-    //                 must connect with allowInsecure=true (testing only).
-    tlsSource: { type: String, enum: ['panel', 'manual', 'self-signed'], default: 'panel' },
+    // VLESS fallbacks[].dest — emitted only on tcp+tls; empty = no fallback.
+    fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
+
+    // TLS provisioning strategy (security==='tls'):
+    //   panel       — inline panel's LE cert (PANEL_DOMAIN); no node files.
+    //   acme        — acme.sh on node issues LE cert for node.domain; auto-renews.
+    //   manual      — operator pastes node.domain + PEM; inlined into config.json.
+    //   self-signed — openssl on node; client needs allowInsecure (testing only).
+    tlsSource: { type: String, enum: ['panel', 'acme', 'manual', 'self-signed'], default: 'panel' },
+    // Empty acmeEmail = use panel-wide ACME_EMAIL env var.
+    acmeEmail: { type: String, default: '' },
     // Public PEM (full chain) for tlsSource==='manual'. Stored as-is; safe to return.
     manualCert: { type: String, default: '' },
     // Private key PEM for tlsSource==='manual'. select:false → never returned by

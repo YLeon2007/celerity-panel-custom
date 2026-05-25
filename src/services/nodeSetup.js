@@ -785,6 +785,95 @@ mkdir -p /usr/local/etc/xray
 echo "Done: Directory /usr/local/etc/xray ready"
 `;
 
+// ACME (acme.sh) setup for tlsSource='acme': issue LE cert for `domain` via
+// HTTP-01 standalone, install to /usr/local/etc/xray/{cert,key}.pem, register
+// acme.sh cron for autonomous renewal. Inputs sanitized at the call-site.
+function buildAcmeSetupScript({ domain, email, nodeIp }) {
+    const safe = (raw, allowed, max) => String(raw || '').replace(allowed, '').slice(0, max);
+    const d = safe(domain, /[^A-Za-z0-9.\-]/g, 253);
+    const e = safe(email, /[^A-Za-z0-9.\-_+@]/g, 254);
+    const ip = safe(nodeIp, /[^A-Za-z0-9.:]/g, 45);
+    if (!d) throw new Error('buildAcmeSetupScript: domain is required');
+    if (!e) throw new Error('buildAcmeSetupScript: email is required');
+
+    return `#!/bin/bash
+set -e
+DOMAIN="${d}"
+EMAIL="${e}"
+NODE_IP="${ip}"
+CERT_PATH=/usr/local/etc/xray/cert.pem
+KEY_PATH=/usr/local/etc/xray/key.pem
+
+echo "=== ACME setup for \${DOMAIN} ==="
+
+# Pre-flight 1: domain must resolve (warn on mismatch, fail on no resolution).
+RESOLVED=$(getent hosts "\${DOMAIN}" 2>/dev/null | awk '{print $1; exit}' || true)
+if [ -z "\${RESOLVED}" ]; then
+    echo "ERROR: DNS resolution failed for \${DOMAIN}. Set an A record pointing to \${NODE_IP} before retrying."
+    exit 11
+fi
+if [ "\${RESOLVED}" != "\${NODE_IP}" ] && [ -n "\${NODE_IP}" ]; then
+    echo "WARN: \${DOMAIN} resolves to \${RESOLVED}, expected \${NODE_IP}. Continuing — anycast/CDN may legitimately differ."
+fi
+
+# Pre-flight 2: port 80 must be free for HTTP-01 standalone.
+if ss -tlnH 'sport = :80' 2>/dev/null | grep -q LISTEN; then
+    echo "ERROR: Port 80 is busy on the node. Stop the listener (nginx/apache/caddy/etc.) and retry."
+    ss -tlnp 'sport = :80' 2>/dev/null || true
+    exit 12
+fi
+
+if [ ! -f "\${HOME}/.acme.sh/acme.sh" ]; then
+    echo "Installing acme.sh..."
+    if ! command -v curl &> /dev/null; then
+        apt-get update && apt-get install -y curl || yum install -y curl || apk add --no-cache curl
+    fi
+    curl -fsSL https://get.acme.sh | sh -s email="\${EMAIL}" >/dev/null 2>&1 || {
+        echo "ERROR: acme.sh installer failed."
+        exit 13
+    }
+fi
+ACME="\${HOME}/.acme.sh/acme.sh"
+
+# Pin CA to LE (acme.sh default has flipped between ZeroSSL and LE).
+"\${ACME}" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+# Skip --issue if cert already present; renewals run via acme.sh cron.
+CERT_FILE="\${HOME}/.acme.sh/\${DOMAIN}_ecc/\${DOMAIN}.cer"
+if [ ! -f "\${CERT_FILE}" ]; then
+    echo "Issuing LE cert for \${DOMAIN} via HTTP-01 standalone..."
+    "\${ACME}" --issue --standalone --server letsencrypt -d "\${DOMAIN}" --keylength ec-256
+else
+    echo "Existing cert present for \${DOMAIN}; skipping --issue (renewals run via acme.sh cron)."
+fi
+
+mkdir -p /usr/local/etc/xray
+
+# Xray runs as User=nobody; acme.sh writes as root → chown is required for the
+# unprivileged service to read the key. Re-applied via --reloadcmd on renewal.
+# 'nobody' primary group differs by distro (nogroup on Debian/Ubuntu).
+NOBODY_GROUP="\$(id -gn nobody 2>/dev/null || echo nobody)"
+RELOAD_CMD="chown 'nobody:\${NOBODY_GROUP}' '\${KEY_PATH}' '\${CERT_PATH}' 2>/dev/null || true; chmod 644 '\${CERT_PATH}' 2>/dev/null || true; chmod 600 '\${KEY_PATH}' 2>/dev/null || true; systemctl reload xray 2>/dev/null || systemctl restart xray 2>/dev/null || true"
+
+"\${ACME}" --install-cert -d "\${DOMAIN}" --ecc \\
+    --key-file       "\${KEY_PATH}" \\
+    --fullchain-file "\${CERT_PATH}" \\
+    --reloadcmd "\${RELOAD_CMD}"
+
+chown "nobody:\${NOBODY_GROUP}" "\${KEY_PATH}" "\${CERT_PATH}" 2>/dev/null || true
+chmod 644 "\${CERT_PATH}" 2>/dev/null || true
+chmod 600 "\${KEY_PATH}"  2>/dev/null || true
+
+if crontab -l 2>/dev/null | grep -q '\\.acme\\.sh/acme\\.sh.*--cron'; then
+    echo "Done: cert installed; acme.sh cron is active."
+else
+    echo "WARN: acme.sh cron entry missing — auto-renewal may not run. Re-run 'acme.sh --install-cronjob' on the node."
+fi
+
+echo "ACME setup completed for \${DOMAIN}"
+`;
+}
+
 /**
  * Generate x25519 keypair for Xray Reality LOCALLY (no SSH).
  * Uses Node's native crypto module (`crypto.generateKeyPairSync('x25519')`)
@@ -880,6 +969,16 @@ async function setupXrayNode(node, options = {}) {
             const msg = `Port conflict detected: Xray port ${nodePort} is already used by the panel (Caddy) on this server. ` +
                 `Use a different port (e.g. 8443) for the Xray node. ` +
                 `After changing the port, save the node and run Auto Setup again.`;
+            log(`ERROR: ${msg}`);
+            return { success: false, error: msg, logs, realityKeys: null };
+        }
+
+        // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
+        const xrayCfgEarly = node?.xray || {};
+        if (sameVps && xrayCfgEarly.security === 'tls' && xrayCfgEarly.tlsSource === 'acme') {
+            const msg = `tlsSource='acme' is incompatible with same-VPS deployment: ` +
+                `port 80 is held by the panel's Caddy and cannot be used for HTTP-01. ` +
+                `Switch the node to tlsSource='panel' (panel's LE cert is reused) or move the node to a separate VPS.`;
             log(`ERROR: ${msg}`);
             return { success: false, error: msg, logs, realityKeys: null };
         }
@@ -1018,6 +1117,24 @@ fi
             if (!certResult.success) {
                 log(`Self-signed cert generation warning: ${certResult.error}`);
             }
+        } else if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'acme') {
+            const domain = String(node.domain || '').trim();
+            const email = (String(xrayCfg.acmeEmail || '').trim()) ||
+                          (String(config.ACME_EMAIL || '').trim());
+            if (!domain) {
+                throw new Error('tlsSource=acme requires node.domain to be set in the Network section.');
+            }
+            if (!email) {
+                throw new Error('tlsSource=acme requires acmeEmail (or the panel-wide ACME_EMAIL env var).');
+            }
+            log(`TLS source: acme — installing acme.sh and issuing LE cert for ${domain}...`);
+            const acmeScript = buildAcmeSetupScript({ domain, email, nodeIp: node.ip });
+            const acmeResult = await execSSH(conn, acmeScript);
+            logs.push(acmeResult.output);
+            if (!acmeResult.success) {
+                throw new Error(`ACME setup failed: ${acmeResult.error || 'see logs above'}`);
+            }
+            log('ACME cert installed and auto-renewal cron registered on the node.');
         } else if (xrayCfg.security === 'tls') {
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }

@@ -343,11 +343,10 @@ function _xrayInboundName(node, inbound) {
  * Resolve TLS-related client knobs (server name, host header for transports
  * that masquerade as HTTP, allowInsecure flag) based on node.xray.tlsSource.
  *
- *   panel       → masquerade under PANEL_DOMAIN (Marzban-style); the cert is
- *                 the panel's LE cert inlined into config.json.
- *   manual      → use the operator-supplied node.domain (PEM is inlined too).
- *   self-signed → fall back to node.domain || node.sni and signal the client
- *                 to skip cert verification.
+ *   panel       → masquerade under PANEL_DOMAIN; panel's LE cert inlined.
+ *   acme        → cert on node (acme.sh); SNI=node.domain (same as manual).
+ *   manual      → operator-supplied node.domain; PEM inlined.
+ *   self-signed → node.domain || node.sni; allowInsecure=true.
  *
  * Returns { sni, host, allowInsecure } where any value may be empty.
  *
@@ -365,9 +364,9 @@ function _resolveXrayTlsClientHints(node) {
         // Operator forgot to set PANEL_DOMAIN — degrade gracefully to node fields.
         return { sni: fallbackSni, host: fallbackSni, allowInsecure: false, source: 'panel' };
     }
-    if (tlsSource === 'manual') {
+    if (tlsSource === 'manual' || tlsSource === 'acme') {
         const dom = (node?.domain || '').trim();
-        return { sni: dom, host: dom, allowInsecure: false, source: 'manual' };
+        return { sni: dom, host: dom, allowInsecure: false, source: tlsSource };
     }
     // self-signed
     return { sni: fallbackSni, host: fallbackSni, allowInsecure: true, source: 'self-signed' };
