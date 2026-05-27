@@ -132,9 +132,14 @@ const i18n = {
 
         if (persist) localStorage.setItem('settings-tab', tab.dataset.tab);
 
-        // Smooth-scroll into the active tab pill (mobile horizontal scroll)
+        // Smooth-scroll the active tab pill into view inside the tabbar only
+        // if it is partially off-screen. `inline:'nearest'` avoids forcing a
+        // horizontal page scroll when the tabbar already contains the pill —
+        // `inline:'center'` here would propagate the scroll up to the page
+        // root and shift the whole layout sideways when the tabbar barely
+        // overflows.
         try {
-            tab.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+            tab.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
         } catch (_) {}
     }
 
