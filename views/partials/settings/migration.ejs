@@ -62,6 +62,38 @@
         display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
     }
     #tab-migration .mig-state-banner.off { border-color: rgba(63,63,70,.9); background: rgba(255,255,255,.03); color: var(--text-secondary); }
+
+    #tab-migration .mig-command-card {
+        margin: 8px 0 16px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: rgba(0,0,0,.22);
+        overflow: hidden;
+    }
+    #tab-migration .mig-command-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--border);
+        background: rgba(255,255,255,.03);
+    }
+    #tab-migration .mig-command-title { font-size: 13px; font-weight: 700; color: var(--text); }
+    #tab-migration .mig-command-desc { margin: 6px 14px 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+    #tab-migration .mig-command {
+        margin: 10px 14px 14px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        background: rgba(0,0,0,.42);
+        border: 1px solid rgba(255,255,255,.06);
+        color: #d4d4d8;
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        white-space: pre;
+        overflow-x: auto;
+    }
     </style>
 
     <% const armed = !!(marzbanCfg && marzbanCfg.enabled); %>
@@ -152,6 +184,26 @@
                     <label><%= t('migration.jwtSecret') %></label>
                     <textarea id="mig-jwt" placeholder="<%= t('migration.jwtSecretPlaceholder') %>"></textarea>
                     <span class="hint"><%= t('migration.jwtSecretHint') %></span>
+                </div>
+
+                <div class="mig-command-card">
+                    <div class="mig-command-head">
+                        <div class="mig-command-title"><%= t('migration.jwtSecretCommandTitle') %></div>
+                        <button type="button" class="btn btn-secondary btn-sm" id="migCopySecretCommand">
+                            <i class="ti ti-copy"></i> <%= t('migration.copyCommand') %>
+                        </button>
+                    </div>
+                    <p class="mig-command-desc"><%= t('migration.jwtSecretCommandDesc') %></p>
+                    <pre class="mig-command" id="migSecretCommand">MARZBAN_CONTAINER="${MARZBAN_CONTAINER:-$(docker compose ps -q marzban 2>/dev/null || true)}"
+[ -n "$MARZBAN_CONTAINER" ] || MARZBAN_CONTAINER="$(docker ps --filter ancestor=gozargah/marzban --format '{{.Names}}' | head -n 1)"
+[ -n "$MARZBAN_CONTAINER" ] || MARZBAN_CONTAINER="$(docker ps --format '{{.Names}} {{.Image}}' | awk 'tolower($0) ~ /marzban/ {print $1; exit}')"
+[ -n "$MARZBAN_CONTAINER" ] || { echo "Marzban container not found" >&2; docker ps; exit 1; }
+docker exec -i "$MARZBAN_CONTAINER" bash -lc 'cd /code && python -' <<'PY'
+from app.db import GetDB, get_jwt_secret_key
+
+with GetDB() as db:
+    print(get_jwt_secret_key(db))
+PY</pre>
                 </div>
 
                 <h3 style="margin: 18px 0 4px;"><%= t('migration.mappingTitle') %></h3>
@@ -257,6 +309,8 @@
         activateFailed: <%- JSON.stringify(t('migration.activateFailed')) %>,
         activateSuccess:<%- JSON.stringify(t('migration.activateSuccess')) %>,
         disableFailed:  <%- JSON.stringify(t('migration.disableFailed')) %>,
+        copyCommand:    <%- JSON.stringify(t('migration.copyCommand')) %>,
+        copied:         <%- JSON.stringify(t('migration.copied')) %>,
     };
     const groupOptions = <%- JSON.stringify((migrationGroups || []).map(g => ({ id: String(g._id), name: g.name }))) %>;
 
@@ -283,6 +337,36 @@
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
         return data;
     }
+
+    function copyText(text) {
+        if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+            document.execCommand('copy');
+            return Promise.resolve();
+        } finally {
+            document.body.removeChild(ta);
+        }
+    }
+
+    $('#migCopySecretCommand')?.addEventListener('click', async () => {
+        const btn = $('#migCopySecretCommand');
+        const original = btn.innerHTML;
+        const command = $('#migSecretCommand')?.textContent || '';
+        try {
+            await copyText(command.trim());
+            btn.innerHTML = '<i class="ti ti-check"></i> ' + i18n.copied;
+            setTimeout(() => { btn.innerHTML = original; }, 1500);
+        } catch (_) {
+            btn.textContent = i18n.copyCommand;
+        }
+    });
 
     // ─── Step 1: Test connection ─────────────────────────────────────────────
     $('#migBtnTest').addEventListener('click', async () => {

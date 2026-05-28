@@ -386,12 +386,18 @@ class SyncService {
         const byNodes = await HyUser.find({ nodes: node._id, enabled: true }).lean();
         // Users linked via groups
         const nodeGroupIds = (node.groups || []).map(g => g._id?.toString() || g.toString());
+        const noExplicitNodes = {
+            $or: [
+                { nodes: { $size: 0 } },
+                { nodes: { $exists: false } },
+            ],
+        };
         let byGroups = [];
         if (nodeGroupIds.length > 0) {
-            byGroups = await HyUser.find({ groups: { $in: node.groups }, enabled: true, nodes: { $size: 0 } }).lean();
+            byGroups = await HyUser.find({ groups: { $in: node.groups }, enabled: true, ...noExplicitNodes }).lean();
         } else {
             // Node has no groups — all users without group assignment
-            byGroups = await HyUser.find({ enabled: true, nodes: { $size: 0 }, groups: { $size: 0 } }).lean();
+            byGroups = await HyUser.find({ enabled: true, groups: { $size: 0 }, ...noExplicitNodes }).lean();
         }
         // Merge and deduplicate by userId
         const seen = new Set();

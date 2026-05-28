@@ -18,6 +18,7 @@ const Settings = require('../../models/settingsModel');
 const cacheService = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const migrationService = require('../../services/marzbanMigrationService');
+const syncService = require('../../services/syncService');
 const logger = require('../../utils/logger');
 const { _isValidPath, PATH_BLACKLIST } = require('../marzbanCompat');
 
@@ -201,6 +202,13 @@ router.post('/migration/finalize', migrationLimiter, async (req, res) => {
         // Refresh the cached regex/secret + cacheService TTLs.
         const { reloadSettings } = require('../../../index');
         await reloadSettings();
+
+        // Xray nodes do not call the panel auth API on every connection like
+        // Hysteria does. They need a runtime/config sync so migrated users'
+        // xrayUuid values are pushed into Xray after the bulk import.
+        syncService.syncAllNodes().catch(err => {
+            logger.warn(`[Migration] Post-finalize sync failed: ${err.message}`);
+        });
 
         res.json({ ok: true });
     } catch (err) {

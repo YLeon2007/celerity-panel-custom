@@ -260,7 +260,14 @@ function _normalizeBaseUrl(raw) {
     let url = raw.trim();
     if (!url) return null;
     if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-    return url.replace(/\/+$/, '');
+    // Operators routinely paste the full dashboard URL (e.g.
+    // `https://host/dashboard/`) — Marzban's REST API always lives at the
+    // origin's root, so strip path / query / hash and keep only the origin.
+    try {
+        return new URL(url).origin;
+    } catch (_) {
+        return null;
+    }
 }
 
 function _buildClient(baseUrl, token) {
@@ -284,10 +291,25 @@ async function _authenticate(baseUrl, username, password) {
     const res = await axios.post(`${baseUrl}/api/admin/token`, body.toString(), {
         timeout: 20000,
         httpsAgent: _httpsAgent,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        // Accept JSON only — without this, a misrouted endpoint that returns
+        // HTML (e.g. when baseUrl points at /dashboard/ instead of origin)
+        // would deserialize as a string and surface as a cryptic "no
+        // access_token" error several layers up.
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept':       'application/json',
+        },
+        responseType: 'json',
     });
-    const token = res.data?.access_token;
-    if (!token) throw new Error('Marzban returned no access_token');
+
+    const data = res.data;
+    if (typeof data !== 'object' || data === null) {
+        throw new Error(`Marzban did not return JSON at ${baseUrl}/api/admin/token — check the panel URL (use the origin without /dashboard/).`);
+    }
+    const token = data.access_token;
+    if (!token) {
+        throw new Error('Marzban returned no access_token — verify the admin credentials.');
+    }
     return token;
 }
 
@@ -379,6 +401,7 @@ function _mapMarzbanUser(u, ctx) {
                 },
                 $setOnInsert: {
                     userId,
+                    nodes: [],
                     subscriptionToken: _newSubscriptionToken(userId),
                     password: crypto.randomBytes(16).toString('hex'),
                     xrayUuid: vlessUuid || crypto.randomUUID(),
