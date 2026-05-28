@@ -8,15 +8,6 @@
         <form method="POST" action="/panel/settings" id="happForm">
             <input type="hidden" name="_subscriptionSettings" value="1">
 
-            <%# Carry over all other subscription fields as hidden so the save handler =%>
-            <%# does not wipe them when only happ fields are submitted. =%>
-            <input type="hidden" name="subscription.supportUrl"     value="<%= settings?.subscription?.supportUrl || '' %>">
-            <input type="hidden" name="subscription.webPageUrl"     value="<%= settings?.subscription?.webPageUrl || '' %>">
-            <input type="hidden" name="subscription.logoUrl"        value="<%= settings?.subscription?.logoUrl || '' %>">
-            <input type="hidden" name="subscription.pageTitle"      value="<%= settings?.subscription?.pageTitle || '' %>">
-            <input type="hidden" name="subscription.updateInterval" value="<%= settings?.subscription?.updateInterval ?? 12 %>">
-            <input type="hidden" name="subscription.buttonsJson"    value="<%= JSON.stringify(settings?.subscription?.buttons || []) %>">
-
             <%# ======== Provider ID ======== %>
             <div class="form-group" style="margin-bottom: 1.5rem;">
                 <label><%= t('settings.subHappProviderId') || 'HAPP Provider ID' %></label>

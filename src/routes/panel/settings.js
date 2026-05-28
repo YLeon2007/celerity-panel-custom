@@ -177,80 +177,98 @@ router.post('/settings', async (req, res) => {
                 : [];
         }
 
-        // Subscription settings
+        // Subscription settings.
+        //
+        // The Subscription tab is split into multiple <form>s (subscription.ejs,
+        // happ.ejs, …), each carrying _subscriptionSettings=1. A submit from any
+        // of them must update ONLY the fields that the submitted form actually
+        // contains, never wipe fields owned by other cards. Hence every field
+        // below goes through setIfPresent — issue #80 was caused by unconditional
+        // assignment of subscription.happProviderId, which the main subscription
+        // card does not render and therefore silently reset on every save.
         if (req.body['_subscriptionSettings'] !== undefined) {
-            updates['subscription.supportUrl']     = req.body['subscription.supportUrl'] || '';
-            updates['subscription.webPageUrl']     = req.body['subscription.webPageUrl'] || '';
-            updates['subscription.happProviderId'] = req.body['subscription.happProviderId'] || '';
-            updates['subscription.logoUrl']        = req.body['subscription.logoUrl'] || '';
-            updates['subscription.pageTitle']      = req.body['subscription.pageTitle'] || '';
+            const trim = (v) => String(v || '');
+            setIfPresent('subscription.supportUrl',     trim);
+            setIfPresent('subscription.webPageUrl',     trim);
+            setIfPresent('subscription.happProviderId', trim);
+            setIfPresent('subscription.logoUrl',        trim);
+            setIfPresent('subscription.pageTitle',      trim);
 
-            const rawInterval = parseInt(req.body['subscription.updateInterval'], 10);
-            updates['subscription.updateInterval'] = isNaN(rawInterval) ? 12 : Math.min(168, Math.max(1, rawInterval));
+            setIfPresent('subscription.updateInterval', (v) => {
+                const n = parseInt(v, 10);
+                return Number.isNaN(n) ? 12 : Math.min(168, Math.max(1, n));
+            });
 
-            let parsedButtons = [];
-            try { parsedButtons = JSON.parse(req.body['subscription.buttonsJson'] || '[]'); } catch {}
-            if (!Array.isArray(parsedButtons)) parsedButtons = [];
-            updates['subscription.buttons'] = parsedButtons
-                .filter(b => b && b.label && b.url)
-                .slice(0, 10)
-                .map(b => ({ label: String(b.label).trim(), url: String(b.url).trim(), icon: String(b.icon || '').trim() }));
+            if (req.body['subscription.buttonsJson'] !== undefined) {
+                let parsedButtons = [];
+                try { parsedButtons = JSON.parse(req.body['subscription.buttonsJson'] || '[]'); } catch {}
+                if (!Array.isArray(parsedButtons)) parsedButtons = [];
+                updates['subscription.buttons'] = parsedButtons
+                    .filter(b => b && b.label && b.url)
+                    .slice(0, 10)
+                    .map(b => ({ label: String(b.label).trim(), url: String(b.url).trim(), icon: String(b.icon || '').trim() }));
+            }
 
-            // HAPP-specific settings (only when this request includes any subscription.happ.* field — avoids wiping HAPP when saving the main subscription card alone)
+            // HAPP-specific settings. Text/select fields use setIfPresent; for
+            // checkboxes we need the "card was submitted" signal (an absent
+            // checkbox means "unchecked", not "field missing").
             const hasHappInBody = Object.keys(req.body).some(k => k.startsWith('subscription.happ.'));
+
+            setIfPresent('subscription.happ.announce', (v) => String(v || '').trim().slice(0, 200));
+
             if (hasHappInBody) {
-                const VALID_PING_TYPES = ['', 'proxy', 'proxy-head', 'tcp', 'icmp'];
-                const rawPingType = req.body['subscription.happ.pingType'] || '';
-                updates['subscription.happ.announce']     = String(req.body['subscription.happ.announce'] || '').trim().slice(0, 200);
                 updates['subscription.happ.hideSettings'] = req.body['subscription.happ.hideSettings'] === 'on';
                 updates['subscription.happ.notifyExpire'] = req.body['subscription.happ.notifyExpire'] === 'on';
-                updates['subscription.happ.alwaysHwid']   = req.body['subscription.happ.alwaysHwid'] === 'on';
-                updates['subscription.happ.pingType']     = VALID_PING_TYPES.includes(rawPingType) ? rawPingType : '';
-                updates['subscription.happ.pingUrl']      = String(req.body['subscription.happ.pingUrl'] || '').trim().slice(0, 500);
-                updates['subscription.happ.colorProfile'] = (() => {
-                    const raw = String(req.body['subscription.happ.colorProfile'] || '').trim();
-                    if (!raw) return '';
-                    if (raw.length > 5120) return '';
-                    try {
-                        const parsed = JSON.parse(raw);
-                        if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) return '';
-                        return JSON.stringify(parsed);
-                    } catch {
-                        return '';
-                    }
-                })();
-
-                const VALID_HWID_MODES = ['off', 'permissive', 'strict'];
-                const rawHwidMode = String(req.body['subscription.happ.hwid.mode'] || 'off');
-                updates['subscription.happ.hwid.mode'] = VALID_HWID_MODES.includes(rawHwidMode) ? rawHwidMode : 'off';
-                const cleanDays = parseInt(req.body['subscription.happ.hwid.inactiveDeviceCleanupDays'], 10);
-                updates['subscription.happ.hwid.inactiveDeviceCleanupDays'] = Number.isFinite(cleanDays)
-                    ? Math.min(3650, Math.max(7, cleanDays))
-                    : 90;
-                const rl = parseInt(req.body['subscription.happ.hwid.upsertRateLimitPerMinute'], 10);
-                updates['subscription.happ.hwid.upsertRateLimitPerMinute'] = Number.isFinite(rl)
-                    ? Math.min(600, Math.max(1, rl))
-                    : 60;
-                updates['subscription.happ.hwid.maxDevicesAnnounce'] = String(
-                    req.body['subscription.happ.hwid.maxDevicesAnnounce'] || ''
-                ).trim().slice(0, 300);
-                // Multiline soft-block remarks. Each non-empty line becomes a
-                // separate fake server (parseRemarkLines in subscription.js
-                // dedupes and caps per-line length). Here we only normalize
-                // line endings and bound the total payload size to keep
-                // settings docs small.
-                const sanitizeRemark = (raw) => String(raw || '')
-                    .replace(/\r\n?/g, '\n')
-                    .replace(/[ \t]+\n/g, '\n')
-                    .trim()
-                    .slice(0, 1500);
-                updates['subscription.happ.hwid.notSupportedRemark'] = sanitizeRemark(
-                    req.body['subscription.happ.hwid.notSupportedRemark']
-                );
-                updates['subscription.happ.hwid.maxDevicesRemark'] = sanitizeRemark(
-                    req.body['subscription.happ.hwid.maxDevicesRemark']
-                );
+                updates['subscription.happ.alwaysHwid']   = req.body['subscription.happ.alwaysHwid']   === 'on';
             }
+
+            const VALID_PING_TYPES = ['', 'proxy', 'proxy-head', 'tcp', 'icmp'];
+            setIfPresent('subscription.happ.pingType', (v) => {
+                const raw = String(v || '');
+                return VALID_PING_TYPES.includes(raw) ? raw : '';
+            });
+            setIfPresent('subscription.happ.pingUrl', (v) => String(v || '').trim().slice(0, 500));
+            setIfPresent('subscription.happ.colorProfile', (v) => {
+                const raw = String(v || '').trim();
+                if (!raw) return '';
+                if (raw.length > 5120) return '';
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) return '';
+                    return JSON.stringify(parsed);
+                } catch {
+                    return '';
+                }
+            });
+
+            const VALID_HWID_MODES = ['off', 'permissive', 'strict'];
+            setIfPresent('subscription.happ.hwid.mode', (v) => {
+                const raw = String(v || 'off');
+                return VALID_HWID_MODES.includes(raw) ? raw : 'off';
+            });
+            setIfPresent('subscription.happ.hwid.inactiveDeviceCleanupDays', (v) => {
+                const n = parseInt(v, 10);
+                return Number.isFinite(n) ? Math.min(3650, Math.max(7, n)) : 90;
+            });
+            setIfPresent('subscription.happ.hwid.upsertRateLimitPerMinute', (v) => {
+                const n = parseInt(v, 10);
+                return Number.isFinite(n) ? Math.min(600, Math.max(1, n)) : 60;
+            });
+            setIfPresent('subscription.happ.hwid.maxDevicesAnnounce',
+                (v) => String(v || '').trim().slice(0, 300));
+
+            // Multiline soft-block remarks. Each non-empty line becomes a
+            // separate fake server (parseRemarkLines in subscription.js
+            // dedupes and caps per-line length). Here we only normalize
+            // line endings and bound the total payload size to keep
+            // settings docs small.
+            const sanitizeRemark = (raw) => String(raw || '')
+                .replace(/\r\n?/g, '\n')
+                .replace(/[ \t]+\n/g, '\n')
+                .trim()
+                .slice(0, 1500);
+            setIfPresent('subscription.happ.hwid.notSupportedRemark', sanitizeRemark);
+            setIfPresent('subscription.happ.hwid.maxDevicesRemark',   sanitizeRemark);
         }
 
         // Homepage mode (decoy/custom). File upload has its own endpoint.
