@@ -130,7 +130,7 @@ Object.assign(locals, {
             <div class="form-section" id="limitsSection">
                 <h3><%= t('nodes.sectionLimits') %></h3>
                 <div class="form-row">
-                    <div class="form-group hysteria-only" id="maxOnlineGroup" style="<%= node?.type === 'xray' ? 'display:none' : '' %>">
+                    <div class="form-group" id="maxOnlineGroup">
                         <label for="maxOnlineUsers"><%= t('nodes.maxOnlineUsers') %></label>
                         <input type="number" id="maxOnlineUsers" name="maxOnlineUsers"
                                value="<%= node?.maxOnlineUsers || 0 %>" placeholder="0" min="0">
