@@ -1,0 +1,82 @@
+# Hysteria Backend - LOCAL development (HTTP only, no domain/SSL required)
+#
+# For local testing on your laptop without a real domain or Let's Encrypt cert.
+# The backend serves plain HTTP on port 3000 (USE_CADDY=true skips Greenlock),
+# and the port is published directly so there is no reverse proxy in front.
+#
+# Run:   docker compose -f docker-compose.local.yml up -d
+# Open:  http://localhost:3000/panel
+#
+# NOT for production — there is no TLS. For production use docker-compose.yml
+# (Caddy) or docker-compose.hub.yml. You can override any value below via a .env
+# file in this directory.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: hysteria-redis-local
+    restart: unless-stopped
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - hysteria-net
+
+  mongo:
+    image: mongo:7
+    container_name: hysteria-mongo-local
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: hysteria
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hysteria}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-localdevpassword}
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - hysteria-net
+
+  backend:
+    build: .
+    container_name: hysteria-backend-local
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+    environment:
+      MONGO_URI: mongodb://${MONGO_USER:-hysteria}:${MONGO_PASSWORD:-localdevpassword}@mongo:27017/hysteria?authSource=admin
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+      # Serve plain HTTP on PORT instead of Greenlock HTTPS (no domain needed).
+      USE_CADDY: "true"
+      # Dev defaults so the panel boots without a .env. Override for anything real.
+      PANEL_DOMAIN: ${PANEL_DOMAIN:-localhost:3000}
+      ACME_EMAIL: ${ACME_EMAIL:-dev@example.com}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-localdevencryptionkey0123456789ab}
+      SESSION_SECRET: ${SESSION_SECRET:-localdevsessionsecret}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+    networks:
+      - hysteria-net
+
+networks:
+  hysteria-net:
+    driver: bridge
+
+volumes:
+  mongo_data:

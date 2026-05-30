@@ -61,6 +61,17 @@ docker compose up -d
 **3. Откройте** `https://ваш-домен/panel`
 > Планируете управлять панелью из AI-ассистента? См. [Гайд по настройке MCP](docs/mcp-user-guide.ru.md).
 
+**Локальная разработка (только HTTP, без домена и SSL):**
+
+Хотите попробовать панель на ноутбуке без публичного домена и сертификата? Используйте локальный compose-файл — он ставит `USE_CADDY=true` (обычный HTTP, без Greenlock/ACME) и публикует порт `3000` напрямую, с дев-дефолтами, так что запускается без `.env`:
+```bash
+git clone https://github.com/ClickDevTech/hysteria-panel.git
+cd hysteria-panel
+docker compose -f docker-compose.local.yml up -d
+# Откройте http://localhost:3000/panel
+```
+> Локальный режим **без TLS** и не для продакшена. Ссылки на подписки предполагают HTTPS, поэтому используйте его только для тестов UI/API.
+
 **Обязательные переменные `.env`:**
 
 ```env
@@ -914,6 +925,8 @@ volumes:
 | `MONGO_USER`         | ❌           | Пользователь MongoDB (default: hysteria)      |
 | `MONGO_URI`          | ❌           | URI подключения к MongoDB (для не-Docker)     |
 | `REDIS_URL`          | ❌           | URL Redis для кэша (default: память)          |
+| `USE_CADDY`          | ❌           | Отдавать HTTP на `PORT` за reverse-proxy вместо Greenlock HTTPS. Используется в `docker-compose.yml`/`docker-compose.dokploy.yml`. Не задано = standalone HTTPS через Greenlock (нужен реальный домен и публичные порты 80/443) |
+| `PORT`               | ❌           | HTTP-порт backend при `USE_CADDY=true` (default: `3000`) |
 | `PANEL_IP_WHITELIST` | ❌           | IP whitelist для панели                       |
 | `SYNC_INTERVAL`      | ❌           | Интервал синхронизации в минутах (default: 2) |
 | `API_DOCS_ENABLED`   | ❌           | Интерактивная документация на `/api/docs`     |

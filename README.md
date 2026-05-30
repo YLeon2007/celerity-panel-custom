@@ -61,6 +61,17 @@ docker compose up -d
 **3. Open** `https://your-domain/panel`
 > Planning to manage the panel from AI assistants? See [MCP Setup Guide](docs/mcp-user-guide.md).
 
+**Local development (HTTP only, no domain/SSL):**
+
+Want to try the panel on your laptop without a public domain or certificate? Use the local compose file — it sets `USE_CADDY=true` (plain HTTP, no Greenlock/ACME) and publishes port `3000` directly, with dev defaults so it boots without a `.env`:
+```bash
+git clone https://github.com/ClickDevTech/hysteria-panel.git
+cd hysteria-panel
+docker compose -f docker-compose.local.yml up -d
+# Open http://localhost:3000/panel
+```
+> Local mode has **no TLS** and is not for production. Subscription/share links assume HTTPS, so use it only for UI/API testing.
+
 **Required `.env` variables:**
 ```env
 PANEL_DOMAIN=panel.example.com
@@ -862,6 +873,8 @@ volumes:
 | `MONGO_USER` | ❌ | MongoDB user (default: hysteria) |
 | `MONGO_URI` | ❌ | MongoDB connection URI (for non-Docker) |
 | `REDIS_URL` | ❌ | Redis URL for cache (default: in-memory) |
+| `USE_CADDY` | ❌ | Serve plain HTTP on `PORT` behind a reverse proxy instead of Greenlock HTTPS. Used by `docker-compose.yml`/`docker-compose.dokploy.yml`. Unset = standalone HTTPS via Greenlock (needs a real domain + public ports 80/443) |
+| `PORT` | ❌ | Backend HTTP port when `USE_CADDY=true` (default: `3000`) |
 | `PANEL_IP_WHITELIST` | ❌ | IP whitelist for panel |
 | `SYNC_INTERVAL` | ❌ | Sync interval in minutes (default: 2) |
 | `API_DOCS_ENABLED` | ❌ | Enable interactive API docs at `/api/docs` |

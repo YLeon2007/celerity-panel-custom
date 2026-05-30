@@ -580,7 +580,9 @@ async function startServer() {
                 logger.info(`[Server] Panel: https://${config.PANEL_DOMAIN}/panel`);
             });
         } else {
-            // Standalone with Greenlock (for local development)
+            // Standalone HTTPS via Greenlock (requires a real public domain
+            // and reachable ports 80/443 for the ACME challenge).
+            // For local HTTP-only testing use USE_CADDY=true (docker-compose.local.yml).
         logger.info(`[Server] Starting HTTPS for ${config.PANEL_DOMAIN}`);
         
         const Greenlock = require('@root/greenlock-express');
