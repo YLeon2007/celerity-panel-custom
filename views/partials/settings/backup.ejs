@@ -1,7 +1,7 @@
 <!-- ==================== TAB: BACKUP ==================== -->
 <div class="tab-content" id="tab-backup">
-    <div class="row" style="align-items: stretch;">
-        <div class="col-6" style="display: flex;">
+    <div class="row" style="align-items: stretch; flex-direction: column; gap: 16px;">
+        <div style="display: flex; width: 100%;">
             <div class="card" style="flex: 1; display: flex; flex-direction: column;">
                 <div class="card-header">
                     <h2><i class="ti ti-device-floppy"></i> <%= t('settings.autoBackup') %></h2>
@@ -18,6 +18,10 @@
                         <small class="hint" style="display: block; margin-top: 6px;">
                             <%= t('settings.autoBackupHint') %>
                         </small>
+                        <div class="alert alert-info" style="margin-top: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.55;">
+                            <strong><%= t('settings.backupHowItWorksTitle') || 'Как это работает' %>:</strong>
+                            <div><%= t('settings.backupHowItWorks') || 'Автобэкап проверяется раз в час. Интервал считается от последнего успешного локального бэкапа. Для автоматической загрузки в S3 должны быть включены и «Автоматический бэкап», и «Загружать в S3».' %></div>
+                        </div>
 
                         <div id="backupSettings" style="margin-top: 14px; <%= settings?.backup?.enabled ? '' : 'display: none;' %>">
                             <div class="settings-grid">
@@ -45,6 +49,21 @@
                                     </span>
                                 </div>
                             </div>
+                        </div>
+
+                        <hr class="settings-divider">
+
+                        <div class="settings-subsection-title">
+                            <i class="ti ti-bolt"></i> <%= t('settings.backupActions') || 'Быстрые действия' %>
+                        </div>
+                        <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px;">
+                            <button type="button" class="btn" onclick="downloadBackupDb()">
+                                <i class="ti ti-device-floppy"></i> <%= t('dashboard.backupDb') || 'Backup DB' %>
+                            </button>
+                            <button type="button" class="btn" onclick="document.getElementById('settingsRestoreInput').click()">
+                                <i class="ti ti-download"></i> <%= t('dashboard.restoreDb') || 'Restore DB' %>
+                            </button>
+                            <input type="file" id="settingsRestoreInput" accept=".tar.gz,.tgz" style="display:none" onchange="restoreBackupFile(this)">
                         </div>
 
                         <hr class="settings-divider">
@@ -123,7 +142,7 @@
             </div>
         </div>
 
-        <div class="col-6" style="display: flex;">
+        <div style="display: flex; width: 100%;">
             <div class="card" style="flex: 1; display: flex; flex-direction: column;">
                 <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
                     <h2><i class="ti ti-clipboard-list"></i> <%= t('settings.backupsList') || 'Доступные бэкапы' %></h2>

@@ -423,6 +423,7 @@
 }
 </style>
 
+<script defer src="/js/backup-actions.js"></script>
 <script>
 const i18n = {
     noLogs: <%- JSON.stringify(t("dashboard.noLogs")) %>,
@@ -434,6 +435,7 @@ const i18n = {
     creatingBackup: <%- JSON.stringify(t("dashboard.creatingBackup")) %>,
     backupDownloaded: <%- JSON.stringify(t("dashboard.backupDownloaded")) %>,
     backupError: <%- JSON.stringify(t("dashboard.backupError")) %>,
+    s3UploadFailed: <%- JSON.stringify(t("settings.s3UploadFailed") || "S3 upload failed: {error}") %>,
     restoringDb: <%- JSON.stringify(t("dashboard.restoringDb")) %>,
     dbRestored: <%- JSON.stringify(t("dashboard.dbRestored")) %>,
     restoreConfirm: <%- JSON.stringify(t("dashboard.restoreConfirm")) %>
@@ -874,76 +876,11 @@ async function restartNode(nodeId) {
 }
 
 async function createBackup() {
-    showToast(i18n.creatingBackup);
-    try {
-        const res = await fetch('/panel/backup', { 
-            method: 'POST', 
-            credentials: 'include' 
-        });
-        
-        if (!res.ok) {
-            const data = await res.json();
-            showToast(i18n.error + ': ' + (data.error || 'unknown'), 'error');
-            return;
-        }
-        
-        const blob = await res.blob();
-        const contentDisposition = res.headers.get('Content-Disposition');
-        let filename = 'backup.tar.gz';
-        if (contentDisposition) {
-            const match = contentDisposition.match(/filename="?([^";\n]+)"?/);
-            if (match) filename = match[1];
-        }
-        
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-        
-        showToast(i18n.backupDownloaded);
-    } catch (e) {
-        showToast(i18n.backupError, 'error');
-    }
+    return window.CelerityBackupActions.downloadBackup({ i18n, showToast });
 }
 
 async function restoreBackup(input) {
-    const file = input.files[0];
-    if (!file) return;
-    
-    const confirmMsg = i18n.restoreConfirm.replace('{filename}', file.name);
-    if (!confirm(confirmMsg)) {
-        input.value = '';
-        return;
-    }
-    
-    showToast(i18n.restoringDb);
-    
-    const formData = new FormData();
-    formData.append('backup', file);
-    
-    try {
-        const res = await fetch('/panel/restore', { 
-            method: 'POST', 
-            credentials: 'include',
-            body: formData
-        });
-        const data = await res.json();
-        
-        if (data.success) {
-            showToast(i18n.dbRestored);
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            showToast(i18n.error + ': ' + (data.error || 'unknown'), 'error');
-        }
-    } catch (e) {
-        showToast(i18n.error + ' restore', 'error');
-    }
-    
-    input.value = '';
+    return window.CelerityBackupActions.restoreBackupFromFile(input, { i18n, showToast });
 }
 
 </script>

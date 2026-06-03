@@ -326,6 +326,9 @@ router.post('/settings', async (req, res) => {
         await Settings.update(updates);
         
         await invalidateSettingsCache();
+        if (req.body['_backupSettings'] || req.body['backup.enabled'] !== undefined) {
+            require('../../services/backupService').resetS3Client();
+        }
         try {
             if (cache.isConnected()) await cache.redis.del('panel:topHwidUsers');
         } catch (_e) { /* ignore */ }
@@ -690,6 +693,7 @@ router.post('/settings/create-backup', async (req, res) => {
             success: true,
             filename: result.filename,
             size: result.sizeMB,
+            s3: result.s3,
         });
     } catch (error) {
         logger.error(`[Backup] Manual backup error: ${error.message}`);
@@ -701,7 +705,7 @@ router.post('/settings/create-backup', async (req, res) => {
 router.post('/settings/test-s3', async (req, res) => {
     try {
         const backupService = require('../../services/backupService');
-        const { endpoint, region, bucket, accessKeyId, secretAccessKey } = req.body;
+        const { endpoint, region, bucket, prefix, accessKeyId, secretAccessKey } = req.body;
         
         if (!bucket || !accessKeyId || !secretAccessKey) {
             return res.status(400).json({ error: 'Bucket, Access Key и Secret Key обязательны' });
@@ -711,6 +715,7 @@ router.post('/settings/test-s3', async (req, res) => {
             endpoint,
             region: region || 'us-east-1',
             bucket,
+            prefix: prefix || 'backups',
             accessKeyId,
             secretAccessKey,
         });
@@ -754,7 +759,7 @@ router.get('/settings/backups-s3', async (req, res) => {
 });
 
 // GET /settings/backups/download - Download a local backup file
-// Query: ?name=hysteria-backup-YYYY-MM-DDTHH-mm-ss.tar.gz
+// Query: ?name=celerity-backup-YYYY-MM-DDTHH-mm-ss.tar.gz
 router.get('/settings/backups/download', async (req, res) => {
     try {
         const backupService = require('../../services/backupService');
@@ -808,8 +813,8 @@ router.get('/settings/backups-s3/download', async (req, res) => {
 
         // Sanity check: key must live in the configured prefix to prevent
         // arbitrary object reads from the bucket via this endpoint.
-        const prefix = (settings.backup.s3.prefix || 'backups').replace(/\/+$/, '');
-        if (!key.startsWith(`${prefix}/hysteria-backup-`) || !key.endsWith('.tar.gz')) {
+        const prefix = settings.backup.s3.prefix || 'backups';
+        if (!backupService.isBackupKeyForPrefix(key, prefix)) {
             return res.status(400).json({ error: 'Invalid backup key' });
         }
 
