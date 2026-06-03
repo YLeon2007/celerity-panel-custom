@@ -18,6 +18,10 @@
                         <small class="hint" style="display: block; margin-top: 6px;">
                             <%= t('settings.autoBackupHint') %>
                         </small>
+                        <div class="alert alert-info" style="margin-top: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.55;">
+                            <strong><%= t('settings.backupHowItWorksTitle') || 'Как это работает' %>:</strong>
+                            <div><%= t('settings.backupHowItWorks') || 'Автобэкап проверяется раз в час. Интервал считается от последнего успешного локального бэкапа. Для автоматической загрузки в S3 должны быть включены и «Автоматический бэкап», и «Загружать в S3».' %></div>
+                        </div>
 
                         <div id="backupSettings" style="margin-top: 14px; <%= settings?.backup?.enabled ? '' : 'display: none;' %>">
                             <div class="settings-grid">
@@ -50,6 +54,24 @@
                         <hr class="settings-divider">
 
                         <div class="settings-subsection-title">
+                            <i class="ti ti-bolt"></i> <%= t('settings.backupActions') || 'Быстрые действия' %>
+                        </div>
+                        <div style="display:flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px;">
+                            <button type="button" class="btn" onclick="downloadBackupDb()">
+                                <i class="ti ti-device-floppy"></i> <%= t('dashboard.backupDb') || 'Backup DB' %>
+                            </button>
+                            <button type="button" class="btn" onclick="document.getElementById('settingsRestoreInput').click()">
+                                <i class="ti ti-download"></i> <%= t('dashboard.restoreDb') || 'Restore DB' %>
+                            </button>
+                            <input type="file" id="settingsRestoreInput" accept=".tar.gz,.tgz" style="display:none" onchange="restoreBackupFile(this)">
+                        </div>
+                        <small class="hint" style="display:block; margin-top: 8px;">
+                            <%= t('settings.backupActionsHint') || 'Эти действия такие же, как на дашборде: создать свежий архив и скачать его, либо восстановить базу из загруженного .tar.gz/.tgz файла.' %>
+                        </small>
+
+                        <hr class="settings-divider">
+
+                        <div class="settings-subsection-title">
                             <i class="ti ti-cloud"></i> <%= t('settings.s3Settings') %>
                         </div>
 
@@ -60,6 +82,9 @@
                         </label>
                         <small class="hint" style="display: block; margin-top: 6px;">
                             <%= t('settings.s3EnabledHint') %>
+                        </small>
+                        <small class="hint" style="display: block; margin-top: 6px;">
+                            <%= t('settings.s3WriteTestHint') || 'Проверка S3 создаёт и удаляет маленький тестовый объект, чтобы подтвердить права на запись и очистку.' %>
                         </small>
 
                         <div id="s3Settings" style="margin-top: 14px; <%= settings?.backup?.s3?.enabled ? '' : 'display: none;' %>">

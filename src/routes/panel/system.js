@@ -9,13 +9,12 @@ const fs = require('fs');
 const fsp = fs.promises;
 const { createReadStream } = require('fs');
 const readline = require('readline');
-const { promisify } = require('util');
-const exec = promisify(require('child_process').exec);
 
 const HyNode = require('../../models/hyNodeModel');
+const Settings = require('../../models/settingsModel');
 const cache = require('../../services/cacheService');
+const backupService = require('../../services/backupService');
 const hostMetrics = require('../../services/hostMetricsService');
-const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { backupUpload } = require('./helpers');
 
@@ -191,27 +190,15 @@ router.get('/logs/search', async (req, res) => {
 // POST /panel/backup
 router.post('/backup', async (req, res) => {
     try {
-        const backupDir = path.join(__dirname, '../../../backups');
-        if (!fs.existsSync(backupDir)) {
-            fs.mkdirSync(backupDir, { recursive: true });
+        const settings = await Settings.get();
+        const result = await backupService.createBackup(settings);
+
+        if (result.s3?.enabled && !result.s3.success) {
+            res.setHeader('X-Celerity-S3-Status', 'failed');
+            res.setHeader('X-Celerity-S3-Error', encodeURIComponent(result.s3.error || 'unknown'));
         }
 
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupName = `hysteria-backup-${timestamp}`;
-        const backupPath = path.join(backupDir, backupName);
-        const archivePath = path.join(backupDir, `${backupName}.tar.gz`);
-
-        const mongoUri = config.MONGO_URI;
-        const dumpCmd = `mongodump --uri="${mongoUri}" --out="${backupPath}" --gzip`;
-
-        await exec(dumpCmd);
-        logger.info(`[Backup] Dump created: ${backupPath}`);
-
-        const tarCmd = `cd "${backupDir}" && tar -czf "${backupName}.tar.gz" "${backupName}" && rm -rf "${backupName}"`;
-        await exec(tarCmd);
-        logger.info(`[Backup] Archive created: ${archivePath}`);
-
-        res.download(archivePath, `${backupName}.tar.gz`, (err) => {
+        res.download(result.path, result.filename, (err) => {
             if (err) {
                 logger.error(`[Backup] Send error: ${err.message}`);
             }
@@ -228,63 +215,14 @@ router.post('/restore', backupUpload.single('backup'), async (req, res) => {
         return res.status(400).json({ error: 'Файл backup не загружен' });
     }
 
-    const uploadedFile = req.file.path;
-    const extractDir = path.join('/tmp', `restore-${Date.now()}`);
-
     try {
-        fs.mkdirSync(extractDir, { recursive: true });
-
-        await exec(`tar -xzf "${uploadedFile}" -C "${extractDir}"`);
-        logger.info(`[Restore] Archive extracted to ${extractDir}`);
-
-        const findDumpPath = (dir) => {
-            const items = fs.readdirSync(dir);
-
-            if (items.includes('hysteria') && fs.statSync(path.join(dir, 'hysteria')).isDirectory()) {
-                return dir;
-            }
-
-            if (items.length === 1 && fs.statSync(path.join(dir, items[0])).isDirectory()) {
-                return findDumpPath(path.join(dir, items[0]));
-            }
-
-            return dir;
-        };
-
-        const dumpPath = findDumpPath(extractDir);
-        logger.info(`[Restore] Dump path: ${dumpPath}`);
-
-        const dumpContents = fs.readdirSync(dumpPath);
-        logger.info(`[Restore] Dump contents: ${dumpContents.join(', ')}`);
-
-        const mongoUri = config.MONGO_URI;
-        const hysteriaDir = path.join(dumpPath, 'hysteria');
-        const restoreCmd = `mongorestore --uri="${mongoUri}" --drop --gzip --db=hysteria "${hysteriaDir}"`;
-
-        logger.info(`[Restore] DB folder: ${hysteriaDir}`);
-        logger.info(`[Restore] Command: ${restoreCmd.replace(mongoUri, 'MONGO_URI')}`);
-
-        const { stdout, stderr } = await exec(restoreCmd);
-        if (stdout) logger.info(`[Restore] stdout: ${stdout}`);
-        if (stderr) logger.info(`[Restore] stderr: ${stderr}`);
-
-        logger.info(`[Restore] Database restored successfully`);
-
-        fs.unlinkSync(uploadedFile);
-        await exec(`rm -rf "${extractDir}"`);
-
+        await backupService.restoreUploadedBackup(req.file.path, req.file.originalname);
         res.json({ success: true, message: 'База данных успешно восстановлена' });
     } catch (error) {
         logger.error(`[Restore] Error: ${error.message}`);
-        if (error.stdout) logger.error(`[Restore] stdout: ${error.stdout}`);
-        if (error.stderr) logger.error(`[Restore] stderr: ${error.stderr}`);
-
-        try {
-            if (fs.existsSync(uploadedFile)) fs.unlinkSync(uploadedFile);
-            await exec(`rm -rf "${extractDir}"`);
-        } catch (e) {}
-
         res.status(500).json({ error: error.message });
+    } finally {
+        await fsp.unlink(req.file.path).catch(() => {});
     }
 });
 

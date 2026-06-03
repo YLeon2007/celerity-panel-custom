@@ -68,6 +68,7 @@
 
 <div id="toast" class="toast"></div>
 
+<script defer src="/js/backup-actions.js"></script>
 <script>
 const i18n = {
     resetConfirm: <%- JSON.stringify(t("settings.resetConfirm")) %>,
@@ -91,6 +92,11 @@ const i18n = {
     creatingBackup: <%- JSON.stringify(t("settings.creatingBackup")) %>,
     backupCreated: <%- JSON.stringify(t("settings.backupCreated")) %>,
     backupError: <%- JSON.stringify(t("settings.backupError")) %>,
+    backupDownloaded: <%- JSON.stringify(t("dashboard.backupDownloaded") || "Backup downloaded") %>,
+    restoreUploadConfirm: <%- JSON.stringify(t("dashboard.restoreConfirm") || "Restore database from \"{filename}\"?") %>,
+    restoringDb: <%- JSON.stringify(t("dashboard.restoringDb") || "Restoring DB...") %>,
+    dbRestored: <%- JSON.stringify(t("dashboard.dbRestored") || "Database restored! Reloading...") %>,
+    s3UploadFailed: <%- JSON.stringify(t("settings.s3UploadFailed") || "S3 upload failed: {error}") %>,
     restoreConfirm: <%- JSON.stringify(t("settings.restoreConfirm") || "Восстановить из этого бэкапа? Текущие данные будут заменены!") %>,
     restoring: <%- JSON.stringify(t("settings.restoring") || "Восстановление...") %>,
     restored: <%- JSON.stringify(t("settings.restored") || "✓ База данных восстановлена! Перезагрузка...") %>,
@@ -182,6 +188,7 @@ async function testS3Connection() {
                 endpoint: document.getElementById('backup.s3.endpoint').value,
                 region: document.getElementById('backup.s3.region').value,
                 bucket: document.getElementById('backup.s3.bucket').value,
+                prefix: document.getElementById('backup.s3.prefix').value,
                 accessKeyId: document.getElementById('backup.s3.accessKeyId').value,
                 secretAccessKey: document.getElementById('backup.s3.secretAccessKey').value,
             })
@@ -219,7 +226,12 @@ async function createBackupNow() {
         const data = await res.json();
         
         if (data.success) {
-            showToast(i18n.backupCreated.replace('{filename}', data.filename).replace('{size}', data.size), 'success');
+            const message = i18n.backupCreated.replace('{filename}', data.filename).replace('{size}', data.size);
+            if (data.s3?.enabled && !data.s3.success) {
+                showToast(message + '. ' + i18n.s3UploadFailed.replace('{error}', data.s3.error || 'unknown'), 'warning');
+            } else {
+                showToast(message, 'success');
+            }
             document.getElementById('lastBackupTime').textContent = new Date().toLocaleString();
             loadBackupsList();
         } else {
@@ -231,6 +243,22 @@ async function createBackupNow() {
     
     btn.disabled = false;
     btn.textContent = i18n.createBackupNow;
+}
+
+async function downloadBackupDb() {
+    return window.CelerityBackupActions.downloadBackup({
+        i18n,
+        showToast,
+        onSuccess: () => loadBackupsList(),
+    });
+}
+
+async function restoreBackupFile(input) {
+    return window.CelerityBackupActions.restoreBackupFromFile(input, {
+        i18n,
+        showToast,
+        reloadDelay: 1500,
+    });
 }
 
 async function loadBackupsList() {

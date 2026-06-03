@@ -29,7 +29,7 @@ const backupUpload = multer({
         if (file.originalname.endsWith('.tar.gz') || file.originalname.endsWith('.tgz')) {
             cb(null, true);
         } else {
-            cb(new Error('Only .tar.gz files are allowed'));
+            cb(new Error('Only .tar.gz or .tgz files are allowed'));
         }
     }
 });

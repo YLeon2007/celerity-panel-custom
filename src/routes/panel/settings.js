@@ -326,6 +326,9 @@ router.post('/settings', async (req, res) => {
         await Settings.update(updates);
         
         await invalidateSettingsCache();
+        if (req.body['_backupSettings'] || req.body['backup.enabled'] !== undefined) {
+            require('../../services/backupService').resetS3Client();
+        }
         try {
             if (cache.isConnected()) await cache.redis.del('panel:topHwidUsers');
         } catch (_e) { /* ignore */ }
@@ -690,6 +693,7 @@ router.post('/settings/create-backup', async (req, res) => {
             success: true,
             filename: result.filename,
             size: result.sizeMB,
+            s3: result.s3,
         });
     } catch (error) {
         logger.error(`[Backup] Manual backup error: ${error.message}`);
@@ -701,7 +705,7 @@ router.post('/settings/create-backup', async (req, res) => {
 router.post('/settings/test-s3', async (req, res) => {
     try {
         const backupService = require('../../services/backupService');
-        const { endpoint, region, bucket, accessKeyId, secretAccessKey } = req.body;
+        const { endpoint, region, bucket, prefix, accessKeyId, secretAccessKey } = req.body;
         
         if (!bucket || !accessKeyId || !secretAccessKey) {
             return res.status(400).json({ error: 'Bucket, Access Key и Secret Key обязательны' });
@@ -711,6 +715,7 @@ router.post('/settings/test-s3', async (req, res) => {
             endpoint,
             region: region || 'us-east-1',
             bucket,
+            prefix: prefix || 'backups',
             accessKeyId,
             secretAccessKey,
         });

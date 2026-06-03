@@ -7,6 +7,7 @@ const { promisify } = require('util');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
+const crypto = require('crypto');
 const config = require('../../config');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
@@ -26,6 +27,15 @@ function getDbName() {
 
 // Lazy-load S3 client (only when needed)
 let s3Client = null;
+
+function normalizeS3Prefix(prefix) {
+    return String(prefix || 'backups').trim().replace(/^\/+|\/+$/g, '');
+}
+
+function buildS3Key(prefix, fileName) {
+    const normalizedPrefix = normalizeS3Prefix(prefix);
+    return normalizedPrefix ? `${normalizedPrefix}/${fileName}` : fileName;
+}
 
 function getS3Client(settings) {
     if (!s3Client && settings?.backup?.s3?.enabled) {
@@ -76,8 +86,27 @@ async function createBackup(settings) {
         const stats = await fs.stat(archivePath);
         const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
 
+        let s3 = {
+            enabled: !!settings?.backup?.s3?.enabled,
+            success: false,
+            skipped: !settings?.backup?.s3?.enabled,
+            key: null,
+            error: null,
+        };
+
         if (settings?.backup?.s3?.enabled) {
-            await uploadToS3(archivePath, `${backupName}.tar.gz`, settings);
+            try {
+                s3 = await uploadToS3(archivePath, `${backupName}.tar.gz`, settings);
+            } catch (error) {
+                s3 = {
+                    enabled: true,
+                    success: false,
+                    skipped: false,
+                    key: null,
+                    error: error.message,
+                };
+                logger.error(`[Backup] S3 upload error: ${error.message}`);
+            }
         }
 
         const keepLast = settings?.backup?.keepLast || 7;
@@ -94,6 +123,7 @@ async function createBackup(settings) {
             path: archivePath,
             size: stats.size,
             sizeMB: parseFloat(sizeMB),
+            s3,
         };
 
     } catch (error) {
@@ -113,40 +143,40 @@ async function createBackup(settings) {
 async function uploadToS3(filePath, fileName, settings) {
     const client = getS3Client(settings);
     if (!client) {
-        logger.warn('[Backup] S3 client not available, skipping upload');
-        return;
+        throw new Error('S3 client not available');
     }
-    
-    try {
-        const { PutObjectCommand } = require('@aws-sdk/client-s3');
-        const fileStream = fsSync.createReadStream(filePath);
-        const stats = await fs.stat(filePath);
-        
-        const bucket = settings.backup.s3.bucket;
-        const prefix = settings.backup.s3.prefix || 'backups';
-        const key = `${prefix}/${fileName}`;
-        
-        logger.info(`[Backup] Uploading to S3: ${bucket}/${key}`);
-        
-        await client.send(new PutObjectCommand({
-            Bucket: bucket,
-            Key: key,
-            Body: fileStream,
-            ContentLength: stats.size,
-            ContentType: 'application/gzip',
-        }));
-        
-        logger.info(`[Backup] Uploaded to S3: ${key}`);
-        
-        // Rotate in S3 if configured
-        if (settings.backup.s3.keepLast) {
-            await rotateS3Backups(settings);
-        }
-        
-    } catch (error) {
-        logger.error(`[Backup] S3 upload error: ${error.message}`);
-        // Do not abort - local backup was created
+
+    const { PutObjectCommand } = require('@aws-sdk/client-s3');
+    const fileStream = fsSync.createReadStream(filePath);
+    const stats = await fs.stat(filePath);
+
+    const bucket = settings.backup.s3.bucket;
+    const key = buildS3Key(settings.backup.s3.prefix, fileName);
+
+    logger.info(`[Backup] Uploading to S3: ${bucket}/${key}`);
+
+    await client.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: fileStream,
+        ContentLength: stats.size,
+        ContentType: 'application/gzip',
+    }));
+
+    logger.info(`[Backup] Uploaded to S3: ${key}`);
+
+    // Rotate in S3 if configured
+    if (settings.backup.s3.keepLast) {
+        await rotateS3Backups(settings);
     }
+
+    return {
+        enabled: true,
+        success: true,
+        skipped: false,
+        key,
+        error: null,
+    };
 }
 
 /**
@@ -160,13 +190,13 @@ async function rotateS3Backups(settings) {
         const { ListObjectsV2Command, DeleteObjectCommand } = require('@aws-sdk/client-s3');
         
         const bucket = settings.backup.s3.bucket;
-        const prefix = settings.backup.s3.prefix || 'backups';
+        const prefix = normalizeS3Prefix(settings.backup.s3.prefix);
         const keepLast = settings.backup.s3.keepLast || 7;
         
         // List objects
         const listResult = await client.send(new ListObjectsV2Command({
             Bucket: bucket,
-            Prefix: `${prefix}/hysteria-backup-`,
+            Prefix: buildS3Key(prefix, 'hysteria-backup-'),
         }));
         
         if (!listResult.Contents || listResult.Contents.length <= keepLast) {
@@ -303,7 +333,12 @@ async function scheduledBackup() {
  */
 async function testS3Connection(s3Config) {
     try {
-        const { S3Client, ListBucketsCommand } = require('@aws-sdk/client-s3');
+        const {
+            S3Client,
+            HeadBucketCommand,
+            PutObjectCommand,
+            DeleteObjectCommand,
+        } = require('@aws-sdk/client-s3');
         
         const client = new S3Client({
             region: s3Config.region || 'us-east-1',
@@ -315,10 +350,25 @@ async function testS3Connection(s3Config) {
             forcePathStyle: !!s3Config.endpoint,
         });
         
-        // Check bucket access
-        const { HeadBucketCommand } = require('@aws-sdk/client-s3');
         await client.send(new HeadBucketCommand({ Bucket: s3Config.bucket }));
-        
+
+        const testKey = buildS3Key(
+            s3Config.prefix || 'backups',
+            `.celerity-s3-test-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.txt`
+        );
+
+        await client.send(new PutObjectCommand({
+            Bucket: s3Config.bucket,
+            Key: testKey,
+            Body: 'celerity-s3-write-test',
+            ContentType: 'text/plain',
+        }));
+
+        await client.send(new DeleteObjectCommand({
+            Bucket: s3Config.bucket,
+            Key: testKey,
+        }));
+
         return { success: true };
         
     } catch (error) {
@@ -342,11 +392,11 @@ async function listS3Backups(settings) {
         const { ListObjectsV2Command } = require('@aws-sdk/client-s3');
         
         const bucket = settings.backup.s3.bucket;
-        const prefix = settings.backup.s3.prefix || 'backups';
+        const prefix = normalizeS3Prefix(settings.backup.s3.prefix);
         
         const result = await client.send(new ListObjectsV2Command({
             Bucket: bucket,
-            Prefix: `${prefix}/hysteria-backup-`,
+            Prefix: buildS3Key(prefix, 'hysteria-backup-'),
         }));
         
         if (!result.Contents) {
@@ -421,14 +471,14 @@ async function downloadFromS3(settings, key) {
     }
     
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
-    const { Readable } = require('stream');
     
     const bucket = settings.backup.s3.bucket;
     const fileName = path.basename(key);
     if (!fileName || fileName === '.' || fileName === '..') {
         throw new Error('Invalid S3 key');
     }
-    const localPath = path.join(__dirname, '../../backups', fileName);
+    const localPath = path.join('/tmp', `celerity-s3-restore-${Date.now()}-${fileName}`);
+    await fs.mkdir(path.dirname(localPath), { recursive: true });
     
     logger.info(`[Backup] Downloading from S3: ${key}`);
     
@@ -452,28 +502,9 @@ async function downloadFromS3(settings, key) {
 }
 
 /**
- * Restore from backup (local or S3)
+ * Restore database from an extracted archive path.
  */
-async function restoreBackup(settings, source, identifier) {
-    let archivePath;
-    let tempDownload = false;
-
-    if (source === 's3') {
-        archivePath = await downloadFromS3(settings, identifier);
-        tempDownload = true;
-    } else {
-        const safeName = path.basename(identifier);
-        if (!safeName || safeName === '.' || safeName === '..') {
-            throw new Error('Invalid backup identifier');
-        }
-        archivePath = path.join(__dirname, '../../backups', safeName);
-        try {
-            await fs.access(archivePath);
-        } catch {
-            throw new Error('Backup file not found');
-        }
-    }
-
+async function restoreArchive(archivePath, source, identifier) {
     const extractDir = path.join('/tmp', `restore-${Date.now()}`);
 
     try {
@@ -527,6 +558,59 @@ async function restoreBackup(settings, source, identifier) {
     }
 }
 
+/**
+ * Restore from backup (local or S3)
+ */
+async function restoreBackup(settings, source, identifier) {
+    let archivePath;
+    let tempDownload = false;
+
+    if (source === 's3') {
+        archivePath = await downloadFromS3(settings, identifier);
+        tempDownload = true;
+    } else {
+        const safeName = path.basename(identifier);
+        if (!safeName || safeName === '.' || safeName === '..') {
+            throw new Error('Invalid backup identifier');
+        }
+        archivePath = path.join(__dirname, '../../backups', safeName);
+        try {
+            await fs.access(archivePath);
+        } catch {
+            throw new Error('Backup file not found');
+        }
+    }
+
+    try {
+        return await restoreArchive(archivePath, source, identifier);
+    } finally {
+        if (tempDownload) {
+            await fs.unlink(archivePath).catch(() => {});
+        }
+    }
+}
+
+/**
+ * Restore from an uploaded archive file.
+ */
+async function restoreUploadedBackup(filePath, originalName) {
+    const safeName = path.basename(originalName || filePath || '');
+    if (!safeName || safeName === '.' || safeName === '..') {
+        throw new Error('Invalid backup file');
+    }
+    if (!safeName.endsWith('.tar.gz') && !safeName.endsWith('.tgz')) {
+        throw new Error('Only .tar.gz files are allowed');
+    }
+
+    try {
+        await fs.access(filePath);
+    } catch {
+        throw new Error('Backup file not found');
+    }
+
+    return restoreArchive(filePath, 'upload', safeName);
+}
+
 module.exports = {
     createBackup,
     listBackups,
@@ -535,6 +619,7 @@ module.exports = {
     getS3BackupStream,
     getLocalBackupPath,
     restoreBackup,
+    restoreUploadedBackup,
     shouldRunBackup,
     scheduledBackup,
     testS3Connection,
