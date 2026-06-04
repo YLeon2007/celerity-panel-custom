@@ -949,7 +949,7 @@ function generateExtraXrayKeys() {
 
 function toggleObfsPassword() {
     const type = document.getElementById('obfsType').value;
-    document.getElementById('obfsPasswordGroup').style.display = type === 'salamander' ? '' : 'none';
+    document.getElementById('obfsPasswordGroup').style.display = type ? '' : 'none';
 }
 
 function toggleCustomConfig() {

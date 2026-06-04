@@ -232,10 +232,10 @@ function generateNodeConfig(node, authUrl, options = {}) {
         }
     }
     
-    if (node.obfs?.password) {
+    if (node.obfs?.type && node.obfs?.password) {
         config.obfs = {
-            type: 'salamander',
-            salamander: { password: node.obfs.password },
+            type: node.obfs.type,
+            [node.obfs.type]: { password: node.obfs.password },
         };
     }
 
