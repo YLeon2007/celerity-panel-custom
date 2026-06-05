@@ -4281,6 +4281,76 @@ body {
     line-height: 1.5;
 }
 
+/* Xray fingerprint: single/random mode selector + pool checkboxes */
+.fp-mode-group .radio-group {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+    margin: 0 0 6px;
+    flex-wrap: nowrap;
+}
+
+.fp-mode-group .radio-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+    margin: 0;
+}
+
+.fp-mode-group .radio-row:hover {
+    border-color: var(--text-muted);
+}
+
+.fp-mode-group .radio-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.fp-mode-group .radio-hint {
+    display: block;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    line-height: 1.5;
+}
+
+.fp-checkbox-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
+    gap: 8px;
+}
+
+.fp-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-xs);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.fp-checkbox:hover {
+    border-color: var(--text-muted);
+}
+
+.fp-checkbox input {
+    margin: 0;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.fp-checkbox input:disabled {
+    cursor: default;
+}
+
 .xray-tls-config .info-card {
     display: flex;
     gap: 10px;

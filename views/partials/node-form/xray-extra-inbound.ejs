@@ -102,16 +102,20 @@
             </select>
         </div>
 
-        <%# Pool — UI-only multi-select (no name); the per-row hidden CSV input is the
+        <%# Pool — UI-only checkboxes (no name); the per-row hidden CSV input is the
             source of truth and is kept in sync by JS (cleared in single mode). %>
         <div class="form-group extra-fp-pool-block" style="<%= fpMode === 'pool' ? '' : 'display:none' %>">
-            <select class="extra-fp-pool" multiple size="8" onchange="syncExtraFingerprintPool(this)">
+            <div class="fp-checkbox-grid">
                 <% fingerprintList.forEach(function(f) { %>
-                    <option value="<%= f %>" <%= fingerprintPool.indexOf(f) !== -1 ? 'selected' : '' %>><%= fpLabel(f) %></option>
+                    <label class="fp-checkbox">
+                        <input type="checkbox" class="extra-fp-pool-cb" value="<%= f %>"
+                               <%= fingerprintPool.indexOf(f) !== -1 ? 'checked' : '' %> onchange="syncExtraFingerprintPool(this)">
+                        <span><%= fpLabel(f) %></span>
+                    </label>
                 <% }); %>
-            </select>
+            </div>
             <input type="hidden" name="xray_extra_fingerprintPool" class="extra-fp-pool-csv" value="<%= fingerprintPool.join(',') %>">
-            <small><%= t('nodes.xrayFingerprintPoolHint') %></small>
+            <small style="display:block;margin-top:8px;"><%= t('nodes.xrayFingerprintPoolHint') %></small>
         </div>
 
         <div class="form-group extra-flow-group" style="<%= transport === 'tcp' ? '' : 'display:none' %>">

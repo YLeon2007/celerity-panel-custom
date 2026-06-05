@@ -456,7 +456,7 @@
     "xrayFingerprintModeSingle": "Один отпечаток",
     "xrayFingerprintModeSingleHint": "Всегда публиковать один фиксированный отпечаток.",
     "xrayFingerprintModePool": "Случайный из набора",
-    "xrayFingerprintModePoolHint": "Выберите несколько — публикуется случайный, меняется при обновлении кэша подписки (по TTL кэша), а не при каждом запросе.",
+    "xrayFingerprintModePoolHint": "Выберите несколько — публикуется случайный, меняется при обновлении кэша подписки (по TTL кэша).",
     "xrayAlpn": "ALPN",
     "xrayAlpnHint": "Через запятую: h3, h2, http/1.1 (только для TLS)",
     "xrayFlow": "Flow (XTLS)",

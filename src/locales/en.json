@@ -456,7 +456,7 @@
     "xrayFingerprintModeSingle": "Single fingerprint",
     "xrayFingerprintModeSingleHint": "Always publish one fixed fingerprint.",
     "xrayFingerprintModePool": "Random from a set",
-    "xrayFingerprintModePoolHint": "Pick several; a random one is published and rotates when the subscription cache refreshes (per cache TTL), not on every request.",
+    "xrayFingerprintModePoolHint": "Pick several; a random one is published and rotates when the subscription cache refreshes (per cache TTL).",
     "xrayAlpn": "ALPN",
     "xrayAlpnHint": "Comma-separated: h3, h2, http/1.1 (TLS only)",
     "xrayFlow": "Flow (XTLS)",

@@ -666,17 +666,16 @@ function _anyXrayTlsInboundActive() {
 }
 
 // Toggle the main inbound fingerprint UI between "single" and "pool" modes.
-// The pool multi-select is disabled in single mode so its (possibly stale)
+// The pool checkboxes are disabled in single mode so a (possibly stale)
 // selection is never submitted; the empty hidden fallback still clears the pool.
 function updateXrayFingerprintModeUI() {
     const checked = document.querySelector('input[name="xrayFingerprintMode"]:checked');
     const mode = checked ? checked.value : 'single';
     const single = document.getElementById('xrayFingerprintSingle');
     const poolBlock = document.getElementById('xrayFingerprintPoolBlock');
-    const poolSelect = document.getElementById('xrayFingerprintPool');
     if (single) single.style.display = mode === 'single' ? '' : 'none';
     if (poolBlock) poolBlock.style.display = mode === 'pool' ? '' : 'none';
-    if (poolSelect) poolSelect.disabled = mode !== 'pool';
+    document.querySelectorAll('input.xray-fp-pool-cb').forEach(cb => { cb.disabled = mode !== 'pool'; });
 }
 
 function updateXraySecurityUI() {
@@ -913,20 +912,20 @@ function updateExtraInboundSummary(el) {
     if (summary) summary.textContent = transport.toUpperCase() + ' / ' + security + ' : ' + port;
 }
 
-// Serialize the per-row fingerprint-pool multi-select into its sibling hidden
-// CSV input. The hidden input (not the select) is submitted so the parallel
+// Serialize a row's checked fingerprint-pool checkboxes into its sibling hidden
+// CSV input. The hidden input (not the checkboxes) is submitted so the parallel
 // xray_extra_*[] arrays stay index-aligned (one value per row).
-function syncExtraFingerprintPool(selectEl) {
-    const card = _findExtraCard(selectEl);
+function syncExtraFingerprintPool(el) {
+    const card = _findExtraCard(el);
     if (!card) return;
     const hidden = card.querySelector('input.extra-fp-pool-csv');
     if (!hidden) return;
-    const values = Array.from(selectEl.selectedOptions).map(o => o.value);
+    const values = Array.from(card.querySelectorAll('input.extra-fp-pool-cb:checked')).map(c => c.value);
     hidden.value = values.join(',');
 }
 
 // Toggle an extra inbound's fingerprint UI between "single" and "pool" modes.
-// The hidden CSV input is the source of truth: filled from the multi-select in
+// The hidden CSV input is the source of truth: filled from the checked boxes in
 // pool mode, emptied in single mode (so the pool is cleared on save).
 function updateExtraFingerprintModeUI(selectEl) {
     const card = _findExtraCard(selectEl);
@@ -934,13 +933,12 @@ function updateExtraFingerprintModeUI(selectEl) {
     const mode = selectEl.value;
     const single = card.querySelector('.extra-fp-single');
     const poolBlock = card.querySelector('.extra-fp-pool-block');
-    const poolSelect = card.querySelector('.extra-fp-pool');
     const hidden = card.querySelector('input.extra-fp-pool-csv');
     if (single) single.style.display = mode === 'single' ? '' : 'none';
     if (poolBlock) poolBlock.style.display = mode === 'pool' ? '' : 'none';
     if (!hidden) return;
-    hidden.value = (mode === 'pool' && poolSelect)
-        ? Array.from(poolSelect.selectedOptions).map(o => o.value).join(',')
+    hidden.value = (mode === 'pool')
+        ? Array.from(card.querySelectorAll('input.extra-fp-pool-cb:checked')).map(c => c.value).join(',')
         : '';
 }
 
