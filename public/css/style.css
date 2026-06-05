@@ -4320,31 +4320,40 @@ body {
 }
 
 .fp-checkbox-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
-    gap: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
 }
 
 .fp-checkbox {
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
+    gap: 6px;
+    padding: 5px 11px;
     border: 1px solid var(--border-light);
-    border-radius: var(--radius-xs);
+    border-radius: 999px;
     cursor: pointer;
-    font-size: 13px;
-    transition: background 120ms ease, border-color 120ms ease;
+    font-size: 12.5px;
+    line-height: 1;
+    user-select: none;
+    transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .fp-checkbox:hover {
-    border-color: var(--text-muted);
+    border-color: var(--accent);
+}
+
+.fp-checkbox:has(input:checked) {
+    border-color: var(--accent);
+    background: rgba(99, 102, 241, 0.14);
+    color: var(--accent-hover);
 }
 
 .fp-checkbox input {
     margin: 0;
     cursor: pointer;
     flex-shrink: 0;
+    accent-color: var(--accent);
 }
 
 .fp-checkbox input:disabled {
