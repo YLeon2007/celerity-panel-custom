@@ -257,7 +257,7 @@ const hyNodeSchema = new mongoose.Schema({
     hopInterval: { type: String, default: '' },
     portConfigs: { type: [portConfigSchema], default: [] },
     obfs: {
-        type: { type: String, enum: ['', 'salamander'], default: '' },
+        type: { type: String, enum: ['', 'salamander', 'gecko'], default: '' },
         password: { type: String, default: '' },
     },
     acme: { type: acmeOptionsSchema, default: () => ({}) },

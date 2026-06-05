@@ -313,8 +313,8 @@ function generateURI(user, node, config) {
         const hopSec = parseDurationSeconds(normalizeHopInterval(config.hopInterval));
         if (hopSec > 0) params.push(`mportHopInt=${hopSec}`);
     }
-    if (config.obfs === 'salamander' && config.obfsPassword) {
-        params.push('obfs=salamander');
+    if (config.obfs && config.obfsPassword) {
+        params.push(`obfs=${config.obfs}`);
         params.push(`obfs-password=${encodeURIComponent(config.obfsPassword)}`);
     }
     
@@ -985,8 +985,8 @@ function generateClashYAML(user, nodes, routing) {
                 if (cfg.portRange) proxy += `\n    ports: ${cfg.portRange}`;
                 const hopIntervalSec = parseDurationSeconds(normalizeHopInterval(cfg.hopInterval));
                 if (hopIntervalSec > 0) proxy += `\n    hop-interval: ${hopIntervalSec}`;
-                if (cfg.obfs === 'salamander' && cfg.obfsPassword) {
-                    proxy += `\n    obfs: salamander\n    obfs-password: "${cfg.obfsPassword}"`;
+                if (cfg.obfs && cfg.obfsPassword) {
+                    proxy += `\n    obfs: ${cfg.obfs}\n    obfs-password: "${cfg.obfsPassword}"`;
                 }
                 proxies.push(proxy);
             });
@@ -1238,8 +1238,8 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride) {
             },
         };
 
-        if (cfg.obfs === 'salamander' && cfg.obfsPassword) {
-            streamSettings.udpmasks = [{ type: 'salamander', settings: { password: cfg.obfsPassword } }];
+        if (cfg.obfs && cfg.obfsPassword) {
+            streamSettings.udpmasks = [{ type: cfg.obfs, settings: { password: cfg.obfsPassword } }];
         }
 
         built.push({
@@ -1514,8 +1514,8 @@ function generateSingboxJSON(user, nodes, routing) {
                     outbound.hop_interval = hopInterval;
                 }
 
-                if (cfg.obfs === 'salamander' && cfg.obfsPassword) {
-                    outbound.obfs = { type: 'salamander', password: cfg.obfsPassword };
+                if (cfg.obfs && cfg.obfsPassword) {
+                    outbound.obfs = { type: cfg.obfs, password: cfg.obfsPassword };
                 }
 
                 proxyOutbounds.push(outbound);

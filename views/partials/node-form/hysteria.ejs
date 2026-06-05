@@ -29,9 +29,10 @@
                         <select id="obfsType" name="obfs.type" onchange="toggleObfsPassword()">
                             <option value="" <%= !node?.obfs?.type ? 'selected' : '' %>><%= t('nodes.off') %></option>
                             <option value="salamander" <%= node?.obfs?.type === 'salamander' ? 'selected' : '' %>>Salamander</option>
+                            <option value="gecko" <%= node?.obfs?.type === 'gecko' ? 'selected' : '' %>>Gecko</option>
                         </select>
                     </div>
-                    <div class="form-group" id="obfsPasswordGroup" style="<%= node?.obfs?.type === 'salamander' ? '' : 'display:none' %>">
+                    <div class="form-group" id="obfsPasswordGroup" style="<%= node?.obfs?.type ? '' : 'display:none' %>">
                         <label for="obfsPassword"><%= t('nodes.obfsPassword') %></label>
                         <div class="input-with-button">
                             <input type="text" id="obfsPassword" name="obfs.password"
