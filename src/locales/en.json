@@ -736,6 +736,7 @@
     "subBrandingTitle": "Page branding",
     "subProfileLinksTitle": "Hiddify profile",
     "sslNotConfigured": "SSL not configured",
+    "panelVersion": "Panel version",
     "general": "General Settings",
     "baseUrl": "Base URL",
     "port": "Port",

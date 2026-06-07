@@ -17,6 +17,7 @@ const totpService = require('../../services/totpService');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
 const { parseDurationSeconds } = require('../../utils/helpers');
+const { version: appVersion } = require('../../../package.json');
 
 // Compiled template cache (production only)
 const templateCache = new Map();
@@ -926,7 +927,8 @@ const render = (res, template, data = {}) => {
         ...data,
         ...i18nVars,
         baseUrl: config.BASE_URL,
-        config
+        config,
+        appVersion,
     });
 
     res.render('layout', {
@@ -935,6 +937,7 @@ const render = (res, template, data = {}) => {
         content,
         baseUrl: config.BASE_URL,
         config,
+        appVersion,
     });
 };
 

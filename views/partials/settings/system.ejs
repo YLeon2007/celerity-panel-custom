@@ -2,6 +2,13 @@
 <div class="tab-content active" id="tab-system">
     <!-- Quick stat-pills: at-a-glance system info -->
     <div class="settings-stat-row">
+        <div class="settings-stat" title="Celerity v<%= appVersion %>">
+            <div class="settings-stat-icon success"><i class="ti ti-rocket"></i></div>
+            <div class="settings-stat-content">
+                <div class="settings-stat-label"><%= t('settings.panelVersion') || 'Версия панели' %></div>
+                <div class="settings-stat-value"><code>v<%= appVersion %></code></div>
+            </div>
+        </div>
         <div class="settings-stat" title="<%= config.BASE_URL %>">
             <div class="settings-stat-icon"><i class="ti ti-world"></i></div>
             <div class="settings-stat-content">

@@ -131,7 +131,7 @@ const manageNodeSchema = z.object({
             cert: z.string().optional(),
             key: z.string().optional(),
         }).optional(),
-        settings: z.record(z.unknown()).optional(),
+        settings: z.record(z.string(), z.unknown()).optional(),
         rankingCoefficient: z.number().optional(),
         comment: z.string().optional().describe('Free-form operator note (trimmed, max 500 chars)'),
         // Xray inbound config (only for type="xray"). On update only the provided
@@ -147,7 +147,7 @@ const manageNodeSchema = z.object({
             httpAltPort: z.number().optional(),
             tlsAltPort: z.number().optional(),
             dnsName: z.string().optional(),
-            dnsConfig: z.record(z.unknown()).optional(),
+            dnsConfig: z.record(z.string(), z.unknown()).optional(),
         }).optional(),
         masquerade: z.object({
             type: z.enum(['proxy', 'string']).optional(),
@@ -158,7 +158,7 @@ const manageNodeSchema = z.object({
             }).optional(),
             string: z.object({
                 content: z.string().optional(),
-                headers: z.record(z.string()).optional(),
+                headers: z.record(z.string(), z.string()).optional(),
                 statusCode: z.number().optional(),
             }).optional(),
             listenHTTP: z.string().optional(),
