@@ -157,6 +157,37 @@ html {
     font-weight: 400;
 }
 
+.version-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    text-decoration: none;
+    padding: 2px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    line-height: 1.4;
+    white-space: nowrap;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.version-badge:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.logo .version-badge {
+    margin-left: auto;
+    align-self: flex-start;
+}
+
+.login-header .version-badge {
+    display: inline-block;
+    margin-top: 14px;
+}
+
 .nav-menu {
     list-style: none;
     padding: 16px 12px;

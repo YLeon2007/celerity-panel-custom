@@ -95,6 +95,13 @@ app.use((req, res, next) => {
 
 app.use(cookieParser());
 app.use(i18nMiddleware);
+
+const { version: appVersion } = require('./package.json');
+app.use((req, res, next) => {
+    res.locals.appVersion = appVersion;
+    next();
+});
+
 app.use(countRequest);
 app.use(express.static(path.join(__dirname, 'public'), {
     maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
