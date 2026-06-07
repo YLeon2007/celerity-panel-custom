@@ -28,14 +28,27 @@ function detectFormat(userAgent) {
     const ua = (userAgent || '').toLowerCase();
     // Shadowrocket expects base64-encoded URI list
     if (/shadowrocket/.test(ua)) return 'shadowrocket';
-    // HAPP (Xray-core based) — plain URI list (individual servers in HAPP UI)
-    // v2ray-json available via ?format=v2ray-json for users who want routing rules
+    // HAPP / Incy (Xray-core based) — plain URI list, upgraded to xray-json when
+    // a virtual node is present (see generateSubscriptionData).
     if (/happ/.test(ua)) return 'uri';
+    if (/incy/.test(ua)) return 'uri';
     // sing-box based clients — checked BEFORE clash because Hiddify UA contains "ClashMeta"
     // Example: "HiddifyNext/4.0.5 (android) like ClashMeta v2ray sing-box"
     if (/hiddify|hiddifynext|sing-?box|nekobox|nekoray|neko|sfi|sfa|sfm|sft|karing/.test(ua)) return 'singbox';
     if (/clash|stash|surge|loon/.test(ua)) return 'clash';
     return 'uri';
+}
+
+// HAPP and Incy: Xray-core clients sharing our xray-json profile array and the
+// ://routing/onadd/{base64} routing deep-link (only the URL scheme differs).
+function isHappUa(userAgent) {
+    return /happ/i.test(userAgent || '');
+}
+function isIncyUa(userAgent) {
+    return /incy/i.test(userAgent || '');
+}
+function isXrayProfileClient(userAgent) {
+    return isHappUa(userAgent) || isIncyUa(userAgent);
 }
 
 function isBrowser(req) {
@@ -2617,15 +2630,11 @@ async function serveSubscription(req, res, ctx) {
     const { extraHeaders: hwidHeaders, aborted: hwidAborted } = await runHwidSubscriptionGate(req, res, user, settings, format);
     if (hwidAborted) return;
 
-    // Cache namespacing: HAPP UA shares the canonical "uri" format with curl/wget
-    // and any unrecognised client. When the user has a virtual node we
-    // transparently upgrade HAPP's response to xray-json (JSON body), but other
-    // clients on the same token must still receive a plain URI list. Suffixing
-    // the cache key with "+happ" splits the keyspace so neither variant pollutes
-    // the other. For all non-uri formats this is a no-op.
-    const isHappUa = /happ/i.test(userAgent || '');
-    const cacheFormat = (isHappUa && (format === 'uri' || format === 'raw'))
-        ? `${format}+happ`
+    // HAPP/Incy may upgrade a "uri" response to xray-json, so split the cache
+    // keyspace from plain URI consumers on the same token. HAPP and Incy share
+    // one namespace (identical body; routing scheme differs post-cache).
+    const cacheFormat = (isXrayProfileClient(userAgent) && (format === 'uri' || format === 'raw'))
+        ? `${format}+xprofile`
         : format;
 
     const cached = await cache.getSubscription(cacheToken, cacheFormat);
@@ -2728,12 +2737,9 @@ function generateSubscriptionData(user, nodes, format, userAgent, happProviderId
         case 'uri':
         case 'raw':
         default: {
-            // HAPP-specific: when the user has at least one virtual (balancer)
-            // node, switch to the Xray JSON profile array so HAPP's Xray-core
-            // can run the balancer/observatory. Other URI consumers keep the
-            // current plain URI list behaviour.
-            const isHapp = /happ/i.test(userAgent || '');
-            const hasVirtual = isHapp && nodes.some(n => n.type === 'virtual');
+            // HAPP / Incy with a virtual node → xray-json profile array so their
+            // Xray-core runs the balancer. Other URI consumers keep the list.
+            const hasVirtual = isXrayProfileClient(userAgent) && nodes.some(n => n.type === 'virtual');
             if (hasVirtual) {
                 content = JSON.stringify(generateXrayJSON(user, nodes, routing), null, 2);
                 effectiveFormat = 'xray-json';
@@ -2813,22 +2819,26 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
 
     let content = data.content;
 
-    // HAPP: deliver routing rules and advanced settings via HTTP headers.
-    // Body prepend only applies when content is a plain URI list — never when
-    // we transparently upgraded to xray-json (which would corrupt the JSON).
-    if (/happ/i.test(userAgent)) {
+    // HAPP / Incy: routing profile via `routing` header + body. Same profile
+    // format; HAPP uses its `happ://` scheme, Incy the scheme-relative form.
+    // Body prepend only for a plain URI list (would corrupt xray-json).
+    const isHappClient = isHappUa(userAgent);
+    const isIncyClient = isIncyUa(userAgent);
+    if (isHappClient || isIncyClient) {
         const isUriBody = (effectiveFormat === 'uri' || effectiveFormat === 'raw');
+        const routingScheme = isHappClient ? 'happ' : '';
         if (settings?.routing?.enabled) {
             const profile = buildHappRoutingProfile(settings.routing);
             if (profile) {
                 const b64 = Buffer.from(JSON.stringify(profile)).toString('base64');
-                const routingLink = `happ://routing/onadd/${b64}`;
+                const routingLink = `${routingScheme}://routing/onadd/${b64}`;
                 headers['routing'] = routingLink;
                 if (isUriBody) {
                     content = `${routingLink}\n${content}`;
                 }
             }
-        } else {
+        } else if (isHappClient) {
+            // Incy has no "routing off" directive — clear rules for HAPP only.
             headers['routing'] = 'happ://routing/off';
             if (isUriBody) {
                 content = `happ://routing/off\n${content}`;
@@ -2836,7 +2846,7 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
         }
 
         const happ = settings?.subscription?.happ;
-        if (happ) {
+        if (isHappClient && happ) {
             if (happ.announce) {
                 const hasNonAscii = /[^\x20-\x7E]/.test(happ.announce);
                 headers['announce'] = hasNonAscii
