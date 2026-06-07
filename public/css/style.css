@@ -1045,9 +1045,25 @@ html {
     cursor: pointer;
 }
 
+/* Mirror .btn-primary styling (gradient, no border, shadow, hover lift) but in red */
 .bulk-delete-btn {
     margin-left: 8px;
     white-space: nowrap;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: linear-gradient(135deg, var(--danger) 0%, var(--danger-hover) 100%);
+    color: white;
+    box-shadow: 0 2px 8px rgba(239, 68, 68, 0.2);
+}
+
+.bulk-delete-btn:hover {
+    background: linear-gradient(135deg, #f87171 0%, var(--danger) 100%);
+    box-shadow: 0 6px 20px rgba(239, 68, 68, 0.35);
+    transform: translateY(-2px);
+}
+
+.bulk-delete-btn:active {
+    transform: translateY(0);
 }
 
 .bulk-delete-btn[hidden] {
