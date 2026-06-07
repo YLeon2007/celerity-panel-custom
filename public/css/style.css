@@ -992,6 +992,32 @@ html {
     transition: all var(--transition);
 }
 
+.user-row.is-selected {
+    background: var(--accent-glow);
+}
+
+.user-select-cell {
+    width: 42px;
+    min-width: 42px;
+    text-align: center;
+}
+
+.user-select-checkbox {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.bulk-delete-btn {
+    margin-left: 8px;
+    white-space: nowrap;
+}
+
+.bulk-delete-btn[hidden] {
+    display: none !important;
+}
+
 .user-info {
     display: flex;
     flex-direction: column;
@@ -2765,9 +2791,27 @@ html {
         margin-bottom: 12px;
         gap: 12px;
     }
+
+    .mobile-user-title-wrap {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        min-width: 0;
+    }
+
+    .mobile-user-card.is-selected {
+        border-color: var(--accent);
+        background: rgba(99, 102, 241, 0.12);
+    }
+
+    .mobile-user-select {
+        margin-top: 2px;
+        flex: 0 0 auto;
+    }
     
     .mobile-node-title {
         flex: 1;
+        min-width: 0;
     }
     
     .mobile-node-title strong {

@@ -425,6 +425,99 @@ function execSSH(conn, command) {
     });
 }
 
+function resolveNodeServiceCandidates(node) {
+    if (!node || node.type === 'virtual') return [];
+    if (node.type === 'xray') return ['xray'];
+    return ['hysteria-server', 'hysteria'];
+}
+
+function hasSshCredentials(node) {
+    return !!(node?.ssh?.password || node?.ssh?.privateKey);
+}
+
+function serviceExistsCommand(serviceName) {
+    return `systemctl list-unit-files ${serviceName}.service --no-legend 2>/dev/null | grep -q . || systemctl status ${serviceName} >/dev/null 2>&1`;
+}
+
+async function runRuntimeServiceCommand(node, action, buildCommand) {
+    const candidates = resolveNodeServiceCandidates(node);
+    if (candidates.length === 0) {
+        return { success: true, attempted: false, reason: 'virtual node' };
+    }
+
+    if (!hasSshCredentials(node)) {
+        return { success: false, attempted: false, reason: 'SSH credentials not configured' };
+    }
+
+    let conn;
+    const failures = [];
+    try {
+        conn = await connectSSH(node);
+
+        for (const service of candidates) {
+            const command = buildCommand(service);
+            const result = await execSSH(conn, command);
+            const output = (result.output || '').trim();
+            const missing = result.code === 3 || output.includes(`SERVICE_MISSING ${service}`);
+
+            if (missing && candidates.length > 1) {
+                failures.push({ service, output, error: 'Service not found' });
+                continue;
+            }
+
+            if (result.success) {
+                return { success: true, attempted: true, action, service, output };
+            }
+
+            failures.push({
+                service,
+                output,
+                error: result.error || `${action} failed`,
+            });
+        }
+    } catch (error) {
+        failures.push({ error: error.message });
+    } finally {
+        if (conn) conn.end();
+    }
+
+    const last = failures[failures.length - 1] || {};
+    return {
+        success: false,
+        attempted: true,
+        action,
+        service: last.service || candidates[candidates.length - 1],
+        output: last.output || '',
+        error: last.error || `${action} failed`,
+        failures,
+    };
+}
+
+async function stopNodeRuntime(node) {
+    return runRuntimeServiceCommand(node, 'stop', service => `
+${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+systemctl stop ${service} 2>&1 || true
+systemctl disable ${service} 2>&1 || true
+sleep 1
+STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
+echo "STATE:$STATE"
+[ "$STATE" != "active" ]
+`);
+}
+
+async function startNodeRuntime(node) {
+    return runRuntimeServiceCommand(node, 'start', service => `
+${serviceExistsCommand(service)} || { echo "SERVICE_MISSING ${service}"; exit 3; }
+systemctl daemon-reload 2>&1 || true
+systemctl enable ${service} 2>&1
+systemctl restart ${service} 2>&1
+sleep 2
+STATE="$(systemctl is-active ${service} 2>/dev/null || true)"
+echo "STATE:$STATE"
+[ "$STATE" = "active" ]
+`);
+}
+
 function uploadFile(conn, content, remotePath) {
     return new Promise((resolve, reject) => {
         conn.sftp((err, sftp) => {
@@ -1647,6 +1740,9 @@ module.exports = {
     installCCAgent,
     buildAgentConfig,
     reloadCcAgent,
+    resolveNodeServiceCandidates,
+    stopNodeRuntime,
+    startNodeRuntime,
     generateAgentToken,
     ensureXrayAgentToken,
     generateX25519Keys,

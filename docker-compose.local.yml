@@ -70,6 +70,7 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:-dev@example.com}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-localdevencryptionkey0123456789ab}
       SESSION_SECRET: ${SESSION_SECRET:-localdevsessionsecret}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
       LOG_LEVEL: ${LOG_LEVEL:-debug}
     networks:
       - hysteria-net

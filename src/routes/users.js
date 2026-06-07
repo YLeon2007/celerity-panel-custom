@@ -42,6 +42,27 @@ function xrayRemoveUser(user) {
     });
 }
 
+async function deleteUserById(userId) {
+    const user = await HyUser.findOneAndDelete({ userId });
+
+    if (!user) {
+        return { deleted: false };
+    }
+
+    await UserDevice.deleteMany({ userId });
+    await hwidDeviceService.invalidateCountCache(userId);
+
+    xrayRemoveUser(user.toObject());
+
+    await invalidateUserCache(userId, user.subscriptionToken);
+    webhook.clearDeviceLimitNotified(userId);
+
+    logger.info(`[Users API] Deleted user ${userId}`);
+    webhook.emit(webhook.EVENTS.USER_DELETED, { userId });
+
+    return { deleted: true, user };
+}
+
 /**
  * GET /users - Список всех пользователей
  */
@@ -394,28 +415,61 @@ router.put('/:userId', requireScope('users:write'), async (req, res) => {
 });
 
 /**
+ * POST /users/bulk-delete - Удалить несколько пользователей
+ * Body: { userIds: string[] }
+ */
+router.post('/bulk-delete', requireScope('users:write'), async (req, res) => {
+    try {
+        const { userIds } = req.body || {};
+
+        if (!Array.isArray(userIds) || userIds.some(userId => typeof userId !== 'string' || !userId.trim())) {
+            return res.status(400).json({ error: 'userIds должен быть массивом непустых строк' });
+        }
+
+        const uniqueUserIds = [...new Set(userIds.map(userId => userId.trim()))];
+        const result = {
+            success: true,
+            deleted: 0,
+            deletedUserIds: [],
+            notFound: [],
+            errors: [],
+        };
+
+        for (const userId of uniqueUserIds) {
+            try {
+                const deletion = await deleteUserById(userId);
+
+                if (!deletion.deleted) {
+                    result.notFound.push(userId);
+                    continue;
+                }
+
+                result.deleted += 1;
+                result.deletedUserIds.push(userId);
+            } catch (error) {
+                logger.error(`[Users API] Bulk delete error for ${userId}: ${error.message}`);
+                result.errors.push({ userId, error: error.message });
+            }
+        }
+
+        res.json(result);
+    } catch (error) {
+        logger.error(`[Users API] Bulk delete error: ${error.message}`);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/**
  * DELETE /users/:userId - Удалить пользователя
  */
 router.delete('/:userId', requireScope('users:write'), async (req, res) => {
     try {
-        const user = await HyUser.findOneAndDelete({ userId: req.params.userId });
-        
-        if (!user) {
+        const result = await deleteUserById(req.params.userId);
+
+        if (!result.deleted) {
             return res.status(404).json({ error: 'Пользователь не найден' });
         }
 
-        await UserDevice.deleteMany({ userId: req.params.userId });
-
-        // Remove from Xray nodes
-        xrayRemoveUser(user.toObject());
-
-        // Инвалидируем кэш
-        await invalidateUserCache(req.params.userId, user.subscriptionToken);
-        webhook.clearDeviceLimitNotified(req.params.userId);
-
-        logger.info(`[Users API] Deleted user ${req.params.userId}`);
-        webhook.emit(webhook.EVENTS.USER_DELETED, { userId: req.params.userId });
-        
         res.json({ success: true, message: 'Пользователь удалён' });
     } catch (error) {
         logger.error(`[Users API] Delete error: ${error.message}`);

@@ -40,6 +40,7 @@ const panelRoutes = require('./src/routes/panel');
 const mcpRoutes = require('./src/routes/mcp');
 const marzbanCompat = require('./src/routes/marzbanCompat');
 const { subscriptionLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
+const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
 const helmet = require('helmet');
 const app = express();
@@ -81,11 +82,7 @@ function initSessionMiddleware() {
         secret: config.SESSION_SECRET,
         resave: false,
         saveUninitialized: false,
-        cookie: { 
-            secure: true,
-            sameSite: 'strict',
-            maxAge: 24 * 60 * 60 * 1000
-        }
+        cookie: buildSessionCookieOptions()
     });
 }
 

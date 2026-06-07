@@ -69,6 +69,7 @@
                         <th><%= t('common.server') %></th>
                         <th><%= t('common.ports') %></th>
                         <th><%= t('common.status') %></th>
+                        <th class="node-active-col"><%= t('nodes.activeColumn') %></th>
                         <th><%= t('common.online') %></th>
                         <th><%= t('nodes.groups') %></th>
                         <th><%= t('nodes.nodeInfo') %></th>
@@ -78,7 +79,7 @@
                 <tbody>
                     <% if (nodes.length === 0) { %>
                     <tr>
-                        <td colspan="9" class="text-center text-muted">
+                        <td colspan="10" class="text-center text-muted">
                             <div class="empty-state">
                                 <span class="empty-icon"><i class="ti ti-server"></i></span>
                                 <p><%= t('nodes.noNodes') %></p>
@@ -94,6 +95,7 @@
                         data-status="<%= node.status %>"
                         data-groups="<%= groupIds %>"
                         data-active="<%= node.active %>"
+                        data-type="<%= node.type || 'hysteria' %>"
                         data-id="<%= node._id %>"
                         data-name="<%= (node.name || '').replace(/"/g, '&quot;') %>"
                         data-ranking="<%= node.rankingCoefficient || 1 %>"
@@ -148,15 +150,29 @@
                         </td>
                         <td>
                             <% if (node.type === 'virtual') { %>
-                                <span class="badge badge-secondary" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
+                                <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
                             <% } else { %>
-                                <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>">
+                                <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
                                     <%= node.status %>
                                 </span>
                             <% } %>
                             <% if (!node.active) { %>
-                            <span class="badge badge-secondary"><%= t('nodes.off') %></span>
+                            <span class="badge badge-secondary node-active-off-badge" data-node-active-off-badge data-node-id="<%= node._id %>"><%= t('nodes.off') %></span>
+                            <% } else { %>
+                            <span class="badge badge-secondary node-active-off-badge" data-node-active-off-badge data-node-id="<%= node._id %>" style="display:none"><%= t('nodes.off') %></span>
                             <% } %>
+                        </td>
+                        <td class="node-active-col">
+                            <label class="toggle-switch node-active-toggle" title="<%= node.active ? t('nodes.disableActiveTitle') : t('nodes.enableActiveTitle') %>">
+                                <input type="checkbox"
+                                       data-node-active-input
+                                       data-node-id="<%= node._id %>"
+                                       data-node-name="<%= node.name %>"
+                                       aria-label="<%= node.active ? t('nodes.disableActiveAria') : t('nodes.enableActiveAria') %>: <%= node.name %>"
+                                       <%= node.active ? 'checked' : '' %>
+                                       onchange="toggleNodeActive('<%= node._id %>', this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
                         </td>
                         <td>
                             <% if (node.type === 'virtual') { %>
@@ -228,6 +244,9 @@
                 <div class="mobile-node-card node-row-mobile"
                      data-status="<%= node.status %>"
                      data-groups="<%= groupIds %>"
+                     data-active="<%= node.active %>"
+                     data-type="<%= node.type || 'hysteria' %>"
+                     data-id="<%= node._id %>"
                      data-name="<%= (node.name || '').replace(/"/g, '&quot;') %>"
                      data-ranking="<%= node.rankingCoefficient || 1 %>"
                      data-online="<%= node.onlineUsers || 0 %>">
@@ -237,14 +256,27 @@
                             <strong><%= node.name %></strong>
                             <% if (node.type === 'xray') { %>
                             <img src="/img/xray.svg" alt="Xray" title="Xray VLESS" style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
+                            <% } else if (node.type === 'virtual') { %>
+                            <i class="ti ti-route" title="Virtual / Balancer" style="font-size:14px;vertical-align:middle;opacity:0.7;"></i>
                             <% } else { %>
                             <img src="/img/hysteria.svg" alt="Hysteria" title="Hysteria 2" style="width:14px;height:14px;vertical-align:middle;opacity:0.7;">
                             <% } %>
-                            <code style="font-size: 11px;"><%= node.ip %></code>
+                            <code style="font-size: 11px;"><%= node.type === 'virtual' ? ((node.virtual && node.virtual.strategy) || 'leastLoad') : node.ip %></code>
                         </div>
-                        <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>">
-                            <%= node.status %>
-                        </span>
+                        <div class="mobile-node-state">
+                            <% if (node.type === 'virtual') { %>
+                            <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
+                            <% } else { %>
+                            <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
+                                <%= node.status %>
+                            </span>
+                            <% } %>
+                            <% if (!node.active) { %>
+                            <span class="badge badge-secondary node-active-off-badge" data-node-active-off-badge data-node-id="<%= node._id %>"><%= t('nodes.off') %></span>
+                            <% } else { %>
+                            <span class="badge badge-secondary node-active-off-badge" data-node-active-off-badge data-node-id="<%= node._id %>" style="display:none"><%= t('nodes.off') %></span>
+                            <% } %>
+                        </div>
                     </div>
 
                     <% if (node.comment) { %>
@@ -260,15 +292,32 @@
                         </div>
                         <div class="mobile-stat-item">
                             <span class="mobile-stat-label"><%= t('common.ports') %></span>
-                            <span class="mobile-stat-value"><%= node.port %></span>
+                            <span class="mobile-stat-value"><%= node.type === 'virtual' ? ((node.virtual && node.virtual.strategy) || 'leastLoad') : node.port %></span>
+                        </div>
+                        <div class="mobile-stat-item mobile-stat-toggle">
+                            <span class="mobile-stat-label"><%= t('nodes.activeColumn') %></span>
+                            <label class="toggle-switch node-active-toggle" title="<%= node.active ? t('nodes.disableActiveTitle') : t('nodes.enableActiveTitle') %>">
+                                <input type="checkbox"
+                                       data-node-active-input
+                                       data-node-id="<%= node._id %>"
+                                       data-node-name="<%= node.name %>"
+                                       aria-label="<%= node.active ? t('nodes.disableActiveAria') : t('nodes.enableActiveAria') %>: <%= node.name %>"
+                                       <%= node.active ? 'checked' : '' %>
+                                       onchange="toggleNodeActive('<%= node._id %>', this.checked)">
+                                <span class="toggle-slider"></span>
+                            </label>
                         </div>
                     </div>
                     
                     <div class="mobile-node-actions">
                         <% if (node.type !== 'virtual') { %>
                         <button class="btn btn-sm" onclick="restartNode('<%= node._id %>')" <%= !node.ssh?.password ? 'disabled' : '' %> title="<%= t('nodes.restart') %>" aria-label="<%= t('nodes.restart') %>"><i class="ti ti-refresh"></i></button>
+                        <a href="/panel/nodes/<%= node._id %>/terminal" class="btn btn-sm" title="<%= t('nodes.terminal') %>" aria-label="<%= t('nodes.terminal') %>" <%= !node.ssh?.password ? 'style="pointer-events:none;opacity:0.5"' : '' %>><i class="ti ti-terminal-2"></i></a>
                         <% } %>
                         <a href="/panel/nodes/<%= node._id %>" class="btn btn-sm" title="<%= t('common.edit') %>" aria-label="<%= t('common.edit') %>"><i class="ti ti-pencil"></i></a>
+                        <% if (node.type !== 'virtual' && (ipProtocolCount || {})[node.ip] < 2) { %>
+                        <a href="/panel/nodes/add?cloneFrom=<%= node._id %>" class="btn btn-sm" title="<%= t('nodes.addPairedProtocol') %>" aria-label="<%= t('nodes.addPairedProtocol') %>"><i class="ti ti-plug-connected"></i></a>
+                        <% } %>
                         <button class="btn btn-sm btn-danger" onclick="deleteNode('<%= node._id %>')" title="<%= t('common.delete') %>" aria-label="<%= t('common.delete') %>"><i class="ti ti-trash"></i></button>
                     </div>
                 </div>
@@ -659,6 +708,24 @@
 .node-info-cell {
     white-space: nowrap;
 }
+.node-active-col {
+    width: 84px;
+    text-align: center;
+}
+.node-active-toggle input:disabled + .toggle-slider {
+    opacity: 0.6;
+    cursor: wait;
+}
+.mobile-node-state {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.mobile-stat-toggle {
+    align-items: center;
+}
 .node-info-badge {
     display: inline-flex;
     align-items: center;
@@ -765,7 +832,14 @@ const i18n = {
     total: <%- JSON.stringify(t("common.total")) %>,
     reorderSaved: <%- JSON.stringify(t("nodes.reorderSaved")) %>,
     reorderFailed: <%- JSON.stringify(t("nodes.reorderFailed")) %>,
-    lbHint: <%- JSON.stringify(t("nodes.lbDragHint")) %>
+    lbHint: <%- JSON.stringify(t("nodes.lbDragHint")) %>,
+    nodeEnabled: <%- JSON.stringify(t("nodes.activeEnabled")) %>,
+    nodeDisabled: <%- JSON.stringify(t("nodes.activeDisabled")) %>,
+    nodeActiveError: <%- JSON.stringify(t("nodes.activeToggleError")) %>,
+    nodeEnableTitle: <%- JSON.stringify(t("nodes.enableActiveTitle")) %>,
+    nodeDisableTitle: <%- JSON.stringify(t("nodes.disableActiveTitle")) %>,
+    nodeEnableAria: <%- JSON.stringify(t("nodes.enableActiveAria")) %>,
+    nodeDisableAria: <%- JSON.stringify(t("nodes.disableActiveAria")) %>
 };
 
 function applyFilters() {
@@ -808,6 +882,10 @@ function statusSortOrder(s) {
     return s === 'online' ? 0 : s === 'error' ? 1 : 2;
 }
 
+function statusBadgeVariant(status) {
+    return status === 'online' ? 'success' : (status === 'error' ? 'danger' : 'warning');
+}
+
 function sortNodesTable() {
     const key = document.getElementById('sortNodes').value;
 
@@ -846,6 +924,87 @@ function sortNodesTable() {
             h.style.opacity = key === 'ranking' ? '' : '0.3';
             h.style.cursor = key === 'ranking' ? 'grab' : 'default';
         });
+    }
+}
+
+function setNodeStatusUi(nodeId, status, nodeType) {
+    if (!status) return;
+
+    document.querySelectorAll(`[data-id="${nodeId}"]`).forEach(row => {
+        row.dataset.status = status;
+        if (nodeType) row.dataset.type = nodeType;
+    });
+
+    if (nodeType === 'virtual') return;
+
+    document.querySelectorAll(`[data-node-status-badge][data-node-id="${nodeId}"]`).forEach(badge => {
+        if (badge.dataset.nodeVirtualStatus === 'true') return;
+        badge.className = `badge badge-${statusBadgeVariant(status)}`;
+        badge.textContent = status;
+    });
+}
+
+function setNodeActiveUi(nodeId, active, status, nodeType) {
+    document.querySelectorAll(`[data-id="${nodeId}"]`).forEach(row => {
+        row.dataset.active = String(active);
+        if (nodeType) row.dataset.type = nodeType;
+    });
+
+    document.querySelectorAll(`[data-node-active-input][data-node-id="${nodeId}"]`).forEach(input => {
+        input.checked = active;
+        input.setAttribute('aria-label', `${active ? i18n.nodeDisableAria : i18n.nodeEnableAria}${input.dataset.nodeName ? ': ' + input.dataset.nodeName : ''}`);
+
+        const label = input.closest('.toggle-switch');
+        if (label) {
+            label.title = active ? i18n.nodeDisableTitle : i18n.nodeEnableTitle;
+        }
+    });
+
+    document.querySelectorAll(`[data-node-active-off-badge][data-node-id="${nodeId}"]`).forEach(badge => {
+        badge.style.display = active ? 'none' : '';
+    });
+
+    setNodeStatusUi(nodeId, status, nodeType);
+}
+
+function setNodeActiveInputsDisabled(nodeId, disabled) {
+    document.querySelectorAll(`[data-node-active-input][data-node-id="${nodeId}"]`).forEach(input => {
+        input.disabled = disabled;
+    });
+}
+
+async function toggleNodeActive(nodeId, active) {
+    const previousActive = !active;
+    let serverFailureApplied = false;
+
+    setNodeActiveUi(nodeId, active);
+    setNodeActiveInputsDisabled(nodeId, true);
+
+    try {
+        const res = await fetch(`/api/nodes/${nodeId}/${active ? 'enable' : 'disable'}`, {
+            method: 'POST',
+            credentials: 'include'
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            if (data.node && typeof data.node.active === 'boolean') {
+                setNodeActiveUi(nodeId, data.node.active, data.node.status, data.node.type);
+                serverFailureApplied = true;
+            }
+            throw new Error(data.error || i18n.nodeActiveError);
+        }
+
+        const finalActive = data.node && typeof data.node.active === 'boolean' ? data.node.active : active;
+        setNodeActiveUi(nodeId, finalActive, data.node && data.node.status, data.node && data.node.type);
+        showToast(finalActive ? i18n.nodeEnabled : i18n.nodeDisabled);
+    } catch (error) {
+        if (!serverFailureApplied) {
+            setNodeActiveUi(nodeId, previousActive);
+        }
+        showToast(error.message || i18n.nodeActiveError, 'error');
+    } finally {
+        setNodeActiveInputsDisabled(nodeId, false);
     }
 }
 

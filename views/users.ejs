@@ -1,6 +1,10 @@
 <div class="page-header sticky-header">
     <div class="page-header-left">
         <span class="results-count"><%= t('common.total') %>: <%= pagination.total %></span>
+        <button type="button" id="bulkDeleteBtn" class="btn btn-danger btn-sm bulk-delete-btn" hidden>
+            <i class="ti ti-trash"></i>
+            <%= t('users.deleteSelected') %> (<span id="bulkDeleteCount">0</span>)
+        </button>
     </div>
     <div class="page-header-center">
         <div class="filters-bar">
@@ -35,6 +39,9 @@
         <table class="table" id="usersTable">
             <thead>
                 <tr>
+                    <th class="th-select user-select-cell">
+                        <input type="checkbox" id="selectAllVisibleUsers" class="user-select-checkbox" aria-label="<%= t('users.selectVisible') %>">
+                    </th>
                     <th class="th-user sortable" onclick="sortBy('userId')" style="cursor: pointer;">
                         <%= t('users.user') %> <%- getSortIcon('userId') %>
                     </th>
@@ -49,7 +56,7 @@
             <tbody>
                 <% if (users.length === 0) { %>
                 <tr>
-                    <td colspan="5" class="empty-cell">
+                    <td colspan="6" class="empty-cell">
                         <div class="empty-state">
                             <span class="empty-icon"><i class="ti ti-users"></i></span>
                             <p><%= t('users.noUsers') %></p>
@@ -62,6 +69,9 @@
                     const isExpired = user.expireAt && new Date(user.expireAt).getTime() < Date.now();
                 %>
                 <tr class="user-row" data-userid="<%= user.userId %>">
+                    <td class="td-select user-select-cell">
+                        <input type="checkbox" class="user-select-checkbox" data-userid="<%= user.userId %>" aria-label="<%= t('users.selectUser') %> <%= user.userId %>">
+                    </td>
                     <td class="td-user">
                         <div class="user-info">
                             <code class="user-id"><%= user.userId %></code>
@@ -145,11 +155,14 @@
         %>
             <div class="mobile-user-card" data-userid="<%= user.userId %>">
                 <div class="mobile-node-header">
-                    <div class="mobile-node-title">
-                        <strong><%= user.userId %></strong>
-                        <% if (user.username) { %>
-                            <code style="font-size: 11px; color: var(--text-muted);"><%= user.username %></code>
-                        <% } %>
+                    <div class="mobile-user-title-wrap">
+                        <input type="checkbox" class="user-select-checkbox mobile-user-select" data-userid="<%= user.userId %>" aria-label="<%= t('users.selectUser') %> <%= user.userId %>">
+                        <div class="mobile-node-title">
+                            <strong><%= user.userId %></strong>
+                            <% if (user.username) { %>
+                                <code style="font-size: 11px; color: var(--text-muted);"><%= user.username %></code>
+                            <% } %>
+                        </div>
                     </div>
                     <% if (isExpired) { %>
                         <span class="badge badge-danger"><%= t('common.expired') %></span>
@@ -263,8 +276,118 @@ const i18n = {
     turnedOff: <%- JSON.stringify(t("users.turnedOff")) %>,
     error: <%- JSON.stringify(t("common.error")) %>,
     linkCopied: <%- JSON.stringify(t("users.linkCopied")) %>,
-    copyError: <%- JSON.stringify(t("users.copyError")) %>
+    copyError: <%- JSON.stringify(t("users.copyError")) %>,
+    confirmBulkDelete: <%- JSON.stringify(t("users.confirmBulkDelete")) %>,
+    bulkDeleteSuccess: <%- JSON.stringify(t("users.bulkDeleteSuccess")) %>,
+    bulkDeletePartial: <%- JSON.stringify(t("users.bulkDeletePartial")) %>,
+    bulkDeleteError: <%- JSON.stringify(t("users.bulkDeleteError")) %>
 };
+
+const selectedUserIds = new Set();
+const bulkDeleteBtn = document.getElementById('bulkDeleteBtn');
+const bulkDeleteCount = document.getElementById('bulkDeleteCount');
+const selectAllVisibleUsers = document.getElementById('selectAllVisibleUsers');
+const userSelectCheckboxes = Array.from(document.querySelectorAll('.user-select-checkbox[data-userid]'));
+
+function formatMessage(template, values) {
+    return Object.entries(values).reduce((message, [key, value]) => {
+        return message.replaceAll(`{${key}}`, value);
+    }, template);
+}
+
+function renderBulkSelection() {
+    userSelectCheckboxes.forEach((checkbox) => {
+        const selected = selectedUserIds.has(checkbox.dataset.userid);
+        checkbox.checked = selected;
+    });
+
+    document.querySelectorAll('.user-row[data-userid], .mobile-user-card[data-userid]').forEach((item) => {
+        item.classList.toggle('is-selected', selectedUserIds.has(item.dataset.userid));
+    });
+
+    const selectedCount = selectedUserIds.size;
+    bulkDeleteCount.textContent = selectedCount;
+    bulkDeleteBtn.hidden = selectedCount === 0;
+
+    const desktopCheckboxes = Array.from(document.querySelectorAll('#usersTable tbody .user-select-checkbox[data-userid]'));
+    const selectedDesktopCount = desktopCheckboxes.filter((checkbox) => selectedUserIds.has(checkbox.dataset.userid)).length;
+    selectAllVisibleUsers.checked = desktopCheckboxes.length > 0 && selectedDesktopCount === desktopCheckboxes.length;
+    selectAllVisibleUsers.indeterminate = selectedDesktopCount > 0 && selectedDesktopCount < desktopCheckboxes.length;
+}
+
+function setUserSelected(userId, selected) {
+    if (selected) {
+        selectedUserIds.add(userId);
+    } else {
+        selectedUserIds.delete(userId);
+    }
+    renderBulkSelection();
+}
+
+userSelectCheckboxes.forEach((checkbox) => {
+    checkbox.addEventListener('change', () => {
+        setUserSelected(checkbox.dataset.userid, checkbox.checked);
+    });
+});
+
+selectAllVisibleUsers.addEventListener('change', () => {
+    document.querySelectorAll('#usersTable tbody .user-select-checkbox[data-userid]').forEach((checkbox) => {
+        if (selectAllVisibleUsers.checked) {
+            selectedUserIds.add(checkbox.dataset.userid);
+        } else {
+            selectedUserIds.delete(checkbox.dataset.userid);
+        }
+    });
+    renderBulkSelection();
+});
+
+bulkDeleteBtn.addEventListener('click', async () => {
+    const userIds = Array.from(selectedUserIds);
+    if (userIds.length === 0) return;
+
+    if (!confirm(formatMessage(i18n.confirmBulkDelete, { count: userIds.length }))) {
+        return;
+    }
+
+    bulkDeleteBtn.disabled = true;
+
+    try {
+        const res = await fetch('/api/users/bulk-delete', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userIds }),
+        });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            throw new Error(data.error || i18n.bulkDeleteError);
+        }
+
+        const issueCount = (data.notFound?.length || 0) + (data.errors?.length || 0);
+        const template = issueCount > 0 ? i18n.bulkDeletePartial : i18n.bulkDeleteSuccess;
+        localStorage.setItem('usersBulkDeleteToast', JSON.stringify({
+            message: formatMessage(template, { count: data.deleted || 0, issues: issueCount }),
+            type: issueCount > 0 ? 'warning' : 'success',
+        }));
+        window.location.reload();
+    } catch (error) {
+        showToast(error.message || i18n.bulkDeleteError, 'error');
+        bulkDeleteBtn.disabled = false;
+    }
+});
+
+try {
+    const pendingToast = JSON.parse(localStorage.getItem('usersBulkDeleteToast') || 'null');
+    if (pendingToast?.message) {
+        localStorage.removeItem('usersBulkDeleteToast');
+        setTimeout(() => showToast(pendingToast.message, pendingToast.type || 'success'), 100);
+    }
+} catch (_error) {
+    localStorage.removeItem('usersBulkDeleteToast');
+}
+
+renderBulkSelection();
 
 // Debounced search
 let searchTimeout;

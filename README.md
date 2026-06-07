@@ -523,6 +523,7 @@ Required scope: `users:read` (GET) / `users:write` (POST, PUT, DELETE)
 | POST | `/api/users` | Create user |
 | PUT | `/api/users/:userId` | Update user |
 | DELETE | `/api/users/:userId` | Delete user |
+| POST | `/api/users/bulk-delete` | Delete selected users (best-effort) |
 | POST | `/api/users/:userId/enable` | Enable user |
 | POST | `/api/users/:userId/disable` | Disable user |
 | POST | `/api/users/:userId/groups` | Add user to groups |

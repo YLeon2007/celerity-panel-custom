@@ -551,6 +551,7 @@ const OPERATION_METADATA = {
     'GET /groups': { scopes: ['stats:read'], responseExample: 'GroupsListResponse' },
     'GET /users': { scopes: ['users:read'], responseExample: 'UserListResponse' },
     'POST /users': { scopes: ['users:write'], requestExample: 'UserCreateRequest', responseExample: 'UserResponse' },
+    'POST /users/bulk-delete': { scopes: ['users:write'], responseExample: 'GenericResponse' },
     'GET /users/{userId}': { scopes: ['users:read'], responseExample: 'UserResponse' },
     'PUT /users/{userId}': { scopes: ['users:write'], requestExample: 'UserUpdateRequest', responseExample: 'UserResponse' },
     'DELETE /users/{userId}': { scopes: ['users:write'], responseExample: 'SuccessWithMessageResponse' },
@@ -1159,6 +1160,44 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     message: { type: 'string' },
                 },
             },
+            UserBulkDeleteRequest: {
+                type: 'object',
+                required: ['userIds'],
+                properties: {
+                    userIds: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        example: ['123456789', '987654321'],
+                    },
+                },
+            },
+            UserBulkDeleteResponse: {
+                type: 'object',
+                properties: {
+                    success: { type: 'boolean', example: true },
+                    deleted: { type: 'integer', example: 2 },
+                    deletedUserIds: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        example: ['123456789', '987654321'],
+                    },
+                    notFound: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        example: ['missing-user'],
+                    },
+                    errors: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                userId: { type: 'string', example: 'problem-user' },
+                                error: { type: 'string', example: 'Database error' },
+                            },
+                        },
+                    },
+                },
+            },
             LoginResult: {
                 type: 'object',
                 properties: {
@@ -1683,6 +1722,45 @@ These endpoints are not under \`/api\` and are not part of this specification:
                                         error: { type: 'string', example: 'Пользователь уже существует' },
                                         user: { $ref: '#/components/schemas/User' },
                                     },
+                                },
+                            },
+                        },
+                    },
+                    401: { $ref: '#/components/responses/Unauthorized' },
+                    403: { $ref: '#/components/responses/Forbidden' },
+                },
+            },
+        },
+
+        '/users/bulk-delete': {
+            post: {
+                tags: ['Users'],
+                summary: 'Bulk delete users',
+                description: 'Deletes selected users by `userId` with the same side effects as single-user deletion. Runs best-effort and reports missing users or per-user errors without rolling back successful deletions.',
+                requestBody: {
+                    required: true,
+                    content: {
+                        'application/json': {
+                            schema: { $ref: '#/components/schemas/UserBulkDeleteRequest' },
+                        },
+                    },
+                },
+                responses: {
+                    200: {
+                        description: 'Bulk delete result',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/UserBulkDeleteResponse' },
+                            },
+                        },
+                    },
+                    400: {
+                        description: 'Malformed body',
+                        content: {
+                            'application/json': {
+                                schema: { $ref: '#/components/schemas/Error' },
+                                examples: {
+                                    invalidUserIds: { value: { error: 'userIds должен быть массивом непустых строк' } },
                                 },
                             },
                         },
