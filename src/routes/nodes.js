@@ -11,24 +11,130 @@ const cryptoService = require('../services/cryptoService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
+const nodeSetup = require('../services/nodeSetup');
+const syncService = require('../services/syncService');
+
+function hasSshCredentials(node) {
+    return !!(node?.ssh?.password || node?.ssh?.privateKey);
+}
+
+function runtimeErrorMessage(result, fallback) {
+    return result?.error || result?.reason || fallback;
+}
+
+async function disableNodeRuntime(node) {
+    if (node.type === 'virtual') {
+        return { success: true, attempted: false, reason: 'virtual node' };
+    }
+
+    if (!hasSshCredentials(node)) {
+        return { success: false, attempted: false, reason: 'SSH credentials not configured' };
+    }
+
+    try {
+        return await nodeSetup.stopNodeRuntime(node);
+    } catch (error) {
+        return { success: false, attempted: true, error: error.message };
+    }
+}
+
+async function startNodeRuntime(node) {
+    if (node.type === 'virtual') {
+        return { success: true, attempted: false, reason: 'virtual node' };
+    }
+
+    if (node.type === 'xray' && node.xray?.agentToken) {
+        const synced = await syncService.updateNodeConfig(node);
+        return synced
+            ? { success: true, attempted: true, service: 'xray', via: 'agent-sync' }
+            : { success: false, attempted: true, service: 'xray', via: 'agent-sync', error: 'Node startup could not be confirmed' };
+    }
+
+    if (!hasSshCredentials(node)) {
+        return { success: false, attempted: false, reason: 'SSH credentials not configured' };
+    }
+
+    return nodeSetup.startNodeRuntime(node);
+}
 
 async function setNodeActive(req, res, active) {
     try {
-        const node = await HyNode.findByIdAndUpdate(
-            req.params.id,
-            { $set: { active } },
-            { new: true }
-        );
-
+        const node = await HyNode.findById(req.params.id);
         if (!node) {
             return res.status(404).json({ error: 'Node not found' });
         }
 
+        if (!active) {
+            const runtime = await disableNodeRuntime(node);
+            const disabledNode = await HyNode.findByIdAndUpdate(
+                req.params.id,
+                { $set: { active: false, status: 'offline', onlineUsers: 0 } },
+                { new: true }
+            );
+
+            await invalidateNodesCache();
+
+            const warning = runtime.success === false
+                ? runtimeErrorMessage(runtime, 'Runtime stop failed')
+                : undefined;
+
+            if (warning) {
+                logger.warn(`[Nodes API] Disabled node ${node.name}, runtime stop warning: ${warning}`);
+            } else {
+                logger.info(`[Nodes API] Disabled node ${node.name}`);
+            }
+
+            return res.json({
+                success: true,
+                node: disabledNode,
+                runtime,
+                ...(warning ? { warning } : {}),
+            });
+        }
+
+        let runtime;
+        try {
+            runtime = await startNodeRuntime(node);
+        } catch (error) {
+            runtime = { success: false, attempted: true, error: error.message };
+        }
+
+        if (!runtime.success) {
+            const errorMessage = runtimeErrorMessage(runtime, 'Node startup could not be confirmed');
+            const failedNode = await HyNode.findByIdAndUpdate(
+                req.params.id,
+                {
+                    $set: {
+                        active: false,
+                        status: 'offline',
+                        onlineUsers: 0,
+                        lastError: errorMessage,
+                    },
+                },
+                { new: true }
+            );
+
+            await invalidateNodesCache();
+
+            logger.warn(`[Nodes API] Enable node ${node.name} failed: ${errorMessage}`);
+            return res.status(500).json({
+                error: errorMessage,
+                node: failedNode,
+                runtime,
+            });
+        }
+
+        const enabledNode = await HyNode.findByIdAndUpdate(
+            req.params.id,
+            { $set: { active: true, status: node.type === 'virtual' ? node.status : 'online', lastError: '' } },
+            { new: true }
+        );
+
         await invalidateNodesCache();
 
-        logger.info(`[Nodes API] ${active ? 'Enabled' : 'Disabled'} node ${node.name}`);
+        logger.info(`[Nodes API] Enabled node ${node.name}`);
 
-        res.json({ success: true, node });
+        res.json({ success: true, node: enabledNode, runtime });
     } catch (error) {
         logger.error(`[Nodes API] ${active ? 'Enable' : 'Disable'} node error: ${error.message}`);
         res.status(500).json({ error: error.message });

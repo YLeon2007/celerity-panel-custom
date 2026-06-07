@@ -95,6 +95,7 @@
                         data-status="<%= node.status %>"
                         data-groups="<%= groupIds %>"
                         data-active="<%= node.active %>"
+                        data-type="<%= node.type || 'hysteria' %>"
                         data-id="<%= node._id %>"
                         data-name="<%= (node.name || '').replace(/"/g, '&quot;') %>"
                         data-ranking="<%= node.rankingCoefficient || 1 %>"
@@ -149,9 +150,9 @@
                         </td>
                         <td>
                             <% if (node.type === 'virtual') { %>
-                                <span class="badge badge-secondary" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
+                                <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
                             <% } else { %>
-                                <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>">
+                                <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
                                     <%= node.status %>
                                 </span>
                             <% } %>
@@ -244,6 +245,7 @@
                      data-status="<%= node.status %>"
                      data-groups="<%= groupIds %>"
                      data-active="<%= node.active %>"
+                     data-type="<%= node.type || 'hysteria' %>"
                      data-id="<%= node._id %>"
                      data-name="<%= (node.name || '').replace(/"/g, '&quot;') %>"
                      data-ranking="<%= node.rankingCoefficient || 1 %>"
@@ -263,9 +265,9 @@
                         </div>
                         <div class="mobile-node-state">
                             <% if (node.type === 'virtual') { %>
-                            <span class="badge badge-secondary" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
+                            <span class="badge badge-secondary" data-node-status-badge data-node-id="<%= node._id %>" data-node-virtual-status="true" title="<%= t('nodes.virtualNoStatus') %>">virtual</span>
                             <% } else { %>
-                            <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>">
+                            <span class="badge badge-<%= node.status === 'online' ? 'success' : (node.status === 'error' ? 'danger' : 'warning') %>" data-node-status-badge data-node-id="<%= node._id %>">
                                 <%= node.status %>
                             </span>
                             <% } %>
@@ -880,6 +882,10 @@ function statusSortOrder(s) {
     return s === 'online' ? 0 : s === 'error' ? 1 : 2;
 }
 
+function statusBadgeVariant(status) {
+    return status === 'online' ? 'success' : (status === 'error' ? 'danger' : 'warning');
+}
+
 function sortNodesTable() {
     const key = document.getElementById('sortNodes').value;
 
@@ -921,9 +927,27 @@ function sortNodesTable() {
     }
 }
 
-function setNodeActiveUi(nodeId, active) {
+function setNodeStatusUi(nodeId, status, nodeType) {
+    if (!status) return;
+
+    document.querySelectorAll(`[data-id="${nodeId}"]`).forEach(row => {
+        row.dataset.status = status;
+        if (nodeType) row.dataset.type = nodeType;
+    });
+
+    if (nodeType === 'virtual') return;
+
+    document.querySelectorAll(`[data-node-status-badge][data-node-id="${nodeId}"]`).forEach(badge => {
+        if (badge.dataset.nodeVirtualStatus === 'true') return;
+        badge.className = `badge badge-${statusBadgeVariant(status)}`;
+        badge.textContent = status;
+    });
+}
+
+function setNodeActiveUi(nodeId, active, status, nodeType) {
     document.querySelectorAll(`[data-id="${nodeId}"]`).forEach(row => {
         row.dataset.active = String(active);
+        if (nodeType) row.dataset.type = nodeType;
     });
 
     document.querySelectorAll(`[data-node-active-input][data-node-id="${nodeId}"]`).forEach(input => {
@@ -939,6 +963,8 @@ function setNodeActiveUi(nodeId, active) {
     document.querySelectorAll(`[data-node-active-off-badge][data-node-id="${nodeId}"]`).forEach(badge => {
         badge.style.display = active ? 'none' : '';
     });
+
+    setNodeStatusUi(nodeId, status, nodeType);
 }
 
 function setNodeActiveInputsDisabled(nodeId, disabled) {
@@ -949,6 +975,7 @@ function setNodeActiveInputsDisabled(nodeId, disabled) {
 
 async function toggleNodeActive(nodeId, active) {
     const previousActive = !active;
+    let serverFailureApplied = false;
 
     setNodeActiveUi(nodeId, active);
     setNodeActiveInputsDisabled(nodeId, true);
@@ -961,14 +988,20 @@ async function toggleNodeActive(nodeId, active) {
         const data = await res.json().catch(() => ({}));
 
         if (!res.ok) {
+            if (data.node && typeof data.node.active === 'boolean') {
+                setNodeActiveUi(nodeId, data.node.active, data.node.status, data.node.type);
+                serverFailureApplied = true;
+            }
             throw new Error(data.error || i18n.nodeActiveError);
         }
 
         const finalActive = data.node && typeof data.node.active === 'boolean' ? data.node.active : active;
-        setNodeActiveUi(nodeId, finalActive);
+        setNodeActiveUi(nodeId, finalActive, data.node && data.node.status, data.node && data.node.type);
         showToast(finalActive ? i18n.nodeEnabled : i18n.nodeDisabled);
     } catch (error) {
-        setNodeActiveUi(nodeId, previousActive);
+        if (!serverFailureApplied) {
+            setNodeActiveUi(nodeId, previousActive);
+        }
         showToast(error.message || i18n.nodeActiveError, 'error');
     } finally {
         setNodeActiveInputsDisabled(nodeId, false);
