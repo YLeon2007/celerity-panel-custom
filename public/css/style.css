@@ -1050,7 +1050,8 @@ html {
     margin-left: 8px;
     white-space: nowrap;
     border: none;
-    border-radius: var(--radius-sm);
+    border-radius: 999px;
+    padding: 9px 18px;
     background: linear-gradient(135deg, var(--danger) 0%, var(--danger-hover) 100%);
     color: white;
     box-shadow: 0 2px 8px rgba(239, 68, 68, 0.2);
