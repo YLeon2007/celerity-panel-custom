@@ -30,7 +30,7 @@ const migrationLimiter = rateLimit({
     max: 30,
     standardHeaders: true,
     legacyHeaders: false,
-    handler: (req, res) => res.status(429).json({ error: 'Too many requests. Try again later.' }),
+    handler: (req, res) => res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' }),
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

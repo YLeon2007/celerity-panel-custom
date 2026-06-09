@@ -20,8 +20,10 @@
             
             <!-- Language Switcher -->
             <div class="login-lang-switcher">
-                <a href="?lang=ru" class="lang-btn <%= typeof lang !== 'undefined' && lang === 'ru' ? 'active' : '' %>">RU</a>
-                <a href="?lang=en" class="lang-btn <%= typeof lang !== 'undefined' && lang === 'en' ? 'active' : '' %>">EN</a>
+                <% const langOptions = typeof languageOptions !== 'undefined' ? languageOptions : []; %>
+                <% langOptions.forEach(function(option) { %>
+                <a href="?lang=<%= encodeURIComponent(option.code) %>" class="lang-btn <%= typeof lang !== 'undefined' && lang === option.code ? 'active' : '' %>"><%= option.label %></a>
+                <% }); %>
             </div>
             
             <% const lockoutIsActive = Boolean(lockoutActive && lockoutIso && lockoutUntil); %>

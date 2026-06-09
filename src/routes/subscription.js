@@ -17,6 +17,7 @@ const cache = require('../services/cacheService');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 const { getNodesByGroups, getSettings, parseDurationSeconds, normalizeHopInterval } = require('../utils/helpers');
+const { getDateLocale, normalizeLanguage } = require('../middleware/i18n');
 const uaStats = require('../services/uaStatsService');
 const { extractHwidHeaders } = require('../utils/hwidHeaders');
 const hwidDeviceService = require('../services/hwidDeviceService');
@@ -1680,7 +1681,73 @@ function generateSingboxJSON(user, nodes, routing) {
 
 // ==================== HTML PAGE ====================
 
-async function generateHTML(user, nodes, token, baseUrl, settings) {
+const SUBSCRIPTION_PAGE_TEXTS = {
+    ru: {
+        pageTitle: 'Подключение',
+        personalConfig: 'Ваша персональная конфигурация',
+        qrTitle: 'QR-КОД',
+        qrHint: 'Отсканируйте для импорта подписки в приложение',
+        appsTitle: 'ПРИЛОЖЕНИЯ',
+        copied: 'Скопировано',
+        done: 'Готово',
+        gb: 'ГБ',
+        used: 'Использовано',
+        locations: 'Локаций',
+        validUntil: 'Действует до',
+        appLinkTitle: 'ССЫЛКА ДЛЯ ПРИЛОЖЕНИЙ',
+        copy: 'Копировать',
+        serverLocations: 'ЛОКАЦИИ',
+        unlimited: 'Бессрочно',
+    },
+    en: {
+        pageTitle: 'Connection',
+        personalConfig: 'Your personal configuration',
+        qrTitle: 'QR CODE',
+        qrHint: 'Scan to import the subscription into your app',
+        appsTitle: 'APPS',
+        copied: 'Copied',
+        done: 'Done',
+        gb: 'GB',
+        used: 'Used',
+        locations: 'Locations',
+        validUntil: 'Valid until',
+        appLinkTitle: 'APP SUBSCRIPTION LINK',
+        copy: 'Copy',
+        serverLocations: 'LOCATIONS',
+        unlimited: 'Unlimited',
+    },
+    'zh-CN': {
+        pageTitle: '连接配置',
+        personalConfig: '你的个人订阅配置',
+        qrTitle: '二维码',
+        qrHint: '扫码将订阅导入客户端',
+        appsTitle: '应用',
+        copied: '已复制',
+        done: '完成',
+        gb: 'GB',
+        used: '已用',
+        locations: '地区',
+        validUntil: '有效期至',
+        appLinkTitle: '客户端订阅链接',
+        copy: '复制',
+        serverLocations: '节点地区',
+        unlimited: '长期有效',
+    },
+};
+
+function getSubscriptionPageText(lang) {
+    const normalized = normalizeLanguage(lang) || 'ru';
+    return {
+        ...SUBSCRIPTION_PAGE_TEXTS.ru,
+        ...(normalized !== 'ru' ? SUBSCRIPTION_PAGE_TEXTS.en : {}),
+        ...(SUBSCRIPTION_PAGE_TEXTS[normalized] || {}),
+        lang: normalized,
+        dateLocale: getDateLocale(normalized),
+    };
+}
+
+async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') {
+    const text = getSubscriptionPageText(lang);
     // Collect all configs
     const allConfigs = [];
     nodes.forEach(node => {
@@ -1725,7 +1792,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
     
     const trafficUsed = ((user.traffic?.tx || 0) + (user.traffic?.rx || 0)) / (1024 * 1024 * 1024);
     const trafficLimit = user.trafficLimit ? user.trafficLimit / (1024 * 1024 * 1024) : 0;
-    const expireDate = user.expireAt ? new Date(user.expireAt).toLocaleDateString('ru-RU') : 'Бессрочно';
+    const expireDate = user.expireAt ? new Date(user.expireAt).toLocaleDateString(text.dateLocale) : text.unlimited;
     
     // Group by location preserving node sort order (Map keeps insertion order for all key types)
     const locations = new Map();
@@ -1742,7 +1809,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
     // Customization from settings
     const sub = settings?.subscription || {};
     const logoUrl   = sub.logoUrl   || '';
-    const pageTitle = sub.pageTitle || 'Подключение';
+    const pageTitle = sub.pageTitle || text.pageTitle;
 
     const logoHtml = logoUrl
         ? `<img src="${logoUrl}" class="brand-logo" onerror="this.style.display='none'">`
@@ -1769,9 +1836,9 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
 
     const qrSectionHtml = qrDataUrl
         ? `<div class="section section-center qr-section">
-            <h2><i class="ti ti-qrcode"></i> QR-КОД</h2>
+            <h2><i class="ti ti-qrcode"></i> ${text.qrTitle}</h2>
             <img src="${qrDataUrl}" alt="QR" class="qr-image">
-            <div class="qr-hint">Отсканируйте для импорта подписки в приложение</div>
+            <div class="qr-hint">${text.qrHint}</div>
            </div>`
         : '';
 
@@ -1793,7 +1860,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
     const buttons = (sub.buttons || []).filter(b => b.label && b.url);
     const buttonsHtml = buttons.length > 0
         ? `<div class="section section-buttons">
-            <h2><i class="ti ti-apps"></i> ПРИЛОЖЕНИЯ</h2>
+            <h2><i class="ti ti-apps"></i> ${text.appsTitle}</h2>
             <div class="btn-grid">
                 ${buttons.map(b => {
                     const href = resolveButtonUrl(b.url, baseUrl);
@@ -1810,7 +1877,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
         : '';
 
     return `<!DOCTYPE html>
-<html lang="ru">
+<html lang="${text.lang}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
@@ -2223,34 +2290,34 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
     <div class="container">
         <div class="header">
             <h1>${logoHtml} <span>${pageTitle}</span></h1>
-            <p>Ваша персональная конфигурация</p>
+            <p>${text.personalConfig}</p>
         </div>
 
         <div class="stats">
             <div class="stat">
-                <div class="stat-value">${trafficUsed.toFixed(1)} ГБ</div>
-                <div class="stat-label">Использовано${trafficLimit > 0 ? ` / ${trafficLimit.toFixed(0)} ГБ` : ''}</div>
+                <div class="stat-value">${trafficUsed.toFixed(1)} ${text.gb}</div>
+                <div class="stat-label">${text.used}${trafficLimit > 0 ? ` / ${trafficLimit.toFixed(0)} ${text.gb}` : ''}</div>
             </div>
             <div class="stat">
                 <div class="stat-value">${locations.size}</div>
-                <div class="stat-label">Локаций</div>
+                <div class="stat-label">${text.locations}</div>
             </div>
             <div class="stat">
                 <div class="stat-value">${expireDate}</div>
-                <div class="stat-label">Действует до</div>
+                <div class="stat-label">${text.validUntil}</div>
             </div>
         </div>
 
         <div class="section">
-            <h2><i class="ti ti-link"></i> ССЫЛКА ДЛЯ ПРИЛОЖЕНИЙ</h2>
+            <h2><i class="ti ti-link"></i> ${text.appLinkTitle}</h2>
             <div class="sub-box">
                 <input type="text" value="${baseUrl}" readonly id="subUrl">
-                <button class="copy-btn" onclick="copyText('${baseUrl}', this)"><i class="ti ti-copy"></i> Копировать</button>
+                <button class="copy-btn" onclick="copyText('${baseUrl}', this)"><i class="ti ti-copy"></i> ${text.copy}</button>
             </div>
         </div>
 
         <div class="section">
-            <h2><i class="ti ti-world"></i> ЛОКАЦИИ</h2>
+            <h2><i class="ti ti-world"></i> ${text.serverLocations}</h2>
             ${[...locations.entries()].map(([name, loc]) => `
             <div class="location">
                 <div class="location-header" onclick="this.parentElement.classList.toggle('open')">
@@ -2264,7 +2331,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
                         ${loc.configs.map(cfg => `
                         <div class="config">
                             <span class="config-name">${cfg.name}</span>
-                            <button class="copy-btn" onclick="copyUri(this)"><i class="ti ti-copy"></i> Копировать</button>
+                            <button class="copy-btn" onclick="copyUri(this)"><i class="ti ti-copy"></i> ${text.copy}</button>
                         </div>
                         `).join('')}
                     </div>
@@ -2277,7 +2344,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
         ${buttonsHtml}
     </div>
 
-    <div class="toast" id="toast"><i class="ti ti-check"></i> Скопировано</div>
+    <div class="toast" id="toast"><i class="ti ti-check"></i> ${text.copied}</div>
 
     <script>
         const uris = ${JSON.stringify(allConfigs.map(c => c.uri))};
@@ -2313,7 +2380,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings) {
 
         function success(btn) {
             const orig = btn.innerHTML;
-            btn.innerHTML = '<i class="ti ti-check"></i> Готово';
+            btn.innerHTML = '<i class="ti ti-check"></i> ${text.done}';
             btn.classList.add('success');
             const toast = document.getElementById('toast');
             toast.classList.add('show');
@@ -2610,7 +2677,7 @@ async function serveSubscription(req, res, ctx) {
         if (nodes.length === 0) {
             return res.status(503).type('text/plain').send('# No servers available');
         }
-        const html = await generateHTML(user, nodes, cacheToken, baseUrl, settings);
+        const html = await generateHTML(user, nodes, cacheToken, baseUrl, settings, res.locals.lang);
         return res
             .type('text/html')
             .set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')

@@ -24,8 +24,10 @@
 
             <div style="text-align:center;">
                 <div class="onboarding-lang-switch">
-                    <a href="?lang=ru" class="<%= typeof lang !== 'undefined' && lang === 'ru' ? 'active' : '' %>">RU</a>
-                    <a href="?lang=en" class="<%= typeof lang !== 'undefined' && lang === 'en' ? 'active' : '' %>">EN</a>
+                    <% const langOptions = typeof languageOptions !== 'undefined' ? languageOptions : []; %>
+                    <% langOptions.forEach(function(option) { %>
+                    <a href="?lang=<%= encodeURIComponent(option.code) %>" class="<%= typeof lang !== 'undefined' && lang === option.code ? 'active' : '' %>"><%= option.label %></a>
+                    <% }); %>
                 </div>
             </div>
 

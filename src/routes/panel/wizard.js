@@ -32,7 +32,7 @@ const wizardLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
-        res.redirect('/panel/wizard?error=' + encodeURIComponent('Too many requests. Try again later.'));
+        res.redirect('/panel/wizard?error=' + encodeURIComponent(res.locals.t?.('wizard.tooManyRequests') || 'Too many requests. Try again later.'));
     },
 });
 
@@ -162,7 +162,7 @@ router.post('/wizard/scenario', wizardLimiter, async (req, res) => {
     const scenario = req.body.scenario;
 
     if (scenario !== 'self-host' && scenario !== 'remote') {
-        return res.redirect('/panel/wizard?error=' + encodeURIComponent('Please select a deployment option'));
+        return res.redirect('/panel/wizard?error=' + encodeURIComponent(res.locals.t?.('wizard.selectDeploymentOption') || 'Please select a deployment option'));
     }
 
     try {
@@ -209,7 +209,7 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
         const installXray     = req.body.installXray     === 'on';
 
         if (!installHysteria && !installXray) {
-            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent('Select at least one protocol to install'));
+            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(res.locals.t?.('wizard.noProtocolSelected') || 'Please select at least one protocol.'));
         }
 
         // SSH credentials
@@ -220,17 +220,17 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
         const sshPrivateKeyRaw = (req.body['ssh.privateKey'] || '').trim();
 
         if (!sshIp) {
-            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent('Server IP or hostname is required'));
+            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(res.locals.t?.('wizard.serverAddressRequired') || 'Server IP or hostname is required'));
         }
 
         if (!sshPassword && !sshPrivateKeyRaw) {
-            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent('SSH password or private key is required'));
+            return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(res.locals.t?.('wizard.sshAuthRequired') || 'SSH password or private key is required'));
         }
 
         let encryptedPrivateKey = '';
         if (sshPrivateKeyRaw) {
             if (!sshKeyService.isValidPrivateKey(sshPrivateKeyRaw)) {
-                return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent('Invalid SSH private key format'));
+                return res.redirect('/panel/wizard/self-host?error=' + encodeURIComponent(res.locals.t?.('wizard.invalidSshPrivateKey') || 'Invalid SSH private key format'));
             }
             encryptedPrivateKey = cryptoService.encrypt(sshPrivateKeyRaw);
         }
@@ -439,7 +439,7 @@ async function _runBootstrap(taskId, nodeIds) {
 router.get('/wizard/progress/:taskId', (req, res) => {
     const taskId = req.params.taskId;
     if (!_bootstrapTasks.has(taskId)) {
-        return res.redirect('/panel/wizard?error=' + encodeURIComponent('Bootstrap task not found'));
+        return res.redirect('/panel/wizard?error=' + encodeURIComponent(res.locals.t?.('wizard.bootstrapTaskNotFound') || 'Bootstrap task not found'));
     }
 
     res.render('wizard', {

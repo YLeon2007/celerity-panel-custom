@@ -1,3 +1,4 @@
+<% const viewDateLocale = typeof dateLocale !== 'undefined' ? dateLocale : undefined; %>
 <div class="page-header">
     <a href="/panel/users" class="btn btn-back"><i class="ti ti-chevron-left"></i> <%= t('common.backToList') %></a>
 </div>
@@ -15,11 +16,11 @@
             <div class="card-body">
                 <div class="detail-grid">
                     <div class="detail-item">
-                        <label>User ID</label>
+                        <label><%= t('users.userId').replace(/\s*\*$/, '') %></label>
                         <code class="value"><%= user.userId %></code>
                     </div>
                     <div class="detail-item">
-                        <label>Username</label>
+                        <label><%= t('users.username') %></label>
                         <span class="value"><%= user.username || '—' %></span>
                     </div>
                     <div class="detail-item">
@@ -75,11 +76,11 @@
                     </div>
                     <div class="detail-item">
                         <label><%= t('users.createdAt') %></label>
-                        <span class="value"><%= user.createdAt ? new Date(user.createdAt).toLocaleString(lang === 'en' ? 'en-US' : 'ru-RU', { dateStyle: 'medium', timeStyle: 'short' }) : '—' %></span>
+                        <span class="value"><%= user.createdAt ? new Date(user.createdAt).toLocaleString(viewDateLocale, { dateStyle: 'medium', timeStyle: 'short' }) : '—' %></span>
                     </div>
                     <div class="detail-item">
                         <label><%= t('users.expires') %></label>
-                        <span class="value"><%= user.expireAt ? new Date(user.expireAt).toLocaleString(lang === 'en' ? 'en-US' : 'ru-RU', { dateStyle: 'medium', timeStyle: 'short' }) : t('users.forever') %></span>
+                        <span class="value"><%= user.expireAt ? new Date(user.expireAt).toLocaleString(viewDateLocale, { dateStyle: 'medium', timeStyle: 'short' }) : t('users.forever') %></span>
                     </div>
                 </div>
                 
@@ -114,7 +115,7 @@
                             <tr data-hwid="<%- encodeURIComponent(d.hwid) %>">
                                 <td><code style="font-size:11px"><%= d.deviceModel || '—' %></code></td>
                                 <td><small><%= [d.platform, d.osVersion].filter(Boolean).join(' ') || '—' %></small></td>
-                                <td><small><%= d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString(lang === 'en' ? 'en-US' : 'ru-RU', { dateStyle: 'short', timeStyle: 'short' }) : '—' %></small></td>
+                                <td><small><%= d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString(viewDateLocale, { dateStyle: 'short', timeStyle: 'short' }) : '—' %></small></td>
                                 <td><button type="button" class="btn btn-sm btn-danger" onclick="unlinkHwid(this.closest('tr').dataset.hwid)"><%= t('users.unlinkDevice') %></button></td>
                             </tr>
                             <% }); %>

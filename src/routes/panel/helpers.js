@@ -919,6 +919,8 @@ const render = (res, template, data = {}) => {
         t: res.locals.t,
         lang: res.locals.lang,
         supportedLangs: res.locals.supportedLangs,
+        languageOptions: res.locals.languageOptions,
+        dateLocale: res.locals.dateLocale,
         locales: res.locals.locales,
     };
 
@@ -1167,7 +1169,7 @@ const sniScanLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
-        res.status(429).json({ error: 'Too many scan requests. Try again in a minute.' });
+        res.status(429).json({ error: res.locals.t?.('common.tooManyScanRequests') || 'Too many scan requests. Try again in a minute.' });
     },
 });
 

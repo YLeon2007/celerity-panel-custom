@@ -112,7 +112,7 @@ router.get('/settings', async (req, res) => {
         });
     } catch (error) {
         logger.error('[Panel] GET /settings error:', error.message);
-        res.status(500).send('Error: ' + error.message);
+        res.status(500).send(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`);
     }
 });
 
@@ -349,7 +349,7 @@ router.post('/settings', async (req, res) => {
 
         logger.info(`[Panel] Settings updated`);
         
-        res.redirect('/panel/settings?message=' + encodeURIComponent('Настройки сохранены'));
+        res.redirect('/panel/settings?message=' + encodeURIComponent(res.locals.t?.('settings.saved') || 'Settings saved'));
     } catch (error) {
         logger.error('[Panel] Settings save error:', error.message);
         res.redirect('/panel/settings?error=' + encodeURIComponent(`${res.locals.t?.('common.error') || 'Error'}: ${error.message}`));
@@ -364,15 +364,15 @@ router.post('/settings/password', async (req, res) => {
         const confirmPassword = String(req.body.confirmPassword || '');
 
         if (!currentPassword || !newPassword || !confirmPassword) {
-            return redirectSettingsSecurity(res, { error: 'Заполните все поля' });
+            return redirectSettingsSecurity(res, { error: res.locals.t?.('settings.passwordFieldsRequired') || 'Fill in all password fields' });
         }
 
         if (newPassword.length < 6) {
-            return redirectSettingsSecurity(res, { error: 'Новый пароль должен быть минимум 6 символов' });
+            return redirectSettingsSecurity(res, { error: res.locals.t?.('settings.newPasswordTooShort') || 'New password must be at least 6 characters' });
         }
 
         if (newPassword !== confirmPassword) {
-            return redirectSettingsSecurity(res, { error: res.locals.t?.('settings.passwordsMismatch') || 'Passwords do not match' });
+            return redirectSettingsSecurity(res, { error: res.locals.t?.('setup.passwordsMismatch') || 'Passwords do not match' });
         }
 
         const admin = await Admin.verifyPassword(req.session.adminUsername, currentPassword);
@@ -629,19 +629,19 @@ router.post('/settings/homepage/upload', (req, res) => {
     homepageUpload.single('file')(req, res, async (err) => {
         if (err) {
             const msg = err.code === 'LIMIT_FILE_SIZE'
-                ? `File too large (max ${homepageService.MAX_CUSTOM_BYTES} bytes)`
+                ? (res.locals.t?.('settings.homepageFileTooLarge') || 'File too large (max {bytes} bytes)').replace('{bytes}', homepageService.MAX_CUSTOM_BYTES)
                 : err.message;
             return res.redirect('/panel/settings?tab=security&error=' + encodeURIComponent(msg));
         }
         if (!req.file) {
-            return res.redirect('/panel/settings?tab=security&error=' + encodeURIComponent('No file uploaded'));
+            return res.redirect('/panel/settings?tab=security&error=' + encodeURIComponent(res.locals.t?.('settings.homepageNoFile') || 'No file uploaded'));
         }
         try {
             await homepageService.setCustom(req.file.buffer);
             await Settings.update({ 'homepage.mode': 'custom' });
             await homepageService.setMode('custom');
             logger.info(`[Panel] Homepage custom HTML uploaded (${req.file.buffer.length} bytes) by ${req.session.adminUsername}`);
-            return res.redirect('/panel/settings?tab=security&message=' + encodeURIComponent('Главная страница обновлена'));
+            return res.redirect('/panel/settings?tab=security&message=' + encodeURIComponent(res.locals.t?.('settings.homepageUpdated') || 'Homepage updated'));
         } catch (error) {
             logger.error(`[Panel] Homepage upload error: ${error.message}`);
             return res.redirect('/panel/settings?tab=security&error=' + encodeURIComponent(error.message));
@@ -655,7 +655,7 @@ router.post('/settings/homepage/reset', async (req, res) => {
         await homepageService.clearCustom();
         await Settings.update({ 'homepage.mode': 'nginx' });
         logger.info(`[Panel] Homepage reset to default by ${req.session.adminUsername}`);
-        return res.redirect('/panel/settings?tab=security&message=' + encodeURIComponent('Главная страница сброшена'));
+        return res.redirect('/panel/settings?tab=security&message=' + encodeURIComponent(res.locals.t?.('settings.homepageResetDone') || 'Homepage reset to default'));
     } catch (error) {
         logger.error(`[Panel] Homepage reset error: ${error.message}`);
         return res.redirect('/panel/settings?tab=security&error=' + encodeURIComponent(error.message));
@@ -708,7 +708,7 @@ router.post('/settings/test-s3', async (req, res) => {
         const { endpoint, region, bucket, prefix, accessKeyId, secretAccessKey } = req.body;
         
         if (!bucket || !accessKeyId || !secretAccessKey) {
-            return res.status(400).json({ error: 'Bucket, Access Key и Secret Key обязательны' });
+            return res.status(400).json({ error: res.locals.t?.('settings.s3RequiredFields') || 'Bucket, Access Key and Secret Key are required' });
         }
         
         const result = await backupService.testS3Connection({

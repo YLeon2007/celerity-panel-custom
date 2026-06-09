@@ -19,7 +19,7 @@ const config = require('./config');
 const logger = require('./src/utils/logger');
 const requireAuth = require('./src/middleware/auth');
 const { requireScope } = requireAuth;
-const { i18nMiddleware } = require('./src/middleware/i18n');
+const { i18nMiddleware, LANGUAGE_OPTIONS, normalizeLanguage } = require('./src/middleware/i18n');
 const { countRequest } = require('./src/middleware/rpsCounter');
 const syncService = require('./src/services/syncService');
 const expireScheduler = require('./src/services/expireScheduler');
@@ -356,38 +356,46 @@ app.post('/api/kick/:userId', requireAuth, requireScope('sync:write'), async (re
 
 if (config.API_DOCS_ENABLED) {
     const { buildSpec } = require('./src/docs/openapi');
+    const docsLanguageOptions = LANGUAGE_OPTIONS.map(({ code, label }) => ({ code, label }));
+    const getDocsLanguage = (req) => normalizeLanguage(req.query?.lang) || 'en';
 
-    // Serve spec in requested language (?lang=ru|en)
+    // Serve spec in requested language (?lang=ru|en|zh-CN)
     app.get('/api/docs/openapi.json', (req, res) => {
-        const lang = req.query.lang === 'ru' ? 'ru' : 'en';
+        const lang = getDocsLanguage(req);
         res.json(buildSpec(lang));
     });
 
     app.get('/api/docs', (req, res) => {
-        const lang = req.query.lang === 'ru' ? 'ru' : 'en';
-        const otherLang = lang === 'ru' ? 'en' : 'ru';
-        const otherLabel = lang === 'ru' ? 'English' : 'Русский';
-        const specUrl = `/api/docs/openapi.json?lang=${lang}`;
+        const lang = getDocsLanguage(req);
+        const specUrl = `/api/docs/openapi.json?lang=${encodeURIComponent(lang)}`;
+        const languageLinks = docsLanguageOptions.map(option => {
+            const activeClass = option.code === lang ? ' active' : '';
+            return `<a class="lang-toggle${activeClass}" href="/api/docs?lang=${encodeURIComponent(option.code)}">${option.label}</a>`;
+        }).join('');
 
         res.send(`<!doctype html>
-<html>
+<html lang="${lang}">
   <head>
     <title>C³ CELERITY — API Reference</title>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <style>
       body { margin: 0; }
-      #lang-toggle {
+      #lang-switch {
         position: fixed; top: 14px; right: 16px; z-index: 9999;
+        display: flex; gap: 6px; font-family: sans-serif;
+      }
+      .lang-toggle {
         padding: 5px 12px; border-radius: 6px; border: 1px solid #a78bfa;
         background: #1e1e2e; color: #a78bfa; font-size: 13px;
-        cursor: pointer; text-decoration: none; font-family: sans-serif;
+        cursor: pointer; text-decoration: none;
       }
-      #lang-toggle:hover { background: #2e2e3e; }
+      .lang-toggle:hover,
+      .lang-toggle.active { background: #2e2e3e; }
     </style>
   </head>
   <body>
-    <a id="lang-toggle" href="/api/docs?lang=${otherLang}">${otherLabel}</a>
+    <nav id="lang-switch" aria-label="API docs language">${languageLinks}</nav>
     <script
       id="api-reference"
       data-url="${specUrl}"
