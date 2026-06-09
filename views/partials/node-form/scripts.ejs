@@ -1363,9 +1363,8 @@ async function refreshNodeInfo() {
 }
 <% } %>
 
-async function generateXrayKeys() {
+async function generateXrayKeys(btn) {
     if (!confirm(i18n.xrayGenerateKeysConfirm)) return;
-    const btn = event.target;
     btn.disabled = true;
     btn.innerHTML = '<i class="ti ti-loader-2"></i>';
     try {
