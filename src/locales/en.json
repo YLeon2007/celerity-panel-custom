@@ -341,7 +341,7 @@
     "virtualNoStatus": "Virtual nodes don't connect to a server — they aggregate other nodes",
     "sectionNetwork": "Network",
     "sectionObfuscation": "Obfuscation (obfs)",
-    "sectionObfuscationHint": "Salamander hides QUIC traffic from DPI. Enable only if your ISP blocks Hysteria — may perform worse on mobile networks. Note: when enabled, the server is no longer compatible with standard QUIC and no longer a valid HTTP/3 server.",
+    "sectionObfuscationHint": "Salamander and Gecko hide QUIC traffic from DPI. Enable only if your ISP blocks Hysteria — may perform worse on mobile networks. Note: when enabled, the server is no longer compatible with standard QUIC and no longer a valid HTTP/3 server.",
     "sectionLimits": "Limits & Priority",
     "hopInterval": "Port Hopping Interval",
     "hopIntervalHint": "Port hopping interval (`hopInterval`). Default: 30s, minimum: 5s.",

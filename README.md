@@ -425,7 +425,7 @@ Hysteria supports obfuscation to disguise traffic:
 3. Set **obfuscation password**
 4. Save and update config
 
-Clients will automatically receive obfs params in subscription.
+Clients will automatically receive the selected `obfs` type and password in subscription.
 
 ### Single VPS Setup (Panel + Node)
 
