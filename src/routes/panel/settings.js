@@ -269,6 +269,21 @@ router.post('/settings', async (req, res) => {
                 .slice(0, 1500);
             setIfPresent('subscription.happ.hwid.notSupportedRemark', sanitizeRemark);
             setIfPresent('subscription.happ.hwid.maxDevicesRemark',   sanitizeRemark);
+
+            // Soft-block for invalid subscriptions: fake locations served to all
+            // clients instead of a 403. An absent checkbox means "unchecked",
+            // so the enabled flag is forced only when this card was submitted.
+            const hasSoftBlockInBody = Object.keys(req.body).some(k => k.startsWith('subscription.softBlock.'));
+            if (hasSoftBlockInBody) {
+                updates['subscription.softBlock.enabled'] = req.body['subscription.softBlock.enabled'] === 'on';
+            }
+            const sanitizeAnnounce = (v) => String(v || '').trim().slice(0, 300);
+            const sanitizeTitle    = (v) => String(v || '').trim().slice(0, 60);
+            for (const k of ['expired', 'disabled', 'trafficExceeded']) {
+                setIfPresent(`subscription.softBlock.${k}.remark`,   sanitizeRemark);
+                setIfPresent(`subscription.softBlock.${k}.announce`, sanitizeAnnounce);
+                setIfPresent(`subscription.softBlock.${k}.title`,    sanitizeTitle);
+            }
         }
 
         // Homepage mode (decoy/custom). File upload has its own endpoint.

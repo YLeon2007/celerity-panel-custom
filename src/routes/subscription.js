@@ -1746,8 +1746,11 @@ function getSubscriptionPageText(lang) {
     };
 }
 
-async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') {
+async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru', opts = {}) {
     const text = getSubscriptionPageText(lang);
+    // Soft-block mode: replace the link/locations/QR sections with a notice
+    // banner; everything else (header, stats, buttons, styles) is reused.
+    const softBlock = opts.softBlock || null;
     // Collect all configs
     const allConfigs = [];
     nodes.forEach(node => {
@@ -1809,7 +1812,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
     // Customization from settings
     const sub = settings?.subscription || {};
     const logoUrl   = sub.logoUrl   || '';
-    const pageTitle = sub.pageTitle || text.pageTitle;
+    const pageTitle = (softBlock && softBlock.title) || sub.pageTitle || text.pageTitle;
 
     const logoHtml = logoUrl
         ? `<img src="${logoUrl}" class="brand-logo" onerror="this.style.display='none'">`
@@ -1820,8 +1823,9 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
     // so the QR seamlessly blends into any surface. Cache key carries a style
     // version (`v3`) so legacy QRs with the old `#141414` background are regenerated.
     const QR_CACHE_KEY = `v3:${baseUrl}`;
-    let qrDataUrl = await cache.getQR(QR_CACHE_KEY);
-    if (!qrDataUrl) {
+    // Soft-block pages never render the QR section, so skip the work entirely.
+    let qrDataUrl = softBlock ? null : await cache.getQR(QR_CACHE_KEY);
+    if (!softBlock && !qrDataUrl) {
         try {
             qrDataUrl = await QRCode.toDataURL(baseUrl, {
                 width: 240,
@@ -1875,6 +1879,25 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
             </div>
            </div>`
         : '';
+
+    // Soft-block notice: announce banner + one row per remark line (deduped
+    // against the banner text). Replaces the link/locations/QR sections.
+    const noticeRows = softBlock
+        ? (softBlock.lines || []).filter(l => l && l !== softBlock.announce)
+        : [];
+    const noticeHtml = softBlock
+        ? `<div class="section">
+            <div style="text-align:center; padding:6px 4px 2px;">
+                <div style="font-size:34px; color:var(--accent); margin-bottom:10px;"><i class="ti ti-alert-triangle"></i></div>
+                <div style="font-size:16px; font-weight:600; line-height:1.5;">${escAttr(softBlock.announce || '')}</div>
+            </div>
+            ${noticeRows.length ? `<div style="margin-top:14px; display:flex; flex-direction:column; gap:8px;">
+                ${noticeRows.map(l => `<div style="padding:12px 14px; background:var(--glass-bg); border:1px solid var(--glass-border); border-radius:var(--radius-sm); text-align:center; color:var(--text-muted);">${escAttr(l)}</div>`).join('')}
+            </div>` : ''}
+           </div>`
+        : '';
+
+    const locationsCount = softBlock ? (softBlock.lines || []).length : locations.size;
 
     return `<!DOCTYPE html>
 <html lang="${text.lang}">
@@ -2290,7 +2313,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
     <div class="container">
         <div class="header">
             <h1>${logoHtml} <span>${pageTitle}</span></h1>
-            <p>${text.personalConfig}</p>
+            ${softBlock ? '' : `<p>${text.personalConfig}</p>`}
         </div>
 
         <div class="stats">
@@ -2298,17 +2321,17 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
                 <div class="stat-value">${trafficUsed.toFixed(1)} ${text.gb}</div>
                 <div class="stat-label">${text.used}${trafficLimit > 0 ? ` / ${trafficLimit.toFixed(0)} ${text.gb}` : ''}</div>
             </div>
-            <div class="stat">
-                <div class="stat-value">${locations.size}</div>
+            ${softBlock ? '' : `<div class="stat">
+                <div class="stat-value">${locationsCount}</div>
                 <div class="stat-label">${text.locations}</div>
-            </div>
+            </div>`}
             <div class="stat">
                 <div class="stat-value">${expireDate}</div>
                 <div class="stat-label">${text.validUntil}</div>
             </div>
         </div>
 
-        <div class="section">
+        ${softBlock ? noticeHtml : `<div class="section">
             <h2><i class="ti ti-link"></i> ${text.appLinkTitle}</h2>
             <div class="sub-box">
                 <input type="text" value="${baseUrl}" readonly id="subUrl">
@@ -2340,7 +2363,7 @@ async function generateHTML(user, nodes, token, baseUrl, settings, lang = 'ru') 
             `).join('')}
         </div>
 
-        ${qrSectionHtml}
+        ${qrSectionHtml}`}
         ${buttonsHtml}
     </div>
 
@@ -2530,12 +2553,13 @@ function encodeAnnounceHeader(text) {
  *
  * @param {string} remark Multiline admin text (or default fallback).
  * @param {string} fallback Default line used when remark is empty.
+ * @param {string} [titleOverride] Optional Profile-Title override (empty = normal title).
  */
-function sendFakeSubscription(res, user, format, userAgent, settings, remark, fallback, extraHeaders) {
+function sendFakeSubscription(res, user, format, userAgent, settings, remark, fallback, extraHeaders, titleOverride) {
     const lines = parseRemarkLines(remark, fallback);
     const data = {
         content: generateFakeSubscriptionContent(format, lines),
-        profileTitle: getSubscriptionTitle(user),
+        profileTitle: (titleOverride || '').trim() || getSubscriptionTitle(user),
         username: user.username || user.userId,
         traffic: { tx: user.traffic?.tx || 0, rx: user.traffic?.rx || 0 },
         trafficLimit: user.trafficLimit || 0,
@@ -2543,6 +2567,64 @@ function sendFakeSubscription(res, user, format, userAgent, settings, remark, fa
     };
     res.set('Cache-Control', 'no-store');
     sendCachedSubscription(res, data, format, userAgent, settings, extraHeaders);
+}
+
+// Default fake-location names per invalid reason, used only when the admin
+// left the remark empty. validateUser() error string -> default text.
+const SOFTBLOCK_DEFAULTS = {
+    Expired: 'Subscription expired',
+    Inactive: 'Subscription disabled',
+    'Traffic exceeded': 'Traffic limit reached',
+};
+// validateUser() error string -> settings.subscription.softBlock key.
+const SOFTBLOCK_REASON_KEY = {
+    Expired: 'expired',
+    Inactive: 'disabled',
+    'Traffic exceeded': 'trafficExceeded',
+};
+
+/**
+ * Decide what an invalid subscription receives. When soft-block is disabled,
+ * keep the legacy plain-text 403. When enabled, browsers get a styled HTML
+ * page with a banner; apps get a fake-location subscription (Happ also gets an
+ * in-app popup via the `announce` header). Self-contained: loads settings and
+ * detects format/browser itself so both subscription routes can reuse it.
+ *
+ * @param {object} validation Result of validateUser() ({ valid, error }).
+ * @param {{ cacheToken?: string, baseUrl?: string }} [ctx] For the HTML page.
+ */
+async function rejectOrSoftBlock(req, res, user, validation, ctx = {}) {
+    const settings = await getSettings();
+    const sb = settings?.subscription?.softBlock;
+    const key = SOFTBLOCK_REASON_KEY[validation.error];
+    if (!sb?.enabled || !key) {
+        return res.status(403).type('text/plain').send(`# ${validation.error}`);
+    }
+
+    const cfg = sb[key] || {};
+    const fallback = SOFTBLOCK_DEFAULTS[validation.error];
+    const lines = parseRemarkLines(cfg.remark, fallback);
+    const announce = (cfg.announce || '').trim() || lines[0];
+    const title = (cfg.title || '').trim();
+    const userAgent = req.headers['user-agent'] || '';
+
+    // Browser without ?format -> render the same styled HTML page with a banner.
+    if (isBrowser(req) && !req.query.format) {
+        const html = await generateHTML(user, [], ctx.cacheToken, ctx.baseUrl || '',
+            settings, res.locals.lang, { softBlock: { announce, lines, title } });
+        return res
+            .type('text/html')
+            .set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            .send(html);
+    }
+
+    const format = req.query.format || detectFormat(userAgent);
+    const extraHeaders = {};
+    if (/happ/i.test(userAgent) && announce) {
+        extraHeaders['announce'] = encodeAnnounceHeader(announce);
+    }
+    return sendFakeSubscription(res, user, format, userAgent, settings,
+        cfg.remark, fallback, extraHeaders, title);
 }
 
 /**
@@ -2756,13 +2838,14 @@ router.get('/files/:token', async (req, res) => {
             return res.status(404).type('text/plain').send('# User not found');
         }
 
+        const baseUrl = `${req.protocol}://${req.get('host')}/api/files/${token}`;
+
         const validation = validateUser(user);
         if (!validation.valid) {
             logger.warn(`[Sub] User ${user.userId} invalid: ${validation.error}`);
-            return res.status(403).type('text/plain').send(`# ${validation.error}`);
+            return await rejectOrSoftBlock(req, res, user, validation, { cacheToken: token, baseUrl });
         }
 
-        const baseUrl = `${req.protocol}://${req.get('host')}/api/files/${token}`;
         return await serveSubscription(req, res, { user, cacheToken: token, baseUrl });
     } catch (error) {
         logger.error(`[Sub] Error: ${error.message}`);
@@ -2964,3 +3047,4 @@ module.exports = router;
 module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
+module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
