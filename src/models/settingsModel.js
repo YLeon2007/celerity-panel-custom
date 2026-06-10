@@ -112,6 +112,18 @@ const settingsSchema = new mongoose.Schema({
                 maxDevicesRemark: { type: String, default: '' },
             },
         },
+
+        // Soft-block for invalid subscriptions (expired / disabled / traffic exceeded).
+        // Instead of a 403, serve a valid subscription whose servers are fake
+        // locations named after the admin text. Shown to all clients.
+        // remark = fake locations; announce = Happ popup + HTML banner;
+        // title  = optional subscription name override (empty = keep normal title).
+        softBlock: {
+            enabled: { type: Boolean, default: false },
+            expired:         { remark: { type: String, default: '' }, announce: { type: String, default: '' }, title: { type: String, default: '' } },
+            disabled:        { remark: { type: String, default: '' }, announce: { type: String, default: '' }, title: { type: String, default: '' } },
+            trafficExceeded: { remark: { type: String, default: '' }, announce: { type: String, default: '' }, title: { type: String, default: '' } },
+        },
     },
 
     deployment: {

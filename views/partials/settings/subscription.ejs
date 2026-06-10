@@ -332,7 +332,44 @@
 
     <%- include('hysteria-limit') %>
 
-    <%- include('happ') %>
-
     <%- include('routing') %>
+
+    <details class="happ-collapse-section" style="margin-top: 1.5rem;">
+        <summary class="happ-collapse-summary">
+            <i class="ti ti-chevron-right"></i>
+            <span><i class="ti ti-shield-x"></i> <%= t('settings.softBlockTitle') %></span>
+        </summary>
+        <%- include('softblock') %>
+    </details>
+
+    <details class="happ-collapse-section" style="margin-top: 1.5rem;">
+        <summary class="happ-collapse-summary">
+            <i class="ti ti-chevron-right"></i>
+            <span><i class="ti ti-rocket"></i> <%= t('settings.happSectionToggle') %></span>
+        </summary>
+        <%- include('happ') %>
+    </details>
 </div>
+
+<style>
+.happ-collapse-section > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    transition: color 0.15s, border-color 0.15s;
+}
+.happ-collapse-section > summary::-webkit-details-marker { display: none; }
+.happ-collapse-section > summary:hover { color: var(--accent); border-color: var(--accent); }
+.happ-collapse-section > summary > i:first-child { transition: transform 0.2s; }
+.happ-collapse-section[open] > summary > i:first-child { transform: rotate(90deg); }
+.happ-collapse-section > summary span i { color: var(--accent); margin-right: 2px; }
+</style>

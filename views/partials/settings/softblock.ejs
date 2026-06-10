@@ -1,0 +1,93 @@
+<%# ==================== SECTION: SOFT-BLOCK (invalid subscriptions) ==================== %>
+<div class="card" style="margin-top: 1.5rem;">
+    <div class="card-header">
+        <h2><i class="ti ti-shield-x"></i> <%= t('settings.softBlockTitle') %></h2>
+        <p class="hint" style="margin:0"><%= t('settings.softBlockDesc') %></p>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="/panel/settings" id="softBlockForm">
+            <input type="hidden" name="_subscriptionSettings" value="1">
+
+            <label class="checkbox-label" style="margin-bottom: 1.25rem;">
+                <input type="checkbox" name="subscription.softBlock.enabled"
+                       <%= settings?.subscription?.softBlock?.enabled ? 'checked' : '' %>>
+                <span class="checkbox-text">
+                    <strong><%= t('settings.softBlockEnable') %></strong>
+                    <small class="hint" style="display:block; margin-top:2px;"><%= t('settings.softBlockEnableHint') %></small>
+                </span>
+            </label>
+
+            <%
+            const softBlockReasons = [
+                { key: 'expired',         label: t('settings.softBlockReasonExpired') },
+                { key: 'disabled',        label: t('settings.softBlockReasonDisabled') },
+                { key: 'trafficExceeded', label: t('settings.softBlockReasonTrafficExceeded') },
+            ];
+            %>
+            <% softBlockReasons.forEach(function(reason) {
+                const cfg = (settings?.subscription?.softBlock && settings.subscription.softBlock[reason.key]) || {};
+            %>
+            <div class="softblock-reason">
+                <h4 style="margin: 0 0 0.75rem; font-size: 14px;">
+                    <i class="ti ti-point"></i> <%= reason.label %>
+                </h4>
+                <div class="form-group" style="margin-bottom: 0.85rem;">
+                    <label><%= t('settings.softBlockRemark') %></label>
+                    <div style="position: relative;">
+                        <textarea name="subscription.softBlock.<%= reason.key %>.remark"
+                                  class="softblock-remark" maxlength="1500" rows="3"
+                                  style="width:100%; resize:vertical; font-size:13px; padding-bottom:22px;"
+                                  placeholder="Subscription expired&#10;Please renew to restore access"><%= cfg.remark || '' %></textarea>
+                        <span class="softblock-remark-counter" style="position:absolute; bottom:6px; right:8px; font-size:11px; color:var(--text-muted); pointer-events:none;"></span>
+                    </div>
+                    <small class="hint"><%= t('settings.softBlockRemarkHint') %></small>
+                </div>
+                <div class="settings-grid">
+                    <div class="form-group">
+                        <label><%= t('settings.softBlockAnnounce') %></label>
+                        <textarea name="subscription.softBlock.<%= reason.key %>.announce"
+                                  maxlength="300" rows="2"
+                                  style="width:100%; font-size:13px;"><%= cfg.announce || '' %></textarea>
+                        <small class="hint"><%= t('settings.softBlockAnnounceHint') %></small>
+                    </div>
+                    <div class="form-group">
+                        <label><%= t('settings.softBlockName') %></label>
+                        <input type="text" name="subscription.softBlock.<%= reason.key %>.title"
+                               maxlength="60" value="<%= cfg.title || '' %>">
+                        <small class="hint"><%= t('settings.softBlockNameHint') %></small>
+                    </div>
+                </div>
+            </div>
+            <% }); %>
+
+            <div class="settings-save-bar">
+                <button type="submit" class="btn btn-primary">
+                    <i class="ti ti-device-floppy"></i> <%= t('common.save') %>
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<style>
+.softblock-reason {
+    margin-bottom: 1.25rem;
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.025);
+}
+.softblock-reason h4 i { color: var(--accent); }
+</style>
+
+<script>
+(function () {
+    document.querySelectorAll('.softblock-remark').forEach(function (ta) {
+        var counter = ta.parentElement.querySelector('.softblock-remark-counter');
+        if (!counter) return;
+        var update = function () { counter.textContent = ta.value.length + '/' + ta.maxLength; };
+        ta.addEventListener('input', update);
+        update();
+    });
+})();
+</script>

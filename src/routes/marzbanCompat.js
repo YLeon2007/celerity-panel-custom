@@ -179,21 +179,24 @@ async function _handle(req, res, next) {
         return res.status(404).type('text/plain').send('# User not found');
     }
 
-    const validation = subscriptionModule.validateUser(user);
-    if (!validation.valid) {
-        return res.status(403).type('text/plain').send(`# ${validation.error}`);
-    }
-
-    const client = m.groups?.client;
-    if (client === 'info') {
-        return subscriptionModule.serveInfo(req, res, user);
-    }
-
     // Map legacy client_type into Celerity's `format` query so the shared
-    // pipeline picks the right generator branch. Setting it on req.query
-    // keeps the helper signature stable.
+    // pipeline picks the right generator branch. Done before validation so the
+    // soft-block fake subscription also honours the requested client format.
+    // Setting it on req.query keeps the helper signature stable.
+    const client = m.groups?.client;
     if (client && CLIENT_TO_FORMAT[client]) {
         req.query = { ...req.query, format: CLIENT_TO_FORMAT[client] };
+    }
+
+    const validation = subscriptionModule.validateUser(user);
+    if (!validation.valid) {
+        const cacheToken = user.subscriptionToken || userId;
+        const baseUrl = `${req.protocol}://${req.get('host')}${req.path.replace(/\/+$/, '')}`;
+        return subscriptionModule.rejectOrSoftBlock(req, res, user, validation, { cacheToken, baseUrl });
+    }
+
+    if (client === 'info') {
+        return subscriptionModule.serveInfo(req, res, user);
     }
 
     // Cache key uses the user's Celerity subscriptionToken so both native and
