@@ -81,14 +81,12 @@ function getFallbackChain(lang = DEFAULT_LANG) {
     const normalized = normalizeLanguage(lang) || DEFAULT_LANG;
     const chain = [normalized];
 
-    if (normalized === DEFAULT_LANG) {
-        return chain;
-    }
-
     if (normalized !== FALLBACK_LANG) {
         chain.push(FALLBACK_LANG);
     }
-    chain.push(DEFAULT_LANG);
+    if (normalized !== DEFAULT_LANG) {
+        chain.push(DEFAULT_LANG);
+    }
 
     return [...new Set(chain)];
 }
@@ -233,4 +231,3 @@ module.exports = {
     SUPPORTED_LANGS,
     DEFAULT_LANG,
 };
-
