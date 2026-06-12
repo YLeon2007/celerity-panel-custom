@@ -125,7 +125,7 @@ async function ensureStarterAccessBundle(nodeIds) {
         await user.save();
     }
 
-    const subscriptionToken = user.subscriptionToken || user.userId;
+    const subscriptionToken = user.subscriptionToken;
 
     await Promise.all([
         invalidateGroupsCache(),

@@ -125,7 +125,7 @@
                     </td>
                     <td class="td-actions">
                         <div class="action-buttons">
-                            <button class="btn-icon" onclick="copySubscription('<%= user.subscriptionToken || user.userId %>')" title="<%= t('users.copySubscription') %>">
+                            <button class="btn-icon" onclick="copySubscription('<%= user.subscriptionToken %>')" title="<%= t('users.copySubscription') %>">
                                 <i class="ti ti-clipboard"></i>
                             </button>
                             <a href="/panel/users/<%= user.userId %>" class="btn-icon" title="<%= t('users.details') %>">
@@ -208,7 +208,7 @@
                 <% } %>
                 
                 <div class="mobile-node-actions">
-                    <button class="btn btn-sm" onclick="copySubscription('<%= user.subscriptionToken || user.userId %>')" style="flex: 1;">
+                    <button class="btn btn-sm" onclick="copySubscription('<%= user.subscriptionToken %>')" style="flex: 1;">
                         <i class="ti ti-clipboard"></i> <%= t('users.subscription') %>
                     </button>
                     <a href="/panel/users/<%= user.userId %>" class="btn btn-sm" style="flex: 1;">

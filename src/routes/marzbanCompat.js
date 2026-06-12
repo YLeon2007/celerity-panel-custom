@@ -190,7 +190,7 @@ async function _handle(req, res, next) {
 
     const validation = subscriptionModule.validateUser(user);
     if (!validation.valid) {
-        const cacheToken = user.subscriptionToken || userId;
+        const cacheToken = user.subscriptionToken || token;
         const baseUrl = `${req.protocol}://${req.get('host')}${req.path.replace(/\/+$/, '')}`;
         return subscriptionModule.rejectOrSoftBlock(req, res, user, validation, { cacheToken, baseUrl });
     }
@@ -199,10 +199,10 @@ async function _handle(req, res, next) {
         return subscriptionModule.serveInfo(req, res, user);
     }
 
-    // Cache key uses the user's Celerity subscriptionToken so both native and
-    // legacy URLs share one cache entry. Without this we would double the
-    // Redis footprint and double-generate after every panel mutation.
-    const cacheToken = user.subscriptionToken || userId;
+    // Prefer the user's Celerity subscriptionToken so native and legacy URLs
+    // share one cache entry. If a legacy user somehow was not backfilled yet,
+    // fall back to the signed Marzban token, never the public Celerity userId.
+    const cacheToken = user.subscriptionToken || token;
     const baseUrl = `${req.protocol}://${req.get('host')}${req.path.replace(/\/+$/, '')}`;
 
     // Reuse the public-facing limiter so legacy hits share the same bucket as

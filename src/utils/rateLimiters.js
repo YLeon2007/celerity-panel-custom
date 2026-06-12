@@ -32,11 +32,20 @@ const subscriptionLimiter = rateLimit({
     },
 });
 
+const authLimiter = rateLimit({
+    windowMs: 1000,
+    max: () => _state.authPerSecond,
+    handler: (req, res) => {
+        logger.warn(`[Auth] Rate limit: ${req.ip}`);
+        res.status(429).json({ ok: false });
+    },
+});
+
 function applyRateLimits(settings) {
     if (settings?.rateLimit) {
         _state.subscriptionPerMinute = settings.rateLimit.subscriptionPerMinute || 100;
         _state.authPerSecond = settings.rateLimit.authPerSecond || 200;
-        logger.info(`[Settings] Rate limits: sub=${_state.subscriptionPerMinute}/min`);
+        logger.info(`[Settings] Rate limits: sub=${_state.subscriptionPerMinute}/min auth=${_state.authPerSecond}/sec`);
     }
 }
 
@@ -46,6 +55,7 @@ function getRateLimitState() {
 
 module.exports = {
     subscriptionLimiter,
+    authLimiter,
     applyRateLimits,
     getRateLimitState,
 };

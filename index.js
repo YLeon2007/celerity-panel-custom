@@ -39,7 +39,7 @@ const authRoutes = require('./src/routes/auth');
 const panelRoutes = require('./src/routes/panel');
 const mcpRoutes = require('./src/routes/mcp');
 const marzbanCompat = require('./src/routes/marzbanCompat');
-const { subscriptionLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
+const { subscriptionLimiter, authLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
 const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
 const helmet = require('helmet');
@@ -148,7 +148,7 @@ app.get('/health', async (req, res) => {
 
 // ==================== API ROUTES ====================
 
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 
 const Admin = require('./src/models/adminModel');
 const totpService = require('./src/services/totpService');
@@ -510,6 +510,32 @@ async function startServer() {
             }));
             await HyUser.bulkWrite(bulkOps, { ordered: false });
             logger.info(`[Migration] Generated xrayUuid for ${usersWithoutUuid.length} existing users`);
+        }
+
+        // Migration: ensure all users have a non-public subscription token.
+        const usersWithoutSubscriptionToken = await HyUser.find({
+            $or: [
+                { subscriptionToken: { $exists: false } },
+                { subscriptionToken: null },
+                { subscriptionToken: '' },
+            ],
+        }).select('_id userId');
+        if (usersWithoutSubscriptionToken.length > 0) {
+            const crypto = require('crypto');
+            const bulkOps = usersWithoutSubscriptionToken.map(u => {
+                const token = crypto.createHash('sha256')
+                    .update(u.userId + crypto.randomBytes(8).toString('hex'))
+                    .digest('hex')
+                    .substring(0, 16);
+                return {
+                    updateOne: {
+                        filter: { _id: u._id },
+                        update: { $set: { subscriptionToken: token } },
+                    },
+                };
+            });
+            await HyUser.bulkWrite(bulkOps, { ordered: false });
+            logger.info(`[Migration] Generated subscriptionToken for ${usersWithoutSubscriptionToken.length} existing users`);
         }
 
         // Migration: backfill xray.tlsSource for legacy Xray nodes that were

@@ -97,6 +97,19 @@ async function getUserWithCache(userId) {
     return user;
 }
 
+function parseHysteriaAuthPayload(auth) {
+    if (typeof auth !== 'string') return null;
+
+    const colonIdx = auth.indexOf(':');
+    if (colonIdx === -1) return null;
+
+    const userId = auth.substring(0, colonIdx);
+    const password = auth.substring(colonIdx + 1);
+    if (!userId || !password) return null;
+
+    return { userId, password };
+}
+
 /**
  * POST /auth - User authorization check
  * 
@@ -106,22 +119,14 @@ async function getUserWithCache(userId) {
 router.post('/', async (req, res) => {
     try {
         const { addr, auth, tx } = req.body;
-        
-        if (!auth) {
-            logger.warn(`[Auth] Empty auth from ${addr}`);
+
+        const parsedAuth = parseHysteriaAuthPayload(auth);
+        if (!parsedAuth) {
+            logger.warn(`[Auth] Invalid auth payload from ${addr}`);
             return res.json({ ok: false });
         }
-        
-        // Parse auth string: can be "userId:password" or just "userId"
-        let userId, password;
-        const colonIdx = auth.indexOf(':');
-        if (colonIdx !== -1) {
-            userId = auth.substring(0, colonIdx);
-            password = auth.substring(colonIdx + 1);
-        } else {
-            userId = auth;
-            password = null;
-        }
+
+        const { userId, password } = parsedAuth;
         
         const user = await getUserWithCache(userId);
         
@@ -135,20 +140,18 @@ router.post('/', async (req, res) => {
             return res.json({ ok: false });
         }
         
-        if (password) {
-            const expectedPassword = cryptoService.generatePassword(userId);
-            if (password !== expectedPassword) {
-                // Cached user may not have password field (stripped for security).
-                // Fall back to DB lookup before rejecting.
-                let dbPassword = user.password;
-                if (dbPassword === undefined || dbPassword === null) {
-                    const dbUser = await HyUser.findOne({ userId }, 'password').lean();
-                    dbPassword = dbUser?.password;
-                }
-                if (password !== dbPassword) {
-                    logger.warn(`[Auth] Invalid password: ${userId} (${addr})`);
-                    return res.json({ ok: false });
-                }
+        const expectedPassword = cryptoService.generatePassword(userId);
+        if (password !== expectedPassword) {
+            // Cached user may not have password field (stripped for security).
+            // Fall back to DB lookup before rejecting.
+            let dbPassword = user.password;
+            if (dbPassword === undefined || dbPassword === null) {
+                const dbUser = await HyUser.findOne({ userId }, 'password').lean();
+                dbPassword = dbUser?.password;
+            }
+            if (password !== dbPassword) {
+                logger.warn(`[Auth] Invalid password: ${userId} (${addr})`);
+                return res.json({ ok: false });
             }
         }
         

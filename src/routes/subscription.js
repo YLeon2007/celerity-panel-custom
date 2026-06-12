@@ -59,13 +59,7 @@ function isBrowser(req) {
 }
 
 async function getUserByToken(token) {
-    // Single query instead of two (optimization)
-    const user = await HyUser.findOne({
-        $or: [
-            { subscriptionToken: token },
-            { userId: token }
-        ]
-    })
+    const user = await HyUser.findOne({ subscriptionToken: token })
         .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     

@@ -174,7 +174,7 @@
                         <i class="ti ti-clipboard"></i> <%= t('users.copySubscription') %>
                     </button>
                     
-                    <a href="<%= baseUrl %>/api/files/<%= user.subscriptionToken || user.userId %>" 
+                    <a href="<%= baseUrl %>/api/files/<%= user.subscriptionToken %>" 
                        target="_blank" class="btn btn-block">
                         <i class="ti ti-external-link"></i> <%= t('users.openSubscription') %>
                     </a>
@@ -196,7 +196,7 @@
                 <div id="qrcode" style="text-align:center;margin-bottom:12px;"></div>
                 <p class="hint mb-1"><%= t('users.universalLink') %></p>
                 <input type="text" readonly class="input-readonly" 
-                       value="<%= baseUrl %>/api/files/<%= user.subscriptionToken || user.userId %>" id="subLink">
+                       value="<%= baseUrl %>/api/files/<%= user.subscriptionToken %>" id="subLink">
                 <button class="btn btn-sm btn-block mt-1" onclick="copySubscription()"><%= t('common.copy') %></button>
             </div>
         </div>
