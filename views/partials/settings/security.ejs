@@ -79,6 +79,7 @@
                 </div>
                 <div class="card-body">
                     <form method="POST" action="/panel/settings">
+                        <input type="hidden" name="_nodeAuthSettings" value="1">
                         <label class="checkbox-label">
                             <input type="checkbox" name="nodeAuth.insecure"
                                    <%= settings?.nodeAuth?.insecure !== false ? 'checked' : '' %>>

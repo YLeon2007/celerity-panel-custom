@@ -260,8 +260,10 @@ function resolveVirtualSources(nodes, user) {
 
 function validateUser(user) {
     if (!user) return { valid: false, error: 'Not found' };
-    if (!user.enabled) return { valid: false, error: 'Inactive' };
+    // Expiry is checked before enabled: the scheduler auto-disables expired
+    // users, so an expired account would otherwise report "Inactive".
     if (user.expireAt && new Date(user.expireAt) < new Date()) return { valid: false, error: 'Expired' };
+    if (!user.enabled) return { valid: false, error: 'Inactive' };
     if (user.trafficLimit > 0) {
         const used = (user.traffic?.tx || 0) + (user.traffic?.rx || 0);
         if (used >= user.trafficLimit) return { valid: false, error: 'Traffic exceeded' };
