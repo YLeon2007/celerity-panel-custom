@@ -157,7 +157,12 @@ router.post('/settings', async (req, res) => {
         setIfPresent('sshPool.connectTimeout', v => parseInt(v) || 15);
         setIfPresent('sshPool.keepAliveInterval', v => parseInt(v) || 30);
         setIfPresent('sshPool.maxRetries', v => parseInt(v) || 2);
-        setBool('nodeAuth.insecure');
+
+        // Node Auth card is a standalone form; an absent checkbox means
+        // "unchecked", so force-apply the boolean when that card is submitted.
+        if (req.body['_nodeAuthSettings'] !== undefined) {
+            updates['nodeAuth.insecure'] = req.body['nodeAuth.insecure'] === 'on';
+        }
 
         // Hysteria IP device limit (its own card on the Subscription tab).
         if (req.body['_hyLimitSettings'] !== undefined) {

@@ -7,6 +7,18 @@
 {$PANEL_DOMAIN} {
     encode gzip zstd
 
+    # --- TLS 1.2 fallback (disabled by default) ---
+    # RKN/TSPU (June 2026) intermittently freezes TLS 1.3 handshakes on
+    # "suspicious" RU subnets, causing the panel to load "через раз".
+    # Empirically, pinning TLS 1.2 restores access for many users.
+    # Note: HTTP/2 (global `protocols h1 h2`) is the primary mitigation — it
+    # multiplexes all requests over a single TLS connection so the
+    # >3-handshakes-per-60s TSPU trigger never fires. Enable the block below
+    # only if users still report flapping access on this Caddy-based deploy.
+    # tls {
+    #     protocols tls1.2 tls1.2
+    # }
+
     reverse_proxy backend:3000 {
         transport http {
             versions 1.1

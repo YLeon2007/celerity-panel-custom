@@ -254,14 +254,21 @@ router.get('/:userId', requireScope('users:read'), async (req, res) => {
 
 /**
  * POST /users - Создать пользователя
- * Body: { userId, username?, groups?, enabled?, trafficLimit?, expireAt? }
+ * Body: { userId, username?, groups?, enabled?, trafficLimit?, maxDevices?, expireAt? }
  */
 router.post('/', requireScope('users:write'), async (req, res) => {
     try {
-        const { userId, username, groups, enabled, trafficLimit, expireAt } = req.body;
+        const { userId, username, groups, enabled, trafficLimit, expireAt, maxDevices } = req.body;
         
         if (!userId) {
             return res.status(400).json({ error: 'userId обязателен' });
+        }
+
+        // Clamp to a sane range; -1 unlimited, 0 inherits group limit.
+        let maxDevicesValue = 0;
+        if (maxDevices !== undefined) {
+            const parsed = parseInt(maxDevices, 10);
+            maxDevicesValue = Number.isFinite(parsed) ? Math.max(-1, parsed) : 0;
         }
         
         // Проверяем существование
@@ -283,6 +290,7 @@ router.post('/', requireScope('users:write'), async (req, res) => {
             groups: userGroups,
             enabled: enabled !== undefined ? enabled : false,
             trafficLimit: trafficLimit || 0,
+            maxDevices: maxDevicesValue,
             expireAt: expireAt || null,
             nodes: [], // Ноды автоматически по группам
         });
