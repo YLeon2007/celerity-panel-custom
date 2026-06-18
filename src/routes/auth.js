@@ -10,33 +10,7 @@ const cryptoService = require('../services/cryptoService');
 const cache = require('../services/cacheService');
 const { getSettings } = require('../utils/helpers');
 const logger = require('../utils/logger');
-
-/**
- * Extract IP from addr (IPv4 and IPv6 support)
- */
-function extractIP(addr) {
-    if (!addr) return '';
-    
-    // IPv6 with brackets: [2001:db8::1]:55239
-    if (addr.startsWith('[')) {
-        const endBracket = addr.indexOf(']');
-        if (endBracket > 0) {
-            return addr.substring(1, endBracket);
-        }
-    }
-    
-    // Find last colon
-    const lastColon = addr.lastIndexOf(':');
-    if (lastColon > 0) {
-        // Check if part after : is port (digits only)
-        const afterColon = addr.substring(lastColon + 1);
-        if (/^\d+$/.test(afterColon)) {
-            return addr.substring(0, lastColon);
-        }
-    }
-    
-    return addr;
-}
+const { extractClientIp } = require('../utils/clientIp');
 
 /**
  * Check device limit by unique IPs
@@ -183,7 +157,7 @@ router.post('/', async (req, res) => {
         
         // -1 = unlimited, 0 = no limit (no settings)
         if (maxDevices > 0) {
-            const clientIP = extractIP(addr);
+            const clientIP = extractClientIp(addr);
             
             const { allowed, activeCount } = await checkDeviceLimit(userId, clientIP, maxDevices);
             

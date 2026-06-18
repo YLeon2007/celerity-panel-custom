@@ -15,6 +15,7 @@
 const rateLimit = require('express-rate-limit');
 
 const logger = require('./logger');
+const { extractClientIp } = require('./clientIp');
 
 // Live thresholds. Mutated by applyRateLimits(); the limiter `max` callback
 // reads from this object so updates take effect on the next request.
@@ -32,11 +33,17 @@ const subscriptionLimiter = rateLimit({
     },
 });
 
+// Hysteria nodes (not end clients) call /api/auth, so keying by req.ip would
+// share one bucket across every user behind a node. Key by the client address
+// the node reports in the body instead; fall back to req.ip for malformed hits.
+const authKey = (req) => extractClientIp(req.body?.addr) || req.ip;
+
 const authLimiter = rateLimit({
     windowMs: 1000,
     max: () => _state.authPerSecond,
+    keyGenerator: authKey,
     handler: (req, res) => {
-        logger.warn(`[Auth] Rate limit: ${req.ip}`);
+        logger.warn(`[Auth] Rate limit: ${authKey(req)}`);
         res.status(429).json({ ok: false });
     },
 });
