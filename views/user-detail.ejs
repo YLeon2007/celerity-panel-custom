@@ -179,6 +179,10 @@
                         <i class="ti ti-external-link"></i> <%= t('users.openSubscription') %>
                     </a>
                     
+                    <button class="btn btn-block" onclick="resetTraffic()">
+                        <i class="ti ti-refresh"></i> <%= t('users.resetTraffic') %>
+                    </button>
+                    
                     <hr>
                     
                     <button class="btn btn-danger btn-block" onclick="deleteUser()">
@@ -213,6 +217,7 @@ const i18n = {
     linkCopied: <%- JSON.stringify(t("users.linkCopied")) %>,
     confirmUnlinkHwid: <%- JSON.stringify(t("users.confirmUnlinkHwid")) %>,
     confirmUnlinkAllHwid: <%- JSON.stringify(t("users.confirmUnlinkAllHwid")) %>,
+    confirmResetTraffic: <%- JSON.stringify(t("users.confirmResetTraffic")) %>,
 };
 
 async function unlinkHwid(hwid) {
@@ -243,6 +248,19 @@ async function unlinkAllHwid() {
 
 async function toggleUser(enabled) {
     const res = await fetch(`/api/users/${userId}/${enabled ? 'enable' : 'disable'}`, {
+        method: 'POST',
+        credentials: 'include'
+    });
+    if (res.ok) location.reload();
+    else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || i18n.error);
+    }
+}
+
+async function resetTraffic() {
+    if (!confirm(i18n.confirmResetTraffic)) return;
+    const res = await fetch(`/api/users/${userId}/reset-traffic`, {
         method: 'POST',
         credentials: 'include'
     });

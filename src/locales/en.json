@@ -652,6 +652,7 @@
     "enableUser": "Enable User",
     "disableUser": "Disable User",
     "resetTraffic": "Reset Traffic",
+    "confirmResetTraffic": "Reset traffic counter for this user?",
     "deleteUser": "Delete User",
     "deleteSelected": "Delete selected",
     "selectVisible": "Select all visible users",

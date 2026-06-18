@@ -983,7 +983,11 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
             outboundTag: portalTag,
         });
 
-        if (link.geoRouting?.enabled) {
+        // Geo routing only takes effect when at least one tag is set;
+        // otherwise fall back to default so client traffic still gets a route.
+        const hasGeoTags = link.geoRouting?.enabled &&
+            ((link.geoRouting.domains?.length > 0) || (link.geoRouting.geoip?.length > 0));
+        if (hasGeoTags) {
             geoLinks.push({ link, portalTag });
         } else {
             defaultLinks.push({ link, portalTag });
@@ -1457,7 +1461,9 @@ function applyForwardChain(config, forwardLinks, clientInboundTags) {
     // Geo-specific routing for individual links in the chain
     // (only the exit link's geo-routing makes sense for a sequential chain)
     const exitLink = sorted[sorted.length - 1];
-    if (exitLink.geoRouting?.enabled) {
+    const hasGeoTags = exitLink.geoRouting?.enabled &&
+        ((exitLink.geoRouting.domains?.length > 0) || (exitLink.geoRouting.geoip?.length > 0));
+    if (hasGeoTags) {
         if (exitLink.geoRouting.domains?.length > 0) {
             config.routing.rules.push({
                 type: 'field',

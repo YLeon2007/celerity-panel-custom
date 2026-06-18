@@ -652,6 +652,7 @@
     "enableUser": "启用用户",
     "disableUser": "禁用用户",
     "resetTraffic": "重置流量",
+    "confirmResetTraffic": "重置此用户的流量计数器？",
     "deleteUser": "删除用户",
     "deleteSelected": "删除所选",
     "selectVisible": "选择所有可见用户",

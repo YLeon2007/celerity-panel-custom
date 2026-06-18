@@ -952,6 +952,12 @@
         if (hint) hint.textContent = i18n.modeReverseHint || 'Bridge initiates tunnel to Portal. Bridge can be behind NAT.';
         var realitySec = document.getElementById('realitySection');
         if (realitySec) realitySec.style.display = 'none';
+        var geoEnabled = document.getElementById('geoRoutingEnabled');
+        if (geoEnabled) geoEnabled.checked = false;
+        var geoDomains = document.getElementById('geoRoutingDomains');
+        if (geoDomains) geoDomains.value = '';
+        var geoGeoip = document.getElementById('geoRoutingGeoip');
+        if (geoGeoip) geoGeoip.value = '';
         var geoFields = document.getElementById('geoRoutingFields');
         if (geoFields) geoFields.style.display = 'none';
         var domGroup = document.getElementById('tunnelDomainGroup');
@@ -994,17 +1000,15 @@
             data.realityFingerprint = form.realityFingerprint?.value || 'chrome';
         }
 
-        // Geo routing
+        // Geo routing (always sent so unchecking persists)
         const geoEnabled = document.getElementById('geoRoutingEnabled');
-        if (geoEnabled?.checked) {
-            const domStr = (document.getElementById('geoRoutingDomains')?.value || '').trim();
-            const ipStr  = (document.getElementById('geoRoutingGeoip')?.value || '').trim();
-            data.geoRouting = {
-                enabled: true,
-                domains: domStr ? domStr.split(/[,\s]+/).filter(Boolean) : [],
-                geoip:   ipStr  ? ipStr.split(/[,\s]+/).filter(Boolean)  : [],
-            };
-        }
+        const domStr = (document.getElementById('geoRoutingDomains')?.value || '').trim();
+        const ipStr  = (document.getElementById('geoRoutingGeoip')?.value || '').trim();
+        data.geoRouting = {
+            enabled: !!geoEnabled?.checked,
+            domains: domStr ? domStr.split(/[,\s]+/).filter(Boolean) : [],
+            geoip:   ipStr  ? ipStr.split(/[,\s]+/).filter(Boolean)  : [],
+        };
 
         if (!data.name || !data.portalNodeId || !data.bridgeNodeId) {
             alert(i18n.fillRequired || 'Please fill in all required fields');
