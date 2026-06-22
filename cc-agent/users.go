@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -137,18 +136,4 @@ func (s *UserStore) GetLastSync() time.Time {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastSync
-}
-
-// RestoreToXray pushes all stored users into a running Xray instance (called on startup)
-func (s *UserStore) RestoreToXray(ctx context.Context, xc *XrayClient) (int, error) {
-	users := s.List()
-	count := 0
-	for _, u := range users {
-		if err := xc.AddUser(ctx, u); err != nil {
-			log.Printf("[restore] Failed to restore user %s: %v", u.Email, err)
-			continue
-		}
-		count++
-	}
-	return count, nil
 }

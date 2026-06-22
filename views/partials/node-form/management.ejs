@@ -57,6 +57,11 @@
             const _evOk = _evParseable
                 && (_evParts[0] > 1 || (_evParts[0] === 1 && _evParts[1] >= 2));
             const _hasExtras = Array.isArray(node.xray?.extraInbounds) && node.xray.extraInbounds.length > 0;
+            // Current cc-agent version with the durable-config fix. Nodes below
+            // this still lose runtime users on an Xray restart and should be
+            // updated via the agent update command (broadcast terminal).
+            const _evCurrent = _evParseable
+                && (_evParts[0] > 1 || (_evParts[0] === 1 && _evParts[1] >= 3));
         %>
         <% if (_hasExtras && _evParseable && !_evOk) { %>
         <div class="ssh-warning mt-2" role="alert">
@@ -65,6 +70,17 @@
                 <strong><%= t('nodes.agentOutdatedTitle') %></strong>
                 <div style="margin-top:4px;font-weight:400;font-size:12.5px;">
                     <%= t('nodes.agentOutdatedMessage') %>
+                </div>
+            </div>
+        </div>
+        <% } %>
+        <% if (_evParseable && !_evCurrent) { %>
+        <div class="ssh-warning mt-2" role="alert">
+            <i class="ti ti-arrow-up-circle ssh-warning-icon"></i>
+            <div>
+                <strong><%= t('nodes.agentUpdateAvailableTitle') %></strong>
+                <div style="margin-top:4px;font-weight:400;font-size:12.5px;">
+                    <%= t('nodes.agentUpdateAvailableMessage') %>
                 </div>
             </div>
         </div>

@@ -16,6 +16,7 @@ type API struct {
 	cfg        *Config
 	userStore  *UserStore
 	xrayClient *XrayClient
+	persister  *ConfigPersister
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
@@ -127,6 +128,7 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.userStore.Sync(req.Users)
+	a.persister.MarkDirty()
 	go func() {
 		if err := a.userStore.Save(); err != nil {
 			log.Printf("[store] Save: %v", err)
@@ -164,6 +166,7 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.userStore.Add(&u)
+	a.persister.MarkDirty()
 	go func() { _ = a.userStore.Save() }()
 
 	jsonOK(w, map[string]string{"status": "ok"})
@@ -186,6 +189,7 @@ func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.userStore.Remove(email)
+	a.persister.MarkDirty()
 	go func() { _ = a.userStore.Save() }()
 
 	jsonOK(w, map[string]string{"status": "ok"})
@@ -225,8 +229,16 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /restart — restart Xray service, then restore all users (Xray loses state on restart)
+// POST /restart — restart Xray service. The on-disk config.json already carries
+// the current user list (kept in sync by ConfigPersister), so Xray comes back up
+// with the correct users on its own — no gRPC replay needed.
 func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
+	// Make sure the latest user set is persisted before the restart so the
+	// reloaded Xray cannot pick up a stale snapshot.
+	if _, err := a.persister.Flush(); err != nil {
+		log.Printf("[api] Restart: config flush failed: %v", err)
+	}
+
 	out, err := exec.Command("systemctl", "restart", "xray").CombinedOutput()
 	if err != nil {
 		log.Printf("[api] Restart xray error: %v, output: %s", err, out)
@@ -234,20 +246,12 @@ func (a *API) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wait for Xray to fully start before restoring users
+	// Give Xray a moment to come up before returning, so a follow-up /sync from
+	// the panel hits a live gRPC API.
 	time.Sleep(2 * time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	count, err := a.userStore.RestoreToXray(ctx, a.xrayClient)
-	if err != nil {
-		log.Printf("[api] RestoreToXray after restart: %v", err)
-	} else {
-		log.Printf("[api] Xray restarted + restored %d users", count)
-	}
-
-	jsonOK(w, map[string]string{"status": "ok", "users_restored": fmt.Sprintf("%d", count)})
+	log.Printf("[api] Xray restarted (%d users in config)", a.userStore.Count())
+	jsonOK(w, map[string]string{"status": "ok", "users": fmt.Sprintf("%d", a.userStore.Count())})
 }
 
 // getXrayVersion reads the installed Xray version by running `xray version`

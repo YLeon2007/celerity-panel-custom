@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	proxyman_command "github.com/xtls/xray-core/app/proxyman/command"
 	stats_command "github.com/xtls/xray-core/app/stats/command"
@@ -102,7 +103,7 @@ func (c *XrayClient) AddUser(ctx context.Context, u *User) error {
 				},
 			}),
 		})
-		if err != nil && firstErr == nil {
+		if err != nil && !isUserExistsErr(err) && firstErr == nil {
 			firstErr = fmt.Errorf("AddUser %s on %s: %w", u.Email, ib.Tag, err)
 		}
 	}
@@ -122,11 +123,26 @@ func (c *XrayClient) RemoveUser(ctx context.Context, email string) error {
 				Email: email,
 			}),
 		})
-		if err != nil && firstErr == nil {
+		if err != nil && !isUserNotFoundErr(err) && firstErr == nil {
 			firstErr = fmt.Errorf("RemoveUser %s on %s: %w", email, ib.Tag, err)
 		}
 	}
 	return firstErr
+}
+
+// isUserExistsErr reports whether an AddUser error is the benign "already
+// exists" case. Treating it as success keeps the per-inbound loop idempotent
+// (e.g. after a config-driven restart already populated the user).
+func isUserExistsErr(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
+}
+
+// isUserNotFoundErr reports whether a RemoveUser error is the benign "not
+// found" case (user already absent from the runtime). Treating it as success
+// silences the RemoveUser-not-found noise and avoids masking real failures.
+func isUserNotFoundErr(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") || strings.Contains(s, "not exist")
 }
 
 // QueryStats fetches traffic stats from Xray matching the given pattern.
