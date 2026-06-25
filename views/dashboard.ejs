@@ -281,6 +281,13 @@
                         <span class="sys-value" id="ramValue">—</span>
                     </div>
                     <div class="sys-item">
+                        <span class="sys-label"><%= t('stats.serverDisk') || 'Disk' %></span>
+                        <div class="progress-bar-wrap">
+                            <div class="progress-bar" id="diskBar" style="width: 0%"></div>
+                        </div>
+                        <span class="sys-value" id="diskValue">—</span>
+                    </div>
+                    <div class="sys-item">
                         <span class="sys-label">RPS</span>
                         <span class="sys-value" id="rpsValue">—</span>
                     </div>
@@ -668,7 +675,19 @@ async function loadSystemStats() {
             ramBar.style.width = ramPercent + '%';
             ramBar.className = 'progress-bar' + (ramPercent > 80 ? ' high' : ramPercent > 60 ? ' medium' : '');
             document.getElementById('ramValue').textContent = ramPercent + '%';
-            
+
+            // Disk (panel host filesystem)
+            const diskBar = document.getElementById('diskBar');
+            if (diskBar && data.disk && data.disk.total > 0) {
+                const diskPercent = data.disk.percent || 0;
+                diskBar.style.width = diskPercent + '%';
+                diskBar.className = 'progress-bar' + (diskPercent > 90 ? ' high' : diskPercent > 75 ? ' medium' : '');
+                const freeGB = (data.disk.free / 1073741824).toFixed(1);
+                document.getElementById('diskValue').textContent = `${diskPercent}% (${freeGB} GB free)`;
+            } else if (diskBar) {
+                document.getElementById('diskValue').textContent = 'n/a';
+            }
+
             // RPS (Requests Per Second)
             const rps = data.requests?.rps || 0;
             const rpm = data.requests?.rpm || 0;
