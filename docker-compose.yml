@@ -70,6 +70,7 @@ services:
     expose:
       - "3000"
     volumes:
+      - .:/opt/hysteria-panel-host
       - ./logs:/app/logs
       - ./backups:/app/backups
       - caddy_data:/caddy_data:ro

@@ -1553,5 +1553,12 @@
     "activateFailed": "Не удалось активировать: {error}",
     "activateSuccess": "Маршрут совместимости включён. Старые ссылки уже должны открываться.",
     "disableFailed": "Ошибка: {error}"
+  },
+  "update": {
+    "check": "Проверить обновление",
+    "available": "Доступно обновление",
+    "apply": "Обновить",
+    "modalTitle": "Обновление панели",
+    "modalSubtitle": "Перед обновлением будет создан backup, dump MongoDB и ROLLBACK.sh."
   }
 }

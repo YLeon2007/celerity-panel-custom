@@ -1553,5 +1553,12 @@
     "activateFailed": "Activation failed: {error}",
     "activateSuccess": "Compat route armed. Old links should resolve now.",
     "disableFailed": "Failed: {error}"
+  },
+  "update": {
+    "check": "Check for update",
+    "available": "Update available",
+    "apply": "Update",
+    "modalTitle": "Panel update",
+    "modalSubtitle": "A file backup, MongoDB dump, and ROLLBACK.sh will be created before updating."
   }
 }

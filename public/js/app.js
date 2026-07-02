@@ -28,4 +28,158 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
     });
 });
 
+(function initPanelSelfUpdate() {
+    const widget = document.getElementById('panelUpdateWidget');
+    const action = document.getElementById('panelUpdateAction');
+    const modal = document.getElementById('panelUpdateModal');
+    const closeBtn = document.getElementById('panelUpdateClose');
+    const cancelBtn = document.getElementById('panelUpdateCancel');
+    const applyBtn = document.getElementById('panelUpdateApply');
+    const meta = document.getElementById('panelUpdateMeta');
+    const changelog = document.getElementById('panelUpdateChangelog');
+    const logBox = document.getElementById('panelUpdateLog');
+
+    if (!widget || !action || !modal || !applyBtn) return;
+
+    const i18n = {
+        checking: document.documentElement.lang === 'ru' ? 'Проверка...' : 'Checking...',
+        check: document.documentElement.lang === 'ru' ? 'Проверить обновление' : 'Check for update',
+        available: document.documentElement.lang === 'ru' ? 'Доступно обновление' : 'Update available',
+        upToDate: document.documentElement.lang === 'ru' ? 'Обновлений нет' : 'Up to date',
+        failed: document.documentElement.lang === 'ru' ? 'Ошибка проверки' : 'Check failed',
+        applying: document.documentElement.lang === 'ru' ? 'Обновление запущено...' : 'Update started...',
+        noChangelog: document.documentElement.lang === 'ru' ? 'Changelog пуст или недоступен.' : 'Changelog is empty or unavailable.',
+        confirmApply: document.documentElement.lang === 'ru'
+            ? 'Запустить обновление панели? Будет создан backup и ROLLBACK.sh.'
+            : 'Start panel update? Backup and ROLLBACK.sh will be created.',
+    };
+
+    const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+    const LAST_AUTO_CHECK_KEY = 'celerity:lastAutoUpdateCheckAt';
+    let currentStatus = null;
+
+    function setState(state) {
+        widget.dataset.updateState = state;
+        if (state === 'checking') action.textContent = i18n.checking;
+        if (state === 'available') action.textContent = i18n.available;
+        if (state === 'idle') action.textContent = i18n.check;
+        if (state === 'error') action.textContent = i18n.failed;
+    }
+
+    function openModal() {
+        modal.classList.add('active');
+        modal.setAttribute('aria-hidden', 'false');
+    }
+
+    function closeModal() {
+        modal.classList.remove('active');
+        modal.setAttribute('aria-hidden', 'true');
+    }
+
+    function renderStatus(status) {
+        currentStatus = status;
+        const updateAvailable = Boolean(status && status.updateAvailable);
+        setState(updateAvailable ? 'available' : 'idle');
+
+        if (!meta || !changelog) return;
+        const current = status.currentVersion || widget.dataset.currentVersion || 'unknown';
+        const latest = status.latestVersion || status.latestSha || 'unknown';
+        const branch = status.branch || 'main';
+        const behind = status.behindBy || 0;
+
+        meta.innerHTML = `
+            <div><strong>Current:</strong> v${current} ${status.currentSha ? `(${status.currentSha})` : ''}</div>
+            <div><strong>Latest:</strong> ${status.latestVersion ? `v${latest}` : latest}</div>
+            <div><strong>Branch:</strong> ${branch}; <strong>Commits:</strong> ${behind}</div>
+        `;
+
+        if (Array.isArray(status.changelog) && status.changelog.length > 0) {
+            changelog.innerHTML = `<ul>${status.changelog.map(item => (
+                `<li><code>${item.sha || ''}</code> <span>${item.date || ''}</span> ${escapeHtml(item.subject || '')}</li>`
+            )).join('')}</ul>`;
+        } else {
+            changelog.textContent = i18n.noChangelog;
+        }
+
+        applyBtn.disabled = !updateAvailable || Boolean(status.apply?.running);
+        if (logBox && status.apply?.log) {
+            logBox.hidden = false;
+            logBox.textContent = status.apply.log;
+        }
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    async function requestJson(url, options = {}) {
+        const response = await fetch(url, {
+            credentials: 'same-origin',
+            headers: { 'Accept': 'application/json', ...(options.headers || {}) },
+            ...options,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || response.statusText);
+        return data;
+    }
+
+    async function checkUpdate({ force = false, open = false } = {}) {
+        setState('checking');
+        try {
+            const status = await requestJson(force ? '/panel/update/check' : '/panel/update/status', {
+                method: force ? 'POST' : 'GET',
+            });
+            renderStatus(status);
+            if (open || status.updateAvailable) openModal();
+            return status;
+        } catch (error) {
+            setState('error');
+            window.showToast(error.message || i18n.failed, 'error');
+            throw error;
+        }
+    }
+
+    action.addEventListener('click', async () => {
+        if (currentStatus?.updateAvailable) {
+            renderStatus(currentStatus);
+            openModal();
+            return;
+        }
+        await checkUpdate({ force: true, open: true }).catch(() => {});
+    });
+
+    applyBtn.addEventListener('click', async () => {
+        if (!confirm(i18n.confirmApply)) return;
+        applyBtn.disabled = true;
+        applyBtn.textContent = i18n.applying;
+        try {
+            const result = await requestJson('/panel/update/apply', { method: 'POST' });
+            if (logBox) {
+                logBox.hidden = false;
+                logBox.textContent = result.apply?.log || i18n.applying;
+            }
+            window.showToast(i18n.applying, 'success');
+        } catch (error) {
+            window.showToast(error.message, 'error');
+            applyBtn.disabled = false;
+        }
+    });
+
+    [closeBtn, cancelBtn].forEach(btn => btn?.addEventListener('click', closeModal));
+    modal.addEventListener('click', (event) => {
+        if (event.target === modal) closeModal();
+    });
+
+    const lastAutoCheck = Number(localStorage.getItem(LAST_AUTO_CHECK_KEY) || '0');
+    if (!lastAutoCheck || Date.now() - lastAutoCheck > CHECK_INTERVAL_MS) {
+        localStorage.setItem(LAST_AUTO_CHECK_KEY, String(Date.now()));
+        checkUpdate({ force: false, open: false }).catch(() => {});
+    }
+})();
+
 console.log('⚡ Hysteria Panel loaded');

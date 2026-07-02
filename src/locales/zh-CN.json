@@ -1553,5 +1553,12 @@
     "activateFailed": "启用失败：{error}",
     "activateSuccess": "兼容路由已就绪。旧链接现在应可解析。",
     "disableFailed": "失败：{error}"
+  },
+  "update": {
+    "check": "检查更新",
+    "available": "有可用更新",
+    "apply": "更新",
+    "modalTitle": "面板更新",
+    "modalSubtitle": "更新前将创建文件备份、MongoDB 转储和 ROLLBACK.sh。"
   }
 }
