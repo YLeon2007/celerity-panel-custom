@@ -2,19 +2,26 @@
 
 This repository can deploy the custom C³ CELERITY panel from source with one installer script.
 
-## One-command install from the private GitHub repository
-
-Because `YLeon2007/celerity-panel-custom` is private, the target server needs a GitHub token that can read the repository.
+## One-command install from the public GitHub repository
 
 ```bash
-export GITHUB_TOKEN='<GITHUB_TOKEN>'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 
 curl -fsSL \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.raw" \
-  "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=main" \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
+  | sudo -E bash
+```
+
+For `develop` testing:
+
+```bash
+export PANEL_DOMAIN='panel.example.com'
+export ACME_EMAIL='admin@example.com'
+export BRANCH='develop'
+
+curl -fsSL \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh \
   | sudo -E bash
 ```
 
@@ -33,6 +40,8 @@ Override if needed:
 export BRANCH=develop
 export INSTALL_DIR=/opt/hysteria-panel-dev
 ```
+
+> If you deploy from a private fork instead of this public repository, set `GITHUB_TOKEN` with read access before running the installer.
 
 ## Existing installation safety
 

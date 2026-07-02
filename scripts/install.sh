@@ -2,20 +2,20 @@
 set -euo pipefail
 
 # C³ CELERITY custom one-command installer
-# Default target: private repo YLeon2007/celerity-panel-custom.
+# Default target: public repo YLeon2007/celerity-panel-custom.
 #
-# Minimal usage for a public/SSH-accessible checkout:
-#   PANEL_DOMAIN=panel.example.com ACME_EMAIL=admin@example.com bash scripts/install.sh
-#
-# For the private GitHub repo via HTTPS token:
-#   export GITHUB_TOKEN=<GITHUB_TOKEN>
+# Production install:
 #   export PANEL_DOMAIN=panel.example.com
 #   export ACME_EMAIL=admin@example.com
-#   curl -fsSL \
-#     -H "Authorization: Bearer $GITHUB_TOKEN" \
-#     -H "Accept: application/vnd.github.raw" \
-#     "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=main" \
-#     | sudo -E bash
+#   curl -fsSL https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh | sudo -E bash
+#
+# Develop branch test:
+#   export PANEL_DOMAIN=panel.example.com
+#   export ACME_EMAIL=admin@example.com
+#   export BRANCH=develop
+#   curl -fsSL https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh | sudo -E bash
+#
+# Private fork only: set GITHUB_TOKEN with read access before running.
 
 REPO="${REPO:-YLeon2007/celerity-panel-custom}"
 BRANCH="${BRANCH:-main}"

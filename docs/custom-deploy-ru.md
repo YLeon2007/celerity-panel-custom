@@ -2,34 +2,26 @@
 
 Этот репозиторий позволяет развернуть custom-версию панели C³ CELERITY из исходников одним установочным скриптом.
 
-## Установка одной командой из приватного GitHub-репозитория
-
-Репозиторий `YLeon2007/celerity-panel-custom` приватный, поэтому целевому серверу нужен GitHub token с правом чтения этого репозитория.
+## Установка одной командой из публичного GitHub-репозитория
 
 ```bash
-export GITHUB_TOKEN='<GITHUB_TOKEN>'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 
 curl -fsSL \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.raw" \
-  "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=main" \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
   | sudo -E bash
 ```
 
-Для тестирования ветки `develop` используйте URL с `develop` и передайте `BRANCH=develop`:
+Для тестирования ветки `develop`:
 
 ```bash
-export GITHUB_TOKEN='<GITHUB_TOKEN>'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 export BRANCH='develop'
 
 curl -fsSL \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  -H "Accept: application/vnd.github.raw" \
-  "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=develop" \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh \
   | sudo -E bash
 ```
 
@@ -45,9 +37,12 @@ COMPOSE_FILE=docker-compose.yml
 При необходимости можно переопределить параметры:
 
 ```bash
+export BRANCH=develop
 export INSTALL_DIR='/opt/hysteria-panel-dev'
 export COMPOSE_FILE='docker-compose.yml'
 ```
+
+> Если вы разворачиваете не этот публичный repo, а приватный fork, перед запуском задайте `GITHUB_TOKEN` с правом чтения репозитория.
 
 ## Безопасность при существующей установке
 

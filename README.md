@@ -13,9 +13,9 @@
 [![Telegram](https://img.shields.io/badge/Telegram-Chat-2CA5E0?logo=telegram&logoColor=white)](https://t.me/+JKFdEr7TqvIyOTFi)
 [![Support](https://img.shields.io/badge/%E2%99%A5-Support-EC4899)](https://celerity.help)
 
-**C³ CELERITY** by Click Connect — modern web panel for managing [Hysteria 2](https://v2.hysteria.network/) and [Xray VLESS](https://xtls.github.io/) proxy servers with centralized authentication, one-click node setup, and flexible user-to-server group mapping.
+**C³ CELERITY custom** is a YLeon2007-maintained build of the original C³ CELERITY panel by Click Connect. It keeps upstream functionality for managing [Hysteria 2](https://v2.hysteria.network/) and [Xray VLESS](https://xtls.github.io/) proxy servers, while adding a reproducible custom deployment workflow and a place for Leonid-specific improvements.
 
-**Built for performance:** Lightweight architecture designed for speed at any scale.
+**Built for practical operations:** source-based deploys, feature branches, safe updates, and one-command installation into `/opt/hysteria-panel`.
 
 <p align="center">
   <img src="docs/dashboard.png" alt="C³ CELERITY Dashboard" width="800">
@@ -23,56 +23,90 @@
   <em>Dashboard — real-time server monitoring and statistics</em>
 </p>
 
-## ⚡ Quick Start
+## ⚡ Quick Start — custom public repository
 
-> Updating an existing installation? See [Safe Production Updates](docs/safe-update.md).
+> This custom repository is intended to be deployed from source. The tested production path builds the backend locally with Docker Compose and serves HTTPS through Caddy.
 
-**1. Install Docker** (if not installed):
+### One-command production install
+
+Point DNS for your panel domain to the target server, then run:
+
 ```bash
-curl -fsSL https://get.docker.com | sh
+export PANEL_DOMAIN='panel.example.com'
+export ACME_EMAIL='admin@example.com'
+
+curl -fsSL \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
+  | sudo -E bash
 ```
 
-**2. Deploy panel (Docker Hub - recommended):**
-```bash
-mkdir hysteria-panel && cd hysteria-panel
+The installer defaults to:
 
-# Download required files
-curl -O https://raw.githubusercontent.com/ClickDevTech/hysteria-panel/main/docker-compose.hub.yml
-curl -O https://raw.githubusercontent.com/ClickDevTech/hysteria-panel/main/docker.env.example
-
-# Create Greenlock SSL config (required for HTTPS)
-mkdir -p greenlock.d
-curl -o greenlock.d/config.json https://raw.githubusercontent.com/ClickDevTech/hysteria-panel/main/greenlock.d/config.json
-
-cp docker.env.example .env
-nano .env  # Set your domain, email, and secrets
-docker compose -f docker-compose.hub.yml up -d
+```text
+REPO=YLeon2007/celerity-panel-custom
+BRANCH=main
+INSTALL_DIR=/opt/hysteria-panel
+COMPOSE_FILE=docker-compose.yml
 ```
 
-**Alternative: Build from source** (for development or customization)
-```bash
-git clone https://github.com/ClickDevTech/hysteria-panel.git
-cd hysteria-panel
-cp docker.env.example .env
-nano .env  # Set your domain, email, and secrets
-docker compose up -d
+It will:
+
+- install Docker/Docker Compose if missing;
+- clone this repository into `/opt/hysteria-panel`;
+- generate `.env` with `ENCRYPTION_KEY`, `SESSION_SECRET`, and `MONGO_PASSWORD` if not provided;
+- run `docker compose -f docker-compose.yml up -d --build`;
+- let Caddy obtain a Let's Encrypt certificate for `PANEL_DOMAIN`.
+
+Open:
+
+```text
+https://your-domain/panel
 ```
 
-**3. Open** `https://your-domain/panel`
-> Planning to manage the panel from AI assistants? See [MCP Setup Guide](docs/mcp-user-guide.md).
+### Test or development branch install
 
-**Local development (HTTP only, no domain/SSL):**
-
-Want to try the panel on your laptop without a public domain or certificate? Use the local compose file — it sets `USE_CADDY=true` (plain HTTP, no Greenlock/ACME) and publishes port `3000` directly, with dev defaults so it boots without a `.env`:
 ```bash
-git clone https://github.com/ClickDevTech/hysteria-panel.git
-cd hysteria-panel
+export PANEL_DOMAIN='panel.example.com'
+export ACME_EMAIL='admin@example.com'
+export BRANCH='develop'
+
+curl -fsSL \
+  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh \
+  | sudo -E bash
+```
+
+### Existing installation safety
+
+If `/opt/hysteria-panel` already exists, the installer creates a backup under:
+
+```text
+/opt/hysteria-panel-install-backups/
+```
+
+Then it stops. Re-run with `FORCE=1` only when you intentionally want to update/replace the existing checkout.
+
+### Detailed deploy docs
+
+- [Custom deployment](docs/custom-deploy.md)
+- [Custom deployment — Russian](docs/custom-deploy-ru.md)
+- Updating an existing installation? See [Safe Production Updates](docs/safe-update.md).
+- Planning to manage the panel from AI assistants? See [MCP Setup Guide](docs/mcp-user-guide.md).
+
+### Local development
+
+```bash
+git clone https://github.com/YLeon2007/celerity-panel-custom.git
+cd celerity-panel-custom
 docker compose -f docker-compose.local.yml up -d
 # Open http://localhost:3000/panel
 ```
+
 > Local mode has **no TLS** and is not for production. Subscription/share links assume HTTPS, so use it only for UI/API testing.
 
-**Required `.env` variables:**
+### Required `.env` variables for manual installs
+
+The installer generates these automatically, but manual deployments must set at least:
+
 ```env
 PANEL_DOMAIN=panel.example.com
 ACME_EMAIL=admin@example.com
