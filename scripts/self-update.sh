@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 REPO_PATH="${SELF_UPDATE_REPO_PATH:-/opt/hysteria-panel-host}"
 REMOTE="${SELF_UPDATE_REMOTE:-origin}"
-BRANCH="${SELF_UPDATE_BRANCH:-main}"
+BRANCH="${SELF_UPDATE_BRANCH:-}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_ROOT="$REPO_PATH/backups/self-update"
 BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
@@ -38,7 +38,11 @@ log "ROLLBACK_PATH=$ROLLBACK_PATH"
 
 CURRENT_SHA="$(git rev-parse HEAD)"
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ -z "$BRANCH" ]; then
+  BRANCH="$CURRENT_BRANCH"
+fi
 log "Current ref: $CURRENT_BRANCH $CURRENT_SHA"
+log "Update target: $REMOTE/$BRANCH"
 
 if [ -f .env ]; then
   cp -a .env "$BACKUP_DIR/.env"

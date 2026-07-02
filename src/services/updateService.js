@@ -11,7 +11,6 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_HOST_REPO_PATH = '/opt/hysteria-panel-host';
 const DEFAULT_REMOTE = 'origin';
-const DEFAULT_BRANCH = 'main';
 const CHECK_CACHE_TTL_MS = 5 * 60 * 1000;
 
 let lastStatus = null;
@@ -35,8 +34,11 @@ function remoteName() {
     return process.env.SELF_UPDATE_REMOTE || DEFAULT_REMOTE;
 }
 
-function branchName() {
-    return process.env.SELF_UPDATE_BRANCH || process.env.GIT_BRANCH || DEFAULT_BRANCH;
+async function branchName() {
+    if (process.env.SELF_UPDATE_BRANCH) return process.env.SELF_UPDATE_BRANCH;
+    if (process.env.GIT_BRANCH) return process.env.GIT_BRANCH;
+    const currentBranch = await execGit(['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => null);
+    return currentBranch && currentBranch !== 'HEAD' ? currentBranch : 'main';
 }
 
 function scriptPath() {
@@ -137,7 +139,7 @@ async function computeStatus({ force = false } = {}) {
             updateAvailable: false,
             ...local,
             remote: remoteName(),
-            branch: branchName(),
+            branch: await branchName(),
             latestSha: null,
             latestVersion: null,
             behindBy: 0,
@@ -148,7 +150,7 @@ async function computeStatus({ force = false } = {}) {
     }
 
     const remote = remoteName();
-    const branch = branchName();
+    const branch = await branchName();
     const remoteRef = `${remote}/${branch}`;
 
     await execGit(['fetch', '--prune', remote, branch], { timeout: 60000, maxBuffer: 1024 * 1024 });
@@ -188,7 +190,7 @@ async function getStatus() {
             currentVersion: packageVersion,
             repoPath: hostRepoPath(),
             remote: remoteName(),
-            branch: branchName(),
+            branch: await branchName(),
             error: error.message,
             apply: publicApplyState(),
         };
@@ -246,7 +248,7 @@ async function applyUpdate() {
             ...process.env,
             SELF_UPDATE_REPO_PATH: hostRepoPath(),
             SELF_UPDATE_REMOTE: remoteName(),
-            SELF_UPDATE_BRANCH: branchName(),
+            SELF_UPDATE_BRANCH: await branchName(),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
