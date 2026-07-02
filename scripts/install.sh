@@ -118,7 +118,8 @@ clone_or_update_repo() {
 
   log "Cloning $REPO branch $BRANCH into $INSTALL_DIR"
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    git -c http.https://github.com/.extraheader="Authorization: Bearer ${GITHUB_TOKEN}" \
+    basic_auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+    git -c http.https://github.com/.extraheader="Authorization: Basic ${basic_auth}" \
       clone --branch "$BRANCH" "https://github.com/$REPO.git" "$INSTALL_DIR"
   else
     git clone --branch "$BRANCH" "https://github.com/$REPO.git" "$INSTALL_DIR"
