@@ -13,7 +13,7 @@
 [![Telegram](https://img.shields.io/badge/Telegram-Chat-2CA5E0?logo=telegram&logoColor=white)](https://t.me/+JKFdEr7TqvIyOTFi)
 [![Поддержать](https://img.shields.io/badge/%E2%99%A5-%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-EC4899)](https://celerity.help)
 
-**C³ CELERITY custom** — поддерживаемая YLeon2007 сборка оригинальной панели C³ CELERITY by Click Connect. Она сохраняет upstream-функциональность для управления серверами [Hysteria 2](https://v2.hysteria.network/) и [Xray VLESS](https://xtls.github.io/), но добавляет воспроизводимый custom-deploy и место для доработок Леонида.
+**C³ CELERITY custom** — custom-сборка оригинальной панели C³ CELERITY by Click Connect. Она сохраняет upstream-функциональность для управления серверами [Hysteria 2](https://v2.hysteria.network/) и [Xray VLESS](https://xtls.github.io/), но добавляет воспроизводимый custom-deploy и место для проектных доработок.
 
 **Создана для практической эксплуатации:** деплой из исходников, feature-ветки, безопасные обновления и установка одной командой в `/opt/hysteria-panel`.
 

@@ -13,7 +13,7 @@
 [![Telegram](https://img.shields.io/badge/Telegram-Chat-2CA5E0?logo=telegram&logoColor=white)](https://t.me/+JKFdEr7TqvIyOTFi)
 [![Support](https://img.shields.io/badge/%E2%99%A5-Support-EC4899)](https://celerity.help)
 
-**C³ CELERITY custom** is a YLeon2007-maintained build of the original C³ CELERITY panel by Click Connect. It keeps upstream functionality for managing [Hysteria 2](https://v2.hysteria.network/) and [Xray VLESS](https://xtls.github.io/) proxy servers, while adding a reproducible custom deployment workflow and a place for Leonid-specific improvements.
+**C³ CELERITY custom** is a custom build of the original C³ CELERITY panel by Click Connect. It keeps upstream functionality for managing [Hysteria 2](https://v2.hysteria.network/) and [Xray VLESS](https://xtls.github.io/) proxy servers, while adding a reproducible deployment workflow and a place for project-specific improvements.
 
 **Built for practical operations:** source-based deploys, feature branches, safe updates, and one-command installation into `/opt/hysteria-panel`.
 
