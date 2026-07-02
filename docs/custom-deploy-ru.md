@@ -7,27 +7,29 @@
 Репозиторий `YLeon2007/celerity-panel-custom` приватный, поэтому целевому серверу нужен GitHub token с правом чтения этого репозитория.
 
 ```bash
-export GITHUB_TOKEN='TOKEN_PLACEHOLDER'
+export GITHUB_TOKEN='<GITHUB_TOKEN>'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 
 curl -fsSL \
-  -H "Authorization: Bearer TOKEN_PLACEHOLDER" \
-  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=main" \
   | sudo -E bash
 ```
 
 Для тестирования ветки `develop` используйте URL с `develop` и передайте `BRANCH=develop`:
 
 ```bash
-export GITHUB_TOKEN='TOKEN_PLACEHOLDER'
+export GITHUB_TOKEN='<GITHUB_TOKEN>'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 export BRANCH='develop'
 
 curl -fsSL \
-  -H "Authorization: Bearer TOKEN_PLACEHOLDER" \
-  https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh \
+  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  "https://api.github.com/repos/YLeon2007/celerity-panel-custom/contents/scripts/install.sh?ref=develop" \
   | sudo -E bash
 ```
 
