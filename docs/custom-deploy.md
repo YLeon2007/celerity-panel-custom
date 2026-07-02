@@ -7,12 +7,12 @@ This repository can deploy the custom C³ CELERITY panel from source with one in
 Because `YLeon2007/celerity-panel-custom` is private, the target server needs a GitHub token that can read the repository.
 
 ```bash
-export GITHUB_TOKEN='<GITHUB_TOKEN>'
+export GITHUB_TOKEN='TOKEN_PLACEHOLDER'
 export PANEL_DOMAIN='panel.example.com'
 export ACME_EMAIL='admin@example.com'
 
 curl -fsSL \
-  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+  -H "Authorization: Bearer TOKEN_PLACEHOLDER" \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
   | sudo -E bash
 ```

@@ -8,10 +8,10 @@ set -euo pipefail
 #   PANEL_DOMAIN=panel.example.com ACME_EMAIL=admin@example.com bash scripts/install.sh
 #
 # For the private GitHub repo via HTTPS token:
-#   export GITHUB_TOKEN=<GITHUB_TOKEN>
+#   export GITHUB_TOKEN=TOKEN_PLACEHOLDER
 #   export PANEL_DOMAIN=panel.example.com
 #   export ACME_EMAIL=admin@example.com
-#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+#   curl -fsSL -H "Authorization: Bearer TOKEN_PLACEHOLDER" \
 #     https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh | sudo -E bash
 
 REPO="${REPO:-YLeon2007/celerity-panel-custom}"
