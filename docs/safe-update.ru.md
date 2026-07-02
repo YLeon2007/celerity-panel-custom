@@ -78,6 +78,45 @@ docker exec hysteria-mongo rm -f /tmp/hysteria-$TS.archive
 
 ---
 
+## Кнопка self-update в панели
+
+В topbar панели показывается текущая версия и ссылка **Проверить обновление**.
+
+При клике backend проверяет ту же Git-ветку, которая сейчас checkout на сервере (`git rev-parse --abbrev-ref HEAD`), если `SELF_UPDATE_BRANCH` не задан явно. Если есть новые коммиты, modal показывает краткий changelog и включает кнопку **Обновить**.
+
+Механизм обновления выполняется внутри backend-контейнера против host checkout, смонтированного в `/opt/hysteria-panel-host`, и требует:
+
+```yaml
+backend:
+  volumes:
+    - .:/opt/hysteria-panel-host
+    - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Перед применением обновления `scripts/self-update.sh`:
+
+1. проверяет свободное место;
+2. сохраняет `.env`;
+3. создаёт tar backup файлов репозитория;
+4. создаёт dump MongoDB, если доступны Mongo credentials;
+5. записывает `ROLLBACK.sh` для отката одной командой;
+6. выполняет `git pull --ff-only`;
+7. пересобирает stack через `docker compose -f docker-compose.yml up -d --build`.
+
+Backup сохраняется в:
+
+```text
+/opt/hysteria-panel/backups/self-update/<timestamp>/
+```
+
+Если что-то пошло не так, подключитесь по SSH и запустите сгенерированный rollback, например:
+
+```bash
+bash /opt/hysteria-panel/backups/self-update/<timestamp>/ROLLBACK.sh
+```
+
+---
+
 ## Рекомендуемое обновление: сборка из `main`
 
 ### 1. Получите и посмотрите изменения

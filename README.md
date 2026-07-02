@@ -171,6 +171,7 @@ Use `latest` for fast updates, or pin an explicit tag for predictable production
 
 ## ✨ Features
 
+- 🔄 **Panel self-update** — topbar version check, changelog modal, backup, fast-forward pull, rebuild, and generated rollback script
 - 🖥 **Web Panel** — Full UI for managing nodes and users
 - 🔐 **Dual Protocol** — Hysteria 2 and Xray VLESS on one panel
 - 🛡️ **Panel 2FA (TOTP)** — Unified TOTP verification flow for admin login and sensitive security actions

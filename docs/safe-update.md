@@ -78,6 +78,45 @@ You can also create/download backups from the panel UI if configured.
 
 ---
 
+## Panel self-update button
+
+The panel topbar shows the current version and a **Check for update** link.
+
+When clicked, the backend checks the same Git branch currently checked out on the server (`git rev-parse --abbrev-ref HEAD`) unless `SELF_UPDATE_BRANCH` is explicitly set. If commits are available, the modal shows a short changelog and enables **Update**.
+
+The update flow runs inside the backend container against the host checkout mounted at `/opt/hysteria-panel-host` and requires:
+
+```yaml
+backend:
+  volumes:
+    - .:/opt/hysteria-panel-host
+    - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Before applying an update, `scripts/self-update.sh`:
+
+1. checks free disk space;
+2. backs up `.env`;
+3. creates a tar backup of repository files;
+4. creates a MongoDB dump when Mongo credentials are available;
+5. writes a one-command `ROLLBACK.sh`;
+6. runs `git pull --ff-only`;
+7. rebuilds with `docker compose -f docker-compose.yml up -d --build`.
+
+Backups are stored under:
+
+```text
+/opt/hysteria-panel/backups/self-update/<timestamp>/
+```
+
+If something goes wrong, SSH into the server and run the generated rollback script, for example:
+
+```bash
+bash /opt/hysteria-panel/backups/self-update/<timestamp>/ROLLBACK.sh
+```
+
+---
+
 ## Recommended update: source build from `main`
 
 ### 1. Fetch and inspect changes
