@@ -3,8 +3,10 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости (mongodump для бэкапов)
-RUN apk add --no-cache mongodb-tools
+# Устанавливаем системные зависимости:
+# - mongodb-tools: mongodump/mongorestore для backup/restore
+# - git/bash/docker-cli: self-update из панели через host checkout + docker compose
+RUN apk add --no-cache mongodb-tools git bash docker-cli docker-cli-compose
 
 # Копируем зависимости
 COPY package*.json ./

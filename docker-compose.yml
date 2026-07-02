@@ -71,6 +71,7 @@ services:
       - "3000"
     volumes:
       - .:/opt/hysteria-panel-host
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./logs:/app/logs
       - ./backups:/app/backups
       - caddy_data:/caddy_data:ro
