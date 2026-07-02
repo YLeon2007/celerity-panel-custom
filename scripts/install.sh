@@ -118,19 +118,8 @@ clone_or_update_repo() {
 
   log "Cloning $REPO branch $BRANCH into $INSTALL_DIR"
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    askpass="$(mktemp)"
-    cat >"$askpass" <<EOF_ASKPASS
-#!/bin/sh
-case "\$1" in
-  *Username*) printf '%s\n' 'x-access-token' ;;
-  *Password*) printf '%s\n' '${GITHUB_TOKEN}' ;;
-  *) printf '\n' ;;
-esac
-EOF_ASKPASS
-    chmod 700 "$askpass"
-    GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-      git clone --branch "$BRANCH" "https://github.com/$REPO.git" "$INSTALL_DIR"
-    rm -f "$askpass"
+    git -c http.https://github.com/.extraheader="Authorization: Bearer ${GITHUB_TOKEN}" \
+      clone --branch "$BRANCH" "https://github.com/$REPO.git" "$INSTALL_DIR"
   else
     git clone --branch "$BRANCH" "https://github.com/$REPO.git" "$INSTALL_DIR"
   fi
