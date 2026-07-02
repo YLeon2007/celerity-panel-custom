@@ -1,252 +1,292 @@
-# Безопасное обновление на проде
+# Безопасное обновление на production
 
-Пошаговое руководство по обновлению C³ CELERITY на production-сервере с минимальным временем простоя.
+Пошаговая инструкция по безопасному обновлению custom-развёртывания C³ CELERITY.
 
----
+Документ соответствует текущему workflow публичного custom-репозитория:
 
-## 📋 Предварительный чеклист
-
-Перед любым обновлением:
-
-1. **Создайте резервную копию базы данных**
-   ```bash
-   # Через UI панели: Дашборд → Бэкап → Скачать
-   # Или вручную через mongodump:
-   docker exec hysteria-mongo mongodump --archive=/data/db/backup.archive --username=hysteria --password --authenticationDatabase=admin
-   docker cp hysteria-mongo:/data/db/backup.archive ./backup-$(date +%Y%m%d-%H%M%S).archive
-   ```
-
-2. **Проверьте текущую версию**
-   ```bash
-   docker logs hysteria-backend --tail 50 | grep -i version
-   ```
-
-3. **Проверьте свободное место на диске**
-   ```bash
-   df -h
-   # Минимум 2GB свободного места для нового образа
-   ```
-
-4. **Сохраните текущий .env файл**
-   ```bash
-   cp .env .env.backup-$(date +%Y%m%d)
-   ```
-
----
-
-## 🚀 Обновление (Docker Hub — рекомендуется)
-
-Для production-развертывания через `docker-compose.hub.yml`:
-
-### 1. Перейдите в директорию проекта
-
-```bash
-cd /path/to/hysteria-panel
-```
-
-### 2. Остановите текущие контейнеры (короткое время простоя)
-
-```bash
-docker compose -f docker-compose.hub.yml down
-```
-
-> **Время простоя:** ~10-30 секунд
-
-### 3. Скачайте новый образ
-
-```bash
-docker compose -f docker-compose.hub.yml pull
-```
-
-### 4. Запустите обновлённые контейнеры
-
-```bash
-docker compose -f docker-compose.hub.yml up -d
-```
-
-### 5. Проверьте статус
-
-```bash
-# Все контейнеры должны быть "running"
-docker compose -f docker-compose.hub.yml ps
-
-# Проверьте логи на ошибки
-docker logs hysteria-backend --tail 100 -f
-```
-
-### 6. Проверьте доступность
-
-```bash
-curl -I https://ваш-домен/panel
+```text
+Репозиторий: https://github.com/YLeon2007/celerity-panel-custom
+Директория установки: /opt/hysteria-panel
+Production-ветка: main
+Compose-файл: docker-compose.yml
+Backend: локальная сборка из исходников
+HTTPS: контейнер Caddy
 ```
 
 ---
 
-## 🔧 Обновление (сборка из исходников)
+## Предварительный чеклист
 
-Для развертывания через `docker-compose.yml` с локальной сборкой:
+Команды выполняются на сервере панели.
 
-### 1. Перейдите в директорию проекта
+### 1. Перейдите в директорию установки
 
 ```bash
-cd /path/to/hysteria-panel
+cd /opt/hysteria-panel
 ```
 
-### 2. Получите последние изменения
+### 2. Проверьте текущее состояние
 
 ```bash
-git fetch origin
-git status  # проверьте незакоммиченные изменения
-git pull origin main
+git branch --show-current
+git rev-parse --short HEAD
+docker compose -f docker-compose.yml ps
+curl -I https://$(grep '^PANEL_DOMAIN=' .env | cut -d= -f2)/panel/login
 ```
 
-### 3. Остановите текущие контейнеры
+### 3. Проверьте свободное место
 
 ```bash
-docker compose down
+df -h /
+docker system df
 ```
 
-### 4. Пересоберите образ
+Для пересборки образа и backup желательно иметь минимум 2 GB свободного места.
+
+### 4. Сохраните `.env` и файлы установки
 
 ```bash
-docker compose build --no-cache backend
+TS=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR=/opt/hysteria-panel-install-backups/manual-update-$TS
+mkdir -p "$BACKUP_DIR"
+cp -a /opt/hysteria-panel/.env "$BACKUP_DIR/.env"
+tar --exclude='.git' --exclude='node_modules' --exclude='logs/*.log' \
+  -czf "$BACKUP_DIR/hysteria-panel-files.tar.gz" \
+  -C /opt hysteria-panel
+printf 'Backup dir: %s\n' "$BACKUP_DIR"
 ```
 
-> **Время:** 2-5 минут в зависимости от сервера
+### 5. Сделайте backup MongoDB
 
-### 5. Запустите контейнеры
+Если `.env` был создан через `scripts/install.sh`, команда ниже использует сгенерированные `MONGO_USER` / `MONGO_PASSWORD`:
 
 ```bash
-docker compose up -d
+set -a
+. ./.env
+set +a
+TS=$(date +%Y%m%d-%H%M%S)
+docker exec hysteria-mongo mongodump \
+  --archive=/tmp/hysteria-$TS.archive \
+  --username "$MONGO_USER" \
+  --password "$MONGO_PASSWORD" \
+  --authenticationDatabase=admin
+docker cp hysteria-mongo:/tmp/hysteria-$TS.archive ./backups/hysteria-$TS.archive
+docker exec hysteria-mongo rm -f /tmp/hysteria-$TS.archive
 ```
 
-### 6. Проверьте статус
+Также можно создать/скачать backup через UI панели, если это настроено.
+
+---
+
+## Рекомендуемое обновление: сборка из `main`
+
+### 1. Получите и посмотрите изменения
 
 ```bash
-docker compose ps
-docker logs hysteria-backend --tail 100 -f
+cd /opt/hysteria-panel
+git fetch origin main
+git log --oneline --decorate -5 HEAD..origin/main
+```
+
+Если вывод пустой — обновлять нечего.
+
+### 2. Убедитесь, что working tree чистый
+
+```bash
+git status --short
+```
+
+Если есть локальные изменения — сначала разберите их, закоммитьте или сохраните через stash.
+
+### 3. Обновите checkout
+
+```bash
+git checkout main
+git pull --ff-only origin main
+```
+
+### 4. Пересоберите и перезапустите stack
+
+```bash
+docker compose -f docker-compose.yml up -d --build
+```
+
+Команда пересобирает backend из текущих исходников и пересоздаёт только те контейнеры, которым это нужно.
+
+### 5. Проверьте контейнеры и логи
+
+```bash
+docker compose -f docker-compose.yml ps
+docker compose -f docker-compose.yml logs --tail=120 backend
+docker compose -f docker-compose.yml logs --tail=120 caddy
+```
+
+Ожидаемые контейнеры:
+
+```text
+hysteria-backend
+hysteria-caddy
+hysteria-mongo
+hysteria-redis
+```
+
+### 6. Проверьте доступность панели
+
+```bash
+DOMAIN=$(grep '^PANEL_DOMAIN=' .env | cut -d= -f2)
+curl -I "https://$DOMAIN/panel/login"
+curl -I "https://$DOMAIN/panel"
+```
+
+Ожидаемо:
+
+```text
+/panel/login -> 200
+/panel       -> 302 redirect на /panel/login
 ```
 
 ---
 
-## 🔄 Откат на предыдущую версию
+## Обновление staging/develop установки
 
-Если после обновления возникли проблемы:
-
-### Вариант 1: Откат на конкретную версию образа
-
-1. Отредактируйте `docker-compose.hub.yml`:
-   ```yaml
-   backend:
-     image: clickdevtech/hysteria-panel:v1.2.3  # укажите нужную версию
-   ```
-
-2. Примените изменения:
-   ```bash
-   docker compose -f docker-compose.hub.yml down
-   docker compose -f docker-compose.hub.yml pull
-   docker compose -f docker-compose.hub.yml up -d
-   ```
-
-### Вариант 2: Откат на предыдущий git-коммит
+Если сервер специально установлен из `develop`:
 
 ```bash
-# Найдите предыдущий рабочий коммит
+cd /opt/hysteria-panel
+git fetch origin develop
+git checkout develop
+git pull --ff-only origin develop
+docker compose -f docker-compose.yml up -d --build
+```
+
+Для production используйте `main`, если вы не тестируете unreleased changes осознанно.
+
+---
+
+## Откат
+
+### Вариант 1: откат на предыдущий git commit
+
+```bash
+cd /opt/hysteria-panel
 git log --oneline -10
-
-# Откатитесь
-git checkout <commit-hash>
-
-# Пересоберите
-docker compose build --no-cache backend
-docker compose up -d
+git checkout <previous-good-commit>
+docker compose -f docker-compose.yml up -d --build
 ```
 
-### Вариант 3: Восстановление базы данных
+После проверки можно временно остаться на detached commit или создать rollback-ветку:
 
 ```bash
-# Восстановление из бэкапа
-docker cp ./backup.archive hysteria-mongo:/data/db/backup.archive
-docker exec hysteria-mongo mongorestore --archive=/data/db/backup.archive --drop --username=hysteria --password --authenticationDatabase=admin
+git switch -c rollback/<date-or-reason>
 ```
 
----
-
-## ✅ После обновления
-
-1. **Проверьте авторизацию** — войдите в панель
-2. **Проверьте ноды** — статус всех нод должен быть `online`
-3. **Проверьте подписки** — откройте ссылку подписки в браузере
-4. **Проверьте API** — выполните тестовый запрос с API-ключом
-5. **Мониторьте логи** в течение 10-15 минут:
-   ```bash
-   docker logs hysteria-backend -f --tail 50
-   ```
-
----
-
-## ⚠️ Типичные проблемы
-
-### Контейнер не стартует
+### Вариант 2: восстановить файлы из tar backup
 
 ```bash
-# Проверьте логи
-docker logs hysteria-backend
-
-# Частые причины:
-# - Ошибка в .env файле
-# - Проблема с подключением к MongoDB
-# - Нехватка памяти
+cd /opt
+mv /opt/hysteria-panel /opt/hysteria-panel.broken-$(date +%Y%m%d-%H%M%S)
+tar -xzf /opt/hysteria-panel-install-backups/<backup-dir>/hysteria-panel-files.tar.gz -C /opt
+cd /opt/hysteria-panel
+docker compose -f docker-compose.yml up -d --build
 ```
 
-### MongoDB не подключается
+### Вариант 3: восстановить MongoDB из backup
+
+Делайте это только если изменилась/повредилась сама база и вы точно готовы потерять более новые данные.
 
 ```bash
-# Проверьте статус MongoDB
-docker logs hysteria-mongo --tail 50
-
-# Перезапустите MongoDB
-docker compose restart mongo
+cd /opt/hysteria-panel
+set -a
+. ./.env
+set +a
+docker cp ./backups/hysteria-YYYYMMDD-HHMMSS.archive hysteria-mongo:/tmp/restore.archive
+docker exec hysteria-mongo mongorestore \
+  --archive=/tmp/restore.archive \
+  --drop \
+  --username "$MONGO_USER" \
+  --password "$MONGO_PASSWORD" \
+  --authenticationDatabase=admin
+docker exec hysteria-mongo rm -f /tmp/restore.archive
 ```
 
-### SSL-сертификаты не работают
+---
+
+## Проверки после обновления
+
+1. Войдите в панель.
+2. Проверьте статусы нод.
+3. Откройте хотя бы одну subscription-ссылку.
+4. Проверьте API, если используете API keys.
+5. Следите за логами 10-15 минут:
 
 ```bash
-# Проверьте содержимое greenlock.d
-ls -la greenlock.d/
-
-# Перезапустите с очисткой кэша
-docker compose down
-docker compose up -d
+docker compose -f docker-compose.yml logs -f --tail=80 backend
 ```
 
 ---
 
-## 📅 Рекомендуемое расписание
+## Типовые проблемы
 
-| Действие | Частота |
-|----------|---------|
-| Бэкап базы | Ежедневно (авто) + перед обновлением |
-| Проверка обновлений | Еженедельно |
-| Обновление security-патчей | В течение 48 часов |
-| Мажорные обновления | После тестирования на staging |
+### Backend не стартует
+
+```bash
+docker compose -f docker-compose.yml logs --tail=200 backend
+docker compose -f docker-compose.yml ps
+```
+
+Частые причины:
+
+- неверные значения в `.env`;
+- MongoDB или Redis ещё не healthy;
+- не хватает памяти/диска;
+- в обновлении появилась синтаксическая/runtime ошибка.
+
+### MongoDB не healthy
+
+```bash
+docker compose -f docker-compose.yml logs --tail=100 mongo
+docker compose -f docker-compose.yml restart mongo
+```
+
+### Проблема с Caddy / HTTPS сертификатом
+
+```bash
+docker compose -f docker-compose.yml logs --tail=160 caddy
+ss -ltnp | grep -E ':80|:443'
+dig +short "$DOMAIN"
+```
+
+Проверьте, что:
+
+- DNS указывает на этот сервер;
+- порты 80 и 443 открыты;
+- другой сервис не занимает 80/443;
+- `PANEL_DOMAIN` в `.env` указан правильно.
 
 ---
 
-## 🛡️ Рекомендации
+## Примечание про Docker Hub
 
-1. **Тестируйте на staging** — дублирующая среда для проверки обновлений
-2. **Обновляйте в низконагруженное время** — ночь/раннее утро по времени пользователей
-3. **Держите бэкапы** — минимум 3 последних бэкапа базы
-4. **Документируйте изменения** — сохраняйте записи о версиях и датах обновлений
-5. **Не обновляйте всё сразу** — сначала панель, затем при необходимости ноды
+В custom-репозитории сейчас используется source-based deployment через `docker-compose.yml`. Upstream-файл `docker-compose.hub.yml` сохранён, но workflow публикации custom Docker Hub image оставлен ручным/выключенным по умолчанию, пока не настроены namespace образа и GitHub secrets.
+
+Для этого custom repo предпочтителен flow обновления через сборку из исходников, описанный выше.
 
 ---
 
-## 📞 Если что-то пошло не так
+## Рекомендации
 
-1. Не паникуйте — данные в MongoDB сохранены
-2. Проверьте логи: `docker logs hysteria-backend --tail 200`
-3. Откатитесь на предыдущую версию
-4. При необходимости восстановите базу из бэкапа
-5. Создайте issue на GitHub с описанием проблемы и логами
+1. Сначала тестируйте обновления на staging.
+2. Обновляйте в часы минимальной нагрузки.
+3. Храните минимум 3 свежих backup базы.
+4. Записывайте git commit до и после каждого обновления.
+5. Не запускайте `docker system prune -a`, пока не убедились, что rollback не понадобится.
+
+---
+
+## Если что-то пошло не так
+
+1. Не паникуйте — данные MongoDB остаются в Docker volume, если вы явно не делали `--drop`.
+2. Проверьте логи: `docker compose -f docker-compose.yml logs --tail=200 backend`.
+3. Откатитесь на предыдущий git commit.
+4. Восстанавливайте MongoDB только при необходимости.
+5. Создайте GitHub issue или приложите логи к maintenance-отчёту.
