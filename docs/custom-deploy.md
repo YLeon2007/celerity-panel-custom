@@ -5,19 +5,16 @@ This repository can deploy the custom C³ CELERITY panel from source with one in
 ## One-command install from the public GitHub repository
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
-
 curl -fsSL \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
   | sudo -E bash
 ```
 
+The script prompts for missing values (`PANEL_DOMAIN`, `ACME_EMAIL`) in interactive mode. For automation, pass them as environment variables.
+
 For `develop` testing:
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
 export BRANCH='develop'
 
 curl -fsSL \

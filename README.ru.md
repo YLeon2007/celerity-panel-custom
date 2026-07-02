@@ -29,13 +29,17 @@
 Сначала направьте DNS домена панели на целевой сервер, затем выполните:
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
-
 curl -fsSL \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
   | sudo -E bash
 ```
+
+Во время установки скрипт интерактивно спросит:
+
+1. `Укажите домен для панели / Enter panel domain:`
+2. `Укажите email администратора домена для получения сертификата Let's Encrypt / Enter domain administrator email for Let's Encrypt certificate:`
+
+Для non-interactive установки по-прежнему можно заранее задать `PANEL_DOMAIN` и `ACME_EMAIL`.
 
 По умолчанию installer использует:
 
@@ -63,8 +67,6 @@ https://ваш-домен/panel
 ### Установка тестовой/develop-ветки
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
 export BRANCH='develop'
 
 curl -fsSL \

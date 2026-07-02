@@ -5,19 +5,16 @@
 ## Установка одной командой из публичного GitHub-репозитория
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
-
 curl -fsSL \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
   | sudo -E bash
 ```
 
+Скрипт интерактивно спросит отсутствующие значения (`PANEL_DOMAIN`, `ACME_EMAIL`). Для автоматизации передайте их через переменные окружения.
+
 Для тестирования ветки `develop`:
 
 ```bash
-export PANEL_DOMAIN='panel.example.com'
-export ACME_EMAIL='admin@example.com'
 export BRANCH='develop'
 
 curl -fsSL \

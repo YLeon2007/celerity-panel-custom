@@ -5,15 +5,14 @@ set -euo pipefail
 # Default target: public repo YLeon2007/celerity-panel-custom.
 #
 # Production install:
-#   export PANEL_DOMAIN=panel.example.com
-#   export ACME_EMAIL=admin@example.com
 #   curl -fsSL https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh | sudo -E bash
 #
 # Develop branch test:
-#   export PANEL_DOMAIN=panel.example.com
-#   export ACME_EMAIL=admin@example.com
 #   export BRANCH=develop
 #   curl -fsSL https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/develop/scripts/install.sh | sudo -E bash
+#
+# Optional non-interactive mode:
+#   PANEL_DOMAIN=panel.example.com ACME_EMAIL=admin@example.com bash scripts/install.sh
 #
 # Private fork only: set GITHUB_TOKEN with read access before running.
 
@@ -76,11 +75,39 @@ install_base_tools() {
   fi
 }
 
+prompt_for_missing_inputs() {
+  if [ -n "$PANEL_DOMAIN" ] && [ -n "$ACME_EMAIL" ]; then
+    return
+  fi
+
+  if [ ! -r /dev/tty ]; then
+    fail "Interactive input is unavailable. Set PANEL_DOMAIN and ACME_EMAIL environment variables."
+  fi
+
+  if [ -z "$PANEL_DOMAIN" ]; then
+    printf '\nУкажите домен для панели / Enter panel domain: ' >/dev/tty
+    IFS= read -r PANEL_DOMAIN </dev/tty
+    PANEL_DOMAIN="${PANEL_DOMAIN#http://}"
+    PANEL_DOMAIN="${PANEL_DOMAIN#https://}"
+    PANEL_DOMAIN="${PANEL_DOMAIN%%/*}"
+  fi
+
+  if [ -z "$ACME_EMAIL" ]; then
+    printf "Укажите email администратора домена для получения сертификата Let's Encrypt / Enter domain administrator email for Let's Encrypt certificate: " >/dev/tty
+    IFS= read -r ACME_EMAIL </dev/tty
+  fi
+}
+
 validate_inputs() {
+  prompt_for_missing_inputs
   [ -n "$PANEL_DOMAIN" ] || fail "PANEL_DOMAIN is required, e.g. PANEL_DOMAIN=panel.example.com"
   [ -n "$ACME_EMAIL" ] || fail "ACME_EMAIL is required, e.g. ACME_EMAIL=admin@example.com"
   case "$PANEL_DOMAIN" in
     http://*|https://*|*/*) fail "PANEL_DOMAIN must be a hostname only, without scheme/path" ;;
+  esac
+  case "$ACME_EMAIL" in
+    *@*) ;;
+    *) fail "ACME_EMAIL must look like an email address, e.g. admin@example.com" ;;
   esac
 }
 
