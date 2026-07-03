@@ -227,6 +227,7 @@ class SyncService {
         this.isSyncing = false;
         this.lastSyncTime = null;
         this.xrayUserStatsSnapshots = new Map();
+        this.xrayNodeOnlineUsers = new Map();
     }
 
     /**
@@ -690,10 +691,11 @@ class SyncService {
             if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
                 logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
             }
-            return { onlineUserIds: activeUserIds };
+            return { onlineUserIds: activeUserIds, nodeKey: snapshotKey, ok: true };
         } catch (error) {
             logger.error(`[Agent Stats] ${node.name} error: ${error.message}`);
-            return { onlineUserIds: [] };
+            const nodeKey = node._id?.toString?.() || node.id || node.name;
+            return { onlineUserIds: [], nodeKey, ok: false };
         }
     }
 
@@ -1125,7 +1127,9 @@ class SyncService {
      */
     async collectAllStats() {
         const nodes = await HyNode.find({ active: true });
-        const xrayOnlineUserIds = new Set();
+        const activeXrayNodeKeys = new Set(nodes
+            .filter(node => node.type === 'xray')
+            .map(node => node._id?.toString?.() || node.id || node.name));
         
         // Parallel processing with concurrency limit
         const CONCURRENCY = 5;
@@ -1139,9 +1143,24 @@ class SyncService {
             );
             results.forEach((result) => {
                 if (result.status !== 'fulfilled') return;
-                const ids = result.value?.onlineUserIds;
-                if (Array.isArray(ids)) ids.forEach(userId => xrayOnlineUserIds.add(userId));
+                const value = result.value;
+                if (!value || !value.nodeKey || !Array.isArray(value.onlineUserIds)) return;
+                // Only a successful stats response should replace that node's
+                // contribution. A timeout/unavailable node must not erase users
+                // reported by other nodes or cause whole-list flicker.
+                if (value.ok) {
+                    this.xrayNodeOnlineUsers.set(value.nodeKey, new Set(value.onlineUserIds.map(String)));
+                }
             });
+        }
+
+        for (const nodeKey of this.xrayNodeOnlineUsers.keys()) {
+            if (!activeXrayNodeKeys.has(nodeKey)) this.xrayNodeOnlineUsers.delete(nodeKey);
+        }
+
+        const xrayOnlineUserIds = new Set();
+        for (const ids of this.xrayNodeOnlineUsers.values()) {
+            ids.forEach(userId => xrayOnlineUserIds.add(userId));
         }
         await cache.setXrayOnlineUsers([...xrayOnlineUserIds], Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
         
