@@ -337,6 +337,14 @@
     <details class="happ-collapse-section" style="margin-top: 1.5rem;">
         <summary class="happ-collapse-summary">
             <i class="ti ti-chevron-right"></i>
+            <span><i class="ti ti-brand-apple"></i> <%= t('settings.routingIosToggle') || 'Split Tunneling — iOS' %></span>
+        </summary>
+        <%- include('routing-ios') %>
+    </details>
+
+    <details class="happ-collapse-section" style="margin-top: 1.5rem;">
+        <summary class="happ-collapse-summary">
+            <i class="ti ti-chevron-right"></i>
             <span><i class="ti ti-shield-x"></i> <%= t('settings.softBlockTitle') %></span>
         </summary>
         <%- include('softblock') %>

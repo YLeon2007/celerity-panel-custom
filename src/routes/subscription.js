@@ -52,6 +52,29 @@ function isXrayProfileClient(userAgent) {
     return isHappUa(userAgent) || isIncyUa(userAgent);
 }
 
+function detectClientPlatform(req) {
+    const userAgent = String(req.headers['user-agent'] || '').toLowerCase();
+    const deviceOs = String(req.headers['x-device-os'] || '').toLowerCase();
+    const deviceModel = String(req.headers['x-device-model'] || '').toLowerCase();
+    const combined = `${deviceOs} ${deviceModel} ${userAgent}`;
+
+    if (/\b(ipad|iphone|ipod|ios|ipados)\b/.test(combined) || /cpu (iphone )?os /.test(combined)) {
+        return 'ios';
+    }
+    if (/android/.test(combined)) return 'android';
+    if (/windows|win32|win64/.test(combined)) return 'windows';
+    if (/mac os|macintosh|darwin/.test(combined)) return 'macos';
+    if (/linux/.test(combined)) return 'linux';
+    return 'unknown';
+}
+
+function selectRoutingProfile(settings, userAgent, platform) {
+    if (isHappUa(userAgent) && platform === 'ios' && settings?.routingIos?.enabled) {
+        return { routing: settings.routingIos, variant: 'happ-ios' };
+    }
+    return { routing: settings?.routing || null, variant: 'default' };
+}
+
 function isBrowser(req) {
     const accept = req.headers.accept || '';
     const ua = (req.headers['user-agent'] || '').toLowerCase();
@@ -2782,6 +2805,8 @@ async function serveSubscription(req, res, ctx) {
     uaStats.track(cacheToken, userAgent);
 
     const settings = await getSettings();
+    const platform = detectClientPlatform(req);
+    const routingSelection = selectRoutingProfile(settings, userAgent, platform);
 
     const { extraHeaders: hwidHeaders, aborted: hwidAborted } = await runHwidSubscriptionGate(req, res, user, settings, format);
     if (hwidAborted) return;
@@ -2789,9 +2814,12 @@ async function serveSubscription(req, res, ctx) {
     // HAPP/Incy may upgrade a "uri" response to xray-json, so split the cache
     // keyspace from plain URI consumers on the same token. HAPP and Incy share
     // one namespace (identical body; routing scheme differs post-cache).
-    const cacheFormat = (isXrayProfileClient(userAgent) && (format === 'uri' || format === 'raw'))
+    const cacheFormatBase = (isXrayProfileClient(userAgent) && (format === 'uri' || format === 'raw'))
         ? `${format}+xprofile`
         : format;
+    const cacheFormat = routingSelection.variant === 'happ-ios'
+        ? `${cacheFormatBase}+${routingSelection.variant}`
+        : cacheFormatBase;
 
     const cached = await cache.getSubscription(cacheToken, cacheFormat);
     if (cached) {
@@ -2809,7 +2837,8 @@ async function serveSubscription(req, res, ctx) {
 
     logger.debug(`[Sub] Serving ${nodes.length} nodes to user ${user.userId}`);
 
-    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', settings?.routing);
+    const subscriptionData = generateSubscriptionData(user, nodes, format, userAgent, settings?.subscription?.happProviderId || '', routingSelection.routing);
+    subscriptionData.routingVariant = routingSelection.variant;
     await cache.setSubscription(cacheToken, cacheFormat, subscriptionData);
     return sendCachedSubscription(res, subscriptionData, format, userAgent, settings, hwidHeaders);
 }
@@ -2984,8 +3013,9 @@ function sendCachedSubscription(res, data, format, userAgent, settings, hwidExtr
     if (isHappClient || isIncyClient) {
         const isUriBody = (effectiveFormat === 'uri' || effectiveFormat === 'raw');
         const routingScheme = isHappClient ? 'happ' : '';
-        if (settings?.routing?.enabled) {
-            const profile = buildHappRoutingProfile(settings.routing);
+        const selectedRouting = data.routingVariant === 'happ-ios' ? settings?.routingIos : settings?.routing;
+        if (selectedRouting?.enabled) {
+            const profile = buildHappRoutingProfile(selectedRouting);
             if (profile) {
                 const b64 = Buffer.from(JSON.stringify(profile)).toString('base64');
                 const routingLink = `${routingScheme}://routing/onadd/${b64}`;

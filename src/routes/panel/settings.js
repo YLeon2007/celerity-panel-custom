@@ -329,6 +329,29 @@ router.post('/settings', async (req, res) => {
             await cache.invalidateAllSubscriptions();
         }
 
+        // iOS-specific HAPP routing settings
+        if (req.body['_routingIosSettings'] !== undefined) {
+            updates['routingIos.enabled'] = req.body['routingIos.enabled'] === 'on';
+            updates['routingIos.dns.domestic'] = (req.body['routingIos.dns.domestic'] || '77.88.8.8').trim();
+            updates['routingIos.dns.remote']   = (req.body['routingIos.dns.remote']   || 'tls://1.1.1.1').trim();
+            let parsedRules = [];
+            try { parsedRules = JSON.parse(req.body['routingIos.rulesJson'] || '[]'); } catch {}
+            if (!Array.isArray(parsedRules)) parsedRules = [];
+            const VALID_ACTIONS = ['direct', 'block'];
+            const VALID_TYPES   = ['domain_suffix', 'domain_keyword', 'domain', 'geosite', 'geoip', 'ip_cidr'];
+            updates['routingIos.rules'] = parsedRules
+                .filter(r => r && VALID_ACTIONS.includes(r.action) && VALID_TYPES.includes(r.type) && r.value)
+                .slice(0, 200)
+                .map(r => ({
+                    action:  r.action,
+                    type:    r.type,
+                    value:   String(r.value).trim(),
+                    comment: String(r.comment || '').trim().slice(0, 100),
+                    enabled: r.enabled !== false,
+                }));
+            await cache.invalidateAllSubscriptions();
+        }
+
         // Backup settings
         if (req.body['_backupSettings'] || req.body['backup.enabled'] !== undefined) {
             updates['backup.enabled'] = req.body['backup.enabled'] === 'on';

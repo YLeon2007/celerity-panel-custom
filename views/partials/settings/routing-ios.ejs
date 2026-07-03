@@ -1,0 +1,364 @@
+<%# ==================== SECTION: ROUTING IOS (embedded in Subscription tab) ==================== %>
+<div class="card" style="margin-top: 1.5rem;">
+    <div class="card-header">
+        <h2><i class="ti ti-route"></i> <%= t('settings.routingIosTitle') %></h2>
+        <p class="hint" style="margin:0"><%= t('settings.routingIosDesc') %></p>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="/panel/settings" id="routingIosForm">
+            <input type="hidden" name="_routingIosSettings" value="1">
+
+            <%# ======== Master switch ======== %>
+            <div style="margin-bottom: 1.25rem;">
+                <label class="checkbox-label" style="font-size:15px; font-weight:600;">
+                    <input type="checkbox" name="routingIos.enabled" id="routingIosMasterSwitch"
+                           <%= settings?.routingIos?.enabled ? 'checked' : '' %>
+                           onchange="toggleRoutingIosEnabled()">
+                    <span class="checkbox-text"><%= t('settings.routingEnabled') %></span>
+                </label>
+                <p class="hint" style="margin-top:6px;"><%= t('settings.routingEnabledHint') %></p>
+            </div>
+
+            <div id="routingIosBody" style="<%= settings?.routingIos?.enabled ? '' : 'display:none' %>">
+
+                <%# ======== How it works ======== %>
+                <div class="alert" style="background:rgba(59,130,246,0.06); border:1px solid rgba(59,130,246,0.2); border-radius:var(--radius-sm); padding:14px 18px; margin-bottom:1.5rem; font-size:13px; line-height:1.7;">
+                    <div style="margin-bottom:8px;">
+                        <i class="ti ti-info-circle" style="color:var(--accent);"></i>
+                        <strong style="color:var(--accent);"><%= t('settings.routingHowItWorks') %></strong>
+                    </div>
+                    <div><%- t('settings.routingHowItWorksDesc') %></div>
+                </div>
+
+                <%# ======== Client support ======== %>
+                <div class="alert" style="background:rgba(34,197,94,0.06); border:1px solid rgba(34,197,94,0.2); border-radius:var(--radius-sm); padding:14px 18px; margin-bottom:1.5rem; font-size:13px; line-height:1.7;">
+                    <div style="margin-bottom:8px;">
+                        <i class="ti ti-devices" style="color:var(--success, #22c55e);"></i>
+                        <strong style="color:var(--success, #22c55e);"><%= t('settings.routingClientSupport') %></strong>
+                    </div>
+                    <div><%- t('settings.routingClientSupportDesc') %></div>
+                </div>
+
+                <%# ======== Presets ======== %>
+                <div class="form-section" style="margin-bottom:1.5rem;">
+                    <h3><%= t('settings.routingPresets') %></h3>
+                    <p class="hint" style="margin-bottom:10px;"><%= t('settings.routingPresetsHint') %></p>
+                    <div class="presets-grid">
+                        <div class="preset-card" onclick="applyRoutingIosPreset('bypass-ru', this)">
+                            <span class="preset-badge"><i class="ti ti-check"></i></span>
+                            <div class="preset-icon"><i class="ti ti-flag"></i></div>
+                            <div class="preset-title"><%= t('settings.presetBypassRu') %></div>
+                            <div class="preset-desc"><%= t('settings.presetBypassRuDesc') %></div>
+                        </div>
+                        <div class="preset-card" onclick="applyRoutingIosPreset('bypass-cn', this)">
+                            <span class="preset-badge"><i class="ti ti-check"></i></span>
+                            <div class="preset-icon"><i class="ti ti-flag-2"></i></div>
+                            <div class="preset-title"><%= t('settings.presetBypassCn') %></div>
+                            <div class="preset-desc"><%= t('settings.presetBypassCnDesc') %></div>
+                        </div>
+                        <div class="preset-card" onclick="applyRoutingIosPreset('block-ads', this)">
+                            <span class="preset-badge"><i class="ti ti-check"></i></span>
+                            <div class="preset-icon"><i class="ti ti-ban"></i></div>
+                            <div class="preset-title"><%= t('settings.presetBlockAds') %></div>
+                            <div class="preset-desc"><%= t('settings.presetBlockAdsDesc') %></div>
+                        </div>
+                        <div class="preset-card" onclick="applyRoutingIosPreset('bypass-lan', this)">
+                            <span class="preset-badge"><i class="ti ti-check"></i></span>
+                            <div class="preset-icon"><i class="ti ti-home"></i></div>
+                            <div class="preset-title"><%= t('settings.presetBypassLan') %></div>
+                            <div class="preset-desc"><%= t('settings.presetBypassLanDesc') %></div>
+                        </div>
+                        <div class="preset-card preset-card--danger" onclick="applyRoutingIosPreset('clear', this)">
+                            <div class="preset-icon"><i class="ti ti-trash"></i></div>
+                            <div class="preset-title"><%= t('settings.presetClear') %></div>
+                            <div class="preset-desc"><%= t('settings.presetClearDesc') %></div>
+                        </div>
+                    </div>
+                </div>
+
+                <%# ======== Rules table ======== %>
+                <div class="form-section" style="margin-bottom:1.5rem;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+                        <div>
+                            <h3 style="margin:0;"><%= t('settings.routingRules') %></h3>
+                            <p class="hint" style="margin:4px 0 0;"><%= t('settings.routingRulesHint') %></p>
+                        </div>
+                        <button type="button" class="btn btn-primary btn-sm" onclick="addRoutingIosRule()">
+                            <i class="ti ti-plus"></i> <%= t('settings.routingAddRule') %>
+                        </button>
+                    </div>
+
+                    <input type="hidden" name="routingIos.rulesJson" id="routingIosRulesJson" value="">
+
+                    <div id="routingIosRulesTable" style="overflow-x:auto;">
+                        <table style="width:100%; border-collapse:collapse; font-size:13px;" id="rulesIosTable">
+                            <thead>
+                                <tr style="border-bottom:2px solid var(--border); color:var(--text-muted);">
+                                    <th style="padding:8px 6px; text-align:left; white-space:nowrap;">#</th>
+                                    <th style="padding:8px 6px; text-align:left; white-space:nowrap;"><%= t('settings.routingAction') %></th>
+                                    <th style="padding:8px 6px; text-align:left; white-space:nowrap;"><%= t('settings.routingType') %></th>
+                                    <th style="padding:8px 6px; text-align:left; width:100%;"><%= t('settings.routingValue') %></th>
+                                    <th style="padding:8px 6px; text-align:left; min-width:120px;"><%= t('settings.routingComment') %></th>
+                                    <th style="padding:8px 6px; text-align:center; white-space:nowrap;"><%= t('settings.routingEnabled2') %></th>
+                                    <th style="padding:8px 6px;"></th>
+                                </tr>
+                            </thead>
+                            <tbody id="rulesIosBody"></tbody>
+                        </table>
+                        <div id="rulesIosEmpty" style="display:none; text-align:center; padding:24px; color:var(--text-muted); font-size:13px;">
+                            <i class="ti ti-inbox"></i> <%= t('settings.routingNoRules') %>
+                        </div>
+                    </div>
+                </div>
+
+                <%# ======== DNS settings ======== %>
+                <div class="form-section" style="margin-bottom:1.5rem;">
+                    <h3><%= t('settings.routingDns') %></h3>
+                    <p class="hint" style="margin-bottom:12px;"><%= t('settings.routingDnsHint') %></p>
+                    <div class="settings-grid">
+                        <div class="form-group">
+                            <label><%= t('settings.routingDnsDomestic') %></label>
+                            <input type="text" name="routingIos.dns.domestic" id="routingDnsDomestic"
+                                   value="<%= settings?.routingIos?.dns?.domestic || '77.88.8.8' %>"
+                                   placeholder="77.88.8.8">
+                            <small class="hint"><%= t('settings.routingDnsDomesticHint') %></small>
+                        </div>
+                        <div class="form-group">
+                            <label><%= t('settings.routingDnsRemote') %></label>
+                            <input type="text" name="routingIos.dns.remote" id="routingDnsRemote"
+                                   value="<%= settings?.routingIos?.dns?.remote || 'tls://1.1.1.1' %>"
+                                   placeholder="tls://1.1.1.1">
+                            <small class="hint"><%= t('settings.routingDnsRemoteHint') %></small>
+                        </div>
+                    </div>
+                </div>
+
+            </div><%# /routingIosBody %>
+
+            <div class="settings-save-bar">
+                <button type="submit" class="btn btn-primary">
+                    <i class="ti ti-device-floppy"></i> <%= t('common.save') %>
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<style>
+.presets-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 10px;
+}
+.preset-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: all 0.15s;
+    background: var(--bg-secondary);
+    user-select: none;
+    position: relative;
+}
+.preset-card:hover { border-color: var(--accent); background: rgba(59,130,246,0.05); }
+.preset-card:active { transform: scale(0.98); }
+.preset-card.flash { border-color: var(--success, #22c55e); background: rgba(34,197,94,0.08); }
+.preset-card.flash .preset-badge { background: var(--success, #22c55e); }
+.preset-card--danger:hover { border-color: var(--danger, #ef4444); background: rgba(239,68,68,0.05); }
+.preset-card--danger.flash { border-color: var(--danger, #ef4444); background: rgba(239,68,68,0.08); }
+.preset-icon { font-size: 20px; margin-bottom: 6px; }
+.preset-icon i { font-size: 20px; }
+.preset-title { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.preset-desc { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+.preset-badge {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--accent); color: #fff;
+    font-size: 10px; font-weight: 600; line-height: 1;
+    padding: 3px 6px; border-radius: var(--radius-xs);
+    opacity: 0; transition: opacity 0.2s;
+}
+.preset-card.applied .preset-badge { opacity: 1; }
+
+#rulesIosTable td { padding: 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+#rulesIosTable tbody tr:last-child td { border-bottom: none; }
+#rulesIosTable select, #rulesIosTable input[type="text"] {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 4px 6px;
+}
+#rulesIosTable select:focus, #rulesIosTable input[type="text"]:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.rule-num { color: var(--text-muted); font-size: 11px; width: 24px; text-align: right; }
+.rule-del-btn {
+    background: none; border: none; color: var(--text-muted);
+    cursor: pointer; padding: 2px 4px; font-size: 14px; line-height: 1;
+    transition: color 0.15s;
+}
+.rule-del-btn:hover { color: #ff6b6b; }
+</style>
+
+<script>
+(function() {
+    var CLEAR_CONFIRM = <%- JSON.stringify(t('settings.clearRulesConfirm')) %>;
+
+    var PRESETS = {
+        'bypass-ru': [
+            { action: 'direct', type: 'geosite',        value: 'category-ru',   comment: 'Russian sites DB', enabled: true },
+            { action: 'direct', type: 'geoip',          value: 'ru',            comment: 'Russian IPs',      enabled: true },
+            { action: 'direct', type: 'domain_suffix',  value: '.ru',           comment: '',                 enabled: true },
+            { action: 'direct', type: 'domain_suffix',  value: '.su',           comment: '',                 enabled: true },
+            { action: 'direct', type: 'domain_suffix',  value: '.xn--p1ai',     comment: '.рф',              enabled: true },
+            { action: 'direct', type: 'domain',         value: 'match.tv',      comment: '',                 enabled: true },
+            { action: 'direct', type: 'domain',         value: 'ntvplus.tv',    comment: '',                 enabled: true },
+            { action: 'direct', type: 'domain',         value: 'ozon.travel',   comment: '',                 enabled: true },
+            { action: 'direct', type: 'domain',         value: 'lenta.tech',    comment: '',                 enabled: true },
+            { action: 'direct', type: 'geoip',          value: 'private',       comment: 'LAN',              enabled: true },
+        ],
+        'bypass-cn': [
+            { action: 'direct', type: 'geosite',       value: 'cn',            comment: 'Chinese sites DB', enabled: true },
+            { action: 'direct', type: 'geoip',         value: 'cn',            comment: 'Chinese IPs',      enabled: true },
+            { action: 'direct', type: 'geoip',         value: 'private',       comment: 'LAN',              enabled: true },
+        ],
+        'block-ads': [
+            { action: 'block', type: 'geosite', value: 'category-ads', comment: 'Ad networks', enabled: true },
+        ],
+        'bypass-lan': [
+            { action: 'direct', type: 'geoip', value: 'private', comment: 'LAN', enabled: true },
+        ],
+        'clear': [],
+    };
+
+    var TYPE_LABELS = {
+        domain_suffix:   <%- JSON.stringify(t('settings.routingTypeDomainSuffix')) %>,
+        domain_keyword:  <%- JSON.stringify(t('settings.routingTypeDomainKeyword')) %>,
+        domain:          <%- JSON.stringify(t('settings.routingTypeDomain')) %>,
+        geosite:         <%- JSON.stringify(t('settings.routingTypeGeosite')) %>,
+        geoip:           <%- JSON.stringify(t('settings.routingTypeGeoip')) %>,
+        ip_cidr:         <%- JSON.stringify(t('settings.routingTypeIpCidr')) %>,
+    };
+
+    var routingIosRules = <%- JSON.stringify((settings?.routingIos?.rules || []).map(r => ({
+        action:  r.action  || 'direct',
+        type:    r.type    || 'geosite',
+        value:   r.value   || '',
+        comment: r.comment || '',
+        enabled: r.enabled !== false,
+    }))).replace(/</g, '\\u003c') %>;
+
+    function ruleKey(r) { return r.type + ':' + r.value; }
+
+    function syncJson() {
+        document.getElementById('routingIosRulesJson').value = JSON.stringify(routingIosRules);
+        updatePresetBadges();
+    }
+
+    function updatePresetBadges() {
+        var currentKeys = {};
+        routingIosRules.forEach(function(r) { currentKeys[ruleKey(r)] = true; });
+
+        document.querySelectorAll('#routingIosForm .preset-card').forEach(function(card) {
+            var key = card.getAttribute('onclick')?.match(/applyRoutingIosPreset\('([^']+)'/)?.[1];
+            if (!key || key === 'clear') { card.classList.remove('applied'); return; }
+            var preset = PRESETS[key];
+            if (!preset) return;
+            var allPresent = preset.every(function(r) { return currentKeys[ruleKey(r)]; });
+            card.classList.toggle('applied', allPresent && preset.length > 0);
+        });
+    }
+
+    function renderRules() {
+        var tbody = document.getElementById('rulesIosBody');
+        var empty = document.getElementById('rulesIosEmpty');
+
+        if (routingIosRules.length === 0) {
+            tbody.innerHTML = '';
+            empty.style.display = '';
+            syncJson();
+            return;
+        }
+        empty.style.display = 'none';
+
+        tbody.innerHTML = routingIosRules.map(function(r, i) {
+            return '<tr data-idx="' + i + '">'
+                + '<td><span class="rule-num">' + (i + 1) + '</span></td>'
+                + '<td><select onchange="updateRoutingIosRule(' + i + ', \'action\', this.value)" style="width:70px;">'
+                +   '<option value="direct"' + (r.action === 'direct' ? ' selected' : '') + '>direct</option>'
+                +   '<option value="block"' + (r.action === 'block' ? ' selected' : '') + '>block</option>'
+                + '</select></td>'
+                + '<td><select onchange="updateRoutingIosRule(' + i + ', \'type\', this.value)" style="min-width:110px;">'
+                +   Object.keys(TYPE_LABELS).map(function(k) {
+                        return '<option value="' + k + '"' + (r.type === k ? ' selected' : '') + '>' + TYPE_LABELS[k] + '</option>';
+                    }).join('')
+                + '</select></td>'
+                + '<td><input type="text" value="' + escHtml(r.value) + '" oninput="updateRoutingIosRule(' + i + ', \'value\', this.value)" style="width:100%; min-width:120px;" placeholder="category-ru / .ru / 1.2.3.0/24"></td>'
+                + '<td><input type="text" value="' + escHtml(r.comment) + '" oninput="updateRoutingIosRule(' + i + ', \'comment\', this.value)" style="width:100%; min-width:90px;"></td>'
+                + '<td style="text-align:center;"><input type="checkbox"' + (r.enabled ? ' checked' : '') + ' onchange="updateRoutingIosRule(' + i + ', \'enabled\', this.checked)"></td>'
+                + '<td><button type="button" class="rule-del-btn" onclick="deleteRoutingIosRule(' + i + ')"><i class="ti ti-x"></i></button></td>'
+                + '</tr>';
+        }).join('');
+
+        syncJson();
+    }
+
+    window.updateRoutingIosRule = function(i, field, val) {
+        routingIosRules[i][field] = val;
+        syncJson();
+    };
+
+    window.deleteRoutingIosRule = function(i) {
+        routingIosRules.splice(i, 1);
+        renderRules();
+    };
+
+    window.addRoutingIosRule = function() {
+        routingIosRules.push({ action: 'direct', type: 'geosite', value: '', comment: '', enabled: true });
+        renderRules();
+        var tbody = document.getElementById('rulesIosBody');
+        var lastRow = tbody.lastElementChild;
+        if (lastRow) {
+            var valueInput = lastRow.querySelector('input[type="text"]');
+            if (valueInput) { valueInput.focus(); }
+            lastRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    };
+
+    window.applyRoutingIosPreset = function(key, el) {
+        var preset = PRESETS[key];
+        if (preset === undefined) return;
+
+        if (key === 'clear') {
+            if (routingIosRules.length > 0 && !confirm(CLEAR_CONFIRM)) return;
+            routingIosRules = [];
+        } else {
+            var existingKeys = {};
+            routingIosRules.forEach(function(r) { existingKeys[ruleKey(r)] = true; });
+            preset.forEach(function(r) {
+                if (!existingKeys[ruleKey(r)]) {
+                    routingIosRules.push({ action: r.action, type: r.type, value: r.value, comment: r.comment, enabled: r.enabled });
+                    existingKeys[ruleKey(r)] = true;
+                }
+            });
+        }
+
+        renderRules();
+        el.classList.add('flash');
+        setTimeout(function() { el.classList.remove('flash'); }, 800);
+    };
+
+    window.toggleRoutingIosEnabled = function() {
+        var checked = document.getElementById('routingIosMasterSwitch').checked;
+        document.getElementById('routingIosBody').style.display = checked ? '' : 'none';
+    };
+
+    function escHtml(s) {
+        return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    renderRules();
+})();
+</script>

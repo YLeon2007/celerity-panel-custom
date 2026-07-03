@@ -1051,7 +1051,10 @@
     "routingDnsRemoteHint": "代理流量使用的加密 DNS（例如 Cloudflare DoT：tls://1.1.1.1）",
     "routingClientSupport": "客户端兼容性",
     "routingClientSupportDesc": "<strong>完整支持：</strong> HAPP（原生路由协议）、Clash Meta / Stash（YAML 规则）。<br><strong>部分支持：</strong> Hiddify / SFA / NekoBox（sing-box JSON - 某些客户端可能用自己的模板覆盖规则）。<br><strong>不支持：</strong> v2rayNG、Streisand、Shadowrocket - 这些客户端使用 URI 订阅，无法携带路由规则。用户需要手动配置路由。",
-    "clearRulesConfirm": "移除所有路由规则？"
+    "clearRulesConfirm": "移除所有路由规则？",
+    "routingIosToggle": "分流 — iOS",
+    "routingIosTitle": "分流 — iOS (HAPP)",
+    "routingIosDesc": "仅适用于 iPhone/iPad 上 HAPP 的独立路由规则。Android、Windows 和其他客户端继续使用默认分流配置。"
   },
   "setup": {
     "title": "初始设置",

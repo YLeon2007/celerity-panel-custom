@@ -159,6 +159,28 @@ const settingsSchema = new mongoose.Schema({
         },
     },
 
+    // Optional HAPP iOS-specific split tunneling profile. When enabled and a
+    // HAPP client is detected as iOS/iPadOS, this profile is used instead of
+    // the default `routing` profile. Other clients keep using `routing`.
+    routingIos: {
+        enabled: { type: Boolean, default: false },
+        rules: {
+            type: [{
+                _id: false,
+                action:  { type: String, enum: ['direct', 'block'], default: 'direct' },
+                type:    { type: String, enum: ['domain_suffix', 'domain_keyword', 'domain', 'geosite', 'geoip', 'ip_cidr'] },
+                value:   { type: String },
+                comment: { type: String, default: '' },
+                enabled: { type: Boolean, default: true },
+            }],
+            default: [],
+        },
+        dns: {
+            domestic: { type: String, default: '77.88.8.8' },
+            remote:   { type: String, default: 'tls://1.1.1.1' },
+        },
+    },
+
     // Marzban legacy-link compatibility. When `enabled` is true the compat
     // middleware accepts incoming requests at /{path}/{token} (or /{salt}/{path}/{token}
     // when urlSalt is set), verifies the HMAC against jwtSecretEncrypted, and

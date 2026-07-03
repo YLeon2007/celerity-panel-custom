@@ -1051,7 +1051,10 @@
     "routingDnsRemoteHint": "Зашифрованный DNS для проксируемого трафика (например Cloudflare DoT: tls://1.1.1.1)",
     "routingClientSupport": "Совместимость клиентов",
     "routingClientSupportDesc": "<strong>Полная поддержка:</strong> HAPP (встроенный протокол маршрутизации), Clash Meta / Stash (YAML-правила).<br><strong>Частичная поддержка:</strong> Hiddify / SFA / NekoBox (sing-box JSON — некоторые клиенты могут заменять правила своими шаблонами).<br><strong>Не поддерживается:</strong> v2rayNG, Streisand, Shadowrocket — эти клиенты используют URI-подписки, которые не могут содержать routing rules. Пользователям нужно настраивать маршрутизацию вручную.",
-    "clearRulesConfirm": "Удалить все правила маршрутизации?"
+    "clearRulesConfirm": "Удалить все правила маршрутизации?",
+    "routingIosToggle": "Split Tunneling — iOS",
+    "routingIosTitle": "Split Tunneling — iOS (HAPP)",
+    "routingIosDesc": "Отдельные правила маршрутизации только для HAPP на iPhone/iPad. Android, Windows и остальные клиенты продолжают получать основной Split Tunneling."
   },
   "setup": {
     "title": "Первоначальная настройка",
