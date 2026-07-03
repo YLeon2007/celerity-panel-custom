@@ -34,9 +34,19 @@ assert.strictEqual(normalizeClientOs({ platform: '', userAgent: '' }), 'unknown'
         { platform: 'Windows', lastSeenAt: new Date('2026-07-03T09:29:59.000Z') },
     ], { now: fixedNow, onlineUserIds: new Set(), userId: 'bob', lang: 'ru' });
 
-    assert.strictEqual(stats.online, false, 'fresh UserDevice heartbeat must not imply real VPN online');
+    assert.strictEqual(stats.online, false, 'fresh UserDevice heartbeat must not imply real VPN online unless explicitly enabled');
     assert.strictEqual(stats.onlineDeviceCount, 0);
     assert.strictEqual(stats.osSummary, '1 устройство windows');
+}
+
+{
+    const stats = buildClientStats([
+        { platform: 'Android', lastSeenAt: new Date('2026-07-03T09:29:30.000Z') },
+    ], { now: fixedNow, onlineUserIds: new Set(), userId: 'lilya', lang: 'ru', freshDeviceOnlineMs: 10 * 60 * 1000 });
+
+    assert.strictEqual(stats.online, true, 'optional fresh HAPP/device heartbeat should count as short-lived online signal');
+    assert.strictEqual(stats.onlineDeviceCount, 1);
+    assert.strictEqual(stats.osSummary, '1 устройство android');
 }
 
 {

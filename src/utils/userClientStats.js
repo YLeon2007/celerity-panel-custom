@@ -102,7 +102,13 @@ function buildClientStats(devices = [], options = {}) {
 
     const sorted = [...devices].sort((a, b) => new Date(b.lastSeenAt || 0) - new Date(a.lastSeenAt || 0));
     const osList = uniqPreserveOrder(sorted.map(normalizeClientOs));
-    const online = userId ? onlineUserIds.has(userId) : false;
+    const freshDeviceOnlineMs = Number(options.freshDeviceOnlineMs || 0);
+    const nowMs = options.now ? new Date(options.now).getTime() : Date.now();
+    const hasFreshDeviceHeartbeat = freshDeviceOnlineMs > 0 && sorted.some((device) => {
+        const lastSeenMs = new Date(device.lastSeenAt || 0).getTime();
+        return Number.isFinite(lastSeenMs) && nowMs - lastSeenMs <= freshDeviceOnlineMs;
+    });
+    const online = userId ? (onlineUserIds.has(userId) || hasFreshDeviceHeartbeat) : false;
 
     let osSummary = `0 ${deviceWord(0, lang)} unknown`;
     if (sorted.length > 0) {
