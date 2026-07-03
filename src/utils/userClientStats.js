@@ -52,26 +52,46 @@ function hasNonEmptyCollection(value) {
     return false;
 }
 
-function isXrayUserOnline(stats = {}) {
-    // Current cc-agent releases expose per-user live activity as the users
-    // present in the current /stats poll with positive rx/tx deltas. Treat those
-    // deltas as online, but keep the caller-side cache short-lived so a user is
-    // cleared on the next quiet/disconnected poll rather than held for minutes.
+function xrayTrafficTotal(stats = {}) {
+    return ['tx', 'rx', 'uplink', 'downlink', 'upload', 'download']
+        .reduce((sum, key) => sum + Number(stats[key] || 0), 0);
+}
+
+function isTrafficGrowing(stats = {}, previousStats = null) {
+    const current = xrayTrafficTotal(stats);
+    if (!isPositiveNumber(current)) return false;
+    if (!previousStats) return false;
+    return current > xrayTrafficTotal(previousStats);
+}
+
+function isXrayUserOnline(stats = {}, options = {}) {
+    const previousStats = options.previousStats || null;
+    const requireTrafficChange = options.requireTrafficChange === true;
+
+    // Prefer explicit live signals when future/current agents provide them.
     if (stats.online === true || stats.active === true || stats.isOnline === true) return true;
     if (stats.connected === true || stats.isConnected === true || stats.hasConnection === true) return true;
-    if (isPositiveNumber(stats.tx) || isPositiveNumber(stats.rx)) return true;
-    if (isPositiveNumber(stats.uplink) || isPositiveNumber(stats.downlink)) return true;
-    if (isPositiveNumber(stats.upload) || isPositiveNumber(stats.download)) return true;
     if (isPositiveNumber(stats.connections) || isPositiveNumber(stats.connectionCount)) return true;
     if (isPositiveNumber(stats.onlineConnections) || isPositiveNumber(stats.sessionCount)) return true;
     if (hasNonEmptyCollection(stats.sessions) || hasNonEmptyCollection(stats.connectionsList)) return true;
     if (hasNonEmptyCollection(stats.connectionIds) || hasNonEmptyCollection(stats.clientIps)) return true;
-    return false;
+
+    // Current cc-agent builds may expose only per-user traffic counters. On prod
+    // those counters can remain present after disconnect, so the sync job passes
+    // requireTrafficChange=true and a previous snapshot: online only if the
+    // counter grows between polls. Unit callers can still treat one positive
+    // traffic sample as online by leaving requireTrafficChange=false.
+    if (requireTrafficChange) return isTrafficGrowing(stats, previousStats);
+    return isPositiveNumber(xrayTrafficTotal(stats));
 }
 
-function extractXrayOnlineUserIds(usersStats = {}) {
+function extractXrayOnlineUserIds(usersStats = {}, options = {}) {
+    const previousUsersStats = options.previousUsersStats || {};
     return Object.entries(usersStats)
-        .filter(([, stats]) => isXrayUserOnline(stats || {}))
+        .filter(([userId, stats]) => isXrayUserOnline(stats || {}, {
+            ...options,
+            previousStats: previousUsersStats[userId] || null,
+        }))
         .map(([userId]) => userId);
 }
 

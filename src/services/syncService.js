@@ -226,6 +226,7 @@ class SyncService {
     constructor() {
         this.isSyncing = false;
         this.lastSyncTime = null;
+        this.xrayUserStatsSnapshots = new Map();
     }
 
     /**
@@ -642,7 +643,13 @@ class SyncService {
             const nodeRx = nodeTraffic.rx || 0;
 
             const userEntries = Object.entries(users);
-            const activeUserIds = extractXrayOnlineUserIds(users);
+            const snapshotKey = node._id?.toString?.() || node.id || node.name;
+            const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
+            const activeUserIds = extractXrayOnlineUserIds(users, {
+                previousUsersStats: previousUsers,
+                requireTrafficChange: true,
+            });
+            this.xrayUserStatsSnapshots.set(snapshotKey, users);
             const bulkOps = [];
             const now = new Date();
 
@@ -669,10 +676,9 @@ class SyncService {
                 this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
             }
 
-            // Online = real active users reported by cc-agent /stats.
-            // Traffic counters may be zero for some live sessions, so prefer
-            // explicit online/active flags when agent provides them and fall
-            // back to non-zero deltas for older agents.
+            // Online = users whose explicit live flags are true or whose traffic
+            // counters increased since the previous poll. A positive-but-unchanged
+            // counter is treated as stale so disconnected clients clear quickly.
             const activeUsers = activeUserIds.length;
             const nodeUpdate = { $set: { onlineUsers: activeUsers } };
             if (nodeTx > 0 || nodeRx > 0) {

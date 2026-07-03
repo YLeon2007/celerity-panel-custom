@@ -65,4 +65,20 @@ assert.strictEqual(normalizeClientOs({ platform: '', userAgent: '' }), 'unknown'
     assert.deepStrictEqual(users.sort(), ['alice', 'bob', 'dave', 'erin', 'frank', 'grace']);
 }
 
+{
+    const users = extractXrayOnlineUserIds({
+        growing: { tx: 10, rx: 15 },
+        unchanged: { tx: 10, rx: 15 },
+        firstSeen: { tx: 1, rx: 1 },
+        explicit: { tx: 0, rx: 0, connected: true },
+    }, {
+        requireTrafficChange: true,
+        previousUsersStats: {
+            growing: { tx: 10, rx: 10 },
+            unchanged: { tx: 10, rx: 15 },
+        },
+    });
+    assert.deepStrictEqual(users.sort(), ['explicit', 'growing'], 'stale repeated traffic counters must not keep users online');
+}
+
 console.log('user client stats tests passed');
