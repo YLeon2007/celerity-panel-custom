@@ -228,6 +228,7 @@ class SyncService {
         this.lastSyncTime = null;
         this.xrayUserStatsSnapshots = new Map();
         this.xrayNodeOnlineUsers = new Map();
+        this.xrayNodeUserLastActive = new Map();
     }
 
     /**
@@ -644,6 +645,7 @@ class SyncService {
             const nodeRx = nodeTraffic.rx || 0;
 
             const userEntries = Object.entries(users);
+            const now = new Date();
             const snapshotKey = node._id?.toString?.() || node.id || node.name;
             const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
             const activeUserIds = extractXrayOnlineUserIds(users, {
@@ -651,8 +653,17 @@ class SyncService {
                 requireTrafficChange: true,
             });
             this.xrayUserStatsSnapshots.set(snapshotKey, users);
+
+            const activityWindowMs = 90 * 1000;
+            const nodeLastActive = this.xrayNodeUserLastActive.get(snapshotKey) || new Map();
+            activeUserIds.forEach(userId => nodeLastActive.set(String(userId), now.getTime()));
+            for (const [userId, lastActiveAt] of nodeLastActive.entries()) {
+                if (now.getTime() - lastActiveAt > activityWindowMs) nodeLastActive.delete(userId);
+            }
+            this.xrayNodeUserLastActive.set(snapshotKey, nodeLastActive);
+            const onlineWindowUserIds = [...nodeLastActive.keys()];
+
             const bulkOps = [];
-            const now = new Date();
 
             for (const [email, traffic] of userEntries) {
                 const tx = traffic.tx || 0;
@@ -677,10 +688,11 @@ class SyncService {
                 this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
             }
 
-            // Online = users whose explicit live flags are true or whose traffic
-            // counters increased since the previous poll. A positive-but-unchanged
-            // counter is treated as stale so disconnected clients clear quickly.
-            const activeUsers = activeUserIds.length;
+            // Online = users with explicit live/growing traffic observed recently.
+            // cc-agent traffic events can be sparse/unstable between polls, so keep
+            // a short per-node activity window to avoid flicker while still clearing
+            // disconnected clients quickly.
+            const activeUsers = onlineWindowUserIds.length;
             const nodeUpdate = { $set: { onlineUsers: activeUsers } };
             if (nodeTx > 0 || nodeRx > 0) {
                 nodeUpdate.$inc = { 'traffic.tx': nodeTx, 'traffic.rx': nodeRx };
@@ -691,7 +703,7 @@ class SyncService {
             if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
                 logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
             }
-            return { onlineUserIds: activeUserIds, nodeKey: snapshotKey, ok: true };
+            return { onlineUserIds: onlineWindowUserIds, nodeKey: snapshotKey, ok: true };
         } catch (error) {
             logger.error(`[Agent Stats] ${node.name} error: ${error.message}`);
             const nodeKey = node._id?.toString?.() || node.id || node.name;
