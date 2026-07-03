@@ -215,9 +215,12 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	snap := ParseSnapshot(rawStats)
 
-	users := make(map[string]map[string]any, len(snap.Users))
+	users := make(map[string]map[string]int64, len(snap.Users))
 	for email, t := range snap.Users {
-		users[email] = map[string]any{"tx": t.Tx, "rx": t.Rx, "online": true}
+		if t.Tx == 0 && t.Rx == 0 {
+			continue
+		}
+		users[email] = map[string]int64{"tx": t.Tx, "rx": t.Rx}
 	}
 
 	jsonOK(w, map[string]any{
