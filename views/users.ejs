@@ -74,10 +74,16 @@
                     </td>
                     <td class="td-user">
                         <div class="user-info">
-                            <code class="user-id"><%= user.userId %></code>
-                            <% if (user.username) { %>
-                            <span class="user-name"><%= user.username %></span>
-                            <% } %>
+                            <div class="user-title-line">
+                                <code class="user-id"><%= user.userId %></code>
+                                <% if (user.username) { %>
+                                <span class="user-name"><%= user.username %></span>
+                                <% } %>
+                                <span class="user-client-meta" title="<%= user.clientStats?.online ? 'Online' : 'Offline' %><% if (user.clientStats?.lastSeenAt) { %>; last seen: <%= new Date(user.clientStats.lastSeenAt).toLocaleString() %><% } %>">
+                                    <span class="client-status-light <%= user.clientStats?.online ? 'online' : 'offline' %>" aria-label="<%= user.clientStats?.online ? 'online' : 'offline' %>"></span>
+                                    <span class="client-os-summary"><%= user.clientStats?.osSummary || '—' %></span>
+                                </span>
+                            </div>
                         </div>
                     </td>
                     <td class="td-status">
@@ -162,6 +168,10 @@
                             <% if (user.username) { %>
                                 <code style="font-size: 11px; color: var(--text-muted);"><%= user.username %></code>
                             <% } %>
+                            <span class="user-client-meta mobile-client-meta" title="<%= user.clientStats?.online ? 'Online' : 'Offline' %><% if (user.clientStats?.lastSeenAt) { %>; last seen: <%= new Date(user.clientStats.lastSeenAt).toLocaleString() %><% } %>">
+                                <span class="client-status-light <%= user.clientStats?.online ? 'online' : 'offline' %>" aria-label="<%= user.clientStats?.online ? 'online' : 'offline' %>"></span>
+                                <span class="client-os-summary"><%= user.clientStats?.osSummary || '—' %></span>
+                            </span>
                         </div>
                     </div>
                     <% if (isExpired) { %>

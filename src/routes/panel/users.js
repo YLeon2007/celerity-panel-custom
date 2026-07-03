@@ -9,6 +9,8 @@ const syncService = require('../../services/syncService');
 const expireScheduler = require('../../services/expireScheduler');
 const hwidDeviceService = require('../../services/hwidDeviceService');
 const webhookService = require('../../services/webhookService');
+const UserDevice = require('../../models/userDeviceModel');
+const { attachClientStatsToUsers } = require('../../utils/userClientStats');
 const { render } = require('./helpers');
 const { getActiveGroups, invalidateGroupsCache, getSettings, invalidateUserCache, invalidateNodesCache } = require('../../utils/helpers');
 const { recomputeEnabled } = require('../../utils/userActivity');
@@ -89,10 +91,23 @@ router.get('/users', async (req, res) => {
                 .lean();
         }
         
-        const [total, groups] = await Promise.all([
+        const [total, groups, settings] = await Promise.all([
             HyUser.countDocuments(filter),
             getActiveGroups(),
+            getSettings(),
         ]);
+
+        const userIds = users.map(user => user.userId).filter(Boolean);
+        const userDevices = userIds.length > 0
+            ? await UserDevice.find({ userId: { $in: userIds } })
+                .select('userId platform deviceModel userAgent lastSeenAt')
+                .sort({ lastSeenAt: -1 })
+                .lean()
+            : [];
+        users = attachClientStatsToUsers(users, userDevices, {
+            onlineTtlSeconds: settings?.cache?.onlineSessionsTTL || 10,
+            lang: res.locals.lang || 'ru',
+        });
         
         render(res, 'users', {
             title: res.locals.locales.users.title,
