@@ -1403,7 +1403,7 @@ if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
 else
     BIN="cc-agent-linux-amd64"
 fi
-URL="https://github.com/ClickDevTech/CELERITY-panel/releases/latest/download/$BIN"
+URL="https://github.com/YLeon2007/celerity-panel-custom/releases/latest/download/$BIN"
 echo "Downloading $URL ..."
 curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent
 if [ ! -s /usr/local/bin/cc-agent ]; then

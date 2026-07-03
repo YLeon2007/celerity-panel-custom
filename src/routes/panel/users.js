@@ -107,7 +107,6 @@ router.get('/users', async (req, res) => {
         const xrayOnlineUsers = await cache.getXrayOnlineUsers();
         users = attachClientStatsToUsers(users, userDevices, {
             onlineUserIds: Object.keys(xrayOnlineUsers || {}),
-            freshDeviceOnlineMs: 30 * 60 * 1000,
             lang: res.locals.lang || 'ru',
         });
         

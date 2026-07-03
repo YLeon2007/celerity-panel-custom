@@ -880,7 +880,7 @@ function setupCronJobs() {
     // Collect live traffic/online stats frequently so per-user VPN lamps do not
     // stay stale for minutes after a disconnect. collectAllStats() owns the
     // short-lived xray:online:users cache; history snapshots stay on 5m/hourly jobs.
-    cron.schedule('*/30 * * * * *', async () => {
+    cron.schedule('*/15 * * * * *', async () => {
         try {
             logger.debug('[Cron] Collecting live stats');
             await syncService.collectAllStats();

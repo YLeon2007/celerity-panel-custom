@@ -47,6 +47,11 @@ func main() {
 	persister := NewConfigPersister(xrayConfigPath, cfg.Inbounds, userStore)
 	go persister.run()
 
+	onlineTracker := NewOnlineTracker(defaultOnlineTimeout)
+	watchCtx, stopOnlineWatcher := context.WithCancel(context.Background())
+	defer stopOnlineWatcher()
+	go onlineTracker.RunJournalWatcher(watchCtx)
+
 	// Startup reconciliation. Make the on-disk config reflect the current users
 	// (durability), then heal the running Xray only if the disk was actually
 	// stale and no panel /sync arrived to fix the runtime during the grace window.
@@ -110,10 +115,11 @@ func main() {
 	}()
 
 	api := &API{
-		cfg:        cfg,
-		userStore:  userStore,
-		xrayClient: xrayClient,
-		persister:  persister,
+		cfg:           cfg,
+		userStore:     userStore,
+		xrayClient:    xrayClient,
+		persister:     persister,
+		onlineTracker: onlineTracker,
 	}
 
 	mux := http.NewServeMux()

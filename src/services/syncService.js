@@ -27,6 +27,7 @@ const webhook = require('./webhookService');
 const { extractXrayOnlineUserIds } = require('../utils/userClientStats');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
+const { extractAgentOnlineUserIds } = require('../utils/agentOnlineState');
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -644,17 +645,30 @@ class SyncService {
             const nodeTx = nodeTraffic.tx || 0;
             const nodeRx = nodeTraffic.rx || 0;
 
+            let agentOnlineUserIds = [];
+            let agentOnlineAvailable = false;
+            try {
+                const onlineResponse = await this._agentRequest(node, 'GET', '/online');
+                agentOnlineUserIds = extractAgentOnlineUserIds(onlineResponse.data || {});
+                agentOnlineAvailable = true;
+            } catch (onlineError) {
+                logger.debug(`[Agent Online] ${node.name}: /online unavailable (${onlineError.message}), falling back to traffic deltas`);
+            }
+
             const userEntries = Object.entries(users);
             const now = new Date();
             const snapshotKey = node._id?.toString?.() || node.id || node.name;
             const previousUsers = this.xrayUserStatsSnapshots.get(snapshotKey) || {};
-            const activeUserIds = extractXrayOnlineUserIds(users, {
+            const trafficActiveUserIds = extractXrayOnlineUserIds(users, {
                 previousUsersStats: previousUsers,
                 requireTrafficChange: true,
             });
+            const activeUserIds = agentOnlineAvailable
+                ? agentOnlineUserIds
+                : trafficActiveUserIds;
             this.xrayUserStatsSnapshots.set(snapshotKey, users);
 
-            const activityWindowMs = 90 * 1000;
+            const activityWindowMs = agentOnlineAvailable ? 45 * 1000 : 90 * 1000;
             const nodeLastActive = this.xrayNodeUserLastActive.get(snapshotKey) || new Map();
             activeUserIds.forEach(userId => nodeLastActive.set(String(userId), now.getTime()));
             for (const [userId, lastActiveAt] of nodeLastActive.entries()) {

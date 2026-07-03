@@ -398,7 +398,11 @@ CC Agent is a lightweight HTTP service on the node for managing Xray users witho
 
 Agent is installed automatically during Xray node auto-setup.
 
-By default, auto-setup downloads `cc-agent` from the official upstream C³ CELERITY release (`ClickDevTech/CELERITY-panel`). This is intentional: the agent is treated as an upstream-compatible runtime component, so this custom repository does not need to publish new agent binaries unless we actually change the agent protocol or behavior. If custom agent changes become necessary later, publish the binaries from this repository and update `src/services/nodeSetup.js` accordingly.
+Auto-setup downloads `cc-agent` from this custom repository's GitHub Releases (`YLeon2007/celerity-panel-custom`). The custom agent stays upstream-compatible for `/stats`, `/sync`, `/users`, and `/restart`, and additionally exposes `GET /online` with log-derived per-user VPN state:
+
+- `online=true` appears as soon as Xray logs `accepted ... email: <userId>`;
+- users turn offline after 45 seconds without new accepted events;
+- the panel polls live state every 15 seconds and falls back to traffic-delta detection only when an old agent has no `/online` endpoint.
 
 ---
 

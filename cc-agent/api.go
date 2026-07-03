@@ -13,10 +13,11 @@ import (
 
 // API holds dependencies for the HTTP handler layer
 type API struct {
-	cfg        *Config
-	userStore  *UserStore
-	xrayClient *XrayClient
-	persister  *ConfigPersister
+	cfg           *Config
+	userStore     *UserStore
+	xrayClient    *XrayClient
+	persister     *ConfigPersister
+	onlineTracker *OnlineTracker
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
@@ -27,6 +28,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /users", a.auth(a.handleAddUser))
 	mux.HandleFunc("DELETE /users/{email}", a.auth(a.handleRemoveUser))
 	mux.HandleFunc("GET /stats", a.auth(a.handleStats))
+	mux.HandleFunc("GET /online", a.auth(a.handleOnline))
 	mux.HandleFunc("POST /restart", a.auth(a.handleRestart))
 }
 
@@ -226,6 +228,19 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{
 		"users": users,
 		"node":  map[string]int64{"tx": snap.Node.Tx, "rx": snap.Node.Rx},
+	})
+}
+
+// GET /online — returns log-derived per-user online state.
+func (a *API) handleOnline(w http.ResponseWriter, r *http.Request) {
+	users := map[string]OnlineUserState{}
+	if a.onlineTracker != nil {
+		users = a.onlineTracker.Snapshot(time.Now())
+	}
+	jsonOK(w, map[string]any{
+		"users":     users,
+		"updatedAt": time.Now().UTC(),
+		"timeoutMs": int(defaultOnlineTimeout / time.Millisecond),
 	})
 }
 
