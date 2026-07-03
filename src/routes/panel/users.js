@@ -9,6 +9,7 @@ const syncService = require('../../services/syncService');
 const expireScheduler = require('../../services/expireScheduler');
 const hwidDeviceService = require('../../services/hwidDeviceService');
 const webhookService = require('../../services/webhookService');
+const cache = require('../../services/cacheService');
 const UserDevice = require('../../models/userDeviceModel');
 const { attachClientStatsToUsers } = require('../../utils/userClientStats');
 const { render } = require('./helpers');
@@ -91,10 +92,9 @@ router.get('/users', async (req, res) => {
                 .lean();
         }
         
-        const [total, groups, settings] = await Promise.all([
+        const [total, groups] = await Promise.all([
             HyUser.countDocuments(filter),
             getActiveGroups(),
-            getSettings(),
         ]);
 
         const userIds = users.map(user => user.userId).filter(Boolean);
@@ -104,8 +104,9 @@ router.get('/users', async (req, res) => {
                 .sort({ lastSeenAt: -1 })
                 .lean()
             : [];
+        const xrayOnlineUsers = await cache.getXrayOnlineUsers();
         users = attachClientStatsToUsers(users, userDevices, {
-            onlineTtlSeconds: settings?.cache?.onlineSessionsTTL || 10,
+            onlineUserIds: Object.keys(xrayOnlineUsers || {}),
             lang: res.locals.lang || 'ru',
         });
         

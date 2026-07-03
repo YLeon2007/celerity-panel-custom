@@ -24,6 +24,7 @@ const axios = require('axios');
 const https = require('https');
 const config = require('../../config');
 const webhook = require('./webhookService');
+const { extractXrayOnlineUserIds } = require('../utils/userClientStats');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
 
@@ -641,6 +642,7 @@ class SyncService {
             const nodeRx = nodeTraffic.rx || 0;
 
             const userEntries = Object.entries(users);
+            const activeUserIds = extractXrayOnlineUserIds(users);
             const bulkOps = [];
             const now = new Date();
 
@@ -667,9 +669,11 @@ class SyncService {
                 this.enforceTrafficLimit(userEntries.map(([email]) => email)).catch(() => {});
             }
 
-            // Online = users with non-zero traffic in the last poll interval.
-            // Always update (even to 0) so the counter falls back after idle intervals.
-            const activeUsers = bulkOps.length;
+            // Online = real active users reported by cc-agent /stats.
+            // Traffic counters may be zero for some live sessions, so prefer
+            // explicit online/active flags when agent provides them and fall
+            // back to non-zero deltas for older agents.
+            const activeUsers = activeUserIds.length;
             const nodeUpdate = { $set: { onlineUsers: activeUsers } };
             if (nodeTx > 0 || nodeRx > 0) {
                 nodeUpdate.$inc = { 'traffic.tx': nodeTx, 'traffic.rx': nodeRx };
@@ -677,11 +681,13 @@ class SyncService {
             }
             await HyNode.updateOne({ _id: node._id }, nodeUpdate);
 
-            if (nodeTx > 0 || nodeRx > 0) {
+            if (nodeTx > 0 || nodeRx > 0 || activeUsers > 0) {
                 logger.info(`[Agent Stats] ${node.name}: ${activeUsers} online, node ↑${(nodeTx / 1024 / 1024).toFixed(1)}MB ↓${(nodeRx / 1024 / 1024).toFixed(1)}MB`);
             }
+            return { onlineUserIds: activeUserIds };
         } catch (error) {
             logger.error(`[Agent Stats] ${node.name} error: ${error.message}`);
+            return { onlineUserIds: [] };
         }
     }
 
@@ -1113,18 +1119,25 @@ class SyncService {
      */
     async collectAllStats() {
         const nodes = await HyNode.find({ active: true });
+        const xrayOnlineUserIds = new Set();
         
         // Parallel processing with concurrency limit
         const CONCURRENCY = 5;
         for (let i = 0; i < nodes.length; i += CONCURRENCY) {
             const batch = nodes.slice(i, i + CONCURRENCY);
-            await Promise.allSettled(
+            const results = await Promise.allSettled(
                 batch.flatMap(node => [
                     this.collectTrafficStats(node),
                     this.getOnlineUsers(node)
                 ])
             );
+            results.forEach((result) => {
+                if (result.status !== 'fulfilled') return;
+                const ids = result.value?.onlineUserIds;
+                if (Array.isArray(ids)) ids.forEach(userId => xrayOnlineUserIds.add(userId));
+            });
         }
+        await cache.setXrayOnlineUsers([...xrayOnlineUserIds], cache.ttl.TRAFFIC_STATS);
         
         // Update last stats collection time
         this.lastSyncTime = new Date();

@@ -34,18 +34,40 @@ function uniqPreserveOrder(values) {
     return out;
 }
 
+function toOnlineUserIdSet(value) {
+    if (!value) return new Set();
+    if (value instanceof Set) return value;
+    if (Array.isArray(value)) return new Set(value.map(String));
+    return new Set(Object.keys(value).filter(userId => value[userId]));
+}
+
+function isPositiveNumber(value) {
+    const n = Number(value || 0);
+    return Number.isFinite(n) && n > 0;
+}
+
+function isXrayUserOnline(stats = {}) {
+    if (stats.online === true || stats.active === true || stats.isOnline === true) return true;
+    if (isPositiveNumber(stats.tx) || isPositiveNumber(stats.rx)) return true;
+    if (isPositiveNumber(stats.uplink) || isPositiveNumber(stats.downlink)) return true;
+    if (isPositiveNumber(stats.upload) || isPositiveNumber(stats.download)) return true;
+    return false;
+}
+
+function extractXrayOnlineUserIds(usersStats = {}) {
+    return Object.entries(usersStats)
+        .filter(([, stats]) => isXrayUserOnline(stats || {}))
+        .map(([userId]) => userId);
+}
+
 function buildClientStats(devices = [], options = {}) {
-    const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
-    const onlineTtlSeconds = Math.max(1, Number(options.onlineTtlSeconds || 10));
     const lang = options.lang || 'ru';
-    const cutoff = now.getTime() - onlineTtlSeconds * 1000;
+    const onlineUserIds = toOnlineUserIdSet(options.onlineUserIds);
+    const userId = options.userId ? String(options.userId) : '';
 
     const sorted = [...devices].sort((a, b) => new Date(b.lastSeenAt || 0) - new Date(a.lastSeenAt || 0));
     const osList = uniqPreserveOrder(sorted.map(normalizeClientOs));
-    const onlineDevices = sorted.filter((device) => {
-        const ts = new Date(device.lastSeenAt || 0).getTime();
-        return Number.isFinite(ts) && ts >= cutoff;
-    });
+    const online = userId ? onlineUserIds.has(userId) : false;
 
     let osSummary = '—';
     if (osList.length === 1 && sorted.length <= 1) {
@@ -55,9 +77,9 @@ function buildClientStats(devices = [], options = {}) {
     }
 
     return {
-        online: onlineDevices.length > 0,
+        online,
         deviceCount: sorted.length,
-        onlineDeviceCount: onlineDevices.length,
+        onlineDeviceCount: online ? 1 : 0,
         osList,
         osSummary,
         lastSeenAt: sorted[0]?.lastSeenAt || null,
@@ -74,7 +96,7 @@ function attachClientStatsToUsers(users = [], devices = [], options = {}) {
 
     return users.map((user) => {
         const userId = user.userId;
-        const stats = buildClientStats(byUser.get(userId) || [], options);
+        const stats = buildClientStats(byUser.get(userId) || [], { ...options, userId });
         if (user && typeof user.toObject === 'function') {
             return { ...user.toObject(), clientStats: stats };
         }
@@ -86,4 +108,5 @@ module.exports = {
     normalizeClientOs,
     buildClientStats,
     attachClientStatsToUsers,
+    extractXrayOnlineUserIds,
 };

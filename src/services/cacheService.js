@@ -36,6 +36,7 @@ const PREFIX = {
     NODES: 'nodes:active',   // nodes:active
     SETTINGS: 'settings',    // settings
     TRAFFIC_STATS: 'traffic:stats', // Total traffic stats
+    XRAY_ONLINE_USERS: 'xray:online:users', // { userId: lastActiveIso }
     GROUPS: 'groups:active', // Active groups
     DASHBOARD_COUNTS: 'dashboard:counts', // Dashboard counters
 };
@@ -44,6 +45,8 @@ class CacheService {
     constructor() {
         this.redis = null;
         this.connected = false;
+        this.xrayOnlineUsersFallback = new Map();
+        this.xrayOnlineUsersFallbackExpiresAt = 0;
         // Dynamic TTL from panel settings
         this.ttl = { ...DEFAULT_TTL };
     }
@@ -543,6 +546,52 @@ class CacheService {
         } catch (err) {
             logger.error(`[Cache] setTrafficStats error: ${err.message}`);
         }
+    }
+
+    /**
+     * Save real per-user VPN online state reported by Xray cc-agent /stats.
+     * Value shape: { [userId]: ISO lastActiveAt }
+     */
+    async setXrayOnlineUsers(userIds = [], ttlSeconds = null, now = new Date()) {
+        const ttl = Math.max(1, Number(ttlSeconds || this.ttl.TRAFFIC_STATS || DEFAULT_TTL.TRAFFIC_STATS));
+        const lastActiveAt = (now instanceof Date ? now : new Date(now)).toISOString();
+        const uniqueUserIds = [...new Set((userIds || []).map(String).filter(Boolean))];
+        const payload = Object.fromEntries(uniqueUserIds.map(userId => [userId, lastActiveAt]));
+
+        this.xrayOnlineUsersFallback = new Map(Object.entries(payload));
+        this.xrayOnlineUsersFallbackExpiresAt = Date.now() + ttl * 1000;
+        const expiresAt = this.xrayOnlineUsersFallbackExpiresAt;
+        setTimeout(() => {
+            if (this.xrayOnlineUsersFallbackExpiresAt === expiresAt) this.xrayOnlineUsersFallback.clear();
+        }, ttl * 1000).unref?.();
+
+        if (!this.isConnected()) return;
+
+        try {
+            await this.redis.setex(PREFIX.XRAY_ONLINE_USERS, ttl, JSON.stringify(payload));
+            logger.debug(`[Cache] SET xray online users: ${uniqueUserIds.length}`);
+        } catch (err) {
+            logger.error(`[Cache] setXrayOnlineUsers error: ${err.message}`);
+        }
+    }
+
+    /**
+     * Read real per-user VPN online state reported by Xray cc-agent /stats.
+     */
+    async getXrayOnlineUsers() {
+        if (this.isConnected()) {
+            try {
+                const data = await this.redis.get(PREFIX.XRAY_ONLINE_USERS);
+                if (data) return JSON.parse(data);
+            } catch (err) {
+                logger.error(`[Cache] getXrayOnlineUsers error: ${err.message}`);
+            }
+        }
+
+        if (this.xrayOnlineUsersFallbackExpiresAt && Date.now() > this.xrayOnlineUsersFallbackExpiresAt) {
+            this.xrayOnlineUsersFallback.clear();
+        }
+        return Object.fromEntries(this.xrayOnlineUsersFallback.entries());
     }
 
     /**
