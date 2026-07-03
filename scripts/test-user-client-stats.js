@@ -58,8 +58,20 @@ assert.strictEqual(normalizeClientOs({ platform: '', userAgent: '' }), 'unknown'
         bob: { tx: 0, rx: 12 },
         carol: { tx: 0, rx: 0, active: false },
         dave: { uplink: 1, downlink: 0 },
+        erin: { connected: true },
+        frank: { connectionCount: 2 },
+        grace: { sessions: [{ id: 's1' }] },
     });
-    assert.deepStrictEqual(users.sort(), ['alice', 'bob', 'dave']);
+    assert.deepStrictEqual(users.sort(), ['alice', 'erin', 'frank', 'grace']);
+}
+
+{
+    const users = extractXrayOnlineUserIds({
+        staleRx: { tx: 0, rx: 2048 },
+        staleUplink: { uplink: 4096, downlink: 0 },
+        staleUpload: { upload: 1, download: 0 },
+    });
+    assert.deepStrictEqual(users, [], 'traffic counters alone must not keep disconnected users online');
 }
 
 console.log('user client stats tests passed');

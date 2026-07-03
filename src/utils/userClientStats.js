@@ -46,11 +46,23 @@ function isPositiveNumber(value) {
     return Number.isFinite(n) && n > 0;
 }
 
+function hasNonEmptyCollection(value) {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return Object.keys(value).length > 0;
+    return false;
+}
+
 function isXrayUserOnline(stats = {}) {
+    // Do not infer live VPN presence from tx/rx/uplink/downlink counters: cc-agent
+    // may report cumulative or recently flushed traffic after the client disconnects,
+    // which keeps the UI green for offline users. Only explicit connection/live
+    // signals should feed the short-lived online lamp.
     if (stats.online === true || stats.active === true || stats.isOnline === true) return true;
-    if (isPositiveNumber(stats.tx) || isPositiveNumber(stats.rx)) return true;
-    if (isPositiveNumber(stats.uplink) || isPositiveNumber(stats.downlink)) return true;
-    if (isPositiveNumber(stats.upload) || isPositiveNumber(stats.download)) return true;
+    if (stats.connected === true || stats.isConnected === true || stats.hasConnection === true) return true;
+    if (isPositiveNumber(stats.connections) || isPositiveNumber(stats.connectionCount)) return true;
+    if (isPositiveNumber(stats.onlineConnections) || isPositiveNumber(stats.sessionCount)) return true;
+    if (hasNonEmptyCollection(stats.sessions) || hasNonEmptyCollection(stats.connectionsList)) return true;
+    if (hasNonEmptyCollection(stats.connectionIds) || hasNonEmptyCollection(stats.clientIps)) return true;
     return false;
 }
 
