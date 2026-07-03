@@ -49,6 +49,9 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         upToDate: document.documentElement.lang === 'ru' ? 'Обновлений нет' : 'Up to date',
         failed: document.documentElement.lang === 'ru' ? 'Ошибка проверки' : 'Check failed',
         applying: document.documentElement.lang === 'ru' ? 'Обновление запущено...' : 'Update started...',
+        applied: document.documentElement.lang === 'ru' ? 'Обновление завершено успешно.' : 'Update completed successfully.',
+        applyFailed: document.documentElement.lang === 'ru' ? 'Обновление завершилось ошибкой.' : 'Update failed.',
+        polling: document.documentElement.lang === 'ru' ? 'Жду лог выполнения...' : 'Waiting for progress log...',
         noChangelog: document.documentElement.lang === 'ru' ? 'Changelog пуст или недоступен.' : 'Changelog is empty or unavailable.',
         noUpdateDetails: document.documentElement.lang === 'ru'
             ? 'Установлена последняя версия. Обновление не требуется.'
@@ -109,9 +112,50 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         applyBtn.style.display = updateAvailable ? '' : 'none';
         applyBtn.disabled = !updateAvailable || Boolean(status.apply?.running);
         applyBtn.textContent = i18n.apply;
-        if (logBox && status.apply?.log) {
-            logBox.hidden = false;
-            logBox.textContent = status.apply.log;
+        if (status.apply) {
+            renderApplyState(status.apply);
+        }
+    }
+
+    function scrollLogToBottom() {
+        if (logBox) logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function renderApplyState(apply) {
+        if (!logBox || !apply) return;
+        logBox.hidden = false;
+        const lines = [];
+        if (apply.startedAt) lines.push(`[ui] started: ${apply.startedAt}`);
+        if (apply.log) lines.push(apply.log.trimEnd());
+        else if (apply.running) lines.push(i18n.polling);
+        if (apply.finishedAt) lines.push(`[ui] finished: ${apply.finishedAt}`);
+        if (apply.success === true) lines.push(`[ui] ${i18n.applied}`);
+        if (apply.success === false) lines.push(`[ui] ${i18n.applyFailed} ${apply.error || ''}`.trim());
+        if (apply.backupDir) lines.push(`[ui] backup: ${apply.backupDir}`);
+        if (apply.rollbackPath) lines.push(`[ui] rollback: ${apply.rollbackPath}`);
+        logBox.textContent = lines.filter(Boolean).join('\n');
+        scrollLogToBottom();
+    }
+
+    async function pollApplyUntilDone() {
+        for (;;) {
+            const status = await requestJson('/panel/update/status', { method: 'GET' });
+            currentStatus = status;
+            renderApplyState(status.apply);
+
+            if (!status.apply?.running) {
+                applyBtn.disabled = false;
+                applyBtn.textContent = status.apply?.success === false ? i18n.applyFailed : i18n.applied;
+                if (status.apply?.success === false) {
+                    window.showToast(status.apply.error || i18n.applyFailed, 'error');
+                } else {
+                    setState('idle');
+                    window.showToast(i18n.applied, 'success');
+                }
+                return status;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 2000));
         }
     }
 
@@ -166,14 +210,12 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         applyBtn.textContent = i18n.applying;
         try {
             const result = await requestJson('/panel/update/apply', { method: 'POST' });
-            if (logBox) {
-                logBox.hidden = false;
-                logBox.textContent = result.apply?.log || i18n.applying;
-            }
-            window.showToast(i18n.applying, 'success');
+            renderApplyState(result.apply || { running: true, log: i18n.applying });
+            await pollApplyUntilDone();
         } catch (error) {
             window.showToast(error.message, 'error');
             applyBtn.disabled = false;
+            applyBtn.textContent = i18n.apply;
         }
     });
 
