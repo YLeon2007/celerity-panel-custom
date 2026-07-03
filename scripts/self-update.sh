@@ -83,8 +83,29 @@ detect_compose_project() {
   printf 'hysteria-panel'
 }
 
+detect_docker_repo_path() {
+  if [ -n "${SELF_UPDATE_DOCKER_REPO_PATH:-}" ]; then
+    printf '%s' "$SELF_UPDATE_DOCKER_REPO_PATH"
+    return 0
+  fi
+
+  local name source
+  for name in hysteria-backend backend; do
+    source="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "'"$REPO_PATH"'" }}{{ .Source }}{{ end }}{{ end }}' "$name" 2>/dev/null || true)"
+    if [ -n "$source" ] && [ "$source" != "<no value>" ]; then
+      printf '%s' "$source"
+      return 0
+    fi
+  done
+
+  # Host-side/manual execution usually already uses the real host path.
+  printf '%s' "$REPO_PATH"
+}
+
 COMPOSE_PROJECT="$(detect_compose_project)"
+DOCKER_REPO_PATH="$(detect_docker_repo_path)"
 log "Docker Compose project: $COMPOSE_PROJECT"
+log "Docker host repo path: $DOCKER_REPO_PATH"
 
 if docker compose version >/dev/null 2>&1; then
   COMPOSE=(docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml)
@@ -165,8 +186,28 @@ log "Fast-forwarding from $CURRENT_SHA to $REMOTE/$BRANCH"
 git pull --ff-only "$REMOTE" "$BRANCH"
 
 log "Rebuilding containers"
-"${COMPOSE[@]}" up -d --build
+if [ "${SELF_UPDATE_DETACHED_HELPER:-1}" = "1" ]; then
+  HELPER_NAME="celerity-self-update-${TIMESTAMP}"
+  HELPER_IMAGE="${SELF_UPDATE_HELPER_IMAGE:-alpine:3.20}"
+  HELPER_LOG="$BACKUP_DIR/helper.log"
+  : > "$HELPER_LOG"
+  log "Starting detached compose helper: $HELPER_NAME"
+  docker run -d --rm \
+    --name "$HELPER_NAME" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$DOCKER_REPO_PATH:$REPO_PATH" \
+    -w "$REPO_PATH" \
+    -e COMPOSE_PROJECT="$COMPOSE_PROJECT" \
+    -e REPO_PATH="$REPO_PATH" \
+    "$HELPER_IMAGE" \
+    sh -lc 'set -Eeuo pipefail; apk add --no-cache docker-cli docker-cli-compose >>"$REPO_PATH/backups/self-update/'"$TIMESTAMP"'/helper.log" 2>&1; cd "$REPO_PATH"; docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml up -d --build >>"$REPO_PATH/backups/self-update/'"$TIMESTAMP"'/helper.log" 2>&1'
+  log "Detached helper launched; backend container may restart now"
+  log "HELPER_NAME=$HELPER_NAME"
+  log "HELPER_LOG=$HELPER_LOG"
+else
+  "${COMPOSE[@]}" up -d --build
+fi
 
-log "Self-update completed"
+log "Self-update handoff completed"
 log "BACKUP_DIR=$BACKUP_DIR"
 log "ROLLBACK_PATH=$ROLLBACK_PATH"

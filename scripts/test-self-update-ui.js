@@ -31,6 +31,19 @@ assert(
     'self-update script must pass a stable project name to docker compose/docker-compose'
 );
 assert(
+    selfUpdate.includes('SELF_UPDATE_DETACHED_HELPER:-1')
+        && selfUpdate.includes('docker run -d --rm')
+        && selfUpdate.includes('-v /var/run/docker.sock:/var/run/docker.sock')
+        && selfUpdate.includes('Detached helper launched'),
+    'self-update script must hand off rebuild to a detached helper by default so backend recreation does not kill the update'
+);
+assert(
+    selfUpdate.includes('SELF_UPDATE_HELPER_IMAGE')
+        && selfUpdate.includes('docker-cli-compose')
+        && selfUpdate.includes('docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml up -d --build'),
+    'detached helper must run host-side docker compose with the existing project name'
+);
+assert(
     selfUpdate.includes("printf 'hysteria-panel'"),
     'self-update script must have a stable fallback project name'
 );
