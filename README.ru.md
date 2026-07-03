@@ -155,6 +155,7 @@ MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
 - 🚫 **Фильтрация трафика (ACL)** — блокировка рекламы, доменов, IP; маршрутизация через прокси
 - 🧩 **Расширенный конфиг Hysteria** — опциональные параметры ACME challenge, режимы masquerade, resolver, speed test, sniffing и настройка QUIC
 - 📊 **Статистика** — онлайн, трафик, состояние серверов
+- 🟢 **Индикаторы клиентов** — лампочка VPN-активности по пользователям, количество устройств и OS summary из HAPP/HWID metadata
 - 📱 **Подписки** — автоформаты для Clash, Sing-box, Shadowrocket, Hiddify
 - 🍎 **HAPP iOS routing** — отдельный iOS-профиль split tunneling с изоляцией cache от default HAPP routing
 - 🔄 **Бэкап/Восстановление** — автоматические бэкапы с поддержкой S3

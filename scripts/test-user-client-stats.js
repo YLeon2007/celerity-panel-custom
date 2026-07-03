@@ -36,7 +36,7 @@ assert.strictEqual(normalizeClientOs({ platform: '', userAgent: '' }), 'unknown'
 
     assert.strictEqual(stats.online, false, 'fresh UserDevice heartbeat must not imply real VPN online');
     assert.strictEqual(stats.onlineDeviceCount, 0);
-    assert.strictEqual(stats.osSummary, 'windows');
+    assert.strictEqual(stats.osSummary, '1 устройство windows');
 }
 
 {

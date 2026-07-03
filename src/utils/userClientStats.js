@@ -70,9 +70,7 @@ function buildClientStats(devices = [], options = {}) {
     const online = userId ? onlineUserIds.has(userId) : false;
 
     let osSummary = '—';
-    if (osList.length === 1 && sorted.length <= 1) {
-        osSummary = osList[0];
-    } else if (sorted.length > 0) {
+    if (sorted.length > 0) {
         osSummary = `${sorted.length} ${deviceWord(sorted.length, lang)} ${osList.join('+')}`;
     }
 
