@@ -49,7 +49,7 @@ assert.strictEqual(normalizeClientOs({ platform: '', userAgent: '' }), 'unknown'
     assert.strictEqual(result[0].clientStats.online, false, 'OS device data alone should not mark online');
     assert.strictEqual(result[0].clientStats.osSummary, '2 устройства ios+android');
     assert.strictEqual(result[1].clientStats.online, true, 'online can come from Xray stats even without HWID device rows');
-    assert.strictEqual(result[1].clientStats.osSummary, '—');
+    assert.strictEqual(result[1].clientStats.osSummary, '0 устройств unknown');
 }
 
 {

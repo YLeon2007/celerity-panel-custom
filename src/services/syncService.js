@@ -1137,7 +1137,7 @@ class SyncService {
                 if (Array.isArray(ids)) ids.forEach(userId => xrayOnlineUserIds.add(userId));
             });
         }
-        await cache.setXrayOnlineUsers([...xrayOnlineUserIds], cache.ttl.TRAFFIC_STATS);
+        await cache.setXrayOnlineUsers([...xrayOnlineUserIds], Math.max(45, cache.ttl.ONLINE_SESSIONS || 10));
         
         // Update last stats collection time
         this.lastSyncTime = new Date();

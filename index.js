@@ -877,16 +877,24 @@ function setupWebSocketServer(server) {
 }
 
 function setupCronJobs() {
-    // Collect stats every 5 minutes
+    // Collect live traffic/online stats frequently so per-user VPN lamps do not
+    // stay stale for minutes after a disconnect. collectAllStats() owns the
+    // short-lived xray:online:users cache; history snapshots stay on 5m/hourly jobs.
+    cron.schedule('*/30 * * * * *', async () => {
+        try {
+            logger.debug('[Cron] Collecting live stats');
+            await syncService.collectAllStats();
+        } catch (error) {
+            logger.error(`[Cron] Live stats collection failed: ${error.message}`);
+        }
+    });
+
+    // Save stats snapshot for charts every 5 minutes
     cron.schedule('*/5 * * * *', async () => {
         try {
-            logger.debug('[Cron] Collecting stats');
-            await syncService.collectAllStats();
-            
-            // Save stats snapshot for charts
             await statsService.saveHourlySnapshot();
         } catch (error) {
-            logger.error(`[Cron] Stats collection failed: ${error.message}`);
+            logger.error(`[Cron] Stats snapshot failed: ${error.message}`);
         }
     });
     

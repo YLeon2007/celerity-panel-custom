@@ -158,7 +158,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 - 🚫 **Traffic Filtering (ACL)** — Block ads, domains, IPs; route through custom proxies
 - 🧩 **Advanced Hysteria Config** — optional ACME challenge options, masquerade modes, resolver, speed test, sniffing, and QUIC tuning
 - 📊 **Statistics** — Online users, traffic, server status
-- 🟢 **Client indicators** — per-user VPN activity lamp plus device count and OS summary from HAPP/HWID metadata
+- 🟢 **Client indicators** — per-user VPN activity lamp with short-lived Xray telemetry, plus device count and OS summary from HAPP/HWID metadata
 - 📱 **Subscriptions** — Auto-format for Clash, Sing-box, Shadowrocket, Hiddify
 - 🍎 **HAPP iOS routing** — separate iOS split-tunneling profile with cache isolation from default HAPP routing
 - 🔄 **Backup/Restore** — Automatic backups with S3 support

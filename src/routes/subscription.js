@@ -2681,6 +2681,23 @@ async function runHwidSubscriptionGate(req, res, user, settings, format) {
     const limit = hwidDeviceService.effectiveDeviceLimit(user);
     const extra = {};
 
+    const h = extractHwidHeaders(req);
+
+    // Device metadata is useful for the users UI even when HWID limiting is
+    // disabled or unlimited. Record it opportunistically when the client sends
+    // x-hwid; enforcement remains controlled by mode/limit below.
+    if (h && (mode === 'off' || limit === 0 || limit < 0)) {
+        await hwidDeviceService.checkAndUpsert({
+            userId: user.userId,
+            headers: h,
+            limit: Math.max(0, limit),
+            enforce: false,
+        });
+        if (mode === 'off' || limit === 0 || limit < 0) {
+            return { extraHeaders: extra, aborted: false };
+        }
+    }
+
     if (mode === 'off' || limit === 0) {
         return { extraHeaders: extra, aborted: false };
     }
@@ -2695,7 +2712,6 @@ async function runHwidSubscriptionGate(req, res, user, settings, format) {
     const hwidCfg = settings?.subscription?.happ?.hwid || {};
     const isHapp = /happ/i.test(userAgent);
 
-    const h = extractHwidHeaders(req);
     if (!h) {
         if (mode === 'strict') {
             const oh = { ...extra, 'x-hwid-not-supported': 'true' };

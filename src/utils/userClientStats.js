@@ -69,7 +69,7 @@ function buildClientStats(devices = [], options = {}) {
     const osList = uniqPreserveOrder(sorted.map(normalizeClientOs));
     const online = userId ? onlineUserIds.has(userId) : false;
 
-    let osSummary = '—';
+    let osSummary = `0 ${deviceWord(0, lang)} unknown`;
     if (sorted.length > 0) {
         osSummary = `${sorted.length} ${deviceWord(sorted.length, lang)} ${osList.join('+')}`;
     }
