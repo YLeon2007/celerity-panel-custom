@@ -5,8 +5,8 @@
 [English](README.md) | **[Русский](README.ru.md)**
 
 [License: MIT](LICENSE)
-[Docker Pulls](https://hub.docker.com/r/clickdevtech/hysteria-panel)
-[Docker Image Size](https://hub.docker.com/r/clickdevtech/hysteria-panel)
+[Deploy из исходников](docs/custom-deploy-ru.md)
+[Self-update панели](docs/safe-update.ru.md)
 [Node.js](package.json)
 [Hysteria](https://v2.hysteria.network/)
 [Xray](https://xtls.github.io/)
@@ -116,53 +116,30 @@ MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
 
 ---
 
-## 🐳 Dokploy (разработка и релиз)
+## 🐳 Dokploy / Traefik (опционально, не основной путь)
 
-Используйте `docker-compose.dokploy.yml` при деплое через Dokploy с Traefik.
+Основной supported production-путь для этого custom-репозитория — source-based installer выше (`scripts/install.sh`) и `docker-compose.yml` с Caddy. Он сохраняет git checkout на сервере в `/opt/hysteria-panel`, поэтому кнопка self-update в панели может подтянуть этот репозиторий, создать backup, пересобрать контейнеры и сгенерировать rollback-скрипт.
 
-### Режим разработки (сборка из текущей ветки)
+`docker-compose.dokploy.yml` оставлен только для операторов, которые осознанно деплоят через Dokploy/Traefik и понимают ограничения:
 
-1. В Dokploy создайте проект из этого репозитория/ветки.
-2. Укажите путь к compose-файлу: `docker-compose.dokploy.yml`.
-3. Добавьте переменные окружения из `docker.env.example`, минимум:
-   - `MONGO_PASSWORD`
-   - `PANEL_DOMAIN`
-   - `ACME_EMAIL`
-   - `ENCRYPTION_KEY`
-   - `SESSION_SECRET`
-   - `DOKPLOY_PANEL_HOST` (домен для правила Traefik `Host(...)`)
-   - `DOKPLOY_TRAEFIK_SERVICE_PORT` (порт Traefik/backend, по умолчанию `3000`)
-4. Запустите деплой: Dokploy выполнит `build: .` и поднимет стек.
+- Dokploy должен собирать backend именно из **этого репозитория/ветки** (`build: .`).
+- Не переключайте backend на `clickdevtech/hysteria-panel:latest`, если нужны custom-изменения из этого repo (self-update, HAPP iOS routing, custom deploy docs и т.д.). Upstream Docker Hub image не содержит custom-коммиты этого репозитория.
+- Self-update flow рассчитан на host git checkout. Если lifecycle checkout/build управляется Dokploy, обновления обычно лучше делать через git/Dokploy redeploy, а не заменой backend на upstream image.
 
-Этот режим удобен для проверки изменений из ветки до публикации релизного образа.
+Минимальные переменные для Dokploy:
 
-### Режим релиза (образ из Docker Hub)
+- `MONGO_PASSWORD`
+- `PANEL_DOMAIN`
+- `ACME_EMAIL`
+- `ENCRYPTION_KEY`
+- `SESSION_SECRET`
+- `DOKPLOY_PANEL_HOST` (домен для правила Traefik `Host(...)`)
+- `DOKPLOY_TRAEFIK_SERVICE_PORT` (порт Traefik/backend, по умолчанию `3000`)
 
-Если нужен стабильный деплой по тегам Docker Hub (без сборки), замените источник `backend` в compose на образ:
+Для обычных production-серверов используйте installer одной командой и safe update guide:
 
-```yaml
-backend:
-  image: clickdevtech/hysteria-panel:latest
-  # или зафиксируйте тег релиза, например clickdevtech/hysteria-panel:v1.2.3
-  restart: always
-  depends_on:
-    mongo:
-      condition: service_healthy
-    redis:
-      condition: service_healthy
-  expose:
-    - "${DOKPLOY_TRAEFIK_SERVICE_PORT:-3000}"
-  labels:
-    - "traefik.enable=true"
-    - "traefik.http.routers.celerity.rule=Host(`${DOKPLOY_PANEL_HOST}`)"
-    - "traefik.http.routers.celerity.entrypoints=websecure"
-    - "traefik.http.routers.celerity.tls=true"
-    - "traefik.http.services.celerity.loadbalancer.server.port=${DOKPLOY_TRAEFIK_SERVICE_PORT:-3000}"
-  env_file:
-    - .env
-```
-
-`latest` подходит для быстрых обновлений, фиксированный тег — для предсказуемых прод-выкаток.
+- [Custom deployment](docs/custom-deploy.md)
+- [Безопасное обновление на проде](docs/safe-update.ru.md)
 
 ---
 
@@ -179,6 +156,7 @@ backend:
 - 🧩 **Расширенный конфиг Hysteria** — опциональные параметры ACME challenge, режимы masquerade, resolver, speed test, sniffing и настройка QUIC
 - 📊 **Статистика** — онлайн, трафик, состояние серверов
 - 📱 **Подписки** — автоформаты для Clash, Sing-box, Shadowrocket, Hiddify
+- 🍎 **HAPP iOS routing** — отдельный iOS-профиль split tunneling с изоляцией cache от default HAPP routing
 - 🔄 **Бэкап/Восстановление** — автоматические бэкапы с поддержкой S3
 - 💻 **SSH-терминал** — прямой доступ к нодам из браузера
 - 🔑 **API-ключи** — безопасный внешний доступ со скоупами, IP-фильтром и rate limiting
@@ -428,6 +406,8 @@ CC Agent — это лёгкий HTTP-сервис на ноде для упра
 - Health check
 
 Agent устанавливается автоматически при автонастройке Xray ноды.
+
+По умолчанию автонастройка скачивает `cc-agent` из официального upstream release C³ CELERITY (`ClickDevTech/CELERITY-panel`). Это сделано осознанно: агент считается upstream-compatible runtime-компонентом, поэтому custom-репозиторию не нужно публиковать новые бинарники агента при каждом upstream-обновлении. Переносить release агента в этот репозиторий имеет смысл только если мы реально меняем протокол, конфиг или поведение агента; тогда нужно собрать свои бинарники и обновить ссылку в `src/services/nodeSetup.js`.
 
 ---
 
@@ -950,37 +930,15 @@ Bucket: my-backups
 
 ## 🐳 Docker Compose
 
-```yaml
-version: '3.8'
+Этот custom-репозиторий рассчитан на запуск из исходников. Production compose собирает backend локально из текущего checkout:
 
-services:
-  mongo:
-    image: mongo:7
-    restart: always
-    volumes:
-      - mongo_data:/data/db
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hysteria}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
-
-  backend:
-    image: clickdevtech/hysteria-panel:latest
-    restart: always
-    depends_on:
-      - mongo
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./logs:/app/logs
-      - ./greenlock.d:/app/greenlock.d
-      - ./backups:/app/backups
-    env_file:
-      - .env
-
-volumes:
-  mongo_data:
+```bash
+docker compose -f docker-compose.yml up -d --build
 ```
+
+По возможности используйте installer одной командой: он создаёт `.env`, готовит директории и запускает compose за вас.
+
+Не заменяйте backend на `clickdevtech/hysteria-panel:latest`, если только осознанно не хотите upstream image без custom-коммитов этого репозитория.
 
 ---
 

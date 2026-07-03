@@ -5,8 +5,8 @@
 **[English](README.md)** | [Русский](README.ru.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker Pulls](https://img.shields.io/docker/pulls/clickdevtech/hysteria-panel)](https://hub.docker.com/r/clickdevtech/hysteria-panel)
-[![Docker Image Size](https://img.shields.io/docker/image-size/clickdevtech/hysteria-panel/latest)](https://hub.docker.com/r/clickdevtech/hysteria-panel)
+[![Deploy](https://img.shields.io/badge/deploy-source--based-2563EB)](docs/custom-deploy.md)
+[![Self Update](https://img.shields.io/badge/panel-self--update-16A34A)](docs/safe-update.md)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](package.json)
 [![Hysteria](https://img.shields.io/badge/Hysteria-2.x-9B59B6)](https://v2.hysteria.network/)
 [![Xray](https://img.shields.io/badge/Xray-VLESS-00ADD8)](https://xtls.github.io/)
@@ -119,53 +119,30 @@ MONGO_PASSWORD=yourmongopassword   # openssl rand -hex 16
 
 ---
 
-## 🐳 Dokploy (Development and Release)
+## 🐳 Dokploy / Traefik (optional, not the primary path)
 
-Use `docker-compose.dokploy.yml` when deploying through Dokploy with Traefik.
+The supported production path for this custom repository is the source-based installer above (`scripts/install.sh`) and `docker-compose.yml` with Caddy. It keeps the local git checkout in `/opt/hysteria-panel`, so the in-panel self-update button can pull this repository, create backups, rebuild, and generate rollback scripts.
 
-### Development Mode (build from current branch)
+`docker-compose.dokploy.yml` is kept only for operators who intentionally deploy through Dokploy/Traefik and understand the trade-offs:
 
-1. In Dokploy, create a project from this repository/branch.
-2. Set compose path to `docker-compose.dokploy.yml`.
-3. Add env vars from `docker.env.example` and set at least:
-   - `MONGO_PASSWORD`
-   - `PANEL_DOMAIN`
-   - `ACME_EMAIL`
-   - `ENCRYPTION_KEY`
-   - `SESSION_SECRET`
-   - `DOKPLOY_PANEL_HOST` (domain used in Traefik `Host(...)` rule)
-   - `DOKPLOY_TRAEFIK_SERVICE_PORT` (Traefik target/backend port, default `3000`)
-4. Deploy: Dokploy will run `build: .` and start the stack.
+- Dokploy must build from **this repository/branch** (`build: .`).
+- Do **not** switch the backend to `clickdevtech/hysteria-panel:latest` if you need custom changes from this repo (self-update, HAPP iOS routing, custom deploy docs, etc.). That upstream Docker Hub image does not contain this repository's custom commits.
+- The self-update flow is designed around a host git checkout. If Dokploy manages the checkout/build lifecycle, updates should normally be performed through git/Dokploy redeploys, not by replacing the backend with an upstream image.
 
-This mode is best when you test branch changes before publishing a release image.
+Minimum Dokploy env vars:
 
-### Release Mode (Docker Hub image)
+- `MONGO_PASSWORD`
+- `PANEL_DOMAIN`
+- `ACME_EMAIL`
+- `ENCRYPTION_KEY`
+- `SESSION_SECRET`
+- `DOKPLOY_PANEL_HOST` (domain used in the Traefik `Host(...)` rule)
+- `DOKPLOY_TRAEFIK_SERVICE_PORT` (Traefik target/backend port, default `3000`)
 
-If you want stable deploys from Docker Hub tags (without building), replace `backend` image source in Dokploy compose with:
+For normal production servers, prefer the one-command installer and the safe update guide:
 
-```yaml
-backend:
-  image: clickdevtech/hysteria-panel:latest
-  # or pin a release tag, e.g. clickdevtech/hysteria-panel:v1.2.3
-  restart: always
-  depends_on:
-    mongo:
-      condition: service_healthy
-    redis:
-      condition: service_healthy
-  expose:
-    - "${DOKPLOY_TRAEFIK_SERVICE_PORT:-3000}"
-  labels:
-    - "traefik.enable=true"
-    - "traefik.http.routers.celerity.rule=Host(`${DOKPLOY_PANEL_HOST}`)"
-    - "traefik.http.routers.celerity.entrypoints=websecure"
-    - "traefik.http.routers.celerity.tls=true"
-    - "traefik.http.services.celerity.loadbalancer.server.port=${DOKPLOY_TRAEFIK_SERVICE_PORT:-3000}"
-  env_file:
-    - .env
-```
-
-Use `latest` for fast updates, or pin an explicit tag for predictable production rollouts.
+- [Custom deployment](docs/custom-deploy.md)
+- [Safe Production Updates](docs/safe-update.md)
 
 ---
 
@@ -182,6 +159,7 @@ Use `latest` for fast updates, or pin an explicit tag for predictable production
 - 🧩 **Advanced Hysteria Config** — optional ACME challenge options, masquerade modes, resolver, speed test, sniffing, and QUIC tuning
 - 📊 **Statistics** — Online users, traffic, server status
 - 📱 **Subscriptions** — Auto-format for Clash, Sing-box, Shadowrocket, Hiddify
+- 🍎 **HAPP iOS routing** — separate iOS split-tunneling profile with cache isolation from default HAPP routing
 - 🔄 **Backup/Restore** — Automatic backups with S3 support
 - 💻 **SSH Terminal** — Direct node access from browser
 - 🔑 **API Keys** — Secure external access with scopes, IP allowlist, rate limiting
@@ -418,6 +396,8 @@ CC Agent is a lightweight HTTP service on the node for managing Xray users witho
 - Health check
 
 Agent is installed automatically during Xray node auto-setup.
+
+By default, auto-setup downloads `cc-agent` from the official upstream C³ CELERITY release (`ClickDevTech/CELERITY-panel`). This is intentional: the agent is treated as an upstream-compatible runtime component, so this custom repository does not need to publish new agent binaries unless we actually change the agent protocol or behavior. If custom agent changes become necessary later, publish the binaries from this repository and update `src/services/nodeSetup.js` accordingly.
 
 ---
 
@@ -905,37 +885,15 @@ Bucket: my-backups
 
 ## 🐳 Docker Compose
 
-```yaml
-version: '3.8'
+This custom repository is intended to run from source. The production compose file builds the backend locally from the current checkout:
 
-services:
-  mongo:
-    image: mongo:7
-    restart: always
-    volumes:
-      - mongo_data:/data/db
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hysteria}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
-
-  backend:
-    image: clickdevtech/hysteria-panel:latest
-    restart: always
-    depends_on:
-      - mongo
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./logs:/app/logs
-      - ./greenlock.d:/app/greenlock.d
-      - ./backups:/app/backups
-    env_file:
-      - .env
-
-volumes:
-  mongo_data:
+```bash
+docker compose -f docker-compose.yml up -d --build
 ```
+
+Use the one-command installer when possible; it writes `.env`, prepares directories, and runs the compose command for you.
+
+Do **not** replace the backend with `clickdevtech/hysteria-panel:latest` unless you intentionally want the upstream image without this repository's custom commits.
 
 ---
 
