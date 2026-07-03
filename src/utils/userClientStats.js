@@ -53,12 +53,15 @@ function hasNonEmptyCollection(value) {
 }
 
 function isXrayUserOnline(stats = {}) {
-    // Do not infer live VPN presence from tx/rx/uplink/downlink counters: cc-agent
-    // may report cumulative or recently flushed traffic after the client disconnects,
-    // which keeps the UI green for offline users. Only explicit connection/live
-    // signals should feed the short-lived online lamp.
+    // Current cc-agent releases expose per-user live activity as the users
+    // present in the current /stats poll with positive rx/tx deltas. Treat those
+    // deltas as online, but keep the caller-side cache short-lived so a user is
+    // cleared on the next quiet/disconnected poll rather than held for minutes.
     if (stats.online === true || stats.active === true || stats.isOnline === true) return true;
     if (stats.connected === true || stats.isConnected === true || stats.hasConnection === true) return true;
+    if (isPositiveNumber(stats.tx) || isPositiveNumber(stats.rx)) return true;
+    if (isPositiveNumber(stats.uplink) || isPositiveNumber(stats.downlink)) return true;
+    if (isPositiveNumber(stats.upload) || isPositiveNumber(stats.download)) return true;
     if (isPositiveNumber(stats.connections) || isPositiveNumber(stats.connectionCount)) return true;
     if (isPositiveNumber(stats.onlineConnections) || isPositiveNumber(stats.sessionCount)) return true;
     if (hasNonEmptyCollection(stats.sessions) || hasNonEmptyCollection(stats.connectionsList)) return true;
