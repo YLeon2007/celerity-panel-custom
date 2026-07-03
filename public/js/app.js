@@ -106,6 +106,7 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         }
 
         applyBtn.hidden = !updateAvailable;
+        applyBtn.style.display = updateAvailable ? '' : 'none';
         applyBtn.disabled = !updateAvailable || Boolean(status.apply?.running);
         applyBtn.textContent = i18n.apply;
         if (logBox && status.apply?.log) {
