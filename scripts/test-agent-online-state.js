@@ -1,5 +1,8 @@
 const assert = require('assert');
-const { extractAgentOnlineUserIds } = require('../src/utils/agentOnlineState');
+const {
+    extractAgentOnlineUserIds,
+    mergeNodeOnlineContributions,
+} = require('../src/utils/agentOnlineState');
 
 const payload = {
     users: {
@@ -21,5 +24,24 @@ const payload = {
 assert.deepStrictEqual(extractAgentOnlineUserIds(payload), ['leon']);
 assert.deepStrictEqual(extractAgentOnlineUserIds({ users: {} }), []);
 assert.deepStrictEqual(extractAgentOnlineUserIds(null), []);
+
+{
+    const contributions = new Map([
+        ['de', new Set(['leon'])],
+        ['fi', new Set(['lilya'])],
+    ]);
+    const merged = mergeNodeOnlineContributions(contributions, ['de', 'fi']);
+    assert.deepStrictEqual([...merged.userIds].sort(), ['leon', 'lilya']);
+
+    // A successful empty /online response for one node must replace that node,
+    // not preserve old users for an extra panel-side timeout.
+    contributions.set('de', new Set());
+    const afterEmptyDe = mergeNodeOnlineContributions(contributions, ['de', 'fi']);
+    assert.deepStrictEqual([...afterEmptyDe.userIds].sort(), ['lilya']);
+
+    // Removed/inactive node contributions must be pruned.
+    const afterPrune = mergeNodeOnlineContributions(contributions, ['de']);
+    assert.deepStrictEqual([...afterPrune.contributions.keys()], ['de']);
+}
 
 console.log('test-agent-online-state: OK');

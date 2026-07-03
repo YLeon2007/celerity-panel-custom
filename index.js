@@ -877,10 +877,19 @@ function setupWebSocketServer(server) {
 }
 
 function setupCronJobs() {
-    // Collect live traffic/online stats frequently so per-user VPN lamps do not
-    // stay stale for minutes after a disconnect. collectAllStats() owns the
-    // short-lived xray:online:users cache; history snapshots stay on 5m/hourly jobs.
-    cron.schedule('*/15 * * * * *', async () => {
+    // Poll lightweight cc-agent /online every 5s. The agent itself applies the
+    // 45s no-event timeout, so this cron only mirrors node state into Redis for UI.
+    cron.schedule('*/5 * * * * *', async () => {
+        try {
+            await syncService.collectXrayAgentOnlineStates();
+        } catch (error) {
+            logger.error(`[Cron] Xray online collection failed: ${error.message}`);
+        }
+    });
+
+    // Collect traffic stats separately; this is heavier and must not gate the
+    // users-list online lamp.
+    cron.schedule('*/30 * * * * *', async () => {
         try {
             logger.debug('[Cron] Collecting live stats');
             await syncService.collectAllStats();

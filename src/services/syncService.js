@@ -27,7 +27,10 @@ const webhook = require('./webhookService');
 const { extractXrayOnlineUserIds } = require('../utils/userClientStats');
 const nodeSetup = require('./nodeSetup');
 const { getPanelCertificates, isSameVpsAsPanel } = nodeSetup;
-const { extractAgentOnlineUserIds } = require('../utils/agentOnlineState');
+const {
+    extractAgentOnlineUserIds,
+    mergeNodeOnlineContributions,
+} = require('../utils/agentOnlineState');
 
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
@@ -668,14 +671,23 @@ class SyncService {
                 : trafficActiveUserIds;
             this.xrayUserStatsSnapshots.set(snapshotKey, users);
 
-            const activityWindowMs = agentOnlineAvailable ? 45 * 1000 : 90 * 1000;
-            const nodeLastActive = this.xrayNodeUserLastActive.get(snapshotKey) || new Map();
-            activeUserIds.forEach(userId => nodeLastActive.set(String(userId), now.getTime()));
-            for (const [userId, lastActiveAt] of nodeLastActive.entries()) {
-                if (now.getTime() - lastActiveAt > activityWindowMs) nodeLastActive.delete(userId);
+            let onlineWindowUserIds;
+            if (agentOnlineAvailable) {
+                // /online already applies the agent-side 45s timeout. Do not add
+                // another panel-side grace window, otherwise disconnect becomes
+                // ~90s+ stale.
+                onlineWindowUserIds = agentOnlineUserIds.map(String);
+                this.xrayNodeUserLastActive.set(snapshotKey, new Map(onlineWindowUserIds.map(userId => [userId, now.getTime()])));
+            } else {
+                const activityWindowMs = 90 * 1000;
+                const nodeLastActive = this.xrayNodeUserLastActive.get(snapshotKey) || new Map();
+                activeUserIds.forEach(userId => nodeLastActive.set(String(userId), now.getTime()));
+                for (const [userId, lastActiveAt] of nodeLastActive.entries()) {
+                    if (now.getTime() - lastActiveAt > activityWindowMs) nodeLastActive.delete(userId);
+                }
+                this.xrayNodeUserLastActive.set(snapshotKey, nodeLastActive);
+                onlineWindowUserIds = [...nodeLastActive.keys()];
             }
-            this.xrayNodeUserLastActive.set(snapshotKey, nodeLastActive);
-            const onlineWindowUserIds = [...nodeLastActive.keys()];
 
             const bulkOps = [];
 
@@ -1146,6 +1158,40 @@ class SyncService {
                 logger.error(`[Kick] Kick error on ${node.name}: ${error.message}`);
             }
         }
+    }
+
+    /**
+     * Collect log-derived online state from Xray agents only.
+     * This is intentionally separate from /stats traffic accounting so the UI
+     * lamp is not delayed by slower node traffic polls or gRPC stats resets.
+     */
+    async collectXrayAgentOnlineStates() {
+        const nodes = await HyNode.find({ type: 'xray', active: true, 'xray.agentToken': { $exists: true, $ne: '' } });
+        const activeXrayNodeKeys = new Set(nodes.map(node => node._id?.toString?.() || node.id || node.name));
+        const CONCURRENCY = 8;
+
+        for (let i = 0; i < nodes.length; i += CONCURRENCY) {
+            const batch = nodes.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(batch.map(async (node) => {
+                const response = await this._agentRequest(node, 'GET', '/online');
+                return {
+                    ok: true,
+                    nodeKey: node._id?.toString?.() || node.id || node.name,
+                    onlineUserIds: extractAgentOnlineUserIds(response.data || {}),
+                };
+            }));
+
+            results.forEach((result) => {
+                if (result.status !== 'fulfilled') return;
+                const value = result.value;
+                if (!value || !value.nodeKey || !Array.isArray(value.onlineUserIds)) return;
+                this.xrayNodeOnlineUsers.set(value.nodeKey, new Set(value.onlineUserIds.map(String)));
+            });
+        }
+
+        const merged = mergeNodeOnlineContributions(this.xrayNodeOnlineUsers, [...activeXrayNodeKeys]);
+        this.xrayNodeOnlineUsers = merged.contributions;
+        await cache.setXrayOnlineUsers([...merged.userIds], 10);
     }
 
     /**
