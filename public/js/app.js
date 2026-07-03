@@ -45,10 +45,14 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         checking: document.documentElement.lang === 'ru' ? 'Проверка...' : 'Checking...',
         check: document.documentElement.lang === 'ru' ? 'Проверить обновление' : 'Check for update',
         available: document.documentElement.lang === 'ru' ? 'Доступно обновление' : 'Update available',
+        apply: document.documentElement.lang === 'ru' ? 'Обновить' : 'Update',
         upToDate: document.documentElement.lang === 'ru' ? 'Обновлений нет' : 'Up to date',
         failed: document.documentElement.lang === 'ru' ? 'Ошибка проверки' : 'Check failed',
         applying: document.documentElement.lang === 'ru' ? 'Обновление запущено...' : 'Update started...',
         noChangelog: document.documentElement.lang === 'ru' ? 'Changelog пуст или недоступен.' : 'Changelog is empty or unavailable.',
+        noUpdateDetails: document.documentElement.lang === 'ru'
+            ? 'Установлена последняя версия. Обновление не требуется.'
+            : 'The latest version is already installed. No update is required.',
         confirmApply: document.documentElement.lang === 'ru'
             ? 'Запустить обновление панели? Будет создан backup и ROLLBACK.sh.'
             : 'Start panel update? Backup and ROLLBACK.sh will be created.',
@@ -98,10 +102,12 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
                 `<li><code>${item.sha || ''}</code> <span>${item.date || ''}</span> ${escapeHtml(item.subject || '')}</li>`
             )).join('')}</ul>`;
         } else {
-            changelog.textContent = i18n.noChangelog;
+            changelog.textContent = updateAvailable ? i18n.noChangelog : i18n.noUpdateDetails;
         }
 
+        applyBtn.hidden = !updateAvailable;
         applyBtn.disabled = !updateAvailable || Boolean(status.apply?.running);
+        applyBtn.textContent = i18n.apply;
         if (logBox && status.apply?.log) {
             logBox.hidden = false;
             logBox.textContent = status.apply.log;
