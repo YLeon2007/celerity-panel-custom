@@ -18,4 +18,21 @@ assert(
     'update modal polling must survive transient backend/rate-limit failures'
 );
 
+
+const selfUpdate = fs.readFileSync(path.join(__dirname, '..', 'scripts/self-update.sh'), 'utf8');
+
+assert(
+    selfUpdate.includes('detect_compose_project()') && selfUpdate.includes('com.docker.compose.project'),
+    'self-update script must detect the existing Docker Compose project from running containers'
+);
+assert(
+    selfUpdate.includes('docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml')
+        && selfUpdate.includes('docker-compose -p "$COMPOSE_PROJECT" -f docker-compose.yml'),
+    'self-update script must pass a stable project name to docker compose/docker-compose'
+);
+assert(
+    selfUpdate.includes("printf 'hysteria-panel'"),
+    'self-update script must have a stable fallback project name'
+);
+
 console.log('self-update UI tests passed');

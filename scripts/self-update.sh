@@ -58,10 +58,35 @@ tar --exclude='./.git' \
     -czf "$BACKUP_DIR/files.tar.gz" .
 log "Backed up project files"
 
+detect_compose_project() {
+  if [ -n "${SELF_UPDATE_COMPOSE_PROJECT_NAME:-}" ]; then
+    printf '%s' "$SELF_UPDATE_COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+
+  local name project
+  for name in hysteria-backend hysteria-mongo hysteria-redis hysteria-caddy; do
+    project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$name" 2>/dev/null || true)"
+    if [ -n "$project" ] && [ "$project" != "<no value>" ]; then
+      printf '%s' "$project"
+      return 0
+    fi
+  done
+
+  # Fallback for a fresh install. Keep this stable even when the script is
+  # executed from the backend container's /opt/hysteria-panel-host bind mount;
+  # otherwise Compose derives a different project name and fixed container_name
+  # entries (hysteria-mongo, hysteria-redis, etc.) conflict with prod containers.
+  printf 'hysteria-panel'
+}
+
+COMPOSE_PROJECT="$(detect_compose_project)"
+log "Docker Compose project: $COMPOSE_PROJECT"
+
 if docker compose version >/dev/null 2>&1; then
-  COMPOSE=(docker compose -f docker-compose.yml)
+  COMPOSE=(docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml)
 elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE=(docker-compose -f docker-compose.yml)
+  COMPOSE=(docker-compose -p "$COMPOSE_PROJECT" -f docker-compose.yml)
 else
   fail "docker compose/docker-compose not found"
 fi
@@ -109,10 +134,20 @@ fi
 if [ -f "$BACKUP_DIR/files.tar.gz" ]; then
   tar -xzf "$BACKUP_DIR/files.tar.gz" -C "$REPO_PATH"
 fi
+COMPOSE_PROJECT="${SELF_UPDATE_COMPOSE_PROJECT_NAME:-}"
+if [ -z "$COMPOSE_PROJECT" ]; then
+  for name in hysteria-backend hysteria-mongo hysteria-redis hysteria-caddy; do
+    COMPOSE_PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$name" 2>/dev/null || true)"
+    if [ -n "$COMPOSE_PROJECT" ] && [ "$COMPOSE_PROJECT" != "<no value>" ]; then
+      break
+    fi
+  done
+fi
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-hysteria-panel}"
 if docker compose version >/dev/null 2>&1; then
-  docker compose -f docker-compose.yml up -d --build
+  docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml up -d --build
 elif command -v docker-compose >/dev/null 2>&1; then
-  docker-compose -f docker-compose.yml up -d --build
+  docker-compose -p "$COMPOSE_PROJECT" -f docker-compose.yml up -d --build
 else
   echo "[rollback] docker compose not found" >&2
   exit 1
