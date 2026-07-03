@@ -23,6 +23,9 @@ need cp
 need mkdir
 
 [ -d "$REPO_PATH/.git" ] || fail "Git checkout not found at $REPO_PATH"
+export GIT_CONFIG_COUNT="${GIT_CONFIG_COUNT:-1}"
+export GIT_CONFIG_KEY_0="${GIT_CONFIG_KEY_0:-safe.directory}"
+export GIT_CONFIG_VALUE_0="${GIT_CONFIG_VALUE_0:-$REPO_PATH}"
 cd "$REPO_PATH"
 
 FREE_KB="$(df -Pk "$REPO_PATH" | awk 'NR==2 {print $4}')"

@@ -72,8 +72,9 @@ async function pathExists(p) {
 }
 
 async function execGit(args, options = {}) {
-    const { stdout } = await execFileAsync('git', args, {
-        cwd: hostRepoPath(),
+    const repo = hostRepoPath();
+    const { stdout } = await execFileAsync('git', ['-c', `safe.directory=${repo}`, ...args], {
+        cwd: repo,
         timeout: options.timeout || 30000,
         maxBuffer: options.maxBuffer || 1024 * 1024,
         env: process.env,
