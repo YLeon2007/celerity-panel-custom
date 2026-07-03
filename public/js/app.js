@@ -52,6 +52,9 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
         applied: document.documentElement.lang === 'ru' ? 'Обновление завершено успешно.' : 'Update completed successfully.',
         applyFailed: document.documentElement.lang === 'ru' ? 'Обновление завершилось ошибкой.' : 'Update failed.',
         polling: document.documentElement.lang === 'ru' ? 'Жду лог выполнения...' : 'Waiting for progress log...',
+        reconnecting: document.documentElement.lang === 'ru'
+            ? 'Backend перезапускается или временно недоступен; продолжаю ждать лог...'
+            : 'Backend is restarting or temporarily unavailable; still waiting for the log...',
         noChangelog: document.documentElement.lang === 'ru' ? 'Changelog пуст или недоступен.' : 'Changelog is empty or unavailable.',
         noUpdateDetails: document.documentElement.lang === 'ru'
             ? 'Установлена последняя версия. Обновление не требуется.'
@@ -138,21 +141,38 @@ document.querySelectorAll('[data-confirm]').forEach(el => {
     }
 
     async function pollApplyUntilDone() {
+        let transientFailures = 0;
         for (;;) {
-            const status = await requestJson('/panel/update/status', { method: 'GET' });
-            currentStatus = status;
-            renderApplyState(status.apply);
+            try {
+                const status = await requestJson('/panel/update/status', { method: 'GET' });
+                transientFailures = 0;
+                currentStatus = status;
+                renderApplyState(status.apply);
 
-            if (!status.apply?.running) {
-                applyBtn.disabled = false;
-                applyBtn.textContent = status.apply?.success === false ? i18n.applyFailed : i18n.applied;
-                if (status.apply?.success === false) {
-                    window.showToast(status.apply.error || i18n.applyFailed, 'error');
-                } else {
-                    setState('idle');
-                    window.showToast(i18n.applied, 'success');
+                if (!status.apply?.running) {
+                    applyBtn.disabled = false;
+                    applyBtn.textContent = status.apply?.success === false ? i18n.applyFailed : i18n.applied;
+                    if (status.apply?.success === false) {
+                        window.showToast(status.apply.error || i18n.applyFailed, 'error');
+                    } else {
+                        setState('idle');
+                        window.showToast(i18n.applied, 'success');
+                    }
+                    return status;
                 }
-                return status;
+            } catch (error) {
+                transientFailures += 1;
+                // During self-update the backend container can restart, and older
+                // deployments could also rate-limit status polling. Keep the modal
+                // alive instead of freezing on the last line.
+                renderApplyState({
+                    running: true,
+                    log: `[ui] ${i18n.reconnecting}
+[ui] ${error.message || error}`,
+                });
+                if (transientFailures % 5 === 0) {
+                    window.showToast(error.message || i18n.failed, 'warning');
+                }
             }
 
             await new Promise(resolve => setTimeout(resolve, 2000));

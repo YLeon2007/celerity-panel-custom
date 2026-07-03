@@ -19,8 +19,23 @@ const updateLimiter = rateLimit({
     }),
 });
 
+// The update modal polls /status every few seconds while docker compose rebuilds
+// and may keep polling across a backend restart. Keep this endpoint cheap but do
+// not share the low apply/check mutation limit, otherwise the live log freezes
+// with HTTP 429 after ~40 seconds.
+const updateStatusLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({
+        success: false,
+        error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.',
+    }),
+});
+
 // GET /panel/update/status
-router.get('/update/status', updateLimiter, async (req, res) => {
+router.get('/update/status', updateStatusLimiter, async (req, res) => {
     try {
         const status = await updateService.getStatus();
         res.json(status);
