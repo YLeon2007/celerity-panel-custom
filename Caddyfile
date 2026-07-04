@@ -19,7 +19,7 @@
     #     protocols tls1.2 tls1.2
     # }
 
-    reverse_proxy backend:3000 {
+    reverse_proxy hysteria-backend:3000 {
         transport http {
             versions 1.1
         }
