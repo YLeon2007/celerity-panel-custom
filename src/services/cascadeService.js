@@ -96,7 +96,9 @@ class CascadeService {
     }
 
     /**
-     * Deploy a reverse-proxy link (original flow).
+     * Deploy a reverse-proxy link.
+     * Portal config is rebuilt for the changed portal, while Bridge config is
+     * rebuilt from all active reverse links that share this bridge node.
      */
     async _deployReverseLink(link, portalNode, bridgeNode) {
         await this._deployPortalConfig(portalNode);
@@ -147,15 +149,30 @@ class CascadeService {
                     logger.warn(`[Cascade] Bridge node redeploy on forward undeploy: ${err.message}`);
                 }
             } else {
-                const ssh = new NodeSSH(bridgeNode);
-                try {
-                    await ssh.connect();
-                    await ssh.exec('systemctl stop xray-bridge 2>/dev/null; systemctl disable xray-bridge 2>/dev/null');
-                    logger.info(`[Cascade] Bridge service stopped on ${bridgeNode.name}`);
-                } catch (err) {
-                    logger.warn(`[Cascade] Bridge stop on undeploy: ${err.message}`);
-                } finally {
-                    ssh.disconnect();
+                const remainingLinks = await CascadeLink.find({
+                    bridgeNode: bridgeNode._id,
+                    active: true,
+                    mode: { $ne: 'forward' },
+                    _id: { $ne: link._id },
+                }).populate('portalNode');
+
+                if (remainingLinks.length > 0) {
+                    try {
+                        await this._deployBridgeConfig(remainingLinks[0], bridgeNode, remainingLinks[0].portalNode);
+                    } catch (err) {
+                        logger.warn(`[Cascade] Bridge redeploy on reverse undeploy: ${err.message}`);
+                    }
+                } else {
+                    const ssh = new NodeSSH(bridgeNode);
+                    try {
+                        await ssh.connect();
+                        await ssh.exec('systemctl stop xray-bridge 2>/dev/null; systemctl disable xray-bridge 2>/dev/null');
+                        logger.info(`[Cascade] Bridge service stopped on ${bridgeNode.name}`);
+                    } catch (err) {
+                        logger.warn(`[Cascade] Bridge stop on undeploy: ${err.message}`);
+                    } finally {
+                        ssh.disconnect();
+                    }
                 }
             }
         }
@@ -394,7 +411,7 @@ class CascadeService {
             } else if (isBridge && !isPortal) {
                 const upstreamLink = asBridgeLinks[0];
                 const upstreamPortal = await HyNode.findById(upstreamLink.portalNode);
-                await this._deployPureBridge(node, upstreamLink, upstreamPortal);
+                await this._deployPureBridge(node, upstreamLink, upstreamPortal, asBridgeLinks);
             }
         }
     }
@@ -438,12 +455,16 @@ class CascadeService {
     /**
      * Deploy pure Bridge node config (tail of chain).
      */
-    async _deployPureBridge(node, upstreamLink, upstreamPortal) {
+    async _deployPureBridge(node, upstreamLink, upstreamPortal, upstreamLinks = null) {
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error(`Bridge node ${node.name} has no SSH credentials`);
         }
 
-        const bridgeConfig = configGenerator.generateBridgeConfig(upstreamLink, upstreamPortal);
+        let bridgeLinks = upstreamLinks;
+        if (!Array.isArray(bridgeLinks) || bridgeLinks.length === 0) {
+            bridgeLinks = [{ ...upstreamLink, portalNode: upstreamPortal }];
+        }
+        const bridgeConfig = configGenerator.generateCombinedBridgeConfig(bridgeLinks);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
         const ssh = new NodeSSH(node);
@@ -902,7 +923,13 @@ class CascadeService {
             logger.info(`[Cascade] Node ${bridgeNode.name} is a RELAY (${downstreamLinks.length} downstream link(s))`);
             bridgeConfig = configGenerator.generateRelayConfig(link, portalNode, downstreamLinks);
         } else {
-            bridgeConfig = configGenerator.generateBridgeConfig(link, portalNode);
+            const bridgeLinks = await CascadeLink.find({
+                bridgeNode: bridgeNode._id,
+                active: true,
+                mode: { $ne: 'forward' },
+            }).populate('portalNode');
+            logger.info(`[Cascade] Node ${bridgeNode.name} is a BRIDGE (${bridgeLinks.length} reverse link(s))`);
+            bridgeConfig = configGenerator.generateCombinedBridgeConfig(bridgeLinks);
         }
 
         const serviceUnit = configGenerator.generateBridgeSystemdService();

@@ -1142,6 +1142,94 @@ function generateBridgeConfig(link, portalNode) {
 }
 
 /**
+ * Generate a standalone Xray JSON config for a Bridge node that connects to
+ * multiple reverse Portal nodes at once. This keeps one xray-bridge service per
+ * bridge node, but gives every reverse link its own bridge tag and tunnel
+ * outbound so deploying a second portal no longer overwrites the first one.
+ *
+ * @param {Array<Object>} links - CascadeLink documents populated with portalNode
+ * @returns {string} JSON string ready to write to config.json
+ */
+function generateCombinedBridgeConfig(links) {
+    if (!Array.isArray(links) || links.length === 0) {
+        throw new Error('generateCombinedBridgeConfig requires at least one link');
+    }
+
+    const config = {
+        log: { loglevel: 'warning' },
+        reverse: { bridges: [] },
+        outbounds: [
+            {
+                tag: 'freedom',
+                protocol: 'freedom',
+                settings: { domainStrategy: 'UseIPv4' },
+            },
+            {
+                tag: 'blackhole',
+                protocol: 'blackhole',
+            },
+        ],
+        routing: {
+            domainStrategy: 'IPIfNonMatch',
+            rules: [],
+        },
+    };
+
+    for (const link of links) {
+        const portalNode = link.portalNode;
+        if (!portalNode || !portalNode.ip) {
+            throw new Error(`Portal node is not populated for cascade link ${link.name || link._id}`);
+        }
+
+        const tunnelDomain = link.tunnelDomain || 'reverse.tunnel.internal';
+        const protocol = link.tunnelProtocol || 'vless';
+        const linkIdShort = String(link._id).slice(-8);
+        const bridgeTag = `bridge-${linkIdShort}`;
+        const tunnelTag = `tunnel-${linkIdShort}`;
+
+        const tunnelOutbound = {
+            tag: tunnelTag,
+            protocol,
+            settings: {
+                vnext: [{
+                    address: portalNode.ip,
+                    port: link.tunnelPort || 10086,
+                    users: [buildOutboundUser(link.tunnelUuid, protocol)],
+                }],
+            },
+            streamSettings: buildCascadeTunnelStreamSettings(link),
+        };
+        if (link.muxEnabled) {
+            tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
+        }
+
+        config.reverse.bridges.push({ tag: bridgeTag, domain: tunnelDomain });
+        config.outbounds.unshift(tunnelOutbound);
+
+        config.routing.rules.push(
+            {
+                type: 'field',
+                domain: [`full:${tunnelDomain}`],
+                outboundTag: tunnelTag,
+            },
+            {
+                type: 'field',
+                inboundTag: [bridgeTag],
+                outboundTag: 'freedom',
+            }
+        );
+    }
+
+    config.routing.rules.push({
+        type: 'field',
+        ip: ['geoip:private'],
+        outboundTag: 'blackhole',
+    });
+
+    return JSON.stringify(config, null, 2);
+}
+
+/**
  * Generate Xray JSON config for a Relay (intermediate hop) node.
  * The Relay connects upstream to a Portal AND accepts downstream connections from Bridges,
  * forwarding traffic through the chain instead of releasing to internet.
@@ -1669,6 +1757,7 @@ module.exports = {
     generateXraySystemdService,
     applyReversePortal,
     generateBridgeConfig,
+    generateCombinedBridgeConfig,
     generateRelayConfig,
     buildCascadeTunnelStreamSettings,
     generateBridgeSystemdService,
