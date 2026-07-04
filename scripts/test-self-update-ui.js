@@ -47,5 +47,11 @@ assert(
     selfUpdate.includes("printf 'hysteria-panel'"),
     'self-update script must have a stable fallback project name'
 );
+assert(
+    selfUpdate.includes('awk -v dest="$REPO_PATH"')
+        && selfUpdate.includes('*/hysteria-panel-host)')
+        && selfUpdate.includes('${REPO_PATH%-host}'),
+    'self-update helper must resolve container repo paths such as /opt/hysteria-panel-host to a real host bind source'
+);
 
 console.log('self-update UI tests passed');

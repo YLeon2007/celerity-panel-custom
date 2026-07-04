@@ -91,12 +91,24 @@ detect_docker_repo_path() {
 
   local name source
   for name in hysteria-backend backend; do
-    source="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "'"$REPO_PATH"'" }}{{ .Source }}{{ end }}{{ end }}' "$name" 2>/dev/null || true)"
+    source="$(docker inspect -f '{{ range .Mounts }}{{ printf "%s\t%s\n" .Destination .Source }}{{ end }}' "$name" 2>/dev/null | awk -v dest="$REPO_PATH" '$1 == dest { print $2; exit }' || true)"
     if [ -n "$source" ] && [ "$source" != "<no value>" ]; then
       printf '%s' "$source"
       return 0
     fi
   done
+
+  # When called from the backend container, REPO_PATH is commonly the container
+  # bind destination (/opt/hysteria-panel-host). Docker needs the host-side
+  # source path. If inspect is temporarily unavailable, use the source-compose
+  # convention rather than letting Docker create /opt/hysteria-panel-host as a
+  # host directory; that breaks file mounts such as ./Caddyfile:/etc/caddy/Caddyfile.
+  case "$REPO_PATH" in
+    */hysteria-panel-host)
+      printf '%s' "${REPO_PATH%-host}"
+      return 0
+      ;;
+  esac
 
   # Host-side/manual execution usually already uses the real host path.
   printf '%s' "$REPO_PATH"
