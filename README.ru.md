@@ -146,6 +146,7 @@ MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
 ## ✨ Возможности
 
 - 🔄 **Self-update панели** — проверка версии в topbar, modal с changelog, backup, fast-forward pull, rebuild и сгенерированный rollback-скрипт
+- 🛠️ **Source-based Caddy deploy** — production compose собирает backend из этого репозитория и проксирует HTTPS через Caddy на стабильное имя контейнера
 - 🖥 **Веб-панель** — полноценный UI для управления нодами и пользователями
 - 🔐 **Двойной протокол** — Hysteria 2 и Xray VLESS на одной панели
 - 🛡️ **2FA для панели (TOTP)** — единый сценарий подтверждения TOTP для входа администратора и чувствительных действий безопасности
@@ -163,6 +164,7 @@ MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
 - 🔑 **API-ключи** — безопасный внешний доступ со скоупами, IP-фильтром и rate limiting
 - 🪝 **Вебхуки** — уведомления о событиях с подписью HMAC-SHA256
 - 🗺 **Карта сети** — визуальная каскадная топология с Forward/Reverse Chain *(бета)*
+- 🌉 **MultiBridge Reverse** — несколько reverse-связей могут сходиться на один bridge; Xray bridge config объединяет все активные связи и изолирует internal-domain по link id
 - 🤖 **MCP-интеграция** — нативная поддержка AI-ассистентов (Claude, Cursor и др.) для управления панелью
 
 ---

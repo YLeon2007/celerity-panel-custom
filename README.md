@@ -149,6 +149,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 ## ✨ Features
 
 - 🔄 **Panel self-update** — topbar version check, changelog modal, backup, fast-forward pull, rebuild, and generated rollback script
+- 🛠️ **Source-based Caddy deploy** — production compose builds the backend from this repository and proxies HTTPS through Caddy to the stable backend container name
 - 🖥 **Web Panel** — Full UI for managing nodes and users
 - 🔐 **Dual Protocol** — Hysteria 2 and Xray VLESS on one panel
 - 🛡️ **Panel 2FA (TOTP)** — Unified TOTP verification flow for admin login and sensitive security actions
@@ -166,6 +167,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 - 🔑 **API Keys** — Secure external access with scopes, IP allowlist, rate limiting
 - 🪝 **Webhooks** — Real-time event notifications with HMAC-SHA256 signing
 - 🗺 **Network Map** — Visual cascade topology with Forward/Reverse chain routing *(beta)*
+- 🌉 **MultiBridge Reverse** — multiple reverse links can share one bridge; the Xray bridge config combines all active links and isolates internal domains by link id
 - 🤖 **MCP Integration** — Native AI assistant support (Claude, Cursor, etc.) for panel management
 
 ---
