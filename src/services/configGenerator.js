@@ -927,6 +927,12 @@ WantedBy=multi-user.target
 
 // ==================== XRAY CASCADE (Reverse Proxy) ====================
 
+function getCascadeTunnelDomain(link) {
+    const baseDomain = link.tunnelDomain || 'reverse.tunnel.internal';
+    const linkIdShort = String(link._id).slice(-8);
+    return `${linkIdShort}.${baseDomain}`;
+}
+
 /**
  * Apply reverse-portal configuration to an existing Xray config object.
  * Adds portal entries, bridge-connector inbounds, and routing rules for
@@ -953,12 +959,13 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
 
     for (const link of portalLinks) {
         const linkIdShort = String(link._id).slice(-8);
+        const tunnelDomain = getCascadeTunnelDomain(link);
         const portalTag = `portal-${linkIdShort}`;
         const connectorTag = `bridge-conn-${linkIdShort}`;
 
         config.reverse.portals.push({
             tag: portalTag,
-            domain: link.tunnelDomain || 'reverse.tunnel.internal',
+            domain: tunnelDomain,
         });
 
         const protocol = link.tunnelProtocol || 'vless';
@@ -979,7 +986,7 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
         config.routing.rules.push({
             type: 'field',
             inboundTag: [connectorTag],
-            domain: [`full:${link.tunnelDomain || 'reverse.tunnel.internal'}`],
+            domain: [`full:${tunnelDomain}`],
             outboundTag: portalTag,
         });
 
@@ -1074,7 +1081,7 @@ function normalizeInboundTags(input) {
  * @returns {string} JSON string ready to write to config.json
  */
 function generateBridgeConfig(link, portalNode) {
-    const tunnelDomain = link.tunnelDomain || 'reverse.tunnel.internal';
+    const tunnelDomain = getCascadeTunnelDomain(link);
     const protocol = link.tunnelProtocol || 'vless';
     const linkIdShort = String(link._id).slice(-8);
 
@@ -1181,7 +1188,7 @@ function generateCombinedBridgeConfig(links) {
             throw new Error(`Portal node is not populated for cascade link ${link.name || link._id}`);
         }
 
-        const tunnelDomain = link.tunnelDomain || 'reverse.tunnel.internal';
+        const tunnelDomain = getCascadeTunnelDomain(link);
         const protocol = link.tunnelProtocol || 'vless';
         const linkIdShort = String(link._id).slice(-8);
         const bridgeTag = `bridge-${linkIdShort}`;
@@ -1240,7 +1247,7 @@ function generateCombinedBridgeConfig(links) {
  * @returns {string} JSON string ready to write to config.json
  */
 function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
-    const upDomain = upstreamLink.tunnelDomain || 'reverse.tunnel.internal';
+    const upDomain = getCascadeTunnelDomain(upstreamLink);
     const upProtocol = upstreamLink.tunnelProtocol || 'vless';
     const upLinkId = String(upstreamLink._id).slice(-8);
 
@@ -1286,7 +1293,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
     // FIRST: Add connector rules for each downstream link (must be checked BEFORE tunnel-up rule)
     for (const downLink of downstreamLinks) {
         const downLinkId = String(downLink._id).slice(-8);
-        const downDomain = downLink.tunnelDomain || 'reverse.tunnel.internal';
+        const downDomain = getCascadeTunnelDomain(downLink);
         const downProtocol = downLink.tunnelProtocol || 'vless';
         const portalTag = `portal-down-${downLinkId}`;
         const connectorTag = `conn-down-${downLinkId}`;

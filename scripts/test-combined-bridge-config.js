@@ -32,7 +32,7 @@ const rules = config.routing?.rules || [];
 
 assert.strictEqual(bridges.length, 2, 'must create one reverse bridge per active link');
 assert.deepStrictEqual(bridges.map(b => b.tag).sort(), ['bridge-11111111', 'bridge-22222222']);
-assert.deepStrictEqual(bridges.map(b => b.domain).sort(), ['portal-a.reverse.internal', 'portal-b.reverse.internal']);
+assert.deepStrictEqual(bridges.map(b => b.domain).sort(), ['11111111.portal-a.reverse.internal', '22222222.portal-b.reverse.internal']);
 
 for (const id of ['11111111', '22222222']) {
     assert(outbounds.some(o => o.tag === `tunnel-${id}`), `missing tunnel outbound for ${id}`);
@@ -42,5 +42,15 @@ for (const id of ['11111111', '22222222']) {
 
 assert(outbounds.some(o => o.tag === 'freedom'), 'missing freedom outbound');
 assert(outbounds.some(o => o.tag === 'blackhole'), 'missing blackhole outbound');
+
+const portalConfig = { inbounds: [], outbounds: [{ tag: 'direct', protocol: 'freedom' }], routing: { rules: [] } };
+configGenerator.applyReversePortal(portalConfig, links, ['client-in']);
+assert.deepStrictEqual(
+    portalConfig.reverse.portals.map(p => p.domain).sort(),
+    ['11111111.portal-a.reverse.internal', '22222222.portal-b.reverse.internal'],
+    'portal and bridge configs must use the same per-link tunnel domains'
+);
+assert(portalConfig.routing.rules.some(r => JSON.stringify(r.domain) === JSON.stringify(['full:11111111.portal-a.reverse.internal'])), 'missing portal connector rule for first unique domain');
+assert(portalConfig.routing.rules.some(r => JSON.stringify(r.domain) === JSON.stringify(['full:22222222.portal-b.reverse.internal'])), 'missing portal connector rule for second unique domain');
 
 console.log('combined bridge config test passed');
