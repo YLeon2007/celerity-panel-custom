@@ -78,11 +78,14 @@ async function search(filters = {}, opts = {}) {
     const limit = Math.max(1, Math.min(MAX_ROW_LIMIT, Number(opts.limit) || DEFAULT_ROW_LIMIT));
     const offset = Math.max(0, Number(opts.offset) || 0);
 
-    // Alias columns to the names the dashboard/search UI already expects (ts,
-    // node_id, ...), so the client layer stays unchanged.
+    // Times are returned as Unix epoch seconds (absolute instants), not
+    // formatted strings. This is version-independent (no reliance on
+    // formatDateTime specifiers like %M, whose meaning changed across
+    // ClickHouse versions) and timezone-safe — the client renders them in the
+    // viewer's local zone. Aliases stay the same so the API shape is unchanged.
     const sql = `
         SELECT
-            formatDateTime(event_time, '%Y-%m-%d %H:%M:%S', 'UTC') AS ts,
+            toUnixTimestamp(event_time) AS ts,
             node_id, email, source_ip, source_port,
             dest_host, dest_ip, dest_port, network,
             inbound_tag, outbound_tag, action, raw, parse_ok
@@ -119,8 +122,8 @@ async function userIps(email, filters = {}, opts = {}) {
             source_ip AS ip,
             count() AS events,
             uniqExact(if(dest_host != '', dest_host, dest_ip)) AS dests,
-            formatDateTime(max(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS last_seen,
-            formatDateTime(min(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS first_seen
+            toUnixTimestamp(max(event_time)) AS last_seen,
+            toUnixTimestamp(min(event_time)) AS first_seen
         FROM access_events
         ${where} ${andWhere} source_ip != ''
         GROUP BY source_ip
@@ -176,7 +179,7 @@ async function overview(filters = {}, opts = {}) {
 
     const seriesSql = `
         SELECT
-            formatDateTime(toStartOfHour(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS bucket,
+            toUnixTimestamp(toStartOfHour(event_time)) AS bucket,
             count() AS hits,
             countIf(action = 'accepted') AS accepted,
             countIf(action = 'rejected') AS rejected,
@@ -207,7 +210,7 @@ async function overview(filters = {}, opts = {}) {
             uniqExact(${DEST}) AS dests,
             count() AS events,
             countIf(network = 'udp') / nullIf(count(), 0) AS udp_share,
-            formatDateTime(max(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS last_seen
+            toUnixTimestamp(max(event_time)) AS last_seen
         FROM access_events ${where} ${andWhere} email != ''
         GROUP BY email ORDER BY ips DESC LIMIT ${userN}`;
 

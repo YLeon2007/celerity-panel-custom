@@ -42,19 +42,36 @@
         return n.toFixed(i ? 1 : 0) + ' ' + u[i];
     }
 
-    // The server returns naive UTC timestamps ("2026-07-10 10:05:00", no zone).
-    // Parse them as UTC so the whole page displays in the viewer's LOCAL time —
-    // consistent with the datetime-local filter inputs (which are local and get
-    // converted to UTC for the query). Without this the shown times would be
-    // silently shifted by the timezone offset.
+    // Turn a server timestamp into a real Date. The access-log API returns Unix
+    // epoch seconds (absolute instants, zone-safe, version-independent); we also
+    // accept a couple of string shapes for robustness (e.g. Mongo ISO dates in
+    // node status). Anything unrecognised returns null instead of letting
+    // Date() guess — a lenient guess is exactly what turned a malformed CH
+    // string ("21:July:54") into a bogus date before.
     function parseTs(v) {
         if (v == null || v === '') return null;
         if (v instanceof Date) return v;
-        let s = String(v);
-        const naive = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s);
-        if (naive) s = s.replace(' ', 'T') + 'Z';
-        const d = new Date(s);
-        return isNaN(d.getTime()) ? null : d;
+        // Epoch (number or all-digit string). Seconds vs milliseconds is decided
+        // by magnitude: epoch seconds are ~1.7e9, so anything below 1e11 is
+        // seconds and gets scaled to ms.
+        if (typeof v === 'number' || /^\d+$/.test(String(v))) {
+            let n = Number(v);
+            if (n < 1e11) n *= 1000;
+            const d = new Date(n);
+            return isNaN(d.getTime()) ? null : d;
+        }
+        const s = String(v);
+        // Naive "YYYY-MM-DD HH:MM:SS" (no zone) is UTC by our convention.
+        if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s)) {
+            const d = new Date(s.replace(' ', 'T') + 'Z');
+            return isNaN(d.getTime()) ? null : d;
+        }
+        // ISO 8601 carrying an explicit zone (e.g. Mongo dates "…Z" / "+03:00").
+        if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(s)) {
+            const d = new Date(s);
+            return isNaN(d.getTime()) ? null : d;
+        }
+        return null;
     }
 
     function fmtTime(v) {

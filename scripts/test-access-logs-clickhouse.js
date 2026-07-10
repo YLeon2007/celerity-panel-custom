@@ -130,7 +130,17 @@ async function offlineTests() {
     const d = parseLikeMv('this is not an xray line');
     assert.strictEqual(d.parse_ok, 0, 'garbage rejected');
 
-    console.log('  offline: schema + regex OK');
+    // Timestamps must leave ClickHouse as Unix epoch seconds, never as strings
+    // built with formatDateTime. formatDateTime('%M'/'%i') is version-fragile:
+    // %M flipped from "minutes" to "month name" in newer ClickHouse, which
+    // produced garbage like "21:July:54" that Date() then misparsed. Guard the
+    // read-side SQL so no one reintroduces it.
+    const searchSrc = fs.readFileSync(
+        path.join(__dirname, '..', 'src', 'services', 'accessLogs', 'searchService.js'), 'utf8');
+    assert.ok(searchSrc.includes('toUnixTimestamp('), 'searchService emits epoch via toUnixTimestamp');
+    assert.ok(!/formatDateTime\s*\(/.test(searchSrc), 'searchService must not use formatDateTime for output');
+
+    console.log('  offline: schema + regex + epoch SQL guard OK');
 }
 
 async function onlineTests() {
