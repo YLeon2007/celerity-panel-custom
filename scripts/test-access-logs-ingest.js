@@ -1,10 +1,12 @@
 /**
  * End-to-end-ish test for the panel-side ingest spool + processor (no HTTP, no
- * DB, no Parquet binding). Verifies:
+ * ClickHouse). Verifies:
  *   - persistBatch writes an atomic sealed file and lists it,
- *   - the processor gunzips + parses NDJSON, buckets by date/node/hour,
- *   - quarantine of clock-skewed events,
- *   - processed marker + spool removal (idempotency).
+ *   - the processor parses NDJSON into { node_id, raw } rows,
+ *   - client-IP masking rewrites the raw line in place,
+ *   - with ClickHouse not configured, the batch stays spooled (never acked
+ *     without a persisted write) — the at-least-once invariant,
+ *   - processed marker pruning.
  *
  * Uses a throwaway ACCESS_LOGS_DIR so it never touches real data.
  */
@@ -20,8 +22,8 @@ const assert = require('assert');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'al-ingest-'));
 process.env.ACCESS_LOGS_DIR = TMP;
 
-// No MongoDB in this test: disable mongoose op buffering so the best-effort
-// rollup write fails fast instead of hanging for the default 10s timeout.
+// No MongoDB in this test: disable mongoose op buffering so a settings read
+// (used to check the maskClientIp flag) fails fast instead of hanging.
 try { require('mongoose').set('bufferTimeoutMS', 1); } catch (_) { /* mongoose optional */ }
 
 (async () => {
@@ -31,23 +33,19 @@ try { require('mongoose').set('bufferTimeoutMS', 1); } catch (_) { /* mongoose o
 
     const nodeId = 'node123';
 
-    // Build a gzipped NDJSON batch: one good recent line + one ancient (skew).
-    const nowIso = new Date().toISOString();
-    function xrayLine(d) {
+    function xrayLine(d, ip) {
         const y = d.getUTCFullYear();
         const mo = String(d.getUTCMonth() + 1).padStart(2, '0');
         const da = String(d.getUTCDate()).padStart(2, '0');
         const h = String(d.getUTCHours()).padStart(2, '0');
         const mi = String(d.getUTCMinutes()).padStart(2, '0');
         const s = String(d.getUTCSeconds()).padStart(2, '0');
-        return `${y}/${mo}/${da} ${h}:${mi}:${s} 1.2.3.4:5555 accepted tcp:example.com:443 [vless-in -> direct] email: user@x`;
+        return `${y}/${mo}/${da} ${h}:${mi}:${s} ${ip}:5555 accepted tcp:example.com:443 [vless-in -> direct] email: user@x`;
     }
-    const recentLine = xrayLine(new Date());
-    const ancientLine = xrayLine(new Date('2000-01-01T00:00:00Z'));
+    const line = xrayLine(new Date(), '1.2.3.4');
 
     const ndjson =
-        JSON.stringify({ offset: 10, raw: recentLine, read_at: nowIso }) + '\n' +
-        JSON.stringify({ offset: 20, raw: ancientLine, read_at: nowIso }) + '\n';
+        JSON.stringify({ offset: 10, raw: line, read_at: new Date().toISOString() }) + '\n';
     const gz = zlib.gzipSync(Buffer.from(ndjson, 'utf8'));
     const batchId = crypto.createHash('sha256').update(gz).digest('hex');
 
@@ -60,33 +58,36 @@ try { require('mongoose').set('bufferTimeoutMS', 1); } catch (_) { /* mongoose o
     // Duplicate detection is false before processing.
     assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), false);
 
-    // Drain. In this test env the DuckDB native binding is not exercised for
-    // writing; if it is unavailable the batch must stay spooled (never acked
-    // without a persisted write). If it IS available, the batch is fully
-    // processed. Both outcomes are valid — assert the invariant accordingly.
+    // parseSpoolFile yields raw rows tagged with the node id.
+    const parsed = await processService.parseSpoolFile(spoolPath, false);
+    assert.strictEqual(parsed.rows.length, 1, 'one parsed row');
+    assert.strictEqual(parsed.rows[0].node_id, nodeId, 'row tagged with node id');
+    assert.ok(parsed.rows[0].raw.includes('1.2.3.4'), 'raw line preserved');
+
+    // IP masking primitives: IPv4 keeps /24, IPv6 keeps three hextets.
+    assert.strictEqual(processService.maskIp('192.168.1.33'), '192.168.1.0', 'IPv4 masked to /24');
+    assert.strictEqual(processService.maskIp('2001:db8:abcd:12:34::1'), '2001:db8:abcd::', 'IPv6 masked');
+    assert.strictEqual(processService.maskIp(''), '', 'empty stays empty');
+
+    // Masking rewrites the source IP in the raw line (/24).
+    const masked = processService.maskRawLine(line);
+    assert.ok(masked.includes('1.2.3.0'), 'masked to /24');
+    assert.ok(!masked.includes('1.2.3.4:'), 'original source ip scrubbed');
+
+    // Drain with ClickHouse NOT configured: batch must stay spooled and NOT be
+    // marked processed (never ack without a persisted write).
     await processService.drainOnce();
-
-    const duckAvailable = await require('../src/services/accessLogs/duckdbService').isAvailable();
     list = await spoolService.listSpool();
-    if (duckAvailable) {
-        assert.strictEqual(list.length, 0, 'spool drained when storage available');
-        assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), true);
-        // Parquet part file written for the recent event's partition.
-        const parquetRoot = path.join(TMP, 'parquet');
-        assert.ok(fs.existsSync(parquetRoot), 'parquet dir created');
-    } else {
-        assert.strictEqual(list.length, 1, 'batch stays spooled when storage unavailable');
-        assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), false,
-            'not marked processed without a persisted write');
-    }
+    assert.strictEqual(list.length, 1, 'batch stays spooled when ClickHouse not configured');
+    assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), false,
+        'not marked processed without a persisted write');
 
-    // bucketEvents unit: recent -> 1 bucket, ancient -> quarantined.
-    const { parseAccessLine } = require('../src/services/accessLogs/eventContract');
-    const evGood = parseAccessLine(recentLine, { nodeId, offset: 1 });
-    const evOld = parseAccessLine(ancientLine, { nodeId, offset: 2 });
-    const { buckets, quarantined } = processService.bucketEvents([evGood, evOld], nodeId, Date.now());
-    assert.strictEqual(buckets.size, 1, 'one partition bucket');
-    assert.strictEqual(quarantined.length, 1, 'one quarantined');
+    // Marker pruning: a fresh marker with a 0ms TTL is removed.
+    await spoolService.markProcessed(nodeId, batchId);
+    assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), true, 'marker written');
+    const removed = await spoolService.pruneProcessedMarkers(-1000);
+    assert.ok(removed >= 1, 'stale marker pruned');
+    assert.strictEqual(await spoolService.isAlreadyProcessed(nodeId, batchId), false, 'marker gone');
 
     await fsp.rm(TMP, { recursive: true, force: true });
     console.log('test-access-logs-ingest: OK');

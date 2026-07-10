@@ -1,18 +1,21 @@
 /**
- * Spool processor: drains durably-spooled ingest batches into the analytical
- * store.
+ * Spool processor: drains durably-spooled ingest batches into ClickHouse.
  *
  * For each sealed spool file it:
- *   1. gunzips + splits NDJSON into raw events,
- *   2. parses each line via the shared event contract,
- *   3. applies clock-skew quarantine (events too far from panel time are set
- *      aside instead of polluting partitions),
- *   4. hands parsed events to the Parquet writer, partitioned by (date, node, hour),
- *   5. marks the batch processed (idempotency) and removes the spool file.
+ *   1. gunzips + splits NDJSON into { node_id, raw } records,
+ *   2. optionally masks client IPs in the raw line (privacy setting),
+ *   3. inserts the raw rows into ClickHouse access_ingest (a materialized view
+ *      parses them into access_events), using the batch id as a dedup token so
+ *      a retried batch is dropped natively,
+ *   4. marks the batch processed (idempotency) and removes the spool file.
+ *
+ * The panel does NO per-event parsing: ClickHouse does it. That keeps CPU on the
+ * panel proportional to bytes moved, not events, which matters on weak hardware.
  *
  * Runs on a timer and can be nudged via kick() right after an ingest so latency
  * stays low without a tight busy loop. A single-flight guard prevents concurrent
- * drains from racing on the same files.
+ * drains from racing on the same files. When ClickHouse is unavailable the run
+ * stops and everything stays spooled for a later retry (at-least-once).
  */
 
 const zlib = require('zlib');
@@ -21,9 +24,8 @@ const fsp = require('fs/promises');
 const path = require('path');
 
 const logger = require('../../utils/logger');
-const paths = require('./paths');
 const spoolService = require('./spoolService');
-const { parseAccessLine, maskEventSourceIp } = require('./eventContract');
+const clickhouse = require('./clickhouseService');
 
 const gunzip = promisify(zlib.gunzip);
 
@@ -32,43 +34,17 @@ const gunzip = promisify(zlib.gunzip);
 // exhaust panel memory. Legit batches (~500 log lines) are far smaller.
 const MAX_INFLATED_BYTES = 64 * 1024 * 1024; // 64 MB
 
-// Events whose (node-local) timestamp differs from panel time by more than this
-// are quarantined: likely severe clock skew or a bad parse. Keeps partitions
-// bounded to a sane time window.
-const MAX_CLOCK_SKEW_MS = 48 * 60 * 60 * 1000; // 48h
-
 const PROCESS_INTERVAL_MS = 10 * 1000;
 const MAX_FILES_PER_RUN = 50;
+
+// Keep processed dedup markers for a week: long enough to cover any agent retry
+// backoff, short enough to bound the marker directory.
+const PROCESSED_MARKER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 let running = false;
 let timer = null;
 let kickPending = false;
-
-function utcDateStr(date) {
-    return date.toISOString().slice(0, 10); // YYYY-MM-DD
-}
-
-// Split the canonical events of one batch into per-partition buckets keyed by
-// "date|node|hour". Quarantined events are collected separately.
-function bucketEvents(events, nodeId, now) {
-    const buckets = new Map();
-    const quarantined = [];
-    for (const ev of events) {
-        const ts = ev.timestamp instanceof Date ? ev.timestamp : null;
-        if (!ts || Math.abs(now - ts.getTime()) > MAX_CLOCK_SKEW_MS) {
-            quarantined.push(ev);
-            continue;
-        }
-        const dateStr = utcDateStr(ts);
-        const hour = ts.getUTCHours();
-        const key = `${dateStr}|${nodeId}|${hour}`;
-        if (!buckets.has(key)) {
-            buckets.set(key, { dateStr, nodeId, hour, events: [] });
-        }
-        buckets.get(key).events.push(ev);
-    }
-    return { buckets, quarantined };
-}
+let lastMarkerPruneAt = 0;
 
 // Cached maskClientIp flag (checked per drain run, cheap TTL cache).
 let _maskCache = { value: false, at: 0 };
@@ -88,19 +64,41 @@ async function shouldMaskClientIp() {
     return _maskCache.value;
 }
 
-// Parse a single spool file into canonical events tagged with the node id.
+/**
+ * Privacy mask for client IPs (settings.accessLogs.maskClientIp).
+ * IPv4 keeps the /24 (last octet zeroed); IPv6 keeps the first three hextets.
+ * Exact source-IP search becomes impossible by design.
+ */
+function maskIp(ip) {
+    if (!ip) return '';
+    const v4 = ip.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/);
+    if (v4) return `${v4[1]}.0`;
+    if (ip.includes(':')) {
+        const parts = ip.split(':');
+        return parts.slice(0, 3).join(':') + '::';
+    }
+    return ip;
+}
+
+// The source IP is the first token after the timestamp on an Xray access line
+// (optionally prefixed by "from "). Mask it in place so the exact address never
+// reaches storage when masking is enabled. Best-effort: a line that does not
+// match is passed through unchanged (it will land with parse_ok handling in CH).
+const SRC_IP_RE = /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?:from\s+)?)([^\s:]+)/;
+function maskRawLine(raw) {
+    if (!raw) return raw;
+    return raw.replace(SRC_IP_RE, (m, prefix, ip) => prefix + maskIp(ip));
+}
+
+// Parse a single spool file into ClickHouse raw rows tagged with the node id.
 // Throws on corrupt gzip OR on decompression past MAX_INFLATED_BYTES (both are
-// treated as an undecodable batch and quarantined by the caller).
-async function parseSpoolFile(filePath) {
+// treated as an undecodable batch and dropped by the caller).
+async function parseSpoolFile(filePath, mask) {
     const { nodeId } = spoolService.parseSpoolName(filePath);
     const gz = await fsp.readFile(filePath);
     const ndjson = (await gunzip(gz, { maxOutputLength: MAX_INFLATED_BYTES })).toString('utf8');
 
-    // Privacy: when enabled, client IPs are masked BEFORE anything is persisted
-    // (Parquet, rollups, quarantine) so the exact address never hits disk.
-    const mask = await shouldMaskClientIp();
-
-    const events = [];
+    const rows = [];
     for (const line of ndjson.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
@@ -110,34 +108,22 @@ async function parseSpoolFile(filePath) {
         } catch (_) {
             continue; // skip malformed NDJSON record
         }
-        let ev = parseAccessLine(rec.raw, { nodeId, offset: rec.offset });
-        if (mask) ev = maskEventSourceIp(ev);
-        events.push(ev);
+        let raw = String(rec.raw == null ? '' : rec.raw);
+        if (mask) raw = maskRawLine(raw);
+        // The agent also sends a file offset per record; it is only used for
+        // agent-side resume and is deliberately not stored.
+        rows.push({ node_id: nodeId, raw });
     }
-    return { nodeId, events };
+    return { nodeId, rows };
 }
 
-async function quarantineEvents(nodeId, events) {
-    if (!events.length) return;
-    try {
-        await fsp.mkdir(paths.QUARANTINE_DIR, { recursive: true });
-        const name = `${Date.now()}-${nodeId}-${events.length}.jsonl`;
-        const body = events.map(e => JSON.stringify(e)).join('\n') + '\n';
-        await fsp.writeFile(path.join(paths.QUARANTINE_DIR, name), body);
-    } catch (e) {
-        logger.warn(`[AccessLogs] quarantine write failed: ${e.message}`);
-    }
-}
-
-// Process a single spool file end-to-end. Returns the number of events written.
-async function processFile(filePath) {
+// Process a single spool file end-to-end. Returns the number of rows inserted.
+async function processFile(filePath, mask) {
     const { batchId, nodeId } = spoolService.parseSpoolName(filePath);
-    const now = Date.now();
 
     // Crash-recovery fast path: a crash between markProcessed and spool-file
-    // removal leaves an already-processed batch behind. Parquet part-name dedup
-    // would make re-processing harmless, but skipping it avoids the wasted
-    // gunzip + parse work.
+    // removal leaves an already-processed batch behind. The ClickHouse dedup
+    // token would make re-insertion harmless, but skipping avoids wasted work.
     if (batchId && await spoolService.isAlreadyProcessed(nodeId, batchId)) {
         await spoolService.removeSpoolFile(filePath);
         return 0;
@@ -145,47 +131,29 @@ async function processFile(filePath) {
 
     let parsed;
     try {
-        parsed = await parseSpoolFile(filePath);
+        parsed = await parseSpoolFile(filePath, mask);
     } catch (e) {
-        // Undecodable batch (corrupt gzip, etc): quarantine the raw file so it
-        // does not block the queue.
+        // Undecodable batch (corrupt gzip, etc): drop it so it cannot block the
+        // queue. There is no structured content to salvage.
         logger.warn(`[AccessLogs] undecodable batch ${path.basename(filePath)}: ${e.message}`);
-        try {
-            await fsp.mkdir(paths.QUARANTINE_DIR, { recursive: true });
-            await fsp.rename(filePath, path.join(paths.QUARANTINE_DIR, path.basename(filePath)));
-        } catch (_) { await spoolService.removeSpoolFile(filePath); }
+        await spoolService.removeSpoolFile(filePath);
         return 0;
     }
 
-    const { buckets, quarantined } = bucketEvents(parsed.events, parsed.nodeId || nodeId, now);
-
-    let written = 0;
-    const parquetWriter = require('./parquetWriter');
-    const rollupService = require('./rollupService');
-    for (const { dateStr, nodeId: nid, hour, events } of buckets.values()) {
-        if (!events.length) continue;
-        // A write failure (incl. duckdb_unavailable) throws: we deliberately let
-        // it propagate so the batch stays in the spool and is retried later,
+    if (parsed.rows.length > 0) {
+        // A failure here (incl. ClickHouse unavailable) throws: we deliberately
+        // let it propagate so the batch stays in the spool and is retried later,
         // rather than acking data we never persisted.
-        const wr = await parquetWriter.appendPartition(dateStr, nid, hour, events);
-        // Fold into Mongo rollups only when this call actually wrote a new part
-        // (not a dedup hit), so rollups are not double-counted on re-processing.
-        if (!wr.dedup) {
-            await rollupService.foldPartition(dateStr, nid, hour, events);
-        }
-        written += events.length;
+        await clickhouse.insertRaw(parsed.rows, batchId);
     }
 
-    // Only quarantine skewed events and mark processed AFTER a successful write,
-    // so a retry re-runs the whole batch consistently.
-    await quarantineEvents(parsed.nodeId || nodeId, quarantined);
     await spoolService.markProcessed(parsed.nodeId || nodeId, batchId);
     await spoolService.removeSpoolFile(filePath);
-    return written;
+    return parsed.rows.length;
 }
 
 // Track a "storage unavailable" state so the drain loop can back off instead of
-// hammering DuckDB when the native binding is missing.
+// hammering ClickHouse when it is unreachable.
 let storageUnavailable = false;
 
 async function drainOnce() {
@@ -194,25 +162,34 @@ async function drainOnce() {
     let processedFiles = 0;
     let totalEvents = 0;
     try {
+        // Skip entirely when ClickHouse is not configured: keep batches spooled
+        // (backpressure guards the disk) until an admin sets up the connection.
+        if (!(await clickhouse.isConfigured())) {
+            return { processed: 0, unconfigured: true };
+        }
+
+        const mask = await shouldMaskClientIp();
         const files = await spoolService.listSpool();
         const slice = files.slice(0, MAX_FILES_PER_RUN);
         for (const f of slice) {
             try {
-                totalEvents += await processFile(f);
+                totalEvents += await processFile(f, mask);
                 processedFiles++;
                 storageUnavailable = false;
             } catch (e) {
-                if (String(e.message).includes('duckdb_unavailable')) {
-                    // Persistent storage is down: stop this run, keep everything
-                    // spooled, and log once. The interval timer will retry later.
-                    if (!storageUnavailable) {
-                        logger.warn('[AccessLogs] Parquet storage unavailable (DuckDB); batches remain spooled until it recovers');
-                        storageUnavailable = true;
-                    }
-                    break;
+                // Any insert error (connection refused, timeout, auth): stop this
+                // run, keep everything spooled, log once. The timer retries later.
+                if (!storageUnavailable) {
+                    logger.warn(`[AccessLogs] ClickHouse unavailable, batches remain spooled: ${e.message}`);
+                    storageUnavailable = true;
                 }
-                logger.error(`[AccessLogs] processFile ${path.basename(f)} failed: ${e.message}`);
+                break;
             }
+        }
+        // Occasionally prune old dedup markers (at most once a day).
+        if (Date.now() - lastMarkerPruneAt > 24 * 60 * 60 * 1000) {
+            lastMarkerPruneAt = Date.now();
+            spoolService.pruneProcessedMarkers(PROCESSED_MARKER_TTL_MS).catch(() => {});
         }
     } catch (e) {
         logger.error(`[AccessLogs] drain failed: ${e.message}`);
@@ -249,13 +226,13 @@ function stop() {
 }
 
 module.exports = {
-    MAX_CLOCK_SKEW_MS,
     start,
     stop,
     kick,
     drainOnce,
     // exported for tests
-    bucketEvents,
+    maskIp,
+    maskRawLine,
     parseSpoolFile,
     processFile,
 };

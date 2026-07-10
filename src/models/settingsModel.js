@@ -147,10 +147,20 @@ const settingsSchema = new mongoose.Schema({
             enum: ['disabled', 'enabling', 'active', 'disabling', 'error'],
             default: 'disabled',
         },
-        // Retention for searchable Parquet (whole partitions dropped past this).
-        retentionDays: { type: Number, default: 14 },
-        // Hard cap on the central Parquet store (oldest partitions pruned first).
-        maxStorageGb: { type: Number, default: 10 },
+        // Retention window (days). Mapped to a native ClickHouse TTL on the
+        // access_events table; still admin-configurable.
+        retentionDays: { type: Number, default: 30 },
+        // External ClickHouse connection. The password is AES-encrypted at rest
+        // (cryptoService); everything analytical runs on this server, not the
+        // panel. Empty host = feature not backed by storage.
+        clickhouse: {
+            host: { type: String, default: '' },
+            port: { type: Number, default: 8123 },
+            database: { type: String, default: 'default' },
+            username: { type: String, default: 'default' },
+            passwordEncrypted: { type: String, default: '' },
+            secure: { type: Boolean, default: false },
+        },
         // Which nodes ship access logs: all eligible xray nodes, or a subset.
         nodeScope: { type: String, enum: ['all', 'selected'], default: 'all' },
         nodeIds: { type: [String], default: [] },

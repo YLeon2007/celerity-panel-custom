@@ -714,13 +714,28 @@ async function startServer() {
         setupCronJobs();
 
         // Access-logs spool processor. Always started: it is idle when the spool
-        // is empty (feature off) and picks up batches immediately once an admin
-        // enables collection, without needing a restart.
+        // is empty (feature off / ClickHouse not configured) and picks up batches
+        // immediately once collection is enabled, without needing a restart.
         try {
             require('./src/services/accessLogs/processService').start();
         } catch (e) {
             logger.warn(`[AccessLogs] processor start skipped: ${e.message}`);
         }
+
+        // Ensure the ClickHouse schema exists on boot when credentials are set,
+        // so the pipeline can insert immediately. Idempotent (IF NOT EXISTS) and
+        // best-effort: a missing/unreachable ClickHouse just logs and retries on
+        // the next settings save.
+        setTimeout(async () => {
+            try {
+                const clickhouse = require('./src/services/accessLogs/clickhouseService');
+                if (await clickhouse.isConfigured()) {
+                    await clickhouse.ensureSchema();
+                }
+            } catch (e) {
+                logger.warn(`[AccessLogs] ClickHouse schema ensure at boot skipped: ${e.message}`);
+            }
+        }, 15 * 1000);
 
         // Crash recovery: if the panel died mid-reconcile the access-logs state
         // stays stuck in a transitional value. Re-run reconciliation once on
@@ -1048,19 +1063,8 @@ function setupCronJobs() {
         }
     });
     
-    // Access-logs retention & storage-cap enforcement (daily 03:20). Cheap no-op
-    // when the feature is off or the store is empty.
-    cron.schedule('20 3 * * *', async () => {
-        try {
-            const Settings = require('./src/models/settingsModel');
-            const settings = await Settings.get();
-            if (settings?.accessLogs?.enabled) {
-                await require('./src/services/accessLogs/retentionService').enforce();
-            }
-        } catch (error) {
-            logger.error(`[Cron] Access-logs retention failed: ${error.message}`);
-        }
-    });
+    // Access-logs retention is enforced natively by the ClickHouse TTL on the
+    // access_events table (set via settings), so the panel runs no retention job.
 
     // Clean inactive HWID device rows (daily 03:30)
     cron.schedule('30 3 * * *', async () => {

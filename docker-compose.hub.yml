@@ -59,7 +59,7 @@ services:
       - ./logs:/app/logs
       - ./greenlock.d:/app/greenlock.d
       - ./backups:/app/backups
-      # Access-logs pipeline data (Parquet store + ingest spool) must survive
+      # Access-logs ingest spool (batches not yet forwarded to ClickHouse) must survive
       # container rebuilds.
       - ./data:/app/data
     env_file:

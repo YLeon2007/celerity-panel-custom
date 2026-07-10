@@ -50,11 +50,8 @@ cc-agent/cc-agent-linux-arm64
 # Access-logs ingest spool
 data/access-logs/
 
-# Updater sidecar state (last update run log)
+# Updater sidecar state
 data/updater/
-
-# Access-logs pipeline data (Parquet store + ingest spool)
-data/access-logs/
 
 Rules.md
 TODO.md

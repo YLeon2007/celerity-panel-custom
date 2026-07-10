@@ -34,10 +34,14 @@ const cred = require('../src/services/accessLogs/credentialService');
     const s = new Settings({ _id: 'settings' });
     assert.strictEqual(s.accessLogs.enabled, false, 'access logs off by default');
     assert.strictEqual(s.accessLogs.state, 'disabled');
-    assert.strictEqual(s.accessLogs.retentionDays, 14);
-    assert.strictEqual(s.accessLogs.maxStorageGb, 10);
+    assert.strictEqual(s.accessLogs.retentionDays, 30);
     assert.strictEqual(s.accessLogs.nodeScope, 'all');
     assert.strictEqual(s.accessLogs.maskClientIp, false);
+    // ClickHouse connection defaults (empty host = not configured).
+    assert.strictEqual(s.accessLogs.clickhouse.host, '');
+    assert.strictEqual(s.accessLogs.clickhouse.port, 8123);
+    assert.strictEqual(s.accessLogs.clickhouse.database, 'default');
+    assert.strictEqual(s.accessLogs.clickhouse.secure, false);
 }
 
 // --- node model defaults + credential is select:false ---------------------

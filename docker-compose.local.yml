@@ -59,7 +59,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./backups:/app/backups
-      # Access-logs pipeline data (Parquet store + ingest spool).
+      # Access-logs ingest spool (batches not yet forwarded to ClickHouse).
       - ./data:/app/data
     environment:
       MONGO_URI: mongodb://${MONGO_USER:-hysteria}:${MONGO_PASSWORD:-localdevpassword}@mongo:27017/hysteria?authSource=admin

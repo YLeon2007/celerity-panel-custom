@@ -34,7 +34,7 @@
                             <span><%= t('accessLogs.enable') || 'Собирать и анализировать access-логи' %></span>
                         </label>
                         <small class="hint" style="display: block; margin-top: 6px;">
-                            <%= t('accessLogs.enableHint') || 'По умолчанию выключено. Сбор идёт через cc-agent, хранение — в Parquet, поиск — через DuckDB.' %>
+                            <%= t('accessLogs.enableHint') || 'По умолчанию выключено. Сбор идёт через cc-agent, хранение и аналитика — во внешнем ClickHouse.' %>
                         </small>
 
                         <div class="settings-list" style="margin-top: 14px;">
@@ -45,18 +45,63 @@
                         </div>
 
                         <div id="accessLogsSettings" style="margin-top: 14px; <%= al.enabled ? '' : 'display: none;' %>">
+                            <% const ch = al.clickhouse || {}; %>
+                            <h3 style="margin: 4px 0 10px; font-size: 14px;">
+                                <i class="ti ti-database"></i> <%= t('accessLogs.chSection') || 'Подключение ClickHouse' %>
+                            </h3>
+                            <small class="hint" style="display:block; margin-bottom:10px;">
+                                <%= t('accessLogs.chSectionHint') || 'Внешний сервер ClickHouse хранит и анализирует логи. Панель только пересылает данные.' %>
+                            </small>
+                            <div class="settings-grid">
+                                <div class="form-group">
+                                    <label for="accessLogs.clickhouse.host"><%= t('accessLogs.chHost') || 'Хост' %></label>
+                                    <input type="text" name="accessLogs.clickhouse.host" id="accessLogs.clickhouse.host"
+                                           value="<%= ch.host || '' %>" placeholder="clickhouse.example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="accessLogs.clickhouse.port"><%= t('accessLogs.chPort') || 'Порт' %></label>
+                                    <input type="number" name="accessLogs.clickhouse.port" id="accessLogs.clickhouse.port"
+                                           value="<%= ch.port || 8123 %>" min="1" max="65535">
+                                </div>
+                                <div class="form-group">
+                                    <label for="accessLogs.clickhouse.database"><%= t('accessLogs.chDatabase') || 'База данных' %></label>
+                                    <input type="text" name="accessLogs.clickhouse.database" id="accessLogs.clickhouse.database"
+                                           value="<%= ch.database || 'default' %>" placeholder="default">
+                                </div>
+                                <div class="form-group">
+                                    <label for="accessLogs.clickhouse.username"><%= t('accessLogs.chUsername') || 'Пользователь' %></label>
+                                    <input type="text" name="accessLogs.clickhouse.username" id="accessLogs.clickhouse.username"
+                                           value="<%= ch.username || 'default' %>" placeholder="default" autocomplete="off">
+                                </div>
+                                <div class="form-group">
+                                    <label for="accessLogs.clickhouse.password"><%= t('accessLogs.chPassword') || 'Пароль' %></label>
+                                    <input type="password" name="accessLogs.clickhouse.password" id="accessLogs.clickhouse.password"
+                                           value="" placeholder="<%= ch.passwordEncrypted ? '••••••••' : '' %>" autocomplete="new-password">
+                                    <small class="hint"><%= t('accessLogs.chPasswordHint') || 'Оставьте пустым, чтобы сохранить текущий пароль.' %></small>
+                                </div>
+                                <div class="form-group">
+                                    <label class="checkbox-label" style="margin-top: 26px;">
+                                        <input type="checkbox" name="accessLogs.clickhouse.secure" id="accessLogs.clickhouse.secure"
+                                               <%= ch.secure ? 'checked' : '' %>>
+                                        <span><%= t('accessLogs.chSecure') || 'HTTPS (TLS)' %></span>
+                                    </label>
+                                </div>
+                            </div>
+                            <div style="margin: 6px 0 4px;">
+                                <button type="button" class="btn" id="accessLogsTestCh">
+                                    <i class="ti ti-plug-connected"></i> <%= t('accessLogs.chTest') || 'Проверить соединение' %>
+                                </button>
+                                <span id="accessLogsTestChResult" class="hint" style="margin-left: 8px;"></span>
+                            </div>
+
+                            <hr class="settings-divider">
+
                             <div class="settings-grid">
                                 <div class="form-group">
                                     <label for="accessLogs.retentionDays"><%= t('accessLogs.retentionDays') || 'Хранение (дней)' %></label>
                                     <input type="number" name="accessLogs.retentionDays" id="accessLogs.retentionDays"
-                                           value="<%= al.retentionDays || 14 %>" min="1" max="365">
-                                    <small class="hint"><%= t('accessLogs.retentionHint') || 'Старые партиции удаляются целиком.' %></small>
-                                </div>
-                                <div class="form-group">
-                                    <label for="accessLogs.maxStorageGb"><%= t('accessLogs.maxStorageGb') || 'Лимит хранилища (ГБ)' %></label>
-                                    <input type="number" name="accessLogs.maxStorageGb" id="accessLogs.maxStorageGb"
-                                           value="<%= al.maxStorageGb || 10 %>" min="1" max="2000">
-                                    <small class="hint"><%= t('accessLogs.maxStorageHint') || 'При превышении удаляются самые старые партиции.' %></small>
+                                           value="<%= al.retentionDays || 30 %>" min="1" max="3650">
+                                    <small class="hint"><%= t('accessLogs.retentionHint') || 'Реализуется нативным TTL в ClickHouse.' %></small>
                                 </div>
                             </div>
 
@@ -152,6 +197,45 @@
     if (scope && nodeList) {
         scope.addEventListener('change', function () {
             nodeList.style.display = this.value === 'selected' ? '' : 'none';
+        });
+    }
+
+    const testBtn = document.getElementById('accessLogsTestCh');
+    const testResult = document.getElementById('accessLogsTestChResult');
+    if (testBtn && testResult) {
+        testBtn.addEventListener('click', async function () {
+            const val = (id) => (document.getElementById(id) || {}).value || '';
+            testBtn.disabled = true;
+            testResult.textContent = '…';
+            testResult.style.color = '';
+            try {
+                const res = await fetch('/panel/settings/test-clickhouse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        host: val('accessLogs.clickhouse.host'),
+                        port: val('accessLogs.clickhouse.port'),
+                        database: val('accessLogs.clickhouse.database'),
+                        username: val('accessLogs.clickhouse.username'),
+                        password: val('accessLogs.clickhouse.password'),
+                        secure: document.getElementById('accessLogs.clickhouse.secure').checked,
+                    }),
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    testResult.style.color = 'var(--success, #22c55e)';
+                    testResult.textContent = 'OK' + (data.version ? ' (' + data.version + ')' : '');
+                } else {
+                    testResult.style.color = 'var(--danger, #ef4444)';
+                    testResult.textContent = data.error || 'error';
+                }
+            } catch (e) {
+                testResult.style.color = 'var(--danger, #ef4444)';
+                testResult.textContent = e.message;
+            } finally {
+                testBtn.disabled = false;
+            }
         });
     }
 })();

@@ -398,10 +398,22 @@ router.post('/settings', async (req, res) => {
             updates['accessLogs.enabled'] = wantEnabled;
             const retention = parseInt(req.body['accessLogs.retentionDays'], 10);
             updates['accessLogs.retentionDays'] = Number.isFinite(retention)
-                ? Math.min(365, Math.max(1, retention)) : 14;
-            const maxGb = parseInt(req.body['accessLogs.maxStorageGb'], 10);
-            updates['accessLogs.maxStorageGb'] = Number.isFinite(maxGb)
-                ? Math.min(2000, Math.max(1, maxGb)) : 10;
+                ? Math.min(3650, Math.max(1, retention)) : 30;
+
+            // External ClickHouse connection. The password is only overwritten
+            // when a non-empty value is submitted, so leaving the field blank
+            // keeps the stored credential (never wiped by an empty form field).
+            updates['accessLogs.clickhouse.host'] = String(req.body['accessLogs.clickhouse.host'] || '').trim().slice(0, 255);
+            const chPort = parseInt(req.body['accessLogs.clickhouse.port'], 10);
+            updates['accessLogs.clickhouse.port'] = Number.isFinite(chPort)
+                ? Math.min(65535, Math.max(1, chPort)) : 8123;
+            updates['accessLogs.clickhouse.database'] = String(req.body['accessLogs.clickhouse.database'] || 'default').trim().slice(0, 128);
+            updates['accessLogs.clickhouse.username'] = String(req.body['accessLogs.clickhouse.username'] || 'default').trim().slice(0, 128);
+            updates['accessLogs.clickhouse.secure'] = req.body['accessLogs.clickhouse.secure'] === 'on';
+            const chPassword = req.body['accessLogs.clickhouse.password'];
+            if (chPassword !== undefined && chPassword !== '') {
+                updates['accessLogs.clickhouse.passwordEncrypted'] = cryptoService.encrypt(String(chPassword));
+            }
             const scope = req.body['accessLogs.nodeScope'] === 'selected' ? 'selected' : 'all';
             updates['accessLogs.nodeScope'] = scope;
             const rawNodeIds = req.body['accessLogs.nodeIds'];
@@ -451,8 +463,20 @@ router.post('/settings', async (req, res) => {
 
         // Kick off access-log reconciliation in the background so the request
         // stays fast (Xray restarts on nodes must not block the HTTP response).
+        // Also ensure the ClickHouse schema exists and its retention TTL matches
+        // the saved setting; both are idempotent and off the request path.
         if (accessLogsToggled) {
-            setImmediate(() => {
+            setImmediate(async () => {
+                const clickhouse = require('../../services/accessLogs/clickhouseService');
+                try {
+                    clickhouse.reset();
+                    if (await clickhouse.isConfigured()) {
+                        await clickhouse.ensureSchema();
+                        await clickhouse.applyRetention(updates['accessLogs.retentionDays']);
+                    }
+                } catch (err) {
+                    logger.error('[AccessLogs] ClickHouse setup after settings save failed:', err.message);
+                }
                 require('../../services/accessLogs/provisionService')
                     .reconcileAll()
                     .catch(err => logger.error('[AccessLogs] Reconcile after settings save failed:', err.message));
@@ -834,6 +858,40 @@ router.post('/settings/test-s3', async (req, res) => {
         
         if (result.success) {
             res.json({ success: true });
+        } else {
+            res.status(400).json({ error: result.error });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /settings/test-clickhouse - Verify ClickHouse credentials before saving.
+router.post('/settings/test-clickhouse', async (req, res) => {
+    try {
+        const clickhouse = require('../../services/accessLogs/clickhouseService');
+        const host = String(req.body.host || '').trim();
+        if (!host) {
+            return res.status(400).json({ error: res.locals.t?.('accessLogs.chHostRequired') || 'Host is required' });
+        }
+        // If the password field was left blank, fall back to the stored one so a
+        // test on an existing config does not require re-typing the secret.
+        let passwordEncrypted = '';
+        if (!req.body.password) {
+            const settings = await Settings.get();
+            passwordEncrypted = settings?.accessLogs?.clickhouse?.passwordEncrypted || '';
+        }
+        const result = await clickhouse.testConnection({
+            host,
+            port: req.body.port,
+            database: req.body.database,
+            username: req.body.username,
+            password: req.body.password || '',
+            passwordEncrypted,
+            secure: req.body.secure === 'on' || req.body.secure === true || req.body.secure === 'true',
+        });
+        if (result.ok) {
+            res.json({ success: true, version: result.version });
         } else {
             res.status(400).json({ error: result.error });
         }

@@ -1,74 +1,66 @@
 /**
- * Search & analytics over the Parquet access-log store (read side).
+ * Search & analytics over the ClickHouse access-log store (read side).
  *
- * Builds parameterized DuckDB SQL against the Hive-partitioned Parquet glob and
- * runs it through the isolated duckdbService worker. All user input is bound as
- * parameters — never interpolated — and partition pruning is pushed down via the
- * date/hour columns so DuckDB only touches relevant files.
+ * Builds parameterized ClickHouse SQL (using {name:Type} placeholders bound via
+ * query_params) against the access_events table. All user input is bound as
+ * parameters, never interpolated. ClickHouse does the heavy lifting on its own
+ * server, so the panel stays light and queries can run concurrently.
  *
- * When DuckDB is unavailable the service returns { degraded: true } so callers
- * can fall back to Mongo rollups without throwing.
+ * When ClickHouse is not configured/reachable the service returns
+ * { degraded: true } so callers can render a "configure ClickHouse" banner
+ * instead of throwing.
  */
 
-const path = require('path');
-const paths = require('./paths');
-const duckdb = require('./duckdbService');
+const clickhouse = require('./clickhouseService');
 const logger = require('../../utils/logger');
-
-// Glob covering every part file. DuckDB reads hive_partitioning so date=/node_id=
-// /hour= become queryable columns, enabling partition pruning.
-const PARQUET_GLOB = path.join(paths.PARQUET_DIR, '**', '*.parquet').replace(/\\/g, '/');
 
 const MAX_ROW_LIMIT = 5000;
 const DEFAULT_ROW_LIMIT = 200;
 
 // Whitelisted sortable columns to avoid any injection via ORDER BY.
-const SORTABLE = new Set(['ts', 'email', 'source_ip', 'dest_host', 'dest_ip', 'action', 'network']);
+const SORTABLE = new Set(['event_time', 'email', 'source_ip', 'dest_host', 'dest_ip', 'action', 'network']);
 
-// Build a FROM clause with hive partitioning + union_by_name so schema drift
-// across part files never breaks a query.
-function fromClause() {
-    return `read_parquet('${PARQUET_GLOB.replace(/'/g, "''")}', hive_partitioning = true, union_by_name = true)`;
-}
-
-// Translate high-level filters into a parameterized WHERE + params array.
-// Time filters are duplicated onto the hive partition column (`date`, a
-// YYYY-MM-DD string; lexicographic order == chronological) so DuckDB prunes
-// whole partitions instead of opening every part file's footer.
+// Translate high-level filters into a parameterized WHERE + a params object for
+// ClickHouse query_params. Returns { where, params } where `where` already
+// includes the leading "WHERE" (or is empty).
 function buildWhere(filters = {}) {
     const clauses = [];
-    const params = [];
+    const params = {};
 
+    // Time bounds are passed as unix seconds and materialized as UTC DateTimes,
+    // so comparisons never depend on the ClickHouse server timezone.
     if (filters.from instanceof Date) {
-        clauses.push('date >= ?'); params.push(filters.from.toISOString().slice(0, 10));
-        clauses.push('ts >= ?'); params.push(filters.from.toISOString());
+        clauses.push("event_time >= toDateTime({from:UInt32}, 'UTC')");
+        params.from = toUnixSeconds(filters.from);
     }
     if (filters.to instanceof Date) {
-        clauses.push('date <= ?'); params.push(filters.to.toISOString().slice(0, 10));
-        clauses.push('ts <= ?'); params.push(filters.to.toISOString());
+        clauses.push("event_time <= toDateTime({to:UInt32}, 'UTC')");
+        params.to = toUnixSeconds(filters.to);
     }
-    if (filters.nodeId) { clauses.push('node_id = ?'); params.push(String(filters.nodeId)); }
-    if (filters.email) { clauses.push('email = ?'); params.push(String(filters.email)); }
-    if (filters.sourceIp) { clauses.push('source_ip = ?'); params.push(String(filters.sourceIp)); }
-    if (filters.action) { clauses.push('action = ?'); params.push(String(filters.action)); }
-    if (filters.network) { clauses.push('network = ?'); params.push(String(filters.network)); }
+    if (filters.nodeId) { clauses.push('node_id = {nodeId:String}'); params.nodeId = String(filters.nodeId); }
+    if (filters.email) { clauses.push('email = {email:String}'); params.email = String(filters.email); }
+    if (filters.sourceIp) { clauses.push('source_ip = {sourceIp:String}'); params.sourceIp = String(filters.sourceIp); }
+    if (filters.action) { clauses.push('action = {action:String}'); params.action = String(filters.action); }
+    if (filters.network) { clauses.push('network = {network:String}'); params.network = String(filters.network); }
 
-    // Destination is matched against host OR ip with a prefix/substring contains
-    // (ILIKE) for usability. Bound as a parameter.
+    // Destination matched against host OR ip with a case-insensitive substring.
     if (filters.destination) {
-        clauses.push('(dest_host ILIKE ? OR dest_ip ILIKE ?)');
-        const like = `%${String(filters.destination)}%`;
-        params.push(like, like);
+        clauses.push('(positionCaseInsensitive(dest_host, {dest:String}) > 0 OR positionCaseInsensitive(dest_ip, {dest:String}) > 0)');
+        params.dest = String(filters.destination);
     }
 
-    // Free-text search across the raw line (bounded, parameterized).
+    // Free-text search across the raw line.
     if (filters.q) {
-        clauses.push('raw ILIKE ?');
-        params.push(`%${String(filters.q)}%`);
+        clauses.push('positionCaseInsensitive(raw, {q:String}) > 0');
+        params.q = String(filters.q);
     }
 
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     return { where, params };
+}
+
+function toUnixSeconds(d) {
+    return Math.max(0, Math.floor(d.getTime() / 1000));
 }
 
 /**
@@ -76,30 +68,33 @@ function buildWhere(filters = {}) {
  * @returns {Promise<{degraded?:boolean, rows?:Array, error?:string}>}
  */
 async function search(filters = {}, opts = {}) {
-    if (!(await duckdb.isAvailable())) {
+    if (!(await clickhouse.isConfigured())) {
         return { degraded: true, rows: [] };
     }
 
     const { where, params } = buildWhere(filters);
-
-    const sortCol = SORTABLE.has(opts.sort) ? opts.sort : 'ts';
+    const sortCol = SORTABLE.has(opts.sort) ? opts.sort : 'event_time';
     const sortDir = opts.dir === 'asc' ? 'ASC' : 'DESC';
     const limit = Math.max(1, Math.min(MAX_ROW_LIMIT, Number(opts.limit) || DEFAULT_ROW_LIMIT));
     const offset = Math.max(0, Number(opts.offset) || 0);
 
+    // Alias columns to the names the dashboard/search UI already expects (ts,
+    // node_id, ...), so the client layer stays unchanged.
     const sql = `
-        SELECT event_id, ts, node_id, email, source_ip, source_port,
-               dest_host, dest_ip, dest_port, network, inbound_tag, outbound_tag,
-               action, raw, parse_ok
-        FROM ${fromClause()}
+        SELECT
+            formatDateTime(event_time, '%Y-%m-%d %H:%M:%S', 'UTC') AS ts,
+            node_id, email, source_ip, source_port,
+            dest_host, dest_ip, dest_port, network,
+            inbound_tag, outbound_tag, action, raw, parse_ok
+        FROM access_events
         ${where}
         ORDER BY ${sortCol} ${sortDir}
         LIMIT ${limit} OFFSET ${offset}
     `;
 
-    const res = await duckdb.query(sql, params, { rowLimit: limit, timeoutMs: opts.timeoutMs || 30000 });
+    const res = await clickhouse.query(sql, params, { timeoutMs: opts.timeoutMs || 30000 });
     if (!res.ok) {
-        if (res.error === 'duckdb_unavailable') return { degraded: true, rows: [] };
+        if (res.error === 'not_configured') return { degraded: true, rows: [] };
         logger.warn(`[AccessLogs] search failed: ${res.error}`);
         return { error: res.error, rows: [] };
     }
@@ -107,36 +102,35 @@ async function search(filters = {}, opts = {}) {
 }
 
 /**
- * Distinct source IPs a single user connected from, within the current filter
- * window — powers the expandable "all IPs for this user" detail row. Ordered by
- * activity so the busiest address is first. `email` is bound as a parameter.
+ * Distinct source IPs a single user connected from, within the filter window —
+ * powers the expandable "all IPs for this user" detail row. Ordered by activity.
  * @returns {Promise<{degraded?:boolean, rows?:Array, error?:string}>}
  */
 async function userIps(email, filters = {}, opts = {}) {
-    if (!(await duckdb.isAvailable())) {
+    if (!(await clickhouse.isConfigured())) {
         return { degraded: true, rows: [] };
     }
     const { where, params } = buildWhere({ ...filters, email: String(email || '') });
     const andWhere = where ? 'AND' : 'WHERE';
     const limit = Math.max(1, Math.min(500, Number(opts.limit) || 200));
 
-    const DEST = "coalesce(nullif(dest_host,''), dest_ip)";
     const sql = `
-        SELECT source_ip AS ip,
-               count(*) AS events,
-               count(DISTINCT ${DEST}) AS dests,
-               max(ts) AS last_seen,
-               min(ts) AS first_seen
-        FROM ${fromClause()}
-        ${where} ${andWhere} source_ip <> ''
+        SELECT
+            source_ip AS ip,
+            count() AS events,
+            uniqExact(if(dest_host != '', dest_host, dest_ip)) AS dests,
+            formatDateTime(max(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS last_seen,
+            formatDateTime(min(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS first_seen
+        FROM access_events
+        ${where} ${andWhere} source_ip != ''
         GROUP BY source_ip
         ORDER BY events DESC
         LIMIT ${limit}
     `;
 
-    const res = await duckdb.query(sql, params, { rowLimit: limit, timeoutMs: opts.timeoutMs || 30000 });
+    const res = await clickhouse.query(sql, params, { timeoutMs: opts.timeoutMs || 30000 });
     if (!res.ok) {
-        if (res.error === 'duckdb_unavailable') return { degraded: true, rows: [] };
+        if (res.error === 'not_configured') return { degraded: true, rows: [] };
         logger.warn(`[AccessLogs] userIps failed: ${res.error}`);
         return { error: res.error, rows: [] };
     }
@@ -144,161 +138,111 @@ async function userIps(email, filters = {}, opts = {}) {
 }
 
 /**
- * Summary aggregates for a dashboard: totals, top destinations, top users, and a
- * per-hour time series. Single query set kept small for weak hardware.
- */
-async function summary(filters = {}, opts = {}) {
-    if (!(await duckdb.isAvailable())) {
-        return { degraded: true };
-    }
-    const { where, params } = buildWhere(filters);
-    const topN = Math.max(1, Math.min(50, Number(opts.topN) || 10));
-
-    const from = fromClause();
-
-    const totalsSql = `SELECT count(*) AS total,
-                              count(DISTINCT email) AS users,
-                              count(DISTINCT source_ip) AS ips
-                       FROM ${from} ${where}`;
-    const topDestSql = `SELECT coalesce(nullif(dest_host,''), dest_ip) AS dest, count(*) AS hits
-                        FROM ${from} ${where}
-                        GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
-    const topUserSql = `SELECT email, count(*) AS hits
-                        FROM ${from} ${where} ${where ? 'AND' : 'WHERE'} email <> ''
-                        GROUP BY email ORDER BY hits DESC LIMIT ${topN}`;
-    const seriesSql = `SELECT date_trunc('hour', ts) AS bucket, count(*) AS hits
-                       FROM ${from} ${where}
-                       GROUP BY bucket ORDER BY bucket`;
-
-    // Run sequentially, not in parallel: the DuckDB service intentionally allows
-    // only one heavy query at a time (weak-hardware constraint), so concurrent
-    // calls would be rejected as "busy".
-    const totals = await duckdb.query(totalsSql, params, { rowLimit: 1 });
-    const topDest = await duckdb.query(topDestSql, params, { rowLimit: topN });
-    const topUser = await duckdb.query(topUserSql, params, { rowLimit: topN });
-    const series = await duckdb.query(seriesSql, params, { rowLimit: 24 * 62 });
-
-    if (!totals.ok && totals.error === 'duckdb_unavailable') return { degraded: true };
-
-    return {
-        totals: (totals.ok && totals.rows[0]) || { total: 0, users: 0, ips: 0 },
-        topDestinations: (topDest.ok && topDest.rows) || [],
-        topUsers: (topUser.ok && topUser.rows) || [],
-        series: (series.ok && series.rows) || [],
-    };
-}
-
-/**
- * Combined dashboard overview computed in a SINGLE DuckDB worker spawn:
- * totals + action/protocol split, an hourly time series (with per-action
- * breakdown), top destinations/ports/blocked, and a per-user aggregate used by
- * both the "users by IP count" (sharing lens) and "users by fan-out" (abuse
- * lens) tables. All filters are bound as parameters; the per-user distinct
- * counts (source IPs, /24 subnets, destinations) are DuckDB-only and therefore
- * absent in degraded mode.
+ * Combined dashboard overview: totals + action/protocol split, an hourly time
+ * series (with per-action breakdown), top destinations/ports/blocked, and a
+ * per-user aggregate for the "users by IP count" (sharing lens) and "users by
+ * fan-out" (abuse lens) tables. All filters are bound as parameters.
  *
- * @returns {Promise<{degraded?:boolean, error?:string, totals?:Object,
- *   series?:Array, topDestinations?:Array, topPorts?:Array, topBlocked?:Array,
- *   users?:Array}>}
+ * ClickHouse runs each query independently on its own server, so these fire
+ * concurrently. Same result shape as before so the route/UI stay unchanged.
  */
 async function overview(filters = {}, opts = {}) {
-    if (!(await duckdb.isAvailable())) {
+    if (!(await clickhouse.isConfigured())) {
         return { degraded: true };
     }
 
     const { where, params } = buildWhere(filters);
-    const from = fromClause();
     const andWhere = where ? 'AND' : 'WHERE';
     const topN = Math.max(1, Math.min(50, Number(opts.topN) || 10));
     const userN = Math.max(1, Math.min(200, Number(opts.userLimit) || 25));
 
     // "dest" = human destination: host when present, else IP.
-    const DEST = "coalesce(nullif(dest_host,''), dest_ip)";
-    // "/24" style subnet for IPv4 (strip last octet); IPv6 left intact.
-    const SUBNET = "regexp_replace(source_ip, '\\.[0-9]+$', '')";
+    const DEST = "if(dest_host != '', dest_host, dest_ip)";
+    // "/24" subnet for IPv4 (strip last octet); IPv6 left intact.
+    const SUBNET = "replaceRegexpOne(source_ip, '\\\\.[0-9]+$', '')";
 
-    // Every query shares the same WHERE (and therefore the same params array);
-    // the extra per-query predicates below add no new bind parameters.
-    const queries = [
-        {
-            key: 'totals', rowLimit: 1, params,
-            sql: `SELECT
-                    count(*) AS total,
-                    count(DISTINCT email) AS users,
-                    count(DISTINCT source_ip) AS ips,
-                    count(DISTINCT ${DEST}) AS dests,
-                    count(*) FILTER (WHERE action='accepted') AS accepted,
-                    count(*) FILTER (WHERE action='rejected') AS rejected,
-                    count(*) FILTER (WHERE action='blocked')  AS blocked,
-                    count(*) FILTER (WHERE network='tcp') AS tcp,
-                    count(*) FILTER (WHERE network='udp') AS udp
-                  FROM ${from} ${where}`,
-        },
-        {
-            key: 'series', rowLimit: 24 * 62, params,
-            sql: `SELECT date_trunc('hour', ts) AS bucket,
-                         count(*) AS hits,
-                         count(*) FILTER (WHERE action='accepted') AS accepted,
-                         count(*) FILTER (WHERE action='rejected') AS rejected,
-                         count(*) FILTER (WHERE action='blocked')  AS blocked
-                  FROM ${from} ${where}
-                  GROUP BY bucket ORDER BY bucket`,
-        },
-        {
-            key: 'topDest', rowLimit: topN, params,
-            sql: `SELECT ${DEST} AS dest, count(*) AS hits
-                  FROM ${from} ${where}
-                  GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`,
-        },
-        {
-            key: 'topPorts', rowLimit: topN, params,
-            sql: `SELECT dest_port AS port, count(*) AS hits
-                  FROM ${from} ${where} ${andWhere} dest_port IS NOT NULL
-                  GROUP BY dest_port ORDER BY hits DESC LIMIT ${topN}`,
-        },
-        {
-            key: 'topBlocked', rowLimit: topN, params,
-            sql: `SELECT ${DEST} AS dest, count(*) AS hits
-                  FROM ${from} ${where} ${andWhere} action IN ('blocked','rejected')
-                  GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`,
-        },
-        {
-            key: 'users', rowLimit: userN, params,
-            sql: `SELECT email,
-                         count(DISTINCT source_ip) AS ips,
-                         count(DISTINCT ${SUBNET}) AS subnets,
-                         count(DISTINCT ${DEST}) AS dests,
-                         count(*) AS events,
-                         (count(*) FILTER (WHERE network='udp'))*1.0 / nullif(count(*),0) AS udp_share,
-                         max(ts) AS last_seen
-                  FROM ${from} ${where} ${andWhere} email <> ''
-                  GROUP BY email ORDER BY ips DESC LIMIT ${userN}`,
-        },
-    ];
+    const totalsSql = `
+        SELECT
+            count() AS total,
+            uniqExact(email) AS users,
+            uniqExact(source_ip) AS ips,
+            uniqExact(${DEST}) AS dests,
+            countIf(action = 'accepted') AS accepted,
+            countIf(action = 'rejected') AS rejected,
+            countIf(action = 'blocked')  AS blocked,
+            countIf(network = 'tcp') AS tcp,
+            countIf(network = 'udp') AS udp
+        FROM access_events ${where}`;
 
-    const res = await duckdb.queryBatch(queries, { timeoutMs: opts.timeoutMs || 45000 });
-    if (!res.ok) {
-        if (res.error === 'duckdb_unavailable') return { degraded: true };
-        logger.warn(`[AccessLogs] overview failed: ${res.error}`);
-        return { error: res.error };
+    const seriesSql = `
+        SELECT
+            formatDateTime(toStartOfHour(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS bucket,
+            count() AS hits,
+            countIf(action = 'accepted') AS accepted,
+            countIf(action = 'rejected') AS rejected,
+            countIf(action = 'blocked')  AS blocked
+        FROM access_events ${where}
+        GROUP BY bucket ORDER BY bucket`;
+
+    const topDestSql = `
+        SELECT ${DEST} AS dest, count() AS hits
+        FROM access_events ${where}
+        GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
+
+    const topPortsSql = `
+        SELECT dest_port AS port, count() AS hits
+        FROM access_events ${where} ${andWhere} dest_port != 0
+        GROUP BY dest_port ORDER BY hits DESC LIMIT ${topN}`;
+
+    const topBlockedSql = `
+        SELECT ${DEST} AS dest, count() AS hits
+        FROM access_events ${where} ${andWhere} action IN ('blocked','rejected')
+        GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
+
+    const usersSql = `
+        SELECT
+            email,
+            uniqExact(source_ip) AS ips,
+            uniqExact(${SUBNET}) AS subnets,
+            uniqExact(${DEST}) AS dests,
+            count() AS events,
+            countIf(network = 'udp') / nullIf(count(), 0) AS udp_share,
+            formatDateTime(max(event_time), '%Y-%m-%d %H:%M:%S', 'UTC') AS last_seen
+        FROM access_events ${where} ${andWhere} email != ''
+        GROUP BY email ORDER BY ips DESC LIMIT ${userN}`;
+
+    const timeoutMs = opts.timeoutMs || 30000;
+    // Fire concurrently; ClickHouse handles the parallelism server-side.
+    const [totals, series, topDest, topPorts, topBlocked, users] = await Promise.all([
+        clickhouse.query(totalsSql, params, { timeoutMs }),
+        clickhouse.query(seriesSql, params, { timeoutMs }),
+        clickhouse.query(topDestSql, params, { timeoutMs }),
+        clickhouse.query(topPortsSql, params, { timeoutMs }),
+        clickhouse.query(topBlockedSql, params, { timeoutMs }),
+        clickhouse.query(usersSql, params, { timeoutMs }),
+    ]);
+
+    // If the very first query could not even connect, report degraded so the UI
+    // shows the "configure ClickHouse" state rather than empty zeros.
+    if (!totals.ok && totals.error === 'not_configured') return { degraded: true };
+    if (!totals.ok) {
+        logger.warn(`[AccessLogs] overview failed: ${totals.error}`);
+        return { error: totals.error };
     }
 
-    const r = res.results || {};
     return {
-        totals: (r.totals && r.totals[0]) || { total: 0, users: 0, ips: 0, dests: 0 },
-        series: r.series || [],
-        topDestinations: r.topDest || [],
-        topPorts: r.topPorts || [],
-        topBlocked: r.topBlocked || [],
-        users: r.users || [],
+        totals: (totals.rows && totals.rows[0]) || { total: 0, users: 0, ips: 0, dests: 0 },
+        series: (series.ok && series.rows) || [],
+        topDestinations: (topDest.ok && topDest.rows) || [],
+        topPorts: (topPorts.ok && topPorts.rows) || [],
+        topBlocked: (topBlocked.ok && topBlocked.rows) || [],
+        users: (users.ok && users.rows) || [],
     };
 }
 
 module.exports = {
-    PARQUET_GLOB,
     buildWhere,
     search,
     userIps,
-    summary,
     overview,
 };

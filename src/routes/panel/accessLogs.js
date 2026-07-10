@@ -5,15 +5,15 @@
  *   GET  /panel/access-logs             -> dashboard page
  *   GET  /panel/access-logs/api/analytics -> combined overview: totals, series,
  *                                          top dests/ports/blocked, per-user
- *                                          IP/fan-out (Parquet via DuckDB in one
- *                                          worker spawn; Mongo rollups when degraded)
- *   GET  /panel/access-logs/api/search  -> paged raw-event search (DuckDB)
+ *                                          IP/fan-out (ClickHouse). degraded when
+ *                                          ClickHouse is not configured/reachable.
+ *   GET  /panel/access-logs/api/search  -> paged raw-event search (ClickHouse)
  *   GET  /panel/access-logs/api/status  -> per-node shipping + pipeline status
  *   POST /panel/access-logs/api/purge   -> delete the entire stored dataset
  *
  * Search/summary never interpolate user input into SQL — filters are bound as
- * parameters inside searchService. When the feature is off, the page shows a
- * banner and the APIs return empty/disabled payloads.
+ * ClickHouse query parameters inside searchService. When the feature is off, the
+ * page shows a banner and the APIs return empty/disabled payloads.
  */
 
 const express = require('express');
@@ -87,28 +87,36 @@ router.get('/access-logs/api/analytics', async (req, res) => {
         const result = await searchService.overview(filters, { topN: 10, userLimit: 25 });
 
         if (result.degraded) {
-            // DuckDB is down: fall back to Mongo rollups for the cheap aggregates
-            // (totals + timeline + top destinations). Per-user IP/fan-out tables
-            // and port/blocked breakdowns need Parquet, so they are empty and the
-            // UI flags them as requiring DuckDB.
-            const rollupService = require('../../services/accessLogs/rollupService');
-            const from = filters.from || new Date(Date.now() - 24 * 60 * 60 * 1000);
-            const to = filters.to || new Date();
-            const roll = await rollupService.readSummary(from, to, filters.nodeId);
+            // ClickHouse is not configured/reachable: the whole feature is backed
+            // by it, so there is nothing to show. The UI renders a "configure
+            // ClickHouse" banner instead of zeros.
             return res.json({
                 enabled: true,
                 degraded: true,
-                duckdbRequired: true,
-                totals: roll.totals,
-                series: roll.series,
-                topDestinations: roll.topDestinations,
+                chRequired: true,
+                totals: {},
+                series: [],
+                topDestinations: [],
                 topPorts: [],
                 topBlocked: [],
                 users: [],
             });
         }
         if (result.error) {
-            return res.json({ enabled: true, error: result.error, totals: {}, series: [], users: [] });
+            // Configured but the query failed (ClickHouse down, auth error...):
+            // surface the degraded banner instead of a page full of zeros.
+            return res.json({
+                enabled: true,
+                degraded: true,
+                chRequired: true,
+                error: result.error,
+                totals: {},
+                series: [],
+                topDestinations: [],
+                topPorts: [],
+                topBlocked: [],
+                users: [],
+            });
         }
         return res.json({ enabled: true, degraded: false, ...result });
     } catch (error) {
@@ -156,7 +164,7 @@ router.get('/access-logs/api/status', async (req, res) => {
         const Settings = require('../../models/settingsModel');
         const HyNode = require('../../models/hyNodeModel');
         const spoolService = require('../../services/accessLogs/spoolService');
-        const duckdb = require('../../services/accessLogs/duckdbService');
+        const clickhouse = require('../../services/accessLogs/clickhouseService');
 
         const settings = await Settings.get();
         const nodes = await HyNode.find({
@@ -165,14 +173,14 @@ router.get('/access-logs/api/status', async (req, res) => {
         }).select('name agentVersion xray.accessLogs').lean();
 
         const spool = await spoolService.spoolSize();
-        const duckAvailable = await duckdb.isAvailable();
+        const chAvailable = await clickhouse.isAvailable();
 
         res.json({
             enabled: !!settings?.accessLogs?.enabled,
             state: settings?.accessLogs?.state || 'disabled',
             stats: settings?.accessLogs?.stats || {},
             spool,
-            duckdb: duckAvailable,
+            clickhouse: chAvailable,
             nodes: nodes.map(n => ({
                 id: String(n._id),
                 name: n.name,
@@ -192,14 +200,18 @@ router.post('/access-logs/api/purge', async (req, res) => {
     try {
         const fsp = require('fs/promises');
         const paths = require('../../services/accessLogs/paths');
-        const AccessLogRollup = require('../../models/accessLogRollupModel');
+        const clickhouse = require('../../services/accessLogs/clickhouseService');
 
-        // Remove Parquet, incoming spool, and quarantine; recreate empty dirs.
-        for (const dir of [paths.PARQUET_DIR, paths.INCOMING_DIR, paths.QUARANTINE_DIR]) {
-            await fsp.rm(dir, { recursive: true, force: true });
-            await fsp.mkdir(dir, { recursive: true });
+        // Drop stored events in ClickHouse (keeps the schema).
+        try {
+            await clickhouse.truncate();
+        } catch (e) {
+            logger.warn(`[AccessLogs] purge: ClickHouse truncate skipped: ${e.message}`);
         }
-        await AccessLogRollup.deleteMany({});
+
+        // Clear the local incoming spool so pending batches are not re-inserted.
+        await fsp.rm(paths.INCOMING_DIR, { recursive: true, force: true });
+        await fsp.mkdir(paths.INCOMING_DIR, { recursive: true });
 
         // Reset the aggregate ingest counters so the settings dashboard reflects
         // the now-empty dataset.

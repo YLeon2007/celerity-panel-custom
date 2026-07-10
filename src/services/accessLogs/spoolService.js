@@ -2,18 +2,19 @@
  * Panel-side durable ingest spool.
  *
  * The ingest endpoint accepts a gzipped NDJSON batch and, before doing any
- * parsing/Parquet work, persists the raw bytes to disk with an atomic
+ * forwarding work, persists the raw bytes to disk with an atomic
  * write-then-rename. This gives at-least-once durability: once the batch is on
  * disk we can ACK the agent, and a separate processing stage drains the spool
- * into Parquet. A crash between ACK and processing simply leaves the batch in
+ * into ClickHouse. A crash between ACK and processing simply leaves the batch in
  * the spool to be picked up on restart.
  *
  * Idempotency: the batch id (sha256 of the raw bytes, sent as X-Batch-Id and
  * re-verified here) is embedded in the spool file name. A retried identical
  * batch that was already processed is rejected via the dedup marker directory;
  * a retry that races the processor may create a second spool file (names carry
- * a timestamp prefix), which is harmless: the Parquet part name is a content
- * hash, so re-processing the same events dedups at the storage layer.
+ * a timestamp prefix), which is harmless: the batch id is passed to ClickHouse
+ * as an insert deduplication token, so re-processing the same events dedups at
+ * the storage layer.
  */
 
 const fs = require('fs');
@@ -125,6 +126,28 @@ async function removeSpoolFile(filePath) {
     }
 }
 
+// Prune processed dedup markers older than maxAgeMs. Without the old retention
+// job these zero-byte files would accumulate forever; a bounded window keeps the
+// dedup guard useful (covers agent retry backoff) without unbounded growth.
+async function pruneProcessedMarkers(maxAgeMs) {
+    const cutoff = Date.now() - maxAgeMs;
+    let removed = 0;
+    try {
+        const entries = await fsp.readdir(PROCESSED_DIR, { withFileTypes: true });
+        for (const e of entries) {
+            if (!e.isFile()) continue;
+            const p = path.join(PROCESSED_DIR, e.name);
+            try {
+                const st = await fsp.stat(p);
+                if (st.mtimeMs < cutoff) { await fsp.unlink(p); removed++; }
+            } catch (_) { /* ignore */ }
+        }
+    } catch (e) {
+        if (e.code !== 'ENOENT') logger.warn(`[AccessLogs] pruneProcessedMarkers: ${e.message}`);
+    }
+    return removed;
+}
+
 // Parse node id + batch id back out of a spool file name.
 function parseSpoolName(filePath) {
     const base = path.basename(filePath).replace(/\.ndjson\.gz$/, '');
@@ -146,6 +169,7 @@ module.exports = {
     listSpool,
     spoolSize,
     removeSpoolFile,
+    pruneProcessedMarkers,
     parseSpoolName,
     spoolFileName,
 };

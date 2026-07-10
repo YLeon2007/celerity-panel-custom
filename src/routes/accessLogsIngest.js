@@ -11,8 +11,8 @@
  *   5. Backpressure: 429 when the panel spool is over its cap.
  *   6. Durably spool the raw bytes (atomic write), then ACK.
  *
- * Parsing/Parquet happens in a separate processing stage draining the spool, so
- * the request path stays fast and the endpoint is safe under load.
+ * Forwarding to ClickHouse happens in a separate processing stage draining the
+ * spool, so the request path stays fast and the endpoint is safe under load.
  */
 
 const express = require('express');

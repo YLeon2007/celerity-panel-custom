@@ -74,8 +74,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./logs:/app/logs
       - ./backups:/app/backups
-      # Access-logs pipeline data (Parquet store + ingest spool) must survive
-      # container rebuilds.
+      # Access-logs ingest spool must survive container rebuilds (batches not
+      # yet forwarded to ClickHouse live here).
       - ./data:/app/data
       - caddy_data:/caddy_data:ro
     env_file:

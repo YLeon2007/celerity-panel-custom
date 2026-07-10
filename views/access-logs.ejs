@@ -13,7 +13,7 @@
     <!-- Degraded-mode banner (toggled by JS) -->
     <div id="alDegraded" class="alert alert-info" style="display:none; margin-bottom:14px;">
         <i class="ti ti-info-circle"></i>
-        <%= t('accessLogs.searchDegraded') || 'Детальный поиск недоступен (DuckDB не готов); показаны только агрегаты.' %>
+        <%= t('accessLogs.chRequired') || 'Функция требует ClickHouse. Настройте подключение в Настройках.' %>
     </div>
 
     <!-- Summary cards -->
@@ -346,7 +346,7 @@ window.__AL_I18N = {
     purgeConfirm: <%- JSON.stringify(t('accessLogs.purgeConfirm') || 'Удалить все сохранённые access-логи? Это необратимо.') %>,
     noResults: <%- JSON.stringify(t('accessLogs.noResults') || 'Ничего не найдено') %>,
     never: <%- JSON.stringify(t('settings.never') || 'никогда') %>,
-    duckdbRequired: <%- JSON.stringify(t('accessLogs.duckdbRequired') || 'Виджет требует DuckDB, который сейчас недоступен.') %>,
+    chRequired: <%- JSON.stringify(t('accessLogs.chRequired') || 'ClickHouse is required. Configure the connection in Settings.') %>,
     noIps: <%- JSON.stringify(t('accessLogs.noIps') || 'Нет IP за выбранный период.') %>,
     accepted: <%- JSON.stringify(t('accessLogs.stateActive') || 'accepted') %>,
     labels: {

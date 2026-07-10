@@ -52,7 +52,7 @@ services:
     volumes:
       - app_logs:/app/logs
       - app_backups:/app/backups
-      # Access-logs pipeline data (Parquet store + ingest spool).
+      # Access-logs ingest spool (batches not yet forwarded to ClickHouse).
       - app_data:/app/data
 
 volumes:

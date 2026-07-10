@@ -1,11 +1,10 @@
 // Access-logs dashboard: filters, analytics overview (charts + user/top tables),
 // on-demand event search, node status, purge.
 //
-// All DuckDB-backed data comes from a single /api/analytics call (the server
-// runs the whole overview in one worker spawn). The raw-event search is a
-// separate on-demand request. Requests are issued sequentially, never in
-// parallel, because the panel intentionally allows only one heavy DuckDB query
-// at a time (weak-hardware constraint) and parallel calls would be rejected.
+// The whole overview comes from a single /api/analytics call (the server fans
+// the aggregate queries out to ClickHouse). The raw-event search is a separate
+// on-demand request. Requests are issued sequentially so the slower analytics
+// response does not delay the search rows the user is usually after.
 (function () {
     'use strict';
 
@@ -43,8 +42,8 @@
         return n.toFixed(i ? 1 : 0) + ' ' + u[i];
     }
 
-    // DuckDB returns naive UTC timestamps ("2026-07-10 10:05:00", no zone). Parse
-    // them as UTC so the whole page displays in the viewer's LOCAL time —
+    // The server returns naive UTC timestamps ("2026-07-10 10:05:00", no zone).
+    // Parse them as UTC so the whole page displays in the viewer's LOCAL time —
     // consistent with the datetime-local filter inputs (which are local and get
     // converted to UTC for the query). Without this the shown times would be
     // silently shifted by the timezone offset.
@@ -359,9 +358,10 @@
             renderUsers(data.users);
             renderTops(data);
 
-            // In degraded mode the DuckDB-only widgets are empty; hint why.
-            if (data.duckdbRequired) {
-                const note = (span) => '<tr><td class="al-empty" colspan="' + span + '">' + esc(I18N.duckdbRequired) + '</td></tr>';
+            // Degraded mode (ClickHouse not configured/unreachable): widgets are
+            // empty; hint why.
+            if (data.chRequired) {
+                const note = (span) => '<tr><td class="al-empty" colspan="' + span + '">' + esc(I18N.chRequired) + '</td></tr>';
                 if (!(data.users || []).length) { $('alUsersByIp').innerHTML = note(5); $('alUsersByFanout').innerHTML = note(4); }
                 if (!(data.topPorts || []).length) $('alTopPorts').innerHTML = note(2);
                 if (!(data.topBlocked || []).length) $('alTopBlocked').innerHTML = note(2);
@@ -417,8 +417,8 @@
         }
     }
 
-    // Sequential refresh: analytics -> search -> status (never parallel, to
-    // respect the single-concurrent-DuckDB-query limit).
+    // Sequential refresh: analytics -> search -> status. Keeps the page calm and
+    // avoids piling concurrent aggregate queries onto ClickHouse from one tab.
     async function refreshAll() {
         await loadAnalytics();
         await loadSearch();
