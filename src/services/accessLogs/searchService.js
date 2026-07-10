@@ -186,7 +186,7 @@ async function overview(filters = {}, opts = {}) {
 
     const topDestSql = `
         SELECT ${DEST} AS dest, count() AS hits
-        FROM access_events ${where}
+        FROM access_events ${where} ${andWhere} ${DEST} != ''
         GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
 
     const topPortsSql = `
@@ -196,7 +196,7 @@ async function overview(filters = {}, opts = {}) {
 
     const topBlockedSql = `
         SELECT ${DEST} AS dest, count() AS hits
-        FROM access_events ${where} ${andWhere} action IN ('blocked','rejected')
+        FROM access_events ${where} ${andWhere} action IN ('blocked','rejected') AND ${DEST} != ''
         GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`;
 
     const usersSql = `

@@ -51,6 +51,17 @@ const CH_LINE_RE =
     '(?:\\s+email:\\s*(\\S+))?' +
     '\\s*$';
 
+// Fallback for connection-level error lines that are NOT access records, e.g.:
+//   2026/07/10 17:41:28 from 95.24.24.226:9048 rejected proxy/vless/encoding: invalid request user id: <uuid>
+// These carry a timestamp, source and action but no "tcp:/udp:" destination
+// (an attacker/scanner hitting an inbound with a bad UUID). Captures:
+//   1 ts, 2 src, 3 action. The tail (error text) stays in `raw`.
+const CH_ERR_RE =
+    '^(\\d{4}/\\d{2}/\\d{2} \\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)\\s+' +
+    '(?:from\\s+)?' +
+    '(\\S+?)\\s+' +
+    '(accepted|rejected|blocked)(?:\\s|$)';
+
 // Escape a JS string for use inside a single-quoted ClickHouse SQL literal.
 // ClickHouse collapses unknown escapes ('\d' -> 'd'), so every backslash must
 // be doubled or the inlined regex silently loses all its character classes.
@@ -63,9 +74,9 @@ function sqlString(s) {
 // the stale one). The version is part of the MV name; ensureSchema drops any
 // older names listed here. Bump MV_VERSION whenever the MV definition changes
 // and append the previous name to LEGACY_MV_NAMES.
-const MV_VERSION = 2;
+const MV_VERSION = 3;
 const MV_NAME = `access_events_mv_v${MV_VERSION}`;
-const LEGACY_MV_NAMES = ['access_events_mv'];
+const LEGACY_MV_NAMES = ['access_events_mv', 'access_events_mv_v2'];
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -248,16 +259,21 @@ function schemaStatements(retentionDays) {
         SETTINGS non_replicated_deduplication_window = 1000`,
 
         // Parse raw -> structured on insert. Everything derives from `raw`.
-        // A line that does not match the regex (or carries a broken timestamp)
-        // still lands with parse_ok = 0 and event_time = now(), so no data is
-        // lost and it stays searchable by raw text within the retention window.
+        // Two shapes are recognised: (n) a normal access line and, as a fallback,
+        // (ne) a connection-level error line ("from IP rejected <msg>", no
+        // destination) which is tagged outbound_tag = 'handshake-error' so the
+        // action counters stay accurate and the attacking source IP is visible.
+        // A line matching neither still lands with parse_ok = 0 and
+        // event_time = now(), so nothing is lost and it stays searchable by raw.
         `CREATE MATERIALIZED VIEW IF NOT EXISTS ${MV_NAME} TO access_events AS
         WITH
             extractGroups(raw, '${sqlString(CH_LINE_RE)}') AS g,
             length(g) AS n,
-            if(n > 0, g[1], '') AS ts_str,
-            if(n > 0, g[2], '') AS src,
-            if(n > 0, g[3], '') AS act,
+            extractGroups(raw, '${sqlString(CH_ERR_RE)}') AS ge,
+            length(ge) AS ne,
+            if(n > 0, g[1], if(ne > 0, ge[1], '')) AS ts_str,
+            if(n > 0, g[2], if(ne > 0, ge[2], '')) AS src,
+            if(n > 0, g[3], if(ne > 0, ge[3], '')) AS act,
             if(n > 0, g[4], '') AS net,
             if(n > 0, g[5], '') AS dst,
             if(n > 0, g[6], '') AS route,
@@ -283,10 +299,10 @@ function schemaStatements(retentionDays) {
             dst_port AS dest_port,
             net AS network,
             in_tag AS inbound_tag,
-            out_tag AS outbound_tag,
+            if(n > 0, out_tag, if(ne > 0, 'handshake-error', '')) AS outbound_tag,
             act AS action,
             raw,
-            toUInt8(n > 0) AS parse_ok
+            toUInt8(n > 0 OR ne > 0) AS parse_ok
         FROM access_ingest`,
     ];
 }
@@ -392,6 +408,7 @@ async function truncate() {
 
 module.exports = {
     CH_LINE_RE,
+    CH_ERR_RE,
     readConfig,
     getClient,
     reset,

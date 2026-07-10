@@ -50,7 +50,9 @@
     "server": "Server",
     "ports": "Ports",
     "clear": "Clear",
-    "reset": "Reset"
+    "reset": "Reset",
+    "attention": "Attention",
+    "restore": "Restore"
   },
   "nav": {
     "dashboard": "Dashboard",

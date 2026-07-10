@@ -74,6 +74,21 @@ async function offlineTests() {
     assert.ok(mvDdl.includes('replaceAll(ts_str'), 'date slashes replaced with replaceAll');
     // Unparsed lines must not land in 1970 (instantly TTL-dropped).
     assert.ok(mvDdl.includes("now('UTC')"), 'zero timestamps fall back to now()');
+    // Connection-level error lines are parsed via the fallback regex and tagged.
+    assert.ok(mvDdl.includes('handshake-error'), 'handshake-error fallback tag present');
+    assert.ok(mvDdl.includes('ne > 0'), 'error-line group participates in parse_ok');
+
+    // The fallback regex matches an error line but NOT as an access record.
+    const errLine = '2026/07/10 17:41:28.205208 from 95.24.24.226:9048 rejected proxy/vless/encoding: invalid request user id: 55837f55-c7ee-4533-b2a6-0ace8a266802';
+    assert.strictEqual(parseLikeMv(errLine).parse_ok, 0, 'error line is not a normal access record');
+    const errRe = new RegExp(clickhouse.CH_ERR_RE);
+    const em = errRe.exec(errLine);
+    assert.ok(em, 'error line matches fallback regex');
+    assert.strictEqual(em[2], '95.24.24.226:9048', 'fallback captures source');
+    assert.strictEqual(em[3], 'rejected', 'fallback captures action');
+    // A real access line must still be handled by the primary parser, not misrouted.
+    assert.ok(errRe.exec('2023/11/22 17:01:32 1.2.3.4:1122 accepted tcp:example.com:443 [in -> direct]'),
+        'fallback also matches normal lines (primary takes precedence in the MV)');
 
     // Retention clamps to sane bounds (0/NaN falls back to the 30-day default).
     assert.ok(clickhouse.schemaStatements(-5)[1].includes('INTERVAL 1 DAY'), 'retention floor');
@@ -152,6 +167,7 @@ async function onlineTests() {
     const batchId = 'test-batch-' + Date.now();
     await clickhouse.insertRaw([
         { node_id: 'n1', raw: '2023/11/22 17:01:32 1.2.3.4:1122 accepted tcp:example.com:443 [vless-in -> direct] email: 42' },
+        { node_id: 'n1', raw: '2023/11/22 17:01:33 from 9.9.9.9:5000 rejected proxy/vless/encoding: invalid request user id: abc' },
     ], batchId);
 
     // Give the MV a moment (insert is synchronous, but read is eventually there).
@@ -160,6 +176,14 @@ async function onlineTests() {
     assert.ok(res.rows.length >= 1, 'row present after MV parse');
     assert.strictEqual(res.rows[0].network, 'tcp');
     assert.strictEqual(res.rows[0].dest_host, 'example.com');
+
+    // The connection-error line parsed via fallback: rejected, source set, tagged.
+    const errRes = await clickhouse.query(
+        "SELECT source_ip, action, outbound_tag, parse_ok FROM access_events WHERE source_ip = '9.9.9.9' LIMIT 1");
+    assert.ok(errRes.ok && errRes.rows.length >= 1, 'error line stored');
+    assert.strictEqual(errRes.rows[0].action, 'rejected', 'error line action');
+    assert.strictEqual(errRes.rows[0].outbound_tag, 'handshake-error', 'error line tagged');
+    assert.strictEqual(Number(errRes.rows[0].parse_ok), 1, 'error line counts as parsed');
 
     await clickhouse.truncate();
     void orig;
