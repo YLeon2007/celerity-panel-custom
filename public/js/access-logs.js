@@ -14,6 +14,7 @@
     const enabled = app.dataset.enabled === '1';
     const I18N = window.__AL_I18N || {};
     const L = (I18N.labels) || {};
+    const NODES = window.__AL_NODES || {};
 
     const $ = (id) => document.getElementById(id);
     const toast = (msg, type) => {
@@ -45,6 +46,24 @@
     function fmtTime(v) {
         if (!v) return I18N.never || '—';
         try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+    }
+
+    // Colored pill for an action / protocol so the tables scan at a glance.
+    function actionBadge(a) {
+        a = String(a || '');
+        if (!a) return '';
+        const cls = a === 'accepted' ? 'al-badge-accepted'
+            : a === 'rejected' ? 'al-badge-rejected'
+            : a === 'blocked' ? 'al-badge-blocked' : '';
+        return '<span class="al-badge ' + cls + '">' + esc(a) + '</span>';
+    }
+    function netBadge(n) {
+        n = String(n || '');
+        if (!n) return '';
+        return '<span class="al-badge ' + (n === 'udp' ? 'al-badge-udp' : 'al-badge-net') + '">' + esc(n) + '</span>';
+    }
+    function nodeName(id) {
+        return NODES[id] || id || '';
     }
 
     // Collect filters from the form into a query string.
@@ -138,21 +157,22 @@
     function renderBarRows(tbody, rows, cols) {
         if (!tbody) return;
         rows = rows || [];
-        if (!rows.length) { tbody.innerHTML = '<tr><td class="hint" colspan="' + cols.length + '">—</td></tr>'; return; }
+        if (!rows.length) { tbody.innerHTML = '<tr><td class="al-empty" colspan="' + cols.length + '">—</td></tr>'; return; }
         const barCol = cols.find(c => c.bar);
         const max = barCol ? Math.max(1, ...rows.map(r => Number(r[barCol.key] || 0))) : 1;
         tbody.innerHTML = rows.map(r => {
             return '<tr>' + cols.map(c => {
                 let v = r[c.key];
                 if (c.fmt) v = c.fmt(v, r);
+                const cls = c.cls ? ' class="' + c.cls + '"' : '';
                 const align = c.align ? ' style="text-align:' + c.align + ';"' : '';
                 if (c.bar) {
                     const pct = Math.round((Number(r[c.key] || 0) / max) * 100);
-                    return '<td class="al-bar-cell"' + align + '>'
+                    return '<td class="al-bar-cell al-num"' + align + '>'
                         + '<span class="al-bar" style="width:' + pct + '%;"></span>'
                         + '<span class="al-bar-label">' + esc(v) + '</span></td>';
                 }
-                return '<td' + align + '>' + (c.html ? v : esc(v)) + '</td>';
+                return '<td' + cls + align + '>' + (c.html ? v : esc(v)) + '</td>';
             }).join('') + '</tr>';
         }).join('');
     }
@@ -164,15 +184,7 @@
 
     function renderUsers(users) {
         users = users || [];
-        // Sharing lens: sorted by distinct IPs (server already sorts by ips).
-        const byIp = users.slice().sort((a, b) => (b.ips - a.ips) || (b.events - a.events));
-        renderBarRows($('alUsersByIp'), byIp, [
-            { key: 'email', fmt: (v) => v || '—' },
-            { key: 'ips', align: 'right', bar: true, fmt: fmtNum },
-            { key: 'subnets', align: 'right', fmt: fmtNum },
-            { key: 'events', align: 'right', fmt: fmtNum },
-            { key: 'last_seen', align: 'right', fmt: (v) => fmtTime(v) },
-        ]);
+        renderUsersByIp(users);
         // Fan-out lens: sorted by distinct destinations.
         const byFan = users.slice().sort((a, b) => (b.dests - a.dests) || (b.events - a.events));
         renderBarRows($('alUsersByFanout'), byFan, [
@@ -183,17 +195,78 @@
         ]);
     }
 
+    // Sharing lens with click-to-expand: each user row reveals the full list of
+    // source IPs it connected from (fetched lazily on first expand).
+    function renderUsersByIp(users) {
+        const tbody = $('alUsersByIp');
+        if (!tbody) return;
+        const byIp = users.slice().sort((a, b) => (b.ips - a.ips) || (b.events - a.events));
+        if (!byIp.length) {
+            tbody.innerHTML = '<tr><td class="al-empty" colspan="5">—</td></tr>';
+            return;
+        }
+        const max = Math.max(1, ...byIp.map(u => Number(u.ips || 0)));
+        tbody.innerHTML = byIp.map((u, i) => {
+            const email = u.email || '—';
+            const pct = Math.round((Number(u.ips || 0) / max) * 100);
+            return '<tr class="al-user-row" data-idx="' + i + '" data-email="' + esc(email) + '">'
+                + '<td><i class="al-caret ti ti-chevron-right"></i>' + esc(email) + '</td>'
+                + '<td class="al-bar-cell al-num" style="text-align:right;">'
+                +   '<span class="al-bar" style="width:' + pct + '%;"></span>'
+                +   '<span class="al-bar-label">' + fmtNum(u.ips) + '</span></td>'
+                + '<td class="al-num" style="text-align:right;">' + fmtNum(u.subnets) + '</td>'
+                + '<td class="al-num" style="text-align:right;">' + fmtNum(u.events) + '</td>'
+                + '<td class="hint" style="text-align:right;">' + esc(fmtTime(u.last_seen)) + '</td>'
+                + '</tr>'
+                + '<tr class="al-ip-detail" data-for="' + i + '" style="display:none;">'
+                + '<td colspan="5"><div class="al-ip-wrap" data-loaded="0"></div></td></tr>';
+        }).join('');
+        tbody.querySelectorAll('.al-user-row').forEach(row => {
+            row.addEventListener('click', () => toggleUserIps(row));
+        });
+    }
+
+    async function toggleUserIps(row) {
+        const idx = row.dataset.idx;
+        const detail = row.parentNode.querySelector('.al-ip-detail[data-for="' + idx + '"]');
+        if (!detail) return;
+        const isOpen = detail.style.display !== 'none';
+        if (isOpen) { detail.style.display = 'none'; row.classList.remove('open'); return; }
+        detail.style.display = ''; row.classList.add('open');
+
+        const wrap = detail.querySelector('.al-ip-wrap');
+        if (wrap.dataset.loaded === '1') return;
+        wrap.innerHTML = '<span class="hint">…</span>';
+        try {
+            const qs = new URLSearchParams(queryString());
+            qs.set('email', row.dataset.email);
+            const data = await getJson('/panel/access-logs/api/user-ips?' + qs.toString());
+            const rows = data.rows || [];
+            if (!rows.length) {
+                wrap.innerHTML = '<span class="hint">' + esc(I18N.noIps || '—') + '</span>';
+            } else {
+                wrap.innerHTML = rows.map(r =>
+                    '<span class="al-ip-chip"><span class="al-mono">' + esc(r.ip) + '</span>'
+                    + '<span class="al-ip-meta">' + fmtNum(r.events) + ' · ' + fmtNum(r.dests) + ' dst · ' + esc(fmtTime(r.last_seen)) + '</span></span>'
+                ).join('');
+            }
+            wrap.dataset.loaded = '1';
+        } catch (e) {
+            wrap.innerHTML = '<span class="hint">' + esc(e.message) + '</span>';
+        }
+    }
+
     function renderTops(data) {
         renderBarRows($('alTopDest'), data.topDestinations, [
-            { key: 'dest', fmt: (v, r) => v || r.key || '—' },
+            { key: 'dest', cls: 'al-mono al-trunc', fmt: (v, r) => v || r.key || '—' },
             { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
         ]);
         renderBarRows($('alTopPorts'), data.topPorts, [
-            { key: 'port', fmt: (v) => (v == null ? '—' : v) },
+            { key: 'port', cls: 'al-mono', fmt: (v) => (v == null ? '—' : v) },
             { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
         ]);
         renderBarRows($('alTopBlocked'), data.topBlocked, [
-            { key: 'dest', fmt: (v, r) => v || r.key || '—' },
+            { key: 'dest', cls: 'al-mono al-trunc', fmt: (v, r) => v || r.key || '—' },
             { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
         ]);
     }
@@ -211,8 +284,6 @@
             $('alUsers').textContent = fmtNum(totals.users);
             $('alIps').textContent = totals.ips != null ? fmtNum(totals.ips) : '—';
             $('alDests').textContent = totals.dests != null ? fmtNum(totals.dests) : '—';
-            const blocked = (totals.blocked != null ? totals.blocked : 0);
-            $('alBlocked').textContent = fmtNum(blocked);
 
             renderTimeline(data.series || []);
 
@@ -231,10 +302,10 @@
 
             // In degraded mode the DuckDB-only widgets are empty; hint why.
             if (data.duckdbRequired) {
-                const note = '<tr><td class="hint" colspan="6">' + esc(I18N.duckdbRequired) + '</td></tr>';
-                if (!(data.users || []).length) { $('alUsersByIp').innerHTML = note; $('alUsersByFanout').innerHTML = note; }
-                if (!(data.topPorts || []).length) $('alTopPorts').innerHTML = note;
-                if (!(data.topBlocked || []).length) $('alTopBlocked').innerHTML = note;
+                const note = (span) => '<tr><td class="al-empty" colspan="' + span + '">' + esc(I18N.duckdbRequired) + '</td></tr>';
+                if (!(data.users || []).length) { $('alUsersByIp').innerHTML = note(5); $('alUsersByFanout').innerHTML = note(4); }
+                if (!(data.topPorts || []).length) $('alTopPorts').innerHTML = note(2);
+                if (!(data.topBlocked || []).length) $('alTopBlocked').innerHTML = note(2);
             }
         } catch (e) {
             toast('Analytics error: ' + e.message, 'error');
@@ -253,13 +324,13 @@
                 const src = [r.source_ip, r.source_port].filter(Boolean).join(':');
                 const dest = [(r.dest_host || r.dest_ip), r.dest_port].filter(Boolean).join(':');
                 return `<tr>
-                    <td>${esc(fmtTime(r.ts))}</td>
-                    <td>${esc(r.node_id || '')}</td>
+                    <td class="hint" style="white-space:nowrap;">${esc(fmtTime(r.ts))}</td>
+                    <td>${esc(nodeName(r.node_id))}</td>
                     <td>${esc(r.email || '')}</td>
-                    <td>${esc(src)}</td>
-                    <td>${esc(dest)}</td>
-                    <td>${esc(r.network || '')}</td>
-                    <td>${esc(r.action || '')}</td>
+                    <td class="al-mono">${esc(src)}</td>
+                    <td class="al-mono al-trunc" title="${esc(dest)}">${esc(dest)}</td>
+                    <td>${netBadge(r.network)}</td>
+                    <td>${actionBadge(r.action)}</td>
                 </tr>`;
             }).join('');
         } catch (e) {

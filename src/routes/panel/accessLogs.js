@@ -136,6 +136,21 @@ router.get('/access-logs/api/search', async (req, res) => {
     }
 });
 
+router.get('/access-logs/api/user-ips', async (req, res) => {
+    try {
+        if (!(await isEnabled())) return res.json({ enabled: false, rows: [] });
+        const email = String(req.query.email || '').slice(0, 256);
+        if (!email) return res.json({ enabled: true, rows: [] });
+        const filters = filtersFromQuery(req.query);
+        const searchService = require('../../services/accessLogs/searchService');
+        const result = await searchService.userIps(email, filters, { limit: 200 });
+        return res.json({ enabled: true, ...result });
+    } catch (error) {
+        logger.error('[Panel] access-logs user-ips error:', error.message);
+        res.status(500).json({ error: 'user-ips failed' });
+    }
+});
+
 router.get('/access-logs/api/status', async (req, res) => {
     try {
         const Settings = require('../../models/settingsModel');

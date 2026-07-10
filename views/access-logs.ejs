@@ -35,11 +35,6 @@
             <div class="stat-value" id="alDests">—</div>
             <div class="stat-label"><%= t('accessLogs.statUniqueDests') || 'Назначений' %></div>
         </div>
-        <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-shield-x"></i></span></div>
-            <div class="stat-value" id="alBlocked">—</div>
-            <div class="stat-label"><%= t('accessLogs.statBlocked') || 'Заблокировано' %></div>
-        </div>
     </div>
 
     <!-- Filters -->
@@ -128,9 +123,12 @@
                 <h2><i class="ti ti-user-share"></i> <%= t('accessLogs.usersByIp') || 'Пользователи по числу IP' %></h2>
             </div>
             <div class="card-body">
-                <p class="hint" style="margin:0 0 10px;"><%= t('accessLogs.usersByIpHint') || '' %></p>
+                <p class="hint" style="margin:0 0 10px;">
+                    <%= t('accessLogs.usersByIpHint') || '' %>
+                    <span class="hint"><%= t('accessLogs.usersByIpExpand') || 'Нажмите на пользователя, чтобы увидеть все его IP.' %></span>
+                </p>
                 <div style="overflow-x:auto;">
-                    <table class="data-table">
+                    <table class="al-tbl">
                         <thead><tr>
                             <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
                             <th style="text-align:right;"><%= t('accessLogs.colIps') || 'IP' %></th>
@@ -150,7 +148,7 @@
             <div class="card-body">
                 <p class="hint" style="margin:0 0 10px;"><%= t('accessLogs.usersByFanoutHint') || '' %></p>
                 <div style="overflow-x:auto;">
-                    <table class="data-table">
+                    <table class="al-tbl">
                         <thead><tr>
                             <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
                             <th style="text-align:right;"><%= t('accessLogs.colDests') || 'Назнач.' %></th>
@@ -168,15 +166,15 @@
     <div class="al-row al-row-3" style="margin-bottom:16px;">
         <div class="card al-col">
             <div class="card-header"><h2><i class="ti ti-map-pin"></i> <%= t('accessLogs.topDestinations') || 'Топ назначений' %></h2></div>
-            <div class="card-body"><table class="data-table"><tbody id="alTopDest"></tbody></table></div>
+            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopDest"></tbody></table></div>
         </div>
         <div class="card al-col">
             <div class="card-header"><h2><i class="ti ti-plug"></i> <%= t('accessLogs.topPorts') || 'Топ портов' %></h2></div>
-            <div class="card-body"><table class="data-table"><tbody id="alTopPorts"></tbody></table></div>
+            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopPorts"></tbody></table></div>
         </div>
         <div class="card al-col">
             <div class="card-header"><h2><i class="ti ti-shield-x"></i> <%= t('accessLogs.topBlocked') || 'Топ заблокированных' %></h2></div>
-            <div class="card-body"><table class="data-table"><tbody id="alTopBlocked"></tbody></table></div>
+            <div class="card-body"><table class="al-tbl al-tbl-top"><tbody id="alTopBlocked"></tbody></table></div>
         </div>
     </div>
 
@@ -187,12 +185,16 @@
             <span id="alResultCount" class="hint"></span>
         </div>
         <div class="card-body" style="overflow-x:auto;">
-            <table class="data-table">
+            <table class="al-tbl">
                 <thead>
                     <tr>
-                        <th>ts</th><th><%= t('accessLogs.filterNode') || 'Нода' %></th>
-                        <th>email</th><th>src</th><th>dest</th>
-                        <th>net</th><th>action</th>
+                        <th><%= t('accessLogs.colTime') || 'Время' %></th>
+                        <th><%= t('accessLogs.filterNode') || 'Нода' %></th>
+                        <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
+                        <th><%= t('accessLogs.colSource') || 'Источник' %></th>
+                        <th><%= t('accessLogs.colDest') || 'Назначение' %></th>
+                        <th><%= t('accessLogs.colNet') || 'Проток.' %></th>
+                        <th><%= t('accessLogs.colAction') || 'Действие' %></th>
                     </tr>
                 </thead>
                 <tbody id="alResults"></tbody>
@@ -209,8 +211,8 @@
             <h2><i class="ti ti-server-cog"></i> Status</h2>
             <span class="hint">Spool: <span id="alSpool">—</span></span>
         </div>
-        <div class="card-body">
-            <table class="data-table">
+        <div class="card-body" style="overflow-x:auto;">
+            <table class="al-tbl">
                 <thead><tr><th><%= t('accessLogs.filterNode') || 'Нода' %></th><th>agent</th><th>status</th><th><%= t('accessLogs.lastIngestAt') || 'Последний приём' %></th><th>error</th></tr></thead>
                 <tbody id="alNodeStatus"></tbody>
             </table>
@@ -235,14 +237,66 @@
 .al-chart-body-sm { height: 280px; }
 .al-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .al-row-3 { grid-template-columns: 1fr 1fr 1fr; }
+/* ── Tables ─────────────────────────────────────────────────────────── */
+.al-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.al-tbl thead th {
+    text-align: left; font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em;
+    color: var(--text-muted, #8b8b96);
+    padding: 8px 10px; white-space: nowrap;
+    border-bottom: 1px solid var(--border-color, rgba(255,255,255,.08));
+}
+.al-tbl tbody td {
+    padding: 9px 10px; vertical-align: middle;
+    border-bottom: 1px solid var(--border-color, rgba(255,255,255,.05));
+}
+.al-tbl tbody tr:last-child td { border-bottom: 0; }
+.al-tbl tbody tr:hover { background: rgba(255,255,255,.035); }
+.al-tbl-top tbody td { padding: 7px 10px; }
+.al-mono {
+    font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Consolas, monospace;
+    font-size: 12px;
+}
+.al-trunc { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.al-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.al-badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; line-height: 1.5; white-space: nowrap;
+}
+.al-badge-accepted { background: rgba(34,197,94,.14); color: #4ade80; }
+.al-badge-rejected { background: rgba(245,158,11,.15); color: #fbbf24; }
+.al-badge-blocked  { background: rgba(239,68,68,.15);  color: #f87171; }
+.al-badge-net      { background: rgba(99,102,241,.16); color: #a5b4fc; }
+.al-badge-udp      { background: rgba(6,182,212,.16);  color: #67e8f9; }
+
 .al-bar-cell { position: relative; }
 .al-bar {
-    position: absolute; left: 0; top: 0; bottom: 0;
-    background: var(--accent-glow, rgba(124,58,237,.18));
+    position: absolute; right: 0; top: 4px; bottom: 4px;
+    background: var(--accent-glow, rgba(124,58,237,.22));
     border-radius: 4px; z-index: 0;
 }
-.al-bar-label { position: relative; z-index: 1; }
+.al-bar-label { position: relative; z-index: 1; font-variant-numeric: tabular-nums; }
 .al-flag { color: var(--danger, #ef4444); font-weight: 600; }
+
+/* ── Expandable user rows (per-user IP list) ────────────────────────── */
+.al-user-row { cursor: pointer; }
+.al-caret {
+    display: inline-block; transition: transform .15s ease;
+    color: var(--text-muted, #8b8b96); margin-right: 4px;
+}
+.al-user-row.open .al-caret { transform: rotate(90deg); }
+.al-ip-detail > td { background: rgba(255,255,255,.02); padding: 10px 14px !important; }
+.al-ip-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
+.al-ip-chip {
+    display: inline-flex; flex-direction: column; gap: 1px;
+    padding: 5px 10px; border-radius: 8px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid var(--border-color, rgba(255,255,255,.07));
+}
+.al-ip-chip .al-ip-meta { font-size: 10.5px; color: var(--text-muted, #8b8b96); }
+.al-empty { color: var(--text-muted, #8b8b96); padding: 12px 10px; }
+
 @media (max-width: 1100px) {
     .al-charts-grid { grid-template-columns: 1fr; }
     .al-row, .al-row-3 { grid-template-columns: 1fr; }
@@ -257,10 +311,13 @@ window.__AL_I18N = {
     noResults: <%- JSON.stringify(t('accessLogs.noResults') || 'Ничего не найдено') %>,
     never: <%- JSON.stringify(t('settings.never') || 'никогда') %>,
     duckdbRequired: <%- JSON.stringify(t('accessLogs.duckdbRequired') || 'Виджет требует DuckDB, который сейчас недоступен.') %>,
+    noIps: <%- JSON.stringify(t('accessLogs.noIps') || 'Нет IP за выбранный период.') %>,
     accepted: <%- JSON.stringify(t('accessLogs.stateActive') || 'accepted') %>,
     labels: {
         accepted: 'accepted', rejected: 'rejected', blocked: 'blocked', tcp: 'tcp', udp: 'udp'
     }
 };
+// Node id -> display name, so raw event rows show a readable node instead of a hash.
+window.__AL_NODES = <%- JSON.stringify((nodes || []).reduce((m, n) => { m[String(n._id)] = n.name; return m; }, {})) %>;
 </script>
 <script defer src="/js/access-logs.js"></script>

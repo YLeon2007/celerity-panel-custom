@@ -49,7 +49,8 @@
     "connections": "connections",
     "server": "Server",
     "ports": "Ports",
-    "clear": "Clear"
+    "clear": "Clear",
+    "reset": "Reset"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -129,6 +130,13 @@
     "colLastSeen": "Last seen",
     "colPort": "Port",
     "colHits": "Hits",
+    "colTime": "Time",
+    "colSource": "Source",
+    "colDest": "Destination",
+    "colNet": "Proto",
+    "colAction": "Action",
+    "usersByIpExpand": "Click a user to see all their IPs.",
+    "noIps": "No IPs in the selected window.",
     "duckdbRequired": "This widget needs DuckDB, which is currently unavailable.",
     "recentEvents": "Recent events"
   },

@@ -49,7 +49,8 @@
     "connections": "подключений",
     "server": "Сервер",
     "ports": "Порты",
-    "clear": "Очистить"
+    "clear": "Очистить",
+    "reset": "Сбросить"
   },
   "nav": {
     "dashboard": "Главная",
@@ -129,6 +130,13 @@
     "colLastSeen": "Активность",
     "colPort": "Порт",
     "colHits": "Хитов",
+    "colTime": "Время",
+    "colSource": "Источник",
+    "colDest": "Назначение",
+    "colNet": "Проток.",
+    "colAction": "Действие",
+    "usersByIpExpand": "Нажмите на пользователя, чтобы увидеть все его IP.",
+    "noIps": "Нет IP за выбранный период.",
     "duckdbRequired": "Виджет требует DuckDB, который сейчас недоступен.",
     "recentEvents": "Последние события"
   },

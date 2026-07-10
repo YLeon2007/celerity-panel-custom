@@ -107,6 +107,43 @@ async function search(filters = {}, opts = {}) {
 }
 
 /**
+ * Distinct source IPs a single user connected from, within the current filter
+ * window — powers the expandable "all IPs for this user" detail row. Ordered by
+ * activity so the busiest address is first. `email` is bound as a parameter.
+ * @returns {Promise<{degraded?:boolean, rows?:Array, error?:string}>}
+ */
+async function userIps(email, filters = {}, opts = {}) {
+    if (!(await duckdb.isAvailable())) {
+        return { degraded: true, rows: [] };
+    }
+    const { where, params } = buildWhere({ ...filters, email: String(email || '') });
+    const andWhere = where ? 'AND' : 'WHERE';
+    const limit = Math.max(1, Math.min(500, Number(opts.limit) || 200));
+
+    const DEST = "coalesce(nullif(dest_host,''), dest_ip)";
+    const sql = `
+        SELECT source_ip AS ip,
+               count(*) AS events,
+               count(DISTINCT ${DEST}) AS dests,
+               max(ts) AS last_seen,
+               min(ts) AS first_seen
+        FROM ${fromClause()}
+        ${where} ${andWhere} source_ip <> ''
+        GROUP BY source_ip
+        ORDER BY events DESC
+        LIMIT ${limit}
+    `;
+
+    const res = await duckdb.query(sql, params, { rowLimit: limit, timeoutMs: opts.timeoutMs || 30000 });
+    if (!res.ok) {
+        if (res.error === 'duckdb_unavailable') return { degraded: true, rows: [] };
+        logger.warn(`[AccessLogs] userIps failed: ${res.error}`);
+        return { error: res.error, rows: [] };
+    }
+    return { rows: res.rows };
+}
+
+/**
  * Summary aggregates for a dashboard: totals, top destinations, top users, and a
  * per-hour time series. Single query set kept small for weak hardware.
  */
@@ -261,6 +298,7 @@ module.exports = {
     PARQUET_GLOB,
     buildWhere,
     search,
+    userIps,
     summary,
     overview,
 };
