@@ -63,7 +63,7 @@
                     <span class="nav-icon"><i class="ti ti-users"></i></span>
                     <span><%= t('nav.users') %></span>
                 </a></li>
-                <% if (typeof accessLogsEnabled === 'undefined' || accessLogsEnabled) { %>
+                <% if (typeof accessLogsEnabled !== 'undefined' && accessLogsEnabled) { %>
                 <li><a href="/panel/access-logs" class="<%= page === 'accessLogs' ? 'active' : '' %>">
                     <span class="nav-icon"><i class="ti ti-list-search"></i></span>
                     <span><%= t('nav.accessLogs') %></span>

@@ -151,9 +151,116 @@ async function summary(filters = {}, opts = {}) {
     };
 }
 
+/**
+ * Combined dashboard overview computed in a SINGLE DuckDB worker spawn:
+ * totals + action/protocol split, an hourly time series (with per-action
+ * breakdown), top destinations/ports/blocked, and a per-user aggregate used by
+ * both the "users by IP count" (sharing lens) and "users by fan-out" (abuse
+ * lens) tables. All filters are bound as parameters; the per-user distinct
+ * counts (source IPs, /24 subnets, destinations) are DuckDB-only and therefore
+ * absent in degraded mode.
+ *
+ * @returns {Promise<{degraded?:boolean, error?:string, totals?:Object,
+ *   series?:Array, topDestinations?:Array, topPorts?:Array, topBlocked?:Array,
+ *   users?:Array}>}
+ */
+async function overview(filters = {}, opts = {}) {
+    if (!(await duckdb.isAvailable())) {
+        return { degraded: true };
+    }
+
+    const { where, params } = buildWhere(filters);
+    const from = fromClause();
+    const andWhere = where ? 'AND' : 'WHERE';
+    const topN = Math.max(1, Math.min(50, Number(opts.topN) || 10));
+    const userN = Math.max(1, Math.min(200, Number(opts.userLimit) || 25));
+
+    // "dest" = human destination: host when present, else IP.
+    const DEST = "coalesce(nullif(dest_host,''), dest_ip)";
+    // "/24" style subnet for IPv4 (strip last octet); IPv6 left intact.
+    const SUBNET = "regexp_replace(source_ip, '\\.[0-9]+$', '')";
+
+    // Every query shares the same WHERE (and therefore the same params array);
+    // the extra per-query predicates below add no new bind parameters.
+    const queries = [
+        {
+            key: 'totals', rowLimit: 1, params,
+            sql: `SELECT
+                    count(*) AS total,
+                    count(DISTINCT email) AS users,
+                    count(DISTINCT source_ip) AS ips,
+                    count(DISTINCT ${DEST}) AS dests,
+                    count(*) FILTER (WHERE action='accepted') AS accepted,
+                    count(*) FILTER (WHERE action='rejected') AS rejected,
+                    count(*) FILTER (WHERE action='blocked')  AS blocked,
+                    count(*) FILTER (WHERE network='tcp') AS tcp,
+                    count(*) FILTER (WHERE network='udp') AS udp
+                  FROM ${from} ${where}`,
+        },
+        {
+            key: 'series', rowLimit: 24 * 62, params,
+            sql: `SELECT date_trunc('hour', ts) AS bucket,
+                         count(*) AS hits,
+                         count(*) FILTER (WHERE action='accepted') AS accepted,
+                         count(*) FILTER (WHERE action='rejected') AS rejected,
+                         count(*) FILTER (WHERE action='blocked')  AS blocked
+                  FROM ${from} ${where}
+                  GROUP BY bucket ORDER BY bucket`,
+        },
+        {
+            key: 'topDest', rowLimit: topN, params,
+            sql: `SELECT ${DEST} AS dest, count(*) AS hits
+                  FROM ${from} ${where}
+                  GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`,
+        },
+        {
+            key: 'topPorts', rowLimit: topN, params,
+            sql: `SELECT dest_port AS port, count(*) AS hits
+                  FROM ${from} ${where} ${andWhere} dest_port IS NOT NULL
+                  GROUP BY dest_port ORDER BY hits DESC LIMIT ${topN}`,
+        },
+        {
+            key: 'topBlocked', rowLimit: topN, params,
+            sql: `SELECT ${DEST} AS dest, count(*) AS hits
+                  FROM ${from} ${where} ${andWhere} action IN ('blocked','rejected')
+                  GROUP BY dest ORDER BY hits DESC LIMIT ${topN}`,
+        },
+        {
+            key: 'users', rowLimit: userN, params,
+            sql: `SELECT email,
+                         count(DISTINCT source_ip) AS ips,
+                         count(DISTINCT ${SUBNET}) AS subnets,
+                         count(DISTINCT ${DEST}) AS dests,
+                         count(*) AS events,
+                         (count(*) FILTER (WHERE network='udp'))*1.0 / nullif(count(*),0) AS udp_share,
+                         max(ts) AS last_seen
+                  FROM ${from} ${where} ${andWhere} email <> ''
+                  GROUP BY email ORDER BY ips DESC LIMIT ${userN}`,
+        },
+    ];
+
+    const res = await duckdb.queryBatch(queries, { timeoutMs: opts.timeoutMs || 45000 });
+    if (!res.ok) {
+        if (res.error === 'duckdb_unavailable') return { degraded: true };
+        logger.warn(`[AccessLogs] overview failed: ${res.error}`);
+        return { error: res.error };
+    }
+
+    const r = res.results || {};
+    return {
+        totals: (r.totals && r.totals[0]) || { total: 0, users: 0, ips: 0, dests: 0 },
+        series: r.series || [],
+        topDestinations: r.topDest || [],
+        topPorts: r.topPorts || [],
+        topBlocked: r.topBlocked || [],
+        users: r.users || [],
+    };
+}
+
 module.exports = {
     PARQUET_GLOB,
     buildWhere,
     search,
     summary,
+    overview,
 };

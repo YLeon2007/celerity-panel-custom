@@ -18,22 +18,27 @@
         <div class="stat-card">
             <div class="stat-header"><span class="stat-icon"><i class="ti ti-list"></i></span></div>
             <div class="stat-value" id="alTotal">—</div>
-            <div class="stat-label"><%= t('accessLogs.summary') || 'Всего событий' %></div>
+            <div class="stat-label"><%= t('accessLogs.statEvents') || 'Событий' %></div>
         </div>
         <div class="stat-card">
             <div class="stat-header"><span class="stat-icon"><i class="ti ti-users"></i></span></div>
             <div class="stat-value" id="alUsers">—</div>
-            <div class="stat-label"><%= t('accessLogs.topUsers') || 'Пользователей' %></div>
+            <div class="stat-label"><%= t('accessLogs.statUsers') || 'Пользователей' %></div>
         </div>
         <div class="stat-card">
             <div class="stat-header"><span class="stat-icon"><i class="ti ti-world"></i></span></div>
             <div class="stat-value" id="alIps">—</div>
-            <div class="stat-label">IP</div>
+            <div class="stat-label"><%= t('accessLogs.statUniqueIps') || 'Уникальных IP' %></div>
         </div>
         <div class="stat-card">
-            <div class="stat-header"><span class="stat-icon"><i class="ti ti-database"></i></span></div>
-            <div class="stat-value" id="alSpool">—</div>
-            <div class="stat-label">Spool</div>
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-map-pin"></i></span></div>
+            <div class="stat-value" id="alDests">—</div>
+            <div class="stat-label"><%= t('accessLogs.statUniqueDests') || 'Назначений' %></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-shield-x"></i></span></div>
+            <div class="stat-value" id="alBlocked">—</div>
+            <div class="stat-label"><%= t('accessLogs.statBlocked') || 'Заблокировано' %></div>
         </div>
     </div>
 
@@ -100,22 +105,85 @@
         </div>
     </div>
 
-    <!-- Top lists -->
-    <div class="row" style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:16px;">
-        <div class="card" style="flex:1; min-width:280px;">
-            <div class="card-header"><h2><i class="ti ti-map-pin"></i> <%= t('accessLogs.topDestinations') || 'Топ назначений' %></h2></div>
-            <div class="card-body"><table class="data-table"><tbody id="alTopDest"></tbody></table></div>
+    <!-- Charts -->
+    <div class="al-charts-grid" style="margin-bottom:16px;">
+        <div class="card al-chart-wide">
+            <div class="card-header"><h2><i class="ti ti-chart-area"></i> <%= t('accessLogs.activityTimeline') || 'Активность во времени' %></h2></div>
+            <div class="card-body al-chart-body"><canvas id="alTimeline"></canvas></div>
         </div>
-        <div class="card" style="flex:1; min-width:280px;">
-            <div class="card-header"><h2><i class="ti ti-user"></i> <%= t('accessLogs.topUsers') || 'Топ пользователей' %></h2></div>
-            <div class="card-body"><table class="data-table"><tbody id="alTopUsers"></tbody></table></div>
+        <div class="card">
+            <div class="card-header"><h2><i class="ti ti-chart-donut"></i> <%= t('accessLogs.actionBreakdown') || 'Действия' %></h2></div>
+            <div class="card-body al-chart-body al-chart-body-sm"><canvas id="alActionChart"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-header"><h2><i class="ti ti-chart-pie"></i> <%= t('accessLogs.protocolBreakdown') || 'Протоколы' %></h2></div>
+            <div class="card-body al-chart-body al-chart-body-sm"><canvas id="alProtoChart"></canvas></div>
         </div>
     </div>
 
-    <!-- Results -->
+    <!-- Users: sharing + fan-out lenses -->
+    <div class="al-row" style="margin-bottom:16px;">
+        <div class="card al-col">
+            <div class="card-header">
+                <h2><i class="ti ti-user-share"></i> <%= t('accessLogs.usersByIp') || 'Пользователи по числу IP' %></h2>
+            </div>
+            <div class="card-body">
+                <p class="hint" style="margin:0 0 10px;"><%= t('accessLogs.usersByIpHint') || '' %></p>
+                <div style="overflow-x:auto;">
+                    <table class="data-table">
+                        <thead><tr>
+                            <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colIps') || 'IP' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colSubnets') || '/24' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colEvents') || 'Событий' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colLastSeen') || 'Активность' %></th>
+                        </tr></thead>
+                        <tbody id="alUsersByIp"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="card al-col">
+            <div class="card-header">
+                <h2><i class="ti ti-affiliate"></i> <%= t('accessLogs.usersByFanout') || 'Пользователи по назначениям' %></h2>
+            </div>
+            <div class="card-body">
+                <p class="hint" style="margin:0 0 10px;"><%= t('accessLogs.usersByFanoutHint') || '' %></p>
+                <div style="overflow-x:auto;">
+                    <table class="data-table">
+                        <thead><tr>
+                            <th><%= t('accessLogs.colUser') || 'Пользователь' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colDests') || 'Назнач.' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colUdp') || 'UDP %' %></th>
+                            <th style="text-align:right;"><%= t('accessLogs.colEvents') || 'Событий' %></th>
+                        </tr></thead>
+                        <tbody id="alUsersByFanout"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Top lists -->
+    <div class="al-row al-row-3" style="margin-bottom:16px;">
+        <div class="card al-col">
+            <div class="card-header"><h2><i class="ti ti-map-pin"></i> <%= t('accessLogs.topDestinations') || 'Топ назначений' %></h2></div>
+            <div class="card-body"><table class="data-table"><tbody id="alTopDest"></tbody></table></div>
+        </div>
+        <div class="card al-col">
+            <div class="card-header"><h2><i class="ti ti-plug"></i> <%= t('accessLogs.topPorts') || 'Топ портов' %></h2></div>
+            <div class="card-body"><table class="data-table"><tbody id="alTopPorts"></tbody></table></div>
+        </div>
+        <div class="card al-col">
+            <div class="card-header"><h2><i class="ti ti-shield-x"></i> <%= t('accessLogs.topBlocked') || 'Топ заблокированных' %></h2></div>
+            <div class="card-body"><table class="data-table"><tbody id="alTopBlocked"></tbody></table></div>
+        </div>
+    </div>
+
+    <!-- Recent events -->
     <div class="card" style="margin-bottom:16px;">
         <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
-            <h2><i class="ti ti-list-details"></i> <%= t('accessLogs.search') || 'Поиск' %></h2>
+            <h2><i class="ti ti-list-details"></i> <%= t('accessLogs.recentEvents') || 'Последние события' %></h2>
             <span id="alResultCount" class="hint"></span>
         </div>
         <div class="card-body" style="overflow-x:auto;">
@@ -137,7 +205,10 @@
 
     <!-- Node status + purge -->
     <div class="card">
-        <div class="card-header"><h2><i class="ti ti-server-cog"></i> Status</h2></div>
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+            <h2><i class="ti ti-server-cog"></i> Status</h2>
+            <span class="hint">Spool: <span id="alSpool">—</span></span>
+        </div>
         <div class="card-body">
             <table class="data-table">
                 <thead><tr><th><%= t('accessLogs.filterNode') || 'Нода' %></th><th>agent</th><th>status</th><th><%= t('accessLogs.lastIngestAt') || 'Последний приём' %></th><th>error</th></tr></thead>
@@ -153,11 +224,43 @@
 
 <div id="toast" class="toast"></div>
 
+<style>
+.al-charts-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr;
+    gap: 16px;
+}
+.al-chart-wide { grid-column: auto; }
+.al-chart-body { height: 280px; position: relative; }
+.al-chart-body-sm { height: 280px; }
+.al-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.al-row-3 { grid-template-columns: 1fr 1fr 1fr; }
+.al-bar-cell { position: relative; }
+.al-bar {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: var(--accent-glow, rgba(124,58,237,.18));
+    border-radius: 4px; z-index: 0;
+}
+.al-bar-label { position: relative; z-index: 1; }
+.al-flag { color: var(--danger, #ef4444); font-weight: 600; }
+@media (max-width: 1100px) {
+    .al-charts-grid { grid-template-columns: 1fr; }
+    .al-row, .al-row-3 { grid-template-columns: 1fr; }
+}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
 <script>
 window.__AL_I18N = {
     purgeConfirm: <%- JSON.stringify(t('accessLogs.purgeConfirm') || 'Удалить все сохранённые access-логи? Это необратимо.') %>,
     noResults: <%- JSON.stringify(t('accessLogs.noResults') || 'Ничего не найдено') %>,
     never: <%- JSON.stringify(t('settings.never') || 'никогда') %>,
+    duckdbRequired: <%- JSON.stringify(t('accessLogs.duckdbRequired') || 'Виджет требует DuckDB, который сейчас недоступен.') %>,
+    accepted: <%- JSON.stringify(t('accessLogs.stateActive') || 'accepted') %>,
+    labels: {
+        accepted: 'accepted', rejected: 'rejected', blocked: 'blocked', tcp: 'tcp', udp: 'udp'
+    }
 };
 </script>
 <script defer src="/js/access-logs.js"></script>

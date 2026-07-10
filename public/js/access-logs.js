@@ -1,4 +1,11 @@
-// Access-logs dashboard: filters, summary, search, node status, purge.
+// Access-logs dashboard: filters, analytics overview (charts + user/top tables),
+// on-demand event search, node status, purge.
+//
+// All DuckDB-backed data comes from a single /api/analytics call (the server
+// runs the whole overview in one worker spawn). The raw-event search is a
+// separate on-demand request. Requests are issued sequentially, never in
+// parallel, because the panel intentionally allows only one heavy DuckDB query
+// at a time (weak-hardware constraint) and parallel calls would be rejected.
 (function () {
     'use strict';
 
@@ -6,6 +13,7 @@
     if (!app) return;
     const enabled = app.dataset.enabled === '1';
     const I18N = window.__AL_I18N || {};
+    const L = (I18N.labels) || {};
 
     const $ = (id) => document.getElementById(id);
     const toast = (msg, type) => {
@@ -19,6 +27,11 @@
         return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
             '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
         }[c]));
+    }
+
+    function fmtNum(n) {
+        n = Number(n) || 0;
+        return n.toLocaleString();
     }
 
     function fmtBytes(n) {
@@ -46,7 +59,6 @@
             if (el && el.value) {
                 let v = el.value;
                 if ((key === 'from' || key === 'to') && v) {
-                    // datetime-local -> ISO
                     const d = new Date(v);
                     if (!isNaN(d.getTime())) v = d.toISOString();
                 }
@@ -62,30 +74,171 @@
         return res.json();
     }
 
-    async function loadSummary() {
-        try {
-            const data = await getJson('/panel/access-logs/api/summary?' + queryString());
-            if (!data.enabled) return;
-            $('alDegraded').style.display = data.degraded ? '' : 'none';
-            const totals = data.totals || {};
-            $('alTotal').textContent = totals.total != null ? totals.total : '0';
-            $('alUsers').textContent = totals.users != null ? totals.users : (data.topUsers ? data.topUsers.length : '0');
-            $('alIps').textContent = totals.ips != null ? totals.ips : '—';
+    // ─── Charts ────────────────────────────────────────────────────────────
+    const Cc = {
+        accepted: '#22c55e', rejected: '#f59e0b', blocked: '#ef4444',
+        tcp: '#6366f1', udp: '#06b6d4', accent: '#7c3aed', grid: '#27272a', text: '#a1a1aa',
+    };
+    let timelineChart = null, actionChart = null, protoChart = null;
 
-            renderTop($('alTopDest'), data.topDestinations, (r) => r.dest || r.key, (r) => r.hits);
-            renderTop($('alTopUsers'), data.topUsers, (r) => r.email || r.key, (r) => r.hits);
-        } catch (e) {
-            toast('Summary error: ' + e.message, 'error');
-        }
+    function ensureChartDefaults() {
+        if (!window.Chart) return false;
+        Chart.defaults.color = Cc.text;
+        Chart.defaults.borderColor = Cc.grid;
+        Chart.defaults.font.family = "'Inter', sans-serif";
+        Chart.defaults.plugins.legend.labels.boxWidth = 12;
+        Chart.defaults.maintainAspectRatio = false;
+        return true;
     }
 
-    function renderTop(tbody, rows, keyFn, valFn) {
+    function renderTimeline(series) {
+        if (!ensureChartDefaults()) return;
+        const ctx = $('alTimeline'); if (!ctx) return;
+        const labels = series.map(r => r.bucket);
+        const ds = (key, color) => ({
+            label: (L[key] || key), data: series.map(r => Number(r[key] || 0)),
+            borderColor: color, backgroundColor: color + '33', fill: true, tension: 0.3,
+            pointRadius: 0, borderWidth: 2,
+        });
+        const data = {
+            labels,
+            datasets: [ds('accepted', Cc.accepted), ds('rejected', Cc.rejected), ds('blocked', Cc.blocked)],
+        };
+        const options = {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+                x: { type: 'time', time: { tooltipFormat: 'PPpp' }, grid: { display: false } },
+                y: { beginAtZero: true, stacked: true, ticks: { precision: 0 } },
+            },
+            plugins: { legend: { position: 'bottom' } },
+            elements: { line: { fill: true } },
+        };
+        // Stacked areas read better for accepted/rejected/blocked composition.
+        options.scales.y.stacked = true;
+        data.datasets.forEach(d => { d.fill = true; });
+        if (timelineChart) { timelineChart.data = data; timelineChart.options = options; timelineChart.update(); }
+        else timelineChart = new Chart(ctx.getContext('2d'), { type: 'line', data, options });
+    }
+
+    function renderDonut(canvasId, ref, entries) {
+        if (!ensureChartDefaults()) return null;
+        const ctx = $(canvasId); if (!ctx) return ref;
+        const data = {
+            labels: entries.map(e => e.label),
+            datasets: [{ data: entries.map(e => e.value), backgroundColor: entries.map(e => e.color), borderWidth: 0 }],
+        };
+        const options = { responsive: true, cutout: '62%', plugins: { legend: { position: 'bottom' } } };
+        if (ref) { ref.data = data; ref.update(); return ref; }
+        return new Chart(ctx.getContext('2d'), { type: 'doughnut', data, options });
+    }
+
+    // ─── Tables ────────────────────────────────────────────────────────────
+    // Render a table body with an inline proportion bar on a numeric column.
+    function renderBarRows(tbody, rows, cols) {
         if (!tbody) return;
         rows = rows || [];
-        if (!rows.length) { tbody.innerHTML = '<tr><td class="hint">—</td></tr>'; return; }
-        tbody.innerHTML = rows.map(r =>
-            `<tr><td>${esc(keyFn(r))}</td><td style="text-align:right;">${esc(valFn(r))}</td></tr>`
-        ).join('');
+        if (!rows.length) { tbody.innerHTML = '<tr><td class="hint" colspan="' + cols.length + '">—</td></tr>'; return; }
+        const barCol = cols.find(c => c.bar);
+        const max = barCol ? Math.max(1, ...rows.map(r => Number(r[barCol.key] || 0))) : 1;
+        tbody.innerHTML = rows.map(r => {
+            return '<tr>' + cols.map(c => {
+                let v = r[c.key];
+                if (c.fmt) v = c.fmt(v, r);
+                const align = c.align ? ' style="text-align:' + c.align + ';"' : '';
+                if (c.bar) {
+                    const pct = Math.round((Number(r[c.key] || 0) / max) * 100);
+                    return '<td class="al-bar-cell"' + align + '>'
+                        + '<span class="al-bar" style="width:' + pct + '%;"></span>'
+                        + '<span class="al-bar-label">' + esc(v) + '</span></td>';
+                }
+                return '<td' + align + '>' + (c.html ? v : esc(v)) + '</td>';
+            }).join('') + '</tr>';
+        }).join('');
+    }
+
+    function pct01(v) {
+        const n = Number(v || 0);
+        return Math.round(n * 100) + '%';
+    }
+
+    function renderUsers(users) {
+        users = users || [];
+        // Sharing lens: sorted by distinct IPs (server already sorts by ips).
+        const byIp = users.slice().sort((a, b) => (b.ips - a.ips) || (b.events - a.events));
+        renderBarRows($('alUsersByIp'), byIp, [
+            { key: 'email', fmt: (v) => v || '—' },
+            { key: 'ips', align: 'right', bar: true, fmt: fmtNum },
+            { key: 'subnets', align: 'right', fmt: fmtNum },
+            { key: 'events', align: 'right', fmt: fmtNum },
+            { key: 'last_seen', align: 'right', fmt: (v) => fmtTime(v) },
+        ]);
+        // Fan-out lens: sorted by distinct destinations.
+        const byFan = users.slice().sort((a, b) => (b.dests - a.dests) || (b.events - a.events));
+        renderBarRows($('alUsersByFanout'), byFan, [
+            { key: 'email', fmt: (v) => v || '—' },
+            { key: 'dests', align: 'right', bar: true, fmt: fmtNum },
+            { key: 'udp_share', align: 'right', fmt: pct01 },
+            { key: 'events', align: 'right', fmt: fmtNum },
+        ]);
+    }
+
+    function renderTops(data) {
+        renderBarRows($('alTopDest'), data.topDestinations, [
+            { key: 'dest', fmt: (v, r) => v || r.key || '—' },
+            { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
+        ]);
+        renderBarRows($('alTopPorts'), data.topPorts, [
+            { key: 'port', fmt: (v) => (v == null ? '—' : v) },
+            { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
+        ]);
+        renderBarRows($('alTopBlocked'), data.topBlocked, [
+            { key: 'dest', fmt: (v, r) => v || r.key || '—' },
+            { key: 'hits', align: 'right', bar: true, fmt: fmtNum },
+        ]);
+    }
+
+    // ─── Loaders ─────────────────────────────────────────────────────────────
+    async function loadAnalytics() {
+        try {
+            const data = await getJson('/panel/access-logs/api/analytics?' + queryString());
+            if (!data.enabled) return;
+            const degraded = !!data.degraded;
+            $('alDegraded').style.display = degraded ? '' : 'none';
+
+            const totals = data.totals || {};
+            $('alTotal').textContent = fmtNum(totals.total);
+            $('alUsers').textContent = fmtNum(totals.users);
+            $('alIps').textContent = totals.ips != null ? fmtNum(totals.ips) : '—';
+            $('alDests').textContent = totals.dests != null ? fmtNum(totals.dests) : '—';
+            const blocked = (totals.blocked != null ? totals.blocked : 0);
+            $('alBlocked').textContent = fmtNum(blocked);
+
+            renderTimeline(data.series || []);
+
+            actionChart = renderDonut('alActionChart', actionChart, [
+                { label: L.accepted || 'accepted', value: Number(totals.accepted || 0), color: Cc.accepted },
+                { label: L.rejected || 'rejected', value: Number(totals.rejected || 0), color: Cc.rejected },
+                { label: L.blocked || 'blocked', value: Number(totals.blocked || 0), color: Cc.blocked },
+            ]);
+            protoChart = renderDonut('alProtoChart', protoChart, [
+                { label: L.tcp || 'tcp', value: Number(totals.tcp || 0), color: Cc.tcp },
+                { label: L.udp || 'udp', value: Number(totals.udp || 0), color: Cc.udp },
+            ]);
+
+            renderUsers(data.users);
+            renderTops(data);
+
+            // In degraded mode the DuckDB-only widgets are empty; hint why.
+            if (data.duckdbRequired) {
+                const note = '<tr><td class="hint" colspan="6">' + esc(I18N.duckdbRequired) + '</td></tr>';
+                if (!(data.users || []).length) { $('alUsersByIp').innerHTML = note; $('alUsersByFanout').innerHTML = note; }
+                if (!(data.topPorts || []).length) $('alTopPorts').innerHTML = note;
+                if (!(data.topBlocked || []).length) $('alTopBlocked').innerHTML = note;
+            }
+        } catch (e) {
+            toast('Analytics error: ' + e.message, 'error');
+        }
     }
 
     async function loadSearch() {
@@ -128,19 +281,21 @@
                     <td>${esc(fmtTime(n.lastBatchAt))}</td>
                     <td class="hint">${esc(n.lastError || '')}</td>
                 </tr>`
-            ).join('') : '<tr><td class="hint">—</td></tr>';
+            ).join('') : '<tr><td class="hint" colspan="5">—</td></tr>';
         } catch (e) {
             // status is non-critical; keep quiet
         }
     }
 
-    function refreshAll() {
-        loadSummary();
-        loadSearch();
-        loadStatus();
+    // Sequential refresh: analytics -> search -> status (never parallel, to
+    // respect the single-concurrent-DuckDB-query limit).
+    async function refreshAll() {
+        await loadAnalytics();
+        await loadSearch();
+        await loadStatus();
     }
 
-    // Wire events (only when the feature is enabled).
+    // ─── Wiring ──────────────────────────────────────────────────────────────
     const form = $('alFilters');
     if (form) {
         form.addEventListener('submit', (e) => { e.preventDefault(); refreshAll(); });
@@ -168,8 +323,8 @@
         });
     }
 
-    // Default the time range to the last 24 h so the initial page load queries
-    // only recent partitions instead of scanning the whole dataset.
+    // Default the time range to the last 24 h so the initial load queries only
+    // recent partitions instead of scanning the whole dataset.
     function setDefaultRange() {
         const from = $('alFrom');
         if (!from || from.value) return;
@@ -182,7 +337,6 @@
         setDefaultRange();
         refreshAll();
     } else {
-        // Still show node/pipeline status so admins can see why nothing arrives.
         loadStatus();
     }
 })();

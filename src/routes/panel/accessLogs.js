@@ -2,9 +2,11 @@
  * Admin-only access-logs UI + JSON API.
  *
  * Routes (all behind the panel auth chain applied in panel/index.js):
- *   GET  /panel/access-logs            -> dashboard page
- *   GET  /panel/access-logs/api/summary -> aggregates (Parquet via DuckDB, or
- *                                          Mongo rollups when degraded)
+ *   GET  /panel/access-logs             -> dashboard page
+ *   GET  /panel/access-logs/api/analytics -> combined overview: totals, series,
+ *                                          top dests/ports/blocked, per-user
+ *                                          IP/fan-out (Parquet via DuckDB in one
+ *                                          worker spawn; Mongo rollups when degraded)
  *   GET  /panel/access-logs/api/search  -> paged raw-event search (DuckDB)
  *   GET  /panel/access-logs/api/status  -> per-node shipping + pipeline status
  *   POST /panel/access-logs/api/purge   -> delete the entire stored dataset
@@ -77,25 +79,41 @@ router.get('/access-logs', async (req, res) => {
 
 // ─── JSON API ────────────────────────────────────────────────────────────────
 
-router.get('/access-logs/api/summary', async (req, res) => {
+router.get('/access-logs/api/analytics', async (req, res) => {
     try {
         if (!(await isEnabled())) return res.json({ enabled: false });
         const filters = filtersFromQuery(req.query);
         const searchService = require('../../services/accessLogs/searchService');
-        const result = await searchService.summary(filters, { topN: 10 });
+        const result = await searchService.overview(filters, { topN: 10, userLimit: 25 });
 
         if (result.degraded) {
-            // Fall back to Mongo rollups so the dashboard still renders.
+            // DuckDB is down: fall back to Mongo rollups for the cheap aggregates
+            // (totals + timeline + top destinations). Per-user IP/fan-out tables
+            // and port/blocked breakdowns need Parquet, so they are empty and the
+            // UI flags them as requiring DuckDB.
             const rollupService = require('../../services/accessLogs/rollupService');
             const from = filters.from || new Date(Date.now() - 24 * 60 * 60 * 1000);
             const to = filters.to || new Date();
             const roll = await rollupService.readSummary(from, to, filters.nodeId);
-            return res.json({ enabled: true, degraded: true, ...roll });
+            return res.json({
+                enabled: true,
+                degraded: true,
+                duckdbRequired: true,
+                totals: roll.totals,
+                series: roll.series,
+                topDestinations: roll.topDestinations,
+                topPorts: [],
+                topBlocked: [],
+                users: [],
+            });
+        }
+        if (result.error) {
+            return res.json({ enabled: true, error: result.error, totals: {}, series: [], users: [] });
         }
         return res.json({ enabled: true, degraded: false, ...result });
     } catch (error) {
-        logger.error('[Panel] access-logs summary error:', error.message);
-        res.status(500).json({ error: 'summary failed' });
+        logger.error('[Panel] access-logs analytics error:', error.message);
+        res.status(500).json({ error: 'analytics failed' });
     }
 });
 

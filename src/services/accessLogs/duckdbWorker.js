@@ -64,25 +64,35 @@ async function main() {
         await conn.run(`SET threads=${threads}`);
         await conn.run(`SET memory_limit='${memMb}MB'`);
 
-        const params = Array.isArray(job.params) ? job.params : [];
-        const reader = await conn.runAndReadAll(job.sql, params);
-        let rows = reader.getRowObjects();
+        // Read one query's rows, normalized + row-capped.
+        async function runOne(sql, params, rowLimit) {
+            const reader = await conn.runAndReadAll(sql, Array.isArray(params) ? params : []);
+            let rows = reader.getRowObjects();
+            const limit = Number(rowLimit) || 1000;
+            if (rows.length > limit) rows = rows.slice(0, limit);
+            // Normalize so JSON.stringify never throws: BIGINT -> Number, and
+            // DuckDB temporal/complex wrapper objects -> string (node-api returns
+            // TIMESTAMP as objects carrying BigInt micros).
+            return rows.map((row) => {
+                const out = {};
+                for (const k of Object.keys(row)) out[k] = normalizeValue(row[k]);
+                return out;
+            });
+        }
 
-        const limit = Number(job.rowLimit) || 1000;
-        if (rows.length > limit) rows = rows.slice(0, limit);
-
-        // Normalize values so JSON.stringify never throws: BIGINT -> Number,
-        // and DuckDB's temporal/complex wrapper objects -> a string. The node-api
-        // returns TIMESTAMP as objects (e.g. DuckDBTimestampValue) which are not
-        // JSON-serializable and also carry BigInt micros internally.
-        const safe = rows.map((row) => {
-            const out = {};
-            for (const k of Object.keys(row)) {
-                out[k] = normalizeValue(row[k]);
+        // Batch mode: run several labelled queries on one connection in a single
+        // child-process spawn, so a whole dashboard costs one worker instead of N.
+        if (Array.isArray(job.queries)) {
+            const results = {};
+            for (const q of job.queries) {
+                results[q.key] = await runOne(q.sql, q.params, q.rowLimit);
             }
-            return out;
-        });
+            process.stdout.write(JSON.stringify({ ok: true, results }));
+            process.exit(0);
+            return;
+        }
 
+        const safe = await runOne(job.sql, job.params, job.rowLimit);
         process.stdout.write(JSON.stringify({ ok: true, rows: safe }));
         process.exit(0);
     } catch (err) {
