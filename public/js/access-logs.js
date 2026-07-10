@@ -43,9 +43,25 @@
         return n.toFixed(i ? 1 : 0) + ' ' + u[i];
     }
 
+    // DuckDB returns naive UTC timestamps ("2026-07-10 10:05:00", no zone). Parse
+    // them as UTC so the whole page displays in the viewer's LOCAL time —
+    // consistent with the datetime-local filter inputs (which are local and get
+    // converted to UTC for the query). Without this the shown times would be
+    // silently shifted by the timezone offset.
+    function parseTs(v) {
+        if (v == null || v === '') return null;
+        if (v instanceof Date) return v;
+        let s = String(v);
+        const naive = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(s);
+        if (naive) s = s.replace(' ', 'T') + 'Z';
+        const d = new Date(s);
+        return isNaN(d.getTime()) ? null : d;
+    }
+
     function fmtTime(v) {
         if (!v) return I18N.never || '—';
-        try { return new Date(v).toLocaleString(); } catch (_) { return String(v); }
+        const d = parseTs(v);
+        return d ? d.toLocaleString() : String(v);
     }
 
     // Colored pill for an action / protocol so the tables scan at a glance.
@@ -87,10 +103,32 @@
         return params.toString();
     }
 
+    // ─── Busy indicator ──────────────────────────────────────────────────────
+    // A reference-counted busy state drives the top progress bar and the search
+    // button spinner, so any in-flight request (analytics, search, status, the
+    // per-user IP drilldown) shows progress without flicker between chained calls.
+    let busyCount = 0;
+    function setBusy(on) {
+        busyCount += on ? 1 : -1;
+        if (busyCount < 0) busyCount = 0;
+        const busy = busyCount > 0;
+        const bar = $('alProgress');
+        if (bar) bar.classList.toggle('active', busy);
+        const btn = $('alSearchBtn');
+        const icon = $('alSearchIcon');
+        if (btn) btn.disabled = busy;
+        if (icon) icon.className = busy ? 'ti ti-loader-2 al-spin' : 'ti ti-search';
+    }
+
     async function getJson(url) {
-        const res = await fetch(url, { credentials: 'include' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        return res.json();
+        setBusy(true);
+        try {
+            const res = await fetch(url, { credentials: 'include' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } finally {
+            setBusy(false);
+        }
     }
 
     // ─── Charts ────────────────────────────────────────────────────────────
@@ -113,7 +151,8 @@
     function renderTimeline(series) {
         if (!ensureChartDefaults()) return;
         const ctx = $('alTimeline'); if (!ctx) return;
-        const labels = series.map(r => r.bucket);
+        // Parse UTC buckets to real instants so the time axis renders in local time.
+        const labels = series.map(r => parseTs(r.bucket));
         const ds = (key, color) => ({
             label: (L[key] || key), data: series.map(r => Number(r[key] || 0)),
             borderColor: color, backgroundColor: color + '33', fill: true, tension: 0.3,
@@ -271,6 +310,26 @@
         ]);
     }
 
+    // ─── Skeletons (first-load placeholders) ─────────────────────────────────
+    function skelRow(cols) {
+        let tds = '';
+        for (let i = 0; i < cols; i++) {
+            tds += '<td' + (i ? ' style="text-align:right;"' : '') + '><span class="al-skel"></span></td>';
+        }
+        return '<tr>' + tds + '</tr>';
+    }
+    function repeat(n, fn) { let s = ''; for (let i = 0; i < n; i++) s += fn(); return s; }
+    function paintSkeletons() {
+        ['alTotal', 'alUsers', 'alIps', 'alDests'].forEach(id => {
+            const el = $(id); if (el) el.innerHTML = '<span class="al-skel"></span>';
+        });
+        const tables = { alUsersByIp: 5, alUsersByFanout: 4, alTopDest: 2, alTopPorts: 2, alTopBlocked: 2 };
+        for (const id of Object.keys(tables)) {
+            const t = $(id); if (t) t.innerHTML = repeat(5, () => skelRow(tables[id]));
+        }
+        const res = $('alResults'); if (res) res.innerHTML = repeat(6, () => skelRow(7));
+    }
+
     // ─── Loaders ─────────────────────────────────────────────────────────────
     async function loadAnalytics() {
         try {
@@ -406,6 +465,7 @@
 
     if (enabled) {
         setDefaultRange();
+        paintSkeletons();
         refreshAll();
     } else {
         loadStatus();
