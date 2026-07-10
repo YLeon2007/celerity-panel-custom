@@ -96,6 +96,21 @@ router.get('/settings', async (req, res) => {
             maxBytes: homepageService.MAX_CUSTOM_BYTES,
         };
 
+        // Eligible nodes for access-log collection: client-facing Xray nodes
+        // (standalone or portal). Used by the access-logs settings tab.
+        let accessLogNodes = [];
+        try {
+            const HyNode = require('../../models/hyNodeModel');
+            accessLogNodes = await HyNode.find({
+                type: 'xray',
+                cascadeRole: { $in: ['standalone', 'portal'] },
+            })
+                .select('name cascadeRole agentVersion xray.accessLogs.status xray.accessLogs.lastError xray.accessLogs.lastBatchAt')
+                .lean();
+        } catch (e) {
+            logger.warn(`[Panel] accessLogNodes: ${e.message}`);
+        }
+
         render(res, 'settings', {
             title: res.locals.locales.settings.title,
             page: 'settings',
@@ -109,6 +124,7 @@ router.get('/settings', async (req, res) => {
             homepageInfo,
             migrationGroups,
             marzbanCfg,
+            accessLogNodes,
             message: req.query.message || null,
             error: req.query.error || null,
         });
@@ -371,7 +387,44 @@ router.post('/settings', async (req, res) => {
             }
             updates['backup.s3.keepLast'] = parseInt(req.body['backup.s3.keepLast']) || 30;
         }
-        
+
+        // Access-logs settings (opt-in Xray access-log collection & analytics).
+        // Its own form carries the _accessLogsSettings marker, so an absent
+        // checkbox means "off". Actual node provisioning is kicked off after the
+        // settings are persisted (below), never inline with the request.
+        let accessLogsToggled = false;
+        if (req.body['_accessLogsSettings'] !== undefined) {
+            const wantEnabled = req.body['accessLogs.enabled'] === 'on';
+            updates['accessLogs.enabled'] = wantEnabled;
+            const retention = parseInt(req.body['accessLogs.retentionDays'], 10);
+            updates['accessLogs.retentionDays'] = Number.isFinite(retention)
+                ? Math.min(365, Math.max(1, retention)) : 14;
+            const maxGb = parseInt(req.body['accessLogs.maxStorageGb'], 10);
+            updates['accessLogs.maxStorageGb'] = Number.isFinite(maxGb)
+                ? Math.min(2000, Math.max(1, maxGb)) : 10;
+            const scope = req.body['accessLogs.nodeScope'] === 'selected' ? 'selected' : 'all';
+            updates['accessLogs.nodeScope'] = scope;
+            const rawNodeIds = req.body['accessLogs.nodeIds'];
+            updates['accessLogs.nodeIds'] = rawNodeIds
+                ? (Array.isArray(rawNodeIds) ? rawNodeIds : [rawNodeIds]).filter(Boolean)
+                : [];
+            updates['accessLogs.maskClientIp'] = req.body['accessLogs.maskClientIp'] === 'on';
+            // Ingest URL must be an absolute http(s) URL; anything else is
+            // silently dropped to the default (derived from BASE_URL).
+            const rawIngestUrl = String(req.body['accessLogs.ingestUrl'] || '').trim().slice(0, 500);
+            let ingestUrl = '';
+            if (rawIngestUrl) {
+                try {
+                    const u = new URL(rawIngestUrl);
+                    if (u.protocol === 'https:' || u.protocol === 'http:') ingestUrl = rawIngestUrl;
+                } catch (_) { /* invalid URL -> fall back to derived */ }
+            }
+            updates['accessLogs.ingestUrl'] = ingestUrl;
+            updates['accessLogs.state'] = wantEnabled ? 'enabling' : 'disabling';
+            if (wantEnabled) updates['accessLogs.lastEnabledAt'] = new Date();
+            accessLogsToggled = true;
+        }
+
         await Settings.update(updates);
         
         await invalidateSettingsCache();
@@ -394,6 +447,16 @@ router.post('/settings', async (req, res) => {
 
         if (homepageModeChanged) {
             await homepageService.setMode(homepageModeChanged);
+        }
+
+        // Kick off access-log reconciliation in the background so the request
+        // stays fast (Xray restarts on nodes must not block the HTTP response).
+        if (accessLogsToggled) {
+            setImmediate(() => {
+                require('../../services/accessLogs/provisionService')
+                    .reconcileAll()
+                    .catch(err => logger.error('[AccessLogs] Reconcile after settings save failed:', err.message));
+            });
         }
 
         logger.info(`[Panel] Settings updated`);

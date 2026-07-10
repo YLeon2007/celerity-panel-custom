@@ -114,12 +114,20 @@ func main() {
 		}
 	}()
 
+	// Optional access-log shipping module. It remains inert unless explicitly enabled.
+	var shipper *Shipper
+	if cfg.AccessLogs.Enabled && cfg.AccessLogs.IngestURL != "" && cfg.AccessLogs.IngestToken != "" {
+		shipper = NewShipper(cfg)
+		shipper.Start()
+	}
+
 	api := &API{
 		cfg:           cfg,
 		userStore:     userStore,
 		xrayClient:    xrayClient,
 		persister:     persister,
 		onlineTracker: onlineTracker,
+		shipper:       shipper,
 	}
 
 	mux := http.NewServeMux()
@@ -166,6 +174,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+
+	if shipper != nil {
+		shipper.Stop()
+	}
 
 	// Stop the debounce loop and flush any pending config change synchronously.
 	persister.Stop()

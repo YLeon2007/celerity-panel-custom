@@ -1,0 +1,163 @@
+<% if (!enabled) { %>
+<div class="alert alert-warning" style="margin-bottom: 16px;">
+    <i class="ti ti-alert-triangle"></i>
+    <%= t('accessLogs.disabledBanner') || 'Сбор access-логов выключен. Включите его в Настройках.' %>
+    <a href="/panel/settings#tab-accessLogs" style="margin-left: 8px;"><%= t('nav.settings') || 'Настройки' %></a>
+</div>
+<% } %>
+
+<div id="accessLogsApp" data-enabled="<%= enabled ? '1' : '0' %>">
+    <!-- Degraded-mode banner (toggled by JS) -->
+    <div id="alDegraded" class="alert alert-info" style="display:none; margin-bottom:14px;">
+        <i class="ti ti-info-circle"></i>
+        <%= t('accessLogs.searchDegraded') || 'Детальный поиск недоступен (DuckDB не готов); показаны только агрегаты.' %>
+    </div>
+
+    <!-- Summary cards -->
+    <div class="stats-grid stats-summary-grid" style="margin-bottom:16px;">
+        <div class="stat-card">
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-list"></i></span></div>
+            <div class="stat-value" id="alTotal">—</div>
+            <div class="stat-label"><%= t('accessLogs.summary') || 'Всего событий' %></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-users"></i></span></div>
+            <div class="stat-value" id="alUsers">—</div>
+            <div class="stat-label"><%= t('accessLogs.topUsers') || 'Пользователей' %></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-world"></i></span></div>
+            <div class="stat-value" id="alIps">—</div>
+            <div class="stat-label">IP</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-header"><span class="stat-icon"><i class="ti ti-database"></i></span></div>
+            <div class="stat-value" id="alSpool">—</div>
+            <div class="stat-label">Spool</div>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card" style="margin-bottom:16px;">
+        <div class="card-body">
+            <form id="alFilters" class="settings-grid" style="gap:12px;">
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterFrom') || 'С' %></label>
+                    <input type="datetime-local" name="from" id="alFrom">
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterTo') || 'По' %></label>
+                    <input type="datetime-local" name="to" id="alTo">
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterNode') || 'Нода' %></label>
+                    <select name="nodeId" id="alNode">
+                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
+                        <% (nodes || []).forEach(n => { %>
+                            <option value="<%= n._id %>"><%= n.name %></option>
+                        <% }) %>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterUser') || 'Пользователь' %></label>
+                    <input type="text" name="email" id="alEmail" placeholder="email">
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterSourceIp') || 'Source IP' %></label>
+                    <input type="text" name="sourceIp" id="alSourceIp">
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterDestination') || 'Назначение' %></label>
+                    <input type="text" name="destination" id="alDest">
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterProtocol') || 'Протокол' %></label>
+                    <select name="network" id="alNetwork">
+                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
+                        <option value="tcp">tcp</option>
+                        <option value="udp">udp</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label><%= t('accessLogs.filterAction') || 'Действие' %></label>
+                    <select name="action" id="alAction">
+                        <option value=""><%= t('accessLogs.scopeAll') || 'Все' %></option>
+                        <option value="accepted">accepted</option>
+                        <option value="rejected">rejected</option>
+                        <option value="blocked">blocked</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>&nbsp;</label>
+                    <div style="display:flex; gap:8px;">
+                        <button type="submit" class="btn btn-primary">
+                            <i class="ti ti-search"></i> <%= t('accessLogs.search') || 'Поиск' %>
+                        </button>
+                        <button type="button" class="btn" id="alReset"><%= t('common.reset') || 'Сброс' %></button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Top lists -->
+    <div class="row" style="display:flex; gap:16px; flex-wrap:wrap; margin-bottom:16px;">
+        <div class="card" style="flex:1; min-width:280px;">
+            <div class="card-header"><h2><i class="ti ti-map-pin"></i> <%= t('accessLogs.topDestinations') || 'Топ назначений' %></h2></div>
+            <div class="card-body"><table class="data-table"><tbody id="alTopDest"></tbody></table></div>
+        </div>
+        <div class="card" style="flex:1; min-width:280px;">
+            <div class="card-header"><h2><i class="ti ti-user"></i> <%= t('accessLogs.topUsers') || 'Топ пользователей' %></h2></div>
+            <div class="card-body"><table class="data-table"><tbody id="alTopUsers"></tbody></table></div>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div class="card" style="margin-bottom:16px;">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+            <h2><i class="ti ti-list-details"></i> <%= t('accessLogs.search') || 'Поиск' %></h2>
+            <span id="alResultCount" class="hint"></span>
+        </div>
+        <div class="card-body" style="overflow-x:auto;">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>ts</th><th><%= t('accessLogs.filterNode') || 'Нода' %></th>
+                        <th>email</th><th>src</th><th>dest</th>
+                        <th>net</th><th>action</th>
+                    </tr>
+                </thead>
+                <tbody id="alResults"></tbody>
+            </table>
+            <div id="alNoResults" class="hint" style="display:none; padding:12px;">
+                <%= t('accessLogs.noResults') || 'Ничего не найдено' %>
+            </div>
+        </div>
+    </div>
+
+    <!-- Node status + purge -->
+    <div class="card">
+        <div class="card-header"><h2><i class="ti ti-server-cog"></i> Status</h2></div>
+        <div class="card-body">
+            <table class="data-table">
+                <thead><tr><th><%= t('accessLogs.filterNode') || 'Нода' %></th><th>agent</th><th>status</th><th><%= t('accessLogs.lastIngestAt') || 'Последний приём' %></th><th>error</th></tr></thead>
+                <tbody id="alNodeStatus"></tbody>
+            </table>
+            <hr class="settings-divider">
+            <button type="button" class="btn btn-danger" id="alPurge">
+                <i class="ti ti-trash"></i> <%= t('accessLogs.purge') || 'Очистить сохранённые логи' %>
+            </button>
+        </div>
+    </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+window.__AL_I18N = {
+    purgeConfirm: <%- JSON.stringify(t('accessLogs.purgeConfirm') || 'Удалить все сохранённые access-логи? Это необратимо.') %>,
+    noResults: <%- JSON.stringify(t('accessLogs.noResults') || 'Ничего не найдено') %>,
+    never: <%- JSON.stringify(t('settings.never') || 'никогда') %>,
+};
+</script>
+<script defer src="/js/access-logs.js"></script>

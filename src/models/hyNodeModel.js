@@ -220,6 +220,33 @@ const xrayConfigSchema = new mongoose.Schema({
     // ports and transports (Reality TCP + WS+TLS + gRPC, etc). Optional, the
     // main inbound is still defined by the flat fields above.
     extraInbounds: { type: [xrayExtraInboundSchema], default: [] },
+
+    // Per-node access-log shipping state. Independent of the node's core
+    // health: a shipping failure never marks the node offline.
+    accessLogs: {
+        // Effective state for THIS node (may lag the global setting while
+        // reconciliation is in progress or the agent is too old).
+        enabled: { type: Boolean, default: false },
+        status: {
+            type: String,
+            enum: ['disabled', 'pending', 'active', 'degraded', 'error', 'agent-outdated'],
+            default: 'disabled',
+        },
+        // Per-node ingest credential. Encrypted at rest for re-provisioning;
+        // a separate hash (below) is used for constant-time verification.
+        // select:false so it never leaks via ordinary .find()/.findOne().
+        ingestTokenEncrypted: { type: String, default: '', select: false },
+        ingestTokenHash: { type: String, default: '' },
+        // Fingerprint of the last successfully applied access-log config
+        // (enabled + ingest URL + token). Reconciliation skips the expensive
+        // config push + Xray restart when the fingerprint is unchanged.
+        appliedFingerprint: { type: String, default: '' },
+        lastError: { type: String, default: '' },
+        lastBatchAt: { type: Date, default: null },
+        spoolBytes: { type: Number, default: 0 },
+        droppedEvents: { type: Number, default: 0 },
+        lastReconcileAt: { type: Date, default: null },
+    },
 }, { _id: false });
 
 // Virtual node: a balancer entry that aggregates other nodes into a single

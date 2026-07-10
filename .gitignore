@@ -43,6 +43,7 @@ mongo_data/
 
 # CC Agent binaries (large files, deploy separately)
 public/downloads/
+cc-agent/cc-agent
 cc-agent/cc-agent-linux-amd64
 cc-agent/cc-agent-linux-arm64
 
@@ -51,6 +52,9 @@ data/access-logs/
 
 # Updater sidecar state (last update run log)
 data/updater/
+
+# Access-logs pipeline data (Parquet store + ingest spool)
+data/access-logs/
 
 Rules.md
 TODO.md

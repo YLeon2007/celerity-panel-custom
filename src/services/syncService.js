@@ -546,6 +546,23 @@ class SyncService {
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
                 }
 
+                // When access logging is enabled, the log directory must exist
+                // and be writable by the Xray service user (User=nobody in the
+                // systemd unit) BEFORE Xray restarts with the new config —
+                // otherwise Xray fails to start and the node goes down.
+                if (node.xray?.accessLogs?.enabled) {
+                    try {
+                        await ssh.exec(
+                            'mkdir -p /var/log/xray && '
+                            + 'chown nobody /var/log/xray 2>/dev/null || chown nobody:nogroup /var/log/xray 2>/dev/null || true; '
+                            + 'chmod 755 /var/log/xray; '
+                            + 'touch /var/log/xray/access.log && chown nobody /var/log/xray/access.log 2>/dev/null || true'
+                        );
+                    } catch (dirErr) {
+                        logger.warn(`[Xray Sync] Node ${node.name}: access-log dir prep failed: ${dirErr.message}`);
+                    }
+                }
+
                 // Xray config always goes to /usr/local/etc/xray/config.json
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
                 await ssh.uploadContent(configContent, xrayConfigPath);

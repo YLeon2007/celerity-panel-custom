@@ -135,6 +135,40 @@ const settingsSchema = new mongoose.Schema({
         completedAt: { type: Date, default: null },
     },
 
+    // Opt-in Xray access-logs collection & analytics. Disabled by default so
+    // the pipeline stays completely inert (no node provisioning, no ingest)
+    // until an admin explicitly turns it on.
+    accessLogs: {
+        // Admin-requested state. Runtime reconciliation flips `state` as the
+        // per-node provisioning progresses.
+        enabled: { type: Boolean, default: false },
+        state: {
+            type: String,
+            enum: ['disabled', 'enabling', 'active', 'disabling', 'error'],
+            default: 'disabled',
+        },
+        // Retention for searchable Parquet (whole partitions dropped past this).
+        retentionDays: { type: Number, default: 14 },
+        // Hard cap on the central Parquet store (oldest partitions pruned first).
+        maxStorageGb: { type: Number, default: 10 },
+        // Which nodes ship access logs: all eligible xray nodes, or a subset.
+        nodeScope: { type: String, enum: ['all', 'selected'], default: 'all' },
+        nodeIds: { type: [String], default: [] },
+        // Privacy: mask client IPs before storage. When on, exact source-IP
+        // search is not possible (documented in the UI).
+        maskClientIp: { type: Boolean, default: false },
+        // Full ingest endpoint pushed to agents; empty = derive from BASE_URL.
+        ingestUrl: { type: String, default: '' },
+        lastEnabledAt: { type: Date, default: null },
+        // Aggregate ingest counters for the settings dashboard.
+        stats: {
+            ingestedBatches: { type: Number, default: 0 },
+            rejectedBatches: { type: Number, default: 0 },
+            duplicateBatches: { type: Number, default: 0 },
+            lastIngestAt: { type: Date, default: null },
+        },
+    },
+
     homepage: {
         mode: { type: String, enum: ['nginx', 'custom'], default: 'nginx' },
         customHtml: { type: Buffer, default: null },

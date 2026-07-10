@@ -1592,7 +1592,7 @@ function computeInboundFlow(inbound) {
  * the new `inbounds[]` array describing per-tag flow for all VLESS inbounds
  * (main + extras). Old agents read inbound_tag; new agents read inbounds[].
  */
-function buildAgentConfig(node, token, agentPort, apiPort, useTls) {
+function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
     const xray = node.xray || {};
     const mainTag = xray.inboundTag || 'vless-in';
 
@@ -1603,7 +1603,7 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls) {
             .map(i => ({ tag: i.inboundTag, flow: computeInboundFlow(i) })),
     ];
 
-    return {
+    const cfg = {
         listen: `0.0.0.0:${agentPort}`,
         token: token,
         xray_api: `127.0.0.1:${apiPort}`,
@@ -1618,6 +1618,25 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls) {
             key: '/etc/cc-agent/key.pem',
         },
     };
+
+    // Opt-in access-log module. Only written when a caller supplies the block;
+    // otherwise it stays absent so older agents and the disabled state are
+    // untouched (the agent treats an absent block as disabled).
+    if (accessLogs && typeof accessLogs === 'object') {
+        cfg.access_logs = {
+            enabled: !!accessLogs.enabled,
+            path: accessLogs.path || '/var/log/xray/access.log',
+            ingest_url: accessLogs.ingestUrl || '',
+            ingest_token: accessLogs.ingestToken || '',
+            insecure_tls: !!accessLogs.insecureTls,
+            spool_max_bytes: accessLogs.spoolMaxBytes || (200 * 1024 * 1024),
+            batch_max_events: accessLogs.batchMaxEvents || 500,
+            flush_interval_seconds: accessLogs.flushIntervalSeconds || 5,
+            file_max_bytes: accessLogs.fileMaxBytes || (64 * 1024 * 1024),
+        };
+    }
+
+    return cfg;
 }
 
 /**
@@ -1642,7 +1661,17 @@ async function reloadCcAgent(node, ssh) {
     const apiPort = xray.apiPort || 61000;
     const useTls = xray.agentTls !== false;
 
-    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls);
+    // Resolve the access-log block for this node (best-effort). When the module
+    // is disabled or the credential is missing we still write an explicit
+    // disabled block so a previously-enabled agent is turned off cleanly.
+    let accessLogs;
+    try {
+        accessLogs = await require('./accessLogs/provisionService').buildNodeAccessLogsConfig(node);
+    } catch (e) {
+        accessLogs = { enabled: false };
+    }
+
+    const agentConfig = buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs);
     const configJson = JSON.stringify(agentConfig, null, 2);
 
     await ssh.uploadContent(configJson, '/etc/cc-agent/config.json');

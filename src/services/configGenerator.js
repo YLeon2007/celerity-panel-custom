@@ -8,6 +8,24 @@ const path = require('path');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
 
+// Canonical on-node path for the Xray access log when the opt-in access-logs
+// module is enabled. The cc-agent tails exactly this file.
+const XRAY_ACCESS_LOG_PATH = '/var/log/xray/access.log';
+
+// Build the Xray `log` section. When per-node access logging is enabled we write
+// an explicit access-file path; otherwise we explicitly disable it with "none"
+// (an empty/absent value would send access lines to stdout/journald noise).
+// The error log is deliberately NOT set: leaving it absent keeps warnings and
+// errors flowing to stdout -> journald, which admins rely on for diagnostics
+// (`journalctl -u xray`). Never silence it.
+function buildXrayLogSection(node) {
+    const enabled = !!(node && node.xray && node.xray.accessLogs && node.xray.accessLogs.enabled);
+    return {
+        loglevel: 'warning',
+        access: enabled ? XRAY_ACCESS_LOG_PATH : 'none',
+    };
+}
+
 // ─── Panel TLS certificate inlining (Marzban-style) ──────────────────────────
 //
 // When a Xray node is configured with tlsSource==='panel', we read the panel's
@@ -746,9 +764,7 @@ function generateXrayConfig(node, users) {
     const extraInbounds = Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [];
 
     const config = {
-        log: {
-            loglevel: 'warning',
-        },
+        log: buildXrayLogSection(node),
         api: {
             services: ['HandlerService', 'StatsService'],
             tag: 'API',
@@ -915,6 +931,9 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 Type=simple
+# Creates /var/log/xray owned by the service user, so the optional access-log
+# module can write there without manual permission fixes.
+LogsDirectory=xray
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
 Restart=on-failure
 RestartSec=5
@@ -1760,6 +1779,8 @@ module.exports = {
     generateSystemdService,
     applyOutboundsAndAcl,
     generateXrayConfig,
+    buildXrayLogSection,
+    XRAY_ACCESS_LOG_PATH,
     buildXrayStreamSettings,
     generateXraySystemdService,
     applyReversePortal,

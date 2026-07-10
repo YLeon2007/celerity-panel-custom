@@ -18,6 +18,8 @@ type API struct {
 	xrayClient    *XrayClient
 	persister     *ConfigPersister
 	onlineTracker *OnlineTracker
+	// shipper is nil when access-log collection is disabled.
+	shipper *Shipper
 }
 
 func (a *API) RegisterRoutes(mux *http.ServeMux) {
@@ -63,13 +65,19 @@ func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // GET /info — version, uptime, user count
 func (a *API) handleInfo(w http.ResponseWriter, r *http.Request) {
-	jsonOK(w, map[string]any{
+	info := map[string]any{
 		"agent_version":  Version,
 		"xray_version":   getXrayVersion(),
 		"uptime_seconds": int(time.Since(startTime).Seconds()),
 		"users_count":    a.userStore.Count(),
 		"last_sync":      a.userStore.GetLastSync(),
-	})
+	}
+	if a.shipper != nil {
+		info["access_logs"] = a.shipper.Status()
+	} else {
+		info["access_logs"] = ShipperStatus{Enabled: false}
+	}
+	jsonOK(w, info)
 }
 
 // POST /connect — handshake; panel calls this to verify connectivity

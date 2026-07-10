@@ -59,6 +59,9 @@ services:
       - ./logs:/app/logs
       - ./greenlock.d:/app/greenlock.d
       - ./backups:/app/backups
+      # Access-logs pipeline data (Parquet store + ingest spool) must survive
+      # container rebuilds.
+      - ./data:/app/data
     env_file:
       - .env
     environment:

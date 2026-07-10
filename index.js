@@ -68,6 +68,25 @@ app.use(cors({
     origin: config.BASE_URL,
     credentials: true,
 }));
+
+// Access-logs ingest is mounted BEFORE the JSON body parser: it reads the raw
+// gzipped NDJSON body itself. It authenticates via a per-node Bearer token
+// (not a session), so it lives outside the normal /api auth chain. A generous
+// rate limit guards against a misbehaving agent while allowing normal batch
+// cadence from many nodes.
+{
+    const rateLimitLib = require('express-rate-limit');
+    const accessLogsIngestLimiter = rateLimitLib({
+        windowMs: 60 * 1000,
+        max: 600, // ~10 batches/sec/IP; agents batch every few seconds
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: 'too many ingest requests' },
+    });
+    const accessLogsIngestRoutes = require('./src/routes/accessLogsIngest');
+    app.use('/api/access-logs', accessLogsIngestLimiter, accessLogsIngestRoutes);
+}
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -99,6 +118,27 @@ app.use(i18nMiddleware);
 const { version: appVersion } = require('./package.json');
 app.use((req, res, next) => {
     res.locals.appVersion = appVersion;
+    next();
+});
+
+// Expose the access-logs feature flag to views (drives the sidebar nav entry).
+// Cached briefly so it is effectively free per request; only computed for panel
+// HTML routes to avoid work on API/static traffic.
+let _accessLogsNavCache = { value: false, at: 0 };
+const ACCESS_LOGS_NAV_TTL_MS = 30 * 1000;
+app.use(async (req, res, next) => {
+    if (!req.path.startsWith('/panel')) return next();
+    try {
+        const now = Date.now();
+        if (now - _accessLogsNavCache.at > ACCESS_LOGS_NAV_TTL_MS) {
+            const Settings = require('./src/models/settingsModel');
+            const s = await Settings.get();
+            _accessLogsNavCache = { value: !!s?.accessLogs?.enabled, at: now };
+        }
+        res.locals.accessLogsEnabled = _accessLogsNavCache.value;
+    } catch (_) {
+        res.locals.accessLogsEnabled = false;
+    }
     next();
 });
 
@@ -672,7 +712,34 @@ async function startServer() {
         
             // Cron jobs
         setupCronJobs();
-        
+
+        // Access-logs spool processor. Always started: it is idle when the spool
+        // is empty (feature off) and picks up batches immediately once an admin
+        // enables collection, without needing a restart.
+        try {
+            require('./src/services/accessLogs/processService').start();
+        } catch (e) {
+            logger.warn(`[AccessLogs] processor start skipped: ${e.message}`);
+        }
+
+        // Crash recovery: if the panel died mid-reconcile the access-logs state
+        // stays stuck in a transitional value. Re-run reconciliation once on
+        // boot (delayed so nodes/DB settle first); it is a no-op fast path when
+        // every node already matches the desired config.
+        setTimeout(async () => {
+            try {
+                const Settings = require('./src/models/settingsModel');
+                const s = await Settings.get();
+                const state = s?.accessLogs?.state;
+                if (state === 'enabling' || state === 'disabling' || state === 'error') {
+                    logger.info(`[AccessLogs] state '${state}' at boot — resuming reconciliation`);
+                    await require('./src/services/accessLogs/provisionService').reconcileAll();
+                }
+            } catch (e) {
+                logger.warn(`[AccessLogs] boot reconcile skipped: ${e.message}`);
+            }
+        }, 30 * 1000);
+
     } catch (err) {
         logger.error(`[Server] Startup failed: ${err.message}`);
         process.exit(1);
@@ -981,6 +1048,20 @@ function setupCronJobs() {
         }
     });
     
+    // Access-logs retention & storage-cap enforcement (daily 03:20). Cheap no-op
+    // when the feature is off or the store is empty.
+    cron.schedule('20 3 * * *', async () => {
+        try {
+            const Settings = require('./src/models/settingsModel');
+            const settings = await Settings.get();
+            if (settings?.accessLogs?.enabled) {
+                await require('./src/services/accessLogs/retentionService').enforce();
+            }
+        } catch (error) {
+            logger.error(`[Cron] Access-logs retention failed: ${error.message}`);
+        }
+    });
+
     // Clean inactive HWID device rows (daily 03:30)
     cron.schedule('30 3 * * *', async () => {
         try {

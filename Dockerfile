@@ -6,7 +6,7 @@ WORKDIR /app
 # Устанавливаем системные зависимости:
 # - mongodb-tools: mongodump/mongorestore для backup/restore
 # - git/bash/docker-cli: self-update из панели через host checkout + docker compose
-RUN apk add --no-cache mongodb-tools git bash docker-cli docker-cli-compose
+RUN apk add --no-cache mongodb-tools git bash docker-cli docker-cli-compose libstdc++ libgcc
 
 # Копируем зависимости
 COPY package*.json ./

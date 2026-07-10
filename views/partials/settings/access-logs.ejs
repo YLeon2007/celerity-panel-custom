@@ -1,0 +1,158 @@
+<!-- ==================== TAB: ACCESS LOGS ==================== -->
+<%
+    const al = (settings && settings.accessLogs) || {};
+    const alNodes = (typeof accessLogNodes !== 'undefined' && Array.isArray(accessLogNodes)) ? accessLogNodes : [];
+    const alDateLocale = typeof dateLocale !== 'undefined' ? dateLocale : undefined;
+    const alSelected = Array.isArray(al.nodeIds) ? al.nodeIds.map(String) : [];
+    const stateLabels = {
+        disabled: t('accessLogs.stateDisabled') || 'Выключено',
+        enabling: t('accessLogs.stateEnabling') || 'Включается…',
+        active:   t('accessLogs.stateActive')   || 'Активно',
+        disabling:t('accessLogs.stateDisabling')|| 'Выключается…',
+        error:    t('accessLogs.stateError')    || 'Ошибка',
+    };
+%>
+<div class="tab-content" id="tab-accessLogs">
+    <div class="row" style="align-items: stretch; flex-direction: column; gap: 16px;">
+        <div style="display: flex; width: 100%;">
+            <div class="card" style="flex: 1; display: flex; flex-direction: column;">
+                <div class="card-header">
+                    <h2><i class="ti ti-list-search"></i> <%= t('accessLogs.title') || 'Access-логи Xray' %></h2>
+                </div>
+                <div class="card-body">
+                    <div class="alert alert-warning" style="margin-bottom: 14px; padding: 10px 12px; font-size: 13px; line-height: 1.55;">
+                        <strong><%= t('common.attention') || 'Внимание' %>:</strong>
+                        <div><%= t('accessLogs.enableWarning') || 'Включение перезапустит Xray на выбранных нодах (кратковременный обрыв соединений) и начнёт собирать access-логи. Функция требует cc-agent 1.4.0+.' %></div>
+                    </div>
+
+                    <form method="POST" action="/panel/settings" id="accessLogsSettingsForm">
+                        <input type="hidden" name="_accessLogsSettings" value="1">
+
+                        <label class="checkbox-label">
+                            <input type="checkbox" name="accessLogs.enabled" id="accessLogsEnabled"
+                                   <%= al.enabled ? 'checked' : '' %>>
+                            <span><%= t('accessLogs.enable') || 'Собирать и анализировать access-логи' %></span>
+                        </label>
+                        <small class="hint" style="display: block; margin-top: 6px;">
+                            <%= t('accessLogs.enableHint') || 'По умолчанию выключено. Сбор идёт через cc-agent, хранение — в Parquet, поиск — через DuckDB.' %>
+                        </small>
+
+                        <div class="settings-list" style="margin-top: 14px;">
+                            <div class="setting-item">
+                                <label><%= t('accessLogs.currentState') || 'Текущее состояние' %></label>
+                                <span><%= stateLabels[al.state] || al.state || stateLabels.disabled %></span>
+                            </div>
+                        </div>
+
+                        <div id="accessLogsSettings" style="margin-top: 14px; <%= al.enabled ? '' : 'display: none;' %>">
+                            <div class="settings-grid">
+                                <div class="form-group">
+                                    <label for="accessLogs.retentionDays"><%= t('accessLogs.retentionDays') || 'Хранение (дней)' %></label>
+                                    <input type="number" name="accessLogs.retentionDays" id="accessLogs.retentionDays"
+                                           value="<%= al.retentionDays || 14 %>" min="1" max="365">
+                                    <small class="hint"><%= t('accessLogs.retentionHint') || 'Старые партиции удаляются целиком.' %></small>
+                                </div>
+                                <div class="form-group">
+                                    <label for="accessLogs.maxStorageGb"><%= t('accessLogs.maxStorageGb') || 'Лимит хранилища (ГБ)' %></label>
+                                    <input type="number" name="accessLogs.maxStorageGb" id="accessLogs.maxStorageGb"
+                                           value="<%= al.maxStorageGb || 10 %>" min="1" max="2000">
+                                    <small class="hint"><%= t('accessLogs.maxStorageHint') || 'При превышении удаляются самые старые партиции.' %></small>
+                                </div>
+                            </div>
+
+                            <div class="form-group" style="margin-top: 14px;">
+                                <label for="accessLogs.nodeScope"><%= t('accessLogs.nodeScope') || 'Ноды' %></label>
+                                <select name="accessLogs.nodeScope" id="accessLogs.nodeScope">
+                                    <option value="all" <%= (al.nodeScope !== 'selected') ? 'selected' : '' %>><%= t('accessLogs.scopeAll') || 'Все подходящие Xray-ноды' %></option>
+                                    <option value="selected" <%= (al.nodeScope === 'selected') ? 'selected' : '' %>><%= t('accessLogs.scopeSelected') || 'Только выбранные' %></option>
+                                </select>
+                            </div>
+
+                            <div id="accessLogsNodeList" style="margin-top: 10px; <%= (al.nodeScope === 'selected') ? '' : 'display: none;' %>">
+                                <% if (alNodes.length === 0) { %>
+                                    <small class="hint"><%= t('accessLogs.noEligibleNodes') || 'Нет подходящих Xray-нод (standalone/portal).' %></small>
+                                <% } else { %>
+                                    <% alNodes.forEach(n => { %>
+                                        <label class="checkbox-label" style="display:flex; align-items:center; gap:8px;">
+                                            <input type="checkbox" name="accessLogs.nodeIds" value="<%= n._id %>"
+                                                   <%= alSelected.includes(String(n._id)) ? 'checked' : '' %>>
+                                            <span><%= n.name %>
+                                                <% const st = n.xray && n.xray.accessLogs && n.xray.accessLogs.status; %>
+                                                <% if (st && st !== 'disabled') { %>
+                                                    <small class="hint">(<%= st %>)</small>
+                                                <% } %>
+                                            </span>
+                                        </label>
+                                    <% }) %>
+                                <% } %>
+                            </div>
+
+                            <label class="checkbox-label" style="margin-top: 14px;">
+                                <input type="checkbox" name="accessLogs.maskClientIp" id="accessLogs.maskClientIp"
+                                       <%= al.maskClientIp ? 'checked' : '' %>>
+                                <span><%= t('accessLogs.maskClientIp') || 'Маскировать клиентские IP' %></span>
+                            </label>
+                            <small class="hint" style="display:block; margin-top:6px;">
+                                <%= t('accessLogs.maskClientIpHint') || 'При включении точный поиск по source IP будет недоступен.' %>
+                            </small>
+
+                            <div class="form-group" style="margin-top: 14px;">
+                                <label for="accessLogs.ingestUrl"><%= t('accessLogs.ingestUrl') || 'URL приёма (ingest)' %></label>
+                                <input type="text" name="accessLogs.ingestUrl" id="accessLogs.ingestUrl"
+                                       value="<%= al.ingestUrl || '' %>"
+                                       placeholder="https://panel.example.com/api/access-logs/ingest">
+                                <small class="hint"><%= t('accessLogs.ingestUrlHint') || 'Пусто = вычисляется из адреса панели.' %></small>
+                            </div>
+                        </div>
+
+                        <hr class="settings-divider">
+
+                        <div class="settings-list">
+                            <div class="setting-item">
+                                <label><%= t('accessLogs.ingestedBatches') || 'Принято батчей' %></label>
+                                <span><%= (al.stats && al.stats.ingestedBatches) || 0 %></span>
+                            </div>
+                            <div class="setting-item">
+                                <label><%= t('accessLogs.rejectedBatches') || 'Отклонено' %></label>
+                                <span><%= (al.stats && al.stats.rejectedBatches) || 0 %></span>
+                            </div>
+                            <div class="setting-item">
+                                <label><%= t('accessLogs.lastIngestAt') || 'Последний приём' %></label>
+                                <span>
+                                    <%= (al.stats && al.stats.lastIngestAt)
+                                        ? new Date(al.stats.lastIngestAt).toLocaleString(alDateLocale)
+                                        : (t('settings.never') || 'никогда') %>
+                                </span>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 16px;">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="ti ti-device-floppy"></i> <%= t('common.save') || 'Сохранить' %>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    const enabled = document.getElementById('accessLogsEnabled');
+    const box = document.getElementById('accessLogsSettings');
+    if (enabled && box) {
+        enabled.addEventListener('change', function () {
+            box.style.display = this.checked ? '' : 'none';
+        });
+    }
+    const scope = document.getElementById('accessLogs.nodeScope');
+    const nodeList = document.getElementById('accessLogsNodeList');
+    if (scope && nodeList) {
+        scope.addEventListener('change', function () {
+            nodeList.style.display = this.value === 'selected' ? '' : 'none';
+        });
+    }
+})();
+</script>
