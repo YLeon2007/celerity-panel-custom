@@ -25,12 +25,20 @@ const links = [
 assert.strictEqual(typeof configGenerator.generateCombinedBridgeConfig, 'function', 'generateCombinedBridgeConfig must be exported');
 
 const config = JSON.parse(configGenerator.generateCombinedBridgeConfig(links));
+const loggedConfig = JSON.parse(configGenerator.generateCombinedBridgeConfig(links, {
+    accessLog: '/var/log/xray-bridge/access.log',
+}));
 
 const bridges = config.reverse?.bridges || [];
 const outbounds = config.outbounds || [];
 const rules = config.routing?.rules || [];
 
 assert.strictEqual(bridges.length, 2, 'must create one reverse bridge per active link');
+assert.strictEqual(config.log?.access, undefined, 'access logging must remain opt-in');
+assert.strictEqual(loggedConfig.log?.access, '/var/log/xray-bridge/access.log', 'bridge sidecar must emit access logs to its own file');
+assert.deepStrictEqual(loggedConfig.reverse, config.reverse, 'access logging must not alter reverse config');
+assert.deepStrictEqual(loggedConfig.outbounds, config.outbounds, 'access logging must not alter outbounds');
+assert.deepStrictEqual(loggedConfig.routing, config.routing, 'access logging must not alter routing');
 assert.deepStrictEqual(bridges.map(b => b.tag).sort(), ['bridge-11111111', 'bridge-22222222']);
 assert.deepStrictEqual(bridges.map(b => b.domain).sort(), ['11111111.portal-a.reverse.internal', '22222222.portal-b.reverse.internal']);
 

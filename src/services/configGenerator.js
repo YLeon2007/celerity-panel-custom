@@ -1176,13 +1176,15 @@ function generateBridgeConfig(link, portalNode) {
  * @param {Array<Object>} links - CascadeLink documents populated with portalNode
  * @returns {string} JSON string ready to write to config.json
  */
-function generateCombinedBridgeConfig(links) {
+function generateCombinedBridgeConfig(links, options = {}) {
     if (!Array.isArray(links) || links.length === 0) {
         throw new Error('generateCombinedBridgeConfig requires at least one link');
     }
 
+    const log = { loglevel: 'warning' };
+    if (options.accessLog) log.access = options.accessLog;
     const config = {
-        log: { loglevel: 'warning' },
+        log,
         reverse: { bridges: [] },
         outbounds: [
             {

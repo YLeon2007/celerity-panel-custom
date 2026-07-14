@@ -45,12 +45,12 @@ function resolveIngestUrl(settings) {
     return base ? `${base}/api/access-logs/ingest` : '';
 }
 
-// Eligibility: client-facing Xray nodes only (standalone/portal). Bridge/relay
-// nodes never terminate client traffic, so they have no meaningful access log.
+// Eligibility: Xray nodes that either terminate client traffic directly
+// (standalone/portal) or release reverse-cascade traffic (bridge).
 function isEligibleNode(node) {
     return node
         && node.type === 'xray'
-        && ['standalone', 'portal'].includes(node.cascadeRole);
+        && ['standalone', 'portal', 'bridge'].includes(node.cascadeRole);
 }
 
 // Should THIS node be shipping, given the global setting + scope?
@@ -88,7 +88,9 @@ async function buildNodeAccessLogsConfig(node) {
 
     return {
         enabled: true,
-        path: require('../configGenerator').XRAY_ACCESS_LOG_PATH,
+        path: node.cascadeRole === 'bridge'
+            ? '/var/log/xray-bridge/access.log'
+            : require('../configGenerator').XRAY_ACCESS_LOG_PATH,
         ingestUrl,
         ingestToken: token,
         insecureTls,
