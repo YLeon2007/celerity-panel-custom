@@ -778,6 +778,7 @@
     "updateStepRestart": "Restarting panel",
     "updateDone": "Done",
     "updateDetails": "Details",
+    "updateChangelogTitle": "What's new in this version",
     "tabMigration": "Migration",
     "tabSystemDesc": "Performance, caching, rate limits and SSH pool.",
     "tabSubscriptionDesc": "Branding, buttons and client app behavior.",

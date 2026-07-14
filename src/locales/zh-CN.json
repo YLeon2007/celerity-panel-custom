@@ -778,6 +778,7 @@
     "updateStepRestart": "重启面板",
     "updateDone": "完成",
     "updateDetails": "详情",
+    "updateChangelogTitle": "此版本的更新内容",
     "tabMigration": "迁移",
     "tabSystemDesc": "性能、缓存、速率限制和 SSH 连接池。",
     "tabSubscriptionDesc": "品牌、按钮和客户端应用行为。",
