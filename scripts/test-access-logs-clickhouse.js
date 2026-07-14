@@ -152,6 +152,7 @@ async function onlineTests() {
     // Configure the service via an in-memory settings stub.
     const u = new URL(url);
     const Settings = require('../src/models/settingsModel');
+    const cryptoService = require('../src/services/cryptoService');
     Settings.get = async () => ({
         accessLogs: {
             retentionDays: 7,
@@ -160,7 +161,7 @@ async function onlineTests() {
                 port: Number(u.port) || 8123,
                 database: u.pathname.replace(/^\//, '') || 'default',
                 username: decodeURIComponent(u.username) || 'default',
-                passwordEncrypted: '',
+                passwordEncrypted: u.password ? cryptoService.encrypt(decodeURIComponent(u.password)) : '',
                 secure: u.protocol === 'https:',
             },
         },
