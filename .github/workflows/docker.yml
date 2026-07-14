@@ -46,25 +46,17 @@ jobs:
           generate_release_notes: true
           append_body: true
           body: |
-            ---
+            ## CC Agent binaries
 
-            <details>
-            <summary>📦 <b>CC Agent binaries</b> — installed automatically on nodes</summary>
+            Lightweight Go agent for managing Xray on nodes.
+            Downloaded automatically during node auto-setup from the panel.
 
-            <br>
-
-            Lightweight Go agent that manages Xray on your nodes. It is downloaded
-            automatically during node auto-setup, so you normally don't need these —
-            grab them only for a manual node installation.
-
-            | Binary | Architecture |
-            | :--- | :--- |
+            | File | Architecture |
+            |------|-------------|
             | `cc-agent-linux-amd64` | x86_64 (most VPS) |
             | `cc-agent-linux-arm64` | ARM64 |
 
-            The panel itself ships as a Docker image: `clickdevtech/hysteria-panel`
-
-            </details>
+            > Panel source code is distributed via Docker Hub: `clickdevtech/hysteria-panel`
           files: |
             cc-agent/cc-agent-linux-amd64
             cc-agent/cc-agent-linux-arm64

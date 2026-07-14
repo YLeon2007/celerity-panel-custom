@@ -777,7 +777,7 @@
     "updateStepImage": "Downloading & building",
     "updateStepRestart": "Restarting panel",
     "updateDone": "Done",
-    "updateTerminalTitle": "updater",
+    "updateDetails": "Details",
     "tabMigration": "Migration",
     "tabSystemDesc": "Performance, caching, rate limits and SSH pool.",
     "tabSubscriptionDesc": "Branding, buttons and client app behavior.",

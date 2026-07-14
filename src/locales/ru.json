@@ -777,7 +777,7 @@
     "updateStepImage": "Загрузка и сборка образа",
     "updateStepRestart": "Перезапуск панели",
     "updateDone": "Готово",
-    "updateTerminalTitle": "апдейтер",
+    "updateDetails": "Детали",
     "tabMigration": "Миграция",
     "tabSystemDesc": "Производительность, кэш, лимиты и SSH-пул.",
     "tabSubscriptionDesc": "Внешний вид, кнопки и поведение клиентских приложений.",

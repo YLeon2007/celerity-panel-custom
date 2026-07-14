@@ -150,12 +150,12 @@
 
         <div class="upd-steps" id="updSteps"></div>
 
-        <div class="upd-terminal" id="updTerminal" style="display:none;">
-            <div class="upd-terminal-bar">
-                <span class="upd-dot r"></span><span class="upd-dot y"></span><span class="upd-dot g"></span>
-                <span class="upd-terminal-title"><%= t('settings.updateTerminalTitle') || 'updater' %></span>
-            </div>
-            <pre class="upd-terminal-body" id="updLog"></pre>
+        <div class="upd-log-wrap" id="updLogWrap" style="display:none;">
+            <button type="button" class="upd-log-toggle" id="updLogToggle" aria-expanded="false">
+                <i class="ti ti-chevron-right" id="updLogChevron"></i>
+                <span><%= t('settings.updateDetails') || 'Детали' %></span>
+            </button>
+            <pre class="upd-log" id="updLog" style="display:none;"></pre>
         </div>
 
         <!-- Shown only when the flow ends in error/timeout so the admin can leave. -->
@@ -193,12 +193,12 @@
 .upd-step.is-done .upd-step-label{color:var(--text-secondary,#a1a1aa);}
 .upd-step.is-error .upd-step-label{color:#fca5a5;font-weight:600;}
 @keyframes upd-spin{to{transform:rotate(360deg)}}
-.upd-terminal{border:1px solid var(--border,#27272a);border-radius:var(--radius-sm,10px);overflow:hidden;background:#0c0c0e;margin-bottom:18px;}
-.upd-terminal-bar{display:flex;align-items:center;gap:6px;padding:8px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--border,#27272a);}
-.upd-dot{width:10px;height:10px;border-radius:50%;}
-.upd-dot.r{background:#ef4444;}.upd-dot.y{background:#eab308;}.upd-dot.g{background:#22c55e;}
-.upd-terminal-title{margin-left:8px;font-size:11px;color:var(--text-muted,#71717a);font-family:'JetBrains Mono',monospace;}
-.upd-terminal-body{margin:0;padding:12px 14px;max-height:220px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.65;color:#a1a1aa;white-space:pre-wrap;word-break:break-word;}
+.upd-log-wrap{margin-bottom:18px;}
+.upd-log-toggle{display:inline-flex;align-items:center;gap:6px;padding:0;background:none;border:none;cursor:pointer;font-size:12.5px;color:var(--text-muted,#71717a);transition:color .2s;font-family:inherit;}
+.upd-log-toggle:hover{color:var(--text-secondary,#a1a1aa);}
+.upd-log-toggle i{font-size:14px;transition:transform .2s;}
+.upd-log-toggle.is-open i{transform:rotate(90deg);}
+.upd-log{margin:10px 0 0;padding:12px 14px;max-height:220px;overflow:auto;background:rgba(0,0,0,.28);border:1px solid var(--border,#27272a);border-radius:var(--radius-sm,10px);font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.65;color:var(--text-secondary,#a1a1aa);white-space:pre-wrap;word-break:break-word;}
 .upd-actions{display:flex;justify-content:flex-end;}
 </style>
 
@@ -470,9 +470,18 @@
         const titleEl = document.getElementById('updTitle');
         const subEl = document.getElementById('updSub');
         const elapsedEl = document.getElementById('updElapsed');
-        const termEl = document.getElementById('updTerminal');
+        const logWrapEl = document.getElementById('updLogWrap');
+        const logToggleEl = document.getElementById('updLogToggle');
         const logEl = document.getElementById('updLog');
         const actionsEl = document.getElementById('updActions');
+
+        logToggleEl.onclick = () => {
+            const open = logEl.style.display !== 'none';
+            logEl.style.display = open ? 'none' : '';
+            logToggleEl.classList.toggle('is-open', !open);
+            logToggleEl.setAttribute('aria-expanded', String(!open));
+            if (!open) logEl.scrollTop = logEl.scrollHeight;
+        };
 
         renderStages();
         titleEl.textContent = t.inProgress;
@@ -496,12 +505,20 @@
 
         function showLog(lines) {
             if (!lines || !lines.length) return;
-            termEl.style.display = '';
+            logWrapEl.style.display = '';
             const text = lines.join('\n');
             if (logEl.textContent !== text) {
                 logEl.textContent = text;
-                logEl.scrollTop = logEl.scrollHeight;
+                if (logEl.style.display !== 'none') logEl.scrollTop = logEl.scrollHeight;
             }
+        }
+
+        function openLog() {
+            logWrapEl.style.display = '';
+            logEl.style.display = '';
+            logToggleEl.classList.add('is-open');
+            logToggleEl.setAttribute('aria-expanded', 'true');
+            logEl.scrollTop = logEl.scrollHeight;
         }
 
         // Advance the visible stage monotonically (never jump backwards on a
@@ -530,7 +547,7 @@
             iconEl.innerHTML = '<i class="ti ti-alert-triangle"></i>';
             titleEl.textContent = t.failed;
             subEl.textContent = message || '';
-            if (log && log.length) showLog(log);
+            if (log && log.length) { showLog(log); openLog(); }
             actionsEl.style.display = '';
         }
 
