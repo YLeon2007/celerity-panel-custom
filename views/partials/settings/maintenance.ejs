@@ -137,19 +137,70 @@
 </div>
 
 <!-- Full-screen progress overlay shown while the panel is being updated -->
-<div id="updateOverlay" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(15,23,42,0.92); align-items:center; justify-content:center;">
-    <div style="text-align:center; max-width:520px; padding:24px;">
-        <i id="updateOverlaySpinner" class="ti ti-loader-2" style="font-size:40px; color:var(--accent); display:block; margin:0 auto 20px;"></i>
-        <h2 id="updateOverlayTitle"><%= t('settings.updateInProgress') || 'Обновление панели...' %></h2>
-        <p id="updateOverlayStep" style="color:var(--text-muted); font-size:14px;"></p>
-        <pre id="updateOverlayLog" style="display:none; text-align:left; margin-top:16px; max-height:260px; overflow:auto; font-size:11.5px; background:rgba(0,0,0,0.4); padding:12px; border-radius:8px;"></pre>
-        <!-- Shown only when the flow ends in an error/timeout so the admin is not
-             trapped behind a full-screen overlay. -->
-        <button id="updateOverlayClose" class="btn btn-secondary" style="display:none; margin-top:18px;" onclick="location.reload()">
-            <%= t('common.close') || 'Закрыть' %>
-        </button>
+<div id="updateOverlay" class="upd-overlay" style="display:none;">
+    <div class="upd-card">
+        <div class="upd-head">
+            <div class="upd-icon" id="updIcon"><i class="ti ti-rocket"></i></div>
+            <div class="upd-head-text">
+                <h2 class="upd-title" id="updTitle"><%= t('settings.updateInProgress') || 'Обновление панели' %></h2>
+                <p class="upd-sub" id="updSub"></p>
+            </div>
+            <span class="upd-elapsed" id="updElapsed">00:00</span>
+        </div>
+
+        <div class="upd-steps" id="updSteps"></div>
+
+        <div class="upd-terminal" id="updTerminal" style="display:none;">
+            <div class="upd-terminal-bar">
+                <span class="upd-dot r"></span><span class="upd-dot y"></span><span class="upd-dot g"></span>
+                <span class="upd-terminal-title"><%= t('settings.updateTerminalTitle') || 'updater' %></span>
+            </div>
+            <pre class="upd-terminal-body" id="updLog"></pre>
+        </div>
+
+        <!-- Shown only when the flow ends in error/timeout so the admin can leave. -->
+        <div class="upd-actions" id="updActions" style="display:none;">
+            <button class="btn btn-secondary" onclick="location.reload()">
+                <%= t('common.close') || 'Закрыть' %>
+            </button>
+        </div>
     </div>
 </div>
+
+<style>
+.upd-overlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(8,8,10,0.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
+.upd-card{width:100%;max-width:560px;background:var(--glass-bg-strong,rgba(20,20,23,0.92));border:1px solid var(--glass-border-strong,#3f3f46);border-radius:var(--radius,16px);box-shadow:var(--glass-shadow-lg,0 24px 64px rgba(0,0,0,.5));padding:28px;animation:upd-in .35s cubic-bezier(.2,.8,.2,1);}
+@keyframes upd-in{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:none}}
+.upd-head{display:flex;align-items:center;gap:16px;margin-bottom:24px;}
+.upd-head-text{min-width:0;}
+.upd-icon{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:26px;flex:0 0 auto;color:#fff;background:linear-gradient(135deg,var(--accent,#6366f1) 0%,var(--accent-gradient-end,#7c3aed) 100%);box-shadow:0 6px 18px var(--accent-glow,rgba(99,102,241,.3));transition:all .3s;}
+.upd-icon.is-success{background:linear-gradient(135deg,#22c55e,#16a34a);box-shadow:0 6px 18px rgba(34,197,94,.35);}
+.upd-icon.is-error{background:linear-gradient(135deg,#ef4444,#dc2626);box-shadow:0 6px 18px rgba(239,68,68,.35);}
+.upd-icon .ti-loader-2{animation:upd-spin .9s linear infinite;}
+.upd-title{margin:0;font-size:18px;font-weight:650;color:var(--text-primary,#fafafa);}
+.upd-sub{margin:3px 0 0;font-size:13px;color:var(--text-muted,#71717a);font-family:'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.upd-elapsed{margin-left:auto;align-self:flex-start;font-size:12px;color:var(--text-muted,#71717a);font-family:'JetBrains Mono',monospace;background:rgba(255,255,255,.04);border:1px solid var(--border,#27272a);padding:3px 8px;border-radius:var(--radius-xs,6px);}
+.upd-steps{display:flex;flex-direction:column;gap:2px;margin-bottom:20px;}
+.upd-step{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:var(--radius-sm,10px);transition:background .25s;}
+.upd-step.is-active{background:rgba(99,102,241,.10);}
+.upd-step-ic{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:15px;flex:0 0 auto;border:1.5px solid var(--border-light,#3f3f46);color:var(--text-muted,#71717a);background:var(--bg-tertiary,#18181b);transition:all .25s;}
+.upd-step.is-active .upd-step-ic{border-color:var(--accent,#6366f1);color:var(--accent,#6366f1);}
+.upd-step.is-active .upd-step-ic .ti-loader-2{animation:upd-spin .9s linear infinite;}
+.upd-step.is-done .upd-step-ic{border-color:var(--success,#22c55e);background:var(--success,#22c55e);color:#fff;}
+.upd-step.is-error .upd-step-ic{border-color:var(--danger,#ef4444);background:var(--danger,#ef4444);color:#fff;}
+.upd-step-label{font-size:14px;color:var(--text-muted,#71717a);transition:color .25s;}
+.upd-step.is-active .upd-step-label{color:var(--text-primary,#fafafa);font-weight:600;}
+.upd-step.is-done .upd-step-label{color:var(--text-secondary,#a1a1aa);}
+.upd-step.is-error .upd-step-label{color:#fca5a5;font-weight:600;}
+@keyframes upd-spin{to{transform:rotate(360deg)}}
+.upd-terminal{border:1px solid var(--border,#27272a);border-radius:var(--radius-sm,10px);overflow:hidden;background:#0c0c0e;margin-bottom:18px;}
+.upd-terminal-bar{display:flex;align-items:center;gap:6px;padding:8px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--border,#27272a);}
+.upd-dot{width:10px;height:10px;border-radius:50%;}
+.upd-dot.r{background:#ef4444;}.upd-dot.y{background:#eab308;}.upd-dot.g{background:#22c55e;}
+.upd-terminal-title{margin-left:8px;font-size:11px;color:var(--text-muted,#71717a);font-family:'JetBrains Mono',monospace;}
+.upd-terminal-body{margin:0;padding:12px 14px;max-height:220px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:11.5px;line-height:1.65;color:#a1a1aa;white-space:pre-wrap;word-break:break-word;}
+.upd-actions{display:flex;justify-content:flex-end;}
+</style>
 
 <script>
 (function () {
@@ -172,6 +223,12 @@
         success: <%- JSON.stringify(t('settings.updateSuccess') || 'Панель обновлена до v{version}') %>,
         failed: <%- JSON.stringify(t('settings.updateFailed') || 'Обновление не удалось') %>,
         error: <%- JSON.stringify(t('common.error') || 'Ошибка') %>,
+        inProgress: <%- JSON.stringify(t('settings.updateInProgress') || 'Обновление панели') %>,
+        stepBackup: <%- JSON.stringify(t('settings.updateStepBackup') || 'Резервная копия') %>,
+        stepPrepare: <%- JSON.stringify(t('settings.updateStepPrepare') || 'Подготовка') %>,
+        stepImage: <%- JSON.stringify(t('settings.updateStepImage') || 'Загрузка и сборка образа') %>,
+        stepRestart: <%- JSON.stringify(t('settings.updateStepRestart') || 'Перезапуск панели') %>,
+        done: <%- JSON.stringify(t('settings.updateDone') || 'Готово') %>,
     };
 
     const currentVersion = card.dataset.currentVersion;
@@ -339,82 +396,186 @@
         }
     };
 
+    // Ordered pipeline stages shown in the overlay. Raw updater/flow step names
+    // are mapped onto these four buckets so the UI stays readable regardless of
+    // mode (hub vs source use different internal steps).
+    const UPD_STAGES = [
+        { id: 'backup', label: t.stepBackup, icon: 'ti-database' },
+        { id: 'prepare', label: t.stepPrepare, icon: 'ti-git-branch' },
+        { id: 'image', label: t.stepImage, icon: 'ti-package' },
+        { id: 'restart', label: t.stepRestart, icon: 'ti-refresh' },
+    ];
+
+    function stageIndexFromStep(scope, step) {
+        if (scope === 'flow') {
+            if (step === 'backup') return 0;
+            return 1; // trigger
+        }
+        // updater scope
+        switch (step) {
+            case 'start': case 'write-tag': case 'fetch': case 'checkout': case 'rollback-checkout': return 1;
+            case 'pull': case 'build': return 2;
+            case 'recreate': case 'up': return 3;
+            case 'done': return 3;
+            default: return 1;
+        }
+    }
+
+    function renderStages() {
+        const wrap = document.getElementById('updSteps');
+        wrap.innerHTML = '';
+        UPD_STAGES.forEach((s) => {
+            const row = document.createElement('div');
+            row.className = 'upd-step';
+            row.dataset.stage = s.id;
+            row.innerHTML = '<span class="upd-step-ic"><i class="ti ' + s.icon + '"></i></span>'
+                + '<span class="upd-step-label">' + s.label + '</span>';
+            wrap.appendChild(row);
+        });
+    }
+
+    function setStepIcon(row, kind, fallbackIcon) {
+        const ic = row.querySelector('.upd-step-ic i');
+        if (kind === 'active') ic.className = 'ti ti-loader-2';
+        else if (kind === 'done') ic.className = 'ti ti-check';
+        else if (kind === 'error') ic.className = 'ti ti-x';
+        else ic.className = 'ti ' + fallbackIcon;
+    }
+
+    // Mark stages: everything before activeIdx is done, activeIdx is active
+    // (or error/allDone). activeIdx = stage index; opts.error / opts.allDone.
+    function paintStages(activeIdx, opts = {}) {
+        const rows = document.querySelectorAll('#updSteps .upd-step');
+        rows.forEach((row, i) => {
+            row.classList.remove('is-active', 'is-done', 'is-error');
+            const stageIcon = UPD_STAGES[i].icon;
+            if (opts.allDone) {
+                row.classList.add('is-done');
+                setStepIcon(row, 'done', stageIcon);
+            } else if (i < activeIdx) {
+                row.classList.add('is-done');
+                setStepIcon(row, 'done', stageIcon);
+            } else if (i === activeIdx) {
+                if (opts.error) { row.classList.add('is-error'); setStepIcon(row, 'error', stageIcon); }
+                else { row.classList.add('is-active'); setStepIcon(row, 'active', stageIcon); }
+            } else {
+                setStepIcon(row, 'pending', stageIcon);
+            }
+        });
+    }
+
     function startProgressOverlay(targetVersion) {
         const overlay = document.getElementById('updateOverlay');
-        const stepEl = document.getElementById('updateOverlayStep');
-        const logEl = document.getElementById('updateOverlayLog');
+        const iconEl = document.getElementById('updIcon');
+        const titleEl = document.getElementById('updTitle');
+        const subEl = document.getElementById('updSub');
+        const elapsedEl = document.getElementById('updElapsed');
+        const termEl = document.getElementById('updTerminal');
+        const logEl = document.getElementById('updLog');
+        const actionsEl = document.getElementById('updActions');
+
+        renderStages();
+        titleEl.textContent = t.inProgress;
+        subEl.textContent = 'v' + currentVersion + '  →  v' + targetVersion;
+        iconEl.className = 'upd-icon';
+        iconEl.innerHTML = '<i class="ti ti-loader-2"></i>';
         overlay.style.display = 'flex';
-        stepEl.textContent = t.starting;
+        paintStages(0);
 
         let settled = false;
-        // Give the updater a moment before we start polling (the panel container
-        // will be recreated and briefly unreachable).
+        let maxStage = 0;
         const started = Date.now();
-        // Hard ceiling: a source build on weak hardware can take a while, but
-        // past this point the flow is considered lost (e.g. the updater died
-        // mid-run and its in-memory state reset) - stop polling forever.
         const POLL_TIMEOUT_MS = 30 * 60 * 1000;
 
-        // Terminal failure: stop the spinner and let the admin leave the
-        // full-screen overlay instead of trapping them behind it.
-        function failOverlay(message) {
+        const elapsedTimer = setInterval(() => {
+            const s = Math.floor((Date.now() - started) / 1000);
+            const mm = String(Math.floor(s / 60)).padStart(2, '0');
+            const ss = String(s % 60).padStart(2, '0');
+            elapsedEl.textContent = mm + ':' + ss;
+        }, 1000);
+
+        function showLog(lines) {
+            if (!lines || !lines.length) return;
+            termEl.style.display = '';
+            const text = lines.join('\n');
+            if (logEl.textContent !== text) {
+                logEl.textContent = text;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        }
+
+        // Advance the visible stage monotonically (never jump backwards on a
+        // transient status blip).
+        function advance(idx) {
+            if (idx > maxStage) maxStage = idx;
+            paintStages(maxStage);
+        }
+
+        function finishSuccess() {
             settled = true;
-            const spinner = document.getElementById('updateOverlaySpinner');
-            spinner.className = 'ti ti-alert-triangle';
-            spinner.style.color = '#f87171';
-            stepEl.textContent = message;
-            document.getElementById('updateOverlayClose').style.display = '';
+            clearInterval(elapsedTimer);
+            paintStages(0, { allDone: true });
+            iconEl.className = 'upd-icon is-success';
+            iconEl.innerHTML = '<i class="ti ti-check"></i>';
+            titleEl.textContent = t.success.replace('{version}', targetVersion);
+            subEl.textContent = t.done;
+            setTimeout(() => location.reload(), 1600);
+        }
+
+        function finishError(message, log) {
+            settled = true;
+            clearInterval(elapsedTimer);
+            paintStages(maxStage, { error: true });
+            iconEl.className = 'upd-icon is-error';
+            iconEl.innerHTML = '<i class="ti ti-alert-triangle"></i>';
+            titleEl.textContent = t.failed;
+            subEl.textContent = message || '';
+            if (log && log.length) showLog(log);
+            actionsEl.style.display = '';
         }
 
         async function poll() {
             if (settled) return;
             if (Date.now() - started > POLL_TIMEOUT_MS) {
-                failOverlay(t.failed + ' (timeout)');
+                finishError(t.failed + ' (timeout)');
                 return;
             }
-            // First try the updater status (still reachable during a source build
-            // and before the recreate). Then verify via /health once the new
-            // container is up.
             try {
                 const res = await fetch('/panel/settings/update-status', { credentials: 'include', cache: 'no-store' });
                 if (res.ok) {
                     const data = await res.json();
                     const u = data.updater || {};
                     const flow = data.flow || {};
-                    // Panel-side failure (pre-update backup or the trigger call)
-                    // happens before the updater does anything - safe to stop.
+
+                    // Panel-side failure (pre-update backup or trigger) happens
+                    // before the updater touches anything - safe to stop.
                     if (flow.state === 'error') {
-                        failOverlay(t.failed + (flow.error ? (': ' + flow.error) : ''));
+                        finishError(flow.error || '');
                         return;
                     }
                     if (flow.state === 'running' && flow.step) {
-                        stepEl.textContent = t.waiting + ' (' + flow.step + ')';
+                        advance(stageIndexFromStep('flow', flow.step));
                     }
-                    // The sidecar persists its LAST run, so only trust its state
-                    // when that run started after our flow did - otherwise a
-                    // stale error/step from a previous attempt would be taken
-                    // for the current one. ISO timestamps compare lexically.
+
+                    // Only trust the sidecar when its run started after our flow
+                    // (it persists the LAST run; ISO timestamps compare lexically).
                     const updaterCurrent = !!(u.startedAt && flow.startedAt && u.startedAt >= flow.startedAt);
-                    if (updaterCurrent && u.state === 'running' && u.step) {
-                        stepEl.textContent = t.waiting + ' (' + u.step + ')';
+                    if (updaterCurrent) {
+                        if (u.log) showLog(u.log);
+                        if (u.state === 'running' && u.step) advance(stageIndexFromStep('updater', u.step));
+                        if (u.state === 'error') { finishError(u.error || '', u.log); return; }
                     }
-                    if (updaterCurrent && u.state === 'error') {
-                        logEl.style.display = '';
-                        logEl.textContent = (u.log || []).join('\n');
-                        failOverlay(t.failed + (u.error ? (': ' + u.error) : ''));
-                        return;
-                    }
-                    // Success is confirmed when the running panel reports the new version.
+
+                    // Success once the running panel reports the new version.
                     if (cmp(String(data.currentVersion), String(targetVersion)) === 0 && (Date.now() - started) > 3000) {
-                        settled = true;
-                        stepEl.textContent = t.success.replace('{version}', targetVersion);
-                        setTimeout(() => location.reload(), 1500);
+                        finishSuccess();
                         return;
                     }
                 }
             } catch (_) {
-                // Panel is mid-restart; keep waiting.
-                stepEl.textContent = t.waiting;
+                // Panel is mid-restart and briefly unreachable - that IS the
+                // final stage, so surface it as such.
+                advance(3);
             }
             setTimeout(poll, 3000);
         }
