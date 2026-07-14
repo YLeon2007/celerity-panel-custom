@@ -15,8 +15,9 @@ const crypto = require('crypto');
 
 const updateService = require('../src/services/updateService');
 
-assert.deepStrictEqual(updateService.parseVersion('1.4.0'), [1, 4, 0]);
-assert.deepStrictEqual(updateService.parseVersion('v2.10.3'), [2, 10, 3]);
+assert.deepStrictEqual(updateService.parseVersion('1.4.0'), [1, 4, 0, 0]);
+assert.deepStrictEqual(updateService.parseVersion('v2.10.3'), [2, 10, 3, 0]);
+assert.deepStrictEqual(updateService.parseVersion('1.3.3.1'), [1, 3, 3, 1]);
 assert.strictEqual(updateService.parseVersion('1.4'), null);
 assert.strictEqual(updateService.parseVersion('1.4.0-beta'), null);
 assert.strictEqual(updateService.parseVersion('latest'), null);
@@ -27,6 +28,8 @@ assert.strictEqual(updateService.compareVersions('1.4.0', '1.5.0'), -1);
 assert.strictEqual(updateService.compareVersions('1.4.0', '1.4.0'), 0);
 assert.strictEqual(updateService.compareVersions('2.0.0', '1.9.9'), 1);
 assert.strictEqual(updateService.compareVersions('1.4.10', '1.4.2'), 1);
+assert.strictEqual(updateService.compareVersions('1.3.3.1', '1.3.3'), 1);
+assert.strictEqual(updateService.compareVersions('1.3.3', '1.3.3.1'), -1);
 // Unknown/invalid inputs compare as equal (0) rather than throwing.
 assert.strictEqual(updateService.compareVersions('bad', '1.0.0'), 0);
 
@@ -46,6 +49,7 @@ assert.strictEqual(updater.SECRET_CONFIGURED, true);
 // Version regex accepts only plain semver (optionally v-prefixed).
 assert.ok(updater.VERSION_RE.test('1.4.0'));
 assert.ok(updater.VERSION_RE.test('v1.4.0'));
+assert.ok(updater.VERSION_RE.test('1.3.3.1'));
 assert.ok(!updater.VERSION_RE.test('1.4'));
 assert.ok(!updater.VERSION_RE.test('latest'));
 assert.ok(!updater.VERSION_RE.test('1.4.0; rm -rf /'));

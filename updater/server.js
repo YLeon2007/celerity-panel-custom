@@ -44,7 +44,7 @@ const MAX_LOG_LINES = 200;
 const MAX_BODY_BYTES = 16 * 1024;
 
 // Only fully-qualified semver, optionally prefixed with `v`. No shell input.
-const VERSION_RE = /^v?\d+\.\d+\.\d+$/;
+const VERSION_RE = /^v?\d+\.\d+\.\d+(?:\.\d+)?$/;
 
 const configured = SECRET.length >= 32;
 if (!configured) {
