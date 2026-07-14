@@ -4,6 +4,14 @@ const path = require('path');
 
 const updateRoutes = fs.readFileSync(path.join(__dirname, '..', 'src/routes/panel/update.js'), 'utf8');
 const appJs = fs.readFileSync(path.join(__dirname, '..', 'public/js/app.js'), 'utf8');
+const layout = fs.readFileSync(path.join(__dirname, '..', 'views/layout.ejs'), 'utf8');
+const maintenance = fs.readFileSync(path.join(__dirname, '..', 'views/partials/settings/maintenance.ejs'), 'utf8');
+
+assert(!layout.includes('panelUpdateWidget'), 'global topbar update widget must be removed');
+assert(!layout.includes('panelUpdateAction'), 'global check-update button must be removed');
+assert(!layout.includes('panelUpdateModal'), 'obsolete global update modal must be removed');
+assert(maintenance.includes('updateCheckBtn') && maintenance.includes('checkForUpdates()'),
+    'update check must remain available in Settings → Maintenance');
 
 assert(
     updateRoutes.includes('const updateStatusLimiter = rateLimit') && updateRoutes.includes('max: 600'),
