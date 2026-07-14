@@ -45,7 +45,7 @@
                             <i class="ti ti-alert-triangle"></i> <%= t('settings.updateDowngradeWarn') || 'Откат на более старую версию не откатывает изменения в базе данных. Восстановление возможно только из резервной копии.' %>
                         </div>
                         <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                            <button class="btn btn-primary" id="updateApplyBtn" onclick="openUpdateModal()" disabled>
+                            <button type="button" class="btn btn-primary" id="updateApplyBtn" onclick="openUpdateModal()" disabled>
                                 <i class="ti ti-download"></i> <span id="updateApplyLabel"><%= t('settings.updateApply') || 'Установить' %></span>
                             </button>
                             <button class="btn btn-secondary" id="updateCheckBtn" onclick="checkForUpdates()">
@@ -119,7 +119,7 @@
 </div>
 
 <!-- Update confirmation modal -->
-<div class="glass-modal" id="updateModal" style="display:none;">
+<div class="glass-modal" id="updateModal" style="display:none; z-index:10000;" aria-hidden="true">
     <div class="glass-modal-content" style="max-width:440px;">
         <h3 style="margin-top:0;"><%= t('settings.updateConfirmTitle') || 'Подтвердите обновление' %></h3>
         <p style="color:var(--text-muted); font-size:13px;" id="updateModalSummary"></p>
@@ -136,8 +136,8 @@
             <%= t('settings.updateCreateBackup') || 'Создать резервную копию перед обновлением' %>
         </label>
         <div style="display:flex; gap:10px; justify-content:flex-end;">
-            <button class="btn btn-secondary" onclick="closeUpdateModal()"><%= t('common.cancel') || 'Отмена' %></button>
-            <button class="btn btn-primary" id="updateConfirmBtn" onclick="submitUpdate()"><%= t('settings.updateApply') || 'Установить' %></button>
+            <button type="button" class="btn btn-secondary" onclick="closeUpdateModal()"><%= t('common.cancel') || 'Отмена' %></button>
+            <button type="button" class="btn btn-primary" id="updateConfirmBtn" onclick="submitUpdate()"><%= t('settings.updateApply') || 'Установить' %></button>
         </div>
     </div>
 </div>
@@ -218,6 +218,14 @@
 (function () {
     const card = document.getElementById('updateCard');
     if (!card) return;
+
+    // Settings tabs and cards use overflow/transform effects that may create a
+    // containing block and hide a fixed modal. Keep update overlays as direct
+    // body children so they are always visible above the whole panel.
+    ['updateModal', 'updateOverlay'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el && el.parentElement !== document.body) document.body.appendChild(el);
+    });
 
     const t = {
         updateAvailable: <%- JSON.stringify(t('settings.updateAvailable') || 'Доступно обновление') %>,
@@ -382,11 +390,16 @@
         document.getElementById('updateTotp').value = '';
         document.getElementById('updateTotpGroup').style.display = totpEnabled ? '' : 'none';
         document.getElementById('updateBackup').checked = true;
-        document.getElementById('updateModal').style.display = 'flex';
+        const modal = document.getElementById('updateModal');
+        modal.style.display = 'flex';
+        modal.setAttribute('aria-hidden', 'false');
+        requestAnimationFrame(() => document.getElementById('updatePassword').focus());
     };
 
     window.closeUpdateModal = function () {
-        document.getElementById('updateModal').style.display = 'none';
+        const modal = document.getElementById('updateModal');
+        modal.style.display = 'none';
+        modal.setAttribute('aria-hidden', 'true');
     };
 
     window.submitUpdate = async function () {

@@ -12,6 +12,12 @@ assert(!layout.includes('panelUpdateAction'), 'global check-update button must b
 assert(!layout.includes('panelUpdateModal'), 'obsolete global update modal must be removed');
 assert(maintenance.includes('updateCheckBtn') && maintenance.includes('checkForUpdates()'),
     'update check must remain available in Settings → Maintenance');
+assert(maintenance.includes("document.body.appendChild(el)"),
+    'update confirmation/progress overlays must be moved outside transformed settings containers');
+assert(maintenance.includes('requestAnimationFrame(() => document.getElementById(\'updatePassword\').focus())'),
+    'opening the update confirmation must visibly focus the password field');
+assert(maintenance.includes('id="updateApplyBtn"') && maintenance.includes('type="button"'),
+    'update controls must not accidentally submit a surrounding settings form');
 
 assert(
     updateRoutes.includes('const updateStatusLimiter = rateLimit') && updateRoutes.includes('max: 600'),
