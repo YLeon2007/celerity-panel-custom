@@ -13,9 +13,11 @@ assert(!layout.includes('panelUpdateModal'), 'obsolete global update modal must 
 assert(maintenance.includes('updateCheckBtn') && maintenance.includes('checkForUpdates()'),
     'update check must remain available in Settings → Maintenance');
 assert(maintenance.includes("document.body.appendChild(el)"),
-    'update confirmation/progress overlays must be moved outside transformed settings containers');
-assert(maintenance.includes('requestAnimationFrame(() => document.getElementById(\'updatePassword\').focus())'),
-    'opening the update confirmation must visibly focus the password field');
+    'update progress overlay must be moved outside transformed settings containers');
+assert(maintenance.includes('id="updateAuthFields"') && maintenance.includes('onclick="submitUpdate()"'),
+    'credentials and the real submit action must be directly visible in the maintenance card');
+assert(!maintenance.includes('id="updateModal"') && !maintenance.includes('openUpdateModal'),
+    'there must be no intermediate hidden confirmation modal');
 assert(maintenance.includes('id="updateApplyBtn"') && maintenance.includes('type="button"'),
     'update controls must not accidentally submit a surrounding settings form');
 

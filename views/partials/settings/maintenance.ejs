@@ -44,8 +44,23 @@
                         <div id="updateDowngradeWarn" style="display:none; margin:12px 0; padding:10px 12px; border-radius:8px; background:rgba(245,158,11,0.12); color:#fbbf24; font-size:13px;">
                             <i class="ti ti-alert-triangle"></i> <%= t('settings.updateDowngradeWarn') || 'Откат на более старую версию не откатывает изменения в базе данных. Восстановление возможно только из резервной копии.' %>
                         </div>
-                        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                            <button type="button" class="btn btn-primary" id="updateApplyBtn" onclick="openUpdateModal()" disabled>
+                        <div id="updateAuthFields" style="display:none; margin-top:16px; padding:14px; border:1px solid var(--border,#27272a); border-radius:10px; background:rgba(0,0,0,.12);">
+                        <p style="margin:0 0 12px; color:var(--text-muted); font-size:13px;" id="updateModalSummary"></p>
+                        <div class="form-group">
+                            <label for="updatePassword"><%= t('settings.updatePassword') || 'Текущий пароль' %></label>
+                            <input type="password" id="updatePassword" class="form-control" autocomplete="current-password">
+                        </div>
+                        <div class="form-group" id="updateTotpGroup" style="display:none;">
+                            <label for="updateTotp"><%= t('settings.updateTotp') || 'Код 2FA' %></label>
+                            <input type="text" id="updateTotp" class="form-control" inputmode="numeric" autocomplete="one-time-code" maxlength="10">
+                        </div>
+                        <label style="display:flex; align-items:center; gap:8px; font-size:13px; margin:8px 0 16px;">
+                            <input type="checkbox" id="updateBackup" checked>
+                            <%= t('settings.updateCreateBackup') || 'Создать резервную копию перед обновлением' %>
+                        </label>
+                    </div>
+                    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:16px;">
+                        <button type="button" class="btn btn-primary" id="updateApplyBtn" onclick="submitUpdate()" disabled>
                                 <i class="ti ti-download"></i> <span id="updateApplyLabel"><%= t('settings.updateApply') || 'Установить' %></span>
                             </button>
                             <button class="btn btn-secondary" id="updateCheckBtn" onclick="checkForUpdates()">
@@ -114,30 +129,6 @@
                     </button>
                 </div>
             </div>
-        </div>
-    </div>
-</div>
-
-<!-- Update confirmation modal -->
-<div class="glass-modal" id="updateModal" style="display:none; z-index:10000;" aria-hidden="true">
-    <div class="glass-modal-content" style="max-width:440px;">
-        <h3 style="margin-top:0;"><%= t('settings.updateConfirmTitle') || 'Подтвердите обновление' %></h3>
-        <p style="color:var(--text-muted); font-size:13px;" id="updateModalSummary"></p>
-        <div class="form-group">
-            <label for="updatePassword"><%= t('settings.updatePassword') || 'Текущий пароль' %></label>
-            <input type="password" id="updatePassword" class="form-control" autocomplete="current-password">
-        </div>
-        <div class="form-group" id="updateTotpGroup" style="display:none;">
-            <label for="updateTotp"><%= t('settings.updateTotp') || 'Код 2FA' %></label>
-            <input type="text" id="updateTotp" class="form-control" inputmode="numeric" autocomplete="one-time-code" maxlength="10">
-        </div>
-        <label style="display:flex; align-items:center; gap:8px; font-size:13px; margin:8px 0 16px;">
-            <input type="checkbox" id="updateBackup" checked>
-            <%= t('settings.updateCreateBackup') || 'Создать резервную копию перед обновлением' %>
-        </label>
-        <div style="display:flex; gap:10px; justify-content:flex-end;">
-            <button type="button" class="btn btn-secondary" onclick="closeUpdateModal()"><%= t('common.cancel') || 'Отмена' %></button>
-            <button type="button" class="btn btn-primary" id="updateConfirmBtn" onclick="submitUpdate()"><%= t('settings.updateApply') || 'Установить' %></button>
         </div>
     </div>
 </div>
@@ -222,7 +213,7 @@
     // Settings tabs and cards use overflow/transform effects that may create a
     // containing block and hide a fixed modal. Keep update overlays as direct
     // body children so they are always visible above the whole panel.
-    ['updateModal', 'updateOverlay'].forEach((id) => {
+    ['updateOverlay'].forEach((id) => {
         const el = document.getElementById(id);
         if (el && el.parentElement !== document.body) document.body.appendChild(el);
     });
@@ -302,11 +293,17 @@
         const changelogWrap = document.getElementById('updateChangelogWrap');
         const changelogToggle = document.getElementById('updateChangelogToggle');
         const downgradeWarn = document.getElementById('updateDowngradeWarn');
+        const authFields = document.getElementById('updateAuthFields');
 
         const diff = cmp(selectedVersion, currentVersion);
         applyBtn.disabled = diff === 0;
         label.textContent = diff < 0 ? t.rollback : t.install;
         downgradeWarn.style.display = diff < 0 ? '' : 'none';
+        authFields.style.display = diff === 0 ? 'none' : '';
+        document.getElementById('updateModalSummary').textContent = diff === 0
+            ? ''
+            : t.confirmSummary.replace('{version}', selectedVersion);
+        document.getElementById('updateTotpGroup').style.display = totpEnabled ? '' : 'none';
 
         if (rel && rel.body) {
             changelog.textContent = rel.body;
@@ -383,25 +380,6 @@
         }
     };
 
-    window.openUpdateModal = function () {
-        if (!selectedVersion) return;
-        document.getElementById('updateModalSummary').textContent = t.confirmSummary.replace('{version}', selectedVersion);
-        document.getElementById('updatePassword').value = '';
-        document.getElementById('updateTotp').value = '';
-        document.getElementById('updateTotpGroup').style.display = totpEnabled ? '' : 'none';
-        document.getElementById('updateBackup').checked = true;
-        const modal = document.getElementById('updateModal');
-        modal.style.display = 'flex';
-        modal.setAttribute('aria-hidden', 'false');
-        requestAnimationFrame(() => document.getElementById('updatePassword').focus());
-    };
-
-    window.closeUpdateModal = function () {
-        const modal = document.getElementById('updateModal');
-        modal.style.display = 'none';
-        modal.setAttribute('aria-hidden', 'true');
-    };
-
     window.submitUpdate = async function () {
         const password = document.getElementById('updatePassword').value;
         const totpToken = document.getElementById('updateTotp').value;
@@ -409,9 +387,11 @@
         if (!password) { showToast(t.passwordRequired, 'error'); return; }
         if (totpEnabled && !totpToken) { showToast(t.totpRequired, 'error'); return; }
 
-        const confirmBtn = document.getElementById('updateConfirmBtn');
+        const confirmBtn = document.getElementById('updateApplyBtn');
+        const confirmLabel = document.getElementById('updateApplyLabel');
+        const originalLabel = confirmLabel.textContent;
         confirmBtn.disabled = true;
-        confirmBtn.textContent = t.starting;
+        confirmLabel.textContent = t.starting;
 
         try {
             const res = await fetch('/panel/settings/apply-update', {
@@ -422,17 +402,16 @@
             });
             const data = await res.json();
             if (res.status === 202) {
-                closeUpdateModal();
                 startProgressOverlay(selectedVersion);
             } else {
                 showToast((data.error || t.failed), 'error');
                 confirmBtn.disabled = false;
-                confirmBtn.textContent = t.install;
+                confirmLabel.textContent = originalLabel;
             }
         } catch (e) {
             showToast(t.failed + ': ' + e.message, 'error');
             confirmBtn.disabled = false;
-            confirmBtn.textContent = t.install;
+            confirmLabel.textContent = originalLabel;
         }
     };
 
