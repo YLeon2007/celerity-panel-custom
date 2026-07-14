@@ -16,5 +16,11 @@ assert.strictEqual(provision.isEligibleNode({ ...base, cascadeRole: 'bridge' }),
     'bridge nodes must be eligible for xray-bridge access logs');
 assert.strictEqual(provision.isEligibleNode({ ...base, cascadeRole: 'relay' }), false);
 assert.strictEqual(provision.isEligibleNode({ ...base, type: 'hysteria', cascadeRole: 'bridge' }), false);
+assert.strictEqual(provision.accessLogPathForNode({ ...base, cascadeRole: 'bridge' }), '/var/log/xray-bridge/access.log');
+assert.strictEqual(provision.accessLogPathForNode({ ...base, cascadeRole: 'portal' }), '/var/log/xray/access.log');
+
+const source = require('fs').readFileSync(require.resolve('../src/services/accessLogs/provisionService'), 'utf8');
+assert.ok(source.includes("systemctl restart xray-bridge"), 'bridge reconciliation must restart xray-bridge');
+assert.ok(source.includes("mode: { $ne: 'forward' }"), 'bridge reconciliation must preserve all active reverse links');
 
 console.log('access logs bridge eligibility test passed');

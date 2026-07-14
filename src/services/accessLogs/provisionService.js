@@ -88,9 +88,7 @@ async function buildNodeAccessLogsConfig(node) {
 
     return {
         enabled: true,
-        path: node.cascadeRole === 'bridge'
-            ? '/var/log/xray-bridge/access.log'
-            : require('../configGenerator').XRAY_ACCESS_LOG_PATH,
+        path: accessLogPathForNode(node),
         ingestUrl,
         ingestToken: token,
         insecureTls,
@@ -107,11 +105,17 @@ async function buildNodeAccessLogsConfig(node) {
 // lands in the agent's access_logs block: ingest URL, token (via hash), the
 // TLS-verification mode, and the log path — so changing any of them forces a
 // re-push, while unrelated settings saves stay no-ops.
-function desiredFingerprint(shouldShip, settings, tokenHash) {
+function accessLogPathForNode(node) {
+    return node?.cascadeRole === 'bridge'
+        ? '/var/log/xray-bridge/access.log'
+        : require('../configGenerator').XRAY_ACCESS_LOG_PATH;
+}
+
+function desiredFingerprint(shouldShip, settings, tokenHash, node) {
     if (!shouldShip) return 'disabled';
     const ingestUrl = resolveIngestUrl(settings);
     const insecureTls = !!(settings?.nodeAuth?.insecure);
-    const logPath = require('../configGenerator').XRAY_ACCESS_LOG_PATH;
+    const logPath = accessLogPathForNode(node);
     return crypto.createHash('sha256')
         .update('v2|enabled|')
         .update(String(ingestUrl))
@@ -157,7 +161,7 @@ async function reconcileNode(node, settings) {
             tokenHash = withHash?.xray?.accessLogs?.ingestTokenHash || '';
         }
 
-        const fingerprint = desiredFingerprint(shouldShip, settings, tokenHash);
+        const fingerprint = desiredFingerprint(shouldShip, settings, tokenHash, node);
         const applied = node.xray?.accessLogs?.appliedFingerprint || '';
         const currentStatus = node.xray?.accessLogs?.status || 'disabled';
 
@@ -193,11 +197,38 @@ async function reconcileNode(node, settings) {
             },
         });
 
-        // Push config (restarts Xray + reloads cc-agent). Reload the fresh node
-        // doc so the updated flag is reflected.
-        const fresh = await HyNode.findById(node._id);
-        const syncService = require('../syncService');
-        await syncService.updateXrayNodeConfig(fresh);
+        // Push the correct runtime config. Reverse bridge nodes run cascade
+        // traffic in the separate xray-bridge service, so never rewrite their
+        // main client-facing Xray config here.
+        const fresh = await HyNode.findById(node._id).select('+ssh.password +ssh.privateKey');
+        if (fresh.cascadeRole === 'bridge') {
+            const CascadeLink = require('../../models/cascadeLinkModel');
+            const NodeSSH = require('../nodeSSH');
+            const nodeSetup = require('../nodeSetup');
+            const configGenerator = require('../configGenerator');
+            const links = await CascadeLink.find({
+                bridgeNode: fresh._id,
+                active: true,
+                mode: { $ne: 'forward' },
+            }).populate('portalNode');
+            if (links.length === 0) throw new Error('No active reverse links for bridge access logging');
+            const bridgeConfig = configGenerator.generateCombinedBridgeConfig(links, {
+                accessLog: shouldShip ? accessLogPathForNode(fresh) : undefined,
+            });
+            const ssh = new NodeSSH(fresh);
+            await ssh.connect();
+            try {
+                await ssh.exec('mkdir -p /var/log/xray-bridge && chown nobody:nogroup /var/log/xray-bridge');
+                await ssh.uploadContent(bridgeConfig, '/usr/local/etc/xray-bridge/config.json');
+                await ssh.exec('chown root:root /usr/local/etc/xray-bridge/config.json && chmod 644 /usr/local/etc/xray-bridge/config.json && systemctl restart xray-bridge');
+                await nodeSetup.reloadCcAgent(fresh, ssh);
+            } finally {
+                ssh.disconnect();
+            }
+        } else {
+            const syncService = require('../syncService');
+            await syncService.updateXrayNodeConfig(fresh);
+        }
 
         await HyNode.updateOne({ _id: node._id }, {
             $set: {
@@ -244,7 +275,7 @@ async function reconcileAll() {
 
         const nodes = await HyNode.find({
             type: 'xray',
-            cascadeRole: { $in: ['standalone', 'portal'] },
+            cascadeRole: { $in: ['standalone', 'portal', 'bridge'] },
         });
 
         const results = [];
@@ -279,6 +310,7 @@ module.exports = {
     MIN_AGENT_VERSION,
     agentVersionAtLeast,
     resolveIngestUrl,
+    accessLogPathForNode,
     isEligibleNode,
     nodeShouldShip,
     buildNodeAccessLogsConfig,

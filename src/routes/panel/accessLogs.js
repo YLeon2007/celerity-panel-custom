@@ -61,7 +61,7 @@ router.get('/access-logs', async (req, res) => {
         const settings = await Settings.get();
         const nodes = await HyNode.find({
             type: 'xray',
-            cascadeRole: { $in: ['standalone', 'portal'] },
+            cascadeRole: { $in: ['standalone', 'portal', 'bridge'] },
         }).select('name xray.accessLogs.status xray.accessLogs.lastBatchAt').lean();
 
         render(res, 'access-logs', {
@@ -169,7 +169,7 @@ router.get('/access-logs/api/status', async (req, res) => {
         const settings = await Settings.get();
         const nodes = await HyNode.find({
             type: 'xray',
-            cascadeRole: { $in: ['standalone', 'portal'] },
+            cascadeRole: { $in: ['standalone', 'portal', 'bridge'] },
         }).select('name agentVersion xray.accessLogs').lean();
 
         const spool = await spoolService.spoolSize();

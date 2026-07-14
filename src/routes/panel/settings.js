@@ -103,7 +103,7 @@ router.get('/settings', async (req, res) => {
             const HyNode = require('../../models/hyNodeModel');
             accessLogNodes = await HyNode.find({
                 type: 'xray',
-                cascadeRole: { $in: ['standalone', 'portal'] },
+                cascadeRole: { $in: ['standalone', 'portal', 'bridge'] },
             })
                 .select('name cascadeRole agentVersion xray.accessLogs.status xray.accessLogs.lastError xray.accessLogs.lastBatchAt')
                 .lean();
