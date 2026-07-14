@@ -10,6 +10,8 @@
 
 const assert = require('assert');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // ─── updateService: semver helpers ───────────────────────────────────────────
 
@@ -35,6 +37,15 @@ assert.strictEqual(updateService.compareVersions('bad', '1.0.0'), 0);
 
 // Without UPDATER_URL/SECRET the sidecar must be reported as not configured.
 assert.strictEqual(updateService.isUpdaterConfigured(), false);
+
+// Docker socket must be isolated to the updater sidecar, never mounted into backend.
+{
+    const compose = fs.readFileSync(path.join(__dirname, '..', 'docker-compose.yml'), 'utf8');
+    const backendBlock = compose.split(/\n  updater:\n/)[0].split(/\n  backend:\n/)[1] || '';
+    const updaterBlock = compose.split(/\n  updater:\n/)[1] || '';
+    assert.ok(!backendBlock.includes('/var/run/docker.sock'), 'backend must not mount docker.sock');
+    assert.ok(updaterBlock.includes('/var/run/docker.sock'), 'updater sidecar must mount docker.sock');
+}
 
 // ─── updater: HMAC signing / verification ────────────────────────────────────
 

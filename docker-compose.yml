@@ -71,7 +71,6 @@ services:
       - "3000"
     volumes:
       - .:/opt/hysteria-panel-host
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./logs:/app/logs
       - ./backups:/app/backups
       # Access-logs ingest spool must survive container rebuilds (batches not
