@@ -1,6 +1,66 @@
 <!-- ==================== TAB: MAINTENANCE ==================== -->
 <div class="tab-content" id="tab-maintenance">
     <div class="row">
+        <div class="col-12">
+            <div class="card" id="updateCard" data-current-version="<%= appVersion %>" data-totp-enabled="<%= admin?.twoFactor?.enabled ? '1' : '0' %>">
+                <div class="card-header">
+                    <h2><i class="ti ti-rocket"></i> <%= t('settings.updateTitle') || 'Обновление панели' %></h2>
+                </div>
+                <div class="card-body">
+                    <p style="color: var(--text-muted); font-size: 13px; line-height: 1.6; margin-bottom: 16px;">
+                        <%= t('settings.updateDesc') || 'Обновление и откат панели на выбранную версию.' %>
+                    </p>
+
+                    <div class="update-versions" style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:16px;">
+                        <div>
+                            <div style="font-size:12px; color:var(--text-muted);"><%= t('settings.updateCurrentVersion') || 'Текущая версия' %></div>
+                            <div style="font-size:18px; font-weight:600;">v<%= appVersion %></div>
+                        </div>
+                        <div>
+                            <div style="font-size:12px; color:var(--text-muted);"><%= t('settings.updateLatestVersion') || 'Последняя версия' %></div>
+                            <div style="font-size:18px; font-weight:600;" id="updateLatestVersion">—</div>
+                        </div>
+                        <div>
+                            <div style="font-size:12px; color:var(--text-muted);"><%= t('settings.updateLastChecked') || 'Проверено' %></div>
+                            <div style="font-size:13px;" id="updateCheckedAt">—</div>
+                        </div>
+                    </div>
+
+                    <div id="updateBadge" style="display:none; margin-bottom:16px;"></div>
+
+                    <!-- Shown only when the updater sidecar is reachable. -->
+                    <div id="updateControls" style="display:none;">
+                        <div class="form-group" style="max-width:420px;">
+                            <label for="updateVersionSelect"><%= t('settings.updateSelectVersion') || 'Версия' %></label>
+                            <select id="updateVersionSelect" class="form-control"></select>
+                        </div>
+                        <div id="updateChangelog" style="display:none; margin:12px 0; padding:12px; border:1px solid var(--border); border-radius:8px; max-height:220px; overflow:auto; white-space:pre-wrap; font-size:12.5px; line-height:1.5; color:var(--text-muted);"></div>
+                        <div id="updateDowngradeWarn" style="display:none; margin:12px 0; padding:10px 12px; border-radius:8px; background:rgba(245,158,11,0.12); color:#fbbf24; font-size:13px;">
+                            <i class="ti ti-alert-triangle"></i> <%= t('settings.updateDowngradeWarn') || 'Откат на более старую версию не откатывает изменения в базе данных. Восстановление возможно только из резервной копии.' %>
+                        </div>
+                        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                            <button class="btn btn-primary" id="updateApplyBtn" onclick="openUpdateModal()" disabled>
+                                <i class="ti ti-download"></i> <span id="updateApplyLabel"><%= t('settings.updateApply') || 'Установить' %></span>
+                            </button>
+                            <button class="btn btn-secondary" id="updateCheckBtn" onclick="checkForUpdates()">
+                                <i class="ti ti-refresh"></i> <%= t('settings.updateCheckNow') || 'Проверить сейчас' %>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Shown when the updater is not available (dokploy/local/no secret). -->
+                    <div id="updateManual" style="display:none;">
+                        <div style="margin-bottom:12px; padding:10px 12px; border-radius:8px; background:rgba(148,163,184,0.12); font-size:13px; color:var(--text-muted);">
+                            <i class="ti ti-info-circle"></i> <%= t('settings.updateManualNotice') || 'Обновление из UI недоступно для этого способа развёртывания. Обновите панель вручную.' %>
+                        </div>
+                        <button class="btn btn-secondary" id="updateCheckBtnManual" onclick="checkForUpdates()">
+                            <i class="ti ti-refresh"></i> <%= t('settings.updateCheckNow') || 'Проверить сейчас' %>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="col-6">
             <div class="card">
                 <div class="card-header">
@@ -49,3 +109,320 @@
         </div>
     </div>
 </div>
+
+<!-- Update confirmation modal -->
+<div class="glass-modal" id="updateModal" style="display:none;">
+    <div class="glass-modal-content" style="max-width:440px;">
+        <h3 style="margin-top:0;"><%= t('settings.updateConfirmTitle') || 'Подтвердите обновление' %></h3>
+        <p style="color:var(--text-muted); font-size:13px;" id="updateModalSummary"></p>
+        <div class="form-group">
+            <label for="updatePassword"><%= t('settings.updatePassword') || 'Текущий пароль' %></label>
+            <input type="password" id="updatePassword" class="form-control" autocomplete="current-password">
+        </div>
+        <div class="form-group" id="updateTotpGroup" style="display:none;">
+            <label for="updateTotp"><%= t('settings.updateTotp') || 'Код 2FA' %></label>
+            <input type="text" id="updateTotp" class="form-control" inputmode="numeric" autocomplete="one-time-code" maxlength="10">
+        </div>
+        <label style="display:flex; align-items:center; gap:8px; font-size:13px; margin:8px 0 16px;">
+            <input type="checkbox" id="updateBackup" checked>
+            <%= t('settings.updateCreateBackup') || 'Создать резервную копию перед обновлением' %>
+        </label>
+        <div style="display:flex; gap:10px; justify-content:flex-end;">
+            <button class="btn btn-secondary" onclick="closeUpdateModal()"><%= t('common.cancel') || 'Отмена' %></button>
+            <button class="btn btn-primary" id="updateConfirmBtn" onclick="submitUpdate()"><%= t('settings.updateApply') || 'Установить' %></button>
+        </div>
+    </div>
+</div>
+
+<!-- Full-screen progress overlay shown while the panel is being updated -->
+<div id="updateOverlay" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(15,23,42,0.92); align-items:center; justify-content:center;">
+    <div style="text-align:center; max-width:520px; padding:24px;">
+        <i id="updateOverlaySpinner" class="ti ti-loader-2" style="font-size:40px; color:var(--accent); display:block; margin:0 auto 20px;"></i>
+        <h2 id="updateOverlayTitle"><%= t('settings.updateInProgress') || 'Обновление панели...' %></h2>
+        <p id="updateOverlayStep" style="color:var(--text-muted); font-size:14px;"></p>
+        <pre id="updateOverlayLog" style="display:none; text-align:left; margin-top:16px; max-height:260px; overflow:auto; font-size:11.5px; background:rgba(0,0,0,0.4); padding:12px; border-radius:8px;"></pre>
+        <!-- Shown only when the flow ends in an error/timeout so the admin is not
+             trapped behind a full-screen overlay. -->
+        <button id="updateOverlayClose" class="btn btn-secondary" style="display:none; margin-top:18px;" onclick="location.reload()">
+            <%= t('common.close') || 'Закрыть' %>
+        </button>
+    </div>
+</div>
+
+<script>
+(function () {
+    const card = document.getElementById('updateCard');
+    if (!card) return;
+
+    const t = {
+        updateAvailable: <%- JSON.stringify(t('settings.updateAvailable') || 'Доступно обновление') %>,
+        upToDate: <%- JSON.stringify(t('settings.updateUpToDate') || 'Установлена последняя версия') %>,
+        current: <%- JSON.stringify(t('settings.updateCurrentTag') || 'текущая') %>,
+        install: <%- JSON.stringify(t('settings.updateApply') || 'Установить') %>,
+        rollback: <%- JSON.stringify(t('settings.updateRollback') || 'Откатиться') %>,
+        checking: <%- JSON.stringify(t('settings.updateChecking') || 'Проверка...') %>,
+        checkNow: <%- JSON.stringify(t('settings.updateCheckNow') || 'Проверить сейчас') %>,
+        confirmSummary: <%- JSON.stringify(t('settings.updateConfirmSummary') || 'Панель будет переведена на версию v{version}. Возможен кратковременный простой.') %>,
+        passwordRequired: <%- JSON.stringify(t('settings.updatePasswordRequired') || 'Введите пароль') %>,
+        totpRequired: <%- JSON.stringify(t('settings.updateTotpRequired') || 'Введите код 2FA') %>,
+        starting: <%- JSON.stringify(t('settings.updateStarting') || 'Запуск обновления...') %>,
+        waiting: <%- JSON.stringify(t('settings.updateWaiting') || 'Ожидание перезапуска панели...') %>,
+        success: <%- JSON.stringify(t('settings.updateSuccess') || 'Панель обновлена до v{version}') %>,
+        failed: <%- JSON.stringify(t('settings.updateFailed') || 'Обновление не удалось') %>,
+        error: <%- JSON.stringify(t('common.error') || 'Ошибка') %>,
+    };
+
+    const currentVersion = card.dataset.currentVersion;
+    const totpEnabled = card.dataset.totpEnabled === '1';
+    let releases = [];
+    let selectedVersion = null;
+
+    function cmp(a, b) {
+        const pa = String(a).split('.').map(Number);
+        const pb = String(b).split('.').map(Number);
+        for (let i = 0; i < 3; i++) {
+            if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+            if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+        }
+        return 0;
+    }
+
+    function fmtDate(iso) {
+        if (!iso) return '—';
+        try { return new Date(iso).toLocaleString(); } catch (_) { return '—'; }
+    }
+
+    function renderReleases() {
+        const select = document.getElementById('updateVersionSelect');
+        const applyBtn = document.getElementById('updateApplyBtn');
+        select.innerHTML = '';
+        if (!releases.length) {
+            applyBtn.disabled = true;
+            return;
+        }
+        releases.forEach((r) => {
+            const opt = document.createElement('option');
+            opt.value = r.version;
+            const isCurrent = cmp(r.version, currentVersion) === 0;
+            opt.textContent = 'v' + r.version + (isCurrent ? ' (' + t.current + ')' : '');
+            select.appendChild(opt);
+        });
+        // Default to the latest non-current version, else the latest.
+        const firstNonCurrent = releases.find((r) => cmp(r.version, currentVersion) !== 0);
+        select.value = (firstNonCurrent || releases[0]).version;
+        onVersionChange();
+    }
+
+    function onVersionChange() {
+        const select = document.getElementById('updateVersionSelect');
+        selectedVersion = select.value;
+        const rel = releases.find((r) => r.version === selectedVersion);
+        const applyBtn = document.getElementById('updateApplyBtn');
+        const label = document.getElementById('updateApplyLabel');
+        const changelog = document.getElementById('updateChangelog');
+        const downgradeWarn = document.getElementById('updateDowngradeWarn');
+
+        const diff = cmp(selectedVersion, currentVersion);
+        applyBtn.disabled = diff === 0;
+        label.textContent = diff < 0 ? t.rollback : t.install;
+        downgradeWarn.style.display = diff < 0 ? '' : 'none';
+
+        if (rel && rel.body) {
+            changelog.textContent = rel.body;
+            changelog.style.display = '';
+        } else {
+            changelog.style.display = 'none';
+        }
+    }
+
+    function applyState(data) {
+        releases = Array.isArray(data.releases) ? data.releases : [];
+        document.getElementById('updateLatestVersion').textContent = data.latestVersion ? ('v' + data.latestVersion) : '—';
+        document.getElementById('updateCheckedAt').textContent = fmtDate(data.checkedAt);
+
+        const badge = document.getElementById('updateBadge');
+        if (data.updateAvailable) {
+            badge.style.display = '';
+            badge.innerHTML = '<span style="display:inline-block; padding:4px 10px; border-radius:6px; background:rgba(34,197,94,0.15); color:#4ade80; font-size:13px;"><i class="ti ti-arrow-up-circle"></i> ' + t.updateAvailable + '</span>';
+        } else if (data.latestVersion) {
+            badge.style.display = '';
+            badge.innerHTML = '<span style="display:inline-block; padding:4px 10px; border-radius:6px; background:rgba(148,163,184,0.12); color:var(--text-muted); font-size:13px;"><i class="ti ti-check"></i> ' + t.upToDate + '</span>';
+        } else {
+            badge.style.display = 'none';
+        }
+
+        const updaterAvailable = data.updater && data.updater.available;
+        document.getElementById('updateControls').style.display = updaterAvailable ? '' : 'none';
+        document.getElementById('updateManual').style.display = updaterAvailable ? 'none' : '';
+
+        if (updaterAvailable) renderReleases();
+    }
+
+    async function loadStatus() {
+        try {
+            const res = await fetch('/panel/settings/update-status', { credentials: 'include' });
+            const data = await res.json();
+            if (res.ok) applyState(data);
+        } catch (_) { /* keep placeholders */ }
+    }
+
+    window.checkForUpdates = async function () {
+        const btns = [document.getElementById('updateCheckBtn'), document.getElementById('updateCheckBtnManual')].filter(Boolean);
+        btns.forEach((b) => { b.disabled = true; });
+        try {
+            const res = await fetch('/panel/settings/check-updates', { method: 'POST', credentials: 'include' });
+            const data = await res.json();
+            if (res.ok) {
+                applyState(data);
+                // Partial failure: HTTP 200 with stale/empty data because the
+                // GitHub fetch failed. Tell the user instead of failing silently.
+                if (data.error) {
+                    showToast(t.error + ': ' + data.error, 'warning');
+                }
+            } else {
+                showToast((data.error || t.error), 'error');
+            }
+        } catch (e) {
+            showToast(t.error + ': ' + e.message, 'error');
+        } finally {
+            btns.forEach((b) => { b.disabled = false; });
+        }
+    };
+
+    window.openUpdateModal = function () {
+        if (!selectedVersion) return;
+        document.getElementById('updateModalSummary').textContent = t.confirmSummary.replace('{version}', selectedVersion);
+        document.getElementById('updatePassword').value = '';
+        document.getElementById('updateTotp').value = '';
+        document.getElementById('updateTotpGroup').style.display = totpEnabled ? '' : 'none';
+        document.getElementById('updateBackup').checked = true;
+        document.getElementById('updateModal').style.display = 'flex';
+    };
+
+    window.closeUpdateModal = function () {
+        document.getElementById('updateModal').style.display = 'none';
+    };
+
+    window.submitUpdate = async function () {
+        const password = document.getElementById('updatePassword').value;
+        const totpToken = document.getElementById('updateTotp').value;
+        const backup = document.getElementById('updateBackup').checked;
+        if (!password) { showToast(t.passwordRequired, 'error'); return; }
+        if (totpEnabled && !totpToken) { showToast(t.totpRequired, 'error'); return; }
+
+        const confirmBtn = document.getElementById('updateConfirmBtn');
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = t.starting;
+
+        try {
+            const res = await fetch('/panel/settings/apply-update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ version: selectedVersion, currentPassword: password, totpToken, backup }),
+            });
+            const data = await res.json();
+            if (res.status === 202) {
+                closeUpdateModal();
+                startProgressOverlay(selectedVersion);
+            } else {
+                showToast((data.error || t.failed), 'error');
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = t.install;
+            }
+        } catch (e) {
+            showToast(t.failed + ': ' + e.message, 'error');
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = t.install;
+        }
+    };
+
+    function startProgressOverlay(targetVersion) {
+        const overlay = document.getElementById('updateOverlay');
+        const stepEl = document.getElementById('updateOverlayStep');
+        const logEl = document.getElementById('updateOverlayLog');
+        overlay.style.display = 'flex';
+        stepEl.textContent = t.starting;
+
+        let settled = false;
+        // Give the updater a moment before we start polling (the panel container
+        // will be recreated and briefly unreachable).
+        const started = Date.now();
+        // Hard ceiling: a source build on weak hardware can take a while, but
+        // past this point the flow is considered lost (e.g. the updater died
+        // mid-run and its in-memory state reset) - stop polling forever.
+        const POLL_TIMEOUT_MS = 30 * 60 * 1000;
+
+        // Terminal failure: stop the spinner and let the admin leave the
+        // full-screen overlay instead of trapping them behind it.
+        function failOverlay(message) {
+            settled = true;
+            const spinner = document.getElementById('updateOverlaySpinner');
+            spinner.className = 'ti ti-alert-triangle';
+            spinner.style.color = '#f87171';
+            stepEl.textContent = message;
+            document.getElementById('updateOverlayClose').style.display = '';
+        }
+
+        async function poll() {
+            if (settled) return;
+            if (Date.now() - started > POLL_TIMEOUT_MS) {
+                failOverlay(t.failed + ' (timeout)');
+                return;
+            }
+            // First try the updater status (still reachable during a source build
+            // and before the recreate). Then verify via /health once the new
+            // container is up.
+            try {
+                const res = await fetch('/panel/settings/update-status', { credentials: 'include', cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    const u = data.updater || {};
+                    const flow = data.flow || {};
+                    // Panel-side failure (pre-update backup or the trigger call)
+                    // happens before the updater does anything - safe to stop.
+                    if (flow.state === 'error') {
+                        failOverlay(t.failed + (flow.error ? (': ' + flow.error) : ''));
+                        return;
+                    }
+                    if (flow.state === 'running' && flow.step) {
+                        stepEl.textContent = t.waiting + ' (' + flow.step + ')';
+                    }
+                    // The sidecar persists its LAST run, so only trust its state
+                    // when that run started after our flow did - otherwise a
+                    // stale error/step from a previous attempt would be taken
+                    // for the current one. ISO timestamps compare lexically.
+                    const updaterCurrent = !!(u.startedAt && flow.startedAt && u.startedAt >= flow.startedAt);
+                    if (updaterCurrent && u.state === 'running' && u.step) {
+                        stepEl.textContent = t.waiting + ' (' + u.step + ')';
+                    }
+                    if (updaterCurrent && u.state === 'error') {
+                        logEl.style.display = '';
+                        logEl.textContent = (u.log || []).join('\n');
+                        failOverlay(t.failed + (u.error ? (': ' + u.error) : ''));
+                        return;
+                    }
+                    // Success is confirmed when the running panel reports the new version.
+                    if (cmp(String(data.currentVersion), String(targetVersion)) === 0 && (Date.now() - started) > 3000) {
+                        settled = true;
+                        stepEl.textContent = t.success.replace('{version}', targetVersion);
+                        setTimeout(() => location.reload(), 1500);
+                        return;
+                    }
+                }
+            } catch (_) {
+                // Panel is mid-restart; keep waiting.
+                stepEl.textContent = t.waiting;
+            }
+            setTimeout(poll, 3000);
+        }
+        setTimeout(poll, 4000);
+    }
+
+    document.getElementById('updateVersionSelect')?.addEventListener('change', onVersionChange);
+
+    // Load current status once the maintenance tab is first shown, but cheaply on
+    // page load is fine too (single cached call).
+    loadStatus();
+})();
+</script>

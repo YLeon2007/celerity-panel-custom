@@ -39,8 +39,12 @@ services:
       - hysteria-net
 
   # Hysteria Backend (pre-built image from Docker Hub)
+  #
+  # The image tag is pinned via PANEL_TAG so the UI updater can move between
+  # released versions (and roll back) by rewriting PANEL_TAG in .env and
+  # recreating this service. Defaults to `latest` when unset.
   backend:
-    image: clickdevtech/hysteria-panel:latest
+    image: clickdevtech/hysteria-panel:${PANEL_TAG:-latest}
     container_name: hysteria-backend
     restart: always
     depends_on:
@@ -60,6 +64,35 @@ services:
     environment:
       MONGO_URI: mongodb://${MONGO_USER:-hysteria}:${MONGO_PASSWORD}@mongo:27017/hysteria?authSource=admin
       REDIS_URL: redis://redis:6379
+      # In-cluster URL of the updater sidecar. UPDATER_SECRET comes from .env.
+      UPDATER_URL: http://updater:8484
+    networks:
+      - hysteria-net
+
+  # Panel updater sidecar (hub mode: pull pre-built image tag).
+  #
+  # This is the ONLY container with access to the Docker socket. On request from
+  # the panel (HMAC-signed) it rewrites PANEL_TAG in .env, pulls the requested
+  # image tag and recreates the backend. The project directory is mounted at the
+  # SAME absolute path it has on the host so that the relative bind mounts above
+  # (./logs, ./greenlock.d, ./backups, ./data) resolve correctly when
+  # `docker compose up` runs from inside this container.
+  #
+  # Disabled unless UPDATER_SECRET (>=32 chars) is set in .env.
+  updater:
+    image: clickdevtech/celerity-updater:latest
+    container_name: hysteria-updater
+    restart: always
+    environment:
+      UPDATE_MODE: hub
+      PROJECT_DIR: ${PWD}
+      COMPOSE_FILE: docker-compose.hub.yml
+      SERVICE: backend
+      UPDATER_SECRET: ${UPDATER_SECRET:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
     networks:
       - hysteria-net
 

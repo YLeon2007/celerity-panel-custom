@@ -1,7 +1,7 @@
 {
   "name": "c3-celerity",
   "version": "1.3.3.4dev",
-  "description": "C\u00b3 CELERITY - Management panel for Hysteria 2 nodes by Click Connect",
+  "description": "C³ CELERITY - Management panel for Hysteria 2 nodes by Click Connect",
   "keywords": [
     "nodejs",
     "docker",
@@ -32,7 +32,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node scripts/test-session-cookie-config.js && node scripts/test-i18n-fallback.js && node scripts/test-node-ui-meta.js && node scripts/test-node-active-api.js && node scripts/test-auth-subscription-boundaries.js && node scripts/test-setup-ejs-validation.js && node scripts/test-security-ejs-validation.js && node scripts/test-self-update-ui.js && node scripts/test-user-client-stats.js && node scripts/test-agent-online-state.js && node scripts/test-combined-bridge-config.js",
+    "test": "node scripts/test-session-cookie-config.js && node scripts/test-i18n-fallback.js && node scripts/test-node-ui-meta.js && node scripts/test-node-active-api.js && node scripts/test-auth-subscription-boundaries.js && node scripts/test-setup-ejs-validation.js && node scripts/test-security-ejs-validation.js && node scripts/test-self-update-ui.js && node scripts/test-user-client-stats.js && node scripts/test-agent-online-state.js && node scripts/test-combined-bridge-config.js && node scripts/test-update-service.js",
     "build:assets": "npx --yes esbuild public/css/style.css public/css/network.css --minify --loader:.css=css --outdir=public/css --out-extension:.css=.min.css --allow-overwrite && npx --yes esbuild public/js/network.js --minify --outfile=public/js/network.min.js"
   },
   "dependencies": {

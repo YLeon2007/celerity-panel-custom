@@ -82,6 +82,34 @@ services:
       REDIS_URL: redis://redis:6379
       PORT: 3000
       USE_CADDY: "true"
+      # In-cluster URL of the updater sidecar. UPDATER_SECRET comes from .env.
+      UPDATER_URL: http://updater:8484
+    networks:
+      - hysteria-net
+
+  # Panel updater sidecar (source mode: git checkout + rebuild).
+  #
+  # This is the ONLY container with access to the Docker socket. It rebuilds and
+  # recreates the backend on request from the panel (HMAC-signed). The project
+  # directory is mounted at the SAME absolute path it has on the host so that the
+  # relative bind mounts above (./logs, ./backups, ./data) resolve correctly when
+  # `docker compose up` runs from inside this container.
+  #
+  # Disabled unless UPDATER_SECRET (>=32 chars) is set in .env.
+  updater:
+    build: ./updater
+    container_name: hysteria-updater
+    restart: always
+    environment:
+      UPDATE_MODE: source
+      PROJECT_DIR: ${PWD}
+      COMPOSE_FILE: docker-compose.yml
+      SERVICE: backend
+      UPDATER_SECRET: ${UPDATER_SECRET:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
     networks:
       - hysteria-net
 

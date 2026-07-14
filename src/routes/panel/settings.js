@@ -5,6 +5,7 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const rateLimit = require('express-rate-limit');
 
 const HyUser = require('../../models/hyUserModel');
 const HyNode = require('../../models/hyNodeModel');
@@ -19,6 +20,7 @@ const cache = require('../../services/cacheService');
 const hwidDeviceService = require('../../services/hwidDeviceService');
 const homepageService = require('../../services/homepageService');
 const syncService = require('../../services/syncService');
+const updateService = require('../../services/updateService');
 const { invalidateSettingsCache } = require('../../utils/helpers');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
@@ -1017,6 +1019,111 @@ router.post('/settings/test-webhook', async (req, res) => {
         }
     } catch (error) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ==================== PANEL UPDATE ====================
+
+// Forced GitHub re-check is a network egress operation; keep it modest.
+const checkUpdatesLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' }),
+});
+
+// Applying an update is the most privileged action in the panel; strict bucket.
+const applyUpdateLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({ error: res.locals.t?.('common.tooManyRequests') || 'Too many requests. Try again later.' }),
+});
+
+// GET /settings/update-status - Versions (cached) + updater sidecar status +
+// panel-side flow state (pre-update backup / trigger progress).
+router.get('/settings/update-status', async (req, res) => {
+    try {
+        const [versionInfo, updater] = await Promise.all([
+            updateService.getVersionInfo({ force: false }),
+            updateService.getUpdaterStatus({ force: false }),
+        ]);
+        res.json({ ...versionInfo, updater, flow: updateService.getUpdateFlow() });
+    } catch (error) {
+        logger.error('[Panel] update-status error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /settings/check-updates - Force refresh the GitHub release cache.
+// Only the release feed is re-fetched; the updater sidecar status comes from
+// the micro-cache (a version check must not cost an extra sidecar round-trip).
+router.post('/settings/check-updates', checkUpdatesLimiter, async (req, res) => {
+    try {
+        const versionInfo = await updateService.getVersionInfo({ force: true });
+        const updater = await updateService.getUpdaterStatus({ force: false });
+        res.json({ ...versionInfo, updater });
+    } catch (error) {
+        logger.error('[Panel] check-updates error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /settings/apply-update - Re-auth, back up, then trigger the updater.
+// Body: { version, currentPassword, totpToken?, backup?: boolean }
+router.post('/settings/apply-update', applyUpdateLimiter, async (req, res) => {
+    try {
+        if (!updateService.isUpdaterConfigured()) {
+            return res.status(409).json({ error: res.locals.t?.('settings.updateUpdaterUnavailable') || 'Updater is not available for this deployment' });
+        }
+
+        const version = String(req.body.version || '').trim();
+        const currentPassword = String(req.body.currentPassword || '');
+        const totpToken = String(req.body.totpToken || '');
+        // Default to creating a backup unless the client explicitly opts out.
+        const wantBackup = req.body.backup !== false && req.body.backup !== 'false';
+
+        if (!version) {
+            return res.status(400).json({ error: res.locals.t?.('settings.updateVersionRequired') || 'Version is required' });
+        }
+
+        // Re-authenticate the admin (password, plus TOTP when enabled).
+        const admin = await Admin.verifyPassword(req.session.adminUsername, currentPassword);
+        if (!admin) {
+            return res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentPassword') || 'Invalid current password' });
+        }
+        if (admin.twoFactor?.enabled) {
+            if (!admin.twoFactor.secretEncrypted) {
+                return res.status(500).json({ error: res.locals.t?.('auth.totpConfigError') || 'TOTP configuration error' });
+            }
+            const secret = totpService.decryptSecret(admin.twoFactor.secretEncrypted);
+            const validToken = await totpService.verifyToken({ secret, token: totpToken });
+            if (!validToken) {
+                return res.status(401).json({ error: res.locals.t?.('auth.invalidCurrentTotp') || 'Invalid TOTP code' });
+            }
+        }
+
+        // Whitelist: only versions returned by the GitHub release feed may pass.
+        const known = await updateService.isKnownRelease(version);
+        if (!known) {
+            return res.status(400).json({ error: res.locals.t?.('settings.updateUnknownVersion') || 'Unknown version' });
+        }
+
+        // Kick off the flow (optional backup + updater trigger) in the
+        // background and answer immediately: a mongodump can run for minutes,
+        // far beyond sane HTTP/proxy timeouts. Progress is polled via
+        // update-status. A backup failure aborts the flow before the updater
+        // is ever contacted.
+        const flow = updateService.startUpdateFlow(version, { backup: wantBackup });
+
+        logger.warn(`[Panel] Update to ${version} triggered by admin: ${req.session.adminUsername} (IP: ${req.ip})`);
+
+        res.status(202).json({ accepted: true, version, flow });
+    } catch (error) {
+        logger.error('[Panel] apply-update error:', error.message);
+        res.status(error.statusCode || 500).json({ error: error.message });
     }
 });
 

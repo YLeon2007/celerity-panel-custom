@@ -1,331 +1,300 @@
 # Safe Production Updates
 
-Step-by-step guide for safely updating the custom C³ CELERITY deployment.
+Step-by-step guide for updating C³ CELERITY on production servers with minimal downtime.
 
-This document matches the current public custom repository workflow:
+---
 
-```text
-Repository: https://github.com/YLeon2007/celerity-panel-custom
-Install dir: /opt/hysteria-panel
-Production branch: main
-Compose file: docker-compose.yml
-Backend: built locally from source
-HTTPS: Caddy container
+## 📋 Pre-Update Checklist
+
+Before any update:
+
+1. **Create a database backup**
+   ```bash
+   # Via panel UI: Dashboard → Backup → Download
+   # Or manually via mongodump:
+   docker exec hysteria-mongo mongodump --archive=/data/db/backup.archive --username=hysteria --password --authenticationDatabase=admin
+   docker cp hysteria-mongo:/data/db/backup.archive ./backup-$(date +%Y%m%d-%H%M%S).archive
+   ```
+
+2. **Check current version**
+   ```bash
+   docker logs hysteria-backend --tail 50 | grep -i version
+   ```
+
+3. **Check available disk space**
+   ```bash
+   df -h
+   # Minimum 2GB free space for the new image
+   ```
+
+4. **Backup your .env file**
+   ```bash
+   cp .env .env.backup-$(date +%Y%m%d)
+   ```
+
+---
+
+## 🖱️ In-panel update (UI)
+
+The panel can update and roll back itself from **Settings → Maintenance → Panel update**,
+without SSH. It works for both Docker Hub and build-from-source deployments and is powered
+by an isolated `updater` sidecar container.
+
+### One-time setup
+
+1. Generate a strong secret and add it to `.env` (min. 32 chars):
+   ```bash
+   echo "UPDATER_SECRET=$(openssl rand -hex 32)" >> .env
+   ```
+
+2. Recreate the stack so the `updater` service starts:
+   ```bash
+   # Docker Hub deployment
+   docker compose -f docker-compose.hub.yml up -d
+   # Build-from-source deployment
+   docker compose up -d
+   ```
+
+Without `UPDATER_SECRET` the updater refuses all requests and the UI shows manual
+instructions instead of the update button (fail-safe default).
+
+### How it works
+
+- The panel never has access to the Docker socket; only the `updater` sidecar does.
+- The panel sends an HMAC-signed, single-purpose request ("move `backend` to version X").
+- **Hub mode:** the updater rewrites `PANEL_TAG` in `.env`, pulls the image and recreates
+  the backend.
+- **Source mode:** the updater runs `git checkout --force vX.Y.Z`, rebuilds and recreates
+  the backend. The forced checkout **discards local modifications to tracked files** —
+  the deployment copy must not carry manual patches (untracked files such as `.env`,
+  `data/`, `logs/` and `backups/` are never touched).
+- A database backup is created before the update by default. `docker pull` / `docker build`
+  run before the container is recreated, so a failed download/build leaves the running panel
+  untouched.
+- **Rollback** is the same operation targeting an older version. Note that a rollback does
+  **not** revert database schema changes — recover data from a backup if needed.
+- Rolling back to a release that predates the in-panel updater removes the update UI from
+  the running panel (old code / old compose file without `UPDATER_URL`). Rolling forward
+  again then requires one manual update using the steps below.
+
+Dokploy and local (`docker-compose.local.yml`) deployments do not run the updater; use the
+manual steps below.
+
+---
+
+## 🚀 Update (Docker Hub — recommended)
+
+For production deployments using `docker-compose.hub.yml`:
+
+### 1. Navigate to project directory
+
+```bash
+cd /path/to/hysteria-panel
+```
+
+### 2. Stop current containers (short downtime)
+
+```bash
+docker compose -f docker-compose.hub.yml down
+```
+
+> **Downtime:** ~10-30 seconds
+
+### 3. Pull the new image
+
+```bash
+docker compose -f docker-compose.hub.yml pull
+```
+
+### 4. Start updated containers
+
+```bash
+docker compose -f docker-compose.hub.yml up -d
+```
+
+### 5. Check status
+
+```bash
+# All containers should be "running"
+docker compose -f docker-compose.hub.yml ps
+
+# Check logs for errors
+docker logs hysteria-backend --tail 100 -f
+```
+
+### 6. Verify accessibility
+
+```bash
+curl -I https://your-domain/panel
 ```
 
 ---
 
-## Pre-update checklist
+## 🔧 Update (build from source)
 
-Run commands on the panel server.
+For deployments using `docker-compose.yml` with local build:
 
-### 1. Go to the installation directory
-
-```bash
-cd /opt/hysteria-panel
-```
-
-### 2. Check current state
+### 1. Navigate to project directory
 
 ```bash
-git branch --show-current
-git rev-parse --short HEAD
-docker compose -f docker-compose.yml ps
-curl -I https://$(grep '^PANEL_DOMAIN=' .env | cut -d= -f2)/panel/login
+cd /path/to/hysteria-panel
 ```
 
-### 3. Check disk space
+### 2. Get latest changes
 
 ```bash
-df -h /
-docker system df
+git fetch origin
+git status  # check for uncommitted changes
+git pull origin main
 ```
 
-Keep at least 2 GB free for image rebuilds and backups.
-
-### 4. Backup `.env` and repository files
+### 3. Stop current containers
 
 ```bash
-TS=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR=/opt/hysteria-panel-install-backups/manual-update-$TS
-mkdir -p "$BACKUP_DIR"
-cp -a /opt/hysteria-panel/.env "$BACKUP_DIR/.env"
-tar --exclude='.git' --exclude='node_modules' --exclude='logs/*.log' \
-  -czf "$BACKUP_DIR/hysteria-panel-files.tar.gz" \
-  -C /opt hysteria-panel
-printf 'Backup dir: %s\n' "$BACKUP_DIR"
+docker compose down
 ```
 
-### 5. Backup MongoDB
-
-If your `.env` was generated by `scripts/install.sh`, this command works with the generated `MONGO_USER` / `MONGO_PASSWORD` values:
+### 4. Rebuild the image
 
 ```bash
-set -a
-. ./.env
-set +a
-TS=$(date +%Y%m%d-%H%M%S)
-docker exec hysteria-mongo mongodump \
-  --archive=/tmp/hysteria-$TS.archive \
-  --username "$MONGO_USER" \
-  --password "$MONGO_PASSWORD" \
-  --authenticationDatabase=admin
-docker cp hysteria-mongo:/tmp/hysteria-$TS.archive ./backups/hysteria-$TS.archive
-docker exec hysteria-mongo rm -f /tmp/hysteria-$TS.archive
+docker compose build --no-cache backend
 ```
 
-You can also create/download backups from the panel UI if configured.
+> **Time:** 2-5 minutes depending on server
 
----
-
-## Panel self-update button
-
-The panel topbar shows the current version and a **Check for update** link.
-
-When clicked, the backend checks the same Git branch currently checked out on the server (`git rev-parse --abbrev-ref HEAD`) unless `SELF_UPDATE_BRANCH` is explicitly set. If commits are available, the modal shows a short changelog and enables **Update**.
-
-The update flow runs inside the backend container against the host checkout mounted at `/opt/hysteria-panel-host` and requires:
-
-```yaml
-backend:
-  volumes:
-    - .:/opt/hysteria-panel-host
-    - /var/run/docker.sock:/var/run/docker.sock
-```
-
-Before applying an update, `scripts/self-update.sh`:
-
-1. checks free disk space;
-2. backs up `.env`;
-3. creates a tar backup of repository files;
-4. creates a MongoDB dump when Mongo credentials are available;
-5. writes a one-command `ROLLBACK.sh`;
-6. runs `git pull --ff-only`;
-7. rebuilds with `docker compose -f docker-compose.yml up -d --build`.
-
-Backups are stored under:
-
-```text
-/opt/hysteria-panel/backups/self-update/<timestamp>/
-```
-
-If something goes wrong, SSH into the server and run the generated rollback script, for example:
+### 5. Start containers
 
 ```bash
-bash /opt/hysteria-panel/backups/self-update/<timestamp>/ROLLBACK.sh
+docker compose up -d
+```
+
+### 6. Check status
+
+```bash
+docker compose ps
+docker logs hysteria-backend --tail 100 -f
 ```
 
 ---
 
-## Recommended update: source build from `main`
+## 🔄 Rollback to Previous Version
 
-### 1. Fetch and inspect changes
+If problems occur after update:
 
-```bash
-cd /opt/hysteria-panel
-git fetch origin main
-git log --oneline --decorate -5 HEAD..origin/main
-```
+### Option 1: Rollback to specific image version
 
-If the log is empty, there is nothing to update.
+1. Edit `docker-compose.hub.yml`:
+   ```yaml
+   backend:
+     image: clickdevtech/hysteria-panel:v1.2.3  # specify desired version
+   ```
 
-### 2. Ensure the working tree is clean
+2. Apply changes:
+   ```bash
+   docker compose -f docker-compose.hub.yml down
+   docker compose -f docker-compose.hub.yml pull
+   docker compose -f docker-compose.hub.yml up -d
+   ```
 
-```bash
-git status --short
-```
-
-If you have local changes, commit/stash them or stop and inspect first.
-
-### 3. Update the checkout
-
-```bash
-git checkout main
-git pull --ff-only origin main
-```
-
-### 4. Rebuild and restart
+### Option 2: Rollback to previous git commit
 
 ```bash
-docker compose -f docker-compose.yml up -d --build
-```
-
-This rebuilds the backend image from the current source and recreates only containers that need changes.
-
-### 5. Verify containers and logs
-
-```bash
-docker compose -f docker-compose.yml ps
-docker compose -f docker-compose.yml logs --tail=120 backend
-docker compose -f docker-compose.yml logs --tail=120 caddy
-```
-
-Expected containers:
-
-```text
-hysteria-backend
-hysteria-caddy
-hysteria-mongo
-hysteria-redis
-```
-
-### 6. Verify panel access
-
-```bash
-DOMAIN=$(grep '^PANEL_DOMAIN=' .env | cut -d= -f2)
-curl -I "https://$DOMAIN/panel/login"
-curl -I "https://$DOMAIN/panel"
-```
-
-Expected:
-
-```text
-/panel/login -> 200
-/panel       -> 302 redirect to /panel/login
-```
-
----
-
-## Updating a staging/develop install
-
-If the server was intentionally installed from `develop`:
-
-```bash
-cd /opt/hysteria-panel
-git fetch origin develop
-git checkout develop
-git pull --ff-only origin develop
-docker compose -f docker-compose.yml up -d --build
-```
-
-For production, use `main` unless you explicitly want to test unreleased changes.
-
----
-
-## Rollback
-
-### Option 1: rollback to the previous git commit
-
-```bash
-cd /opt/hysteria-panel
+# Find the previous working commit
 git log --oneline -10
-git checkout <previous-good-commit>
-docker compose -f docker-compose.yml up -d --build
+
+# Checkout
+git checkout <commit-hash>
+
+# Rebuild
+docker compose build --no-cache backend
+docker compose up -d
 ```
 
-After confirming the rollback works, either stay on that detached commit temporarily or create a rollback branch:
+### Option 3: Database restoration
 
 ```bash
-git switch -c rollback/<date-or-reason>
-```
-
-### Option 2: restore files from the pre-update tar backup
-
-```bash
-cd /opt
-mv /opt/hysteria-panel /opt/hysteria-panel.broken-$(date +%Y%m%d-%H%M%S)
-tar -xzf /opt/hysteria-panel-install-backups/<backup-dir>/hysteria-panel-files.tar.gz -C /opt
-cd /opt/hysteria-panel
-docker compose -f docker-compose.yml up -d --build
-```
-
-### Option 3: restore MongoDB from backup
-
-Only do this if the database itself was changed/corrupted and you are sure you want to discard newer data.
-
-```bash
-cd /opt/hysteria-panel
-set -a
-. ./.env
-set +a
-docker cp ./backups/hysteria-YYYYMMDD-HHMMSS.archive hysteria-mongo:/tmp/restore.archive
-docker exec hysteria-mongo mongorestore \
-  --archive=/tmp/restore.archive \
-  --drop \
-  --username "$MONGO_USER" \
-  --password "$MONGO_PASSWORD" \
-  --authenticationDatabase=admin
-docker exec hysteria-mongo rm -f /tmp/restore.archive
+# Restore from backup
+docker cp ./backup.archive hysteria-mongo:/data/db/backup.archive
+docker exec hysteria-mongo mongorestore --archive=/data/db/backup.archive --drop --username=hysteria --password --authenticationDatabase=admin
 ```
 
 ---
 
-## Post-update checks
+## ✅ After Update
 
-1. Log in to the panel.
-2. Check that nodes still show correct status.
-3. Open at least one subscription URL.
-4. Check API access if you use API keys.
-5. Watch logs for 10-15 minutes:
+1. **Check authentication** — login to the panel
+2. **Check nodes** — all nodes should show `online` status
+3. **Check subscriptions** — open subscription URL in browser
+4. **Check API** — make a test request with API key
+5. **Monitor logs** for 10-15 minutes:
+   ```bash
+   docker logs hysteria-backend -f --tail 50
+   ```
+
+---
+
+## ⚠️ Common Issues
+
+### Container won't start
 
 ```bash
-docker compose -f docker-compose.yml logs -f --tail=80 backend
+# Check logs
+docker logs hysteria-backend
+
+# Common causes:
+# - Error in .env file
+# - MongoDB connection issue
+# - Out of memory
+```
+
+### MongoDB connection fails
+
+```bash
+# Check MongoDB status
+docker logs hysteria-mongo --tail 50
+
+# Restart MongoDB
+docker compose restart mongo
+```
+
+### SSL certificates not working
+
+```bash
+# Check greenlock.d contents
+ls -la greenlock.d/
+
+# Restart with cache clear
+docker compose down
+docker compose up -d
 ```
 
 ---
 
-## Common issues
+## 📅 Recommended Schedule
 
-### Backend does not start
-
-```bash
-docker compose -f docker-compose.yml logs --tail=200 backend
-docker compose -f docker-compose.yml ps
-```
-
-Common causes:
-
-- invalid `.env` values;
-- MongoDB or Redis is not healthy yet;
-- not enough memory/disk;
-- syntax/runtime error introduced by a source update.
-
-### MongoDB is not healthy
-
-```bash
-docker compose -f docker-compose.yml logs --tail=100 mongo
-docker compose -f docker-compose.yml restart mongo
-```
-
-### Caddy / HTTPS certificate issue
-
-```bash
-docker compose -f docker-compose.yml logs --tail=160 caddy
-ss -ltnp | grep -E ':80|:443'
-dig +short "$DOMAIN"
-```
-
-Check that:
-
-- DNS points to this server;
-- ports 80 and 443 are open;
-- no other service uses 80/443;
-- `PANEL_DOMAIN` in `.env` is correct.
+| Action | Frequency |
+|--------|-----------|
+| Database backup | Daily (auto) + before updates |
+| Check for updates | Weekly |
+| Security patches | Within 48 hours |
+| Major updates | After staging testing |
 
 ---
 
-## Docker Hub note
+## 🛡️ Best Practices
 
-The custom repository currently uses source-based deployment through `docker-compose.yml`. The upstream `docker-compose.hub.yml` file is still present, but the custom Docker Hub publishing workflow is manual/disabled by default until a custom Docker image namespace and secrets are configured.
-
-For this custom repo, prefer the source-build update flow above.
-
----
-
-## Best practices
-
-1. Test updates on staging first.
-2. Update during low-traffic hours.
-3. Keep at least 3 recent database backups.
-4. Record the git commit before and after every update.
-5. Do not run `docker system prune -a` before confirming rollback is not needed.
+1. **Test on staging** — duplicate environment for update testing
+2. **Update during low-traffic hours** — night/early morning in users' timezone
+3. **Keep backups** — at least 3 recent database backups
+4. **Document changes** — save records of versions and update dates
+5. **Don't update everything at once** — panel first, then nodes if needed
 
 ---
 
-## If something goes wrong
+## 📞 If Something Goes Wrong
 
-1. Do not panic — MongoDB data is in the Docker volume unless explicitly dropped.
-2. Check logs: `docker compose -f docker-compose.yml logs --tail=200 backend`.
-3. Roll back to the previous git commit.
-4. Restore MongoDB only if necessary.
-5. Open a GitHub issue or attach logs to the maintenance report.
+1. Don't panic — data is safe in MongoDB
+2. Check logs: `docker logs hysteria-backend --tail 200`
+3. Rollback to previous version
+4. Restore database from backup if needed
+5. Create a GitHub issue with problem description and logs
