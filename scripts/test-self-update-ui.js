@@ -18,6 +18,10 @@ assert(maintenance.includes('id="updateAuthFields"') && maintenance.includes('on
     'credentials and the real submit action must be directly visible in the maintenance card');
 assert(!maintenance.includes('id="updateModal"') && !maintenance.includes('openUpdateModal'),
     'there must be no intermediate hidden confirmation modal');
+assert(!maintenance.includes('for (let i = 0; i < 3; i++)'),
+    'maintenance UI must not truncate version comparison to three components');
+assert(maintenance.includes('Math.max(pa.length, pb.length, 4)'),
+    'maintenance UI must compare four-component custom versions');
 assert(maintenance.includes('id="updateApplyBtn"') && maintenance.includes('type="button"'),
     'update controls must not accidentally submit a surrounding settings form');
 
