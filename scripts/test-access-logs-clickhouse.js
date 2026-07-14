@@ -181,15 +181,23 @@ async function onlineTests() {
         { node_id: 'n1', raw: '2023/11/22 17:01:33 from 9.9.9.9:5000 rejected proxy/vless/encoding: invalid request user id: abc' },
     ], batchId);
 
-    // Give the MV a moment (insert is synchronous, but read is eventually there).
-    const res = await clickhouse.query("SELECT email, network, dest_host FROM access_events WHERE email = '42' LIMIT 1");
+    // Materialized-view visibility may lag the HTTP insert response briefly.
+    async function waitForRow(sql, attempts = 25) {
+        for (let i = 0; i < attempts; i++) {
+            const result = await clickhouse.query(sql);
+            if (result.ok && result.rows.length >= 1) return result;
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        return clickhouse.query(sql);
+    }
+    const res = await waitForRow("SELECT email, network, dest_host FROM access_events WHERE email = '42' LIMIT 1");
     assert.ok(res.ok, `read ok: ${res.error || ''}`);
     assert.ok(res.rows.length >= 1, 'row present after MV parse');
     assert.strictEqual(res.rows[0].network, 'tcp');
     assert.strictEqual(res.rows[0].dest_host, 'example.com');
 
     // The connection-error line parsed via fallback: rejected, source set, tagged.
-    const errRes = await clickhouse.query(
+    const errRes = await waitForRow(
         "SELECT source_ip, action, outbound_tag, parse_ok FROM access_events WHERE source_ip = '9.9.9.9' LIMIT 1");
     assert.ok(errRes.ok && errRes.rows.length >= 1, 'error line stored');
     assert.strictEqual(errRes.rows[0].action, 'rejected', 'error line action');
