@@ -1396,22 +1396,44 @@ fi`;
     // Step 1: Download binary
     log('Downloading cc-agent binary...');
     const downloadResult = await execSSH(conn, `
-rm -f /usr/local/bin/cc-agent
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     BIN="cc-agent-linux-arm64"
 else
     BIN="cc-agent-linux-amd64"
 fi
-URL="https://github.com/YLeon2007/celerity-panel-custom/releases/latest/download/$BIN"
+BASE_URL="https://github.com/YLeon2007/celerity-panel-custom/releases/latest/download"
+URL="$BASE_URL/$BIN"
+TMP="/usr/local/bin/cc-agent.new"
+SUMS="/tmp/cc-agent-SHA256SUMS.$$"
+rm -f "$TMP" "$SUMS"
 echo "Downloading $URL ..."
-curl -fsSL --max-time 120 "$URL" -o /usr/local/bin/cc-agent
-if [ ! -s /usr/local/bin/cc-agent ]; then
-    echo "ERROR: Download failed or file is empty"
+if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 300 "$URL" -o "$TMP"; then
+    rm -f "$TMP" "$SUMS"
+    echo "ERROR: Binary download failed; existing cc-agent was preserved"
     exit 1
 fi
-chmod +x /usr/local/bin/cc-agent
-echo "OK: cc-agent binary ready"
+if [ ! -s "$TMP" ]; then
+    rm -f "$TMP" "$SUMS"
+    echo "ERROR: Downloaded file is empty; existing cc-agent was preserved"
+    exit 1
+fi
+if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 60 "$BASE_URL/SHA256SUMS" -o "$SUMS"; then
+    rm -f "$TMP" "$SUMS"
+    echo "ERROR: Checksum download failed; existing cc-agent was preserved"
+    exit 1
+fi
+EXPECTED=$(awk -v file="$BIN" '$2 == file { print $1; exit }' "$SUMS")
+ACTUAL=$(sha256sum "$TMP" | cut -d' ' -f1)
+if [ -z "$EXPECTED" ] || [ "$ACTUAL" != "$EXPECTED" ]; then
+    rm -f "$TMP" "$SUMS"
+    echo "ERROR: SHA-256 verification failed; existing cc-agent was preserved"
+    exit 1
+fi
+chmod +x "$TMP"
+mv -f "$TMP" /usr/local/bin/cc-agent
+rm -f "$SUMS"
+echo "OK: cc-agent binary ready (sha256: $ACTUAL)"
 ls -la /usr/local/bin/cc-agent
 `);
 

@@ -19,6 +19,14 @@ assert.strictEqual(provision.isEligibleNode({ ...base, type: 'hysteria', cascade
 assert.strictEqual(provision.accessLogPathForNode({ ...base, cascadeRole: 'bridge' }), '/var/log/xray-bridge/access.log');
 assert.strictEqual(provision.accessLogPathForNode({ ...base, cascadeRole: 'portal' }), '/var/log/xray/access.log');
 
+const nodeSetupSource = require('fs').readFileSync(require.resolve('../src/services/nodeSetup'), 'utf8');
+assert.ok(!nodeSetupSource.includes('rm -f /usr/local/bin/cc-agent\nARCH='),
+    'agent setup must not delete the existing binary before download verification');
+assert.ok(nodeSetupSource.includes('cc-agent.new') && nodeSetupSource.includes('SHA256SUMS'),
+    'agent setup must download atomically and verify the release checksum');
+assert.ok(nodeSetupSource.includes('existing cc-agent was preserved'),
+    'agent setup download failures must explicitly preserve the previous binary');
+
 const source = require('fs').readFileSync(require.resolve('../src/services/accessLogs/provisionService'), 'utf8');
 assert.ok(source.includes("systemctl restart xray-bridge"), 'bridge reconciliation must restart xray-bridge');
 assert.ok(source.includes("mode: { $ne: 'forward' }"), 'bridge reconciliation must preserve all active reverse links');

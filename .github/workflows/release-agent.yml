@@ -1,0 +1,79 @@
+name: CC Agent Release Assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and attach assets to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-agent-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "Invalid stable release tag: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Set up Go from cc-agent/go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cc-agent/go.mod
+          cache-dependency-path: cc-agent/go.sum
+
+      - name: Test cc-agent
+        working-directory: cc-agent
+        run: go test ./...
+
+      - name: Build static Linux binaries
+        working-directory: cc-agent
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/cc-agent-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/cc-agent-linux-arm64 .
+          cd dist
+          sha256sum cc-agent-linux-amd64 cc-agent-linux-arm64 > SHA256SUMS
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-agent-${{ steps.release.outputs.tag }}
+          path: |
+            cc-agent/dist/cc-agent-linux-amd64
+            cc-agent/dist/cc-agent-linux-arm64
+            cc-agent/dist/SHA256SUMS
+
+      - name: Attach binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            cc-agent/dist/cc-agent-linux-amd64
+            cc-agent/dist/cc-agent-linux-arm64
+            cc-agent/dist/SHA256SUMS

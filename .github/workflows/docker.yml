@@ -22,7 +22,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: cc-agent/go.mod
           cache-dependency-path: cc-agent/go.sum
 
       - name: Build cc-agent
@@ -36,28 +36,6 @@ jobs:
         with:
           name: cc-agent-binaries
           path: |
-            cc-agent/cc-agent-linux-amd64
-            cc-agent/cc-agent-linux-arm64
-
-      - name: Publish to GitHub Release (on tag only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          append_body: true
-          body: |
-            ## CC Agent binaries
-
-            Lightweight Go agent for managing Xray on nodes.
-            Downloaded automatically during node auto-setup from the panel.
-
-            | File | Architecture |
-            |------|-------------|
-            | `cc-agent-linux-amd64` | x86_64 (most VPS) |
-            | `cc-agent-linux-arm64` | ARM64 |
-
-            > Panel source code is distributed via Docker Hub: `clickdevtech/hysteria-panel`
-          files: |
             cc-agent/cc-agent-linux-amd64
             cc-agent/cc-agent-linux-arm64
 
