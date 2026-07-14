@@ -16,4 +16,7 @@ COPY server.js ./
 
 EXPOSE 8484
 
-CMD ["node", "server.js"]
+# Absolute path: compose sets working_dir to the mounted project dir (so docker
+# compose runs there), which overrides the image WORKDIR - a relative entrypoint
+# would then resolve against the project dir where no server.js exists.
+CMD ["node", "/updater/server.js"]
