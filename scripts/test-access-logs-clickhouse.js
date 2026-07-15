@@ -12,6 +12,7 @@
  */
 
 const assert = require('assert');
+const crypto = require('crypto');
 
 // Point at a temp dir so requiring settings-backed modules is harmless.
 const os = require('os');
@@ -175,16 +176,23 @@ async function onlineTests() {
 
     await clickhouse.ensureSchema(7);
 
-    const batchId = 'test-batch-' + Date.now();
+    const runStartedAt = Date.now();
+    const runId = crypto.randomUUID();
+    const batchId = 'test-batch-' + runId;
+    const fixtureEmail = `e2e-${runId}`;
+    const fixtureSourceIp = `198.51.100.${(runStartedAt % 200) + 1}`;
+    const fixtureMarker = `e2e-marker-${runId}`;
     // Keep E2E fixtures inside the configured retention window. Using a fixed
     // historical date makes ClickHouse TTL merges race the assertions: the
     // first row may be visible briefly while the second disappears as expired.
-    const currentTs = new Date().toISOString()
+    // Per-run email/source values also prevent stale rows left by an interrupted
+    // previous run from satisfying the current assertions.
+    const currentTs = new Date(runStartedAt).toISOString()
         .replace(/-(\d{2})-(\d{2})T/, '/$1/$2 ')
         .replace(/\.\d{3}Z$/, '');
     await clickhouse.insertRaw([
-        { node_id: 'n1', raw: `${currentTs} 1.2.3.4:1122 accepted tcp:example.com:443 [vless-in -> direct] email: 42` },
-        { node_id: 'n1', raw: `${currentTs} from 9.9.9.9:5000 rejected proxy/vless/encoding: invalid request user id: abc` },
+        { node_id: 'n1', raw: `${currentTs} 1.2.3.4:1122 accepted tcp:example.com:443 [vless-in -> direct] email: ${fixtureEmail}` },
+        { node_id: 'n1', raw: `${currentTs} from ${fixtureSourceIp}:5000 rejected proxy/vless/encoding: invalid request user id: ${fixtureMarker}` },
     ], batchId);
 
     // Materialized-view visibility may lag the HTTP insert response briefly.
@@ -196,7 +204,8 @@ async function onlineTests() {
         }
         return clickhouse.query(sql);
     }
-    const res = await waitForRow("SELECT email, network, dest_host FROM access_events WHERE email = '42' LIMIT 1");
+    const res = await waitForRow(
+        `SELECT email, network, dest_host FROM access_events WHERE email = '${fixtureEmail}' LIMIT 1`);
     assert.ok(res.ok, `read ok: ${res.error || ''}`);
     assert.ok(res.rows.length >= 1, 'row present after MV parse');
     assert.strictEqual(res.rows[0].network, 'tcp');
@@ -204,7 +213,8 @@ async function onlineTests() {
 
     // The connection-error line parsed via fallback: rejected, source set, tagged.
     const errRes = await waitForRow(
-        "SELECT source_ip, action, outbound_tag, parse_ok FROM access_events WHERE source_ip = '9.9.9.9' LIMIT 1");
+        `SELECT source_ip, action, outbound_tag, parse_ok FROM access_events ` +
+        `WHERE source_ip = '${fixtureSourceIp}' AND position(raw, '${fixtureMarker}') > 0 LIMIT 1`);
     assert.ok(errRes.ok && errRes.rows.length >= 1, 'error line stored');
     assert.strictEqual(errRes.rows[0].action, 'rejected', 'error line action');
     assert.strictEqual(errRes.rows[0].outbound_tag, 'handshake-error', 'error line tagged');

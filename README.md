@@ -148,7 +148,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 
 ## ✨ Features
 
-- 🔄 **Panel self-update** — topbar version check, changelog modal, backup, fast-forward pull, rebuild, and generated rollback script
+- 🔄 **Panel self-update** — isolated updater sidecar, Maintenance-page release check/changelog, authenticated backup/install flow, live progress log, and rollback artifacts
 - 🛠️ **Source-based Caddy deploy** — production compose builds the backend from this repository and proxies HTTPS through Caddy to the stable backend container name
 - 🖥 **Web Panel** — Full UI for managing nodes and users
 - 🔐 **Dual Protocol** — Hysteria 2 and Xray VLESS on one panel
