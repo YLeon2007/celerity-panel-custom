@@ -248,9 +248,14 @@ clone_or_update_repo() {
       fail "Existing checkout has local changes. Backup was created; clean or commit them before FORCE=1."
     fi
     git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-    run_git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" fetch --prune origin "$BRANCH"
-    git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" checkout "$BRANCH"
-    run_git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH"
+    run_git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" fetch origin \
+      "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+    if git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" checkout "$BRANCH"
+      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" merge --ff-only "refs/remotes/origin/$BRANCH"
+    else
+      git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR" checkout --track -b "$BRANCH" "refs/remotes/origin/$BRANCH"
+    fi
   else
     if [ -e "$INSTALL_DIR" ]; then
       rm -rf -- "$INSTALL_DIR"

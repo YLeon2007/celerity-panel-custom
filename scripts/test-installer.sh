@@ -93,4 +93,33 @@ set -e
 [ "$rc" -ne 0 ]
 [ -z "$(find "$ROOT/tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]
 
+# Updating an existing checkout to a previously unseen branch must create the
+# remote-tracking ref explicitly and move only by fast-forward.
+git init -q --bare "$ROOT/source.git"
+git init -q -b main "$ROOT/source-work"
+git -C "$ROOT/source-work" config user.email test@example.com
+git -C "$ROOT/source-work" config user.name installer-test
+printf 'main\n' >"$ROOT/source-work/version.txt"
+git -C "$ROOT/source-work" add version.txt
+git -C "$ROOT/source-work" commit -qm main
+git -C "$ROOT/source-work" remote add origin "file://$ROOT/source.git"
+git -C "$ROOT/source-work" push -q -u origin main
+git -C "$ROOT/source-work" switch -qc feature/installer-test
+printf 'feature\n' >"$ROOT/source-work/version.txt"
+git -C "$ROOT/source-work" commit -qam feature
+git -C "$ROOT/source-work" push -q -u origin feature/installer-test
+git clone -q --branch main "file://$ROOT/source.git" "$ROOT/update"
+(
+  export CELERITY_INSTALLER_LIBRARY=1 INSTALL_DIR="$ROOT/update" BACKUP_ROOT="$ROOT/update-backups"
+  export INSTALL_USER="$(id -un)" PANEL_DOMAIN=x.example.com ACME_EMAIL=x@example.com
+  export BRANCH=feature/installer-test REPO=owner/repo
+  source "$REPO_ROOT/scripts/install.sh"
+  INSTALL_GROUP="$(id -gn "$INSTALL_USER")"
+  REPO_URL="file://$ROOT/source.git"
+  clone_or_update_repo
+)
+[ "$(git -C "$ROOT/update" branch --show-current)" = feature/installer-test ]
+[ "$(cat "$ROOT/update/version.txt")" = feature ]
+[ "$(git -C "$ROOT/update" rev-parse HEAD)" = "$(git -C "$ROOT/source-work" rev-parse feature/installer-test)" ]
+
 printf 'installer regression tests passed\n'
