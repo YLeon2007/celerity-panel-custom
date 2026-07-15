@@ -144,7 +144,7 @@ validate_inputs() {
   [ -n "$PANEL_DOMAIN" ] || fail "PANEL_DOMAIN is required, e.g. PANEL_DOMAIN=panel.example.com"
   [ -n "$ACME_EMAIL" ] || fail "ACME_EMAIL is required, e.g. ACME_EMAIL=admin@example.com"
   valid_hostname "$PANEL_DOMAIN" || fail "PANEL_DOMAIN must be a valid hostname without scheme/path"
-  printf '%s' "$ACME_EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' \
+  printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' \
     || fail "ACME_EMAIL must look like an email address, e.g. admin@example.com"
 
   case "$INSTALL_DIR" in
@@ -174,6 +174,7 @@ validate_inputs() {
   case "$COMPOSE_FILE" in
     ''|/*|*'..'*) fail "COMPOSE_FILE must be a relative filename inside INSTALL_DIR" ;;
   esac
+  printf '%s' "$COMPOSE_FILE" | grep -Eq '^[A-Za-z0-9._/-]+$' || fail "Invalid COMPOSE_FILE"
   case "$FORCE:$NO_START:$SKIP_HTTPS_CHECK" in
     [01]:[01]:[01]) ;;
     *) fail "FORCE, NO_START and SKIP_HTTPS_CHECK must be 0 or 1" ;;
@@ -197,6 +198,8 @@ validate_inputs() {
     esac
     [ -z "$secret_value" ] || [ "${#secret_value}" -ge "$min_len" ] \
       || fail "$secret_name must be at least $min_len characters when provided"
+    [ -z "$secret_value" ] || printf '%s' "$secret_value" | grep -Eq '^[A-Za-z0-9._~%+/=-]+$' \
+      || fail "$secret_name contains characters unsafe for an unquoted .env value"
   done
 
   printf '%s' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || fail "Invalid REPO owner/name"
@@ -377,7 +380,7 @@ write_env_safely() {
 validate_effective_env() {
   local value
   valid_hostname "$PANEL_DOMAIN" || fail "Effective PANEL_DOMAIN in .env is invalid"
-  printf '%s' "$ACME_EMAIL" | grep -Eq '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$' \
+  printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' \
     || fail "Effective ACME_EMAIL in .env is invalid"
   printf '%s' "$MONGO_USER" | grep -Eq '^[A-Za-z0-9_.-]+$' || fail "Effective MONGO_USER in .env is invalid"
   value="$(env_value ENCRYPTION_KEY)"; [ "${#value}" -ge 32 ] || fail "Effective ENCRYPTION_KEY is too short"
@@ -411,7 +414,7 @@ https_health_ok() {
     return 0
   fi
   local url="${HEALTHCHECK_URL:-https://$PANEL_DOMAIN/health}"
-  curl -fsS --connect-timeout 10 --max-time 20 "$url" >/dev/null 2>&1
+  curl -fsS --connect-timeout 10 --max-time 20 -- "$url" >/dev/null 2>&1
 }
 
 verify_updater_hmac() {

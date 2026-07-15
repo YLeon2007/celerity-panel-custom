@@ -69,6 +69,12 @@ expect_failure 'SESSION_SECRET must be at least 32 characters' \
       INSTALL_USER="$(id -un)" PANEL_DOMAIN=x.example.com ACME_EMAIL=x@example.com \
       SESSION_SECRET=short REPO_ROOT="$REPO_ROOT" bash -c 'source "$REPO_ROOT/scripts/install.sh"; validate_inputs'
 
+expect_failure 'SESSION_SECRET contains characters unsafe for an unquoted .env value' \
+  env CELERITY_INSTALLER_LIBRARY=1 INSTALL_DIR="$ROOT/unsafe-secret" BACKUP_ROOT="$ROOT/backups-secret" \
+      INSTALL_USER="$(id -un)" PANEL_DOMAIN=x.example.com ACME_EMAIL=x@example.com \
+      SESSION_SECRET='0123456789abcdef0123456789abc#ef' REPO_ROOT="$REPO_ROOT" \
+      bash -c 'source "$REPO_ROOT/scripts/install.sh"; validate_inputs'
+
 expect_failure 'Refusing INSTALL_DIR below a world-writable or runtime directory' \
   env CELERITY_INSTALLER_LIBRARY=1 INSTALL_DIR=/tmp/celerity-unsafe BACKUP_ROOT="$ROOT/backups3" \
       INSTALL_USER="$(id -un)" PANEL_DOMAIN=x.example.com ACME_EMAIL=x@example.com \
