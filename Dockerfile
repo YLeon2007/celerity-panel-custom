@@ -3,16 +3,15 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости:
-# - mongodb-tools: mongodump/mongorestore для backup/restore
-# - git/bash/docker-cli: self-update из панели через host checkout + docker compose
-RUN apk add --no-cache mongodb-tools git bash docker-cli docker-cli-compose libstdc++ libgcc
+# Install only runtime tools required for Mongo backup/restore.
+# Git, Bash and Docker CLI/Compose intentionally live only in the isolated updater image.
+RUN apk add --no-cache mongodb-tools libstdc++ libgcc
 
 # Копируем зависимости
 COPY package*.json ./
 
-# Устанавливаем зависимости
-RUN npm install --omit=dev
+# Install exactly the production dependency graph pinned in package-lock.json
+RUN npm ci --omit=dev
 
 # Копируем исходники
 COPY . .

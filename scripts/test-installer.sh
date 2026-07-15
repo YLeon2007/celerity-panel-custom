@@ -6,6 +6,12 @@ ROOT=$(mktemp -d "${PWD}/.installer-test.XXXXXX")
 trap 'rm -rf -- "$ROOT"' EXIT
 REPO_ROOT="$PWD"
 
+# Backend builds must be lockfile-reproducible and must not contain Docker tooling;
+# only the isolated updater image is allowed to control the Docker daemon.
+grep -Fq 'RUN npm ci --omit=dev' Dockerfile
+! grep -Eq '^RUN .*docker-cli' Dockerfile
+grep -Eq '^RUN .*docker-cli.*docker-cli-compose' updater/Dockerfile
+
 export CELERITY_INSTALLER_LIBRARY=1
 export INSTALL_DIR="$ROOT/project"
 export BACKUP_ROOT="$ROOT/backups"
