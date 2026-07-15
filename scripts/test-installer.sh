@@ -41,6 +41,7 @@ write_env_safely
 prepare_dirs
 
 [ "$(env_value PANEL_DOMAIN)" = old.example.com ]
+[ "$(env_value DOKPLOY_PANEL_HOST)" = old.example.com ]
 [ "$(env_value ACME_EMAIL)" = old@example.com ]
 [ "$(env_value ENCRYPTION_KEY)" = 0123456789abcdef0123456789abcdef ]
 [ "$(env_value SESSION_SECRET)" = 0123456789abcdef0123456789abcdef ]

@@ -349,6 +349,10 @@ write_env_safely() {
   # Existing non-empty values always win, including on FORCE=1. Missing/empty
   # values are added or repaired without rotating encryption/database secrets.
   ensure_env_value PANEL_DOMAIN "$PANEL_DOMAIN"
+  # Dependent defaults must use the effective preserved value, not a caller
+  # override rejected by FORCE=1 preservation semantics.
+  PANEL_DOMAIN="$(env_value PANEL_DOMAIN)"
+  export PANEL_DOMAIN
   ensure_env_value DOKPLOY_PANEL_HOST "$PANEL_DOMAIN"
   ensure_env_value DOKPLOY_TRAEFIK_SERVICE_PORT 3000
   ensure_env_value ACME_EMAIL "$ACME_EMAIL"
