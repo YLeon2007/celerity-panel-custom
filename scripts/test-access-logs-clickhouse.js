@@ -176,9 +176,15 @@ async function onlineTests() {
     await clickhouse.ensureSchema(7);
 
     const batchId = 'test-batch-' + Date.now();
+    // Keep E2E fixtures inside the configured retention window. Using a fixed
+    // historical date makes ClickHouse TTL merges race the assertions: the
+    // first row may be visible briefly while the second disappears as expired.
+    const currentTs = new Date().toISOString()
+        .replace(/-(\d{2})-(\d{2})T/, '/$1/$2 ')
+        .replace(/\.\d{3}Z$/, '');
     await clickhouse.insertRaw([
-        { node_id: 'n1', raw: '2023/11/22 17:01:32 1.2.3.4:1122 accepted tcp:example.com:443 [vless-in -> direct] email: 42' },
-        { node_id: 'n1', raw: '2023/11/22 17:01:33 from 9.9.9.9:5000 rejected proxy/vless/encoding: invalid request user id: abc' },
+        { node_id: 'n1', raw: `${currentTs} 1.2.3.4:1122 accepted tcp:example.com:443 [vless-in -> direct] email: 42` },
+        { node_id: 'n1', raw: `${currentTs} from 9.9.9.9:5000 rejected proxy/vless/encoding: invalid request user id: abc` },
     ], batchId);
 
     // Materialized-view visibility may lag the HTTP insert response briefly.
