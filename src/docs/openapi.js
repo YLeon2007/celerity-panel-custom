@@ -762,7 +762,7 @@ const spec = {
         title: 'C³ CELERITY API',
         version,
         description: `
-Management API for [C³ CELERITY](https://github.com/ClickDevTech/hysteria-panel) — Hysteria 2 panel by Click Connect.
+Management API for [C³ CELERITY custom](https://github.com/YLeon2007/celerity-panel-custom), based on the original Hysteria 2 panel by Click Connect.
 
 ## Common Use Cases
 
@@ -836,11 +836,11 @@ These endpoints are not under \`/api\` and are not part of this specification:
         `.trim(),
         contact: {
             name: 'Click Connect',
-            url: 'https://github.com/ClickDevTech/hysteria-panel',
+            url: 'https://github.com/YLeon2007/celerity-panel-custom',
         },
         license: {
             name: 'MIT',
-            url: 'https://github.com/ClickDevTech/hysteria-panel/blob/main/LICENSE',
+            url: 'https://github.com/YLeon2007/celerity-panel-custom/blob/main/LICENSE',
         },
     },
 

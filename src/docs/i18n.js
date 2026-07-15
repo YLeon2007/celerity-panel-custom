@@ -8,7 +8,7 @@ module.exports = {
     ru: {
         info: {
             description: `
-Управляющий API для [C³ CELERITY](https://github.com/ClickDevTech/hysteria-panel) — панели Hysteria 2 от Click Connect.
+Управляющий API для [C³ CELERITY custom](https://github.com/YLeon2007/celerity-panel-custom), основанной на оригинальной панели Hysteria 2 от Click Connect.
 
 ## Частые сценарии
 

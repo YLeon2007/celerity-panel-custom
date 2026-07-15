@@ -4,6 +4,10 @@ This repository can deploy the custom C³ CELERITY panel from source with one in
 
 ## One-command install from the public GitHub repository
 
+The automatic prerequisite path supports Debian/Ubuntu (`apt-get`) on amd64 and
+arm64. Other distributions must provide Git, curl, OpenSSL, Docker Engine and
+Docker Compose v2 before running the script.
+
 ```bash
 curl -fsSL \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
@@ -64,6 +68,7 @@ If not provided, the installer generates:
 ENCRYPTION_KEY
 SESSION_SECRET
 MONGO_PASSWORD
+UPDATER_SECRET
 ```
 
 and writes them to:
@@ -74,6 +79,14 @@ and writes them to:
 
 `.env` is never committed.
 
+On `FORCE=1`, existing non-empty `.env` values are retained. The installer only
+adds missing/empty keys; it never rotates database or encryption secrets. It also
+creates persistent `logs/`, `backups/`, `greenlock.d/`, and `data/` directories.
+
+Unless `NO_START=1` is used, success is reported only after MongoDB/Redis health,
+backend `/health`, public HTTPS, signed updater status, and Docker-socket isolation
+have passed. Only the updater sidecar receives `/var/run/docker.sock`.
+
 ## Update existing custom checkout
 
 ```bash
@@ -81,11 +94,14 @@ cd /opt/hysteria-panel
 git fetch origin main
 git checkout main
 git pull --ff-only origin main
-docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml build backend updater
+docker compose -f docker-compose.yml up -d
 ```
 
 ## Notes
 
 - Production deploy uses `docker-compose.yml`: backend is built from this repository and Caddy terminates HTTPS.
+- In-panel updates are under **Settings → Maintenance → Panel update** and target immutable GitHub releases.
+- Xray Access Logs remain disabled by default and are enabled separately per node.
 - The installer uses `USE_CADDY=true` and expects DNS for `PANEL_DOMAIN` to point to the server.
 - Keep tokens out of shell history where possible; revoke temporary GitHub tokens after deployment.

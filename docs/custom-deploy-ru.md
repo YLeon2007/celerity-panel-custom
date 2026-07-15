@@ -4,6 +4,10 @@
 
 ## Установка одной командой из публичного GitHub-репозитория
 
+Автоматическая установка prerequisites поддерживается на Debian/Ubuntu
+(`apt-get`) для amd64 и arm64. На других дистрибутивах заранее установите Git,
+curl, OpenSSL, Docker Engine и Docker Compose v2.
+
 ```bash
 curl -fsSL \
   https://raw.githubusercontent.com/YLeon2007/celerity-panel-custom/main/scripts/install.sh \
@@ -65,6 +69,7 @@ FORCE=1
 ENCRYPTION_KEY
 SESSION_SECRET
 MONGO_PASSWORD
+UPDATER_SECRET
 ```
 
 и запишет их в:
@@ -75,6 +80,15 @@ MONGO_PASSWORD
 
 Файл `.env` никогда не коммитится в репозиторий.
 
+При `FORCE=1` все существующие непустые значения `.env` сохраняются. Installer
+только добавляет отсутствующие/пустые ключи и не ротирует MongoDB/encryption
+секреты. Также создаются persistent-каталоги `logs/`, `backups/`, `greenlock.d/`
+и `data/`.
+
+Если не задан `NO_START=1`, успех объявляется только после health-проверок
+MongoDB/Redis, backend `/health`, публичного HTTPS, подписанного updater status и
+изоляции Docker socket. Socket получает только updater-sidecar.
+
 ## Обновление существующей custom-установки
 
 ```bash
@@ -82,12 +96,15 @@ cd /opt/hysteria-panel
 git fetch origin main
 git checkout main
 git pull --ff-only origin main
-docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml build backend updater
+docker compose -f docker-compose.yml up -d
 ```
 
 ## Примечания
 
 - Production-развёртывание использует `docker-compose.yml`: backend собирается из этого репозитория, а HTTPS терминирует Caddy.
+- Обновление из панели находится в **Настройки → Обслуживание → Обновление панели** и работает с immutable GitHub Releases.
+- Xray Access Logs по умолчанию выключены и включаются отдельно для каждой ноды.
 - Установщик задаёт `USE_CADDY=true` и ожидает, что DNS-запись для `PANEL_DOMAIN` указывает на сервер.
 - По возможности не сохраняйте токены в истории shell; временные GitHub tokens лучше отзывать после завершения развёртывания.
 - GitHub Actions workflow для Docker Hub в custom-репозитории отключён по умолчанию, чтобы не спамить письмами о failed runs без настроенных Docker Hub secrets.

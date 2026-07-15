@@ -82,9 +82,14 @@ manual steps below.
 
 ---
 
-## 🚀 Update (Docker Hub — recommended)
+## 🚀 Update (upstream Docker Hub — legacy/optional)
 
-For production deployments using `docker-compose.hub.yml`:
+`docker-compose.hub.yml` points to the upstream `clickdevtech/hysteria-panel`
+image and does **not** contain this custom repository's unreleased commits. The
+supported custom production path is the source-based installer and source update
+flow below. Use this section only when you intentionally run the upstream image.
+
+For deployments intentionally using `docker-compose.hub.yml`:
 
 ### 1. Navigate to project directory
 

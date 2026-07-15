@@ -78,42 +78,43 @@ docker exec hysteria-mongo rm -f /tmp/hysteria-$TS.archive
 
 ---
 
-## Кнопка self-update в панели
+## Обновление из панели
 
-В topbar панели показывается текущая версия и ссылка **Проверить обновление**.
+Панель обновляется из **Настройки → Обслуживание → Обновление панели** без SSH.
+Механизм работает через отдельный контейнер `hysteria-updater`.
 
-При клике backend проверяет ту же Git-ветку, которая сейчас checkout на сервере (`git rev-parse --abbrev-ref HEAD`), если `SELF_UPDATE_BRANCH` не задан явно. Если есть новые коммиты, modal показывает краткий changelog и включает кнопку **Обновить**.
+### Однократная настройка
 
-Механизм обновления выполняется внутри backend-контейнера против host checkout, смонтированного в `/opt/hysteria-panel-host`, и требует:
-
-```yaml
-backend:
-  volumes:
-    - .:/opt/hysteria-panel-host
-    - /var/run/docker.sock:/var/run/docker.sock
-```
-
-Перед применением обновления `scripts/self-update.sh`:
-
-1. проверяет свободное место;
-2. сохраняет `.env`;
-3. создаёт tar backup файлов репозитория;
-4. создаёт dump MongoDB, если доступны Mongo credentials;
-5. записывает `ROLLBACK.sh` для отката одной командой;
-6. выполняет `git pull --ff-only`;
-7. пересобирает stack через `docker compose -f docker-compose.yml up -d --build`.
-
-Backup сохраняется в:
-
-```text
-/opt/hysteria-panel/backups/self-update/<timestamp>/
-```
-
-Если что-то пошло не так, подключитесь по SSH и запустите сгенерированный rollback, например:
+При установке через актуальный `scripts/install.sh` сильный `UPDATER_SECRET` уже
+создаётся автоматически. Для старой ручной установки добавьте его самостоятельно:
 
 ```bash
-bash /opt/hysteria-panel/backups/self-update/<timestamp>/ROLLBACK.sh
+echo "UPDATER_SECRET=$(openssl rand -hex 32)" >> .env
+chmod 600 .env
+docker compose -f docker-compose.yml up -d --build updater backend
 ```
+
+Без `UPDATER_SECRET` updater fail-safe отклоняет запросы, а UI показывает ручную
+инструкцию вместо кнопки установки.
+
+### Как это работает
+
+- Backend **не имеет доступа к Docker socket**; socket смонтирован только в
+  изолированный updater-sidecar.
+- Backend отправляет HMAC-подписанный одноцелевой запрос на переход к выбранному
+  immutable release tag.
+- В source-mode updater создаёт backup, выполняет checkout выбранного release tag,
+  сначала собирает новый backend и только затем пересоздаёт его. Ошибка checkout
+  или build оставляет работающий backend нетронутым.
+- Обновление требует повторного ввода пароля администратора и, если включена 2FA,
+  TOTP-кода. В UI отображаются changelog и live progress log.
+- Rollback выполняется тем же механизмом на более старый release, но не отменяет
+  изменения схемы/данных MongoDB — при необходимости используйте database backup.
+
+Backup и rollback-артефакты сохраняются в каталоге `backups/` установки.
+
+> Source-mode делает forced checkout release tag и отбрасывает локальные изменения
+> tracked-файлов. `.env`, `data/`, `logs/` и `backups/` не затрагиваются.
 
 ---
 
@@ -164,6 +165,7 @@ docker compose -f docker-compose.yml logs --tail=120 caddy
 
 ```text
 hysteria-backend
+hysteria-updater
 hysteria-caddy
 hysteria-mongo
 hysteria-redis

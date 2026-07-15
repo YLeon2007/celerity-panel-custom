@@ -7,6 +7,7 @@
 [License: MIT](LICENSE)
 [Deploy из исходников](docs/custom-deploy-ru.md)
 [Self-update панели](docs/safe-update.ru.md)
+[Последний релиз](https://github.com/YLeon2007/celerity-panel-custom/releases/latest)
 [Node.js](package.json)
 [Hysteria](https://v2.hysteria.network/)
 [Xray](https://xtls.github.io/)
@@ -27,6 +28,10 @@
 ### Production-установка одной командой
 
 Сначала направьте DNS домена панели на целевой сервер, затем выполните:
+
+> Автоматическая установка prerequisites поддерживается на Debian/Ubuntu с
+> `apt-get` (amd64 или arm64). На других дистрибутивах сначала установите Git,
+> curl, OpenSSL, Docker Engine и Docker Compose v2, затем запустите installer.
 
 ```bash
 curl -fsSL \
@@ -54,8 +59,11 @@ Installer делает следующее:
 
 - устанавливает Docker/Docker Compose, если их нет;
 - клонирует этот репозиторий в `/opt/hysteria-panel`;
-- генерирует `.env` с `ENCRYPTION_KEY`, `SESSION_SECRET` и `MONGO_PASSWORD`, если они не заданы заранее;
-- запускает `docker compose -f docker-compose.yml up -d --build`;
+- генерирует `.env` с `ENCRYPTION_KEY`, `SESSION_SECRET`, `MONGO_PASSWORD` и HMAC-секретом `UPDATER_SECRET`, если они не заданы заранее;
+- при осознанном `FORCE=1` сохраняет все существующие непустые значения `.env`;
+- создаёт persistent-каталоги `logs/`, `backups/`, `greenlock.d/` и `data/` для Access Logs с ограниченными правами;
+- собирает и запускает backend вместе с изолированным updater-sidecar;
+- ждёт готовности MongoDB, Redis, backend и HTTPS, затем проверяет HMAC updater и изоляцию Docker socket;
 - Caddy получает Let's Encrypt сертификат для `PANEL_DOMAIN`.
 
 После установки откройте:
@@ -109,16 +117,17 @@ Installer генерирует их автоматически, но при ру
 ```env
 PANEL_DOMAIN=panel.example.com
 ACME_EMAIL=admin@example.com
-ENCRYPTION_KEY=ваш32символьныйключ  # openssl rand -hex 16
-SESSION_SECRET=секретсессий         # openssl rand -hex 32
-MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
+ENCRYPTION_KEY=0123456789abcdef0123456789abcdef  # openssl rand -hex 16
+SESSION_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  # openssl rand -hex 32
+MONGO_PASSWORD=0123456789abcdef                 # openssl rand -hex 16
+UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  # openssl rand -hex 32
 ```
 
 ---
 
 ## 🐳 Dokploy / Traefik (опционально, не основной путь)
 
-Основной supported production-путь для этого custom-репозитория — source-based installer выше (`scripts/install.sh`) и `docker-compose.yml` с Caddy. Он сохраняет git checkout на сервере в `/opt/hysteria-panel`, поэтому кнопка self-update в панели может подтянуть этот репозиторий, создать backup, пересобрать контейнеры и сгенерировать rollback-скрипт.
+Основной supported production-путь для этого custom-репозитория — source-based installer выше (`scripts/install.sh`) и `docker-compose.yml` с Caddy. Он сохраняет git checkout в `/opt/hysteria-panel`; раздел **Настройки → Обслуживание → Обновление панели** использует отдельный HMAC-аутентифицированный updater-sidecar для backup, перехода на immutable release tag, пересборки backend и сохранения rollback-артефактов. Сам backend не имеет доступа к Docker socket.
 
 `docker-compose.dokploy.yml` оставлен только для операторов, которые осознанно деплоят через Dokploy/Traefik и понимают ограничения:
 
@@ -145,7 +154,8 @@ MONGO_PASSWORD=парольмонго          # openssl rand -hex 16
 
 ## ✨ Возможности
 
-- 🔄 **Self-update панели** — проверка версии в topbar, modal с changelog, backup, fast-forward pull, rebuild и сгенерированный rollback-скрипт
+- 🔄 **Self-update панели** — изолированный updater-sidecar, проверка релиза/changelog в разделе «Обслуживание», подтверждение паролем/2FA, backup, live log и rollback-артефакты
+- 🧾 **Opt-in Access Logs Xray** — включение отдельно для каждой ноды, persistent spool, доставка в ClickHouse и безопасное выключенное состояние по умолчанию
 - 🛠️ **Source-based Caddy deploy** — production compose собирает backend из этого репозитория и проксирует HTTPS через Caddy на стабильное имя контейнера
 - 🖥 **Веб-панель** — полноценный UI для управления нодами и пользователями
 - 🔐 **Двойной протокол** — Hysteria 2 и Xray VLESS на одной панели

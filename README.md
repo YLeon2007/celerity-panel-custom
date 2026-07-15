@@ -7,6 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Deploy](https://img.shields.io/badge/deploy-source--based-2563EB)](docs/custom-deploy.md)
 [![Self Update](https://img.shields.io/badge/panel-self--update-16A34A)](docs/safe-update.md)
+[![Latest release](https://img.shields.io/github/v/release/YLeon2007/celerity-panel-custom?display_name=tag&sort=semver)](https://github.com/YLeon2007/celerity-panel-custom/releases/latest)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](package.json)
 [![Hysteria](https://img.shields.io/badge/Hysteria-2.x-9B59B6)](https://v2.hysteria.network/)
 [![Xray](https://img.shields.io/badge/Xray-VLESS-00ADD8)](https://xtls.github.io/)
@@ -30,6 +31,10 @@
 ### One-command production install
 
 Point DNS for your panel domain to the target server, then run:
+
+> Supported automatic prerequisite installation: Debian/Ubuntu servers with
+> `apt-get` (amd64 or arm64). On other distributions, install Git, curl, OpenSSL,
+> Docker Engine and Docker Compose v2 first, then run the installer.
 
 ```bash
 curl -fsSL \
@@ -57,8 +62,11 @@ It will:
 
 - install Docker/Docker Compose if missing;
 - clone this repository into `/opt/hysteria-panel`;
-- generate `.env` with `ENCRYPTION_KEY`, `SESSION_SECRET`, and `MONGO_PASSWORD` if not provided;
-- run `docker compose -f docker-compose.yml up -d --build`;
+- generate `.env` with `ENCRYPTION_KEY`, `SESSION_SECRET`, `MONGO_PASSWORD`, and the HMAC `UPDATER_SECRET` if not provided;
+- preserve every existing non-empty `.env` value during an intentional `FORCE=1` repair/update;
+- prepare persistent `logs/`, `backups/`, `greenlock.d/`, and Access Logs `data/` directories with restricted permissions;
+- build and start the backend plus the isolated updater sidecar;
+- wait for MongoDB, Redis, backend and HTTPS health, then verify updater HMAC and Docker-socket isolation;
 - let Caddy obtain a Let's Encrypt certificate for `PANEL_DOMAIN`.
 
 Open:
@@ -112,16 +120,17 @@ The installer generates these automatically, but manual deployments must set at 
 ```env
 PANEL_DOMAIN=panel.example.com
 ACME_EMAIL=admin@example.com
-ENCRYPTION_KEY=your32characterkey  # openssl rand -hex 16
-SESSION_SECRET=yoursessionsecret   # openssl rand -hex 32
-MONGO_PASSWORD=yourmongopassword   # openssl rand -hex 16
+ENCRYPTION_KEY=0123456789abcdef0123456789abcdef  # openssl rand -hex 16
+SESSION_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  # openssl rand -hex 32
+MONGO_PASSWORD=0123456789abcdef                 # openssl rand -hex 16
+UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  # openssl rand -hex 32
 ```
 
 ---
 
 ## 🐳 Dokploy / Traefik (optional, not the primary path)
 
-The supported production path for this custom repository is the source-based installer above (`scripts/install.sh`) and `docker-compose.yml` with Caddy. It keeps the local git checkout in `/opt/hysteria-panel`, so the in-panel self-update button can pull this repository, create backups, rebuild, and generate rollback scripts.
+The supported production path for this custom repository is the source-based installer above (`scripts/install.sh`) and `docker-compose.yml` with Caddy. It keeps the local git checkout in `/opt/hysteria-panel`; **Settings → Maintenance → Panel update** uses an isolated HMAC-authenticated updater sidecar to back up, move to an immutable release tag, rebuild the backend, and retain rollback artifacts. The backend itself has no Docker socket access.
 
 `docker-compose.dokploy.yml` is kept only for operators who intentionally deploy through Dokploy/Traefik and understand the trade-offs:
 
@@ -149,6 +158,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 ## ✨ Features
 
 - 🔄 **Panel self-update** — isolated updater sidecar, Maintenance-page release check/changelog, authenticated backup/install flow, live progress log, and rollback artifacts
+- 🧾 **Opt-in Xray Access Logs** — per-node enablement, durable local spool, ClickHouse delivery, and fail-safe disabled-by-default startup
 - 🛠️ **Source-based Caddy deploy** — production compose builds the backend from this repository and proxies HTTPS through Caddy to the stable backend container name
 - 🖥 **Web Panel** — Full UI for managing nodes and users
 - 🔐 **Dual Protocol** — Hysteria 2 and Xray VLESS on one panel
