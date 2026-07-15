@@ -14,7 +14,6 @@ const nodesRoutes = require('./nodes');
 const usersRoutes = require('./users');
 const settingsRoutes = require('./settings');
 const systemRoutes = require('./system');
-const updateRoutes = require('./update');
 const migrationRoutes = require('./migration');
 const accessLogsRoutes = require('./accessLogs');
 
@@ -32,7 +31,6 @@ router.use('/', requireAuth, requireOnboarding, nodesRoutes);
 router.use('/', requireAuth, requireOnboarding, usersRoutes);
 router.use('/', requireAuth, requireOnboarding, settingsRoutes);
 router.use('/', requireAuth, requireOnboarding, systemRoutes);
-router.use('/', requireAuth, requireOnboarding, updateRoutes);
 router.use('/', requireAuth, requireOnboarding, migrationRoutes);
 router.use('/', requireAuth, requireOnboarding, accessLogsRoutes);
 

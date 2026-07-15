@@ -2,7 +2,8 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const updateRoutes = fs.readFileSync(path.join(__dirname, '..', 'src/routes/panel/update.js'), 'utf8');
+const panelIndex = fs.readFileSync(path.join(__dirname, '..', 'src/routes/panel/index.js'), 'utf8');
+const settingsRoutes = fs.readFileSync(path.join(__dirname, '..', 'src/routes/panel/settings.js'), 'utf8');
 const appJs = fs.readFileSync(path.join(__dirname, '..', 'public/js/app.js'), 'utf8');
 const layout = fs.readFileSync(path.join(__dirname, '..', 'views/layout.ejs'), 'utf8');
 const maintenance = fs.readFileSync(path.join(__dirname, '..', 'views/partials/settings/maintenance.ejs'), 'utf8');
@@ -25,14 +26,17 @@ assert(maintenance.includes('Math.max(pa.length, pb.length, 4)'),
 assert(maintenance.includes('id="updateApplyBtn"') && maintenance.includes('type="button"'),
     'update controls must not accidentally submit a surrounding settings form');
 
-assert(
-    updateRoutes.includes('const updateStatusLimiter = rateLimit') && updateRoutes.includes('max: 600'),
-    'status polling must have a high dedicated rate limit'
-);
-assert(
-    updateRoutes.includes("router.get('/update/status', updateStatusLimiter"),
-    'status route must use updateStatusLimiter, not the low mutation limiter'
-);
+assert(!panelIndex.includes("require('./update')") && !panelIndex.includes('updateRoutes'),
+    'obsolete legacy update routes must not be mounted');
+assert(settingsRoutes.includes("router.get('/settings/update-status'")
+    && settingsRoutes.includes("router.post('/settings/check-updates', checkUpdatesLimiter")
+    && settingsRoutes.includes("router.post('/settings/apply-update', applyUpdateLimiter"),
+    'Maintenance must use the current settings update endpoints and rate limits');
+assert(settingsRoutes.includes('Admin.verifyPassword(req.session.adminUsername, currentPassword)')
+    && settingsRoutes.includes('admin.twoFactor?.enabled')
+    && settingsRoutes.includes('updateService.isKnownRelease(version)')
+    && settingsRoutes.includes('updateService.startUpdateFlow(version, { backup: wantBackup })'),
+    'update apply must re-authenticate, enforce TOTP/release whitelist, and start the guarded flow');
 assert(
     appJs.includes('transientFailures') && appJs.includes('i18n.reconnecting'),
     'update modal polling must survive transient backend/rate-limit failures'
