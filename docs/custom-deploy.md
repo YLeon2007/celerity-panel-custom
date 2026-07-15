@@ -58,7 +58,9 @@ Then it stops and asks you to re-run with:
 FORCE=1
 ```
 
-This prevents accidental overwrites.
+This prevents accidental overwrites. `FORCE=1` is for intentional repair or
+reinstallation, not the normal update path. Routine updates should use
+**Settings → Maintenance → Panel update** or `docs/safe-update.md`.
 
 ## Generated secrets
 

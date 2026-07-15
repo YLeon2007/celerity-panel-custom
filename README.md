@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Deploy](https://img.shields.io/badge/deploy-source--based-2563EB)](docs/custom-deploy.md)
 [![Self Update](https://img.shields.io/badge/panel-self--update-16A34A)](docs/safe-update.md)
-[![Latest release](https://img.shields.io/github/v/release/YLeon2007/celerity-panel-custom?display_name=tag&sort=semver)](https://github.com/YLeon2007/celerity-panel-custom/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/YLeon2007/celerity-panel-custom?display_name=tag)](https://github.com/YLeon2007/celerity-panel-custom/releases/latest)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](package.json)
 [![Hysteria](https://img.shields.io/badge/Hysteria-2.x-9B59B6)](https://v2.hysteria.network/)
 [![Xray](https://img.shields.io/badge/Xray-VLESS-00ADD8)](https://xtls.github.io/)
@@ -93,7 +93,9 @@ If `/opt/hysteria-panel` already exists, the installer creates a backup under:
 /opt/hysteria-panel-install-backups/
 ```
 
-Then it stops. Re-run with `FORCE=1` only when you intentionally want to update/replace the existing checkout.
+Then it stops. Re-run with `FORCE=1` only for an intentional repair/reinstall. For
+routine production updates use **Settings → Maintenance → Panel update** or the
+[Safe Production Updates](docs/safe-update.md) procedure.
 
 ### Detailed deploy docs
 
