@@ -42,6 +42,9 @@ by an isolated `updater` sidecar container.
 
 ### One-time setup
 
+The current `scripts/install.sh` generates a strong `UPDATER_SECRET` automatically.
+For an older manual deployment that does not have it yet:
+
 1. Generate a strong secret and add it to `.env` (min. 32 chars):
    ```bash
    echo "UPDATER_SECRET=$(openssl rand -hex 32)" >> .env
