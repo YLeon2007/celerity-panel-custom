@@ -64,7 +64,7 @@ It will:
 - clone this repository into `/opt/hysteria-panel`;
 - generate `.env` with `ENCRYPTION_KEY`, `SESSION_SECRET`, `MONGO_PASSWORD`, and the HMAC `UPDATER_SECRET` if not provided;
 - preserve every existing non-empty `.env` value during an intentional `FORCE=1` repair/update;
-- prepare persistent `logs/`, `backups/`, `greenlock.d/`, and Access Logs `data/` directories with restricted permissions;
+- prepare `.env` with mode `0600` and persistent `logs/`, `backups/`, `greenlock.d/`, and Access Logs `data/` directories with restrictive permissions (`data/` and `backups/`: `0700`);
 - build and start the backend plus the isolated updater sidecar;
 - wait for MongoDB, Redis, backend and HTTPS health, then verify updater HMAC and Docker-socket isolation;
 - let Caddy obtain a Let's Encrypt certificate for `PANEL_DOMAIN`.

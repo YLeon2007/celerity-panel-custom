@@ -61,7 +61,7 @@ Installer делает следующее:
 - клонирует этот репозиторий в `/opt/hysteria-panel`;
 - генерирует `.env` с `ENCRYPTION_KEY`, `SESSION_SECRET`, `MONGO_PASSWORD` и HMAC-секретом `UPDATER_SECRET`, если они не заданы заранее;
 - при осознанном `FORCE=1` сохраняет все существующие непустые значения `.env`;
-- создаёт persistent-каталоги `logs/`, `backups/`, `greenlock.d/` и `data/` для Access Logs с ограниченными правами;
+- сохраняет `.env` с mode `0600` и создаёт persistent-каталоги `logs/`, `backups/`, `greenlock.d/` и `data/` для Access Logs с ограниченными правами (`data/` и `backups/`: `0700`);
 - собирает и запускает backend вместе с изолированным updater-sidecar;
 - ждёт готовности MongoDB, Redis, backend и HTTPS, затем проверяет HMAC updater и изоляцию Docker socket;
 - Caddy получает Let's Encrypt сертификат для `PANEL_DOMAIN`.
