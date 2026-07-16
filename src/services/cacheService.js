@@ -127,7 +127,7 @@ class CacheService {
             const key = `${PREFIX.SUB}${token}:${format}`;
             const data = await this.redis.get(key);
             if (data) {
-                logger.debug(`[Cache] HIT subscription: ${token}:${format}`);
+                logger.debug(`[Cache] HIT subscription: token=${String(token).substring(0,8)}..., format=${format}`);
                 return JSON.parse(data);
             }
             return null;
@@ -146,7 +146,7 @@ class CacheService {
         try {
             const key = `${PREFIX.SUB}${token}:${format}`;
             await this.redis.setex(key, this.ttl.SUBSCRIPTION, JSON.stringify(data));
-            logger.debug(`[Cache] SET subscription: ${token}:${format}`);
+            logger.debug(`[Cache] SET subscription: token=${String(token).substring(0,8)}..., format=${format}`);
         } catch (err) {
             logger.error(`[Cache] setSubscription error: ${err.message}`);
         }
@@ -165,7 +165,7 @@ class CacheService {
             
             if (keysToDelete.length > 0) {
                 await this.redis.unlink(...keysToDelete);
-                logger.debug(`[Cache] INVALIDATE subscription: ${token} (${keysToDelete.length} keys)`);
+                logger.debug(`[Cache] INVALIDATE subscription: token=${String(token).substring(0,8)}... (${keysToDelete.length} keys)`);
             }
         } catch (err) {
             logger.error(`[Cache] invalidateSubscription error: ${err.message}`);

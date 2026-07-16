@@ -11,8 +11,10 @@ const YAML = require('yaml');
 const packageJson = require('../package.json');
 const configGenerator = require('../src/services/configGenerator');
 const helpers = require('../src/routes/panel/helpers');
-const subscription = require('../src/routes/subscription')._test;
+const subscriptionRouter = require('../src/routes/subscription');
+const subscription = subscriptionRouter._test;
 const syncService = require('../src/services/syncService');
+const cacheService = require('../src/services/cacheService');
 const {
     buildXrayDotUpdates,
     validateXrayCreateNode,
@@ -26,6 +28,51 @@ const { safeUser } = require('../src/mcp/tools/users')._test;
 const { NODE_SAFE_SELECT } = require('../src/mcp/tools/nodes')._test;
 
 assert(NODE_SAFE_SELECT.includes('-xray.extraInbounds.realityPrivateKey'));
+assert.strictEqual(typeof subscription.SUBSCRIPTION_NODE_SAFE_SELECT, 'string',
+    'subscription queries must share a strict allowlisted node projection');
+const safeSubscriptionProjection = HyNode.find({}).select(subscription.SUBSCRIPTION_NODE_SAFE_SELECT);
+assert.strictEqual(safeSubscriptionProjection.selectedInclusively(), true);
+for (const path of [
+    'name', 'type', 'groups', 'cascadeRole', 'obfs.type',
+    'xray.realityPublicKey', 'xray.extraInbounds.realityPublicKey',
+    'xray.hysteria.enabled', 'virtual.observatory.destination',
+]) assert(subscription.SUBSCRIPTION_NODE_SAFE_SELECT.split(/\s+/).includes(path), `subscription projection missing ${path}`);
+for (const path of [
+    'obfs.password', 'ssh.password', 'ssh.privateKey', 'statsSecret', 'outbounds.password',
+    'acme.dnsConfig', 'settings', 'customConfig', 'initScript', 'xray.realityPrivateKey',
+    'xray.extraInbounds.realityPrivateKey', 'xray.manualKey', 'xray.agentToken',
+    'xray.hysteria.obfsPassword', 'xray.accessLogs.ingestTokenEncrypted',
+]) assert(!subscription.SUBSCRIPTION_NODE_SAFE_SELECT.split(/\s+/).includes(path), `subscription projection must exclude ${path}`);
+assert.strictEqual(subscription.SUBSCRIPTION_SECRET_SELECT, '_id obfs.password +xray.hysteria.obfsPassword');
+const subscriptionSecretProjection = HyNode.find({}).select(subscription.SUBSCRIPTION_SECRET_SELECT);
+assert.strictEqual(subscriptionSecretProjection.selectedInclusively(), true);
+assert.deepStrictEqual(subscriptionSecretProjection._fieldsForExec(), {
+    _id: 1,
+    'obfs.password': 1,
+    '+xray.hysteria.obfsPassword': 1,
+});
+assert.strictEqual(typeof subscription.hydrateSubscriptionSecrets, 'function',
+    'subscription secret loading must happen request-locally after node filtering');
+const subscriptionSource = fs.readFileSync('src/routes/subscription.js', 'utf8');
+const marzbanCompatSource = fs.readFileSync('src/routes/marzbanCompat.js', 'utf8');
+assert(marzbanCompatSource.includes("populate('nodes', subscriptionModule.SUBSCRIPTION_NODE_SAFE_SELECT)"),
+    'Marzban compatibility route must use the shared subscription node allowlist');
+assert(!marzbanCompatSource.includes("portConfigs obfs flag xray cascadeRole groups virtual"),
+    'Marzban compatibility route must not restore the old broad node projection');
+assert.strictEqual(subscriptionRouter.SUBSCRIPTION_NODE_SAFE_SELECT, subscription.SUBSCRIPTION_NODE_SAFE_SELECT);
+assert.strictEqual(typeof subscription.normalizeLinkedSubscriptionNodes, 'function');
+assert(!subscriptionSource.includes('xray +xray.hysteria.obfsPassword'),
+    'subscription queries must not combine parent xray with a secret descendant');
+assert(!subscriptionSource.includes('Cache HIT: ${cacheToken}:'),
+    'subscription cache logs must never print the full token');
+assert(!subscriptionSource.includes('User not found for token: ${token}'),
+    'subscription 404 logs must never print the full token');
+const cacheSource = fs.readFileSync('src/services/cacheService.js', 'utf8');
+for (const unsafe of [
+    'HIT subscription: ${token}:${format}',
+    'SET subscription: ${token}:${format}',
+    'INVALIDATE subscription: ${token}',
+]) assert(!cacheSource.includes(unsafe), `cache logs must not contain ${unsafe}`);
 assert.strictEqual(typeof XRAY_VALIDATION_SELECT, 'string', 'update validation must expose one shared projection');
 assert(XRAY_VALIDATION_SELECT.includes('+xray.manualKey'));
 assert(XRAY_VALIDATION_SELECT.includes('+xray.hysteria.obfsPassword'));
@@ -392,6 +439,132 @@ async function runRestartContractTests() {
     assert.deepStrictEqual(validatedXrayUpdateOptions(), {
         new: true, runValidators: true, context: 'query',
     });
+    const legacyCachedNode = {
+        _id: '64b000000000000000000098',
+        name: 'legacy-cache', type: 'xray', active: true, status: 'online',
+        groups: ['64b000000000000000000010'],
+        statsSecret: 'stats', futureTopSecret: 'future',
+        obfs: { type: 'salamander', password: 'legacy-obfs-secret', futureSecret: 'future' },
+        portConfigs: [{ name: 'main', port: 443, enabled: true, futureSecret: 'future' }],
+        outbounds: [{ type: 'socks5', username: 'user', password: 'outbound-pass' }],
+        acme: { dnsConfig: { apiToken: 'dns-token' } },
+        settings: { password: 'generic-secret' }, customConfig: 'secret-config', initScript: 'secret-init',
+        ssh: { username: 'root', password: 'ssh-pass', privateKey: 'ssh-key' },
+        xray: {
+            realityPrivateKey: 'reality-private', manualKey: 'manual-key', agentToken: 'agent-token',
+            futureSecret: 'future-xray',
+            realityPublicKey: 'public-client-hint',
+            extraInbounds: [{ realityPrivateKey: 'extra-private', realityPublicKey: 'extra-public', futureSecret: 'future-extra' }],
+            hysteria: { enabled: true, obfs: 'salamander', obfsPassword: 'stale-cache-secret' },
+            accessLogs: { ingestTokenEncrypted: 'ingest-encrypted', ingestTokenHash: 'ingest-hash' },
+        },
+    };
+    const oldGetActiveNodes = cacheService.getActiveNodes;
+    const oldSetActiveNodes = cacheService.setActiveNodes;
+    let healedCache;
+    try {
+        cacheService.getActiveNodes = async () => [legacyCachedNode];
+        cacheService.setActiveNodes = async nodes => { healedCache = nodes; };
+        const safeCached = await subscription.getActiveNodesWithCache();
+        assert.strictEqual(legacyCachedNode.xray.hysteria.obfsPassword, 'stale-cache-secret',
+            'legacy cache input must not be mutated in place');
+        assert.strictEqual(safeCached[0].xray.hysteria.obfsPassword, undefined);
+        assert.strictEqual(safeCached[0].obfs.password, undefined);
+        assert.strictEqual(safeCached[0].obfs.type, 'salamander');
+        assert.strictEqual(safeCached[0].xray.agentToken, undefined);
+        assert.strictEqual(safeCached[0].xray.realityPublicKey, 'public-client-hint');
+        assert.strictEqual(safeCached[0].xray.extraInbounds[0].realityPublicKey, 'extra-public');
+        for (const key of [
+            'statsSecret', 'futureTopSecret', 'outbounds', 'acme', 'settings',
+            'customConfig', 'initScript', 'ssh',
+        ]) assert.strictEqual(safeCached[0][key], undefined, `cache allowlist leaked ${key}`);
+        assert.strictEqual(safeCached[0].obfs.futureSecret, undefined);
+        assert.strictEqual(safeCached[0].portConfigs[0].futureSecret, undefined);
+        assert.strictEqual(safeCached[0].xray.futureSecret, undefined);
+        assert.strictEqual(safeCached[0].xray.extraInbounds[0].futureSecret, undefined);
+        assert.strictEqual(safeCached[0].xray.accessLogs, undefined);
+        assert.strictEqual(healedCache[0].xray.hysteria.obfsPassword, undefined,
+            'legacy cache entries must be rewritten without secrets');
+    } finally {
+        cacheService.getActiveNodes = oldGetActiveNodes;
+        cacheService.setActiveNodes = oldSetActiveNodes;
+    }
+    const normalizedLinked = subscription.normalizeLinkedSubscriptionNodes([legacyCachedNode]);
+    assert.strictEqual(normalizedLinked.length, 1);
+    assert.strictEqual(normalizedLinked[0].xray.realityPublicKey, 'public-client-hint');
+    assert.strictEqual(normalizedLinked[0].xray.hysteria.enabled, true);
+    assert.strictEqual(normalizedLinked[0].xray.hysteria.obfsPassword, undefined);
+    assert.strictEqual(normalizedLinked[0].statsSecret, undefined);
+    assert.strictEqual(normalizedLinked[0].futureTopSecret, undefined);
+    assert.strictEqual(legacyCachedNode.statsSecret, 'stats',
+        'linked-node normalization must not mutate the populated document');
+    let linkedHydrationIds;
+    const hydratedLinked = await subscription.hydrateSubscriptionSecrets(
+        normalizedLinked,
+        async ids => {
+            linkedHydrationIds = ids.map(String);
+            return [{
+                _id: legacyCachedNode._id,
+                xray: { hysteria: { obfsPassword: 'linked-request-secret' } },
+            }];
+        }
+    );
+    assert.deepStrictEqual(linkedHydrationIds, [legacyCachedNode._id]);
+    assert.strictEqual(hydratedLinked[0].xray.hysteria.obfsPassword, 'linked-request-secret');
+    assert.strictEqual(normalizedLinked[0].xray.hysteria.obfsPassword, undefined);
+    const cachedSubscriptionNode = {
+        _id: '64b000000000000000000099',
+        name: 'cached-hy2',
+        type: 'xray',
+        xray: {
+            hysteria: { enabled: true, obfs: 'salamander', port: 24443 },
+        },
+    };
+    let loadedIds;
+    const hydrated = await subscription.hydrateSubscriptionSecrets(
+        [cachedSubscriptionNode],
+        async ids => {
+            loadedIds = ids.map(String);
+            return [{
+                _id: cachedSubscriptionNode._id,
+                xray: { hysteria: { obfsPassword: 'request-local-secret' } },
+            }];
+        }
+    );
+    assert.deepStrictEqual(loadedIds, [cachedSubscriptionNode._id]);
+    assert.strictEqual(cachedSubscriptionNode.xray.hysteria.obfsPassword, undefined,
+        'Redis/model input must not be mutated with a write-only secret');
+    assert.strictEqual(hydrated[0].xray.hysteria.obfsPassword, 'request-local-secret');
+    assert.notStrictEqual(hydrated[0], cachedSubscriptionNode);
+    await assert.rejects(
+        () => subscription.hydrateSubscriptionSecrets([cachedSubscriptionNode], async () => []),
+        error => error?.code === 'NATIVE_HYSTERIA_SECRET_UNAVAILABLE'
+    );
+    const legacySubscriptionNode = {
+        _id: '64b000000000000000000097',
+        name: 'legacy-hysteria', type: 'hysteria',
+        obfs: { type: 'salamander' },
+    };
+    const hydratedLegacy = await subscription.hydrateSubscriptionSecrets(
+        [legacySubscriptionNode],
+        async () => [{
+            _id: legacySubscriptionNode._id,
+            obfs: { password: 'request-local-legacy-secret' },
+        }]
+    );
+    assert.strictEqual(legacySubscriptionNode.obfs.password, undefined);
+    assert.strictEqual(hydratedLegacy[0].obfs.password, 'request-local-legacy-secret');
+    const emptyLegacy = await subscription.hydrateSubscriptionSecrets(
+        [legacySubscriptionNode],
+        async () => [{ _id: legacySubscriptionNode._id, obfs: { password: '' } }]
+    );
+    assert.strictEqual(emptyLegacy[0].obfs.password, '');
+    assert(!subscription.generateURIList({ userId: 'legacy', password: 'auth' }, emptyLegacy).includes('obfs='),
+        'legacy empty-password state must publish without obfs like the server config');
+    await assert.rejects(
+        () => subscription.hydrateSubscriptionSecrets([legacySubscriptionNode], async () => []),
+        error => error?.code === 'HYSTERIA_SECRET_UNAVAILABLE'
+    );
     assert.strictEqual(typeof validateXrayCreateNode, 'function',
         'REST/MCP create paths must share a pre-save cross-field validator');
     const createNode = hyPort => new HyNode({

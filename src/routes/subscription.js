@@ -82,9 +82,40 @@ function isBrowser(req) {
     return accept.includes('text/html') && /mozilla|chrome|safari|edge|opera/.test(ua);
 }
 
+const SUBSCRIPTION_SECRET_SELECT = '_id obfs.password +xray.hysteria.obfsPassword';
+
+const SUBSCRIPTION_NODE_SAFE_SELECT = [
+    '_id', 'name', 'type', 'flag', 'ip', 'domain', 'sni', 'port', 'portRange',
+    'hopInterval', 'portConfigs.name', 'portConfigs.port', 'portConfigs.portRange',
+    'portConfigs.enabled', 'obfs.type', 'active', 'status', 'onlineUsers',
+    'maxOnlineUsers', 'rankingCoefficient', 'groups', 'cascadeRole',
+    'xray.transport', 'xray.security', 'xray.flow', 'xray.fingerprint',
+    'xray.fingerprintPool', 'xray.alpn', 'xray.realityPublicKey',
+    'xray.realitySni', 'xray.realityShortIds', 'xray.realitySpiderX',
+    'xray.wsPath', 'xray.wsHost', 'xray.grpcServiceName', 'xray.xhttpPath',
+    'xray.xhttpHost', 'xray.xhttpMode', 'xray.tlsSource',
+    'xray.hysteria.enabled', 'xray.hysteria.port', 'xray.hysteria.inboundTag',
+    'xray.hysteria.obfs', 'xray.hysteria.udpIdleTimeout',
+    'xray.extraInbounds.label', 'xray.extraInbounds.uniqueName',
+    'xray.extraInbounds.port', 'xray.extraInbounds.transport',
+    'xray.extraInbounds.security', 'xray.extraInbounds.flow',
+    'xray.extraInbounds.fingerprint', 'xray.extraInbounds.fingerprintPool',
+    'xray.extraInbounds.alpn', 'xray.extraInbounds.realityPublicKey',
+    'xray.extraInbounds.realitySni', 'xray.extraInbounds.realityShortIds',
+    'xray.extraInbounds.realitySpiderX', 'xray.extraInbounds.wsPath',
+    'xray.extraInbounds.wsHost', 'xray.extraInbounds.grpcServiceName',
+    'xray.extraInbounds.xhttpPath', 'xray.extraInbounds.xhttpHost',
+    'xray.extraInbounds.xhttpMode',
+    'virtual.selectMode', 'virtual.sources', 'virtual.sourceGroup',
+    'virtual.strategy', 'virtual.fallbackToFirst',
+    'virtual.observatory.destination', 'virtual.observatory.connectivity',
+    'virtual.observatory.interval', 'virtual.observatory.timeout',
+    'virtual.observatory.sampling',
+].join(' ');
+
 async function getUserByToken(token) {
     const user = await HyUser.findOne({ subscriptionToken: token })
-        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray +xray.hysteria.obfsPassword cascadeRole groups virtual')
+        .populate('nodes', SUBSCRIPTION_NODE_SAFE_SELECT)
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
     return user;
@@ -111,29 +142,164 @@ function encodeTitle(text) {
     return `base64:${Buffer.from(text).toString('base64')}`;
 }
 
+function buildSubscriptionCacheNode(node) {
+    const plain = typeof node?.toObject === 'function'
+        ? node.toObject({ transform: false, depopulate: false })
+        : node || {};
+    const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+    const add = (target, key, value) => {
+        if (value !== undefined) target[key] = clone(value);
+    };
+
+    const safe = {};
+    for (const key of [
+        '_id', 'name', 'type', 'flag', 'ip', 'domain', 'sni', 'port', 'portRange',
+        'hopInterval', 'active', 'status', 'onlineUsers',
+        'maxOnlineUsers', 'rankingCoefficient', 'groups', 'cascadeRole',
+    ]) add(safe, key, plain[key]);
+    safe.portConfigs = (plain.portConfigs || []).map(config => {
+        const safeConfig = {};
+        for (const key of ['name', 'port', 'portRange', 'enabled']) add(safeConfig, key, config[key]);
+        return safeConfig;
+    });
+    if (plain.obfs) safe.obfs = { type: plain.obfs.type || '' };
+
+    if (plain.xray) {
+        const xray = {};
+        for (const key of [
+            'transport', 'security', 'flow', 'fingerprint', 'fingerprintPool', 'alpn',
+            'realityPublicKey', 'realitySni', 'realityShortIds', 'realitySpiderX',
+            'wsPath', 'wsHost', 'grpcServiceName', 'xhttpPath', 'xhttpHost',
+            'xhttpMode', 'tlsSource',
+        ]) add(xray, key, plain.xray[key]);
+        if (plain.xray.hysteria) {
+            const hysteria = {};
+            for (const key of ['enabled', 'port', 'inboundTag', 'obfs', 'udpIdleTimeout']) {
+                add(hysteria, key, plain.xray.hysteria[key]);
+            }
+            xray.hysteria = hysteria;
+        }
+        xray.extraInbounds = (plain.xray.extraInbounds || []).map(inbound => {
+            const safeInbound = {};
+            for (const key of [
+                'label', 'uniqueName', 'port', 'transport', 'security', 'flow',
+                'fingerprint', 'fingerprintPool', 'alpn', 'realityPublicKey',
+                'realitySni', 'realityShortIds', 'realitySpiderX', 'wsPath', 'wsHost',
+                'grpcServiceName', 'xhttpPath', 'xhttpHost', 'xhttpMode',
+            ]) add(safeInbound, key, inbound[key]);
+            return safeInbound;
+        });
+        safe.xray = xray;
+    }
+
+    if (plain.virtual) {
+        const virtual = {};
+        for (const key of ['selectMode', 'sources', 'sourceGroup', 'strategy', 'fallbackToFirst']) {
+            add(virtual, key, plain.virtual[key]);
+        }
+        if (plain.virtual.observatory) {
+            const observatory = {};
+            for (const key of ['destination', 'connectivity', 'interval', 'timeout', 'sampling']) {
+                add(observatory, key, plain.virtual.observatory[key]);
+            }
+            virtual.observatory = observatory;
+        }
+        safe.virtual = virtual;
+    }
+    return safe;
+}
+
 /**
  * Get active nodes (with caching)
  */
 async function getActiveNodesWithCache() {
     const cached = await cache.getActiveNodes();
-    if (cached) return cached;
+    if (cached) {
+        const nodes = cached.map(buildSubscriptionCacheNode);
+        // Self-heal legacy or schema-expanded entries to the strict allowlist.
+        if (JSON.stringify(nodes) !== JSON.stringify(cached)) await cache.setActiveNodes(nodes);
+        return nodes;
+    }
 
-    // Include type, xray, obfs, and cascadeRole fields needed for URI generation and filtering
-    const nodes = await HyNode.find({ active: true })
-        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray +xray.hysteria.obfsPassword cascadeRole virtual')
+    // Defense in depth: query only subscription fields, then build a strict
+    // allowlisted object before writing the shared active-node cache.
+    const selected = await HyNode.find({ active: true })
+        .select(SUBSCRIPTION_NODE_SAFE_SELECT)
         .lean();
+    const nodes = selected.map(buildSubscriptionCacheNode);
     await cache.setActiveNodes(nodes);
     return nodes;
 }
 
-async function getActiveNodes(user) {
+function cloneSubscriptionNode(node) {
+    const plain = typeof node?.toObject === 'function'
+        ? node.toObject({ transform: false, depopulate: false })
+        : JSON.parse(JSON.stringify(node));
+    if (plain?.xray) {
+        plain.xray = { ...plain.xray };
+        if (plain.xray.hysteria) plain.xray.hysteria = { ...plain.xray.hysteria };
+    }
+    return plain;
+}
+
+async function hydrateSubscriptionSecrets(nodes, secretLoader) {
+    const requestNodes = (nodes || []).map(cloneSubscriptionNode);
+    const needsLegacyObfs = node =>
+        node?.type === 'hysteria' && !!node?.obfs?.type;
+    const needsNativeHysteriaObfs = node =>
+        node?.type === 'xray'
+        && node?.xray?.hysteria?.enabled
+        && node.xray.hysteria.obfs === 'salamander';
+    const targets = requestNodes.filter(node => needsLegacyObfs(node) || needsNativeHysteriaObfs(node));
+    if (targets.length === 0) return requestNodes;
+
+    const ids = [...new Set(targets.map(node => String(node._id)))];
+    const load = secretLoader || (wantedIds => HyNode.find({ _id: { $in: wantedIds } })
+        .select(SUBSCRIPTION_SECRET_SELECT)
+        .lean());
+    const byId = new Map((await load(ids) || []).map(node => [String(node._id), node]));
+
+    for (const node of targets) {
+        const selected = byId.get(String(node._id));
+        if (needsLegacyObfs(node)) {
+            if (!selected) {
+                const error = new Error(`Legacy Hysteria node unavailable while loading subscription secret: ${node.name || node._id}`);
+                error.code = 'HYSTERIA_SECRET_UNAVAILABLE';
+                throw error;
+            }
+            // Legacy server config enables obfs only when both type and password
+            // are present. Preserve that backward-compatible empty-password state.
+            node.obfs = { ...node.obfs, password: selected.obfs?.password || '' };
+        }
+        if (needsNativeHysteriaObfs(node)) {
+            const secret = selected?.xray?.hysteria?.obfsPassword;
+            if (!secret) {
+                const error = new Error(`Native Hysteria secret unavailable for node ${node.name || node._id}`);
+                error.code = 'NATIVE_HYSTERIA_SECRET_UNAVAILABLE';
+                throw error;
+            }
+            node.xray.hysteria.obfsPassword = secret;
+        }
+    }
+    return requestNodes;
+}
+
+function normalizeLinkedSubscriptionNodes(nodes) {
+    return (nodes || [])
+        .filter(Boolean)
+        .map(buildSubscriptionCacheNode);
+}
+
+async function getActiveNodes(user, { hydrateSecrets = true } = {}) {
     let nodes = [];
     let settings;
     
     // Check if user has linked nodes
     if (user.nodes && user.nodes.length > 0) {
-        // User has linked nodes - only need settings
-        nodes = user.nodes.filter(n => n && n.active);
+        // Normalize linked documents through the same strict allowlist as the
+        // shared active-node cache. This protects every subscription entrypoint,
+        // even if a future caller accidentally populates broader node fields.
+        nodes = normalizeLinkedSubscriptionNodes(user.nodes).filter(n => n.active);
         settings = await getSettings();
         logger.debug(`[Sub] User ${user.userId}: ${nodes.length} linked active nodes`);
     } else {
@@ -220,6 +386,12 @@ async function getActiveNodes(user) {
         });
     }
 
+    if (hydrateSecrets) {
+        nodes = await hydrateSubscriptionSecrets(nodes);
+    } else {
+        // Never return shared cache/model objects directly to downstream code.
+        nodes = nodes.map(cloneSubscriptionNode);
+    }
     resolveVirtualSources(nodes, user);
 
     return nodes;
@@ -2924,7 +3096,7 @@ async function serveSubscription(req, res, ctx) {
 
     const cached = await cache.getSubscription(cacheToken, cacheFormat);
     if (cached) {
-        logger.debug(`[Sub] Cache HIT: ${cacheToken}:${cacheFormat}`);
+        logger.debug(`[Sub] Cache HIT: token=${String(cacheToken).substring(0,8)}..., format=${cacheFormat}`);
         return sendCachedSubscription(res, cached, format, userAgent, settings, hwidHeaders);
     }
 
@@ -2949,7 +3121,7 @@ async function serveSubscription(req, res, ctx) {
  * Exposed for the same reason as serveSubscription.
  */
 async function serveInfo(req, res, user) {
-    const nodes = await getActiveNodes(user);
+    const nodes = await getActiveNodes(user, { hydrateSecrets: false });
     res.json({
         enabled: user.enabled,
         groups: user.groups,
@@ -2971,7 +3143,7 @@ router.get('/files/:token', async (req, res) => {
         const user = await getUserByToken(token);
 
         if (!user) {
-            logger.warn(`[Sub] User not found for token: ${token}`);
+            logger.warn(`[Sub] User not found for token prefix: ${String(token).substring(0,8)}...`);
             return res.status(404).type('text/plain').send('# User not found');
         }
 
@@ -3186,7 +3358,14 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+module.exports.SUBSCRIPTION_NODE_SAFE_SELECT = SUBSCRIPTION_NODE_SAFE_SELECT;
 module.exports._test = {
+    SUBSCRIPTION_SECRET_SELECT,
+    SUBSCRIPTION_NODE_SAFE_SELECT,
+    buildSubscriptionCacheNode,
+    normalizeLinkedSubscriptionNodes,
+    hydrateSubscriptionSecrets,
+    getActiveNodesWithCache,
     generateURIList,
     generateClashYAML,
     generateSingboxJSON,
