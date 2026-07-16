@@ -6,6 +6,7 @@ process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '0123456789abcdef0123
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-session-secret-0123456789abcdef';
 
 const assert = require('assert');
+const fs = require('fs');
 const YAML = require('yaml');
 const packageJson = require('../package.json');
 const configGenerator = require('../src/services/configGenerator');
@@ -17,6 +18,7 @@ const {
     validateXrayCreateNode,
     validateResultingXrayUpdate,
     validatedXrayUpdateOptions,
+    XRAY_VALIDATION_SELECT,
 } = require('../src/utils/xrayUpdates');
 const HyNode = require('../src/models/hyNodeModel');
 const nodeSetup = require('../src/services/nodeSetup');
@@ -24,6 +26,24 @@ const { safeUser } = require('../src/mcp/tools/users')._test;
 const { NODE_SAFE_SELECT } = require('../src/mcp/tools/nodes')._test;
 
 assert(NODE_SAFE_SELECT.includes('-xray.extraInbounds.realityPrivateKey'));
+assert.strictEqual(typeof XRAY_VALIDATION_SELECT, 'string', 'update validation must expose one shared projection');
+assert(XRAY_VALIDATION_SELECT.includes('+xray.manualKey'));
+assert(XRAY_VALIDATION_SELECT.includes('+xray.hysteria.obfsPassword'));
+assert(!XRAY_VALIDATION_SELECT.split(/\s+/).includes('xray'),
+    'MongoDB forbids selecting parent xray together with included secret descendants');
+const projectionProbe = HyNode.findById('64b000000000000000000001').select(XRAY_VALIDATION_SELECT);
+assert.strictEqual(projectionProbe.selectedInclusively(), false,
+    '+path overrides must preserve the default full-document projection');
+assert.deepStrictEqual(projectionProbe._fieldsForExec(), {
+    '+xray.manualKey': 1,
+    '+xray.hysteria.obfsPassword': 1,
+});
+for (const sourcePath of ['src/routes/nodes.js', 'src/mcp/tools/nodes.js']) {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    assert(source.includes('.select(XRAY_VALIDATION_SELECT)'), `${sourcePath} must use the shared projection`);
+    assert(!source.includes("xray +xray.manualKey +xray.hysteria.obfsPassword"),
+        `${sourcePath} must not reintroduce the MongoDB parent/child projection collision`);
+}
 
 assert.strictEqual(packageJson.version, '1.3.4.0dev');
 assert.strictEqual(nodeSetup.parseInstalledAgentVersion('cc-agent 1.5.0'), '1.5.0');

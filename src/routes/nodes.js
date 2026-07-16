@@ -16,6 +16,7 @@ const {
     validateXrayCreateNode,
     validateResultingXrayUpdate,
     validatedXrayUpdateOptions,
+    XRAY_VALIDATION_SELECT,
 } = require('../utils/xrayUpdates');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
@@ -400,7 +401,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
         const existing = await HyNode.findById(req.params.id)
-            .select('type ip port domain virtual xray +xray.manualKey +xray.hysteria.obfsPassword');
+            .select(XRAY_VALIDATION_SELECT);
         if (!existing) {
             return res.status(404).json({ error: 'Node not found' });
         }

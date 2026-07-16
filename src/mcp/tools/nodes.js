@@ -15,6 +15,7 @@ const {
     validateXrayCreateNode,
     validateResultingXrayUpdate,
     validatedXrayUpdateOptions,
+    XRAY_VALIDATION_SELECT,
 } = require('../../utils/xrayUpdates');
 
 async function invalidateNodesCache() {
@@ -460,7 +461,7 @@ async function manageNode(args, emit) {
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
             const existing = await HyNode.findById(id)
-                .select('type ip port domain virtual xray +xray.manualKey +xray.hysteria.obfsPassword');
+                .select(XRAY_VALIDATION_SELECT);
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
             const nextType = updates.type || existing.type;

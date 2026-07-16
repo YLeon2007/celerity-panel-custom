@@ -1,5 +1,10 @@
 'use strict';
 
+// Selecting the parent `xray` together with included select:false descendants
+// produces a MongoDB "Path collision". A descendant-only inclusion override
+// keeps Mongoose's default full-document projection and adds both secrets.
+const XRAY_VALIDATION_SELECT = '+xray.manualKey +xray.hysteria.obfsPassword';
+
 /**
  * Flatten an Xray partial update into MongoDB dot-paths. Native Hysteria is
  * flattened one level deeper so an update such as {enabled:true,port:24443}
@@ -93,6 +98,7 @@ function validatedXrayUpdateOptions() {
 }
 
 module.exports = {
+    XRAY_VALIDATION_SELECT,
     buildXrayDotUpdates,
     validateXrayCreateNode,
     validateResultingXrayUpdate,
