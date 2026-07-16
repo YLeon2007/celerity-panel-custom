@@ -159,6 +159,7 @@ For normal production servers, prefer the one-command installer and the safe upd
 
 ## ✨ Features
 
+- 🌐 **Native Hysteria 2 in Xray (opt-in)** — run VLESS and Hysteria 2 in one Xray process, with protocol-aware CC Agent sync, TLS/Salamander support, and URI/Clash/sing-box/HAPP subscriptions
 - 🔄 **Panel self-update** — isolated updater sidecar, Maintenance-page release check/changelog, authenticated backup/install flow, live progress log, and rollback artifacts
 - 🧾 **Opt-in Xray Access Logs** — per-node enablement, durable local spool, ClickHouse delivery, and fail-safe disabled-by-default startup
 - 🛠️ **Source-based Caddy deploy** — production compose builds the backend from this repository and proxies HTTPS through Caddy to the stable backend container name

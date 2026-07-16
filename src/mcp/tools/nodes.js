@@ -10,6 +10,12 @@ const HyUser = require('../../models/hyUserModel');
 const cache = require('../../services/cacheService');
 const cryptoService = require('../../services/cryptoService');
 const logger = require('../../utils/logger');
+const {
+    buildXrayDotUpdates,
+    validateXrayCreateNode,
+    validateResultingXrayUpdate,
+    validatedXrayUpdateOptions,
+} = require('../../utils/xrayUpdates');
 
 async function invalidateNodesCache() {
     await cache.invalidateNodes();
@@ -25,7 +31,7 @@ function getSyncService() {
 const sshSessions = new Map();
 
 // Fields excluded from all node queries returned to MCP clients
-const NODE_SAFE_SELECT = '-ssh.password -ssh.privateKey -xray.realityPrivateKey -statsSecret';
+const NODE_SAFE_SELECT = '-ssh.password -ssh.privateKey -xray.realityPrivateKey -xray.extraInbounds.realityPrivateKey -xray.agentToken -xray.hysteria.obfsPassword -xray.accessLogs.ingestTokenEncrypted -xray.accessLogs.ingestTokenHash -statsSecret';
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
 
@@ -73,6 +79,23 @@ const xrayExtraInboundZ = z.object({
     inboundTag: z.string(),
 });
 
+const xrayHysteriaZ = z.object({
+    enabled: z.boolean().optional(),
+    port: z.number().int().min(1).max(65535).optional(),
+    inboundTag: z.string().optional(),
+    obfs: z.enum(['', 'salamander']).optional(),
+    obfsPassword: z.string().optional(),
+    udpIdleTimeout: z.number().int().min(10).max(600).optional(),
+    masquerade: z.object({
+        type: z.enum(['string', 'proxy']).optional(),
+        content: z.string().optional(),
+        statusCode: z.number().int().min(100).max(599).optional(),
+        url: z.string().optional(),
+        rewriteHost: z.boolean().optional(),
+        insecure: z.boolean().optional(),
+    }).optional(),
+});
+
 const xrayConfigZ = z.object({
     ...xrayInboundCommonZ,
     tlsSource: z.enum(['panel', 'acme', 'manual', 'self-signed']).optional(),
@@ -84,6 +107,7 @@ const xrayConfigZ = z.object({
     agentPort: z.number().optional(),
     agentToken: z.string().optional(),
     agentTls: z.boolean().optional(),
+    hysteria: xrayHysteriaZ.optional().describe('Optional native Hysteria 2 inbound hosted by the same Xray process'),
     extraInbounds: z.array(xrayExtraInboundZ).optional(),
 });
 
@@ -400,6 +424,8 @@ async function manageNode(args, emit) {
             if (typeof data.comment === 'string') nodeData.comment = data.comment.trim().slice(0, 500);
 
             const node = new HyNode(nodeData);
+            const xrayError = validateXrayCreateNode(node);
+            if (xrayError) return { error: xrayError, code: 400 };
             await node.save();
             await invalidateNodesCache();
             logger.info(`[MCP] Created ${nodeType} node ${data.name} (${nodeType === 'virtual' ? 'virtual' : data.ip})`);
@@ -429,17 +455,12 @@ async function manageNode(args, emit) {
                 }
             }
 
-            // Xray: partial update via dot-paths so unsent secrets (realityPrivateKey,
-            // realityPublicKey, manualKey) are preserved instead of wiped by a full $set.
-            if (data.xray && typeof data.xray === 'object') {
-                for (const [k, v] of Object.entries(data.xray)) {
-                    updates[`xray.${k}`] = v;
-                }
-            }
+            Object.assign(updates, buildXrayDotUpdates(data.xray));
 
             // findByIdAndUpdate skips pre('validate') hooks, so re-implement
             // type-aware invariants here. Mirror the behaviour of routes/nodes.js PUT.
-            const existing = await HyNode.findById(id).select('type ip virtual').lean();
+            const existing = await HyNode.findById(id)
+                .select('type ip port domain virtual xray +xray.manualKey +xray.hysteria.obfsPassword');
             if (!existing) return { error: `Node '${id}' not found`, code: 404 };
 
             const nextType = updates.type || existing.type;
@@ -459,8 +480,14 @@ async function manageNode(args, emit) {
                 return { error: `Node type ${nextType} requires ip`, code: 400 };
             }
 
-            const node = await HyNode.findByIdAndUpdate(id, { $set: updates }, { new: true })
-                .populate('groups', 'name color');
+            const xrayError = validateResultingXrayUpdate(existing, updates);
+            if (xrayError) return { error: xrayError, code: 400 };
+
+            const node = await HyNode.findByIdAndUpdate(
+                id,
+                { $set: updates },
+                validatedXrayUpdateOptions()
+            ).populate('groups', 'name color');
             if (!node) return { error: `Node '${id}' not found`, code: 404 };
             await invalidateNodesCache();
 
@@ -770,6 +797,7 @@ module.exports = {
     executeSsh,
     sshSession,
     scanSni,
+    _test: { NODE_SAFE_SELECT },
     schemas: {
         queryNodes: queryNodesSchema,
         manageNode: manageNodeSchema,

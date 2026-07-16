@@ -1,5 +1,10 @@
 'use strict';
 
+process.env.PANEL_DOMAIN = process.env.PANEL_DOMAIN || 'panel.example.com';
+process.env.ACME_EMAIL = process.env.ACME_EMAIL || 'admin@example.com';
+process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef';
+process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-session-secret-0123456789abcdef';
+
 const assert = require('assert');
 const configGenerator = require('../src/services/configGenerator');
 

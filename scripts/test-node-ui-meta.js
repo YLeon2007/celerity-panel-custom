@@ -108,6 +108,21 @@ function meta(node) {
 
 {
     const result = meta({
+        type: 'xray',
+        xray: {
+            transport: 'tcp',
+            security: 'reality',
+            tlsSource: 'panel',
+            hysteria: { enabled: true },
+        },
+    });
+    assert(result.badges.some(badge => badge.kind === 'transport' && badge.label === 'TCP/HY2'));
+    assert(result.badges.some(badge => badge.kind === 'security' && badge.label === 'REALITY/TLS'));
+    assert(result.badges.some(badge => badge.kind === 'certificate' && badge.label === 'Panel'));
+}
+
+{
+    const result = meta({
         type: 'hysteria',
         domain: 'hy.example.com',
         useTlsFiles: false,

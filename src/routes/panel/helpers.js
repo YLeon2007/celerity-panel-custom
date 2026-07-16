@@ -96,6 +96,7 @@ const XRAY_FINGERPRINT_VALUES = [
 // the actual private key reaching the browser. When the form is submitted with
 // this exact value, the route must keep the previously stored manualKey.
 const MANUAL_KEY_PLACEHOLDER = '***SET***';
+const XRAY_SECRET_PLACEHOLDER = MANUAL_KEY_PLACEHOLDER;
 
 // Loose hostname check used for tlsSource==='manual' — accepts standard DNS
 // labels, dotted FQDNs and lowercase ASCII. Avoids ReDoS by limiting length.
@@ -296,6 +297,25 @@ function parseXrayFormFields(body) {
         xray.acmeEmail = String(body['xray.acmeEmail']).trim().slice(0, 254);
     }
 
+    const hysteriaEnabled = parseBool(body, 'xray.hysteria.enabled', false);
+    const hysteriaMasqueradeType = body['xray.hysteria.masquerade.type'] === 'proxy' ? 'proxy' : 'string';
+    xray.hysteria = {
+        enabled: hysteriaEnabled,
+        port: parseInt(body['xray.hysteria.port'], 10) || 24443,
+        inboundTag: String(body['xray.hysteria.inboundTag'] || 'hysteria-in').trim().slice(0, 64),
+        obfs: body['xray.hysteria.obfs'] === 'salamander' ? 'salamander' : '',
+        obfsPassword: String(body['xray.hysteria.obfsPassword'] || '').trim().slice(0, 256),
+        udpIdleTimeout: parseInt(body['xray.hysteria.udpIdleTimeout'], 10) || 60,
+        masquerade: {
+            type: hysteriaMasqueradeType,
+            content: String(body['xray.hysteria.masquerade.content'] || 'Not Found').slice(0, 4096),
+            statusCode: parseInt(body['xray.hysteria.masquerade.statusCode'], 10) || 404,
+            url: String(body['xray.hysteria.masquerade.url'] || 'https://www.google.com').trim().slice(0, 2048),
+            rewriteHost: parseBool(body, 'xray.hysteria.masquerade.rewriteHost', true),
+            insecure: parseBool(body, 'xray.hysteria.masquerade.insecure', false),
+        },
+    };
+
     // Always parse extra inbounds — pass [] explicitly when none submitted so
     // the route can persist a "delete-all" intent. Callers that do not want to
     // touch extras can just delete the field from the result.
@@ -324,7 +344,9 @@ function validateXrayFormFields(xray, node) {
     // TLS-source-specific validation is independent of extra inbounds, run
     // it first so the early-return below does not mask manual-PEM mistakes.
     const tlsSecurity = (xray?.security === 'tls');
-    if (tlsSecurity && xray?.tlsSource === 'acme') {
+    const nativeHysteriaEnabled = xray?.hysteria?.enabled === true;
+    const tlsRequired = tlsSecurity || nativeHysteriaEnabled;
+    if (tlsRequired && xray?.tlsSource === 'acme') {
         const domain = String(node?.domain || '').trim().toLowerCase();
         if (!domain) {
             return 'ACME mode requires a domain — fill in the Domain field in the Network section.';
@@ -337,7 +359,7 @@ function validateXrayFormFields(xray, node) {
             return 'ACME mode: email looks invalid (expected admin@example.com).';
         }
     }
-    if (tlsSecurity && xray?.tlsSource === 'manual') {
+    if (tlsRequired && xray?.tlsSource === 'manual') {
         const domain = String(node?.domain || '').trim().toLowerCase();
         if (!domain) {
             return 'Manual TLS requires a domain — fill in the Domain field in the Network section.';
@@ -395,6 +417,33 @@ function validateXrayFormFields(xray, node) {
         }
     }
 
+    if (nativeHysteriaEnabled) {
+        const hy = xray.hysteria || {};
+        if (!Number.isInteger(hy.port) || hy.port < 1 || hy.port > 65535) {
+            return 'Native Hysteria: UDP port must be in 1..65535.';
+        }
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(hy.inboundTag || ''))) {
+            return 'Native Hysteria: inbound tag must match [A-Za-z0-9_-]{1,64}.';
+        }
+        if (hy.inboundTag === (xray.inboundTag || 'vless-in')) {
+            return 'Native Hysteria: inbound tag must differ from the main VLESS tag.';
+        }
+        if (hy.obfs === 'salamander' && String(hy.obfsPassword || '').length < 8) {
+            return 'Native Hysteria: Salamander password must be at least 8 characters.';
+        }
+        if (hy.udpIdleTimeout < 10 || hy.udpIdleTimeout > 600) {
+            return 'Native Hysteria: UDP idle timeout must be between 10 and 600 seconds.';
+        }
+        if (hy.masquerade?.type === 'proxy') {
+            try {
+                const url = new URL(hy.masquerade.url);
+                if (!['http:', 'https:'].includes(url.protocol)) throw new Error('scheme');
+            } catch (_) {
+                return 'Native Hysteria: masquerade proxy URL must be http:// or https://.';
+            }
+        }
+    }
+
     const validateFallbackDest = (value, label) => {
         const v = String(value || '').trim();
         if (!v) return null;
@@ -406,21 +455,32 @@ function validateXrayFormFields(xray, node) {
     const mainFallbackErr = validateFallbackDest(xray?.fallbackDest, 'Main inbound');
     if (mainFallbackErr) return mainFallbackErr;
 
-    if (!xray || !Array.isArray(xray.extraInbounds) || xray.extraInbounds.length === 0) {
-        return null;
-    }
-
     const mainPort = parseInt(node?.port, 10);
     const apiPort = parseInt(xray.apiPort, 10);
     const agentPort = parseInt(xray.agentPort, 10);
     const reservedPorts = new Map();
-    if (Number.isInteger(mainPort)) reservedPorts.set(mainPort, 'main inbound');
+    if (Number.isInteger(mainPort)) reservedPorts.set(mainPort, 'main VLESS inbound');
     if (Number.isInteger(apiPort)) reservedPorts.set(apiPort, 'API');
     if (Number.isInteger(agentPort)) reservedPorts.set(agentPort, 'agent');
+
+    if (nativeHysteriaEnabled) {
+        const hyPort = parseInt(xray.hysteria.port, 10);
+        if (reservedPorts.has(hyPort)) {
+            return `Native Hysteria: UDP port ${hyPort} is already used by ${reservedPorts.get(hyPort)}.`;
+        }
+        reservedPorts.set(hyPort, 'native Hysteria inbound');
+    }
+
+    if (!xray || !Array.isArray(xray.extraInbounds) || xray.extraInbounds.length === 0) {
+        return null;
+    }
 
     const mainTag = (xray.inboundTag || 'vless-in').trim();
     const seenTags = new Map();
     seenTags.set(mainTag, 'main inbound');
+    if (nativeHysteriaEnabled) {
+        seenTags.set(xray.hysteria.inboundTag, 'native Hysteria inbound');
+    }
 
     const tagPattern = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -476,10 +536,20 @@ function validateXrayFormFields(xray, node) {
  */
 function resolveManualKeyPlaceholder(parsedXray, existingXray) {
     if (!parsedXray) return parsedXray;
-    if (parsedXray.manualKey === MANUAL_KEY_PLACEHOLDER) {
-        return { ...parsedXray, manualKey: (existingXray && existingXray.manualKey) || '' };
+    let resolved = parsedXray;
+    if (resolved.manualKey === MANUAL_KEY_PLACEHOLDER) {
+        resolved = { ...resolved, manualKey: (existingXray && existingXray.manualKey) || '' };
     }
-    return parsedXray;
+    if (resolved.hysteria?.obfsPassword === XRAY_SECRET_PLACEHOLDER) {
+        resolved = {
+            ...resolved,
+            hysteria: {
+                ...resolved.hysteria,
+                obfsPassword: existingXray?.hysteria?.obfsPassword || '',
+            },
+        };
+    }
+    return resolved;
 }
 
 /**
@@ -499,6 +569,16 @@ function sanitizeXrayForRender(xray) {
     } else {
         plain.manualKeySet = false;
         plain.manualKey = '';
+    }
+    if (plain.hysteria && typeof plain.hysteria === 'object') {
+        plain.hysteria = { ...plain.hysteria };
+        if (plain.hysteria.obfsPassword) {
+            plain.hysteria.obfsPasswordSet = true;
+            plain.hysteria.obfsPassword = XRAY_SECRET_PLACEHOLDER;
+        } else {
+            plain.hysteria.obfsPasswordSet = false;
+            plain.hysteria.obfsPassword = '';
+        }
     }
     return plain;
 }

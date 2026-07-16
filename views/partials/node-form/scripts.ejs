@@ -514,10 +514,17 @@ function checkXrayPortConflict() {
     // already restricts tags, but never trust render context).
     const mainTag = <%- JSON.stringify(node?.xray?.inboundTag || 'vless-in') %>;
     tagCounts.set(mainTag, 1);
+    const hysteriaEnabled = !!document.getElementById('xrayHysteriaEnabled')?.checked;
+    const hysteriaTagInput = document.getElementById('xrayHysteriaTag');
+    const hysteriaTag = hysteriaEnabled ? (hysteriaTagInput?.value || '').trim() : '';
+    if (hysteriaTag) tagCounts.set(hysteriaTag, (tagCounts.get(hysteriaTag) || 0) + 1);
     document.querySelectorAll('input[name="xray_extra_inboundTag"]').forEach(input => {
         const v = (input.value || '').trim();
         if (v) tagCounts.set(v, (tagCounts.get(v) || 0) + 1);
     });
+    if (hysteriaTagInput) {
+        hysteriaTagInput.classList.toggle('input-error', !!hysteriaTag && (tagCounts.get(hysteriaTag) || 0) > 1);
+    }
     document.querySelectorAll('input[name="xray_extra_inboundTag"]').forEach(input => {
         const v = (input.value || '').trim();
         const isDup = !!v && (tagCounts.get(v) || 0) > 1;
@@ -658,6 +665,7 @@ function updateXrayTransportUI() {
 function _anyXrayTlsInboundActive() {
     const main = document.getElementById('xraySecurity')?.value || '';
     if (main === 'tls') return true;
+    if (document.getElementById('xrayHysteriaEnabled')?.checked) return true;
     const extras = document.querySelectorAll('select[name="xray_extra_security"]');
     for (const el of extras) {
         if (el.value === 'tls') return true;
@@ -676,6 +684,19 @@ function updateXrayFingerprintModeUI() {
     if (single) single.style.display = mode === 'single' ? '' : 'none';
     if (poolBlock) poolBlock.style.display = mode === 'pool' ? '' : 'none';
     document.querySelectorAll('input.xray-fp-pool-cb').forEach(cb => { cb.disabled = mode !== 'pool'; });
+}
+
+function updateXrayNativeHysteriaUI() {
+    const enabled = !!document.getElementById('xrayHysteriaEnabled')?.checked;
+    const fields = document.getElementById('xrayNativeHysteriaFields');
+    if (fields) fields.style.display = enabled ? '' : 'none';
+    const obfs = document.getElementById('xrayHysteriaObfs')?.value || '';
+    const passwordGroup = document.getElementById('xrayHysteriaObfsPasswordGroup');
+    if (passwordGroup) passwordGroup.style.display = enabled && obfs === 'salamander' ? '' : 'none';
+    checkXrayPortConflict();
+    const tlsConfig = document.getElementById('xrayTlsConfig');
+    if (tlsConfig) tlsConfig.style.display = _anyXrayTlsInboundActive() ? '' : 'none';
+    updateXrayTlsSourceUI();
 }
 
 function updateXraySecurityUI() {
@@ -1405,6 +1426,7 @@ async function generateXrayKeys(btn) {
     if (proto === 'xray') {
         updateXrayTransportUI();
         updateXraySecurityUI();
+        updateXrayNativeHysteriaUI();
         updateXrayFingerprintModeUI();
         // Run an initial PEM validation pass for any pre-filled textarea so
         // the operator sees the inline status icon without having to focus.

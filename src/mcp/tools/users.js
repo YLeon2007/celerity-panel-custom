@@ -15,6 +15,17 @@ const webhook = require('../../services/webhookService');
 const expireScheduler = require('../../services/expireScheduler');
 const { recomputeEnabled, isExpired, isOverLimit } = require('../../utils/userActivity');
 
+const USER_SAFE_SELECT = '-password -subscriptionToken -xrayUuid';
+
+function safeUser(user) {
+    if (!user) return user;
+    const plain = typeof user.toObject === 'function' ? user.toObject() : { ...user };
+    delete plain.password;
+    delete plain.subscriptionToken;
+    delete plain.xrayUuid;
+    return plain;
+}
+
 async function invalidateUserCache(userId, subscriptionToken) {
     await cache.invalidateUser(userId);
     if (subscriptionToken) await cache.invalidateSubscription(subscriptionToken);
@@ -68,10 +79,11 @@ async function queryUsers(args) {
 
     if (parsed.id) {
         const user = await HyUser.findOne({ userId: parsed.id })
+            .select(USER_SAFE_SELECT)
             .populate('nodes', 'name ip domain port portRange')
             .populate('groups', 'name color');
         if (!user) return { error: `User '${parsed.id}' not found`, code: 404 };
-        return { user };
+        return { user: safeUser(user) };
     }
 
     const filter = {};
@@ -84,6 +96,7 @@ async function queryUsers(args) {
     if (parsed.sortBy === 'traffic') {
         const pipeline = [
             { $match: filter },
+            { $project: { password: 0, subscriptionToken: 0, xrayUuid: 0 } },
             { $addFields: { totalTraffic: { $add: ['$traffic.tx', '$traffic.rx'] } } },
             { $sort: { totalTraffic: order } },
             { $skip: skip },
@@ -106,6 +119,7 @@ async function queryUsers(args) {
     }[parsed.sortBy] || { createdAt: order };
 
     const users = await HyUser.find(filter)
+        .select(USER_SAFE_SELECT)
         .sort(sortField)
         .skip(skip)
         .limit(parsed.limit)
@@ -128,7 +142,7 @@ async function manageUser(args, emit) {
         case 'create': {
             if (!userId) throw new Error('userId is required for create');
             const existing = await HyUser.findOne({ userId });
-            if (existing) return { error: 'User already exists', code: 409, user: existing };
+            if (existing) return { error: 'User already exists', code: 409, user: safeUser(existing) };
 
             const password = cryptoService.generatePassword(userId);
             const hm = data.hwidMode;
@@ -157,7 +171,7 @@ async function manageUser(args, emit) {
             if (user.enabled) getSyncService().addUserToAllXrayNodes(user.toObject()).catch(() => {});
             if (user.expireAt) expireScheduler.notify(user.expireAt);
             emit('progress', { message: `User '${userId}' created` });
-            return { success: true, user };
+            return { success: true, user: safeUser(user) };
         }
 
         case 'update': {
@@ -221,7 +235,7 @@ async function manageUser(args, emit) {
 
             logger.info(`[MCP] Updated user ${userId}`);
             webhook.emit(webhook.EVENTS.USER_UPDATED, { userId, updates });
-            return { success: true, user: updated };
+            return { success: true, user: safeUser(updated) };
         }
 
         case 'delete': {
@@ -245,7 +259,7 @@ async function manageUser(args, emit) {
             await invalidateUserCache(userId, user.subscriptionToken);
             logger.info(`[MCP] Enabled user ${userId}`);
             webhook.emit(webhook.EVENTS.USER_ENABLED, { userId });
-            return { success: true, user };
+            return { success: true, user: safeUser(user) };
         }
 
         case 'disable': {
@@ -256,7 +270,7 @@ async function manageUser(args, emit) {
             await invalidateUserCache(userId, user.subscriptionToken);
             logger.info(`[MCP] Disabled user ${userId}`);
             webhook.emit(webhook.EVENTS.USER_DISABLED, { userId });
-            return { success: true, user };
+            return { success: true, user: safeUser(user) };
         }
 
         case 'reset_traffic': {
@@ -287,7 +301,7 @@ async function manageUser(args, emit) {
             }
 
             logger.info(`[MCP] Reset traffic for user ${userId}${autoEnable ? ' (auto-enabled)' : ''}`);
-            return { success: true, message: `Traffic reset for '${userId}'`, user };
+            return { success: true, message: `Traffic reset for '${userId}'`, user: safeUser(user) };
         }
 
         default:
@@ -337,6 +351,7 @@ module.exports = {
     queryUsers,
     manageUser,
     manageHwidDevices,
+    _test: { safeUser, USER_SAFE_SELECT },
     schemas: {
         queryUsers: queryUsersSchema,
         manageUser: manageUserSchema,

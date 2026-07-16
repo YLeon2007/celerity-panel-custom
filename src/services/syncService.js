@@ -32,6 +32,63 @@ const {
     mergeNodeOnlineContributions,
 } = require('../utils/agentOnlineState');
 
+const MIN_NATIVE_HYSTERIA_XRAY_VERSION = [26, 3, 27];
+const MIN_NATIVE_HYSTERIA_AGENT_VERSION = [1, 5, 0];
+
+function numericVersionAtLeast(version, minimum) {
+    const match = String(version || '').match(/(?:Xray\s+|cc-agent\s+)?(\d+)\.(\d+)\.(\d+)/i);
+    if (!match) return false;
+    const actual = match.slice(1, 4).map(Number);
+    for (let i = 0; i < 3; i++) {
+        if (actual[i] > minimum[i]) return true;
+        if (actual[i] < minimum[i]) return false;
+    }
+    return true;
+}
+
+function xrayVersionAtLeast(version, minimum = MIN_NATIVE_HYSTERIA_XRAY_VERSION) {
+    return numericVersionAtLeast(version, minimum);
+}
+
+function agentVersionAtLeast(version, minimum = MIN_NATIVE_HYSTERIA_AGENT_VERSION) {
+    return numericVersionAtLeast(version, minimum);
+}
+
+async function restartXrayFailClosed({
+    nativeHysteria,
+    hasAgent,
+    hasSsh,
+    restartViaAgent,
+    restartViaSsh,
+}) {
+    let agentError = null;
+    if (hasAgent) {
+        try {
+            await restartViaAgent();
+            return 'agent';
+        } catch (error) {
+            agentError = error;
+        }
+    }
+
+    if (hasSsh) {
+        try {
+            await restartViaSsh();
+            return 'ssh';
+        } catch (sshError) {
+            if (nativeHysteria) {
+                throw new Error(`Native Hysteria restart failed closed: agent=${agentError?.message || 'unavailable'}; ssh=${sshError.message}`);
+            }
+            return null;
+        }
+    }
+
+    if (nativeHysteria) {
+        throw new Error(`Native Hysteria restart failed closed: agent=${agentError?.message || 'unavailable'}; ssh=unavailable`);
+    }
+    return null;
+}
+
 // HTTPS agent that ignores self-signed certs (agent uses self-signed cert by default)
 const selfSignedAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -80,17 +137,24 @@ function hasConfigRelevantUpdates(updates) {
 async function ensureManualKeyLoaded(node) {
     const xray = node?.xray;
     if (!xray) return;
-    if (xray.tlsSource !== 'manual') return;
-    if (xray.manualKey && String(xray.manualKey).trim().length > 0) return;
+    const needManualKey = xray.tlsSource === 'manual'
+        && !(xray.manualKey && String(xray.manualKey).trim().length > 0);
+    const needHysteriaSecret = xray.hysteria?.enabled
+        && xray.hysteria?.obfs === 'salamander'
+        && !(xray.hysteria?.obfsPassword && String(xray.hysteria.obfsPassword).trim().length > 0);
+    if (!needManualKey && !needHysteriaSecret) return;
     try {
-        const fresh = await HyNode.findById(node._id).select('+xray.manualKey').lean();
-        const key = fresh?.xray?.manualKey || '';
-        if (key) {
-            // node.xray may be a Mongoose subdoc — assign directly.
-            xray.manualKey = key;
+        const fresh = await HyNode.findById(node._id)
+            .select('+xray.manualKey +xray.hysteria.obfsPassword')
+            .lean();
+        if (needManualKey && fresh?.xray?.manualKey) {
+            xray.manualKey = fresh.xray.manualKey;
+        }
+        if (needHysteriaSecret && fresh?.xray?.hysteria?.obfsPassword) {
+            xray.hysteria.obfsPassword = fresh.xray.hysteria.obfsPassword;
         }
     } catch (err) {
-        logger.warn(`[Sync] Failed to lazy-load manualKey for node ${node.name || node._id}: ${err.message}`);
+        logger.warn(`[Sync] Failed to lazy-load Xray secret fields for node ${node.name || node._id}: ${err.message}`);
     }
 }
 
@@ -466,8 +530,32 @@ class SyncService {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
-        // Pull the operator-supplied private key if the node uses manual TLS;
-        // it is intentionally hidden from default queries (select:false).
+        // A known pre-Hysteria core cannot parse the inbound. Unknown versions
+        // still proceed to the authoritative remote `xray run -test` gate below.
+        if (node.xray?.hysteria?.enabled && node.xrayVersion
+            && !xrayVersionAtLeast(node.xrayVersion)) {
+            const error = `Native Hysteria requires Xray >= 26.3.27 (node reports ${node.xrayVersion})`;
+            logger.error(`[Xray Sync] Node ${node.name}: ${error}`);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: error },
+            });
+            await invalidateNodesCache();
+            return false;
+        }
+
+        if (node.xray?.hysteria?.enabled && !agentVersionAtLeast(node.agentVersion)) {
+            const reported = node.agentVersion || 'unknown';
+            const error = `Native Hysteria requires CC Agent >= 1.5.0 (node reports ${reported})`;
+            logger.error(`[Xray Sync] Node ${node.name}: ${error}`);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: error },
+            });
+            await invalidateNodesCache();
+            return false;
+        }
+
+        // Pull operator-supplied secret fields hidden by select:false before
+        // generating subscriptions/configs.
         await ensureManualKeyLoaded(node);
 
         const users = await this._getUsersForNode(node);
@@ -478,7 +566,7 @@ class SyncService {
         try {
             configContent = configGenerator.generateXrayConfig(node, users);
         } catch (genErr) {
-            if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
+            if (['PANEL_CERT_UNAVAILABLE', 'MANUAL_CERT_UNAVAILABLE', 'NATIVE_HYSTERIA_SECRET_UNAVAILABLE'].includes(genErr.code)) {
                 logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
                 await HyNode.updateOne({ _id: node._id }, {
                     $set: {
@@ -492,6 +580,9 @@ class SyncService {
             }
             throw genErr;
         }
+
+        let configInstalled = false;
+        let configInstallError = '';
 
         // Step 1: Upload config.json via SSH (only if SSH is configured)
         if (node.ssh?.password || node.ssh?.privateKey) {
@@ -515,6 +606,9 @@ class SyncService {
                             ...(node.xray?.extraInbounds || [])
                                 .map(i => i.inboundTag)
                                 .filter(Boolean),
+                            ...(node.xray?.hysteria?.enabled
+                                ? [node.xray.hysteria.inboundTag || 'hysteria-in']
+                                : []),
                         ];
 
                         const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
@@ -563,10 +657,22 @@ class SyncService {
                     }
                 }
 
-                // Xray config always goes to /usr/local/etc/xray/config.json
+                // Stage beside the live config, validate with the node's exact Xray
+                // binary, then atomically replace. A schema/version mismatch must
+                // never overwrite the last-known-good runtime config.
                 const xrayConfigPath = '/usr/local/etc/xray/config.json';
-                await ssh.uploadContent(configContent, xrayConfigPath);
-                logger.info(`[Xray Sync] Node ${node.name}: config uploaded to ${xrayConfigPath}`);
+                const candidatePath = `/usr/local/etc/xray/.config.candidate-${process.pid}-${Date.now()}.json`;
+                await ssh.uploadContent(configContent, candidatePath);
+                const configTest = await ssh.exec(
+                    `/usr/local/bin/xray run -test -c ${candidatePath}; rc=$?; `
+                    + `if [ "$rc" -eq 0 ]; then chmod 0644 ${candidatePath} && mv -f ${candidatePath} ${xrayConfigPath}; `
+                    + `else rm -f ${candidatePath}; fi; exit "$rc"`
+                );
+                if (configTest.code !== 0) {
+                    const diagnostic = String(configTest.stderr || configTest.stdout || 'Xray rejected candidate config').trim().slice(0, 1000);
+                    throw new Error(`Xray config validation failed: ${diagnostic}`);
+                }
+                logger.info(`[Xray Sync] Node ${node.name}: candidate config validated and atomically installed at ${xrayConfigPath}`);
 
                 // Also refresh cc-agent config when extra inbounds may have
                 // changed, so the agent picks up new tag→flow mapping. The
@@ -575,37 +681,64 @@ class SyncService {
                     try {
                         await nodeSetup.reloadCcAgent(node, ssh);
                     } catch (reloadErr) {
+                        if (node.xray?.hysteria?.enabled) throw reloadErr;
                         logger.warn(`[Xray Sync] Node ${node.name}: cc-agent reload failed: ${reloadErr.message}`);
                     }
                 }
+                configInstalled = true;
             } catch (error) {
+                configInstallError = error.message;
                 logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
         }
 
-        // Step 2: Restart Xray via Agent (preferred) or SSH fallback
+        if (node.xray?.hysteria?.enabled && !configInstalled) {
+            const error = configInstallError || 'Native Hysteria config requires working SSH for remote validation and atomic install';
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: error },
+            });
+            await invalidateNodesCache();
+            return false;
+        }
+
+        // Step 2: Restart Xray via Agent, with an SSH fallback. Native Hysteria
+        // must stop here when neither path proves that the newly-installed
+        // config is active; checking the old process later is not sufficient.
         const hasAgent = !!(node.xray?.agentToken);
-        if (hasAgent) {
-            try {
-                // /restart blocks until Xray is running and users are restored (~2-3s)
-                await this._agentRequest(node, 'POST', '/restart');
-                logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
-            } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
+        const hasSsh = !!(node.ssh?.password || node.ssh?.privateKey);
+        try {
+            const restartedVia = await restartXrayFailClosed({
+                nativeHysteria: !!node.xray?.hysteria?.enabled,
+                hasAgent,
+                hasSsh,
+                restartViaAgent: async () => {
+                    await this._agentRequest(node, 'POST', '/restart');
+                },
+                restartViaSsh: async () => {
+                    const ssh = new NodeSSH(node);
+                    try {
+                        await ssh.connect();
+                        const result = await ssh.exec('systemctl restart xray && systemctl is-active --quiet xray');
+                        if (result?.code !== 0) {
+                            throw new Error(String(result?.stderr || result?.stdout || `exit ${result?.code}`).trim());
+                        }
+                    } finally {
+                        ssh.disconnect();
+                    }
+                },
+            });
+            if (restartedVia) {
+                logger.info(`[Xray Sync] Node ${node.name}: restarted via ${restartedVia}`);
             }
-        } else if (node.ssh?.password || node.ssh?.privateKey) {
-            const ssh = new NodeSSH(node);
-            try {
-                await ssh.connect();
-                await ssh.exec('systemctl restart xray');
-                logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
-            } catch (error) {
-                logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${error.message}`);
-            } finally {
-                ssh.disconnect();
-            }
+        } catch (error) {
+            logger.error(`[Xray Sync] Node ${node.name}: ${error.message}`);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: error.message },
+            });
+            await invalidateNodesCache();
+            return false;
         }
 
         // Step 3: Sync users via Agent (builds the runtime user list in Xray without restart)
@@ -1366,6 +1499,9 @@ class SyncService {
 
 const _service = new SyncService();
 _service.ensureManualKeyLoaded = ensureManualKeyLoaded;
+_service.xrayVersionAtLeast = xrayVersionAtLeast;
+_service.agentVersionAtLeast = agentVersionAtLeast;
+_service.restartXrayFailClosed = restartXrayFailClosed;
 _service.checkPanelCertRotation = function() {
     return checkPanelCertRotation(_service);
 };

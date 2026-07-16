@@ -840,6 +840,9 @@ class CascadeService {
             ...(portalNode.xray?.extraInbounds || [])
                 .map(i => i.inboundTag)
                 .filter(Boolean),
+            ...(portalNode.xray?.hysteria?.enabled
+                ? [portalNode.xray.hysteria.inboundTag || 'hysteria-in']
+                : []),
         ];
 
         if (reverseLinks.length > 0) {

@@ -157,6 +157,7 @@ UPDATER_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
 
 ## ✨ Возможности
 
+- 🌐 **Нативный Hysteria 2 в Xray (opt-in)** — одновременная работа VLESS и Hysteria 2 в одном процессе Xray, protocol-aware синхронизация CC Agent, TLS/Salamander и подписки URI/Clash/sing-box/HAPP
 - 🔄 **Self-update панели** — изолированный updater-sidecar, проверка релиза/changelog в разделе «Обслуживание», подтверждение паролем/2FA, backup, live log и rollback-артефакты
 - 🧾 **Opt-in Access Logs Xray** — включение отдельно для каждой ноды, persistent spool, доставка в ClickHouse и безопасное выключенное состояние по умолчанию
 - 🛠️ **Source-based Caddy deploy** — production compose собирает backend из этого репозитория и проксирует HTTPS через Caddy на стабильное имя контейнера

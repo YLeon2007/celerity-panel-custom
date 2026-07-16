@@ -65,12 +65,13 @@ func (c *AccessLogsConfig) applyDefaults() {
 	}
 }
 
-// InboundEntry describes a single Xray VLESS inbound the agent has to
-// add/remove users to/from. Flow is the per-inbound XTLS flow (empty for
-// transports that do not support flow, e.g. WebSocket/gRPC/XHTTP).
+// InboundEntry describes one Xray inbound managed by the agent. Protocol is
+// optional for backward compatibility: an empty value means VLESS. Hysteria
+// entries use protocol="hysteria" and the user's ID as the Hysteria auth value.
 type InboundEntry struct {
-	Tag  string `json:"tag"`
-	Flow string `json:"flow"`
+	Tag      string `json:"tag"`
+	Flow     string `json:"flow,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 type Config struct {

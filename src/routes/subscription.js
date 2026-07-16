@@ -11,6 +11,7 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
+const YAML = require('yaml');
 const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
 const cache = require('../services/cacheService');
@@ -83,7 +84,7 @@ function isBrowser(req) {
 
 async function getUserByToken(token) {
     const user = await HyUser.findOne({ subscriptionToken: token })
-        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray cascadeRole groups virtual')
+        .populate('nodes', 'active name type status onlineUsers maxOnlineUsers rankingCoefficient domain sni ip port portRange hopInterval portConfigs obfs flag xray +xray.hysteria.obfsPassword cascadeRole groups virtual')
         .populate('groups', '_id name subscriptionTitle maxDevices');
     
     return user;
@@ -119,7 +120,7 @@ async function getActiveNodesWithCache() {
 
     // Include type, xray, obfs, and cascadeRole fields needed for URI generation and filtering
     const nodes = await HyNode.find({ active: true })
-        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray cascadeRole virtual')
+        .select('name type flag ip domain sni port portRange hopInterval portConfigs obfs active status onlineUsers maxOnlineUsers rankingCoefficient groups xray +xray.hysteria.obfsPassword cascadeRole virtual')
         .lean();
     await cache.setActiveNodes(nodes);
     return nodes;
@@ -573,6 +574,36 @@ function generateVlessURI(user, node) {
     return uris.length > 0 ? uris[0] : null;
 }
 
+function getNativeXrayHysteriaConfig(user, node) {
+    if (node?.type !== 'xray' || !node?.xray?.hysteria?.enabled || !user?.xrayUuid) return null;
+    const hy = node.xray.hysteria;
+    const tls = _resolveXrayTlsClientHints(node);
+    return {
+        host: node.domain || node.ip,
+        port: Number(hy.port || 24443),
+        auth: user.xrayUuid,
+        sni: tls.sni || node.domain || node.ip,
+        allowInsecure: !!tls.allowInsecure,
+        obfs: hy.obfs === 'salamander' ? 'salamander' : '',
+        obfsPassword: hy.obfs === 'salamander' ? String(hy.obfsPassword || '') : '',
+        name: `${node.flag || ''} ${node.name} (Hysteria 2)`.trim(),
+    };
+}
+
+function generateNativeXrayHysteriaURI(user, node) {
+    const cfg = getNativeXrayHysteriaConfig(user, node);
+    if (!cfg) return null;
+    const params = new URLSearchParams();
+    if (cfg.sni) params.set('sni', cfg.sni);
+    params.set('alpn', 'h3');
+    params.set('insecure', cfg.allowInsecure ? '1' : '0');
+    if (cfg.obfs && cfg.obfsPassword) {
+        params.set('obfs', cfg.obfs);
+        params.set('obfs-password', cfg.obfsPassword);
+    }
+    return `hysteria2://${encodeURIComponent(cfg.auth)}@${cfg.host}:${cfg.port}?${params.toString()}#${encodeURIComponent(cfg.name)}`;
+}
+
 // ==================== ROUTING RULE CONVERTERS ====================
 
 /**
@@ -930,6 +961,8 @@ function generateURIList(user, nodes) {
         }
         if (node.type === 'xray') {
             generateVlessURIs(user, node).forEach(uri => uris.push(uri));
+            const nativeHyUri = generateNativeXrayHysteriaURI(user, node);
+            if (nativeHyUri) uris.push(nativeHyUri);
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 uris.push(generateURI(user, node, cfg));
@@ -946,60 +979,52 @@ function _buildClashVlessProxyForInbound(user, node, inbound) {
     const fingerprint = inbound.fingerprint || 'chrome';
     const name = _xrayInboundName(node, inbound);
 
-    let proxy = `  - name: "${name}"
-    type: vless
-    server: ${host}
-    port: ${inbound.port || node.port || 443}
-    uuid: "${user.xrayUuid}"
-    udp: true`;
+    const proxy = {
+        name,
+        type: 'vless',
+        server: host,
+        port: inbound.port || node.port || 443,
+        uuid: user.xrayUuid,
+        udp: true,
+        network: transport,
+    };
 
     if (security === 'reality') {
         const sni = inbound.realitySni && inbound.realitySni[0] ? inbound.realitySni[0] : host;
-        proxy += `
-    network: ${transport}
-    tls: true
-    reality-opts:
-      public-key: "${inbound.realityPublicKey || ''}"
-      short-id: "${(inbound.realityShortIds || ['']).find(id => id && id.length > 0) || ''}"
-    servername: ${sni}
-    client-fingerprint: ${fingerprint}`;
-        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
+        proxy.tls = true;
+        proxy['reality-opts'] = {
+            'public-key': inbound.realityPublicKey || '',
+            'short-id': (inbound.realityShortIds || ['']).find(id => id && id.length > 0) || '',
+        };
+        proxy.servername = sni;
+        proxy['client-fingerprint'] = fingerprint;
+        if (transport === 'tcp' && inbound.flow) proxy.flow = inbound.flow;
     } else if (security === 'tls') {
         const tls = _resolveXrayTlsClientHints(node);
-        proxy += `
-    network: ${transport}
-    tls: true
-    servername: ${tls.sni || host}
-    client-fingerprint: ${fingerprint}`;
-        if (tls.allowInsecure) proxy += `\n    skip-cert-verify: true`;
-        if (inbound.alpn && inbound.alpn.length > 0) {
-            proxy += `\n    alpn:\n${inbound.alpn.map(a => `      - ${a}`).join('\n')}`;
-        }
-        if (transport === 'tcp' && inbound.flow) proxy += `\n    flow: ${inbound.flow}`;
-    } else {
-        proxy += `\n    network: ${transport}`;
+        proxy.tls = true;
+        proxy.servername = tls.sni || host;
+        proxy['client-fingerprint'] = fingerprint;
+        if (tls.allowInsecure) proxy['skip-cert-verify'] = true;
+        if (inbound.alpn && inbound.alpn.length > 0) proxy.alpn = inbound.alpn;
+        if (transport === 'tcp' && inbound.flow) proxy.flow = inbound.flow;
     }
 
     const tlsHints = security === 'tls' ? _resolveXrayTlsClientHints(node) : null;
-
     if (transport === 'ws') {
-        proxy += `
-    ws-opts:
-      path: "${inbound.wsPath || '/'}"`;
         const wsHost = inbound.wsHost || (tlsHints ? tlsHints.host : '');
-        if (wsHost) proxy += `\n      headers:\n        Host: "${wsHost}"`;
+        proxy['ws-opts'] = {
+            path: inbound.wsPath || '/',
+            ...(wsHost ? { headers: { Host: wsHost } } : {}),
+        };
     } else if (transport === 'grpc') {
-        proxy += `
-    grpc-opts:
-      grpc-service-name: "${inbound.grpcServiceName || 'grpc'}"`;
+        proxy['grpc-opts'] = { 'grpc-service-name': inbound.grpcServiceName || 'grpc' };
     } else if (transport === 'xhttp') {
-        // Mihomo (Clash Meta) supports XHTTP since 1.18.x via xhttp-opts
-        proxy += `
-    xhttp-opts:
-      path: "${inbound.xhttpPath || '/'}"
-      mode: "${inbound.xhttpMode || 'auto'}"`;
         const xhttpHost = inbound.xhttpHost || (tlsHints ? tlsHints.host : '');
-        if (xhttpHost) proxy += `\n      host: "${xhttpHost}"`;
+        proxy['xhttp-opts'] = {
+            path: inbound.xhttpPath || '/',
+            mode: inbound.xhttpMode || 'auto',
+            ...(xhttpHost ? { host: xhttpHost } : {}),
+        };
     }
 
     return { name, proxy };
@@ -1018,7 +1043,7 @@ function generateClashYAML(user, nodes, routing) {
     const auth = `${user.userId}:${user.password}`;
     const proxies = [];
     const proxyNames = [];
-    // Maps a HyNode _id (string) -> first proxy name produced for it. Used so
+    // Maps a HyNode _id (string) -> all proxy names produced for it. Used so
     // virtual nodes can reference their source nodes' Clash proxies by name.
     const nameByNodeId = new Map();
     const virtualSpecs = [];
@@ -1032,31 +1057,49 @@ function generateClashYAML(user, nodes, routing) {
         if (node.type === 'xray') {
             if (!user.xrayUuid) return;
             _buildClashVlessProxies(user, node).forEach(({ name, proxy }) => {
-                if (!proxy) return;
                 proxyNames.push(name);
                 proxies.push(proxy);
             });
+            const hy = getNativeXrayHysteriaConfig(user, node);
+            if (hy) {
+                const proxy = {
+                    name: hy.name,
+                    type: 'hysteria2',
+                    server: hy.host,
+                    port: hy.port,
+                    password: hy.auth,
+                    sni: hy.sni,
+                    'skip-cert-verify': hy.allowInsecure,
+                    alpn: ['h3'],
+                };
+                if (hy.obfs && hy.obfsPassword) {
+                    proxy.obfs = hy.obfs;
+                    proxy['obfs-password'] = hy.obfsPassword;
+                }
+                proxyNames.push(hy.name);
+                proxies.push(proxy);
+            }
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const name = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
-                proxyNames.push(name);
-
-                let proxy = `  - name: "${name}"
-    type: hysteria2
-    server: ${cfg.host}
-    port: ${cfg.port}
-    password: "${auth}"
-    sni: ${cfg.sni || cfg.host}
-    skip-cert-verify: ${!cfg.hasCert}
-    alpn:
-      - h3`;
-
-                if (cfg.portRange) proxy += `\n    ports: ${cfg.portRange}`;
+                const proxy = {
+                    name,
+                    type: 'hysteria2',
+                    server: cfg.host,
+                    port: cfg.port,
+                    password: auth,
+                    sni: cfg.sni || cfg.host,
+                    'skip-cert-verify': !cfg.hasCert,
+                    alpn: ['h3'],
+                };
+                if (cfg.portRange) proxy.ports = cfg.portRange;
                 const hopIntervalSec = parseDurationSeconds(normalizeHopInterval(cfg.hopInterval));
-                if (hopIntervalSec > 0) proxy += `\n    hop-interval: ${hopIntervalSec}`;
+                if (hopIntervalSec > 0) proxy['hop-interval'] = hopIntervalSec;
                 if (cfg.obfs && cfg.obfsPassword) {
-                    proxy += `\n    obfs: ${cfg.obfs}\n    obfs-password: "${cfg.obfsPassword}"`;
+                    proxy.obfs = cfg.obfs;
+                    proxy['obfs-password'] = cfg.obfsPassword;
                 }
+                proxyNames.push(name);
                 proxies.push(proxy);
             });
         }
@@ -1076,44 +1119,34 @@ function generateClashYAML(user, nodes, routing) {
         if (sourceNames.length === 0) return;
         const groupName = `${vnode.flag || ''} ${vnode.name}`.trim();
         const obs = (vnode.virtual && vnode.virtual.observatory) || {};
-        const url = obs.destination || 'http://www.gstatic.com/generate_204';
-        const intervalSec = parseDurationSeconds(obs.interval || '1m') || 60;
-        const groupType = vnode.virtual?.strategy === 'random' ? 'load-balance' : 'url-test';
-        virtualGroups.push(
-            `  - name: "${groupName}"\n    type: ${groupType}\n    url: ${url}\n    interval: ${intervalSec}\n    proxies:\n${sourceNames.map(n => `      - "${n}"`).join('\n')}`
-        );
-        // Surface the balancer at the top of the user-facing select group too.
+        virtualGroups.push({
+            name: groupName,
+            type: vnode.virtual?.strategy === 'random' ? 'load-balance' : 'url-test',
+            url: obs.destination || 'http://www.gstatic.com/generate_204',
+            interval: parseDurationSeconds(obs.interval || '1m') || 60,
+            proxies: sourceNames,
+        });
         proxyNames.unshift(groupName);
     });
 
-    let yaml = `proxies:\n${proxies.join('\n')}\n\nproxy-groups:\n  - name: "Proxy"\n    type: select\n    proxies:\n${proxyNames.map(n => `      - "${n}"`).join('\n')}\n`;
-    if (virtualGroups.length > 0) {
-        yaml += virtualGroups.join('\n') + '\n';
-    }
+    const document = {
+        proxies,
+        'proxy-groups': [
+            { name: 'Proxy', type: 'select', proxies: proxyNames },
+            ...virtualGroups,
+        ],
+    };
 
     if (routing && routing.enabled && routing.rules && routing.rules.length > 0) {
-        const clashDns = buildClashDns(routing.rules, routing.dns);
-        const dnsLines = ['dns:', '  enable: true', '  ipv6: false'];
-        dnsLines.push(`  default-nameserver:\n    - ${clashDns['default-nameserver'][0]}`);
-        dnsLines.push(`  nameserver:\n    - ${clashDns.nameserver[0]}`);
-        const policy = clashDns['nameserver-policy'];
-        if (policy && Object.keys(policy).length > 0) {
-            dnsLines.push('  nameserver-policy:');
-            for (const [k, v] of Object.entries(policy)) {
-                dnsLines.push(`    "${k}": "${v}"`);
-            }
-        }
-        yaml += '\n' + dnsLines.join('\n') + '\n';
-
+        document.dns = buildClashDns(routing.rules, routing.dns);
         const clashRules = buildClashRules(routing.rules);
-        if (clashRules.length > 0) {
-            yaml += '\nrules:\n';
-            yaml += clashRules.map(r => `  - ${r}`).join('\n') + '\n';
-            yaml += '  - MATCH,Proxy\n';
-        }
+        if (clashRules.length > 0) document.rules = [...clashRules, 'MATCH,Proxy'];
     }
 
-    return yaml;
+    // Serialize the complete object in one operation. No operator-controlled
+    // scalar is ever interpolated into YAML syntax, including legacy Hysteria,
+    // VLESS transport/TLS/Reality fields, virtual groups, DNS, and rules.
+    return YAML.stringify(document, { lineWidth: 0 });
 }
 
 function _buildSingboxVlessOutboundForInbound(user, node, inbound) {
@@ -1283,6 +1316,37 @@ function _buildV2rayOutboundsForNode(user, node, tagOverride) {
                 },
             });
         });
+
+        const hy = getNativeXrayHysteriaConfig(user, node);
+        if (hy) {
+            const displayName = hy.name;
+            const tag = tagOverride ? tagOverride(built.length, displayName) : displayName;
+            const streamSettings = {
+                network: 'hysteria',
+                security: 'tls',
+                hysteriaSettings: { version: 2, auth: hy.auth },
+                tlsSettings: {
+                    serverName: hy.sni || hy.host,
+                    allowInsecure: hy.allowInsecure,
+                    alpn: ['h3'],
+                },
+            };
+            if (hy.obfs && hy.obfsPassword) {
+                streamSettings.finalmask = {
+                    udp: [{ type: 'salamander', settings: { password: hy.obfsPassword } }],
+                };
+            }
+            built.push({
+                tag,
+                displayName,
+                outbound: {
+                    tag,
+                    protocol: 'hysteria',
+                    settings: { version: 2, address: hy.host, port: hy.port },
+                    streamSettings,
+                },
+            });
+        }
         return built;
     }
 
@@ -1564,6 +1628,27 @@ function generateSingboxJSON(user, nodes, routing) {
                 tags.push(tag);
                 proxyOutbounds.push(outbound);
             });
+            const hy = getNativeXrayHysteriaConfig(user, node);
+            if (hy) {
+                const outbound = {
+                    type: 'hysteria2',
+                    tag: hy.name,
+                    server: hy.host,
+                    server_port: hy.port,
+                    password: hy.auth,
+                    tls: {
+                        enabled: true,
+                        server_name: hy.sni || hy.host,
+                        insecure: hy.allowInsecure,
+                        alpn: ['h3'],
+                    },
+                };
+                if (hy.obfs && hy.obfsPassword) {
+                    outbound.obfs = { type: hy.obfs, password: hy.obfsPassword };
+                }
+                tags.push(hy.name);
+                proxyOutbounds.push(outbound);
+            }
         } else {
             getNodeConfigs(node).forEach(cfg => {
                 const tag = `${node.flag || ''} ${node.name} ${cfg.name}`.trim();
@@ -3101,3 +3186,12 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+module.exports._test = {
+    generateURIList,
+    generateClashYAML,
+    generateSingboxJSON,
+    generateV2rayJSON,
+    generateXrayJSON,
+    getNativeXrayHysteriaConfig,
+    generateNativeXrayHysteriaURI,
+};

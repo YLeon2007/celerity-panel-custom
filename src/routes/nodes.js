@@ -11,6 +11,12 @@ const cryptoService = require('../services/cryptoService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 const { invalidateNodesCache } = require('../utils/helpers');
+const {
+    buildXrayDotUpdates,
+    validateXrayCreateNode,
+    validateResultingXrayUpdate,
+    validatedXrayUpdateOptions,
+} = require('../utils/xrayUpdates');
 const nodeSetup = require('../services/nodeSetup');
 const syncService = require('../services/syncService');
 
@@ -340,6 +346,10 @@ router.post('/', requireScope('nodes:write'), async (req, res) => {
         }
 
         const node = new HyNode(nodeData);
+        const xrayError = validateXrayCreateNode(node);
+        if (xrayError) {
+            return res.status(400).json({ error: xrayError });
+        }
         await node.save();
 
         await invalidateNodesCache();
@@ -370,6 +380,7 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
 
         const updates = {};
         for (const key of allowedUpdates) {
+            if (key === 'xray') continue;
             if (req.body[key] !== undefined) {
                 if (key === 'ssh') {
                     updates[key] = cryptoService.encryptSshCredentials(req.body[key]);
@@ -383,10 +394,13 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             }
         }
 
+        Object.assign(updates, buildXrayDotUpdates(req.body.xray));
+
         // findByIdAndUpdate bypasses pre('validate') hooks even with runValidators,
         // so enforce type-specific invariants explicitly here. We need the existing
         // doc to know the resulting type when only one of {type,virtual} is sent.
-        const existing = await HyNode.findById(req.params.id).select('type ip virtual').lean();
+        const existing = await HyNode.findById(req.params.id)
+            .select('type ip port domain virtual xray +xray.manualKey +xray.hysteria.obfsPassword');
         if (!existing) {
             return res.status(404).json({ error: 'Node not found' });
         }
@@ -408,10 +422,15 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
             return res.status(400).json({ error: `Node type ${nextType} requires ip` });
         }
 
+        const xrayError = validateResultingXrayUpdate(existing, updates);
+        if (xrayError) {
+            return res.status(400).json({ error: xrayError });
+        }
+
         const node = await HyNode.findByIdAndUpdate(
             req.params.id,
             { $set: updates },
-            { new: true }
+            validatedXrayUpdateOptions()
         ).populate('groups', 'name color');
 
         if (!node) {
@@ -437,7 +456,8 @@ router.put('/:id', requireScope('nodes:write'), async (req, res) => {
         res.json(node);
     } catch (error) {
         logger.error(`[Nodes API] Update error: ${error.message}`);
-        res.status(500).json({ error: error.message });
+        const status = error?.name === 'ValidationError' || error?.name === 'CastError' ? 400 : 500;
+        res.status(status).json({ error: error.message });
     }
 });
 

@@ -728,6 +728,78 @@ function buildVlessInbound(inbound, users, node) {
     };
 }
 
+function buildNativeHysteriaInbound(node, users) {
+    const xray = node.xray || {};
+    const hy = xray.hysteria || {};
+    if (!hy.enabled) return null;
+
+    const port = Number(hy.port || 24443);
+    const inboundTag = String(hy.inboundTag || 'hysteria-in');
+    const masquerade = hy.masquerade || {};
+    const hysteriaSettings = {
+        version: 2,
+        udpIdleTimeout: Number(hy.udpIdleTimeout || 60),
+        masquerade: masquerade.type === 'proxy'
+            ? {
+                type: 'proxy',
+                url: masquerade.url || 'https://www.google.com',
+                rewriteHost: masquerade.rewriteHost !== false,
+                insecure: !!masquerade.insecure,
+            }
+            : {
+                type: 'string',
+                content: masquerade.content || 'Not Found',
+                headers: { 'content-type': 'text/plain' },
+                statusCode: Number(masquerade.statusCode || 404),
+            },
+    };
+
+    // Hysteria is a QUIC transport and always uses TLS. Reuse the node's
+    // existing Xray TLS source (panel/acme/manual/self-signed), independently
+    // of the main VLESS inbound which may remain on REALITY.
+    const streamSettings = buildXrayStreamSettings({
+        transport: 'hysteria',
+        security: 'tls',
+        alpn: ['h3'],
+    }, node);
+    streamSettings.hysteriaSettings = hysteriaSettings;
+
+    if (hy.obfs === 'salamander') {
+        if (!hy.obfsPassword) {
+            const err = new Error('NATIVE_HYSTERIA_SECRET_UNAVAILABLE: Salamander PSK is missing');
+            err.code = 'NATIVE_HYSTERIA_SECRET_UNAVAILABLE';
+            throw err;
+        }
+        streamSettings.finalmask = {
+            udp: [{
+                type: 'salamander',
+                settings: { password: hy.obfsPassword },
+            }],
+        };
+    }
+
+    return {
+        listen: '0.0.0.0',
+        port,
+        protocol: 'hysteria',
+        tag: inboundTag,
+        settings: {
+            version: 2,
+            clients: (users || []).filter(u => u.xrayUuid).map(u => ({
+                auth: u.xrayUuid,
+                email: u.userId,
+                level: 0,
+            })),
+        },
+        streamSettings,
+        sniffing: {
+            enabled: true,
+            destOverride: ['http', 'tls', 'quic'],
+            routeOnly: true,
+        },
+    };
+}
+
 /**
  * Generate Xray JSON config for a node with all its users
  * @param {Object} node - Node document (with xray sub-object)
@@ -762,6 +834,7 @@ function generateXrayConfig(node, users) {
     };
 
     const extraInbounds = Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [];
+    const nativeHysteriaInbound = buildNativeHysteriaInbound(node, users);
 
     const config = {
         log: buildXrayLogSection(node),
@@ -795,6 +868,7 @@ function generateXrayConfig(node, users) {
             },
             buildVlessInbound(mainInbound, users, node),
             ...extraInbounds.map(extra => buildVlessInbound(extra, users, node)),
+            ...(nativeHysteriaInbound ? [nativeHysteriaInbound] : []),
         ],
         outbounds: [
             { protocol: 'freedom', tag: 'direct' },
@@ -868,8 +942,13 @@ function generateXrayConfig(node, users) {
     // field-rule with no domain/ip filter, matching every connection from the
     // VLESS inbounds (issue #75).
     const customOutboundNames = new Set(customOutbounds.map(o => o && o.name).filter(Boolean));
-    // Xray rejects condition-less routing rules, so scope `all` to VLESS inbounds.
-    const vlessInboundTags = [mainInboundTag, ...extraInbounds.map(e => e && e.inboundTag).filter(Boolean)];
+    // Xray rejects condition-less routing rules, so scope `all` to every
+    // client-facing inbound (VLESS main/extras + optional native Hysteria).
+    const clientInboundTags = [
+        mainInboundTag,
+        ...extraInbounds.map(e => e && e.inboundTag).filter(Boolean),
+        ...(nativeHysteriaInbound ? [nativeHysteriaInbound.tag] : []),
+    ];
     const aclRules = node.aclRules || [];
     for (const rule of aclRules) {
         const match = rule.match(/^([\w\-]+)\((.+)\)$/);
@@ -905,7 +984,7 @@ function generateXrayConfig(node, users) {
                 routingRule.domain = [`full:${target}`];
             }
         } else {
-            routingRule.inboundTag = vlessInboundTags;
+            routingRule.inboundTag = clientInboundTags;
             routingRule.ruleTag = 'acl-catch-all';
         }
 

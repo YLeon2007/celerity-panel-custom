@@ -1005,7 +1005,8 @@ async function setupXrayNode(node, options = {}) {
 
         // ACME on same-VPS is incompatible (port 80 held by panel Caddy).
         const xrayCfgEarly = node?.xray || {};
-        if (sameVps && xrayCfgEarly.security === 'tls' && xrayCfgEarly.tlsSource === 'acme') {
+        if (sameVps && (xrayCfgEarly.security === 'tls' || xrayCfgEarly.hysteria?.enabled)
+            && xrayCfgEarly.tlsSource === 'acme') {
             const msg = `tlsSource='acme' is incompatible with same-VPS deployment: ` +
                 `port 80 is held by the panel's Caddy and cannot be used for HTTP-01. ` +
                 `Switch the node to tlsSource='panel' (panel's LE cert is reused) or move the node to a separate VPS.`;
@@ -1114,7 +1115,9 @@ async function setupXrayNode(node, options = {}) {
         // Self-signed TLS: openssl is only invoked when explicitly requested.
         // For tlsSource=panel/manual the certificate is inlined into config.json
         // by configGenerator and never written to disk on the remote node.
-        if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'self-signed') {
+        const nativeHysteriaEnabled = xrayCfg.hysteria?.enabled === true;
+        const needsTlsFiles = xrayCfg.security === 'tls' || nativeHysteriaEnabled;
+        if (needsTlsFiles && xrayCfg.tlsSource === 'self-signed') {
             log('Generating self-signed TLS certificate (testing only)...');
             // Strip shell metacharacters from CN (node.sni is admin-only but
             // not strictly validated) and cap at the X.509 64-char CN limit.
@@ -1147,7 +1150,7 @@ fi
             if (!certResult.success) {
                 log(`Self-signed cert generation warning: ${certResult.error}`);
             }
-        } else if (xrayCfg.security === 'tls' && xrayCfg.tlsSource === 'acme') {
+        } else if (needsTlsFiles && xrayCfg.tlsSource === 'acme') {
             const domain = String(node.domain || '').trim();
             const email = (String(xrayCfg.acmeEmail || '').trim()) ||
                           (String(config.ACME_EMAIL || '').trim());
@@ -1165,7 +1168,7 @@ fi
                 throw new Error(`ACME setup failed: ${acmeResult.error || 'see logs above'}`);
             }
             log('ACME cert installed and auto-renewal cron registered on the node.');
-        } else if (xrayCfg.security === 'tls') {
+        } else if (needsTlsFiles) {
             log(`TLS source: ${xrayCfg.tlsSource || 'panel'} — certificate inlined in config.json (no on-node openssl)`);
         }
 
@@ -1176,7 +1179,14 @@ fi
         const extraPorts = ((node.xray || {}).extraInbounds || [])
             .map(i => parseInt(i.port, 10))
             .filter(p => Number.isInteger(p) && p > 0 && p < 65536 && p !== mainPort);
-        const allPorts = [mainPort, ...extraPorts];
+        const nativeHysteriaPort = (node.xray || {}).hysteria?.enabled
+            ? parseInt((node.xray || {}).hysteria.port, 10)
+            : NaN;
+        const allPorts = [mainPort, ...extraPorts,
+            ...(Number.isInteger(nativeHysteriaPort) && nativeHysteriaPort > 0 && nativeHysteriaPort < 65536
+                ? [nativeHysteriaPort]
+                : []),
+        ];
 
         log(`Opening firewall ports (${allPorts.join(', ')}, api:${apiPort})...`);
         const portRules = allPorts.map(p => `
@@ -1502,7 +1512,7 @@ fi
 `);
 
     const allOutput = [downloadResult.output, startResult.output].join('\n');
-    const agentVersion = allOutput.match(/cc-agent[:\s]+(v[\d.]+)/)?.[1] || 'installed';
+    const agentVersion = parseInstalledAgentVersion(allOutput) || 'installed';
     const isRunning = startResult.output.includes('OK: cc-agent running');
 
     return { success: isRunning, agentVersion, output: allOutput };
@@ -1590,6 +1600,10 @@ async function setupXrayNodeWithAgent(node, options = {}) {
     return result;
 }
 
+function parseInstalledAgentVersion(output) {
+    return String(output || '').match(/cc-agent[:\s]+v?([\d.]+)/)?.[1] || '';
+}
+
 /**
  * Compute the XTLS flow value for a given inbound config block.
  * Flow only applies to tcp + reality/tls; for other transports it must be
@@ -1619,10 +1633,13 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
     const mainTag = xray.inboundTag || 'vless-in';
 
     const inbounds = [
-        { tag: mainTag, flow: computeInboundFlow(xray) },
+        { tag: mainTag, flow: computeInboundFlow(xray), protocol: 'vless' },
         ...(Array.isArray(xray.extraInbounds) ? xray.extraInbounds : [])
             .filter(i => i && i.inboundTag)
-            .map(i => ({ tag: i.inboundTag, flow: computeInboundFlow(i) })),
+            .map(i => ({ tag: i.inboundTag, flow: computeInboundFlow(i), protocol: 'vless' })),
+        ...(xray.hysteria?.enabled
+            ? [{ tag: xray.hysteria.inboundTag || 'hysteria-in', protocol: 'hysteria' }]
+            : []),
     ];
 
     const cfg = {
@@ -1673,6 +1690,15 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
  * @param {Object} node - Node document with xray.agentToken/agentPort/...
  * @param {NodeSSH} ssh - Already-connected NodeSSH wrapper from syncService
  */
+function validateCcAgentReloadResult(node, result) {
+    if (!result || typeof result.code !== 'number' || result.code === 0) return true;
+    const diagnostic = String(result.stderr || result.stdout || `exit ${result.code}`).trim().slice(0, 500);
+    const message = `cc-agent did not become active within ~5s${diagnostic ? `: ${diagnostic}` : ''}`;
+    if (node?.xray?.hysteria?.enabled) throw new Error(message);
+    logger.warn(`[Agent] Node ${node?.name || 'unknown'}: ${message} (will continue for legacy config)`);
+    return false;
+}
+
 async function reloadCcAgent(node, ssh) {
     const xray = node.xray || {};
     const token = xray.agentToken;
@@ -1710,9 +1736,7 @@ async function reloadCcAgent(node, ssh) {
         + 'done; '
         + 'exit 1'
     );
-    if (waitResult && typeof waitResult.code === 'number' && waitResult.code !== 0) {
-        logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active within ~5s (will continue anyway)`);
-    }
+    validateCcAgentReloadResult(node, waitResult);
     logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
 }
 
@@ -1727,6 +1751,8 @@ module.exports = {
     setupXrayNodeWithAgent,
     installCCAgent,
     buildAgentConfig,
+    parseInstalledAgentVersion,
+    validateCcAgentReloadResult,
     reloadCcAgent,
     resolveNodeServiceCandidates,
     stopNodeRuntime,

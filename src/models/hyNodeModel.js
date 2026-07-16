@@ -150,6 +150,54 @@ const xrayExtraInboundSchema = new mongoose.Schema({
     fallbackDest: { type: String, default: '', trim: true, maxlength: 253 },
 }, { _id: false });
 
+const xrayHysteriaSchema = new mongoose.Schema({
+    // Native Hysteria 2 inbound hosted by the same Xray process as VLESS.
+    // Opt-in so existing Xray nodes keep byte-for-byte equivalent configs.
+    enabled: { type: Boolean, default: false },
+    port: { type: Number, default: 24443, min: 1, max: 65535 },
+    inboundTag: {
+        type: String,
+        default: 'hysteria-in',
+        trim: true,
+        maxlength: 64,
+        match: /^[A-Za-z0-9_-]{1,64}$/,
+    },
+    obfs: { type: String, enum: ['', 'salamander'], default: '' },
+    obfsPassword: {
+        type: String,
+        default: '',
+        select: false,
+        validate: {
+            validator: value => !value || value.length >= 8,
+            message: 'Native Hysteria Salamander password must be empty or at least 8 characters',
+        },
+    },
+    udpIdleTimeout: { type: Number, default: 60, min: 10, max: 600 },
+    masquerade: {
+        type: { type: String, enum: ['string', 'proxy'], default: 'string' },
+        content: { type: String, default: 'Not Found', maxlength: 4096 },
+        statusCode: { type: Number, default: 404, min: 100, max: 599 },
+        url: {
+            type: String,
+            default: 'https://www.google.com',
+            maxlength: 2048,
+            validate: {
+                validator(value) {
+                    try {
+                        const parsed = new URL(value);
+                        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+                    } catch (_) {
+                        return false;
+                    }
+                },
+                message: 'Native Hysteria masquerade URL must use http:// or https://',
+            },
+        },
+        rewriteHost: { type: Boolean, default: true },
+        insecure: { type: Boolean, default: false },
+    },
+}, { _id: false });
+
 const xrayConfigSchema = new mongoose.Schema({
     // Transport: tcp, ws, grpc, xhttp (splithttp)
     transport: { type: String, enum: ['tcp', 'ws', 'grpc', 'xhttp'], default: 'tcp' },
@@ -215,6 +263,9 @@ const xrayConfigSchema = new mongoose.Schema({
     agentPort: { type: Number, default: 62080 },
     agentToken: { type: String, default: '' },
     agentTls: { type: Boolean, default: true },
+
+    // Optional native Hysteria 2 inbound in the same Xray process.
+    hysteria: { type: xrayHysteriaSchema, default: () => ({}) },
 
     // Additional VLESS inbounds running alongside the main one with their own
     // ports and transports (Reality TCP + WS+TLS + gRPC, etc). Optional, the
@@ -376,6 +427,33 @@ const hyNodeSchema = new mongoose.Schema({
     country: { type: String, default: '' },
 
 }, { timestamps: true });
+
+function redactNodeSecrets(_doc, ret) {
+    delete ret.statsSecret;
+    if (ret?.ssh) {
+        delete ret.ssh.password;
+        delete ret.ssh.privateKey;
+    }
+    if (ret?.xray) {
+        delete ret.xray.realityPrivateKey;
+        delete ret.xray.manualKey;
+        delete ret.xray.agentToken;
+        if (Array.isArray(ret.xray.extraInbounds)) {
+            for (const inbound of ret.xray.extraInbounds) {
+                if (inbound) delete inbound.realityPrivateKey;
+            }
+        }
+        if (ret.xray.hysteria) delete ret.xray.hysteria.obfsPassword;
+        if (ret.xray.accessLogs) {
+            delete ret.xray.accessLogs.ingestTokenEncrypted;
+            delete ret.xray.accessLogs.ingestTokenHash;
+        }
+    }
+    return ret;
+}
+
+hyNodeSchema.set('toJSON', { transform: redactNodeSecrets });
+hyNodeSchema.set('toObject', { transform: redactNodeSecrets });
 
 // One IP may host at most one node per protocol type. Virtual nodes have no IP
 // (null), so the partial filter excludes them from the unique constraint.

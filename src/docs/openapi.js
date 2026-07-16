@@ -37,6 +37,35 @@ function addCommonSchemas(target) {
                 error: { type: 'string', example: 'Too many attempts. Try again in 15 minutes.' },
             },
         },
+        XrayHysteriaConfig: {
+            type: 'object',
+            description: 'Opt-in native Hysteria 2 inbound hosted by the same Xray process as VLESS. Requires Xray >= 26.3.27 and CC Agent >= 1.5.0.',
+            properties: {
+                enabled: { type: 'boolean', default: false },
+                port: { type: 'integer', minimum: 1, maximum: 65535, default: 24443, description: 'UDP listener port.' },
+                inboundTag: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$', maxLength: 64, default: 'hysteria-in' },
+                obfs: { type: 'string', enum: ['', 'salamander'], default: '' },
+                obfsPassword: { type: 'string', minLength: 8, writeOnly: true, description: 'Salamander PSK. Never returned by node APIs/MCP.' },
+                udpIdleTimeout: { type: 'integer', minimum: 10, maximum: 600, default: 60 },
+                masquerade: {
+                    type: 'object',
+                    properties: {
+                        type: { type: 'string', enum: ['string', 'proxy'], default: 'string' },
+                        content: { type: 'string', default: 'Not Found' },
+                        statusCode: { type: 'integer', minimum: 100, maximum: 599, default: 404 },
+                        url: { type: 'string', format: 'uri', maxLength: 2048, pattern: '^https?://', default: 'https://www.google.com' },
+                    },
+                },
+            },
+        },
+        XrayConfig: {
+            type: 'object',
+            description: 'Xray VLESS settings plus an optional native Hysteria 2 inbound.',
+            additionalProperties: true,
+            properties: {
+                hysteria: { $ref: '#/components/schemas/XrayHysteriaConfig' },
+            },
+        },
         VirtualConfig: {
             type: 'object',
             description: `Configuration for a **virtual** node — a load-balancer entry that
@@ -115,7 +144,7 @@ For \`virtual\` you must additionally pass a non-empty \`virtual\` object.`,
                 groups: { type: 'array', items: { type: 'string' }, example: ['64a1b2c3d4e5f6a7b8c9d0e1'], description: 'Server group ObjectIds.' },
                 maxOnlineUsers: { type: 'integer', example: 0, description: '0 = unlimited.' },
                 ssh: { type: 'object', description: 'SSH credentials. Password or privateKey can be provided. Ignored for virtual nodes.' },
-                xray: { type: 'object', description: 'Xray-specific settings when `type=xray`.' },
+                xray: { $ref: '#/components/schemas/XrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
                 cascadeRole: { type: 'string', enum: ['standalone', 'portal', 'bridge'], default: 'standalone', description: 'Always forced to `standalone` for virtual nodes.' },
                 country: { type: 'string', example: 'DE' },
@@ -144,7 +173,7 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 active: { type: 'boolean' },
                 rankingCoefficient: { type: 'number' },
                 type: { type: 'string', enum: ['hysteria', 'xray', 'virtual'] },
-                xray: { type: 'object' },
+                xray: { $ref: '#/components/schemas/XrayConfig' },
                 virtual: { $ref: '#/components/schemas/VirtualConfig' },
                 cascadeRole: { type: 'string' },
                 country: { type: 'string' },

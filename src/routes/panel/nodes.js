@@ -533,7 +533,7 @@ router.get('/nodes/:id', async (req, res) => {
         // PEM is then stripped via sanitizeXrayForRender before reaching EJS.
         const [node, groups, cascadeLinks, settings, candidateNodes] = await Promise.all([
             HyNode.findById(req.params.id)
-                .select('+xray.manualKey')
+                .select('+xray.manualKey +xray.hysteria.obfsPassword')
                 .populate('groups', 'name color'),
             getActiveGroups(),
             CascadeLink.find({
@@ -595,7 +595,7 @@ router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
         // Full doc (not partial) — we .save() it below; +manualKey is select:false.
-        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey');
+        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey +xray.hysteria.obfsPassword');
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }

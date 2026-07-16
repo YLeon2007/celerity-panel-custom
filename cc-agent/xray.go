@@ -11,6 +11,7 @@ import (
 	stats_command "github.com/xtls/xray-core/app/stats/command"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	hysteria_account "github.com/xtls/xray-core/proxy/hysteria/account"
 	vless "github.com/xtls/xray-core/proxy/vless"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -81,9 +82,20 @@ func NewXrayClient(cfg *Config) (*XrayClient, error) {
 	}, nil
 }
 
-// AddUser adds a VLESS user to every configured Xray inbound via gRPC.
-// Flow is taken from the per-inbound configuration; the value of u.Flow
-// is intentionally ignored — the agent is the source of truth here.
+// accountForInbound builds the protocol-specific account payload expected by
+// Xray's HandlerService. Existing entries without an explicit protocol remain
+// VLESS for backward compatibility.
+func accountForInbound(ib InboundEntry, u *User) *serial.TypedMessage {
+	switch strings.ToLower(ib.Protocol) {
+	case "hysteria":
+		return serial.ToTypedMessage(&hysteria_account.Account{Auth: u.ID})
+	default:
+		return serial.ToTypedMessage(&vless.Account{Id: u.ID, Flow: ib.Flow})
+	}
+}
+
+// AddUser adds a user to every configured Xray inbound using the account type
+// declared by each inbound (VLESS by default; native Hysteria when requested).
 func (c *XrayClient) AddUser(ctx context.Context, u *User) error {
 	if len(c.inbounds) == 0 {
 		return fmt.Errorf("AddUser %s: no inbounds configured", u.Email)
@@ -94,12 +106,9 @@ func (c *XrayClient) AddUser(ctx context.Context, u *User) error {
 			Tag: ib.Tag,
 			Operation: serial.ToTypedMessage(&proxyman_command.AddUserOperation{
 				User: &protocol.User{
-					Level: 0,
-					Email: u.Email,
-					Account: serial.ToTypedMessage(&vless.Account{
-						Id:   u.ID,
-						Flow: ib.Flow,
-					}),
+					Level:   0,
+					Email:   u.Email,
+					Account: accountForInbound(ib, u),
 				},
 			}),
 		})

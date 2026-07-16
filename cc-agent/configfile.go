@@ -114,9 +114,9 @@ func (p *ConfigPersister) Flush() (bool, error) {
 		return false, nil
 	}
 
-	managed := make(map[string]string, len(p.inbounds))
+	managed := make(map[string]InboundEntry, len(p.inbounds))
 	for _, ib := range p.inbounds {
-		managed[ib.Tag] = ib.Flow
+		managed[ib.Tag] = ib
 	}
 
 	users := p.store.List()
@@ -128,23 +128,26 @@ func (p *ConfigPersister) Flush() (bool, error) {
 			continue
 		}
 		tag, _ := ib["tag"].(string)
-		flow, isManaged := managed[tag]
+		entry, isManaged := managed[tag]
 		if !isManaged {
 			continue
 		}
 
-		desired := buildConfigClients(users, flow)
+		desired := buildConfigUsers(users, entry)
 
 		settings, ok := ib["settings"].(map[string]any)
 		if !ok {
 			settings = map[string]any{}
 			ib["settings"] = settings
 		}
-		existing, _ := settings["clients"].([]any)
-		if clientsEqual(existing, desired) {
+		// Both VLESS and native Hysteria use settings.clients in Xray JSON;
+		// buildConfigUsers selects the protocol-specific credential key.
+		field := "clients"
+		existing, _ := settings[field].([]any)
+		if usersEqual(existing, desired) {
 			continue
 		}
-		settings["clients"] = desired
+		settings[field] = desired
 		changed = true
 	}
 
@@ -164,29 +167,32 @@ func (p *ConfigPersister) Flush() (bool, error) {
 	return true, nil
 }
 
-// buildConfigClients renders the VLESS clients array. Flow is added only when
-// non-empty, matching the panel's configGenerator.buildXrayClients output and
-// the gRPC AddUser path (which sends per-inbound flow).
-func buildConfigClients(users []*User, flow string) []any {
-	clients := make([]any, 0, len(users))
+// buildConfigUsers renders the protocol-specific user array stored in
+// config.json. VLESS uses settings.clients[].id; native Hysteria uses
+// settings.clients[].auth. The panel user UUID is valid for both.
+func buildConfigUsers(users []*User, inbound InboundEntry) []any {
+	items := make([]any, 0, len(users))
 	for _, u := range users {
-		c := map[string]any{
-			"id":    u.ID,
+		item := map[string]any{
 			"email": u.Email,
 			"level": 0,
 		}
-		if flow != "" {
-			c["flow"] = flow
+		if inbound.Protocol == "hysteria" {
+			item["auth"] = u.ID
+		} else {
+			item["id"] = u.ID
+			if inbound.Flow != "" {
+				item["flow"] = inbound.Flow
+			}
 		}
-		clients = append(clients, c)
+		items = append(items, item)
 	}
-	return clients
+	return items
 }
 
-// clientsEqual compares two clients arrays as sets of (id, email, flow),
-// ignoring order and the always-zero level. This avoids false "changed"
-// verdicts from JSON number typing (float64) or key ordering.
-func clientsEqual(existing, desired []any) bool {
+// usersEqual compares VLESS/Hysteria user arrays as sets, ignoring order and
+// the always-zero level. It supports both id and auth credential keys.
+func usersEqual(existing, desired []any) bool {
 	if len(existing) != len(desired) {
 		return false
 	}
@@ -196,25 +202,26 @@ func clientsEqual(existing, desired []any) bool {
 		if !ok {
 			return false
 		}
-		set[clientKey(m)] = struct{}{}
+		set[userKey(m)] = struct{}{}
 	}
 	for _, c := range desired {
 		m, ok := c.(map[string]any)
 		if !ok {
 			return false
 		}
-		if _, ok := set[clientKey(m)]; !ok {
+		if _, ok := set[userKey(m)]; !ok {
 			return false
 		}
 	}
 	return true
 }
 
-func clientKey(m map[string]any) string {
+func userKey(m map[string]any) string {
 	id, _ := m["id"].(string)
+	auth, _ := m["auth"].(string)
 	email, _ := m["email"].(string)
 	flow, _ := m["flow"].(string)
-	return id + "\x00" + email + "\x00" + flow
+	return id + "\x00" + auth + "\x00" + email + "\x00" + flow
 }
 
 // atomicWriteFile writes data to a temp file in the same directory, fsyncs it,

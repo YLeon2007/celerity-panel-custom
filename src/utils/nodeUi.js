@@ -3,6 +3,7 @@ const TRANSPORTS = {
     ws: { short: 'WS', long: 'WebSocket' },
     grpc: { short: 'gRPC', long: 'gRPC' },
     xhttp: { short: 'XHTTP', long: 'XHTTP' },
+    hysteria: { short: 'HY2', long: 'Hysteria 2 (UDP)' },
 };
 
 function text(value) {
@@ -53,6 +54,9 @@ function collectXrayInbounds(xray) {
         for (const inbound of xray.extraInbounds) {
             if (inbound) inbounds.push(inbound);
         }
+    }
+    if (xray?.hysteria?.enabled) {
+        inbounds.push({ transport: 'hysteria', security: 'tls' });
     }
     return inbounds;
 }

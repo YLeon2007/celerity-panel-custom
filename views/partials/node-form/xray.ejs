@@ -2,6 +2,67 @@
             <div class="form-section" id="xraySection" style="<%= (node?.type || 'hysteria') !== 'xray' ? 'display:none' : '' %>">
                 <h3><img src="/img/xray.svg" alt="Xray" style="width:18px;height:18px;vertical-align:middle;margin-right:8px;"><%= t('nodes.xraySettings') %></h3>
 
+                <% var _nativeHy = node?.xray?.hysteria || {}; %>
+                <div class="form-group" id="xrayNativeHysteriaSection">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="xrayHysteriaEnabled" name="xray.hysteria.enabled"
+                               <%= _nativeHy.enabled ? 'checked' : '' %>
+                               onchange="updateXrayNativeHysteriaUI()">
+                        <span><strong><%= t('nodes.xrayHysteriaEnabled') %></strong></span>
+                    </label>
+                    <small><%= t('nodes.xrayHysteriaEnabledHint') %></small>
+                    <div id="xrayNativeHysteriaFields" style="margin-top:12px;<%= _nativeHy.enabled ? '' : 'display:none' %>">
+                        <div class="form-row-3">
+                            <div class="form-group">
+                                <label for="xrayHysteriaPort"><%= t('nodes.xrayHysteriaPort') %></label>
+                                <input type="number" id="xrayHysteriaPort" name="xray.hysteria.port"
+                                       min="1" max="65535" value="<%= _nativeHy.port || 24443 %>">
+                            </div>
+                            <div class="form-group">
+                                <label for="xrayHysteriaTag"><%= t('nodes.xrayHysteriaTag') %></label>
+                                <input type="text" id="xrayHysteriaTag" name="xray.hysteria.inboundTag"
+                                       maxlength="64" oninput="checkXrayPortConflict()"
+                                       value="<%= _nativeHy.inboundTag || 'hysteria-in' %>">
+                            </div>
+                            <div class="form-group">
+                                <label for="xrayHysteriaIdle"><%= t('nodes.xrayHysteriaIdle') %></label>
+                                <input type="number" id="xrayHysteriaIdle" name="xray.hysteria.udpIdleTimeout"
+                                       min="10" max="600" value="<%= _nativeHy.udpIdleTimeout || 60 %>">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="xrayHysteriaObfs"><%= t('nodes.xrayHysteriaObfs') %></label>
+                                <select id="xrayHysteriaObfs" name="xray.hysteria.obfs" onchange="updateXrayNativeHysteriaUI()">
+                                    <option value="" <%= !_nativeHy.obfs ? 'selected' : '' %>><%= t('nodes.xrayHysteriaObfsNone') %></option>
+                                    <option value="salamander" <%= _nativeHy.obfs === 'salamander' ? 'selected' : '' %>>Salamander / FinalMask</option>
+                                </select>
+                            </div>
+                            <div class="form-group" id="xrayHysteriaObfsPasswordGroup" style="<%= _nativeHy.obfs === 'salamander' ? '' : 'display:none' %>">
+                                <label for="xrayHysteriaObfsPassword"><%= t('nodes.xrayHysteriaObfsPassword') %></label>
+                                <input type="password" id="xrayHysteriaObfsPassword" name="xray.hysteria.obfsPassword"
+                                       autocomplete="new-password" value="<%= _nativeHy.obfsPassword || '' %>">
+                            </div>
+                        </div>
+                        <input type="hidden" name="xray.hysteria.masquerade.type" value="string">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="xrayHysteriaMasqContent"><%= t('nodes.xrayHysteriaMasqContent') %></label>
+                                <input type="text" id="xrayHysteriaMasqContent" name="xray.hysteria.masquerade.content"
+                                       maxlength="4096" value="<%= _nativeHy.masquerade?.content || 'Not Found' %>">
+                            </div>
+                            <div class="form-group">
+                                <label for="xrayHysteriaMasqStatus"><%= t('nodes.xrayHysteriaMasqStatus') %></label>
+                                <input type="number" id="xrayHysteriaMasqStatus" name="xray.hysteria.masquerade.statusCode"
+                                       min="100" max="599" value="<%= _nativeHy.masquerade?.statusCode || 404 %>">
+                            </div>
+                        </div>
+                        <div class="alert alert-info">
+                            <i class="ti ti-info-circle"></i> <%= t('nodes.xrayHysteriaTlsHint') %>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="form-row">
                     <div class="form-group">
                         <label for="xrayTransport"><%= t('nodes.xrayTransport') %></label>
