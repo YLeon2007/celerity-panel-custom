@@ -119,16 +119,23 @@
                         <div class="form-group">
                             <label><%= t('settings.routingDnsDomestic') %></label>
                             <input type="text" name="routingIos.dns.domestic" id="routingDnsDomestic"
-                                   value="<%= settings?.routingIos?.dns?.domestic || '77.88.8.8' %>"
-                                   placeholder="77.88.8.8">
+                                   value="<%= settings?.routingIos?.dns?.domestic || '9.9.9.9' %>"
+                                   placeholder="9.9.9.9">
                             <small class="hint"><%= t('settings.routingDnsDomesticHint') %></small>
                         </div>
                         <div class="form-group">
-                            <label><%= t('settings.routingDnsRemote') %></label>
-                            <input type="text" name="routingIos.dns.remote" id="routingDnsRemote"
-                                   value="<%= settings?.routingIos?.dns?.remote || 'tls://1.1.1.1' %>"
-                                   placeholder="tls://1.1.1.1">
-                            <small class="hint"><%= t('settings.routingDnsRemoteHint') %></small>
+                            <label><%= t('settings.routingDnsRemoteDot') %></label>
+                            <input type="text" name="routingIos.dns.dot" id="routingIosDnsDot"
+                                   value="<%= settings?.routingIos?.dns?.dot || '' %>"
+                                   placeholder="tls://9.9.9.9">
+                            <small class="hint"><%= t('settings.routingDnsRemoteDotHint') %></small>
+                        </div>
+                        <div class="form-group">
+                            <label><%= t('settings.routingDnsRemoteDoh') %></label>
+                            <input type="text" name="routingIos.dns.doh" id="routingIosDnsDoh"
+                                   value="<%= settings?.routingIos?.dns?.doh || '' %>"
+                                   placeholder="https://dns.quad9.net/dns-query">
+                            <small class="hint"><%= t('settings.routingDnsRemoteDohHint') %></small>
                         </div>
                     </div>
                 </div>

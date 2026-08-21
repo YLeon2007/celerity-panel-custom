@@ -198,8 +198,10 @@ const settingsSchema = new mongoose.Schema({
             default: [],
         },
         dns: {
-            domestic: { type: String, default: '77.88.8.8' },
-            remote:   { type: String, default: 'tls://1.1.1.1' },
+            domestic: { type: String, default: '9.9.9.9' },
+            dot:      { type: String, default: '' },
+            doh:      { type: String, default: '' },
+            remote:   { type: String, default: '' },
         },
     },
 
@@ -220,8 +222,10 @@ const settingsSchema = new mongoose.Schema({
             default: [],
         },
         dns: {
-            domestic: { type: String, default: '77.88.8.8' },
-            remote:   { type: String, default: 'tls://1.1.1.1' },
+            domestic: { type: String, default: '9.9.9.9' },
+            dot:      { type: String, default: '' },
+            doh:      { type: String, default: '' },
+            remote:   { type: String, default: '' },
         },
     },
 

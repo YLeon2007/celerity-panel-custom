@@ -25,6 +25,46 @@ const webhookService = require('../services/webhookService');
 
 // ==================== HELPERS ====================
 
+const DEFAULT_DOMESTIC_DNS = '9.9.9.9';
+const DEFAULT_REMOTE_DNS = 'https://dns.quad9.net/dns-query';
+const DOH_BOOTSTRAP_IPS = Object.freeze({
+    'dns.quad9.net': '9.9.9.9',
+    'dns.google': '8.8.8.8',
+    'cloudflare-dns.com': '1.1.1.1',
+});
+
+function cleanRoutingDnsValue(value) {
+    return String(value || '').trim();
+}
+
+function getRoutingDomesticDns(dns) {
+    return cleanRoutingDnsValue(dns && dns.domestic) || DEFAULT_DOMESTIC_DNS;
+}
+
+function getRoutingRemoteDns(dns) {
+    const doh = cleanRoutingDnsValue(dns && dns.doh);
+    if (doh) return doh;
+
+    const dot = cleanRoutingDnsValue(dns && dns.dot);
+    if (dot) return dot;
+
+    // Backward compatibility for settings saved before separate DoT/DoH fields.
+    const legacyRemote = cleanRoutingDnsValue(dns && dns.remote);
+    if (legacyRemote) return legacyRemote;
+
+    return DEFAULT_REMOTE_DNS;
+}
+
+function getDohBootstrapIp(remoteDns, fallback = DEFAULT_DOMESTIC_DNS) {
+    try {
+        const hostname = new URL(remoteDns).hostname.toLowerCase();
+        if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return hostname;
+        return DOH_BOOTSTRAP_IPS[hostname] || fallback;
+    } catch {
+        return fallback;
+    }
+}
+
 function detectFormat(userAgent) {
     const ua = (userAgent || '').toLowerCase();
     // Shadowrocket expects base64-encoded URI list
@@ -643,8 +683,8 @@ function normalizeXrayDnsAddr(addr) {
  * Domestic domains get routed to domestic DNS server.
  */
 function buildXrayDns(rules, dns) {
-    const domesticDns = normalizeXrayDnsAddr((dns && dns.domestic) || '77.88.8.8');
-    const remoteDns   = normalizeXrayDnsAddr((dns && dns.remote)   || 'tls://1.1.1.1');
+    const domesticDns = normalizeXrayDnsAddr(getRoutingDomesticDns(dns));
+    const remoteDns   = normalizeXrayDnsAddr(getRoutingRemoteDns(dns));
 
     const domesticDomains = [];
     for (const r of (rules || [])) {
@@ -659,7 +699,9 @@ function buildXrayDns(rules, dns) {
         servers.push({ address: domesticDns, domains: domesticDomains });
     }
     servers.push(remoteDns);
-    servers.push('8.8.8.8');
+    servers.push(/^https:\/\//i.test(remoteDns)
+        ? getDohBootstrapIp(remoteDns, domesticDns || DEFAULT_DOMESTIC_DNS)
+        : (domesticDns || DEFAULT_DOMESTIC_DNS));
     return servers;
 }
 
@@ -736,8 +778,8 @@ function buildSingboxRules(rules) {
  * Returns { servers, rules, final, ruleSets }.
  */
 function buildSingboxDns(rules, dns) {
-    const domesticAddr = (dns && dns.domestic) ? dns.domestic : '77.88.8.8';
-    const remoteAddr   = (dns && dns.remote)   ? dns.remote   : 'tls://1.1.1.1';
+    const domesticAddr = getRoutingDomesticDns(dns);
+    const remoteAddr   = getRoutingRemoteDns(dns);
     const ruleSetTags = new Set();
 
     const remoteServer = _parseSingboxDnsServer(remoteAddr, 'dns-remote', 'dns-local');
@@ -823,10 +865,11 @@ function buildClashRules(rules) {
  * See: https://www.happ.su/main/dev-docs/routing
  */
 function buildHappRoutingProfile(routing) {
-    if (!routing || !routing.enabled || !routing.rules || routing.rules.length === 0) return null;
+    if (!routing || !routing.enabled) return null;
 
-    const domesticDns = (routing.dns && routing.dns.domestic) || '77.88.8.8';
-    const remoteDns   = (routing.dns && routing.dns.remote)   || 'tls://1.1.1.1';
+    const rules = Array.isArray(routing.rules) ? routing.rules : [];
+    const domesticDns = getRoutingDomesticDns(routing.dns);
+    const remoteDns   = getRoutingRemoteDns(routing.dns);
 
     const profile = {
         Name: 'Auto',
@@ -845,14 +888,14 @@ function buildHappRoutingProfile(routing) {
     };
 
     // Parse remote DNS (tls://IP → DoT, https://url → DoH, plain IP → DoU)
-    if (remoteDns.startsWith('tls://')) {
+    if (/^tls:\/\//i.test(remoteDns)) {
         profile.RemoteDNSType = 'DoT';
         profile.RemoteDNSIP = remoteDns.slice(6);
         profile.RemoteDNSDomain = '';
-    } else if (remoteDns.startsWith('https://')) {
+    } else if (/^https:\/\//i.test(remoteDns)) {
         profile.RemoteDNSType = 'DoH';
         profile.RemoteDNSDomain = remoteDns;
-        profile.RemoteDNSIP = '1.1.1.1';
+        profile.RemoteDNSIP = getDohBootstrapIp(remoteDns, domesticDns || DEFAULT_DOMESTIC_DNS);
         try {
             const hostname = new URL(remoteDns).hostname;
             profile.DnsHosts = { [hostname]: profile.RemoteDNSIP };
@@ -868,7 +911,7 @@ function buildHappRoutingProfile(routing) {
     profile.DomesticDNSIP = domesticDns;
     profile.DomesticDNSDomain = '';
 
-    for (const r of routing.rules) {
+    for (const r of rules) {
         if (!r.enabled) continue;
 
         // Domain-type rules → DirectSites / BlockSites
@@ -899,8 +942,8 @@ function buildHappRoutingProfile(routing) {
  * Build Clash DNS section for split DNS.
  */
 function buildClashDns(rules, dns) {
-    const domestic = (dns && dns.domestic) ? dns.domestic : '77.88.8.8';
-    const remote   = (dns && dns.remote)   ? dns.remote   : 'tls://1.1.1.1';
+    const domestic = getRoutingDomesticDns(dns);
+    const remote   = getRoutingRemoteDns(dns);
 
     const policy = {};
     for (const r of (rules || [])) {
@@ -1363,9 +1406,9 @@ function generateV2rayJSON(user, nodes, routing) {
 
     // Final rule: all remaining traffic through first proxy
     // (This is implicit in Xray when we set the routing config tag for balancer/urltest — use first tag as default)
-    const dnsServers = (routing && routing.enabled && routing.rules)
+    const dnsServers = (routing && routing.enabled)
         ? buildXrayDns(routing.rules, routing.dns)
-        : ['1.1.1.1', '8.8.8.8'];
+        : [DEFAULT_REMOTE_DNS, DEFAULT_DOMESTIC_DNS];
 
     return {
         log: { loglevel: 'warning' },
@@ -1411,9 +1454,9 @@ function _xrayProfileRemark(node) {
  *                     used by virtual profiles to add a balancer + observatory.
  */
 function _buildXrayProfile(remark, proxyOutbounds, routing, extras = {}) {
-    const dnsServers = (routing && routing.enabled && routing.rules)
+    const dnsServers = (routing && routing.enabled)
         ? buildXrayDns(routing.rules, routing.dns)
-        : ['1.1.1.1', '8.8.8.8'];
+        : [DEFAULT_REMOTE_DNS, DEFAULT_DOMESTIC_DNS];
 
     const outbounds = [
         ...proxyOutbounds,
@@ -3101,3 +3144,8 @@ module.exports.serveSubscription = serveSubscription;
 module.exports.serveInfo = serveInfo;
 module.exports.validateUser = validateUser;
 module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
+module.exports._test = {
+    buildHappRoutingProfile,
+    buildXrayDns,
+    getDohBootstrapIp,
+};

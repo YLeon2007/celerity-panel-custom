@@ -34,6 +34,49 @@ const {
 
 // ==================== SETTINGS ====================
 
+function cleanSettingsFormValue(value) {
+    return String(value || '').trim();
+}
+
+function normalizeRoutingDnsForForm(dns) {
+    if (!dns || dns.dot || dns.doh || !dns.remote) return;
+    const remote = String(dns.remote || '').trim();
+    if (/^tls:\/\//i.test(remote)) {
+        dns.dot = remote;
+    } else if (/^https:\/\//i.test(remote)) {
+        dns.doh = remote;
+    }
+}
+
+function readRoutingDnsFormValues(body, prefix) {
+    const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const dotKey = `${prefix}.dns.dot`;
+    const dohKey = `${prefix}.dns.doh`;
+    const legacyRemoteKey = `${prefix}.dns.remote`;
+
+    let dot = cleanSettingsFormValue(body[dotKey]);
+    let doh = cleanSettingsFormValue(body[dohKey]);
+    const legacyRemote = cleanSettingsFormValue(body[legacyRemoteKey]);
+    const legacyOnly = !has(dotKey) && !has(dohKey) && legacyRemote;
+
+    if (legacyOnly) {
+        if (/^https:\/\//i.test(legacyRemote)) {
+            doh = legacyRemote;
+        } else if (/^tls:\/\//i.test(legacyRemote)) {
+            dot = legacyRemote;
+        }
+    }
+
+    return {
+        domestic: cleanSettingsFormValue(body[`${prefix}.dns.domestic`]) || '9.9.9.9',
+        dot,
+        doh,
+        // Keep the legacy field populated with the selected resolver so cached
+        // old forms/API clients and rollback to older code do not lose custom DNS.
+        remote: doh || dot || (legacyOnly ? legacyRemote : ''),
+    };
+}
+
 // GET /settings
 router.get('/settings', async (req, res) => {
     try {
@@ -51,6 +94,8 @@ router.get('/settings', async (req, res) => {
 
         // Convert to plain object before mutating to avoid Mongoose change tracking
         const settings = settingsDoc ? settingsDoc.toObject() : settingsDoc;
+        normalizeRoutingDnsForForm(settings?.routing?.dns);
+        normalizeRoutingDnsForForm(settings?.routingIos?.dns);
 
         // Decrypt secrets for form display (stored encrypted since P1-encrypt-secrets)
         if (settings?.webhook?.secret) {
@@ -325,9 +370,12 @@ router.post('/settings', async (req, res) => {
 
         // Routing settings
         if (req.body['_routingSettings'] !== undefined) {
+            const routingDns = readRoutingDnsFormValues(req.body, 'routing');
             updates['routing.enabled'] = req.body['routing.enabled'] === 'on';
-            updates['routing.dns.domestic'] = (req.body['routing.dns.domestic'] || '77.88.8.8').trim();
-            updates['routing.dns.remote']   = (req.body['routing.dns.remote']   || 'tls://1.1.1.1').trim();
+            updates['routing.dns.domestic'] = routingDns.domestic;
+            updates['routing.dns.dot']      = routingDns.dot;
+            updates['routing.dns.doh']      = routingDns.doh;
+            updates['routing.dns.remote'] = routingDns.remote;
             let parsedRules = [];
             try { parsedRules = JSON.parse(req.body['routing.rulesJson'] || '[]'); } catch {}
             if (!Array.isArray(parsedRules)) parsedRules = [];
@@ -349,9 +397,12 @@ router.post('/settings', async (req, res) => {
 
         // iOS-specific HAPP routing settings
         if (req.body['_routingIosSettings'] !== undefined) {
+            const routingIosDns = readRoutingDnsFormValues(req.body, 'routingIos');
             updates['routingIos.enabled'] = req.body['routingIos.enabled'] === 'on';
-            updates['routingIos.dns.domestic'] = (req.body['routingIos.dns.domestic'] || '77.88.8.8').trim();
-            updates['routingIos.dns.remote']   = (req.body['routingIos.dns.remote']   || 'tls://1.1.1.1').trim();
+            updates['routingIos.dns.domestic'] = routingIosDns.domestic;
+            updates['routingIos.dns.dot']      = routingIosDns.dot;
+            updates['routingIos.dns.doh']      = routingIosDns.doh;
+            updates['routingIos.dns.remote'] = routingIosDns.remote;
             let parsedRules = [];
             try { parsedRules = JSON.parse(req.body['routingIos.rulesJson'] || '[]'); } catch {}
             if (!Array.isArray(parsedRules)) parsedRules = [];
