@@ -14,6 +14,10 @@ const subscription = require('../src/routes/subscription');
 assert(subscription._test, 'subscription route must expose test helpers');
 assert.strictEqual(typeof subscription._test.buildHappRoutingProfile, 'function');
 assert.strictEqual(typeof subscription._test.buildXrayDns, 'function');
+assert.strictEqual(typeof subscription._test.buildSingboxDns, 'function');
+assert.strictEqual(typeof subscription._test.buildSingboxRules, 'function');
+assert.strictEqual(typeof subscription._test.generateSingboxJSON, 'function');
+assert.strictEqual(typeof subscription._test.generateClashYAML, 'function');
 
 const quad9Routing = {
     enabled: true,
@@ -66,6 +70,65 @@ const legacyRemoteRouting = {
 };
 assert.strictEqual(subscription._test.buildHappRoutingProfile(legacyRemoteRouting).RemoteDNSType, 'DoT',
     'legacy single remote field must remain backward-compatible until the new panel fields are saved');
+
+const singboxQuad9Dns = subscription._test.buildSingboxDns([], quad9Routing.dns);
+assert.deepStrictEqual(singboxQuad9Dns.servers[0], {
+    type: 'https',
+    tag: 'dns-remote',
+    server: 'dns.quad9.net',
+    domain_resolver: 'dns-local',
+    detour: 'proxy',
+}, 'sing-box DoH must be dialed through the proxy tunnel and keep Quad9 default');
+assert.deepStrictEqual(singboxQuad9Dns.servers[1], { type: 'udp', tag: 'dns-direct', server: '9.9.9.9', detour: 'direct' });
+assert.strictEqual(singboxQuad9Dns.final, 'dns-remote');
+
+const singboxManualDohDns = subscription._test.buildSingboxDns([], manualDohRouting.dns);
+assert.deepStrictEqual(singboxManualDohDns.servers[0], {
+    type: 'https',
+    tag: 'dns-remote',
+    server: 'dns.google',
+    domain_resolver: 'dns-local',
+    detour: 'proxy',
+}, 'manual sing-box DoH must be dialed through the proxy tunnel');
+
+const singboxManualDotDns = subscription._test.buildSingboxDns([], manualDotRouting.dns);
+assert.deepStrictEqual(singboxManualDotDns.servers[0], {
+    type: 'tls',
+    tag: 'dns-remote',
+    server: '1.1.1.1',
+    domain_resolver: 'dns-local',
+    detour: 'proxy',
+}, 'manual sing-box DoT must be dialed through the proxy tunnel');
+
+const singboxRuleResult = subscription._test.buildSingboxRules([
+    { enabled: true, action: 'direct', type: 'geosite', value: 'ru' },
+    { enabled: true, action: 'direct', type: 'geoip', value: 'ru' },
+    { enabled: true, action: 'direct', type: 'geoip', value: 'telegram' },
+    { enabled: true, action: 'block', type: 'geosite', value: '../bad' },
+]);
+assert(singboxRuleResult.ruleSets.some(rs => rs.tag === 'geosite-category-ru'), 'sing-box geosite ru must map to published category-ru rule-set');
+assert(singboxRuleResult.ruleSets.some(rs => rs.tag === 'geoip-ru'), 'sing-box geoip country code must be kept');
+assert(!JSON.stringify(singboxRuleResult).includes('telegram'), 'unsupported sing-box geoip provider lists must be dropped instead of breaking the config');
+assert(!JSON.stringify(singboxRuleResult).includes('../bad'), 'invalid sing-box rule-set values must not escape rule-set URLs');
+
+const singboxEmptyRulesConfig = subscription._test.generateSingboxJSON(
+    { userId: 'tester', password: 'secret' },
+    [{ type: 'hysteria', name: 'Node', ip: '203.0.113.10', port: 443, flag: '🇩🇪', obfs: {} }],
+    quad9Routing,
+);
+assert.strictEqual(singboxEmptyRulesConfig.dns.servers[0].server, 'dns.quad9.net', 'routing enabled with empty rules must still use selected Quad9 DNS');
+assert.strictEqual(singboxEmptyRulesConfig.dns.servers[0].detour, 'proxy', 'sing-box encrypted DNS must stay inside tunnel even with empty rules');
+assert.strictEqual(singboxEmptyRulesConfig.route.default_domain_resolver, 'dns-direct', 'sing-box must resolve outbound server names directly before the tunnel is up');
+assert(!JSON.stringify(singboxEmptyRulesConfig).includes('223.5.5.5'), 'custom fork must not fall back to upstream AliDNS when routing DNS is configured');
+
+const clashEmptyRulesYaml = subscription._test.generateClashYAML(
+    { userId: 'tester', password: 'secret' },
+    [{ type: 'hysteria', name: 'Node', ip: '203.0.113.10', port: 443, flag: '🇩🇪', obfs: {} }],
+    quad9Routing,
+);
+assert(clashEmptyRulesYaml.includes('dns:'), 'Clash must publish DNS section when routing DNS is enabled even if split rules are empty');
+assert(clashEmptyRulesYaml.includes('https://dns.quad9.net/dns-query'), 'Clash must keep custom Quad9 DoH for empty-rules routing');
+assert(!clashEmptyRulesYaml.includes('tls://1.1.1.1'), 'Clash must not fall back to old upstream DoT default');
 
 const settingsModelSource = fs.readFileSync('src/models/settingsModel.js', 'utf8');
 assert(settingsModelSource.includes("domestic: { type: String, default: '9.9.9.9' }"));

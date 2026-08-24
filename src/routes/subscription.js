@@ -705,6 +705,34 @@ function buildXrayDns(rules, dns) {
     return servers;
 }
 
+// sing-geosite publishes some regional lists only under a `category-` prefix,
+// while the panel stores the short form because that is what Xray expects.
+const SINGBOX_GEOSITE_ALIASES = Object.freeze({
+    ru: 'category-ru',
+    ads: 'category-ads-all',
+});
+
+// Published sing-geosite tags use lowercase alphanumerics plus `-`, and
+// attribute forms such as `name@cn` / `geolocation-!cn`. Rejecting anything
+// outside the allow-list avoids rule-set URLs that 404 or escape the path.
+const SINGBOX_GEOSITE_TAG_RE = /^[a-z0-9][a-z0-9@!-]{0,47}$/;
+// sing-geoip publishes ISO country codes only — provider lists such as
+// `telegram` exist in Xray's geoip.dat but not in SagerNet/sing-geoip .srs.
+const SINGBOX_GEOIP_TAG_RE = /^[a-z]{2}$/;
+
+function _singboxRuleSetTag(type, rawValue) {
+    const value = String(rawValue || '').trim().toLowerCase();
+    if (!value) return null;
+    if (type === 'geosite') {
+        const mapped = SINGBOX_GEOSITE_ALIASES[value] || value;
+        return SINGBOX_GEOSITE_TAG_RE.test(mapped) ? `geosite-${mapped}` : null;
+    }
+    if (type === 'geoip' && SINGBOX_GEOIP_TAG_RE.test(value)) {
+        return `geoip-${value}`;
+    }
+    return null;
+}
+
 /**
  * Convert routing rules to sing-box 1.13+ route.rules entries.
  * geosite/geoip replaced with rule_set references (removed in sing-box 1.12).
@@ -739,24 +767,25 @@ function buildSingboxRules(rules) {
             case 'domain_suffix':  rule.domain_suffix  = b.values; break;
             case 'domain_keyword': rule.domain_keyword = b.values; break;
             case 'domain':         rule.domain         = b.values; break;
-            case 'geosite':
-                rule.rule_set = b.values.map(v => {
-                    const tag = `geosite-${v}`;
-                    ruleSetTags.add(tag);
-                    return tag;
-                });
+            case 'geosite': {
+                const tags = b.values.map(v => _singboxRuleSetTag('geosite', v)).filter(Boolean);
+                if (tags.length === 0) return null;
+                tags.forEach(tag => ruleSetTags.add(tag));
+                rule.rule_set = tags;
                 break;
-            case 'geoip':
-                rule.rule_set = b.values.map(v => {
-                    const tag = `geoip-${v}`;
-                    ruleSetTags.add(tag);
-                    return tag;
-                });
+            }
+            case 'geoip': {
+                const tags = b.values.map(v => _singboxRuleSetTag('geoip', v)).filter(Boolean);
+                if (tags.length === 0) return null;
+                tags.forEach(tag => ruleSetTags.add(tag));
+                rule.rule_set = tags;
                 break;
+            }
             case 'ip_cidr':        rule.ip_cidr        = b.values; break;
+            default: return null;
         }
         return rule;
-    });
+    }).filter(Boolean);
 
     const ruleSets = [...ruleSetTags].map(tag => {
         const isGeoip = tag.startsWith('geoip-');
@@ -782,7 +811,7 @@ function buildSingboxDns(rules, dns) {
     const remoteAddr   = getRoutingRemoteDns(dns);
     const ruleSetTags = new Set();
 
-    const remoteServer = _parseSingboxDnsServer(remoteAddr, 'dns-remote', 'dns-local');
+    const remoteServer = _parseSingboxDnsServer(remoteAddr, 'dns-remote', 'dns-local', 'proxy');
     const servers = [
         remoteServer,
         { type: 'udp', tag: 'dns-direct', server: domesticAddr, detour: 'direct' },
@@ -796,7 +825,8 @@ function buildSingboxDns(rules, dns) {
         if (!r.enabled || r.action !== 'direct') continue;
         if (r.type === 'domain_suffix') suffixes.push(r.value);
         if (r.type === 'geosite') {
-            const tag = `geosite-${r.value}`;
+            const tag = _singboxRuleSetTag('geosite', r.value);
+            if (!tag) continue;
             geositeTags.push(tag);
             ruleSetTags.add(tag);
         }
@@ -816,22 +846,28 @@ function buildSingboxDns(rules, dns) {
 
 /**
  * Parse a DNS address string into a sing-box 1.12+ typed server object.
+ * `detour` is applied to encrypted servers only (DoT/DoH): without it sing-box
+ * dials them from the physical interface, which DPI-heavy ISPs commonly drop,
+ * leaving the tunnel up while name resolution silently fails.
  */
-function _parseSingboxDnsServer(addr, tag, domainResolver) {
-    if (addr.startsWith('tls://')) {
-        const server = { type: 'tls', tag, server: addr.slice(6) };
+function _parseSingboxDnsServer(addr, tag, domainResolver, detour) {
+    const value = String(addr || '').trim();
+    if (value.startsWith('tls://')) {
+        const server = { type: 'tls', tag, server: value.slice(6) };
         if (domainResolver) server.domain_resolver = domainResolver;
+        if (detour) server.detour = detour;
         return server;
     }
-    if (addr.startsWith('https://')) {
+    if (value.startsWith('https://')) {
         try {
-            const url = new URL(addr);
+            const url = new URL(value);
             const server = { type: 'https', tag, server: url.hostname };
             if (domainResolver) server.domain_resolver = domainResolver;
+            if (detour) server.detour = detour;
             return server;
         } catch { /* fall through */ }
     }
-    const server = { type: 'udp', tag, server: addr };
+    const server = { type: 'udp', tag, server: value };
     if (domainResolver) server.domain_resolver = domainResolver;
     return server;
 }
@@ -1134,8 +1170,9 @@ function generateClashYAML(user, nodes, routing) {
         yaml += virtualGroups.join('\n') + '\n';
     }
 
-    if (routing && routing.enabled && routing.rules && routing.rules.length > 0) {
-        const clashDns = buildClashDns(routing.rules, routing.dns);
+    if (routing && routing.enabled) {
+        const routingRules = Array.isArray(routing.rules) ? routing.rules : [];
+        const clashDns = buildClashDns(routingRules, routing.dns);
         const dnsLines = ['dns:', '  enable: true', '  ipv6: false'];
         dnsLines.push(`  default-nameserver:\n    - ${clashDns['default-nameserver'][0]}`);
         dnsLines.push(`  nameserver:\n    - ${clashDns.nameserver[0]}`);
@@ -1148,7 +1185,7 @@ function generateClashYAML(user, nodes, routing) {
         }
         yaml += '\n' + dnsLines.join('\n') + '\n';
 
-        const clashRules = buildClashRules(routing.rules);
+        const clashRules = buildClashRules(routingRules);
         if (clashRules.length > 0) {
             yaml += '\nrules:\n';
             yaml += clashRules.map(r => `  - ${r}`).join('\n') + '\n';
@@ -1687,24 +1724,16 @@ function generateSingboxJSON(user, nodes, routing) {
     ];
 
     const allRuleSets = [];
-    const hasRouting = routing && routing.enabled && routing.rules && routing.rules.length > 0;
+    const routingEnabled = !!(routing && routing.enabled);
+    const routingRules = routingEnabled && Array.isArray(routing.rules) ? routing.rules : [];
+    const hasRoutingRules = routingRules.length > 0;
 
-    // Build sing-box DNS section (split DNS when routing enabled)
-    let dnsSection;
-    if (hasRouting) {
-        const dnsResult = buildSingboxDns(routing.rules, routing.dns);
-        dnsSection = { servers: dnsResult.servers, rules: dnsResult.rules, final: dnsResult.final };
-        allRuleSets.push(...dnsResult.ruleSets);
-    } else {
-        dnsSection = {
-            servers: [
-                { type: 'tls', tag: 'dns-remote', server: '8.8.8.8', domain_resolver: 'dns-local' },
-                { type: 'udp', tag: 'dns-local', server: '223.5.5.5', detour: 'direct' },
-            ],
-            rules: [],
-            final: 'dns-remote',
-        };
-    }
+    // Always build a DNS section from the selected resolver. When routing is
+    // enabled with zero split rules, this still keeps encrypted DNS in the
+    // tunnel instead of falling back to upstream's old physical-interface DNS.
+    const dnsResult = buildSingboxDns(routingRules, routingEnabled ? routing.dns : null);
+    const dnsSection = { servers: dnsResult.servers, rules: dnsResult.rules, final: dnsResult.final };
+    allRuleSets.push(...dnsResult.ruleSets);
 
     // Build route.rules using 1.13+ action format
     const routeRules = [
@@ -1712,8 +1741,8 @@ function generateSingboxJSON(user, nodes, routing) {
         { inbound: 'tun-in', action: 'sniff' },
         { ip_is_private: true, action: 'route', outbound: 'direct' },
     ];
-    if (hasRouting) {
-        const routeResult = buildSingboxRules(routing.rules);
+    if (hasRoutingRules) {
+        const routeResult = buildSingboxRules(routingRules);
         routeRules.push(...routeResult.rules);
         allRuleSets.push(...routeResult.ruleSets);
     }
@@ -1740,6 +1769,10 @@ function generateSingboxJSON(user, nodes, routing) {
             rules: routeRules,
             final: 'proxy',
             auto_detect_interface: true,
+            // Resolver for outbound server addresses (sing-box 1.12+). It must
+            // be a plain direct server: resolving the proxy node hostname
+            // through the tunnel cannot work before the tunnel itself is up.
+            default_domain_resolver: routingEnabled ? 'dns-direct' : 'dns-local',
         },
     };
 
@@ -3147,5 +3180,10 @@ module.exports.rejectOrSoftBlock = rejectOrSoftBlock;
 module.exports._test = {
     buildHappRoutingProfile,
     buildXrayDns,
+    buildSingboxDns,
+    buildSingboxRules,
+    buildClashDns,
+    generateSingboxJSON,
+    generateClashYAML,
     getDohBootstrapIp,
 };
