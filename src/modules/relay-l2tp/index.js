@@ -2,6 +2,8 @@
 
 const manifest = require('./manifest.json');
 
+let routesRegistered = false;
+
 function validateHost(hostCapabilities, candidateManifest = manifest) {
     return candidateManifest;
 }
@@ -33,9 +35,47 @@ function registerConfigFragments({ configFragmentRegistry }) {
     return buildL2tpXrayFragment;
 }
 
+function registerRoutes(context) {
+    if (routesRegistered) {
+        throw new Error('registerRoutes has already been called');
+    }
+    if (!context || typeof context !== 'object') {
+        throw new TypeError('registerRoutes context is required');
+    }
+
+    const { panelRouter, l2tpService, requireAuth, csrf, rateLimiter } = context;
+    if (!panelRouter || typeof panelRouter.use !== 'function') {
+        throw new TypeError('registerRoutes requires panelRouter');
+    }
+    if (!l2tpService) {
+        throw new TypeError('registerRoutes requires l2tpService');
+    }
+    if (typeof requireAuth !== 'function') {
+        throw new TypeError('registerRoutes requires requireAuth');
+    }
+    if (typeof csrf !== 'function') {
+        throw new TypeError('registerRoutes requires csrf');
+    }
+    if (typeof rateLimiter !== 'function') {
+        throw new TypeError('registerRoutes requires rateLimiter');
+    }
+
+    routesRegistered = true;
+    const { createL2tpRouter } = require('./routes/panel');
+    const l2tpRouter = createL2tpRouter({
+        l2tpService,
+        requireAuth,
+        csrf,
+        rateLimiter,
+    });
+
+    panelRouter.use('/', l2tpRouter);
+}
+
 module.exports = {
     manifest,
     validateHost,
     registerModels,
     registerConfigFragments,
+    registerRoutes,
 };

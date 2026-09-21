@@ -11,6 +11,7 @@ const LIFECYCLE_EXPORTS = [
     'validateHost',
     'registerModels',
     'registerConfigFragments',
+    'registerRoutes',
 ];
 
 test('imports the lifecycle entry without loading runtime integrations', () => {
@@ -62,6 +63,180 @@ test('imports the lifecycle entry without loading runtime integrations', () => {
     assert.equal(importResult.status, 0, importResult.stderr);
     assert.equal(importResult.stdout, '');
     assert.equal(importResult.stderr, '');
+});
+
+test('registerRoutes mounts the existing panel router with only injected dependencies', () => {
+    const registrationResult = spawnSync(
+        process.execPath,
+        ['--eval', `
+            const assert = require('node:assert/strict');
+            const Module = require('node:module');
+            const entryPath = ${JSON.stringify(ENTRY_PATH)};
+            const originalLoad = Module._load;
+            const l2tpRouter = { kind: 'l2tp-router' };
+            const factoryCalls = [];
+
+            Module._load = function guardedLoad(request, parent, isMain) {
+                if (request === './routes/panel' && parent?.filename === entryPath) {
+                    return {
+                        createL2tpRouter(dependencies) {
+                            factoryCalls.push(dependencies);
+                            return l2tpRouter;
+                        },
+                    };
+                }
+                assert.equal(
+                    /(?:^|\\/)services(?:\\/|$)|(?:^|\\/)workers(?:\\/|$)/.test(request),
+                    false,
+                    'registerRoutes loaded a service or worker: ' + request,
+                );
+                return originalLoad.call(this, request, parent, isMain);
+            };
+
+            const entry = require(entryPath);
+            const mounts = [];
+            const context = {
+                panelRouter: {
+                    use(...args) {
+                        mounts.push(args);
+                    },
+                },
+                l2tpService: { kind: 'injected-service' },
+                requireAuth() {},
+                csrf() {},
+                rateLimiter() {},
+            };
+
+            entry.registerRoutes(context);
+
+            assert.deepEqual(factoryCalls, [{
+                l2tpService: context.l2tpService,
+                requireAuth: context.requireAuth,
+                csrf: context.csrf,
+                rateLimiter: context.rateLimiter,
+            }]);
+            assert.deepEqual(mounts, [['/', l2tpRouter]]);
+        `],
+        {
+            encoding: 'utf8',
+            timeout: 1_000,
+        },
+    );
+
+    assert.equal(registrationResult.error, undefined);
+    assert.equal(registrationResult.signal, null);
+    assert.equal(registrationResult.status, 0, registrationResult.stderr);
+    assert.equal(registrationResult.stdout, '');
+    assert.equal(registrationResult.stderr, '');
+});
+
+test('registerRoutes rejects every missing injected dependency before creating a router', () => {
+    const validationResult = spawnSync(
+        process.execPath,
+        ['--eval', `
+            const assert = require('node:assert/strict');
+            const Module = require('node:module');
+            const entryPath = ${JSON.stringify(ENTRY_PATH)};
+            const originalLoad = Module._load;
+            let factoryCalls = 0;
+
+            Module._load = function guardedLoad(request, parent, isMain) {
+                if (request === './routes/panel' && parent?.filename === entryPath) {
+                    return {
+                        createL2tpRouter() {
+                            factoryCalls += 1;
+                            return {};
+                        },
+                    };
+                }
+                return originalLoad.call(this, request, parent, isMain);
+            };
+
+            const entry = require(entryPath);
+            const baseContext = {
+                panelRouter: { use() {} },
+                l2tpService: {},
+                requireAuth() {},
+                csrf() {},
+                rateLimiter() {},
+            };
+
+            assert.throws(() => entry.registerRoutes(), /context/i);
+            for (const dependencyName of Object.keys(baseContext)) {
+                const context = { ...baseContext };
+                delete context[dependencyName];
+                assert.throws(
+                    () => entry.registerRoutes(context),
+                    new RegExp(dependencyName, 'i'),
+                );
+            }
+            assert.equal(factoryCalls, 0);
+        `],
+        {
+            encoding: 'utf8',
+            timeout: 1_000,
+        },
+    );
+
+    assert.equal(validationResult.error, undefined);
+    assert.equal(validationResult.signal, null);
+    assert.equal(validationResult.status, 0, validationResult.stderr);
+    assert.equal(validationResult.stdout, '');
+    assert.equal(validationResult.stderr, '');
+});
+
+test('registerRoutes rejects a second call without creating or mounting another router', () => {
+    const duplicateResult = spawnSync(
+        process.execPath,
+        ['--eval', `
+            const assert = require('node:assert/strict');
+            const Module = require('node:module');
+            const entryPath = ${JSON.stringify(ENTRY_PATH)};
+            const originalLoad = Module._load;
+            let factoryCalls = 0;
+
+            Module._load = function guardedLoad(request, parent, isMain) {
+                if (request === './routes/panel' && parent?.filename === entryPath) {
+                    return {
+                        createL2tpRouter() {
+                            factoryCalls += 1;
+                            return {};
+                        },
+                    };
+                }
+                return originalLoad.call(this, request, parent, isMain);
+            };
+
+            const entry = require(entryPath);
+            let mountCalls = 0;
+            const context = {
+                panelRouter: {
+                    use() {
+                        mountCalls += 1;
+                    },
+                },
+                l2tpService: {},
+                requireAuth() {},
+                csrf() {},
+                rateLimiter() {},
+            };
+
+            entry.registerRoutes(context);
+            assert.throws(() => entry.registerRoutes(context), /already|twice|once/i);
+            assert.equal(factoryCalls, 1);
+            assert.equal(mountCalls, 1);
+        `],
+        {
+            encoding: 'utf8',
+            timeout: 1_000,
+        },
+    );
+
+    assert.equal(duplicateResult.error, undefined);
+    assert.equal(duplicateResult.signal, null);
+    assert.equal(duplicateResult.status, 0, duplicateResult.stderr);
+    assert.equal(duplicateResult.stdout, '');
+    assert.equal(duplicateResult.stderr, '');
 });
 
 test('registerModels returns the module model constructors without a registry hook', () => {

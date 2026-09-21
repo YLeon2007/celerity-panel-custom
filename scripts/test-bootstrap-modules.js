@@ -44,6 +44,7 @@ test('imports the relay-l2tp entry without startup or worker side effects', () =
         'validateHost',
         'registerModels',
         'registerConfigFragments',
+        'registerRoutes',
     ]);
 
     const entryPath = require.resolve('../src/modules/relay-l2tp');
