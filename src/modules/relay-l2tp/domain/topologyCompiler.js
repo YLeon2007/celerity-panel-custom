@@ -30,8 +30,13 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
                     nextHopNodeId: pathLinks[index].target,
                     suffixLinks: pathLinks.slice(index).map(link => ({ ...link })),
                 };
-                const relay = relaysByNodeId.get(nodeId) || { nodeId, candidates: [] };
-                relay.candidates.push(candidate);
+                const relay = relaysByNodeId.get(nodeId) || { nodeId, routeGroups: [] };
+                let routeGroup = relay.routeGroups.find(entry => entry.groupId === groupId);
+                if (!routeGroup) {
+                    routeGroup = { groupId, candidates: [] };
+                    relay.routeGroups.push(routeGroup);
+                }
+                routeGroup.candidates.push(candidate);
                 relaysByNodeId.set(nodeId, relay);
             }
         }
@@ -40,33 +45,41 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
     const relays = [...relaysByNodeId.values()]
         .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
     for (const relay of relays) {
-        relay.candidates.sort((left, right) =>
-            left.groupId.localeCompare(right.groupId)
-            || left.pathKey.localeCompare(right.pathKey)
-        );
+        relay.routeGroups.sort((left, right) => left.groupId.localeCompare(right.groupId));
 
-        const selection = selectActivePath(
-            relay.candidates.map(candidate => ({
-                key: candidate.pathKey,
-                priority: candidate.priority,
-                enabled: true,
-                complete: !validation.errors.some(error =>
-                    error.groupId === candidate.groupId && error.pathKey === candidate.pathKey
-                ),
-            })),
-            healthByPathKey,
-        );
-        if (selection.decision === 'select') {
-            const selectedCandidate = relay.candidates.find(
-                candidate => candidate.pathKey === selection.pathKey
+        for (const routeGroup of relay.routeGroups) {
+            routeGroup.candidates.sort((left, right) =>
+                left.pathKey.localeCompare(right.pathKey)
             );
-            relay.decision = {
-                ...selection,
-                groupId: selectedCandidate.groupId,
-                nextHopNodeId: selectedCandidate.nextHopNodeId,
-            };
-        } else {
-            relay.decision = selection;
+            const groupHealthByPathKey = Object.fromEntries(
+                routeGroup.candidates.map(candidate => [
+                    candidate.pathKey,
+                    healthByPathKey[`${routeGroup.groupId}:${candidate.pathKey}`],
+                ])
+            );
+            const selection = selectActivePath(
+                routeGroup.candidates.map(candidate => ({
+                    key: candidate.pathKey,
+                    priority: candidate.priority,
+                    enabled: true,
+                    complete: !validation.errors.some(error =>
+                        error.groupId === routeGroup.groupId && error.pathKey === candidate.pathKey
+                    ),
+                })),
+                groupHealthByPathKey,
+            );
+            if (selection.decision === 'select') {
+                const selectedCandidate = routeGroup.candidates.find(
+                    candidate => candidate.pathKey === selection.pathKey
+                );
+                routeGroup.decision = {
+                    ...selection,
+                    groupId: routeGroup.groupId,
+                    nextHopNodeId: selectedCandidate.nextHopNodeId,
+                };
+            } else {
+                routeGroup.decision = selection;
+            }
         }
     }
 

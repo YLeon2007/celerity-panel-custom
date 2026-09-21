@@ -37,7 +37,7 @@ function routeGroupContractTopology() {
                 priority: 10,
             }],
         }],
-        healthByPathKey: { primary: true },
+        healthByPathKey: { [`${GROUP_ID}:primary`]: true },
     };
 }
 
@@ -51,9 +51,10 @@ test('resolves ordered route-group linkIds into relay suffixes and a scoped deci
 
     const compiled = compileTopology(topology);
     const relay = compiled.relays.find(candidate => candidate.nodeId === RELAY_1_ID);
+    const routeGroup = relay.routeGroups.find(entry => entry.groupId === GROUP_ID);
 
     assert.equal(compiled.valid, true);
-    assert.deepEqual(relay.candidates, [{
+    assert.deepEqual(routeGroup.candidates, [{
         groupId: GROUP_ID,
         pathKey: 'primary',
         priority: 10,
@@ -63,8 +64,8 @@ test('resolves ordered route-group linkIds into relay suffixes and a scoped deci
             { id: RELAY_BRIDGE_LINK_ID, source: RELAY_2_ID, target: BRIDGE_ID, mode: 'forward' },
         ],
     }]);
-    assert.equal(relay.candidates[0].suffixLinks.some(link => link.id === PORTAL_RELAY_LINK_ID), false);
-    assert.deepEqual(relay.decision, {
+    assert.equal(routeGroup.candidates[0].suffixLinks.some(link => link.id === PORTAL_RELAY_LINK_ID), false);
+    assert.deepEqual(routeGroup.decision, {
         decision: 'select',
         groupId: GROUP_ID,
         pathKey: 'primary',
@@ -95,7 +96,7 @@ function singlePathTopology() {
                 priority: 10,
             }],
         }],
-        healthByPathKey: { 'path-primary': true },
+        healthByPathKey: { 'group-primary:path-primary': true },
     };
 }
 
@@ -114,16 +115,17 @@ function twoPathTopology() {
         linkIds: ['portal-relay-1', 'relay-1-relay-3', 'relay-3-bridge-2'],
         priority: 20,
     });
-    topology.healthByPathKey['path-secondary'] = true;
+    topology.healthByPathKey['group-primary:path-secondary'] = true;
     return topology;
 }
 
 test('compiles a relay candidate from only its downstream L2TP suffix', () => {
     const compiled = compileTopology(singlePathTopology());
     const relay = compiled.relays.find(candidate => candidate.nodeId === 'relay-1');
+    const routeGroup = relay.routeGroups.find(entry => entry.groupId === 'group-primary');
 
     assert.equal(compiled.valid, true);
-    assert.deepEqual(relay.candidates, [{
+    assert.deepEqual(routeGroup.candidates, [{
         groupId: 'group-primary',
         pathKey: 'path-primary',
         priority: 10,
@@ -133,14 +135,15 @@ test('compiles a relay candidate from only its downstream L2TP suffix', () => {
             { id: 'relay-2-bridge-1', source: 'relay-2', target: 'bridge-1', mode: 'forward' },
         ],
     }]);
-    assert.equal(relay.candidates[0].suffixLinks.some(link => link.id === 'portal-relay-1'), false);
+    assert.equal(routeGroup.candidates[0].suffixLinks.some(link => link.id === 'portal-relay-1'), false);
 });
 
 test('selects the healthy lowest-priority candidate and declares its next hop', () => {
     const compiled = compileTopology(twoPathTopology());
     const relay = compiled.relays.find(candidate => candidate.nodeId === 'relay-1');
+    const routeGroup = relay.routeGroups.find(entry => entry.groupId === 'group-primary');
 
-    assert.deepEqual(relay.decision, {
+    assert.deepEqual(routeGroup.decision, {
         decision: 'select',
         groupId: 'group-primary',
         pathKey: 'path-primary',
@@ -151,21 +154,113 @@ test('selects the healthy lowest-priority candidate and declares its next hop', 
 test('blocks fail-closed when no candidate is healthy', () => {
     const topology = twoPathTopology();
     topology.healthByPathKey = {
-        'path-primary': false,
-        'path-secondary': false,
+        'group-primary:path-primary': false,
+        'group-primary:path-secondary': false,
     };
     const compiled = compileTopology(topology);
     const relay = compiled.relays.find(candidate => candidate.nodeId === 'relay-1');
+    const routeGroup = relay.routeGroups.find(entry => entry.groupId === 'group-primary');
 
-    assert.deepEqual(relay.decision, {
+    assert.deepEqual(routeGroup.decision, {
         decision: 'block',
         error: { code: 'NO_HEALTHY_PATH' },
     });
 });
 
+function twoGroupSharedPathKeyTopology() {
+    return {
+        nodes: [
+            { id: 'portal-1', role: 'portal' },
+            { id: 'relay-1', role: 'relay' },
+            { id: 'relay-a', role: 'relay' },
+            { id: 'relay-b', role: 'relay' },
+            { id: 'bridge-a', role: 'bridge' },
+            { id: 'bridge-b', role: 'bridge' },
+        ],
+        links: [
+            { id: 'relay-b-bridge-b', source: 'relay-b', target: 'bridge-b', mode: 'forward' },
+            { id: 'relay-1-relay-a', source: 'relay-1', target: 'relay-a', mode: 'forward' },
+            { id: 'portal-relay-1', source: 'portal-1', target: 'relay-1', mode: 'forward' },
+            { id: 'relay-a-bridge-a', source: 'relay-a', target: 'bridge-a', mode: 'forward' },
+            { id: 'relay-1-relay-b', source: 'relay-1', target: 'relay-b', mode: 'forward' },
+        ],
+        groups: [
+            {
+                _id: 'group-b',
+                mode: 'forward',
+                strategy: 'priority-failover',
+                paths: [{
+                    pathKey: 'primary',
+                    linkIds: ['portal-relay-1', 'relay-1-relay-b', 'relay-b-bridge-b'],
+                    priority: 20,
+                }],
+            },
+            {
+                _id: 'group-a',
+                mode: 'forward',
+                strategy: 'priority-failover',
+                paths: [{
+                    pathKey: 'primary',
+                    linkIds: ['portal-relay-1', 'relay-1-relay-a', 'relay-a-bridge-a'],
+                    priority: 10,
+                }],
+            },
+        ],
+        healthByPathKey: {
+            'group-a:primary': true,
+            'group-b:primary': false,
+        },
+    };
+}
+
+test('isolates same-named paths by route group with scoped health decisions', () => {
+    const compiled = compileTopology(twoGroupSharedPathKeyTopology());
+    const relay = compiled.relays.find(candidate => candidate.nodeId === 'relay-1');
+
+    assert.equal(compiled.valid, true);
+    assert.deepEqual(relay.routeGroups, [
+        {
+            groupId: 'group-a',
+            candidates: [{
+                groupId: 'group-a',
+                pathKey: 'primary',
+                priority: 10,
+                nextHopNodeId: 'relay-a',
+                suffixLinks: [
+                    { id: 'relay-1-relay-a', source: 'relay-1', target: 'relay-a', mode: 'forward' },
+                    { id: 'relay-a-bridge-a', source: 'relay-a', target: 'bridge-a', mode: 'forward' },
+                ],
+            }],
+            decision: {
+                decision: 'select',
+                groupId: 'group-a',
+                pathKey: 'primary',
+                nextHopNodeId: 'relay-a',
+            },
+        },
+        {
+            groupId: 'group-b',
+            candidates: [{
+                groupId: 'group-b',
+                pathKey: 'primary',
+                priority: 20,
+                nextHopNodeId: 'relay-b',
+                suffixLinks: [
+                    { id: 'relay-1-relay-b', source: 'relay-1', target: 'relay-b', mode: 'forward' },
+                    { id: 'relay-b-bridge-b', source: 'relay-b', target: 'bridge-b', mode: 'forward' },
+                ],
+            }],
+            decision: {
+                decision: 'block',
+                error: { code: 'NO_HEALTHY_PATH' },
+            },
+        },
+    ]);
+});
+
 test('produces deep-equal IR when input link order is permuted', () => {
-    const original = twoPathTopology();
-    const permuted = twoPathTopology();
+    const original = twoGroupSharedPathKeyTopology();
+    const permuted = twoGroupSharedPathKeyTopology();
     permuted.links.reverse();
 
     assert.deepEqual(compileTopology(permuted), compileTopology(original));
