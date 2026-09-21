@@ -11,6 +11,19 @@ const appConfig = require('../../config');
 // Canonical on-node path for the Xray access log when the opt-in access-logs
 // module is enabled. The cc-agent tails exactly this file.
 const XRAY_ACCESS_LOG_PATH = '/var/log/xray/access.log';
+const REALITY_SHORT_ID_RE = /^[0-9a-f]{0,16}$/i;
+
+function validatedRealityShortIds(rawShortIds, source) {
+    const shortIds = Array.isArray(rawShortIds) && rawShortIds.length > 0
+        ? rawShortIds
+        : [''];
+    if (!shortIds.every(id => typeof id === 'string' && REALITY_SHORT_ID_RE.test(id))) {
+        const error = new Error(`Invalid Reality short ID in ${source}`);
+        error.code = 'INVALID_REALITY_SHORT_ID';
+        throw error;
+    }
+    return shortIds;
+}
 
 // Build the Xray `log` section. When per-node access logging is enabled we write
 // an explicit access-file path; otherwise we explicitly disable it with "none"
@@ -586,9 +599,7 @@ function buildXrayStreamSettings(inbound, node = {}) {
                 ? inbound.realitySni
                 : ['www.google.com'],
             privateKey: inbound.realityPrivateKey || '',
-            shortIds: inbound.realityShortIds && inbound.realityShortIds.length > 0
-                ? inbound.realityShortIds
-                : [''],
+            shortIds: validatedRealityShortIds(inbound.realityShortIds, 'Xray inbound'),
         };
         // spiderX is a client-side hint (only consumed by REALITY's UClient on
         // failed verification). Emit the field only when explicitly set so an
@@ -1452,7 +1463,7 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
                 dest: link.realityDest || 'www.google.com:443',
                 serverNames: realityServerNames,
                 privateKey: link.realityPrivateKey || '',
-                shortIds: link.realityShortIds?.length ? link.realityShortIds : [''],
+                shortIds: validatedRealityShortIds(link.realityShortIds, 'cascade link'),
             };
         } else {
             stream.realitySettings = {
