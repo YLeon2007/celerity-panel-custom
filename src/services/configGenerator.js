@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const appConfig = require('../../config');
+const { composeXrayConfig } = require('../modules/relay-l2tp/services/xrayConfigComposer');
 
 // Canonical on-node path for the Xray access log when the opt-in access-logs
 // module is enabled. The cc-agent tails exactly this file.
@@ -743,9 +744,12 @@ function buildVlessInbound(inbound, users, node) {
  * Generate Xray JSON config for a node with all its users
  * @param {Object} node - Node document (with xray sub-object)
  * @param {Array} users - Array of user documents (with xrayUuid)
+ * @param {Object} [options] - Additional generation options
+ * @param {Array<Object>} [options.fragments] - Canonical Xray config fragments
  * @returns {string} JSON string
  */
-function generateXrayConfig(node, users) {
+function generateXrayConfig(node, users, options = {}) {
+    const { fragments = [] } = options;
     const xray = node.xray || {};
     const apiPort = xray.apiPort || 61000;
     const mainInboundTag = xray.inboundTag || 'vless-in';
@@ -925,7 +929,10 @@ function generateXrayConfig(node, users) {
 
     // geoip:private block is added later by ensurePrivateIpBlock() after cascade rules
 
-    return JSON.stringify(config, null, 2);
+    const finalConfig = Array.isArray(fragments) && fragments.length === 0
+        ? config
+        : composeXrayConfig(config, fragments);
+    return JSON.stringify(finalConfig, null, 2);
 }
 
 /**
