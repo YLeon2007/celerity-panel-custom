@@ -16,7 +16,16 @@ function validTopology() {
             { id: 'relay-bridge', source: 'relay-1', target: 'bridge-1', mode: 'forward' },
         ],
         groups: [
-            { id: 'path-1', nodeIds: ['portal-1', 'relay-1', 'bridge-1'] },
+            {
+                _id: 'group-1',
+                mode: 'forward',
+                strategy: 'priority-failover',
+                paths: [{
+                    pathKey: 'path-1',
+                    linkIds: ['portal-relay', 'relay-bridge'],
+                    priority: 10,
+                }],
+            },
         ],
     };
 }
@@ -30,15 +39,16 @@ test('accepts an ordered Portal -> Relay -> Bridge path', () => {
 
 test('rejects a discontinuous ordered path with a structured code', () => {
     const topology = validTopology();
-    topology.links = topology.links.filter(link => link.id !== 'relay-bridge');
+    topology.links[1].source = 'bridge-2';
 
     assert.deepEqual(validateTopology(topology), {
         valid: false,
         errors: [{
             code: 'DISCONTINUOUS_PATH',
-            groupId: 'path-1',
+            groupId: 'group-1',
+            pathKey: 'path-1',
             sourceNodeId: 'relay-1',
-            targetNodeId: 'bridge-1',
+            targetNodeId: 'bridge-2',
         }],
     });
 });
@@ -51,7 +61,8 @@ test('rejects mixed forward and reverse links in one path', () => {
         valid: false,
         errors: [{
             code: 'MIXED_LINK_MODES',
-            groupId: 'path-1',
+            groupId: 'group-1',
+            pathKey: 'path-1',
             modes: ['forward', 'reverse'],
         }],
     });
@@ -65,12 +76,14 @@ test('rejects a self-loop in a path', () => {
         target: 'relay-1',
         mode: 'forward',
     });
+    topology.groups[0].paths[0].linkIds.splice(1, 0, 'relay-loop');
 
     assert.deepEqual(validateTopology(topology), {
         valid: false,
         errors: [{
             code: 'SELF_LOOP',
-            groupId: 'path-1',
+            groupId: 'group-1',
+            pathKey: 'path-1',
             linkId: 'relay-loop',
             nodeId: 'relay-1',
         }],
@@ -85,12 +98,14 @@ test('rejects a cycle in a path', () => {
         target: 'portal-1',
         mode: 'forward',
     });
+    topology.groups[0].paths[0].linkIds.push('bridge-portal');
 
     assert.deepEqual(validateTopology(topology), {
         valid: false,
         errors: [{
             code: 'CYCLE_DETECTED',
-            groupId: 'path-1',
+            groupId: 'group-1',
+            pathKey: 'path-1',
         }],
     });
 });

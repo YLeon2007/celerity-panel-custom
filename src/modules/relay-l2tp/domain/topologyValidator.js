@@ -1,7 +1,7 @@
 'use strict';
 
-function hasDirectedCycle(nodeIds, links) {
-    const uniqueNodeIds = [...new Set(nodeIds)];
+function hasDirectedCycle(links) {
+    const uniqueNodeIds = [...new Set(links.flatMap(link => [link.source, link.target]))];
     const outgoing = new Map(uniqueNodeIds.map(nodeId => [nodeId, []]));
     const indegree = new Map(uniqueNodeIds.map(nodeId => [nodeId, 0]));
 
@@ -30,59 +30,59 @@ function hasDirectedCycle(nodeIds, links) {
 
 function validateTopology({ links = [], groups = [] } = {}) {
     const errors = [];
+    const linksById = new Map(links.map(link => [String(link.id), link]));
 
     for (const group of groups) {
-        const nodeIds = group.nodeIds || [];
-        const groupNodeIds = new Set(nodeIds);
-        const groupLinks = links.filter(link =>
-            groupNodeIds.has(link.source) && groupNodeIds.has(link.target)
-        );
-        const pathLinks = [];
+        const groupId = String(group._id ?? group.id);
 
-        for (const link of groupLinks) {
-            if (link.source === link.target) {
+        for (const path of group.paths || []) {
+            const pathKey = path.pathKey;
+            const pathLinks = (path.linkIds || [])
+                .map(linkId => linksById.get(String(linkId)))
+                .filter(Boolean);
+
+            for (const link of pathLinks) {
+                if (link.source !== link.target) continue;
                 errors.push({
                     code: 'SELF_LOOP',
-                    groupId: group.id,
+                    groupId,
+                    pathKey,
                     linkId: link.id,
                     nodeId: link.source,
                 });
             }
-        }
 
-        if (hasDirectedCycle(nodeIds, groupLinks)) {
-            errors.push({
-                code: 'CYCLE_DETECTED',
-                groupId: group.id,
-            });
-        }
+            if (hasDirectedCycle(pathLinks)) {
+                errors.push({
+                    code: 'CYCLE_DETECTED',
+                    groupId,
+                    pathKey,
+                });
+            }
 
-        for (let index = 0; index < nodeIds.length - 1; index += 1) {
-            const sourceNodeId = nodeIds[index];
-            const targetNodeId = nodeIds[index + 1];
-            const link = groupLinks.find(candidate =>
-                candidate.source === sourceNodeId && candidate.target === targetNodeId
-            );
+            for (let index = 0; index < pathLinks.length - 1; index += 1) {
+                const sourceNodeId = pathLinks[index].target;
+                const targetNodeId = pathLinks[index + 1].source;
 
-            if (!link) {
+                if (sourceNodeId === targetNodeId) continue;
                 errors.push({
                     code: 'DISCONTINUOUS_PATH',
-                    groupId: group.id,
+                    groupId,
+                    pathKey,
                     sourceNodeId,
                     targetNodeId,
                 });
-            } else {
-                pathLinks.push(link);
             }
-        }
 
-        const modes = [...new Set(pathLinks.map(link => link.mode))].sort();
-        if (modes.length > 1) {
-            errors.push({
-                code: 'MIXED_LINK_MODES',
-                groupId: group.id,
-                modes,
-            });
+            const modes = [...new Set(pathLinks.map(link => link.mode))].sort();
+            if (modes.length > 1) {
+                errors.push({
+                    code: 'MIXED_LINK_MODES',
+                    groupId,
+                    pathKey,
+                    modes,
+                });
+            }
         }
     }
 

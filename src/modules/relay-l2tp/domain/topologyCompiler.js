@@ -7,48 +7,52 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
     const orderedLinks = [...links]
         .sort((left, right) => String(left.id).localeCompare(String(right.id)));
     const validation = validateTopology({ nodes, links: orderedLinks, groups });
-    const nodesById = new Map(nodes.map(node => [node.id, node]));
-    const groupsById = new Map(groups.map(group => [group.id, group]));
+    const nodesById = new Map(nodes.map(node => [String(node.id), node]));
+    const linksById = new Map(orderedLinks.map(link => [String(link.id), link]));
     const relaysByNodeId = new Map();
 
     for (const group of groups) {
-        const nodeIds = group.nodeIds || [];
+        const groupId = String(group._id ?? group.id);
 
-        for (let index = 0; index < nodeIds.length - 1; index += 1) {
-            const nodeId = nodeIds[index];
-            if (nodesById.get(nodeId)?.role !== 'relay') continue;
+        for (const path of group.paths || []) {
+            const pathLinks = (path.linkIds || [])
+                .map(linkId => linksById.get(String(linkId)))
+                .filter(Boolean);
 
-            const suffixLinks = [];
-            for (let pairIndex = index; pairIndex < nodeIds.length - 1; pairIndex += 1) {
-                const link = orderedLinks.find(candidate =>
-                    candidate.source === nodeIds[pairIndex]
-                    && candidate.target === nodeIds[pairIndex + 1]
-                );
-                if (link) suffixLinks.push({ ...link });
+            for (let index = 0; index < pathLinks.length; index += 1) {
+                const nodeId = pathLinks[index].source;
+                if (nodesById.get(String(nodeId))?.role !== 'relay') continue;
+
+                const candidate = {
+                    groupId,
+                    pathKey: path.pathKey,
+                    priority: path.priority,
+                    nextHopNodeId: pathLinks[index].target,
+                    suffixLinks: pathLinks.slice(index).map(link => ({ ...link })),
+                };
+                const relay = relaysByNodeId.get(nodeId) || { nodeId, candidates: [] };
+                relay.candidates.push(candidate);
+                relaysByNodeId.set(nodeId, relay);
             }
-            const candidate = {
-                pathKey: group.id,
-                priority: group.priority,
-                nextHopNodeId: nodeIds[index + 1],
-                suffixLinks,
-            };
-            const relay = relaysByNodeId.get(nodeId) || { nodeId, candidates: [] };
-            relay.candidates.push(candidate);
-            relaysByNodeId.set(nodeId, relay);
         }
     }
 
     const relays = [...relaysByNodeId.values()]
         .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
     for (const relay of relays) {
-        relay.candidates.sort((left, right) => left.pathKey.localeCompare(right.pathKey));
+        relay.candidates.sort((left, right) =>
+            left.groupId.localeCompare(right.groupId)
+            || left.pathKey.localeCompare(right.pathKey)
+        );
 
         const selection = selectActivePath(
             relay.candidates.map(candidate => ({
                 key: candidate.pathKey,
                 priority: candidate.priority,
-                enabled: groupsById.get(candidate.pathKey)?.enabled === true,
-                complete: !validation.errors.some(error => error.groupId === candidate.pathKey),
+                enabled: true,
+                complete: !validation.errors.some(error =>
+                    error.groupId === candidate.groupId && error.pathKey === candidate.pathKey
+                ),
             })),
             healthByPathKey,
         );
@@ -58,6 +62,7 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
             );
             relay.decision = {
                 ...selection,
+                groupId: selectedCandidate.groupId,
                 nextHopNodeId: selectedCandidate.nextHopNodeId,
             };
         } else {
