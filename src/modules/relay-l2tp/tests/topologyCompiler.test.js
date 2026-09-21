@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { compileTopology } = require('../src/modules/relay-l2tp/domain/topologyCompiler');
+const { compileTopology } = require('../domain/topologyCompiler');
 
 function singlePathTopology() {
     return {
