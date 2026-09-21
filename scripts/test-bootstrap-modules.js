@@ -39,7 +39,12 @@ test('rejects a missing manifest capability before the entry lifecycle hook', ()
 });
 
 test('imports the relay-l2tp entry without startup or worker side effects', () => {
-    assert.deepEqual(Object.keys(relayL2tpEntry), ['manifest']);
+    assert.deepEqual(Object.keys(relayL2tpEntry), [
+        'manifest',
+        'validateHost',
+        'registerModels',
+        'registerConfigFragments',
+    ]);
 
     const entryPath = require.resolve('../src/modules/relay-l2tp');
     const importResult = spawnSync(
