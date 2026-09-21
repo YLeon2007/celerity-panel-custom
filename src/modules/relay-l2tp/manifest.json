@@ -1,0 +1,8 @@
+{
+  "id": "relay-l2tp",
+  "version": "0.1.0",
+  "moduleApiVersion": 1,
+  "requiredCapabilities": [
+    "ssh"
+  ]
+}
