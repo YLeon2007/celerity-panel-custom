@@ -43,6 +43,7 @@ test('imports the relay-l2tp entry without startup or worker side effects', () =
         'manifest',
         'validateHost',
         'registerModels',
+        'registerMigrations',
         'registerConfigFragments',
         'registerRoutes',
     ]);

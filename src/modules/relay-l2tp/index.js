@@ -17,6 +17,7 @@ function registerModels({ modelRegistry } = {}) {
         L2tpOperation: require('./models/l2tpOperationModel'),
         TopologyOperation: require('./models/topologyOperationModel'),
         NodeOperationLock: require('./models/nodeOperationLockModel'),
+        RelayL2tpMigrationState: require('./models/relayL2tpMigrationStateModel'),
     };
 
     if (modelRegistry) {
@@ -26,6 +27,18 @@ function registerModels({ modelRegistry } = {}) {
     }
 
     return models;
+}
+
+function registerMigrations({ migrationRegistry } = {}) {
+    const migrations = require('./migrations').migrations;
+
+    if (migrationRegistry) {
+        for (const migration of migrations) {
+            migrationRegistry.register(manifest.id, migration);
+        }
+    }
+
+    return migrations;
 }
 
 function registerConfigFragments({ configFragmentRegistry }) {
@@ -102,6 +115,7 @@ module.exports = {
     manifest,
     validateHost,
     registerModels,
+    registerMigrations,
     registerConfigFragments,
     registerRoutes,
 };

@@ -10,6 +10,7 @@ const LIFECYCLE_EXPORTS = [
     'manifest',
     'validateHost',
     'registerModels',
+    'registerMigrations',
     'registerConfigFragments',
     'registerRoutes',
 ];
@@ -46,6 +47,7 @@ test('imports the lifecycle entry without loading runtime integrations', () => {
             assert.equal(
                 Object.keys(require.cache).some(cachePath => (
                     cachePath.includes('/relay-l2tp/models/')
+                    || cachePath.includes('/relay-l2tp/migrations/')
                     || cachePath.endsWith('/l2tpXrayFragmentProvider.js')
                 )),
                 false,
@@ -269,6 +271,7 @@ test('registerModels returns the module model constructors without a registry ho
         'L2tpOperation',
         'TopologyOperation',
         'NodeOperationLock',
+        'RelayL2tpMigrationState',
     ]);
 });
 
@@ -292,6 +295,7 @@ test('registerModels registers and returns the exact module model constructors',
         'L2tpOperation',
         'TopologyOperation',
         'NodeOperationLock',
+        'RelayL2tpMigrationState',
     ];
     const expectedModels = {
         RelayL2tpState: require('../models/relayL2tpStateModel'),
@@ -301,6 +305,7 @@ test('registerModels registers and returns the exact module model constructors',
         L2tpOperation: require('../models/l2tpOperationModel'),
         TopologyOperation: require('../models/topologyOperationModel'),
         NodeOperationLock: require('../models/nodeOperationLockModel'),
+        RelayL2tpMigrationState: require('../models/relayL2tpMigrationStateModel'),
     };
 
     assert.deepEqual(Object.keys(models), expectedNames);
@@ -309,6 +314,27 @@ test('registerModels registers and returns the exact module model constructors',
     }
     assert.deepEqual(registrations, Object.entries(expectedModels));
     assert.equal(mongoose.connection.readyState, connectionStateBefore);
+});
+
+test('registerMigrations lazily registers the ordered module migration registry', () => {
+    const entry = require('..');
+    const registrations = [];
+    const migrationRegistry = {
+        register(moduleId, migration) {
+            registrations.push([moduleId, migration]);
+        },
+    };
+
+    const migrations = entry.registerMigrations({ migrationRegistry });
+
+    assert.deepEqual(migrations.map(migration => migration.id), [
+        '001-ensure-module-indexes',
+    ]);
+    assert.deepEqual(registrations, migrations.map(migration => [
+        entry.manifest.id,
+        migration,
+    ]));
+    assert.strictEqual(entry.registerMigrations(), migrations);
 });
 
 test('registerConfigFragments registers only relay-l2tp with the existing fragment provider', () => {
