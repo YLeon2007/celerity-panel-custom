@@ -112,6 +112,18 @@ test('each route group path requires a positive finite numeric priority', () => 
     }
 });
 
+test('each route group path is enabled by default and accepts an explicit boolean', () => {
+    const defaultEnabled = routeGroup();
+    assert.equal(defaultEnabled.validateSync(), undefined);
+    assert.equal(defaultEnabled.paths[0].enabled, true);
+
+    const disabled = routeGroup({
+        paths: [{ pathKey: 'secondary', linkIds: [objectId()], priority: 2, enabled: false }],
+    });
+    assert.equal(disabled.validateSync(), undefined);
+    assert.equal(disabled.paths[0].enabled, false);
+});
+
 test('topology state uses a fixed singleton document identity', () => {
     const state = new CascadeTopologyState();
     assert.equal(state._id, 'singleton');

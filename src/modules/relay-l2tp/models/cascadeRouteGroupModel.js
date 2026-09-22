@@ -25,6 +25,7 @@ const routePathSchema = new mongoose.Schema({
             message: 'priority must be a positive finite number',
         },
     },
+    enabled: { type: Boolean, default: true },
 }, { _id: false });
 
 const cascadeRouteGroupSchema = new mongoose.Schema({

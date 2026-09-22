@@ -37,11 +37,33 @@ function validateTopology({ links = [], groups = [] } = {}) {
 
         for (const path of group.paths || []) {
             const pathKey = path.pathKey;
-            const pathLinks = (path.linkIds || [])
-                .map(linkId => linksById.get(String(linkId)))
-                .filter(Boolean);
+            const pathLinks = [];
+
+            for (const linkId of path.linkIds || []) {
+                const link = linksById.get(String(linkId));
+                if (link) {
+                    pathLinks.push(link);
+                    continue;
+                }
+                errors.push({
+                    code: 'UNKNOWN_LINK',
+                    groupId,
+                    pathKey,
+                    linkId: String(linkId),
+                });
+            }
 
             for (const link of pathLinks) {
+                if (group.mode && link.mode !== group.mode) {
+                    errors.push({
+                        code: 'GROUP_MODE_MISMATCH',
+                        groupId,
+                        pathKey,
+                        linkId: String(link.id),
+                        groupMode: group.mode,
+                        linkMode: link.mode,
+                    });
+                }
                 if (link.source !== link.target) continue;
                 errors.push({
                     code: 'SELF_LOOP',

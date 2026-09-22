@@ -53,6 +53,21 @@ test('rejects a discontinuous ordered path with a structured code', () => {
     });
 });
 
+test('rejects route-group paths that reference an unknown link', () => {
+    const topology = validTopology();
+    topology.groups[0].paths[0].linkIds.push('missing-link');
+
+    assert.deepEqual(validateTopology(topology), {
+        valid: false,
+        errors: [{
+            code: 'UNKNOWN_LINK',
+            groupId: 'group-1',
+            pathKey: 'path-1',
+            linkId: 'missing-link',
+        }],
+    });
+});
+
 test('rejects mixed forward and reverse links in one path', () => {
     const topology = validTopology();
     topology.links[1].mode = 'reverse';
@@ -60,11 +75,45 @@ test('rejects mixed forward and reverse links in one path', () => {
     assert.deepEqual(validateTopology(topology), {
         valid: false,
         errors: [{
+            code: 'GROUP_MODE_MISMATCH',
+            groupId: 'group-1',
+            pathKey: 'path-1',
+            linkId: 'relay-bridge',
+            groupMode: 'forward',
+            linkMode: 'reverse',
+        }, {
             code: 'MIXED_LINK_MODES',
             groupId: 'group-1',
             pathKey: 'path-1',
             modes: ['forward', 'reverse'],
         }],
+    });
+});
+
+test('rejects a path whose links all disagree with the route-group mode', () => {
+    const topology = validTopology();
+    topology.groups[0].mode = 'reverse';
+
+    assert.deepEqual(validateTopology(topology), {
+        valid: false,
+        errors: [
+            {
+                code: 'GROUP_MODE_MISMATCH',
+                groupId: 'group-1',
+                pathKey: 'path-1',
+                linkId: 'portal-relay',
+                groupMode: 'reverse',
+                linkMode: 'forward',
+            },
+            {
+                code: 'GROUP_MODE_MISMATCH',
+                groupId: 'group-1',
+                pathKey: 'path-1',
+                linkId: 'relay-bridge',
+                groupMode: 'reverse',
+                linkMode: 'forward',
+            },
+        ],
     });
 });
 
