@@ -349,6 +349,7 @@ test('claims an install once and resolves its PSK once before typed artifact upl
 });
 
 test('runs standalone sync_users with typed verification and finalizes before success', async () => {
+    const clock = createClock();
     const password = 'worker-jit-user-password';
     const operation = {
         id: 'operation-sync-users-9',
@@ -385,6 +386,7 @@ test('runs standalone sync_users with typed verification and finalizes before su
         return succeedClaimed.call(operationRepository, request);
     };
     const worker = createWorker(operationRepository, {
+        clock,
         userSnapshotResolver: async request => {
             snapshotCalls.push(request);
             assert.equal(
@@ -409,6 +411,7 @@ test('runs standalone sync_users with typed verification and finalizes before su
         userSyncReconciler: {
             async finalizeVerifiedSync(request) {
                 events.push({ method: 'finalizeVerifiedSync', request });
+                clock.advance(10_000);
                 return { ok: true };
             },
         },
@@ -486,6 +489,14 @@ test('runs standalone sync_users with typed verification and finalizes before su
         events.findIndex(event => event.method === 'finalizeVerifiedSync')
             < events.findIndex(event => event.method === 'succeedClaimed'),
     );
+    const success = operationRepository.calls.find(call => call.method === 'succeedClaimed');
+    assert.deepEqual({
+        now: success.request.now,
+        journalAt: success.request.journal.at,
+    }, {
+        now: new Date('2026-09-22T10:00:10.000Z'),
+        journalAt: new Date('2026-09-22T10:00:10.000Z'),
+    });
     assert.doesNotMatch(
         JSON.stringify({ operation, repositoryCalls: operationRepository.calls, result }),
         new RegExp(password),
@@ -1794,6 +1805,141 @@ test('does not report success when the terminal owner-and-lease CAS rejects', as
         )),
         false,
     );
+});
+
+test('rechecks the lease at the actual terminal time after reconciliation or finalization', async t => {
+    function makeLeaseAware(operation, clock) {
+        const operationRepository = createOperationRepository([operation]);
+        let leaseUntil = new Date(NOW.getTime() + 30_000);
+
+        operationRepository.renewLease = async request => {
+            operationRepository.calls.push({ method: 'renewLease', request });
+            const claimed = operationRepository.operations[0];
+            if (
+                claimed.status !== 'running'
+                || claimed.leaseOwner !== request.owner
+                || leaseUntil <= request.now
+            ) {
+                return false;
+            }
+            leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+            return true;
+        };
+        operationRepository.succeedClaimed = async request => {
+            operationRepository.calls.push({ method: 'succeedClaimed', request });
+            const claimed = operationRepository.operations[0];
+            if (
+                claimed.status !== 'running'
+                || claimed.leaseOwner !== request.owner
+                || leaseUntil <= request.now
+            ) {
+                return false;
+            }
+            claimed.status = 'succeeded';
+            return true;
+        };
+        return operationRepository;
+    }
+
+    await t.test('install reconciliation cannot succeed after the lease expires', async () => {
+        const clock = createClock();
+        const { operation } = createInstallOperation('operation-reconcile-expired');
+        const operationRepository = makeLeaseAware(operation, clock);
+        const worker = createWorker(operationRepository, {
+            clock,
+            operationMaterializer: materializeInstallOperation,
+            candidateService: {
+                async buildCandidate({ plan }) {
+                    return { operationId: plan.operationId, content: '{}' };
+                },
+            },
+            secretResolver: async () => ({ psk: 'in-memory-only', users: [] }),
+            stateReconciler: async () => {
+                clock.advance(30_001);
+                return { status: 'installed' };
+            },
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async renew() { return { ok: true }; },
+                async release() { return { ok: true }; },
+            },
+            executor: { async executeStep() {} },
+        });
+
+        const result = await worker.runOnce();
+
+        assert.deepEqual(result, {
+            claimed: true,
+            operationId: 'operation-reconcile-expired',
+            status: 'running',
+            stopped: true,
+            errorCode: 'L2TP_OPERATION_LEASE_LOST',
+        });
+        assert.equal(operationRepository.operations[0].status, 'running');
+        assert.equal(
+            operationRepository.calls.some(call => call.method === 'succeedClaimed'),
+            false,
+        );
+        assert.deepEqual(
+            operationRepository.calls.filter(call => call.method === 'renewLease').at(-1).request.now,
+            new Date('2026-09-22T10:00:30.001Z'),
+        );
+    });
+
+    await t.test('user finalization cannot succeed after owner turnover', async () => {
+        const clock = createClock();
+        const operation = createSyncUsersOperation('operation-finalize-owner-turnover');
+        const operationRepository = makeLeaseAware(operation, clock);
+        const worker = createWorker(operationRepository, {
+            clock,
+            userSnapshotResolver: async () => ({ credentialRevision: 9, users: [] }),
+            userSyncReconciler: {
+                async finalizeVerifiedSync() {
+                    clock.advance(30_001);
+                    operationRepository.operations[0].leaseOwner = 'worker-2';
+                    return { ok: true };
+                },
+            },
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async renew() { return { ok: true }; },
+                async release() { return { ok: true }; },
+            },
+            executor: {
+                async executeStep({ step }) {
+                    return step.type === 'verify_users'
+                        ? {
+                            ok: true,
+                            credentialRevision: 9,
+                            enabledUserCount: 0,
+                            managedUserCount: 0,
+                            code: 'USERS_VERIFIED',
+                        }
+                        : { ok: true };
+                },
+            },
+        });
+
+        const result = await worker.runOnce();
+
+        assert.deepEqual(result, {
+            claimed: true,
+            operationId: 'operation-finalize-owner-turnover',
+            status: 'running',
+            stopped: true,
+            errorCode: 'L2TP_OPERATION_LEASE_LOST',
+        });
+        assert.equal(operationRepository.operations[0].status, 'running');
+        assert.equal(operationRepository.operations[0].leaseOwner, 'worker-2');
+        assert.equal(
+            operationRepository.calls.some(call => call.method === 'succeedClaimed'),
+            false,
+        );
+        assert.deepEqual(
+            operationRepository.calls.filter(call => call.method === 'renewLease').at(-1).request.now,
+            new Date('2026-09-22T10:00:30.001Z'),
+        );
+    });
 });
 
 test('verified install state is reconciled before the operation can become succeeded', async () => {

@@ -660,14 +660,18 @@ class L2tpOperationWorker {
                 await heartbeat.renewNow();
                 if (heartbeat.getError()) return leaseLostResult();
             }
-            const finishedAt = this.clock.now();
+            const verifiedAt = this.clock.now();
             const finalStep = executionSteps[executionSteps.length - 1].type;
             if (operation.kind === 'install') {
                 try {
                     if (typeof this.stateReconciler !== 'function') {
                         throw new TypeError('L2TP state reconciler is unavailable');
                     }
-                    await this.stateReconciler({ operation, verifiedAt: finishedAt });
+                    await this.stateReconciler({ operation, verifiedAt });
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.renewNow();
+                    if (heartbeat.getError()) return leaseLostResult();
                 } catch {
                     const errorCode = 'STATE_RECONCILIATION_FAILED';
                     const errorMessage = 'Failed to reconcile verified L2TP state';
@@ -682,7 +686,7 @@ class L2tpOperationWorker {
                         errorCode,
                         errorMessage,
                         journal: {
-                            at: finishedAt,
+                            at: verifiedAt,
                             level: 'error',
                             code: 'L2TP_STATE_RECONCILIATION_FAILED',
                             message: errorMessage,
@@ -755,6 +759,8 @@ class L2tpOperationWorker {
                     }
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.renewNow();
+                    if (heartbeat.getError()) return leaseLostResult();
                 } catch {
                     const errorCode = 'USER_SYNC_FINALIZATION_FAILED';
                     const errorMessage = 'Failed to finalize verified L2TP user sync';
@@ -770,7 +776,7 @@ class L2tpOperationWorker {
                         errorCode,
                         errorMessage,
                         journal: {
-                            at: finishedAt,
+                            at: verifiedAt,
                             level: 'error',
                             code: 'L2TP_USER_SYNC_FINALIZATION_FAILED',
                             message: errorMessage,
@@ -826,6 +832,7 @@ class L2tpOperationWorker {
                     return { claimed: true, operationId, status: 'rolled_back' };
                 }
             }
+            const finishedAt = this.clock.now();
             const succeeded = await this.operationRepository.succeedClaimed({
                 operationId,
                 owner: this.workerId,
