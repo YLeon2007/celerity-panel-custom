@@ -163,6 +163,11 @@ test('builds the concrete repository adapters and composes a dormant runtime', a
     assert.strictEqual(runtimeCalls[0].loadPanelOverview, loadPanelOverview);
     assert.strictEqual(runtimeCalls[0].renderPage, renderPage);
     assert.equal(typeof runtimeCalls[0].preflightRunner, 'function');
+    assert.equal(typeof runtimeCalls[0].candidateService.buildCandidate, 'function');
+    await assert.rejects(
+        runtimeCalls[0].candidateService.buildCandidate(),
+        error => error?.code === 'L2TP_XRAY_CANDIDATE_UNAVAILABLE',
+    );
     assert.equal(typeof runtimeCalls[0].transport.uploadRootFile, 'function');
     assert.equal(typeof runtimeCalls[0].lockService.acquire, 'function');
     assert.equal(typeof runtimeCalls[0].clock.now, 'function');
@@ -384,7 +389,7 @@ test('real panel runtime GET operation strips legacy nested secrets and error de
     );
 });
 
-test('passes an explicitly injected node transport into execution runtime composition', () => {
+test('passes explicitly injected execution factories and candidate resolvers into composition', () => {
     const models = {
         RelayL2tpState: {},
         CascadeRouteGroup: {},
@@ -393,12 +398,24 @@ test('passes an explicitly injected node transport into execution runtime compos
         NodeOperationLock: {},
     };
     class FakeNodeTransport {}
+    const createPreflightRunner = () => async () => ({ ok: true });
+    const createCandidateService = () => ({ async buildCandidate() {} });
+    const candidateNodeResolver = async () => ({});
+    const candidateUserResolver = async () => [];
+    const configGenerator = () => '{}';
+    const fragmentProvider = () => ({});
     let executionDependencies;
 
     createL2tpPanelHost({
         moduleEntry: { registerModels: () => models },
         HyNode: {},
         NodeTransport: FakeNodeTransport,
+        createPreflightRunner,
+        createCandidateService,
+        candidateNodeResolver,
+        candidateUserResolver,
+        configGenerator,
+        fragmentProvider,
         topologyRuntime: {},
         Repository: class FakeRepository {},
         createRepositoryAdapters: () => ({
@@ -418,4 +435,10 @@ test('passes an explicitly injected node transport into execution runtime compos
     });
 
     assert.strictEqual(executionDependencies.NodeTransport, FakeNodeTransport);
+    assert.strictEqual(executionDependencies.createPreflightRunner, createPreflightRunner);
+    assert.strictEqual(executionDependencies.createCandidateService, createCandidateService);
+    assert.strictEqual(executionDependencies.candidateNodeResolver, candidateNodeResolver);
+    assert.strictEqual(executionDependencies.candidateUserResolver, candidateUserResolver);
+    assert.strictEqual(executionDependencies.configGenerator, configGenerator);
+    assert.strictEqual(executionDependencies.fragmentProvider, fragmentProvider);
 });

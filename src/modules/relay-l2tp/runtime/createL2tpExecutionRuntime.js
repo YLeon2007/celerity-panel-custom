@@ -1,14 +1,11 @@
 'use strict';
 
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
-const { materializeInstallOperation } = require('../services/l2tpOperationMaterializer');
 const { L2tpNodeExecutionResolver } = require('../services/l2tpNodeExecutionResolver');
-const { L2tpNodeTransport } = require('../services/l2tpNodeTransport');
 const { createL2tpNodeTransportResolver } = require('../services/l2tpNodeTransportFactory');
 const { L2tpStateManagementService } = require('../services/l2tpStateManagementService');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
-const defaultSecretBox = require('../services/secretBoxService');
 const { createL2tpRuntime } = require('./createL2tpRuntime');
 const { createL2tpWorkerLifecycle } = require('./createL2tpWorkerLifecycle');
 
@@ -65,6 +62,14 @@ async function unavailableSecretResolver() {
     throw error;
 }
 
+const unavailableCandidateService = Object.freeze({
+    async buildCandidate() {
+        const error = new Error('L2TP Xray candidate service is unavailable');
+        error.code = 'L2TP_XRAY_CANDIDATE_UNAVAILABLE';
+        throw error;
+    },
+});
+
 const unavailableStateManagementService = Object.freeze({
     async configureRelay() {
         const error = new Error('L2TP state management is unavailable');
@@ -81,8 +86,7 @@ function lifecycleSummary(state) {
     };
 }
 
-function hasActiveExecutionDependencies({
-    workerLifecycle,
+function assertActiveExecutionDependencies({
     HyNode,
     RelayL2tpState,
     CascadeRouteGroup,
@@ -90,7 +94,12 @@ function hasActiveExecutionDependencies({
     lockModel,
     NodeSSH,
     NodeTransport,
-    preflightRunner,
+    createPreflightRunner,
+    createCandidateService,
+    candidateNodeResolver,
+    candidateUserResolver,
+    configGenerator,
+    fragmentProvider,
     operationMaterializer,
     secretBox,
     secretKey,
@@ -99,29 +108,52 @@ function hasActiveExecutionDependencies({
     createRuntime,
     createWorkerLifecycle,
 }) {
-    return workerLifecycle?.enabled === true
-        && HyNode
-        && typeof HyNode.findById === 'function'
-        && RelayL2tpState
-        && CascadeRouteGroup
-        && operationModel
-        && lockModel
-        && typeof NodeSSH === 'function'
-        && typeof NodeTransport === 'function'
-        && typeof preflightRunner === 'function'
-        && typeof operationMaterializer === 'function'
-        && secretBox
-        && typeof secretBox.encrypt === 'function'
-        && typeof secretBox.decrypt === 'function'
-        && typeof secretKey === 'string'
-        && secretKey.length > 0
-        && clock
-        && typeof clock.now === 'function'
-        && runtimeDependencies
-        && typeof runtimeDependencies === 'object'
-        && !Array.isArray(runtimeDependencies)
-        && typeof createRuntime === 'function'
-        && typeof createWorkerLifecycle === 'function';
+    if (!HyNode || typeof HyNode.findById !== 'function') {
+        throw new TypeError('Active L2TP execution requires HyNode.findById');
+    }
+    for (const [dependencyName, dependency] of Object.entries({
+        RelayL2tpState,
+        CascadeRouteGroup,
+        operationModel,
+        lockModel,
+    })) {
+        if (!dependency) {
+            throw new TypeError(`Active L2TP execution requires ${dependencyName}`);
+        }
+    }
+    for (const [dependencyName, dependency] of Object.entries({
+        NodeSSH,
+        NodeTransport,
+        createPreflightRunner,
+        createCandidateService,
+        candidateNodeResolver,
+        candidateUserResolver,
+        configGenerator,
+        fragmentProvider,
+        operationMaterializer,
+        createRuntime,
+        createWorkerLifecycle,
+    })) {
+        if (typeof dependency !== 'function') {
+            throw new TypeError(`Active L2TP execution requires ${dependencyName} to be a function`);
+        }
+    }
+    if (
+        !secretBox
+        || typeof secretBox.encrypt !== 'function'
+        || typeof secretBox.decrypt !== 'function'
+    ) {
+        throw new TypeError('Active L2TP execution requires secretBox encrypt/decrypt functions');
+    }
+    if (typeof secretKey !== 'string' || secretKey.trim().length === 0) {
+        throw new TypeError('Active L2TP execution requires a non-empty secretKey');
+    }
+    if (!clock || typeof clock.now !== 'function') {
+        throw new TypeError('Active L2TP execution requires clock.now');
+    }
+    if (!runtimeDependencies || typeof runtimeDependencies !== 'object' || Array.isArray(runtimeDependencies)) {
+        throw new TypeError('Active L2TP execution requires runtimeDependencies');
+    }
 }
 
 function createL2tpExecutionRuntime({
@@ -132,10 +164,15 @@ function createL2tpExecutionRuntime({
     operationModel,
     lockModel,
     NodeSSH,
-    NodeTransport = L2tpNodeTransport,
-    preflightRunner,
-    operationMaterializer = materializeInstallOperation,
-    secretBox = defaultSecretBox,
+    NodeTransport,
+    createPreflightRunner,
+    createCandidateService,
+    candidateNodeResolver,
+    candidateUserResolver,
+    configGenerator,
+    fragmentProvider,
+    operationMaterializer,
+    secretBox,
     secretKey,
     stateManagementService,
     clock,
@@ -143,28 +180,11 @@ function createL2tpExecutionRuntime({
     createRuntime = createL2tpRuntime,
     createWorkerLifecycle = createL2tpWorkerLifecycle,
 } = {}) {
-    const active = hasActiveExecutionDependencies({
-        workerLifecycle,
-        HyNode,
-        RelayL2tpState,
-        CascadeRouteGroup,
-        operationModel,
-        lockModel,
-        NodeSSH,
-        NodeTransport,
-        preflightRunner,
-        operationMaterializer,
-        secretBox,
-        secretKey,
-        clock,
-        runtimeDependencies,
-        createRuntime,
-        createWorkerLifecycle,
-    });
-    if (!active) {
+    if (workerLifecycle?.enabled !== true) {
         const runtime = createRuntime({
             ...runtimeDependencies,
             preflightRunner: unavailablePreflightRunner,
+            candidateService: unavailableCandidateService,
             transport: dormantTransport,
             lockService: dormantLockService,
             secretResolver: unavailableSecretResolver,
@@ -177,11 +197,49 @@ function createL2tpExecutionRuntime({
         };
     }
 
+    assertActiveExecutionDependencies({
+        HyNode,
+        RelayL2tpState,
+        CascadeRouteGroup,
+        operationModel,
+        lockModel,
+        NodeSSH,
+        NodeTransport,
+        createPreflightRunner,
+        createCandidateService,
+        candidateNodeResolver,
+        candidateUserResolver,
+        configGenerator,
+        fragmentProvider,
+        operationMaterializer,
+        secretBox,
+        secretKey,
+        clock,
+        runtimeDependencies,
+        createRuntime,
+        createWorkerLifecycle,
+    });
+
     const nodeExecutionResolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH });
     const transportResolver = createL2tpNodeTransportResolver({
         nodeExecutionResolver,
         NodeTransport,
     });
+    const preflightRunner = createPreflightRunner({ transportResolver });
+    if (typeof preflightRunner !== 'function') {
+        throw new TypeError('Active L2TP execution createPreflightRunner must return a function');
+    }
+    const candidateService = createCandidateService({
+        nodeResolver: candidateNodeResolver,
+        userResolver: candidateUserResolver,
+        configGenerator,
+        fragmentProvider,
+    });
+    if (!candidateService || typeof candidateService.buildCandidate !== 'function') {
+        throw new TypeError(
+            'Active L2TP execution createCandidateService must return a candidate service',
+        );
+    }
     const managementRepository = new L2tpStateManagementRepository({
         HyNode,
         RelayL2tpState,
@@ -201,6 +259,7 @@ function createL2tpExecutionRuntime({
     const runtime = createRuntime({
         ...runtimeDependencies,
         preflightRunner,
+        candidateService,
         transportResolver,
         operationMaterializer,
         secretResolver,

@@ -4,7 +4,12 @@ const REQUIRED_ENABLED_DEPENDENCIES = Object.freeze([
     'HyNode',
     'NodeSSH',
     'NodeTransport',
-    'preflightRunner',
+    'createPreflightRunner',
+    'createCandidateService',
+    'candidateNodeResolver',
+    'candidateUserResolver',
+    'configGenerator',
+    'fragmentProvider',
     'operationMaterializer',
     'secretBox',
     'secretKey',
@@ -66,7 +71,12 @@ function assertEnabledDependencies(hostDependencies) {
     for (const dependencyName of [
         'NodeSSH',
         'NodeTransport',
-        'preflightRunner',
+        'createPreflightRunner',
+        'createCandidateService',
+        'candidateNodeResolver',
+        'candidateUserResolver',
+        'configGenerator',
+        'fragmentProvider',
         'operationMaterializer',
     ]) {
         if (typeof hostDependencies[dependencyName] !== 'function') {
