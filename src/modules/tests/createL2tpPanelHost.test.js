@@ -1,0 +1,96 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const { createL2tpPanelHost } = require('../createL2tpPanelHost');
+
+function passThrough(req, res, next) {
+    next();
+}
+
+test('builds the concrete repository adapters and composes a dormant runtime', () => {
+    const HyNode = { modelName: 'HyNode' };
+    const models = {
+        RelayL2tpState: { modelName: 'RelayL2tpState' },
+        CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
+        CascadeTopologyState: { modelName: 'CascadeTopologyState' },
+        L2tpOperation: { modelName: 'L2tpOperation' },
+        NodeOperationLock: { modelName: 'NodeOperationLock' },
+    };
+    const compilerData = { relays: [{ nodeId: 'relay-1', routeGroups: [] }] };
+    const repositoryConstructions = [];
+    const adapterCalls = [];
+    const runtimeCalls = [];
+    let workerRuns = 0;
+
+    class FakeRepository {
+        constructor(dependencies) {
+            repositoryConstructions.push(dependencies);
+        }
+    }
+
+    const adapters = {
+        nodeRepository: { kind: 'node-repository' },
+        stateRepository: { kind: 'state-repository' },
+    };
+    const moduleEntry = {
+        registerModels() {
+            return models;
+        },
+    };
+    const runtime = {
+        service: { kind: 'l2tp-service' },
+        router: { kind: 'l2tp-router' },
+        worker: {
+            runOnce() {
+                workerRuns += 1;
+            },
+        },
+    };
+
+    const host = createL2tpPanelHost({
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        compilerData,
+        moduleEntry,
+        HyNode,
+        Repository: FakeRepository,
+        createRepositoryAdapters(repository) {
+            adapterCalls.push(repository);
+            return adapters;
+        },
+        createRuntime(dependencies) {
+            runtimeCalls.push(dependencies);
+            return runtime;
+        },
+    });
+
+    assert.equal(repositoryConstructions.length, 1);
+    assert.deepEqual(repositoryConstructions[0], {
+        HyNode,
+        RelayL2tpState: models.RelayL2tpState,
+        CascadeRouteGroup: models.CascadeRouteGroup,
+        CascadeTopologyState: models.CascadeTopologyState,
+        L2tpOperation: models.L2tpOperation,
+        compilerData,
+    });
+    assert.deepEqual(adapterCalls, [host.repository]);
+    assert.equal(runtimeCalls.length, 1);
+    assert.strictEqual(runtimeCalls[0].operationModel, models.L2tpOperation);
+    assert.strictEqual(runtimeCalls[0].nodeRepository, adapters.nodeRepository);
+    assert.strictEqual(runtimeCalls[0].stateRepository, adapters.stateRepository);
+    assert.strictEqual(runtimeCalls[0].requireAuth, passThrough);
+    assert.strictEqual(runtimeCalls[0].csrf, passThrough);
+    assert.strictEqual(runtimeCalls[0].rateLimiter, passThrough);
+    assert.equal(typeof runtimeCalls[0].preflightRunner, 'function');
+    assert.equal(typeof runtimeCalls[0].transport.uploadRootFile, 'function');
+    assert.equal(typeof runtimeCalls[0].lockService.acquire, 'function');
+    assert.equal(typeof runtimeCalls[0].clock.now, 'function');
+    assert.equal(typeof runtimeCalls[0].workerId, 'string');
+    assert.equal(typeof runtimeCalls[0].leaseMs, 'number');
+    assert.strictEqual(host.moduleEntry, moduleEntry);
+    assert.strictEqual(host.runtime, runtime);
+    assert.equal(workerRuns, 0);
+});
