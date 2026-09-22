@@ -2,6 +2,7 @@
 
 const REMOTE_OPERATIONS_ROOT = '/var/lib/celerity/l2tp/operations';
 const ARTIFACT_RUNNER_PATH = '/usr/local/bin/celerity-l2tp-artifact-runner';
+const ARTIFACT_RECEIVER_PATH = '/usr/local/bin/celerity-l2tp-artifact-receiver';
 const ARTIFACT_COMMANDS = Object.freeze([
     'preflight',
     'backup',
@@ -20,6 +21,10 @@ const ARTIFACT_COMMANDS = Object.freeze([
 const ARTIFACT_COMMAND_SET = new Set(ARTIFACT_COMMANDS);
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ROOT_FILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
+const ROOT_ARTIFACT_PATHS = Object.freeze({
+    desired: 'desired.json',
+    artifact: 'artifacts.json',
+});
 
 class L2tpNodeTransportError extends Error {
     constructor(code, message) {
@@ -43,6 +48,16 @@ function assertRootFilePath(path) {
         throw new L2tpNodeTransportError(
             'INVALID_ARTIFACT_PATH',
             'Invalid L2TP root artifact path',
+        );
+    }
+}
+
+function assertRootArtifact(type, path) {
+    assertRootFilePath(path);
+    if (!Object.hasOwn(ROOT_ARTIFACT_PATHS, type) || ROOT_ARTIFACT_PATHS[type] !== path) {
+        throw new L2tpNodeTransportError(
+            'ARTIFACT_NOT_ALLOWED',
+            'Artifact is not allowed for L2TP root upload',
         );
     }
 }
@@ -85,22 +100,19 @@ class L2tpNodeTransport {
         this.nodeSSH = nodeSSH;
     }
 
-    async uploadRootFile({ operationId, path, content, owner, group, mode }) {
+    async uploadRootFile({ operationId, type, path, content, owner, group, mode }) {
         assertOperationId(operationId);
         assertRootFilePath(path);
         assertRootFileMetadata({ owner, group, mode });
         assertArtifactContent(content);
+        assertRootArtifact(type, path);
 
-        const operationRoot = `${REMOTE_OPERATIONS_ROOT}/${operationId}/`;
-        const remotePath = `${operationRoot}${path}`;
+        const remotePath = `${REMOTE_OPERATIONS_ROOT}/${operationId}/${path}`;
 
         try {
             assertSuccessfulExec(await this.nodeSSH.exec(
-                `install -d -o root -g root -m 0700 -- ${operationRoot}`,
-            ));
-            await this.nodeSSH.writeFile(remotePath, content);
-            assertSuccessfulExec(await this.nodeSSH.exec(
-                `chown root:root -- ${remotePath} && chmod 0600 -- ${remotePath}`,
+                `${ARTIFACT_RECEIVER_PATH} --operation-id ${operationId} --artifact-name ${path}`,
+                { stdin: content },
             ));
         } catch {
             throw new L2tpNodeTransportError(

@@ -10,8 +10,10 @@ function createNodeSSHFacade() {
 
     return {
         calls,
-        async exec(command) {
-            calls.push({ method: 'exec', command });
+        async exec(command, options) {
+            calls.push(options === undefined
+                ? { method: 'exec', command }
+                : { method: 'exec', command, options });
             return { code: 0, stdout: '', stderr: '' };
         },
         async writeFile(path, content) {
@@ -30,13 +32,14 @@ test('exposes only the two typed remote executor transport methods', () => {
     assert.equal(transport.exec, undefined);
 });
 
-test('uploadRootFile writes a root-only file below the fixed operation root', async () => {
+test('uploadRootFile sends an exact typed artifact to the fixed receiver over stdin', async () => {
     const nodeSSH = createNodeSSHFacade();
     const transport = new L2tpNodeTransport({ nodeSSH });
     const content = '{"psk":"transport-secret"}\n';
 
     const result = await transport.uploadRootFile({
         operationId: 'operation-17',
+        type: 'desired',
         path: 'desired.json',
         content,
         owner: 'root',
@@ -47,22 +50,62 @@ test('uploadRootFile writes a root-only file below the fixed operation root', as
     assert.deepEqual(nodeSSH.calls, [
         {
             method: 'exec',
-            command: 'install -d -o root -g root -m 0700 -- /var/lib/celerity/l2tp/operations/operation-17/',
-        },
-        {
-            method: 'writeFile',
-            path: '/var/lib/celerity/l2tp/operations/operation-17/desired.json',
-            content,
-        },
-        {
-            method: 'exec',
-            command: 'chown root:root -- /var/lib/celerity/l2tp/operations/operation-17/desired.json && chmod 0600 -- /var/lib/celerity/l2tp/operations/operation-17/desired.json',
+            command: '/usr/local/bin/celerity-l2tp-artifact-receiver --operation-id operation-17 --artifact-name desired.json',
+            options: { stdin: content },
         },
     ]);
+    assert.equal(nodeSSH.calls[0].command.includes(content), false);
     assert.deepEqual(result, {
         ok: true,
         path: '/var/lib/celerity/l2tp/operations/operation-17/desired.json',
     });
+});
+
+test('uploadRootFile accepts only exact typed artifact names', async () => {
+    const acceptedNodeSSH = createNodeSSHFacade();
+    const transport = new L2tpNodeTransport({ nodeSSH: acceptedNodeSSH });
+
+    await transport.uploadRootFile({
+        operationId: 'operation-typed',
+        type: 'artifact',
+        path: 'artifacts.json',
+        content: '{}',
+        owner: 'root',
+        group: 'root',
+        mode: 0o600,
+    });
+    assert.equal(acceptedNodeSSH.calls.length, 1);
+
+    for (const { type, path } of [
+        { type: 'desired', path: 'artifacts.json' },
+        { type: 'artifact', path: 'desired.json' },
+        { type: 'desired', path: 'other.json' },
+        { type: 'shell', path: 'desired.json' },
+        { type: undefined, path: 'desired.json' },
+    ]) {
+        const nodeSSH = createNodeSSHFacade();
+        const candidate = new L2tpNodeTransport({ nodeSSH });
+        await assert.rejects(
+            candidate.uploadRootFile({
+                operationId: 'operation-typed',
+                type,
+                path,
+                content: '{}',
+                owner: 'root',
+                group: 'root',
+                mode: 0o600,
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpNodeTransportError');
+                assert.equal(error.code, 'ARTIFACT_NOT_ALLOWED');
+                assert.equal(error.message, 'Artifact is not allowed for L2TP root upload');
+                assert.equal(Object.hasOwn(error, 'path'), false);
+                assert.equal(Object.hasOwn(error, 'type'), false);
+                return true;
+            },
+        );
+        assert.deepEqual(nodeSSH.calls, []);
+    }
 });
 
 test('runArtifactCommand maps every typed command to the fixed artifact runner', async () => {
@@ -221,6 +264,7 @@ test('rejects artifact metadata that is not root-owned mode 0600 before the faca
         await assert.rejects(
             transport.uploadRootFile({
                 operationId: 'operation-21',
+                type: 'desired',
                 path: 'desired.json',
                 content: '{}',
                 ...metadata,
@@ -240,27 +284,13 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
     const secret = 'upload-transport-secret';
     const failures = [
         {
-            async exec() { throw new Error(`mkdir failed: ${secret}`); },
-            async writeFile() { throw new Error('must not write'); },
+            async exec() { throw new Error(`receiver failed: ${secret}`); },
         },
         {
-            execCalls: 0,
-            async exec() {
-                this.execCalls += 1;
-                return { code: 0, stdout: '', stderr: '' };
-            },
-            async writeFile() { throw new Error(`sftp failed: ${secret}`); },
+            async exec() { return { code: 73, stdout: secret, stderr: '' }; },
         },
         {
-            execCalls: 0,
-            async exec() {
-                this.execCalls += 1;
-                if (this.execCalls === 2) {
-                    return { code: 73, stdout: secret, stderr: secret };
-                }
-                return { code: 0, stdout: '', stderr: '' };
-            },
-            async writeFile() {},
+            async exec() { return { code: 73, stdout: '', stderr: secret }; },
         },
     ];
 
@@ -270,6 +300,7 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
         await assert.rejects(
             transport.uploadRootFile({
                 operationId: 'operation-22',
+                type: 'desired',
                 path: 'desired.json',
                 content: `{"psk":"${secret}"}`,
                 owner: 'root',
@@ -326,6 +357,7 @@ test('rejects non-string artifact content before invoking the NodeSSH facade', a
         await assert.rejects(
             transport.uploadRootFile({
                 operationId: 'operation-24',
+                type: 'desired',
                 path: 'desired.json',
                 content,
                 owner: 'root',

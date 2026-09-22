@@ -13,6 +13,11 @@
 const { Client } = require('ssh2');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
+const {
+    createExecStdinError,
+    hasExecStdin,
+    writeExecStdin,
+} = require('./sshExecStdin');
 
 class SSHPool {
     constructor() {
@@ -271,40 +276,82 @@ class SSHPool {
      * Execute command with auto-reconnect
      */
     async exec(node, command, options = {}) {
-        const client = await this.getConnection(node);
+        const includesStdin = hasExecStdin(options);
+        let client;
+        try {
+            client = await this.getConnection(node);
+        } catch (error) {
+            throw includesStdin ? createExecStdinError() : error;
+        }
         const nodeId = node._id?.toString() || node.id;
         
         return new Promise((resolve, reject) => {
             const execTimeout = options.timeout || 30000;
-            
+            let settled = false;
+            let stdinController = null;
+
+            const settle = (error, result) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                stdinController?.cancel();
+                if (error) reject(error);
+                else resolve(result);
+            };
+
             const timer = setTimeout(() => {
-                reject(new Error(`Exec timeout (${execTimeout}ms): ${command.substring(0, 50)}`));
+                settle(includesStdin
+                    ? createExecStdinError()
+                    : new Error(`Exec timeout (${execTimeout}ms): ${command.substring(0, 50)}`));
             }, execTimeout);
             
-            client.exec(command, (err, stream) => {
-                if (err) {
-                    clearTimeout(timer);
-                    // Connection broken - remove from pool
-                    this.removeConnection(nodeId, 'exec error');
-                    reject(err);
-                    return;
-                }
-                
-                let stdout = '';
-                let stderr = '';
-                
-                stream
-                    .on('close', (code) => {
-                        clearTimeout(timer);
-                        resolve({ code, stdout, stderr });
-                    })
-                    .on('data', (data) => {
-                        stdout += data.toString();
-                    })
-                    .stderr.on('data', (data) => {
-                        stderr += data.toString();
-                    });
-            });
+            try {
+                client.exec(command, (err, stream) => {
+                    if (err) {
+                        // Connection broken - remove from pool
+                        this.removeConnection(nodeId, 'exec error');
+                        settle(includesStdin ? createExecStdinError() : err);
+                        return;
+                    }
+
+                    let stdout = '';
+                    let stderr = '';
+                    let stdinComplete = !includesStdin;
+
+                    stream
+                        .on('close', (code) => {
+                            if (!stdinComplete) {
+                                settle(createExecStdinError());
+                                return;
+                            }
+                            settle(null, { code, stdout, stderr });
+                        })
+                        .on('data', (data) => {
+                            stdout += data.toString();
+                        })
+                        .on('error', (error) => {
+                            settle(includesStdin ? createExecStdinError() : error);
+                        })
+                        .stderr.on('data', (data) => {
+                            stderr += data.toString();
+                        }).on('error', (error) => {
+                            settle(includesStdin ? createExecStdinError() : error);
+                        });
+
+                    if (includesStdin) {
+                        stdinController = writeExecStdin(stream, options.stdin, {
+                            onComplete() {
+                                stdinComplete = true;
+                            },
+                            onError(error) {
+                                settle(error);
+                            },
+                        });
+                    }
+                });
+            } catch (error) {
+                settle(includesStdin ? createExecStdinError() : error);
+            }
         });
     }
     

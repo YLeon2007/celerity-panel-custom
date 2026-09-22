@@ -28,6 +28,11 @@ const { Client } = require('ssh2');
 const sshPool = require('./sshPoolService');
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
+const {
+    createExecStdinError,
+    hasExecStdin,
+    writeExecStdin,
+} = require('./sshExecStdin');
 
 // Hard cap to keep CPU usage bounded on weak hardware (1 vCPU).
 // Each SSH handshake involves DH key-exchange which is CPU-heavy on Node.js.
@@ -193,38 +198,75 @@ class NodeSSH {
     /**
      * Execute command on remote server
      */
-    async exec(command) {
+    async exec(command, options = {}) {
         if (this.usePool) {
-            return sshPool.exec(this.node, command);
+            return sshPool.exec(this.node, command, options);
         }
+
+        const includesStdin = hasExecStdin(options);
         
         // Legacy direct execution
         return new Promise((resolve, reject) => {
             if (!this.directClient) {
-                reject(new Error('SSH not connected'));
+                reject(includesStdin ? createExecStdinError() : new Error('SSH not connected'));
                 return;
             }
             
-            this.directClient.exec(command, (err, stream) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                
-                let stdout = '';
-                let stderr = '';
-                
-                stream
-                    .on('close', (code) => {
-                        resolve({ code, stdout, stderr });
-                    })
-                    .on('data', (data) => {
-                        stdout += data.toString();
-                    })
-                    .stderr.on('data', (data) => {
-                        stderr += data.toString();
-                    });
-            });
+            try {
+                this.directClient.exec(command, (err, stream) => {
+                    if (err) {
+                        reject(includesStdin ? createExecStdinError() : err);
+                        return;
+                    }
+
+                    let stdout = '';
+                    let stderr = '';
+                    let settled = false;
+                    let stdinComplete = !includesStdin;
+                    let stdinController = null;
+
+                    const settle = (error, result) => {
+                        if (settled) return;
+                        settled = true;
+                        stdinController?.cancel();
+                        if (error) reject(error);
+                        else resolve(result);
+                    };
+
+                    stream
+                        .on('close', (code) => {
+                            if (!stdinComplete) {
+                                settle(createExecStdinError());
+                                return;
+                            }
+                            settle(null, { code, stdout, stderr });
+                        })
+                        .on('data', (data) => {
+                            stdout += data.toString();
+                        })
+                        .on('error', (error) => {
+                            settle(includesStdin ? createExecStdinError() : error);
+                        })
+                        .stderr.on('data', (data) => {
+                            stderr += data.toString();
+                        }).on('error', (error) => {
+                            settle(includesStdin ? createExecStdinError() : error);
+                        });
+
+                    if (includesStdin) {
+                        stdinController = writeExecStdin(stream, options.stdin, {
+                            onComplete() {
+                                stdinComplete = true;
+                            },
+                            onError(error) {
+                                settle(error);
+                            },
+                        });
+                    }
+                });
+            } catch (error) {
+                reject(includesStdin ? createExecStdinError() : error);
+            }
         });
     }
 
