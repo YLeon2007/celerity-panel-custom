@@ -57,6 +57,8 @@ function createDependencies() {
             psk: 'resolved-in-memory-only',
             users: [],
         }),
+        userSnapshotResolver: async () => ({ credentialRevision: 1, users: [] }),
+        userSyncReconciler: { async finalizeVerifiedSync() { return true; } },
         stateReconciler: async () => ({ status: 'installed' }),
         candidateService: { async buildCandidate() {} },
         requireAuth(req, res, next) { next(); },
@@ -107,6 +109,8 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.worker.executor.transport, dependencies.transport);
     assert.strictEqual(runtime.worker.lockService, dependencies.lockService);
     assert.strictEqual(runtime.worker.secretResolver, dependencies.secretResolver);
+    assert.strictEqual(runtime.worker.userSnapshotResolver, dependencies.userSnapshotResolver);
+    assert.strictEqual(runtime.worker.userSyncReconciler, dependencies.userSyncReconciler);
     assert.strictEqual(runtime.worker.stateReconciler, dependencies.stateReconciler);
     assert.strictEqual(runtime.worker.candidateService, dependencies.candidateService);
     assert.equal(typeof runtime.worker.operationMaterializer, 'function');

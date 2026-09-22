@@ -99,6 +99,8 @@ function createWorker(operationRepository, overrides = {}) {
         lockService,
         executor: overrides.executor || {},
         secretResolver: overrides.secretResolver,
+        userSnapshotResolver: overrides.userSnapshotResolver,
+        userSyncReconciler: overrides.userSyncReconciler,
         stateReconciler: overrides.stateReconciler || (async () => ({ status: 'installed' })),
         operationMaterializer: overrides.operationMaterializer,
         candidateService: overrides.candidateService,
@@ -156,6 +158,29 @@ function createInstallOperation(id = 'operation-install') {
             plan: persistedPlan,
         },
         secrets: { psk: 'worker-jit-psk-secret' },
+    };
+}
+
+function createSyncUsersOperation(id = 'operation-sync-users-9') {
+    return {
+        id,
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'queued',
+        plan: {
+            ok: true,
+            operationId: id,
+            relayId: 'relay-1',
+            desired: { credentialRevision: 9 },
+            steps: [
+                { type: 'backup' },
+                {
+                    type: 'sync_users',
+                    artifacts: [{ type: 'desired', path: 'desired.json' }],
+                },
+                { type: 'verify_users' },
+            ],
+        },
     };
 }
 
@@ -273,7 +298,7 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         transportCalls
             .filter(call => call.method === 'runArtifactCommand')
             .map(call => call.request.command),
-        INSTALL_STEP_TYPES,
+        INSTALL_STEP_TYPES.map(type => (type === 'sync_users' ? 'sync-users' : type)),
     );
     assert.ok(
         transportCalls.indexOf(uploads[0])
@@ -312,6 +337,343 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         )),
         false,
     );
+});
+
+test('runs standalone sync_users with typed verification and finalizes before success', async () => {
+    const password = 'worker-jit-user-password';
+    const operation = {
+        id: 'operation-sync-users-9',
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'queued',
+        plan: {
+            ok: true,
+            operationId: 'operation-sync-users-9',
+            relayId: 'relay-1',
+            desired: { credentialRevision: 9 },
+            steps: [
+                { type: 'backup' },
+                {
+                    type: 'sync_users',
+                    artifacts: [{ type: 'desired', path: 'desired.json' }],
+                },
+                { type: 'verify_users' },
+            ],
+        },
+    };
+    const operationRepository = createOperationRepository([operation]);
+    const snapshotCalls = [];
+    const executed = [];
+    const events = [];
+    const setStatus = operationRepository.setStatus;
+    operationRepository.setStatus = async request => {
+        events.push({ method: 'setStatus', status: request.status });
+        return setStatus.call(operationRepository, request);
+    };
+    const worker = createWorker(operationRepository, {
+        userSnapshotResolver: async request => {
+            snapshotCalls.push(request);
+            assert.equal(
+                operationRepository.operations[0].status,
+                'running',
+                'operation must be claimed first',
+            );
+            assert.deepEqual(executed, [], 'credentials must resolve before remote work');
+            return {
+                credentialRevision: 9,
+                users: [{
+                    id: 'user-alice',
+                    relayNode: 'relay-1',
+                    login: 'alice',
+                    password,
+                    ip: '10.77.0.10',
+                    enabled: true,
+                    desiredRevision: 9,
+                }],
+            };
+        },
+        userSyncReconciler: {
+            async finalizeVerifiedSync(request) {
+                events.push({ method: 'finalizeVerifiedSync', request });
+                return { finalized: true };
+            },
+        },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep({ step }) {
+                executed.push(step);
+                events.push({ method: 'executeStep', step: step.type });
+                if (step.type === 'verify_users') {
+                    return {
+                        ok: true,
+                        credentialRevision: 9,
+                        enabledUserCount: 1,
+                        managedUserCount: 1,
+                        code: 'USERS_VERIFIED',
+                    };
+                }
+                return { ok: true };
+            },
+            async rollback() {},
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(snapshotCalls, [{
+        operationId: 'operation-sync-users-9',
+        kind: 'sync_users',
+        nodeId: 'relay-1',
+        credentialRevision: 9,
+    }]);
+    assert.deepEqual(executed.map(step => step.type), ['backup', 'sync_users', 'verify_users']);
+    assert.deepEqual(executed[1].artifacts.map(artifact => ({
+        type: artifact.type,
+        path: artifact.path,
+    })), [{ type: 'desired', path: 'desired.json' }]);
+    assert.deepEqual(JSON.parse(executed[1].artifacts[0].content), {
+        credentialRevision: 9,
+        users: [{
+            login: 'alice',
+            password,
+            ipAddress: '10.77.0.10',
+            enabled: true,
+        }],
+    });
+    assert.equal(executed[0].artifacts, undefined);
+    assert.equal(executed[2].artifacts, undefined);
+    const finalization = events.find(event => event.method === 'finalizeVerifiedSync');
+    assert.deepEqual(finalization.request, {
+        operation: operationRepository.operations[0],
+        resolvedUsers: [{
+            id: 'user-alice',
+            relayNode: 'relay-1',
+            login: 'alice',
+            password,
+            ip: '10.77.0.10',
+            enabled: true,
+            desiredRevision: 9,
+        }],
+        verification: {
+            ok: true,
+            credentialRevision: 9,
+            enabledUserCount: 1,
+            managedUserCount: 1,
+            code: 'USERS_VERIFIED',
+        },
+        workerId: 'worker-1',
+    });
+    assert.ok(
+        events.findIndex(event => event.method === 'finalizeVerifiedSync')
+            < events.findIndex(event => event.method === 'setStatus' && event.status === 'succeeded'),
+    );
+    assert.doesNotMatch(
+        JSON.stringify({ operation, repositoryCalls: operationRepository.calls, result }),
+        new RegExp(password),
+    );
+});
+
+test('rejects mismatched sync_users identity before snapshot resolution, locking, or remote work', async () => {
+    const operation = createSyncUsersOperation('operation-sync-identity');
+    operation.plan = { ...operation.plan, relayId: 'other-relay' };
+    const operationRepository = createOperationRepository([operation]);
+    const calls = [];
+    const worker = createWorker(operationRepository, {
+        userSnapshotResolver: async () => { calls.push('snapshot'); },
+        lockService: {
+            async acquire() { calls.push('lock'); return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() {},
+        },
+        executor: {
+            async executeStep() { calls.push('execute'); },
+            async rollback() { calls.push('rollback'); },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.status, 'failed');
+    assert.deepEqual(calls, []);
+    const failure = operationRepository.calls.find(call => call.method === 'setStatus');
+    assert.equal(failure.request.errorCode, 'INVALID_SYNC_USERS_PLAN');
+});
+
+test('rechecks the operation lease after snapshot resolution and before credential materialization', async () => {
+    const operationRepository = createOperationRepository([
+        createSyncUsersOperation('operation-sync-cancelled'),
+    ]);
+    let renewals = 0;
+    let passwordReads = 0;
+    operationRepository.renewLease = async request => {
+        operationRepository.calls.push({ method: 'renewLease', request });
+        renewals += 1;
+        return renewals === 1;
+    };
+    const user = {
+        login: 'alice',
+        get password() {
+            passwordReads += 1;
+            return 'must-not-materialize';
+        },
+        ip: '10.77.0.10',
+    };
+    const remoteCalls = [];
+    const worker = createWorker(operationRepository, {
+        userSnapshotResolver: async () => ({ credentialRevision: 9, users: [user] }),
+        userSyncReconciler: { async finalizeVerifiedSync() { return true; } },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep() { remoteCalls.push('execute'); },
+            async rollback() { remoteCalls.push('rollback'); },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-sync-cancelled',
+        status: 'running',
+        stopped: true,
+        errorCode: 'L2TP_OPERATION_LEASE_LOST',
+    });
+    assert.equal(passwordReads, 0);
+    assert.deepEqual(remoteCalls, []);
+    assert.equal(
+        operationRepository.calls.some(call => call.method === 'setStatus'),
+        false,
+    );
+});
+
+test('rejects unsanitized or mismatched user verification attestations and rolls back', async () => {
+    const cases = [
+        {
+            name: 'raw output',
+            verification: {
+                ok: true,
+                credentialRevision: 9,
+                enabledUserCount: 1,
+                managedUserCount: 1,
+                stdout: 'must-not-escape',
+            },
+        },
+        {
+            name: 'revision mismatch',
+            verification: {
+                ok: true,
+                credentialRevision: 10,
+                enabledUserCount: 1,
+                managedUserCount: 1,
+            },
+        },
+        {
+            name: 'count mismatch',
+            verification: {
+                ok: true,
+                credentialRevision: 9,
+                enabledUserCount: 1,
+                managedUserCount: 0,
+            },
+        },
+    ];
+
+    for (const testCase of cases) {
+        const operationRepository = createOperationRepository([
+            createSyncUsersOperation(`operation-${testCase.name.replaceAll(' ', '-')}`),
+        ]);
+        const events = [];
+        const worker = createWorker(operationRepository, {
+            userSnapshotResolver: async () => ({
+                credentialRevision: 9,
+                users: [{
+                    id: 'user-alice',
+                    relayNode: 'relay-1',
+                    login: 'alice',
+                    password: 'private-password',
+                    ip: '10.77.0.10',
+                    enabled: true,
+                    desiredRevision: 9,
+                }],
+            }),
+            userSyncReconciler: {
+                async finalizeVerifiedSync() { events.push('finalize'); return true; },
+            },
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async renew() { return { ok: true }; },
+                async release() { return { ok: true }; },
+            },
+            executor: {
+                async executeStep({ step }) {
+                    events.push(step.type);
+                    return step.type === 'verify_users' ? testCase.verification : { ok: true };
+                },
+                async rollback() { events.push('rollback'); },
+            },
+        });
+
+        const result = await worker.runOnce();
+
+        assert.equal(result.status, 'rolled_back', testCase.name);
+        assert.deepEqual(events, ['backup', 'sync_users', 'verify_users', 'rollback']);
+        const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+        assert.equal(statuses.some(call => call.request.status === 'succeeded'), false);
+        assert.doesNotMatch(JSON.stringify(statuses), /must-not-escape|private-password/);
+    }
+});
+
+test('rolls back and never succeeds when guarded user sync finalization rejects or is falsy', async () => {
+    let finalizationCase = 0;
+    for (const finalization of [
+        async () => null,
+        async () => { throw new Error('database detail must not escape'); },
+    ]) {
+        const operationRepository = createOperationRepository([
+            createSyncUsersOperation(`operation-finalize-${finalizationCase++}`),
+        ]);
+        const events = [];
+        const worker = createWorker(operationRepository, {
+            userSnapshotResolver: async () => ({ credentialRevision: 9, users: [] }),
+            userSyncReconciler: { finalizeVerifiedSync: finalization },
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async renew() { return { ok: true }; },
+                async release() { return { ok: true }; },
+            },
+            executor: {
+                async executeStep({ step }) {
+                    events.push(step.type);
+                    return step.type === 'verify_users'
+                        ? {
+                            ok: true,
+                            credentialRevision: 9,
+                            enabledUserCount: 0,
+                            managedUserCount: 0,
+                        }
+                        : { ok: true };
+                },
+                async rollback() { events.push('rollback'); },
+            },
+        });
+
+        const result = await worker.runOnce();
+
+        assert.equal(result.status, 'rolled_back');
+        assert.equal(events.at(-1), 'rollback');
+        const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+        assert.equal(statuses.some(call => call.request.status === 'succeeded'), false);
+        assert.ok(statuses.every(call => !JSON.stringify(call).includes('database detail')));
+    }
 });
 
 test('rejects invalid claimed install plans before resolving secrets or remote work', async () => {

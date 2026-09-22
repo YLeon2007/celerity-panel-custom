@@ -1,6 +1,7 @@
 'use strict';
 
 const EXECUTION_USER_SELECT = [
+    '_id',
     'relayNode',
     'login',
     'ip',
@@ -19,6 +20,13 @@ class L2tpUserExecutionRepository {
 
     async findEnabledByRelayNode(nodeId) {
         return this.model.find({ relayNode: nodeId, enabled: true })
+            .select(EXECUTION_USER_SELECT)
+            .sort({ login: 1, _id: 1 })
+            .lean();
+    }
+
+    async findByRelayNode(nodeId) {
+        return this.model.find({ relayNode: nodeId })
             .select(EXECUTION_USER_SELECT)
             .sort({ login: 1, _id: 1 })
             .lean();

@@ -1,5 +1,9 @@
 'use strict';
 
+const {
+    materializeSyncUsersOperation,
+} = require('../services/l2tpOperationMaterializer');
+
 const INSTALL_PLAN_ERROR_CODES = new Set([
     'INSTALL_PLAN_REJECTED',
     'INVALID_INSTALL_PLAN',
@@ -87,12 +91,49 @@ function attachRemoteArtifacts(plan, remoteArtifacts) {
     return steps;
 }
 
+function verifiedUsersAttestation(result, plan, resolvedUsers) {
+    const expectedKeys = [
+        'ok',
+        'credentialRevision',
+        'enabledUserCount',
+        'managedUserCount',
+        'code',
+    ];
+    const enabledUserCount = resolvedUsers.filter(user => user.enabled === true).length;
+    if (
+        !result
+        || typeof result !== 'object'
+        || Array.isArray(result)
+        || Object.keys(result).sort().join('\0') !== expectedKeys.sort().join('\0')
+        || result.ok !== true
+        || result.code !== 'USERS_VERIFIED'
+        || result.credentialRevision !== plan.desired.credentialRevision
+        || !Number.isSafeInteger(result.enabledUserCount)
+        || result.enabledUserCount !== enabledUserCount
+        || !Number.isSafeInteger(result.managedUserCount)
+        || result.managedUserCount !== enabledUserCount
+    ) {
+        const error = new Error('L2TP user verification attestation was rejected');
+        error.code = 'USER_SYNC_VERIFICATION_FAILED';
+        throw error;
+    }
+    return {
+        ok: true,
+        credentialRevision: result.credentialRevision,
+        enabledUserCount: result.enabledUserCount,
+        managedUserCount: result.managedUserCount,
+        code: result.code,
+    };
+}
+
 class L2tpOperationWorker {
     constructor({
         operationRepository,
         lockService,
         executor,
         secretResolver,
+        userSnapshotResolver,
+        userSyncReconciler,
         stateReconciler,
         candidateService,
         operationMaterializer,
@@ -106,6 +147,8 @@ class L2tpOperationWorker {
         this.lockService = lockService;
         this.executor = executor;
         this.secretResolver = secretResolver;
+        this.userSnapshotResolver = userSnapshotResolver;
+        this.userSyncReconciler = userSyncReconciler;
         this.stateReconciler = stateReconciler;
         this.candidateService = candidateService;
         this.operationMaterializer = operationMaterializer;
@@ -168,6 +211,18 @@ class L2tpOperationWorker {
         }
     }
 
+    async prepareSyncUsersPlan(operation) {
+        try {
+            const prepared = materializeSyncUsersOperation({ operation, plan: operation.plan });
+            return { plan: prepared.persistedPlan };
+        } catch {
+            return {
+                errorCode: 'INVALID_SYNC_USERS_PLAN',
+                errorMessage: 'The claimed L2TP sync_users plan is invalid',
+            };
+        }
+    }
+
     async buildInstallCandidate(plan) {
         try {
             if (typeof this.candidateService?.buildCandidate !== 'function') {
@@ -215,6 +270,26 @@ class L2tpOperationWorker {
                 ...materialized.remoteArtifacts,
                 { ...XRAY_CANDIDATE_ARTIFACT, content: candidateContent },
             ],
+        );
+    }
+
+    async resolveSyncUsersSnapshot({ operation, operationId, plan }) {
+        if (typeof this.userSnapshotResolver !== 'function') {
+            throw new TypeError('L2TP user snapshot resolver is unavailable');
+        }
+        return this.userSnapshotResolver({
+            operationId,
+            kind: operation.kind,
+            nodeId: entityId(operation.node),
+            credentialRevision: plan.desired?.credentialRevision,
+        });
+    }
+
+    materializeSyncUsersSteps({ operation, plan, snapshot }) {
+        const materialized = materializeSyncUsersOperation({ operation, plan, snapshot });
+        return attachRemoteArtifacts(
+            materialized.persistedPlan,
+            materialized.remoteArtifacts,
         );
     }
 
@@ -298,6 +373,7 @@ class L2tpOperationWorker {
 
         const operationId = String(operation._id ?? operation.id);
         let preparedInstallPlan = null;
+        let preparedSyncUsersPlan = null;
         if (operation.kind === 'install') {
             const prepared = await this.prepareInstallPlan(operation);
             if (prepared.errorCode) {
@@ -308,11 +384,24 @@ class L2tpOperationWorker {
                 });
             }
             preparedInstallPlan = prepared.plan;
+        } else if (operation.kind === 'sync_users') {
+            const prepared = await this.prepareSyncUsersPlan(operation);
+            if (prepared.errorCode) {
+                return this.failClaimedOperation({
+                    operationId,
+                    errorCode: prepared.errorCode,
+                    errorMessage: prepared.errorMessage,
+                });
+            }
+            preparedSyncUsersPlan = prepared.plan;
         }
 
-        const steps = preparedInstallPlan?.steps ?? operation.plan?.steps;
+        const steps = preparedInstallPlan?.steps
+            ?? preparedSyncUsersPlan?.steps
+            ?? operation.plan?.steps;
+        const requiredVerifyStep = operation.kind === 'sync_users' ? 'verify_users' : 'verify';
         const hasVerifyStep = Array.isArray(steps)
-            && steps.some(step => step?.type === 'verify');
+            && steps.some(step => step?.type === requiredVerifyStep);
 
         if (!hasVerifyStep) {
             const errorMessage = 'L2TP operation plan must include a verify step';
@@ -389,7 +478,11 @@ class L2tpOperationWorker {
         });
 
         try {
-            let executionSteps = preparedInstallPlan?.steps ?? operation.plan.steps;
+            let executionSteps = preparedInstallPlan?.steps
+                ?? preparedSyncUsersPlan?.steps
+                ?? operation.plan.steps;
+            let resolvedSyncUsers = null;
+            let userVerification = null;
             if (preparedInstallPlan) {
                 await heartbeat.renewNow();
                 if (heartbeat.getError()) return leaseLostResult();
@@ -412,13 +505,40 @@ class L2tpOperationWorker {
                         errorMessage: 'Failed to resolve L2TP operation secrets',
                     });
                 }
+            } else if (preparedSyncUsersPlan) {
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+                let snapshot;
+                try {
+                    snapshot = await this.resolveSyncUsersSnapshot({
+                        operation,
+                        operationId,
+                        plan: preparedSyncUsersPlan,
+                    });
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.renewNow();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    executionSteps = this.materializeSyncUsersSteps({
+                        operation,
+                        plan: preparedSyncUsersPlan,
+                        snapshot,
+                    });
+                    resolvedSyncUsers = snapshot.users;
+                } catch {
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.stop();
+                    return this.failClaimedOperation({
+                        operationId,
+                        errorCode: 'USER_SNAPSHOT_RESOLUTION_FAILED',
+                        errorMessage: 'Failed to resolve the current L2TP user snapshot',
+                    });
+                }
             }
             const completedSteps = [];
 
             for (const [index, step] of executionSteps.entries()) {
-                await heartbeat.renewNow();
-                if (heartbeat.getError()) return leaseLostResult();
-
                 const stepType = step.type;
                 const startingProgress = Math.round((index / executionSteps.length) * 100);
                 const completedProgress = Math.round(((index + 1) / executionSteps.length) * 100);
@@ -435,8 +555,18 @@ class L2tpOperationWorker {
                     },
                 });
 
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+
                 try {
-                    await this.executor.executeStep({ operation, step });
+                    const stepResult = await this.executor.executeStep({ operation, step });
+                    if (preparedSyncUsersPlan && stepType === 'verify_users') {
+                        userVerification = verifiedUsersAttestation(
+                            stepResult,
+                            preparedSyncUsersPlan,
+                            resolvedSyncUsers,
+                        );
+                    }
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
                 } catch (error) {
@@ -526,7 +656,10 @@ class L2tpOperationWorker {
                 });
             }
 
-            await heartbeat.stop();
+            if (operation.kind === 'sync_users') {
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+            }
             const finishedAt = this.clock.now();
             const finalStep = executionSteps[executionSteps.length - 1].type;
             if (operation.kind === 'install') {
@@ -600,6 +733,94 @@ class L2tpOperationWorker {
                             level: 'warn',
                             code: 'L2TP_OPERATION_ROLLED_BACK',
                             message: 'Rolled back L2TP operation after state reconciliation failure',
+                        },
+                    });
+                    return { claimed: true, operationId, status: 'rolled_back' };
+                }
+            } else if (operation.kind === 'sync_users') {
+                try {
+                    if (typeof this.userSyncReconciler?.finalizeVerifiedSync !== 'function') {
+                        const unavailable = new Error('L2TP user sync reconciler is unavailable');
+                        unavailable.code = 'L2TP_USER_SYNC_RECONCILER_UNAVAILABLE';
+                        throw unavailable;
+                    }
+                    const finalized = await this.userSyncReconciler.finalizeVerifiedSync({
+                        operation,
+                        resolvedUsers: resolvedSyncUsers,
+                        verification: userVerification,
+                        workerId: this.workerId,
+                    });
+                    if (!finalized) {
+                        throw new Error('L2TP user sync finalization was rejected');
+                    }
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                } catch {
+                    const errorCode = 'USER_SYNC_FINALIZATION_FAILED';
+                    const errorMessage = 'Failed to finalize verified L2TP user sync';
+                    const finalizationError = Object.assign(new Error(errorMessage), {
+                        code: errorCode,
+                    });
+                    await heartbeat.stop();
+                    await this.operationRepository.setStatus({
+                        operationId,
+                        status: 'rolling_back',
+                        step: finalStep,
+                        progress: 100,
+                        errorCode,
+                        errorMessage,
+                        journal: {
+                            at: finishedAt,
+                            level: 'error',
+                            code: 'L2TP_USER_SYNC_FINALIZATION_FAILED',
+                            message: errorMessage,
+                        },
+                    });
+
+                    try {
+                        await this.executor.rollback({
+                            operation,
+                            completedSteps: [...completedSteps],
+                            failedStep: { type: 'user_sync_finalization' },
+                            error: finalizationError,
+                        });
+                    } catch (rollbackError) {
+                        const rollbackErrorCode = rollbackError.code || 'ROLLBACK_FAILED';
+                        const rollbackErrorMessage = rollbackError.message
+                            || 'L2TP operation rollback failed';
+                        const rollbackFinishedAt = this.clock.now();
+                        await this.operationRepository.setStatus({
+                            operationId,
+                            status: 'failed',
+                            step: finalStep,
+                            progress: 100,
+                            errorCode: rollbackErrorCode,
+                            errorMessage: rollbackErrorMessage,
+                            finishedAt: rollbackFinishedAt,
+                            journal: {
+                                at: rollbackFinishedAt,
+                                level: 'error',
+                                code: 'L2TP_ROLLBACK_FAILED',
+                                message: 'Failed to roll back L2TP operation',
+                            },
+                        });
+                        return { claimed: true, operationId, status: 'failed' };
+                    }
+
+                    const rollbackFinishedAt = this.clock.now();
+                    await this.operationRepository.setStatus({
+                        operationId,
+                        status: 'rolled_back',
+                        step: finalStep,
+                        progress: 100,
+                        errorCode,
+                        errorMessage,
+                        finishedAt: rollbackFinishedAt,
+                        journal: {
+                            at: rollbackFinishedAt,
+                            level: 'warn',
+                            code: 'L2TP_OPERATION_ROLLED_BACK',
+                            message: 'Rolled back L2TP operation after user sync finalization failure',
                         },
                     });
                     return { claimed: true, operationId, status: 'rolled_back' };

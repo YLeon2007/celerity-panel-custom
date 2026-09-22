@@ -5,6 +5,7 @@ const test = require('node:test');
 
 const {
     materializeInstallOperation,
+    materializeSyncUsersOperation,
 } = require('../services/l2tpOperationMaterializer');
 const {
     buildInstallPlan,
@@ -216,4 +217,114 @@ test('materializes an empty desired users array only when the resolver returns n
         clientCidr: '10.77.0.0/24',
         users: [],
     });
+});
+
+test('materializes standalone sync_users credentials only into its transient typed artifact', () => {
+    const operation = {
+        id: 'operation-user-sync-9',
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'running',
+        leaseOwner: 'worker-1',
+    };
+    const plan = {
+        ok: true,
+        operationId: 'operation-user-sync-9',
+        relayId: 'relay-1',
+        desired: { credentialRevision: 9 },
+        steps: [
+            { type: 'backup' },
+            {
+                type: 'sync_users',
+                artifacts: [{ type: 'desired', path: 'desired.json' }],
+            },
+            { type: 'verify_users' },
+        ],
+    };
+
+    const prepared = materializeSyncUsersOperation({ operation, plan });
+    const materialized = materializeSyncUsersOperation({
+        operation,
+        plan: prepared.persistedPlan,
+        snapshot: {
+            credentialRevision: 9,
+            users: [{
+                id: 'user-alice',
+                relayNode: 'relay-1',
+                login: 'alice',
+                password: SECRET_PASSWORD,
+                ip: '10.77.0.10',
+                enabled: true,
+                desiredRevision: 9,
+            }, {
+                id: 'user-disabled',
+                relayNode: 'relay-1',
+                login: 'disabled',
+                password: 'disabled-secret',
+                ip: '10.77.0.11',
+                enabled: false,
+                desiredRevision: 9,
+            }],
+        },
+    });
+
+    assert.deepEqual(prepared, { persistedPlan: plan, remoteArtifacts: [] });
+    assert.deepEqual(materialized.persistedPlan, plan);
+    assert.deepEqual(materialized.remoteArtifacts, [{
+        stepType: 'sync_users',
+        type: 'desired',
+        path: 'desired.json',
+        content: `${JSON.stringify({
+            credentialRevision: 9,
+            users: [{
+                login: 'alice',
+                password: SECRET_PASSWORD,
+                ipAddress: '10.77.0.10',
+                enabled: true,
+            }, {
+                login: 'disabled',
+                password: 'disabled-secret',
+                ipAddress: '10.77.0.11',
+                enabled: false,
+            }],
+        })}\n`,
+    }]);
+    assert.doesNotMatch(JSON.stringify(materialized.persistedPlan), new RegExp(SECRET_PASSWORD));
+});
+
+test('rejects standalone sync_users identity and snapshot revision mismatches before materialization', () => {
+    const plan = {
+        ok: true,
+        operationId: 'operation-user-sync-9',
+        relayId: 'relay-1',
+        desired: { credentialRevision: 9 },
+        steps: [
+            { type: 'backup' },
+            {
+                type: 'sync_users',
+                artifacts: [{ type: 'desired', path: 'desired.json' }],
+            },
+            { type: 'verify_users' },
+        ],
+    };
+    const operation = {
+        id: 'operation-user-sync-9',
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'running',
+        leaseOwner: 'worker-1',
+    };
+    const snapshot = { credentialRevision: 9, users: [] };
+
+    for (const request of [
+        { operation: { ...operation, id: 'other-operation' }, plan, snapshot },
+        { operation: { ...operation, node: 'other-relay' }, plan, snapshot },
+        { operation: { ...operation, status: 'cancelled' }, plan, snapshot },
+        { operation, plan, snapshot: { ...snapshot, credentialRevision: 10 } },
+    ]) {
+        assert.throws(
+            () => materializeSyncUsersOperation(request),
+            error => error?.code === 'INVALID_SYNC_USERS_CONTEXT',
+        );
+    }
 });

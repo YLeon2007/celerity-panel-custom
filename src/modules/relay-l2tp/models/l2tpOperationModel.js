@@ -22,6 +22,52 @@ const OPERATION_STATUSES = [
     'rolled_back',
     'cancelled',
 ];
+const SYNC_USERS_STEP_TYPES = Object.freeze(['backup', 'sync_users', 'verify_users']);
+
+function plainObject(value) {
+    return value && typeof value.toObject === 'function'
+        ? value.toObject()
+        : value;
+}
+
+function hasExactKeys(value, expectedKeys) {
+    const plain = plainObject(value);
+    return plain
+        && typeof plain === 'object'
+        && !Array.isArray(plain)
+        && Object.keys(plain).sort().join('\0') === [...expectedKeys].sort().join('\0');
+}
+
+function isValidSyncUsersPlan(plan, operation) {
+    if (operation.kind !== 'sync_users') return true;
+    const plain = plainObject(plan);
+    const desired = plainObject(plain?.desired);
+    const steps = plain?.steps?.map(plainObject);
+    const credentialRevision = desired?.credentialRevision;
+    if (
+        !hasExactKeys(plain, ['ok', 'operationId', 'relayId', 'desired', 'steps'])
+        || plain.ok !== true
+        || plain.operationId !== String(operation._id)
+        || plain.relayId !== String(operation.node)
+        || !hasExactKeys(desired, ['credentialRevision'])
+        || !Number.isSafeInteger(credentialRevision)
+        || credentialRevision < 1
+        || !Array.isArray(steps)
+        || steps.length !== SYNC_USERS_STEP_TYPES.length
+        || steps.some((step, index) => step?.type !== SYNC_USERS_STEP_TYPES[index])
+        || !hasExactKeys(steps[0], ['type'])
+        || !hasExactKeys(steps[2], ['type'])
+        || !hasExactKeys(steps[1], ['type', 'artifacts'])
+        || !Array.isArray(steps[1].artifacts)
+        || steps[1].artifacts.length !== 1
+    ) {
+        return false;
+    }
+    const artifact = plainObject(steps[1].artifacts[0]);
+    return hasExactKeys(artifact, ['type', 'path'])
+        && artifact.type === 'desired'
+        && artifact.path === 'desired.json';
+}
 
 const operationLogEntrySchema = new mongoose.Schema({
     at: { type: Date, default: Date.now, required: true },
@@ -108,6 +154,13 @@ const l2tpOperationSchema = new mongoose.Schema({
         type: operationPlanSchema,
         required: true,
         immutable: true,
+        validate: {
+            validator(plan) {
+                return isValidSyncUsersPlan(plan, this);
+            },
+            message: 'sync_users operations require an exact durable plan',
+            type: 'syncUsersPlan',
+        },
     },
     topologyRevision: { type: Number, min: 0, default: null },
     routeGroupId: {

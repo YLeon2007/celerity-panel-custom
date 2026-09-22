@@ -52,6 +52,8 @@ function createActiveHost(overrides = {}) {
     const runtimeCalls = [];
     const preflightFactoryCalls = [];
     const candidateFactoryCalls = [];
+    const userSnapshotFactoryCalls = [];
+    const userSyncFactoryCalls = [];
     let scheduledTick;
     const executionNode = {
         _id: 'node-a',
@@ -208,6 +210,25 @@ function createActiveHost(overrides = {}) {
         candidateFactoryCalls.push(dependencies);
         return new L2tpXrayCandidateService(dependencies);
     };
+    const createUserSnapshotResolver = dependencies => {
+        userSnapshotFactoryCalls.push(dependencies);
+        return async request => ({
+            credentialRevision: request.credentialRevision,
+            users: await dependencies.userResolver.resolve({
+                ...request,
+                kind: 'install',
+            }),
+        });
+    };
+    const userSyncReconciler = {
+        async finalizeVerifiedSync() {
+            return { ok: true };
+        },
+    };
+    const createUserSyncReconciler = dependencies => {
+        userSyncFactoryCalls.push(dependencies);
+        return userSyncReconciler;
+    };
 
     const host = createL2tpPanelHost({
         requireAuth: passThrough,
@@ -232,6 +253,8 @@ function createActiveHost(overrides = {}) {
         NodeTransport: L2tpNodeTransport,
         createPreflightRunner,
         createCandidateService,
+        createUserSnapshotResolver,
+        createUserSyncReconciler,
         candidateNodeResolver,
         candidateUserResolver,
         configGenerator: generateXrayConfig,
@@ -259,16 +282,20 @@ function createActiveHost(overrides = {}) {
         host,
         preflightFactoryCalls,
         runtimeCalls,
+        userSnapshotFactoryCalls,
+        userSyncFactoryCalls,
+        userSyncReconciler,
         userManagementDependencies: {
             HyNode,
             L2tpUser,
+            L2tpOperation: models.L2tpOperation,
             RelayL2tpState,
             secretBox,
         },
     };
 }
 
-test('explicit complete activation wires preflight and candidate factories lazily and starts only on request', async () => {
+test('explicit complete activation wires execution factories lazily and starts only on request', async () => {
     const {
         calls,
         candidateDependencies,
@@ -277,6 +304,10 @@ test('explicit complete activation wires preflight and candidate factories lazil
         host,
         preflightFactoryCalls,
         runtimeCalls,
+        userManagementDependencies,
+        userSnapshotFactoryCalls,
+        userSyncFactoryCalls,
+        userSyncReconciler,
     } = createActiveHost();
 
     assert.equal(runtimeCalls.length, 1);
@@ -290,6 +321,8 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'preflightRunner',
             'candidateService',
             'secretResolver',
+            'userSnapshotResolver',
+            'userSyncReconciler',
             'stateReconciler',
         ].includes(key)),
         [
@@ -298,6 +331,8 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'transportResolver',
             'operationMaterializer',
             'secretResolver',
+            'userSnapshotResolver',
+            'userSyncReconciler',
             'stateReconciler',
         ],
     );
@@ -313,8 +348,17 @@ test('explicit complete activation wires preflight and candidate factories lazil
     assert.ok(host.runtime.worker.lockService instanceof NodeOperationLockService);
     assert.ok(host.runtime.worker.lockService.repository instanceof NodeOperationLockRepository);
     assert.strictEqual(host.runtime.worker.candidateService, runtimeCalls[0].candidateService);
+    assert.strictEqual(host.runtime.worker.userSyncReconciler, userSyncReconciler);
     assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
     assert.strictEqual(runtimeCalls[0].operationMaterializer, materializeInstallOperation);
+    assert.equal(userSnapshotFactoryCalls.length, 1);
+    assert.equal(typeof userSnapshotFactoryCalls[0].userResolver.resolve, 'function');
+    assert.deepEqual(userSyncFactoryCalls, [{
+        L2tpOperation: userManagementDependencies.L2tpOperation,
+        RelayL2tpState: userManagementDependencies.RelayL2tpState,
+        L2tpUser: userManagementDependencies.L2tpUser,
+        clock: runtimeCalls[0].clock,
+    }]);
     assert.deepEqual(calls, []);
     assert.equal(getScheduledTick(), undefined);
     assert.equal(
@@ -345,6 +389,19 @@ test('explicit complete activation wires preflight and candidate factories lazil
             ip: '10.77.0.10',
         }],
     });
+    assert.deepEqual(await host.runtime.worker.userSnapshotResolver({
+        operationId: 'operation-sync-7',
+        kind: 'sync_users',
+        nodeId: 'node-a',
+        credentialRevision: 7,
+    }), {
+        credentialRevision: 7,
+        users: [{
+            login: 'alice',
+            password: 'resolved-alice-password',
+            ip: '10.77.0.10',
+        }],
+    });
     assert.deepEqual(
         calls.map(call => call.kind),
         [
@@ -352,6 +409,11 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'RelayL2tpState.findOne',
             'RelayL2tpState.select',
             'RelayL2tpState.lean',
+            'secretBox.decrypt',
+            'L2tpUser.find',
+            'L2tpUser.select',
+            'L2tpUser.sort',
+            'L2tpUser.lean',
             'secretBox.decrypt',
             'L2tpUser.find',
             'L2tpUser.select',
@@ -377,6 +439,11 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'RelayL2tpState.findOne',
             'RelayL2tpState.select',
             'RelayL2tpState.lean',
+            'secretBox.decrypt',
+            'L2tpUser.find',
+            'L2tpUser.select',
+            'L2tpUser.sort',
+            'L2tpUser.lean',
             'secretBox.decrypt',
             'L2tpUser.find',
             'L2tpUser.select',
@@ -483,6 +550,10 @@ test('active runtime composes model-backed user management without enumerating c
     assert.ok(service.repository instanceof L2tpUserManagementRepository);
     assert.strictEqual(service.repository.HyNode, userManagementDependencies.HyNode);
     assert.strictEqual(service.repository.L2tpUser, userManagementDependencies.L2tpUser);
+    assert.strictEqual(
+        service.repository.L2tpOperation,
+        userManagementDependencies.L2tpOperation,
+    );
     assert.strictEqual(service.repository.RelayL2tpState, userManagementDependencies.RelayL2tpState);
     assert.strictEqual(service.secretBox, userManagementDependencies.secretBox);
     assert.deepEqual(calls, []);

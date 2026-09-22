@@ -31,26 +31,34 @@ function createRepository(overrides = {}) {
     };
 }
 
-test('creates a validated user with an encrypted password and returns only safe fields', async () => {
+test('creates a validated user and atomically queues one durable sync operation', async () => {
     const calls = [];
     const repository = createRepository({
         async findConflict(relayNode, identity) {
             calls.push({ method: 'findConflict', relayNode, identity });
             return null;
         },
-        async reserveCredentialRevision(relayNode) {
-            calls.push({ method: 'reserveCredentialRevision', relayNode });
+        async reserveCredentialRevision() {
+            calls.push({ method: 'unsafeReserveCredentialRevision' });
             return 7;
         },
-        async createUser(fields) {
-            calls.push({ method: 'createUser', fields });
+        async createUser() {
+            calls.push({ method: 'unsafeCreateUser' });
+            return null;
+        },
+        async createUserAndQueueSync(fields) {
+            calls.push({ method: 'createUserAndQueueSync', fields });
             return {
-                _id: 'user-1',
-                ...fields,
-                appliedRevision: 0,
-                syncStatus: 'pending',
-                password: 'must-not-escape',
-                rawCommand: 'must-not-escape',
+                user: {
+                    _id: 'user-1',
+                    ...fields,
+                    desiredRevision: 7,
+                    appliedRevision: 0,
+                    syncStatus: 'pending',
+                    password: 'must-not-escape',
+                    rawCommand: 'must-not-escape',
+                },
+                operationId: 'sync-operation-7',
             };
         },
     });
@@ -83,16 +91,14 @@ test('creates a validated user with an encrypted password and returns only safe 
             plaintext: 'test-account-password',
             key: 'test-secret-key',
         },
-        { method: 'reserveCredentialRevision', relayNode: 'relay-1' },
         {
-            method: 'createUser',
+            method: 'createUserAndQueueSync',
             fields: {
                 relayNode: 'relay-1',
                 login: 'alice',
                 ip: '10.77.0.10',
                 enabled: true,
                 passwordEncrypted: 'sealed-password',
-                desiredRevision: 7,
             },
         },
     ]);
@@ -105,6 +111,7 @@ test('creates a validated user with an encrypted password and returns only safe 
         desiredRevision: 7,
         appliedRevision: 0,
         syncStatus: 'pending',
+        syncOperationId: 'sync-operation-7',
     });
     assert.doesNotMatch(JSON.stringify(user), /test-account-password|sealed-password|password|rawCommand/);
 });
@@ -191,7 +198,7 @@ test('rejects duplicate login or IP without encrypting and translates duplicate-
 
     const raceService = new L2tpUserManagementService({
         repository: createRepository({
-            async createUser() {
+            async createUserAndQueueSync() {
                 throw Object.assign(new Error('E11000 keyValue passwordEncrypted=sealed'), {
                     code: 11000,
                 });
@@ -353,7 +360,7 @@ test('projects every failed sync as one fixed safe code without diagnostic or cr
     );
 });
 
-test('updates allowlisted fields, encrypts a replacement password, and advances desired revision', async () => {
+test('updates desired state and atomically queues its revision-fenced sync operation', async () => {
     const calls = [];
     const existing = {
         _id: 'user-1',
@@ -375,17 +382,31 @@ test('updates allowlisted fields, encrypts a replacement password, and advances 
                 calls.push({ method: 'findConflict', relayNode, identity, excludeUserId });
                 return null;
             },
-            async reserveCredentialRevision(relayNode) {
-                calls.push({ method: 'reserveCredentialRevision', relayNode });
+            async reserveCredentialRevision() {
+                calls.push({ method: 'unsafeReserveCredentialRevision' });
                 return 8;
             },
-            async updateUser(relayNode, userId, fields) {
-                calls.push({ method: 'updateUser', relayNode, userId, fields });
+            async updateUser() {
+                calls.push({ method: 'unsafeUpdateUser' });
+                return null;
+            },
+            async updateUserAndQueueSync(relayNode, userId, expectedRevision, fields) {
+                calls.push({
+                    method: 'updateUserAndQueueSync',
+                    relayNode,
+                    userId,
+                    expectedRevision,
+                    fields,
+                });
                 return {
-                    ...existing,
-                    ...fields,
-                    passwordEncrypted: 'sealed-replacement',
-                    rawCommand: 'must-not-escape',
+                    user: {
+                        ...existing,
+                        ...fields,
+                        desiredRevision: 8,
+                        passwordEncrypted: 'sealed-replacement',
+                        rawCommand: 'must-not-escape',
+                    },
+                    operationId: 'sync-operation-8',
                 };
             },
         }),
@@ -413,16 +434,15 @@ test('updates allowlisted fields, encrypts a replacement password, and advances 
             excludeUserId: 'user-1',
         },
         { method: 'encrypt', plaintext: 'replacement-password', key: 'test-secret-key' },
-        { method: 'reserveCredentialRevision', relayNode: 'relay-1' },
         {
-            method: 'updateUser',
+            method: 'updateUserAndQueueSync',
             relayNode: 'relay-1',
             userId: 'user-1',
+            expectedRevision: 4,
             fields: {
                 ip: '10.77.0.20',
                 enabled: false,
                 passwordEncrypted: 'sealed-replacement',
-                desiredRevision: 8,
             },
         },
     ]);
@@ -435,6 +455,7 @@ test('updates allowlisted fields, encrypts a replacement password, and advances 
         desiredRevision: 8,
         appliedRevision: 4,
         syncStatus: 'synced',
+        syncOperationId: 'sync-operation-8',
     });
     assert.doesNotMatch(JSON.stringify(user), /replacement-password|sealed-replacement|rawCommand/);
 });

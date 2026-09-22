@@ -230,3 +230,147 @@ test('updates one relay-owned user, resets sync state, and returns the safe proj
     assert.strictEqual(user, updated);
     assert.doesNotMatch(SAFE_USER_SELECT, /password|cipher|secret/i);
 });
+
+test('creates a user and its revision-keyed sync operation in one transaction', async () => {
+    const models = createModels();
+    const session = { id: 'transaction-session' };
+    models.L2tpUser.create = async (documents, options) => {
+        models.calls.push({ method: 'L2tpUser.create', documents, options });
+        return [{ _id: 'user-1', ...documents[0] }];
+    };
+    const L2tpOperation = {
+        async create(documents, options) {
+            models.calls.push({ method: 'L2tpOperation.create', documents, options });
+            return documents;
+        },
+    };
+    const repository = new L2tpUserManagementRepository({
+        ...models,
+        L2tpOperation,
+        operationIdFactory: () => 'sync-operation-7',
+        transactionRunner: async work => {
+            models.calls.push({ method: 'transaction.begin', session });
+            const result = await work(session);
+            models.calls.push({ method: 'transaction.commit', session });
+            return result;
+        },
+    });
+
+    const result = await repository.createUserAndQueueSync({
+        relayNode: 'relay-1',
+        login: 'alice',
+        ip: '10.77.0.10',
+        enabled: true,
+        passwordEncrypted: 'sealed-password',
+    });
+
+    assert.equal(result.operationId, 'sync-operation-7');
+    assert.equal(result.user.desiredRevision, 7);
+    assert.equal(result.user.syncStatus, 'pending');
+    assert.doesNotMatch(JSON.stringify(result), /sealed-password|password/i);
+    const stateWrite = models.calls.find(call => (
+        call.method === 'RelayL2tpState.findOneAndUpdate'
+    ));
+    assert.equal(stateWrite.options.session, session);
+    const userWrite = models.calls.find(call => call.method === 'L2tpUser.create');
+    assert.equal(userWrite.options.session, session);
+    assert.equal(userWrite.documents[0].desiredRevision, 7);
+    const operationWrite = models.calls.find(call => call.method === 'L2tpOperation.create');
+    assert.equal(operationWrite.options.session, session);
+    assert.deepEqual(operationWrite.documents, [{
+        _id: 'sync-operation-7',
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'queued',
+        idempotencyKey: 'sync-users:relay-1:revision-7',
+        progress: 0,
+        attempts: 0,
+        plan: {
+            ok: true,
+            operationId: 'sync-operation-7',
+            relayId: 'relay-1',
+            desired: { credentialRevision: 7 },
+            steps: [
+                { type: 'backup' },
+                {
+                    type: 'sync_users',
+                    artifacts: [{ type: 'desired', path: 'desired.json' }],
+                },
+                { type: 'verify' },
+            ],
+        },
+    }]);
+    assert.doesNotMatch(
+        JSON.stringify(operationWrite.documents),
+        /sealed-password|passwordEncrypted|"password"/i,
+    );
+    assert.deepEqual(
+        models.calls.filter(call => call.method.startsWith('transaction.')).map(call => call.method),
+        ['transaction.begin', 'transaction.commit'],
+    );
+});
+
+test('updates by desired-revision CAS and queues the next sync in the same transaction', async () => {
+    const models = createModels();
+    const session = { id: 'transaction-session' };
+    models.RelayL2tpState.findOneAndUpdate = (filter, update, options) => {
+        models.calls.push({ method: 'RelayL2tpState.findOneAndUpdate', filter, update, options });
+        return queryResult({ secretRevision: 8 }, models.calls, 'RelayL2tpState');
+    };
+    models.L2tpUser.findOneAndUpdate = (filter, update, options) => {
+        models.calls.push({ method: 'L2tpUser.findOneAndUpdate', filter, update, options });
+        return queryResult({
+            _id: 'user-1',
+            relayNode: 'relay-1',
+            login: 'alice',
+            ip: '10.77.0.20',
+            enabled: false,
+            desiredRevision: 8,
+            appliedRevision: 4,
+            syncStatus: 'pending',
+        }, models.calls, 'L2tpUser.findOneAndUpdate');
+    };
+    const L2tpOperation = {
+        async create(documents, options) {
+            models.calls.push({ method: 'L2tpOperation.create', documents, options });
+            return documents;
+        },
+    };
+    const repository = new L2tpUserManagementRepository({
+        ...models,
+        L2tpOperation,
+        operationIdFactory: () => 'sync-operation-8',
+        transactionRunner: work => work(session),
+    });
+
+    const result = await repository.updateUserAndQueueSync(
+        'relay-1',
+        'user-1',
+        4,
+        { ip: '10.77.0.20', enabled: false },
+    );
+
+    assert.equal(result.operationId, 'sync-operation-8');
+    assert.equal(result.user.desiredRevision, 8);
+    const userWrite = models.calls.find(call => call.method === 'L2tpUser.findOneAndUpdate');
+    assert.deepEqual(userWrite.filter, {
+        relayNode: 'relay-1',
+        _id: 'user-1',
+        desiredRevision: 4,
+    });
+    assert.deepEqual(userWrite.update, {
+        $set: {
+            ip: '10.77.0.20',
+            enabled: false,
+            desiredRevision: 8,
+            syncStatus: 'pending',
+            lastErrorCode: '',
+            lastError: '',
+        },
+    });
+    assert.equal(userWrite.options.session, session);
+    const operationWrite = models.calls.find(call => call.method === 'L2tpOperation.create');
+    assert.equal(operationWrite.options.session, session);
+    assert.equal(operationWrite.documents[0].idempotencyKey, 'sync-users:relay-1:revision-8');
+    assert.equal(operationWrite.documents[0].plan.desired.credentialRevision, 8);
+});

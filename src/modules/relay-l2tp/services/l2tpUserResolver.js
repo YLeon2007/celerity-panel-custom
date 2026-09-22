@@ -47,6 +47,97 @@ class L2tpUserResolver {
         this.secretKey = secretKey;
     }
 
+    async resolveSyncSnapshot(request) {
+        if (!request || typeof request !== 'object' || request.kind !== 'sync_users') {
+            throw new L2tpUserResolutionError(
+                'INVALID_OPERATION_KIND',
+                'L2TP user snapshots can only be resolved for sync_users execution',
+            );
+        }
+        const nodeId = entityId(request.nodeId ?? request.node);
+        const credentialRevision = request.credentialRevision;
+        if (!nodeId) {
+            throw new L2tpUserResolutionError(
+                'INVALID_OPERATION_NODE',
+                'The L2TP operation does not identify a relay node',
+            );
+        }
+        if (!Number.isSafeInteger(credentialRevision) || credentialRevision < 1) {
+            throw new L2tpUserResolutionError(
+                'CREDENTIAL_REVISION_MISMATCH',
+                'The L2TP operation credential revision is invalid',
+            );
+        }
+        if (typeof this.repository.findByRelayNode !== 'function') {
+            throw new L2tpUserResolutionError(
+                'L2TP_USER_QUERY_FAILED',
+                'The L2TP users could not be loaded',
+            );
+        }
+        const rows = await this.repository.findByRelayNode(nodeId);
+        if (!Array.isArray(rows)) {
+            throw new L2tpUserResolutionError(
+                'L2TP_USER_QUERY_FAILED',
+                'The L2TP users could not be loaded',
+            );
+        }
+
+        const ids = new Set();
+        const logins = new Set();
+        const ips = new Set();
+        const users = rows.map(row => {
+            const id = entityId(row);
+            if (
+                !row
+                || typeof row !== 'object'
+                || !id
+                || entityId(row.relayNode) !== nodeId
+                || typeof row.login !== 'string'
+                || !LOGIN_PATTERN.test(row.login)
+                || !isCanonicalIpv4(row.ip)
+                || typeof row.enabled !== 'boolean'
+                || !Number.isSafeInteger(row.desiredRevision)
+                || row.desiredRevision < 1
+                || row.desiredRevision > credentialRevision
+                || typeof row.passwordEncrypted !== 'string'
+                || row.passwordEncrypted.length === 0
+                || ids.has(id)
+                || logins.has(row.login)
+                || ips.has(row.ip)
+            ) {
+                throw invalidUser();
+            }
+            let password;
+            try {
+                password = this.secretBox.decrypt(row.passwordEncrypted, this.secretKey);
+            } catch {
+                throw new L2tpUserResolutionError(
+                    'L2TP_USER_DECRYPTION_FAILED',
+                    'An L2TP user password could not be decrypted',
+                );
+            }
+            if (typeof password !== 'string' || password.length === 0 || /[\r\n\0]/.test(password)) {
+                throw new L2tpUserResolutionError(
+                    'L2TP_USER_DECRYPTION_FAILED',
+                    'An L2TP user password could not be decrypted',
+                );
+            }
+            ids.add(id);
+            logins.add(row.login);
+            ips.add(row.ip);
+            return {
+                id,
+                relayNode: nodeId,
+                login: row.login,
+                password,
+                ip: row.ip,
+                enabled: row.enabled,
+                desiredRevision: row.desiredRevision,
+            };
+        });
+        return { credentialRevision, users };
+    }
+
     async resolve(operation) {
         if (!operation || typeof operation !== 'object' || operation.kind !== 'install') {
             throw new L2tpUserResolutionError(

@@ -105,9 +105,13 @@ test('enabled mode forwards factory dependencies and starts the lifecycle once',
     const calls = [];
     const createCandidateService = () => ({ buildCandidate() {} });
     const createPreflightRunner = () => async () => ({ ok: true, checks: [] });
+    const createUserSnapshotResolver = () => async () => ({ credentialRevision: 1, users: [] });
+    const createUserSyncReconciler = () => ({ async finalizeVerifiedSync() { return { ok: true }; } });
     const hostDependencies = {
         createCandidateService,
         createPreflightRunner,
+        createUserSnapshotResolver,
+        createUserSyncReconciler,
         marker: 'explicit-host-dependencies',
     };
     const lifecycle = {

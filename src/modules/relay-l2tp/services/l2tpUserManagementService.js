@@ -215,25 +215,32 @@ class L2tpUserManagementService {
         } catch {
             throw encryptionError();
         }
-        const desiredRevision = configuredRevision(
-            await this.repository.reserveCredentialRevision(relayNode),
-        );
-
-        let user;
+        let result;
         try {
-            user = await this.repository.createUser({
+            result = await this.repository.createUserAndQueueSync({
                 relayNode,
                 login: input.login,
                 ip: input.ip,
                 enabled,
                 passwordEncrypted,
-                desiredRevision,
             });
         } catch (error) {
             if (isDuplicateKeyError(error)) throw conflictError();
             throw error;
         }
-        return safeUser(user);
+        const desiredRevision = configuredRevision(result?.user?.desiredRevision);
+        const syncOperationId = entityId(result?.operationId);
+        if (!syncOperationId) {
+            throw new L2tpUserManagementError(
+                'L2TP_USER_SYNC_QUEUE_FAILED',
+                'The L2TP user sync operation could not be queued',
+            );
+        }
+        return safeUser({
+            ...result.user,
+            desiredRevision,
+            syncOperationId,
+        });
     }
 
     async listUsers(nodeId) {
@@ -285,18 +292,28 @@ class L2tpUserManagementService {
         }
         if (Object.keys(fields).length === 0) return safeUser(existing);
 
-        fields.desiredRevision = configuredRevision(
-            await this.repository.reserveCredentialRevision(relayNode),
-        );
-        let user;
+        let result;
         try {
-            user = await this.repository.updateUser(relayNode, selectedUserId, fields);
+            result = await this.repository.updateUserAndQueueSync(
+                relayNode,
+                selectedUserId,
+                existing.desiredRevision,
+                fields,
+            );
         } catch (error) {
             if (isDuplicateKeyError(error)) throw conflictError();
             throw error;
         }
-        if (!user) throw notFoundError();
-        return safeUser(user);
+        if (!result?.user) throw notFoundError();
+        configuredRevision(result.user.desiredRevision);
+        const syncOperationId = entityId(result.operationId);
+        if (!syncOperationId) {
+            throw new L2tpUserManagementError(
+                'L2TP_USER_SYNC_QUEUE_FAILED',
+                'The L2TP user sync operation could not be queued',
+            );
+        }
+        return safeUser({ ...result.user, syncOperationId });
     }
 
     disableUser(nodeId, userId) {

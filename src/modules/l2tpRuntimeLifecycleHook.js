@@ -68,7 +68,12 @@ function createEnabledHostDependencies(factory) {
     if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
         throw new TypeError('L2TP createHostDependencies must return an object');
     }
-    for (const factoryName of ['createCandidateService', 'createPreflightRunner']) {
+    for (const factoryName of [
+        'createCandidateService',
+        'createPreflightRunner',
+        'createUserSnapshotResolver',
+        'createUserSyncReconciler',
+    ]) {
         if (typeof dependencies[factoryName] !== 'function') {
             throw new TypeError(`L2TP enabled startup requires explicit ${factoryName}`);
         }
@@ -105,6 +110,20 @@ function createL2tpRootHostDependencies({
         .createL2tpPreflightRunner,
     operationMaterializer = require('./relay-l2tp/services/l2tpOperationMaterializer')
         .materializeInstallOperation,
+    createUserSnapshotResolver = ({ userResolver } = {}) => {
+        if (!userResolver || typeof userResolver.resolveSyncSnapshot !== 'function') {
+            throw new TypeError('L2TP user snapshot resolver is unavailable');
+        }
+        return request => userResolver.resolveSyncSnapshot(request);
+    },
+    createUserSyncReconciler = ({ L2tpOperation, RelayL2tpState, L2tpUser, clock } = {}) => {
+        const { L2tpUserSyncRepository } = require('./relay-l2tp/repositories/l2tpUserSyncRepository');
+        const { L2tpUserSyncReconciler } = require('./relay-l2tp/services/l2tpUserSyncReconciler');
+        return new L2tpUserSyncReconciler({
+            repository: new L2tpUserSyncRepository({ L2tpOperation, RelayL2tpState, L2tpUser }),
+            clock,
+        });
+    },
     secretBox = require('./relay-l2tp/services/secretBoxService'),
     secretKey = require('../../config').ENCRYPTION_KEY,
     syncService = require('../services/syncService'),
@@ -170,6 +189,8 @@ function createL2tpRootHostDependencies({
         configGenerator,
         fragmentProvider,
         operationMaterializer,
+        createUserSnapshotResolver,
+        createUserSyncReconciler,
         secretBox,
         secretKey,
         requireAuth,

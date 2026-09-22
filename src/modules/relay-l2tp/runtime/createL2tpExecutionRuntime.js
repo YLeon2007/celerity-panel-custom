@@ -9,6 +9,8 @@ const { L2tpNodeExecutionResolver } = require('../services/l2tpNodeExecutionReso
 const { createL2tpNodeTransportResolver } = require('../services/l2tpNodeTransportFactory');
 const { L2tpStateManagementService } = require('../services/l2tpStateManagementService');
 const { L2tpUserManagementService } = require('../services/l2tpUserManagementService');
+const { L2tpUserSyncReconciler } = require('../services/l2tpUserSyncReconciler');
+const { L2tpUserSyncRepository } = require('../repositories/l2tpUserSyncRepository');
 const { L2tpUserResolver } = require('../services/l2tpUserResolver');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
@@ -74,6 +76,20 @@ async function unavailableStateReconciler() {
     throw error;
 }
 
+async function unavailableUserSnapshotResolver() {
+    const error = new Error('L2TP user snapshot resolver is unavailable');
+    error.code = 'L2TP_USER_SNAPSHOT_RESOLVER_UNAVAILABLE';
+    throw error;
+}
+
+const unavailableUserSyncReconciler = Object.freeze({
+    async finalizeVerifiedSync() {
+        const error = new Error('L2TP user sync reconciler is unavailable');
+        error.code = 'L2TP_USER_SYNC_RECONCILER_UNAVAILABLE';
+        throw error;
+    },
+});
+
 const unavailableCandidateService = Object.freeze({
     async buildCandidate() {
         const error = new Error('L2TP Xray candidate service is unavailable');
@@ -135,6 +151,8 @@ function assertActiveExecutionDependencies({
     configGenerator,
     fragmentProvider,
     operationMaterializer,
+    createUserSnapshotResolver,
+    createUserSyncReconciler,
     secretBox,
     secretKey,
     clock,
@@ -166,6 +184,8 @@ function assertActiveExecutionDependencies({
         configGenerator,
         fragmentProvider,
         operationMaterializer,
+        createUserSnapshotResolver,
+        createUserSyncReconciler,
         createRuntime,
         createWorkerLifecycle,
     })) {
@@ -208,6 +228,8 @@ function createL2tpExecutionRuntime({
     configGenerator,
     fragmentProvider,
     operationMaterializer,
+    createUserSnapshotResolver,
+    createUserSyncReconciler,
     secretBox,
     secretKey,
     stateManagementService,
@@ -224,6 +246,8 @@ function createL2tpExecutionRuntime({
             transport: dormantTransport,
             lockService: dormantLockService,
             secretResolver: unavailableSecretResolver,
+            userSnapshotResolver: unavailableUserSnapshotResolver,
+            userSyncReconciler: unavailableUserSyncReconciler,
             stateReconciler: unavailableStateReconciler,
             stateManagementService: stateManagementService ?? unavailableStateManagementService,
             userManagementService: unavailableUserManagementService,
@@ -251,6 +275,8 @@ function createL2tpExecutionRuntime({
         configGenerator,
         fragmentProvider,
         operationMaterializer,
+        createUserSnapshotResolver,
+        createUserSyncReconciler,
         secretBox,
         secretKey,
         clock,
@@ -300,6 +326,7 @@ function createL2tpExecutionRuntime({
         HyNode,
         L2tpUser,
         RelayL2tpState,
+        L2tpOperation: operationModel,
     });
     const userManagementService = new L2tpUserManagementService({
         repository: userManagementRepository,
@@ -312,6 +339,21 @@ function createL2tpExecutionRuntime({
         secretBox,
         secretKey,
     });
+    const userSnapshotResolver = createUserSnapshotResolver({ userResolver });
+    if (typeof userSnapshotResolver !== 'function') {
+        throw new TypeError('Active L2TP execution createUserSnapshotResolver must return a function');
+    }
+    const userSyncReconciler = createUserSyncReconciler({
+        L2tpOperation: operationModel,
+        RelayL2tpState,
+        L2tpUser,
+        clock,
+    });
+    if (!userSyncReconciler || typeof userSyncReconciler.finalizeVerifiedSync !== 'function') {
+        throw new TypeError(
+            'Active L2TP execution createUserSyncReconciler must return a reconciler',
+        );
+    }
     const secretResolver = async operation => {
         const secrets = await managementService.resolveOperationSecrets(operation);
         const users = await userResolver.resolve(operation);
@@ -329,6 +371,8 @@ function createL2tpExecutionRuntime({
         transportResolver,
         operationMaterializer,
         secretResolver,
+        userSnapshotResolver,
+        userSyncReconciler,
         stateReconciler,
         stateManagementService: runtimeStateManagementService,
         userManagementService,

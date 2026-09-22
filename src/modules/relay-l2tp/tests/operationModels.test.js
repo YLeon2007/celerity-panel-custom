@@ -91,7 +91,31 @@ test('L2TP operation kind is required and limited to the documented v1 kinds', (
     assert.deepEqual(L2tpOperation.schema.path('kind').enumValues, L2TP_OPERATION_KINDS);
 
     for (const kind of L2TP_OPERATION_KINDS) {
-        assert.equal(l2tpOperation({ kind }).validateSync(), undefined);
+        if (kind !== 'sync_users') {
+            assert.equal(l2tpOperation({ kind }).validateSync(), undefined);
+            continue;
+        }
+        const operationId = objectId();
+        const node = objectId();
+        assert.equal(l2tpOperation({
+            _id: operationId,
+            node,
+            kind,
+            plan: {
+                ok: true,
+                operationId: String(operationId),
+                relayId: String(node),
+                desired: { credentialRevision: 1 },
+                steps: [
+                    { type: 'backup' },
+                    {
+                        type: 'sync_users',
+                        artifacts: [{ type: 'desired', path: 'desired.json' }],
+                    },
+                    { type: 'verify_users' },
+                ],
+            },
+        }).validateSync(), undefined);
     }
 
     assertValidationKind(l2tpOperation({ kind: undefined }), 'kind', 'required');
@@ -222,6 +246,59 @@ test('L2TP operation plan persists only fixed desired fields and typed artifact 
         artifacts: [{ type: 'desired', path: 'desired.json' }],
     }]);
     assert.doesNotMatch(JSON.stringify(operation.toObject().plan), /desired-psk|desired-password|artifact-psk|artifact-password/);
+});
+
+test('sync_users operations require the exact durable revision-fenced plan schema', () => {
+    const operationId = objectId();
+    const node = objectId();
+    const validPlan = {
+        ok: true,
+        operationId: String(operationId),
+        relayId: String(node),
+        desired: { credentialRevision: 9 },
+        steps: [
+            { type: 'backup' },
+            {
+                type: 'sync_users',
+                artifacts: [{ type: 'desired', path: 'desired.json' }],
+            },
+            { type: 'verify_users' },
+        ],
+    };
+    const createOperation = plan => l2tpOperation({
+        _id: operationId,
+        node,
+        kind: 'sync_users',
+        idempotencyKey: 'sync-users:relay-1:revision-9',
+        plan,
+    });
+
+    assert.equal(createOperation(validPlan).validateSync(), undefined);
+
+    for (const plan of [
+        { ...validPlan, ok: false },
+        { ...validPlan, operationId: String(objectId()) },
+        { ...validPlan, relayId: String(objectId()) },
+        { ...validPlan, desired: { credentialRevision: 0 } },
+        { ...validPlan, desired: { credentialRevision: 1.5 } },
+        { ...validPlan, steps: validPlan.steps.slice(0, 2) },
+        {
+            ...validPlan,
+            steps: validPlan.steps.map(step => (
+                step.type === 'verify_users' ? { type: 'verify' } : step
+            )),
+        },
+        {
+            ...validPlan,
+            steps: validPlan.steps.map(step => (
+                step.type === 'sync_users'
+                    ? { type: 'sync_users', artifacts: [{ type: 'desired', path: 'other.json' }] }
+                    : step
+            )),
+        },
+    ]) {
+        assertValidationKind(createOperation(plan), 'plan', 'syncUsersPlan');
+    }
 });
 
 test('L2TP operation retains optional topology and route-group plan identity', () => {

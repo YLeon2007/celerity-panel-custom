@@ -228,3 +228,53 @@ test('rejects invalid operation revisions and invalid enabled user identities be
         );
     }
 });
+
+test('resolves a revision-fenced sync snapshot including disabled users only after claim', async () => {
+    const decryptions = [];
+    const resolver = new L2tpUserResolver({
+        repository: {
+            async findEnabledByRelayNode() {
+                throw new Error('install-only query must not run for sync_users');
+            },
+            async findByRelayNode(nodeId) {
+                assert.equal(nodeId, 'relay-1');
+                return [
+                    {
+                        _id: 'user-active', relayNode: 'relay-1', login: 'alice', ip: '10.77.0.10',
+                        enabled: true, desiredRevision: 8, passwordEncrypted: 'sealed-active',
+                    },
+                    {
+                        _id: 'user-disabled', relayNode: 'relay-1', login: 'disabled', ip: '10.77.0.11',
+                        enabled: false, desiredRevision: 9, passwordEncrypted: 'sealed-disabled',
+                    },
+                ];
+            },
+        },
+        secretBox: {
+            decrypt(envelope) {
+                decryptions.push(envelope);
+                return envelope === 'sealed-active' ? 'active-password' : 'disabled-password';
+            },
+        },
+        secretKey: 'worker-secret-key',
+    });
+
+    const snapshot = await resolver.resolveSyncSnapshot({
+        kind: 'sync_users', nodeId: 'relay-1', credentialRevision: 9,
+    });
+
+    assert.deepEqual(snapshot, {
+        credentialRevision: 9,
+        users: [
+            {
+                id: 'user-active', relayNode: 'relay-1', login: 'alice', password: 'active-password',
+                ip: '10.77.0.10', enabled: true, desiredRevision: 8,
+            },
+            {
+                id: 'user-disabled', relayNode: 'relay-1', login: 'disabled', password: 'disabled-password',
+                ip: '10.77.0.11', enabled: false, desiredRevision: 9,
+            },
+        ],
+    });
+    assert.deepEqual(decryptions, ['sealed-active', 'sealed-disabled']);
+});
