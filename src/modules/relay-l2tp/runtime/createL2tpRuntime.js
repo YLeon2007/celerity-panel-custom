@@ -12,6 +12,7 @@ const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
 const PROVIDER_ID = 'relay-l2tp';
 const REQUIRED_DEPENDENCIES = Object.freeze([
     'operationModel',
+    'operationRepository',
     'nodeRepository',
     'stateRepository',
     'preflightRunner',
@@ -55,6 +56,7 @@ function createL2tpRuntime(dependencies) {
     assertDependencies(dependencies);
     const {
         operationModel,
+        operationRepository,
         nodeRepository,
         stateRepository,
         preflightRunner,
@@ -70,18 +72,18 @@ function createL2tpRuntime(dependencies) {
         workerId,
         leaseMs,
     } = dependencies;
-    const operationRepository = new L2tpOperationRepository({ model: operationModel });
+    const workerOperationRepository = new L2tpOperationRepository({ model: operationModel });
     const service = new L2tpService({
         nodeRepository,
         stateRepository,
-        operationRepository: operationModel,
+        operationRepository,
         planBuilder: buildInstallPlan,
         preflightRunner,
         clock,
     });
     const executor = new L2tpRemoteExecutor({ transport });
     const worker = new L2tpOperationWorker({
-        operationRepository,
+        operationRepository: workerOperationRepository,
         lockService,
         executor,
         workerId,

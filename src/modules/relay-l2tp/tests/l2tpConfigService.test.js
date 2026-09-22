@@ -115,6 +115,89 @@ test('rejects PSKs containing CR or LF without exposing the secret', () => {
     }
 });
 
+test('rejects blank PSKs without changing non-blank values', () => {
+    for (const psk of ['', ' ', '\t', ' \t ']) {
+        assert.throws(
+            () => buildL2tpArtifacts(desired({ psk })),
+            error => {
+                assert.equal(error.name, 'L2tpConfigError');
+                assert.equal(error.code, 'INVALID_PSK');
+                assert.equal(error.field, 'psk');
+                assert.equal(Object.hasOwn(error, 'value'), false);
+                return true;
+            },
+        );
+    }
+
+    const spacedPsk = ' preserve surrounding spaces ';
+    const result = buildL2tpArtifacts(desired({ psk: spacedPsk }));
+    assert.equal(
+        fileByPath(result, 'etc/ipsec.secrets').content,
+        `%any %any : PSK "${spacedPsk}"\n`,
+    );
+});
+
+test('requires a non-empty bounded DNS server array', () => {
+    const invalidDnsServers = [
+        undefined,
+        '1.1.1.1',
+        [],
+        ['1.1.1.1', '9.9.9.9', '8.8.8.8', '8.8.4.4', '208.67.222.222'],
+    ];
+
+    for (const dnsServers of invalidDnsServers) {
+        assert.throws(
+            () => buildL2tpArtifacts(desired({ dnsServers })),
+            error => {
+                assert.equal(error.name, 'L2tpConfigError');
+                assert.equal(error.code, 'INVALID_DNS_SERVERS');
+                assert.equal(error.field, 'dnsServers');
+                assert.equal(Object.hasOwn(error, 'value'), false);
+                return true;
+            },
+        );
+    }
+});
+
+test('rejects non-canonical or injectable DNS server entries', () => {
+    const invalidEntries = [
+        '1.1.1.1\npassword injected',
+        '1.1.1.1\r\nms-dns 203.0.113.9',
+        ' 1.1.1.1',
+        '1.1.1.1 ',
+        '1.1.1.01',
+        '2001:0db8::1',
+        '2001:DB8::1',
+        'dns.example.test',
+        1234,
+    ];
+
+    for (const entry of invalidEntries) {
+        assert.throws(
+            () => buildL2tpArtifacts(desired({ dnsServers: [entry] })),
+            error => {
+                assert.equal(error.name, 'L2tpConfigError');
+                assert.equal(error.code, 'INVALID_DNS_SERVERS');
+                assert.equal(error.field, 'dnsServers');
+                assert.equal(Object.hasOwn(error, 'value'), false);
+                assert.equal(JSON.stringify(error).includes(String(entry)), false);
+                return true;
+            },
+        );
+    }
+});
+
+test('preserves canonical IPv4 and IPv6 DNS server literals', () => {
+    const dnsServers = ['1.1.1.1', '2001:db8::1'];
+    const result = buildL2tpArtifacts(desired({ dnsServers }));
+
+    assert.match(
+        fileByPath(result, 'etc/ppp/options.xl2tpd').content,
+        /ms-dns 1\.1\.1\.1\nms-dns 2001:db8::1\n$/,
+    );
+    assert.deepEqual(result.metadata.dnsServers, dnsServers);
+});
+
 test('restricts xl2tpd to the desired client pool and local address', () => {
     const result = buildL2tpArtifacts(desired());
 

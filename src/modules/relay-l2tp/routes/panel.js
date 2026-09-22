@@ -35,6 +35,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['UNPROCESSABLE_ENTITY', 422],
     ['PREFLIGHT_FAILED', 422],
     ['PREFLIGHT_CHECK_FAILED', 422],
+    ['NO_HEALTHY_PATH', 422],
+    ['INSTALL_PLAN_REJECTED', 422],
 ]);
 
 function pickOperationInput(body = {}) {

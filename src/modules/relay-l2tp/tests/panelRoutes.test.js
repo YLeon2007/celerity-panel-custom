@@ -332,6 +332,8 @@ test('structured service error codes map to the documented HTTP statuses', async
         { code: 'NODE_NOT_FOUND', status: 404 },
         { code: 'OPERATION_IN_PROGRESS', status: 409 },
         { code: 'PREFLIGHT_FAILED', status: 422 },
+        { code: 'NO_HEALTHY_PATH', status: 422 },
+        { code: 'INSTALL_PLAN_REJECTED', status: 422 },
     ];
 
     for (const { code, status } of cases) {

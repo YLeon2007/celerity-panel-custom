@@ -22,6 +22,10 @@ function createDependencies() {
             async findOneAndUpdate() {},
             async updateOne() {},
         },
+        operationRepository: {
+            async create() {},
+            async findById() {},
+        },
         nodeRepository: { async findById() {} },
         stateRepository: { async findByNodeId() {} },
         preflightRunner: async () => ({ ok: true }),
@@ -59,7 +63,7 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.ok(runtime.service instanceof L2tpService);
     assert.strictEqual(runtime.service.nodeRepository, dependencies.nodeRepository);
     assert.strictEqual(runtime.service.stateRepository, dependencies.stateRepository);
-    assert.strictEqual(runtime.service.operationRepository, dependencies.operationModel);
+    assert.strictEqual(runtime.service.operationRepository, dependencies.operationRepository);
     assert.strictEqual(runtime.service.planBuilder, buildInstallPlan);
     assert.strictEqual(runtime.service.preflightRunner, dependencies.preflightRunner);
     assert.strictEqual(runtime.service.clock, dependencies.clock);
@@ -187,6 +191,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
 
     const dependencyNames = [
         'operationModel',
+        'operationRepository',
         'nodeRepository',
         'stateRepository',
         'preflightRunner',

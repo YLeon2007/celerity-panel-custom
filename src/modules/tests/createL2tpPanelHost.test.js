@@ -2,11 +2,32 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const express = require('express');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
 
 function passThrough(req, res, next) {
     next();
+}
+
+async function request(router, path) {
+    const app = express();
+    app.use(router);
+    const server = await new Promise(resolve => {
+        const listeningServer = app.listen(0, '127.0.0.1', () => resolve(listeningServer));
+    });
+
+    try {
+        const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`);
+        return {
+            status: response.status,
+            body: await response.json(),
+        };
+    } finally {
+        await new Promise((resolve, reject) => {
+            server.close(error => (error ? reject(error) : resolve()));
+        });
+    }
 }
 
 test('builds the concrete repository adapters and composes a dormant runtime', () => {
@@ -44,6 +65,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     const adapters = {
         nodeRepository: { kind: 'node-repository' },
         stateRepository: { kind: 'state-repository' },
+        operationRepository: { kind: 'operation-repository' },
     };
     const moduleEntry = {
         registerModels() {
@@ -118,6 +140,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     }]);
     assert.equal(runtimeCalls.length, 1);
     assert.strictEqual(runtimeCalls[0].operationModel, models.L2tpOperation);
+    assert.strictEqual(runtimeCalls[0].operationRepository, adapters.operationRepository);
     assert.strictEqual(runtimeCalls[0].nodeRepository, adapters.nodeRepository);
     assert.strictEqual(runtimeCalls[0].stateRepository, adapters.stateRepository);
     assert.strictEqual(runtimeCalls[0].requireAuth, passThrough);
@@ -137,4 +160,72 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.ok(host.topologyRuntime instanceof FakeTopologyRuntime);
     assert.strictEqual(host.runtime, runtime);
     assert.equal(workerRuns, 0);
+});
+
+test('real panel runtime GET operation strips legacy nested secrets and error details', async () => {
+    const legacyOperation = {
+        _id: 'operation-legacy',
+        status: 'failed',
+        password: 'top-level-secret',
+        plan: {
+            ok: false,
+            psk: 'plan-secret',
+            error: {
+                code: 'NO_HEALTHY_PATH',
+                message: 'private failure detail',
+                details: { password: 'nested-error-secret' },
+            },
+            steps: [{ type: 'verify', privateKey: 'nested-step-secret' }],
+        },
+    };
+    const operationModel = {
+        findById(operationId) {
+            assert.equal(operationId, 'operation-legacy');
+            const query = {
+                select() { return this; },
+                lean() { return Promise.resolve(legacyOperation); },
+                then(resolve, reject) {
+                    return Promise.resolve(legacyOperation).then(resolve, reject);
+                },
+            };
+            return query;
+        },
+    };
+    const models = {
+        RelayL2tpState: {},
+        CascadeRouteGroup: {},
+        CascadeTopologyState: {},
+        L2tpOperation: operationModel,
+    };
+    const host = createL2tpPanelHost({
+        requireAuth: passThrough,
+        requireOnboarding: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        renderPage() {},
+        moduleEntry: { registerModels: () => models },
+        HyNode: {},
+        topologyRuntime: {},
+        createPanelOverviewLoader: () => async () => ({}),
+    });
+
+    const response = await request(
+        host.runtime.router,
+        '/l2tp/operations/operation-legacy',
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+        _id: 'operation-legacy',
+        status: 'failed',
+        plan: {
+            ok: false,
+            error: { code: 'NO_HEALTHY_PATH' },
+            steps: [{ type: 'verify' }],
+        },
+    });
+    assert.doesNotMatch(
+        JSON.stringify(response.body),
+        /top-level-secret|plan-secret|private failure detail|nested-error-secret|nested-step-secret/,
+    );
 });

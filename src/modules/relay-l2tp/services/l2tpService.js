@@ -106,6 +106,19 @@ class L2tpService {
             relayGroupPlan: context.relayGroupPlan,
             desired: context.desired,
         });
+        if (plan?.ok !== true) {
+            const code = plan?.error?.code === 'NO_HEALTHY_PATH'
+                ? 'NO_HEALTHY_PATH'
+                : 'INSTALL_PLAN_REJECTED';
+            throw new L2tpServiceError(
+                code,
+                'L2TP install plan was rejected',
+                {
+                    nodeId: String(nodeId),
+                    routeGroupId: entityId(context.routeGroup),
+                },
+            );
+        }
 
         await this.operationRepository.create({
             _id: operationId,

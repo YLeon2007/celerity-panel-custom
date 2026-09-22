@@ -1,5 +1,9 @@
 'use strict';
 
+const { isIP } = require('node:net');
+
+const MAX_DNS_SERVERS = 4;
+
 function parseIpv4(value) {
     if (typeof value !== 'string') {
         return null;
@@ -73,6 +77,28 @@ function invalidPsk() {
     return error;
 }
 
+function invalidDnsServers() {
+    const error = new Error('dnsServers must contain canonical IP address literals');
+    error.name = 'L2tpConfigError';
+    error.code = 'INVALID_DNS_SERVERS';
+    error.field = 'dnsServers';
+    return error;
+}
+
+function isCanonicalIpLiteral(value) {
+    if (typeof value !== 'string' || /\s/.test(value)) {
+        return false;
+    }
+    if (parseIpv4(value) !== null) {
+        return true;
+    }
+    if (isIP(value) !== 6) {
+        return false;
+    }
+
+    return new URL(`http://[${value}]/`).hostname === `[${value}]`;
+}
+
 function buildL2tpArtifacts(desired) {
     const clientRange = parseClientCidr(desired.clientCidr);
     if (!clientRange) {
@@ -91,8 +117,21 @@ function buildL2tpArtifacts(desired) {
         throw poolOutsideClientCidr(desired);
     }
 
-    if (typeof desired.psk !== 'string' || /["\r\n]/.test(desired.psk)) {
+    if (
+        typeof desired.psk !== 'string'
+        || desired.psk.trim().length === 0
+        || /["\r\n]/.test(desired.psk)
+    ) {
         throw invalidPsk();
+    }
+
+    if (
+        !Array.isArray(desired.dnsServers)
+        || desired.dnsServers.length === 0
+        || desired.dnsServers.length > MAX_DNS_SERVERS
+        || desired.dnsServers.some(server => !isCanonicalIpLiteral(server))
+    ) {
+        throw invalidDnsServers();
     }
 
     const dnsOptions = desired.dnsServers.map(server => `ms-dns ${server}\n`).join('');

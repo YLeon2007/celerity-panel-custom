@@ -98,6 +98,7 @@ function createL2tpPanelHost({
     });
     const runtime = createRuntime({
         operationModel: models.L2tpOperation,
+        operationRepository: adapters.operationRepository,
         nodeRepository: adapters.nodeRepository,
         stateRepository: adapters.stateRepository,
         preflightRunner,

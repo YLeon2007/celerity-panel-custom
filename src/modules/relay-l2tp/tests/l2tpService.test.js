@@ -579,6 +579,41 @@ test('install rejects a failed preflight without building or persisting a plan',
     assert.equal(operationCreates, 0);
 });
 
+test('install rejects a fail-closed plan without persisting an operation', async () => {
+    const context = installContext();
+    const repositories = createContextRepositories(context);
+    let operationCreates = 0;
+    const service = createService({
+        ...repositories,
+        preflightRunner: async () => ({ ok: true, checks: [] }),
+        planBuilder: () => ({
+            ok: false,
+            error: {
+                code: 'NO_HEALTHY_PATH',
+                details: 'must not escape the service',
+            },
+            steps: [],
+        }),
+        operationRepository: {
+            async create() { operationCreates += 1; },
+        },
+    });
+
+    await assert.rejects(
+        service.install(context.node.id, context.input),
+        error => {
+            assert.equal(error.name, 'L2tpServiceError');
+            assert.equal(error.code, 'NO_HEALTHY_PATH');
+            assert.equal(error.nodeId, 'relay-1');
+            assert.equal(error.routeGroupId, 'group-a');
+            assert.equal(Object.hasOwn(error, 'plan'), false);
+            assert.doesNotMatch(JSON.stringify(error), /must not escape/);
+            return true;
+        },
+    );
+    assert.equal(operationCreates, 0);
+});
+
 test('install validates context, builds a plan, and persists one queued operation', async () => {
     const context = installContext();
     const repositories = createContextRepositories(context);
