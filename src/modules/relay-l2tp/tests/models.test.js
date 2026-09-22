@@ -112,6 +112,30 @@ function assertValid(document, message) {
 }
 
 {
+    const ipPath = L2tpUser.schema.path('ip');
+    assert.strictEqual(ipPath.options.required, true);
+
+    assertValid(new L2tpUser({
+        relayNode: objectId(),
+        login: 'canonical-ip',
+        ip: '10.77.0.10',
+        passwordEncrypted: 'v1:iv:tag:ciphertext',
+        desiredRevision: 1,
+    }));
+
+    for (const ip of [undefined, '', '10.077.0.10', '10.77.0.999', '2001:db8::1']) {
+        const error = new L2tpUser({
+            relayNode: objectId(),
+            login: 'invalid-ip',
+            ip,
+            passwordEncrypted: 'v1:iv:tag:ciphertext',
+            desiredRevision: 1,
+        }).validateSync();
+        assert.ok(error.errors.ip, `IP ${JSON.stringify(ip)} is rejected`);
+    }
+}
+
+{
     const validLogins = [
         'alice',
         'Alice_01',
@@ -125,6 +149,7 @@ function assertValid(document, message) {
         assertValid(new L2tpUser({
             relayNode: objectId(),
             login,
+            ip: '10.77.0.10',
             passwordEncrypted: 'v1:iv:tag:ciphertext',
         }), `login ${login} is accepted`);
     }

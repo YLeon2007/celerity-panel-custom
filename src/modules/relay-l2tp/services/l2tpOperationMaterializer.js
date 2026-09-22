@@ -2,6 +2,7 @@
 
 const { buildL2tpArtifacts } = require('./l2tpConfigService');
 const { INSTALL_STEP_TYPES } = require('./l2tpProvisionPlanService');
+const { reconcileChapSecrets } = require('./l2tpUserSyncService');
 
 const INSTALL_DESIRED_FIELDS = Object.freeze([
     'clientCidr',
@@ -80,6 +81,33 @@ function referencedSteps(steps) {
     });
 }
 
+function materializeUsers(users) {
+    if (!Array.isArray(users)) {
+        throw new TypeError('Resolved L2TP users must be an array');
+    }
+    const desiredUsers = users.map(user => {
+        if (
+            !user
+            || typeof user !== 'object'
+            || Array.isArray(user)
+            || Object.keys(user).length !== 3
+            || !Object.hasOwn(user, 'login')
+            || !Object.hasOwn(user, 'password')
+            || !Object.hasOwn(user, 'ip')
+        ) {
+            throw new TypeError('Resolved L2TP user has an invalid shape');
+        }
+        return {
+            login: user.login,
+            password: user.password,
+            ipAddress: user.ip,
+            enabled: true,
+        };
+    });
+    reconcileChapSecrets('', desiredUsers);
+    return desiredUsers;
+}
+
 function materializeInstallOperation(
     { plan, desired, secrets },
     { buildArtifacts = buildL2tpArtifacts } = {},
@@ -105,6 +133,7 @@ function materializeInstallOperation(
             psk: secrets.psk,
         };
         delete resolvedDesired.credentialRevision;
+        const desiredUsers = materializeUsers(secrets.users);
         const generatedArtifacts = buildArtifacts(resolvedDesired);
         remoteArtifacts.push(
             {
@@ -113,7 +142,7 @@ function materializeInstallOperation(
                 path: 'desired.json',
                 content: `${JSON.stringify({
                     clientCidr: persistedPlan.desired.clientCidr,
-                    users: [],
+                    users: desiredUsers,
                 })}\n`,
             },
             {

@@ -190,14 +190,20 @@ class L2tpOperationWorker {
         if (typeof this.secretResolver !== 'function') {
             throw new TypeError('L2TP operation secret resolver is unavailable');
         }
-        const secrets = await this.secretResolver({
+        const resolutionRequest = {
             operationId,
             kind: operation.kind,
             nodeId: entityId(operation.node),
             credentialRevision: plan.desired?.credentialRevision,
+        };
+        const secrets = await this.secretResolver({
+            ...resolutionRequest,
             secret: 'psk',
         });
-        const materialized = await this.operationMaterializer({ plan, secrets });
+        const materialized = await this.operationMaterializer({
+            plan,
+            secrets,
+        });
         if (!materialized?.persistedPlan || typeof materialized.persistedPlan !== 'object') {
             throw new TypeError('L2TP operation materializer returned no durable plan');
         }

@@ -203,7 +203,14 @@ test('claims an install once and resolves its PSK once before typed artifact upl
                 'operation must be claimed first',
             );
             assert.deepEqual(transportCalls, [], 'secrets must resolve before the first upload');
-            return { psk: secret };
+            return {
+                psk: secret,
+                users: [{
+                    login: 'alice',
+                    password: 'alice-current-password',
+                    ip: '10.77.0.10',
+                }],
+            };
         },
         lockService: {
             async acquire(request) {
@@ -252,6 +259,12 @@ test('claims an install once and resolves its PSK once before typed artifact upl
     );
     assert.deepEqual(JSON.parse(uploads[0].request.content), {
         clientCidr: '10.77.0.0/24',
+        users: [{
+            login: 'alice',
+            password: 'alice-current-password',
+            ipAddress: '10.77.0.10',
+            enabled: true,
+        }],
     });
     assert.match(uploads[1].request.content, new RegExp(secret));
     assert.equal(uploads[2].request.content, candidateContent);
@@ -289,7 +302,9 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         second,
     });
     assert.doesNotMatch(externallyVisible, new RegExp(secret));
+    assert.doesNotMatch(externallyVisible, /alice-current-password/);
     assert.equal(externallyVisible.includes(candidateContent), false);
+    assert.equal(Object.hasOwn(operation.plan.desired, 'users'), false);
     assert.equal(
         operation.plan.steps.some(step => (
             step.artifacts?.some(artifact => Object.hasOwn(artifact, 'content'))
@@ -488,6 +503,68 @@ test('secret resolution failure is sanitized and performs no remote command or r
     assert.doesNotMatch(
         JSON.stringify({ result, repositoryCalls: operationRepository.calls }),
         new RegExp(leakedSecret),
+    );
+});
+
+test('combined secret resolution failure is sanitized and uploads no user artifacts', async () => {
+    const leakedPassword = 'resolver-error-user-password-must-not-leak';
+    const { operation } = createInstallOperation('operation-user-resolver-failure');
+    const operationRepository = createOperationRepository([operation]);
+    const transportCalls = [];
+    const lockCalls = [];
+    let pskResolutions = 0;
+    const worker = createWorker(operationRepository, {
+        operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate({ plan }) {
+                return {
+                    operationId: plan.operationId,
+                    content: '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}',
+                };
+            },
+        },
+        secretResolver: async () => {
+            pskResolutions += 1;
+            throw Object.assign(new Error(`decrypt failure: ${leakedPassword}`), {
+                code: 'L2TP_USER_DECRYPTION_FAILED',
+            });
+        },
+        executor: new L2tpRemoteExecutor({
+            transport: {
+                async uploadRootFile(request) { transportCalls.push(request); },
+                async runArtifactCommand(request) { transportCalls.push(request); },
+            },
+        }),
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release(request) {
+                lockCalls.push(request);
+                return { ok: true };
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+    const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-user-resolver-failure',
+        status: 'failed',
+    });
+    assert.equal(pskResolutions, 1);
+    assert.deepEqual(transportCalls, []);
+    assert.equal(lockCalls.length, 1);
+    assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
+    assert.equal(statuses[0].request.errorCode, 'SECRET_RESOLUTION_FAILED');
+    assert.equal(
+        statuses[0].request.errorMessage,
+        'Failed to resolve L2TP operation secrets',
+    );
+    assert.doesNotMatch(
+        JSON.stringify({ result, repositoryCalls: operationRepository.calls }),
+        new RegExp(leakedPassword),
     );
 });
 

@@ -26,6 +26,10 @@ function queryResult(result, calls, kind) {
             calls.push({ kind: `${kind}.select`, fields });
             return this;
         },
+        sort(order) {
+            calls.push({ kind: `${kind}.sort`, order });
+            return this;
+        },
         lean() {
             calls.push({ kind: `${kind}.lean` });
             return Promise.resolve(result);
@@ -66,6 +70,14 @@ function createActiveHost(overrides = {}) {
         fwmark: 77,
         routeTable: 177,
     };
+    const executionUsers = [{
+        relayNode: 'node-a',
+        login: 'alice',
+        ip: '10.77.0.10',
+        enabled: true,
+        desiredRevision: 4,
+        passwordEncrypted: 'sealed-alice-password',
+    }];
     const HyNode = {
         findById(nodeId) {
             calls.push({ kind: 'HyNode.findById', nodeId });
@@ -78,8 +90,15 @@ function createActiveHost(overrides = {}) {
             return queryResult(executionState, calls, 'RelayL2tpState');
         },
     };
+    const L2tpUser = {
+        find(filter) {
+            calls.push({ kind: 'L2tpUser.find', filter });
+            return queryResult(executionUsers, calls, 'L2tpUser');
+        },
+    };
     const models = {
         RelayL2tpState,
+        L2tpUser,
         CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
         CascadeTopologyState: { modelName: 'CascadeTopologyState' },
         L2tpOperation: { modelName: 'L2tpOperation' },
@@ -114,7 +133,9 @@ function createActiveHost(overrides = {}) {
         },
         decrypt(envelope, key) {
             calls.push({ kind: 'secretBox.decrypt', envelope, key });
-            return 'resolved-psk';
+            if (envelope === 'sealed-psk') return 'resolved-psk';
+            if (envelope === 'sealed-alice-password') return 'resolved-alice-password';
+            throw new Error('unknown encrypted value');
         },
     };
     const adapters = {
@@ -284,7 +305,14 @@ test('explicit complete activation wires preflight and candidate factories lazil
         credentialRevision: 7,
         secret: 'psk',
     });
-    assert.deepEqual(secrets, { psk: 'resolved-psk' });
+    assert.deepEqual(secrets, {
+        psk: 'resolved-psk',
+        users: [{
+            login: 'alice',
+            password: 'resolved-alice-password',
+            ip: '10.77.0.10',
+        }],
+    });
     assert.deepEqual(
         calls.map(call => call.kind),
         [
@@ -293,7 +321,16 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'RelayL2tpState.select',
             'RelayL2tpState.lean',
             'secretBox.decrypt',
+            'L2tpUser.find',
+            'L2tpUser.select',
+            'L2tpUser.sort',
+            'L2tpUser.lean',
+            'secretBox.decrypt',
         ],
+    );
+    assert.doesNotMatch(
+        JSON.stringify(host.runtime),
+        /resolved-alice-password|sealed-alice-password/,
     );
 
     await host.runtime.worker.executor.executeStep({
@@ -308,6 +345,11 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'RelayL2tpState.findOne',
             'RelayL2tpState.select',
             'RelayL2tpState.lean',
+            'secretBox.decrypt',
+            'L2tpUser.find',
+            'L2tpUser.select',
+            'L2tpUser.sort',
+            'L2tpUser.lean',
             'secretBox.decrypt',
             'HyNode.findById',
             'HyNode.select',

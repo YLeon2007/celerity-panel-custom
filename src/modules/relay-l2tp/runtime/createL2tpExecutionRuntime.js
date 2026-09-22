@@ -1,9 +1,11 @@
 'use strict';
 
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
+const { L2tpUserExecutionRepository } = require('../repositories/l2tpUserExecutionRepository');
 const { L2tpNodeExecutionResolver } = require('../services/l2tpNodeExecutionResolver');
 const { createL2tpNodeTransportResolver } = require('../services/l2tpNodeTransportFactory');
 const { L2tpStateManagementService } = require('../services/l2tpStateManagementService');
+const { L2tpUserResolver } = require('../services/l2tpUserResolver');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 const { createL2tpRuntime } = require('./createL2tpRuntime');
@@ -89,6 +91,7 @@ function lifecycleSummary(state) {
 function assertActiveExecutionDependencies({
     HyNode,
     RelayL2tpState,
+    L2tpUser,
     CascadeRouteGroup,
     operationModel,
     lockModel,
@@ -113,6 +116,7 @@ function assertActiveExecutionDependencies({
     }
     for (const [dependencyName, dependency] of Object.entries({
         RelayL2tpState,
+        L2tpUser,
         CascadeRouteGroup,
         operationModel,
         lockModel,
@@ -160,6 +164,7 @@ function createL2tpExecutionRuntime({
     workerLifecycle,
     HyNode,
     RelayL2tpState,
+    L2tpUser,
     CascadeRouteGroup,
     operationModel,
     lockModel,
@@ -200,6 +205,7 @@ function createL2tpExecutionRuntime({
     assertActiveExecutionDependencies({
         HyNode,
         RelayL2tpState,
+        L2tpUser,
         CascadeRouteGroup,
         operationModel,
         lockModel,
@@ -250,7 +256,17 @@ function createL2tpExecutionRuntime({
         secretBox,
         secretKey,
     });
-    const secretResolver = managementService.resolveOperationSecrets.bind(managementService);
+    const userRepository = new L2tpUserExecutionRepository({ model: L2tpUser });
+    const userResolver = new L2tpUserResolver({
+        repository: userRepository,
+        secretBox,
+        secretKey,
+    });
+    const secretResolver = async operation => {
+        const secrets = await managementService.resolveOperationSecrets(operation);
+        const users = await userResolver.resolve(operation);
+        return { ...secrets, users };
+    };
     const lockRepository = new NodeOperationLockRepository({ model: lockModel });
     const lockService = new NodeOperationLockService({
         repository: lockRepository,

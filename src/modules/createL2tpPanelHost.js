@@ -94,6 +94,7 @@ function createL2tpPanelHost({
         workerLifecycle,
         HyNode: injectedHyNode,
         RelayL2tpState: models.RelayL2tpState,
+        L2tpUser: models.L2tpUser,
         CascadeRouteGroup: models.CascadeRouteGroup,
         operationModel: models.L2tpOperation,
         lockModel: models.NodeOperationLock,

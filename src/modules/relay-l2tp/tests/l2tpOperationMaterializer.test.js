@@ -129,7 +129,11 @@ test('materializes fixed preflight JSON and generated artifacts only after secre
         plan: prepared.persistedPlan,
         secrets: {
             psk: SECRET_PSK,
-            users: [{ login: 'alice', password: SECRET_PASSWORD }],
+            users: [{
+                login: 'alice',
+                password: SECRET_PASSWORD,
+                ip: '10.77.0.10',
+            }],
         },
     }, {
         buildArtifacts(resolvedDesired) {
@@ -155,7 +159,15 @@ test('materializes fixed preflight JSON and generated artifacts only after secre
             stepType: 'preflight',
             type: 'desired',
             path: 'desired.json',
-            content: '{"clientCidr":"10.77.0.0/24","users":[]}\n',
+            content: `${JSON.stringify({
+                clientCidr: '10.77.0.0/24',
+                users: [{
+                    login: 'alice',
+                    password: SECRET_PASSWORD,
+                    ipAddress: '10.77.0.10',
+                    enabled: true,
+                }],
+            })}\n`,
         },
         {
             stepType: 'stage_managed_files',
@@ -164,8 +176,44 @@ test('materializes fixed preflight JSON and generated artifacts only after secre
             content: `${JSON.stringify(generatedArtifacts)}\n`,
         },
     ]);
-    assert.doesNotMatch(result.remoteArtifacts[0].content, /psk|password|secret/i);
+    assert.match(result.remoteArtifacts[0].content, new RegExp(SECRET_PASSWORD));
+    assert.doesNotMatch(result.remoteArtifacts[0].content, new RegExp(SECRET_PSK));
     assert.match(result.remoteArtifacts[1].content, new RegExp(SECRET_PSK));
     assert.doesNotMatch(JSON.stringify(result.persistedPlan), new RegExp(SECRET_PSK));
     assert.doesNotMatch(JSON.stringify(result.persistedPlan), new RegExp(SECRET_PASSWORD));
+    assert.equal(Object.hasOwn(result.persistedPlan.desired, 'users'), false);
+});
+
+test('requires the combined resolver to explicitly supply transient users', () => {
+    const prepared = materializeInstallOperation({
+        plan: planFor(),
+        desired: desired(),
+    });
+
+    assert.throws(
+        () => materializeInstallOperation({
+            plan: prepared.persistedPlan,
+            secrets: { psk: SECRET_PSK },
+        }),
+        /users must be an array/i,
+    );
+});
+
+test('materializes an empty desired users array only when the resolver returns no users', () => {
+    const prepared = materializeInstallOperation({
+        plan: planFor(),
+        desired: desired(),
+    });
+    const result = materializeInstallOperation({
+        plan: prepared.persistedPlan,
+        secrets: { psk: SECRET_PSK, users: [] },
+    }, {
+        buildArtifacts() { return { files: [] }; },
+    });
+    const remoteDesired = result.remoteArtifacts.find(artifact => artifact.type === 'desired');
+
+    assert.deepEqual(JSON.parse(remoteDesired.content), {
+        clientCidr: '10.77.0.0/24',
+        users: [],
+    });
 });

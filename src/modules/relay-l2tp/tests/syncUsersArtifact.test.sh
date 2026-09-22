@@ -89,7 +89,14 @@ const result = materializeInstallOperation({
         desired,
         steps: INSTALL_STEP_TYPES.map(type => ({ type })),
     },
-    secrets: { psk: 'transient-psk-not-for-desired' },
+    secrets: {
+        psk: 'transient-psk-not-for-desired',
+        users: [{
+            login: 'materialized-user',
+            password: 'materialized-user-secret',
+            ip: '10.77.0.12',
+        }],
+    },
 });
 const remoteDesired = result.remoteArtifacts.find(artifact => artifact.type === 'desired');
 process.stdout.write(remoteDesired.content);
@@ -97,19 +104,23 @@ NODE
 node -e '
 const fs = require("node:fs");
 const desired = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-if (!Array.isArray(desired.users) || desired.users.length !== 0) process.exit(1);
-if (JSON.stringify(desired).match(/password|psk|secret/i)) process.exit(1);
+if (!Array.isArray(desired.users) || desired.users.length !== 1) process.exit(1);
+if (desired.users[0].login !== "materialized-user") process.exit(1);
+if (desired.users[0].password !== "materialized-user-secret") process.exit(1);
+if (desired.users[0].ipAddress !== "10.77.0.12") process.exit(1);
+if (Object.hasOwn(desired, "psk")) process.exit(1);
 ' "$TMP_DIR/operation/desired.json" \
-    || fail 'materialized desired did not contain an explicit credential-free users array'
-invoke_sync materialized-without-credentials "$TMP_DIR/operation"
-[[ "$status" -eq 0 ]] || fail 'sync users rejected materialized desired without user credentials'
-[[ "$(<"$output")" == '{"status":"ok","changed":1,"managedUsers":0,"disabledUsers":0}' ]] \
-    || fail 'credential-free materialized desired returned the wrong result'
-expected_without_users='local line must survive
+    || fail 'materialized desired did not contain the transient resolved user'
+invoke_sync materialized-user "$TMP_DIR/operation"
+[[ "$status" -eq 0 ]] || fail 'sync users rejected the materialized resolved user'
+[[ "$(<"$output")" == '{"status":"ok","changed":1,"managedUsers":1,"disabledUsers":0}' ]] \
+    || fail 'materialized resolved user returned the wrong result'
+expected_materialized_user='local line must survive
 # BEGIN CELERITY MANAGED L2TP USERS
+"materialized-user" l2tpd "materialized-user-secret" 10.77.0.12
 # END CELERITY MANAGED L2TP USERS'
-[[ "$(<"$TMP_DIR/root/etc/ppp/chap-secrets")" == "$expected_without_users" ]] \
-    || fail 'credential-free materialized desired did not clear only managed users'
+[[ "$(<"$TMP_DIR/root/etc/ppp/chap-secrets")" == "$expected_materialized_user" ]] \
+    || fail 'materialized resolved user did not replace only the managed block'
 
 before="$(<"$TMP_DIR/root/etc/ppp/chap-secrets")"
 printf '%s\n' '{"users":[{"login":"alice","password":"first-secret","ipAddress":"10.77.0.10","enabled":true},{"login":"alice","password":"second-secret","ipAddress":"10.77.0.11","enabled":true}]}' \

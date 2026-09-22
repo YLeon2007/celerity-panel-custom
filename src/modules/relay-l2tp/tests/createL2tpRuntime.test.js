@@ -44,7 +44,10 @@ function createDependencies() {
             async acquire() {},
             async release() {},
         },
-        secretResolver: async () => ({ psk: 'resolved-in-memory-only' }),
+        secretResolver: async () => ({
+            psk: 'resolved-in-memory-only',
+            users: [],
+        }),
         candidateService: { async buildCandidate() {} },
         requireAuth(req, res, next) { next(); },
         requireOnboarding(req, res, next) { next(); },

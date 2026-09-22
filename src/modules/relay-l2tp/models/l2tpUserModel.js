@@ -3,6 +3,13 @@ const mongoose = require('mongoose');
 const LOGIN_PATTERN = /^[A-Za-z0-9._@-]{1,64}$/;
 const SYNC_STATUSES = ['pending', 'syncing', 'synced', 'error', 'delete_pending'];
 
+function isCanonicalIpv4(value) {
+    if (typeof value !== 'string') return false;
+    const octets = value.split('.');
+    return octets.length === 4
+        && octets.every(octet => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
+}
+
 const l2tpUserSchema = new mongoose.Schema({
     login: {
         type: String,
@@ -18,6 +25,14 @@ const l2tpUserSchema = new mongoose.Schema({
         type: String,
         required: true,
         select: false,
+    },
+    ip: {
+        type: String,
+        required: true,
+        validate: {
+            validator: isCanonicalIpv4,
+            message: 'ip must be a canonical IPv4 address',
+        },
     },
     enabled: { type: Boolean, default: true },
     comment: { type: String, default: '' },
