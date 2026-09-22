@@ -1,16 +1,85 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const test = require('node:test');
 
 const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
+const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
+const TARGET_BY_ROLE = Object.freeze({
+    portal: Object.freeze({
+        targetProfile: 'xray-main',
+        serviceUnit: 'xray.service',
+        serviceUnitPath: '/etc/systemd/system/xray.service',
+        configPath: '/usr/local/etc/xray/config.json',
+    }),
+    relay: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+    bridge: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+});
 
 function deepFreeze(value) {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
     for (const nested of Object.values(value)) deepFreeze(nested);
     return Object.freeze(value);
+}
+
+function frozenNode(node, role, nodeRef) {
+    const target = TARGET_BY_ROLE[role];
+    const checks = [{
+        type: 'service',
+        serviceUnit: target.serviceUnit,
+        expectedState: 'active',
+    }];
+    const content = `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'xray-topology-node-candidate',
+        mode: 'forward',
+        nodeRef,
+        role,
+        targetProfile: target.targetProfile,
+        links: [],
+        checks,
+    })}\n`;
+    const sha256 = createHash('sha256').update(content).digest('hex');
+    return deepFreeze({
+        node,
+        nodeRef,
+        role,
+        ...target,
+        candidate: {
+            mediaType: CANDIDATE_MEDIA_TYPE,
+            bytes: [...Buffer.from(content, 'utf8')],
+            sha256,
+        },
+        candidateHash: sha256,
+        checks,
+    });
+}
+
+function durableNode(node, state = 'pending') {
+    return {
+        node: node.node,
+        state,
+        candidateHash: node.candidateHash,
+        candidate: {
+            mediaType: node.candidate.mediaType,
+            bytes: [...node.candidate.bytes],
+            sha256: node.candidate.sha256,
+        },
+        backupId: '',
+    };
 }
 
 function frozenPlan() {
@@ -19,30 +88,25 @@ function frozenPlan() {
         topologyRevision: 7,
         priorDeployedRevision: 5,
         nodes: [
-            {
-                node: 'node-b',
-                candidateHash: 'sha256:bbb',
-                candidate: { content: 'candidate-b-secret' },
-            },
-            {
-                node: 'node-a',
-                candidateHash: 'sha256:aaa',
-                candidate: { content: 'candidate-a-secret' },
-            },
+            frozenNode('node-b', 'bridge', 'bridge'),
+            frozenNode('node-a', 'portal', 'portal'),
         ],
     });
 }
 
 function durableOperation() {
+    const nodes = frozenPlan().nodes
+        .map(node => durableNode(node))
+        .sort((left, right) => left.node.localeCompare(right.node));
     return {
         _id: 'operation-1',
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'queued',
-        nodes: [
-            { node: 'node-a', state: 'pending', candidateHash: 'sha256:aaa', backupId: '' },
-            { node: 'node-b', state: 'pending', candidateHash: 'sha256:bbb', backupId: '' },
-        ],
+        attempts: 0,
+        leaseOwner: '',
+        leaseUntil: null,
+        nodes,
     };
 }
 
@@ -52,21 +116,20 @@ function frozenThreeNodePlan() {
         topologyRevision: 7,
         priorDeployedRevision: 5,
         nodes: [
-            { node: 'node-c', candidateHash: 'sha256:ccc', candidate: { content: 'c' } },
-            { node: 'node-a', candidateHash: 'sha256:aaa', candidate: { content: 'a' } },
-            { node: 'node-b', candidateHash: 'sha256:bbb', candidate: { content: 'b' } },
+            frozenNode('node-c', 'bridge', 'bridge'),
+            frozenNode('node-a', 'portal', 'portal'),
+            frozenNode('node-b', 'relay', 'relay-1'),
         ],
     });
 }
 
 function durableThreeNodeOperation() {
+    const nodes = frozenThreeNodePlan().nodes
+        .map(node => durableNode(node))
+        .sort((left, right) => left.node.localeCompare(right.node));
     return {
         ...durableOperation(),
-        nodes: [
-            { node: 'node-a', state: 'pending', candidateHash: 'sha256:aaa', backupId: '' },
-            { node: 'node-b', state: 'pending', candidateHash: 'sha256:bbb', backupId: '' },
-            { node: 'node-c', state: 'pending', candidateHash: 'sha256:ccc', backupId: '' },
-        ],
+        nodes,
     };
 }
 
@@ -77,9 +140,14 @@ function createRepository(operation = durableOperation(), overrides = {}) {
         operation,
         async claim(request) {
             calls.push({ method: 'claim', request });
-            if (operation.status !== 'queued') return null;
+            const expiredPreparing = operation.status === 'preparing'
+                && operation.leaseUntil instanceof Date
+                && operation.leaseUntil <= request.now;
+            if (operation.status !== 'queued' && !expiredPreparing) return null;
             operation.status = 'preparing';
             operation.leaseOwner = request.owner;
+            operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+            operation.attempts += 1;
             return operation;
         },
         async renewLease(request) {
@@ -123,6 +191,92 @@ function createWorker({ repository, executor, deploymentRepository, clock } = {}
         clock: clock || { now: () => new Date(NOW) },
     });
 }
+
+test('fresh worker resumes an expired preparing claim from durable candidates only', async () => {
+    const operation = durableOperation();
+    operation.status = 'preparing';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    const repository = createRepository(operation);
+    const preparedNodes = [];
+    const executor = {
+        async prepare(request) {
+            assert.equal(Object.isFrozen(request.node), true);
+            assert.equal(Object.isFrozen(request.node.candidate), true);
+            assert.equal(request.node.candidateHash, request.node.candidate.sha256);
+            preparedNodes.push({
+                node: request.node.node,
+                role: request.node.role,
+                targetProfile: request.node.targetProfile,
+            });
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        deploymentRepository: {
+            async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-1',
+        status: 'succeeded',
+    });
+    assert.deepEqual(preparedNodes, [
+        { node: 'node-a', role: 'portal', targetProfile: 'xray-main' },
+        { node: 'node-b', role: 'bridge', targetProfile: 'xray-bridge' },
+    ]);
+    assert.equal(repository.calls[0].method, 'claim');
+    assert.equal(repository.calls[0].request.operationId, 'operation-1');
+    assert.equal(operation.attempts, 1);
+});
+
+test('altered durable candidate hash fails the fenced claim without executor use', async () => {
+    const operation = durableOperation();
+    operation.nodes[0].candidate.sha256 = '0'.repeat(64);
+    operation.nodes[0].candidateHash = '0'.repeat(64);
+    const repository = createRepository(operation);
+    let executorCalls = 0;
+    const forbidden = async () => {
+        executorCalls += 1;
+        throw new Error('executor must not run');
+    };
+    const worker = createWorker({
+        repository,
+        executor: {
+            prepare: forbidden,
+            commit: forbidden,
+            verify: forbidden,
+            cleanupPrepared: forbidden,
+            rollback: forbidden,
+        },
+        deploymentRepository: { markDeployed: forbidden },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-1',
+        status: 'failed',
+    });
+    assert.equal(executorCalls, 0);
+    assert.deepEqual(repository.calls.map(call => call.method), ['claim', 'finishClaimed']);
+    assert.equal(repository.calls[1].request.owner, 'worker-1');
+    assert.equal(repository.calls[1].request.status, 'failed');
+});
 
 test('prepares every node before deterministic commit and verify then fences deployed revision', async () => {
     const plan = frozenPlan();

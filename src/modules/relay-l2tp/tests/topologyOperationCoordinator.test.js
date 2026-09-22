@@ -84,9 +84,9 @@ test('queues one frozen fixed-test operation and starts only the injected worker
         },
     };
     const operationWorker = {
-        async run(plan) {
-            calls.push({ method: 'worker.run', plan });
-            return { claimed: false, operationId: plan.operationId };
+        async run(operationId) {
+            calls.push({ method: 'worker.run', operationId });
+            return { claimed: false, operationId };
         },
     };
     const coordinator = new TopologyOperationCoordinator({
@@ -132,17 +132,21 @@ test('queues one frozen fixed-test operation and starts only the injected worker
         idempotencyKey: 'topology:test:revision-7',
         topologyRevision: 7,
         priorDeployedRevision: 5,
-        nodes: calls.find(call => call.method === 'worker.run').plan.nodes,
+        nodes: calls.find(call => call.method === 'createFrozen').input.nodes,
     });
-    const workerPlan = calls.find(call => call.method === 'worker.run').plan;
-    assert.equal(Object.isFrozen(workerPlan), true);
-    assert.deepEqual(workerPlan.nodes.map(node => ({
+    const durableNodes = calls.find(call => call.method === 'createFrozen').input.nodes;
+    assert.equal(Object.isFrozen(durableNodes), true);
+    assert.deepEqual(durableNodes.map(node => ({
         node: node.node,
         candidateHash: node.candidateHash,
     })), [
         { node: 'bridge-1', candidateHash: 'bridge-hash' },
         { node: 'portal-1', candidateHash: 'portal-hash' },
     ]);
+    assert.deepEqual(calls.find(call => call.method === 'worker.run'), {
+        method: 'worker.run',
+        operationId: 'operation-public',
+    });
     assert.doesNotMatch(JSON.stringify(result), /candidate|bytes|secret/i);
     assert.equal(calls.some(call => call.method === 'markDeployed'), false);
 });

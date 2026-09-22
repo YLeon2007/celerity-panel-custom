@@ -315,7 +315,7 @@ class TopologyOperationCoordinator {
             nodes: plan.nodes,
         });
         if (this.operationWorker) {
-            Promise.resolve(this.operationWorker.run(plan)).catch(() => {
+            Promise.resolve(this.operationWorker.run(operationId)).catch(() => {
                 this.onWorkerError({ operationId });
             });
         }

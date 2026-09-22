@@ -400,19 +400,31 @@ test('topology operation retains durable per-node deployment state', () => {
     const nodeSchema = TopologyOperation.schema.path('nodes').schema;
     assert.deepEqual(nodeSchema.path('state').enumValues, TOPOLOGY_NODE_STATES);
     assert.equal(nodeSchema.path('node').options.ref, 'HyNode');
+    const candidate = {
+        mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
+        bytes: [123, 125, 10],
+        sha256: 'a'.repeat(64),
+        sshPassword: 'must-not-persist',
+    };
 
     for (const state of TOPOLOGY_NODE_STATES) {
         const operation = topologyOperation({
             nodes: [{
                 node: objectId(),
                 state,
-                candidateHash: 'sha256:candidate-1',
+                candidateHash: candidate.sha256,
+                candidate,
                 backupId: 'backup-1',
             }],
         });
 
         assert.equal(operation.validateSync(), undefined);
-        assert.equal(operation.nodes[0].candidateHash, 'sha256:candidate-1');
+        assert.equal(operation.nodes[0].candidateHash, candidate.sha256);
+        assert.deepEqual(operation.nodes[0].candidate.toObject(), {
+            mediaType: candidate.mediaType,
+            bytes: candidate.bytes,
+            sha256: candidate.sha256,
+        });
         assert.equal(operation.nodes[0].backupId, 'backup-1');
     }
 

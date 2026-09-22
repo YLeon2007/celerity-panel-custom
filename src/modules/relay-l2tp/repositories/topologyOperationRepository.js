@@ -7,9 +7,39 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['prepared', 'committed', 'failed', 'rolled_back']);
+const CLAIM_PROJECTION = Object.freeze({
+    _id: 1,
+    topologyRevision: 1,
+    priorDeployedRevision: 1,
+    status: 1,
+    attempts: 1,
+    leaseOwner: 1,
+    leaseUntil: 1,
+    'nodes.node': 1,
+    'nodes.state': 1,
+    'nodes.candidateHash': 1,
+    'nodes.candidate.mediaType': 1,
+    'nodes.candidate.bytes': 1,
+    'nodes.candidate.sha256': 1,
+    'nodes.backupId': 1,
+});
 
 function operationId(value) {
     return value === null || value === undefined ? '' : String(value);
+}
+
+function durableCandidate(candidate) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
+        || typeof candidate.mediaType !== 'string'
+        || !Array.isArray(candidate.bytes)
+        || typeof candidate.sha256 !== 'string') {
+        throw new TypeError('Topology operation requires a durable candidate artifact');
+    }
+    return {
+        mediaType: candidate.mediaType,
+        bytes: [...candidate.bytes],
+        sha256: candidate.sha256,
+    };
 }
 
 class TopologyOperationRepository {
@@ -33,6 +63,7 @@ class TopologyOperationRepository {
                 node: node.node,
                 state: 'pending',
                 candidateHash: node.candidateHash,
+                candidate: durableCandidate(node.candidate),
                 backupId: '',
             }))
             .sort((left, right) => operationId(left.node).localeCompare(operationId(right.node)));
@@ -54,8 +85,18 @@ class TopologyOperationRepository {
             $or: [
                 { status: 'queued' },
                 {
-                    status: { $in: [...ACTIVE_STATUSES] },
+                    status: 'preparing',
                     leaseUntil: { $lte: now },
+                    nodes: {
+                        $not: {
+                            $elemMatch: {
+                                $or: [
+                                    { state: { $ne: 'pending' } },
+                                    { backupId: { $ne: '' } },
+                                ],
+                            },
+                        },
+                    },
                 },
             ],
         }, {
@@ -68,6 +109,8 @@ class TopologyOperationRepository {
         }, {
             new: true,
             runValidators: true,
+            lean: true,
+            projection: CLAIM_PROJECTION,
         });
     }
 

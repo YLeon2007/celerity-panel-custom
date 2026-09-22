@@ -18,6 +18,26 @@ const NODE_STATES = [
     'failed',
     'rolled_back',
 ];
+const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
+const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+
+const topologyCandidateSchema = new mongoose.Schema({
+    mediaType: {
+        type: String,
+        enum: [CANDIDATE_MEDIA_TYPE],
+        required: true,
+    },
+    bytes: {
+        type: [{ type: Number, min: 0, max: 255 }],
+        required: true,
+        validate: bytes => bytes.length > 0 && bytes.length <= 4 * 1024 * 1024,
+    },
+    sha256: {
+        type: String,
+        match: DIGEST_PATTERN,
+        required: true,
+    },
+}, { _id: false, strict: true });
 
 const topologyNodeSchema = new mongoose.Schema({
     node: {
@@ -30,7 +50,15 @@ const topologyNodeSchema = new mongoose.Schema({
         enum: NODE_STATES,
         required: true,
     },
-    candidateHash: { type: String, default: '', trim: true },
+    candidateHash: {
+        type: String,
+        match: DIGEST_PATTERN,
+        required: true,
+    },
+    candidate: {
+        type: topologyCandidateSchema,
+        required: true,
+    },
     backupId: { type: String, default: '', trim: true },
 }, { _id: false, strict: true });
 

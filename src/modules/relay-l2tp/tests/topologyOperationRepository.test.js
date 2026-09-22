@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const test = require('node:test');
 
 const {
@@ -8,6 +9,25 @@ const {
 } = require('../repositories/topologyOperationRepository');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
+const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
+
+function candidate(role, nodeRef, targetProfile) {
+    const content = `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'xray-topology-node-candidate',
+        mode: 'forward',
+        nodeRef,
+        role,
+        targetProfile,
+        links: [],
+        checks: [],
+    })}\n`;
+    return {
+        mediaType: CANDIDATE_MEDIA_TYPE,
+        bytes: [...Buffer.from(content, 'utf8')],
+        sha256: createHash('sha256').update(content).digest('hex'),
+    };
+}
 
 function createModel() {
     const calls = [];
@@ -28,9 +48,11 @@ function createModel() {
     };
 }
 
-test('createFrozen persists only sorted public operation metadata', async () => {
+test('createFrozen persists only sorted allowlisted durable candidate artifacts', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
+    const bridgeCandidate = candidate('bridge', 'bridge', 'xray-bridge');
+    const portalCandidate = candidate('portal', 'portal', 'xray-main');
 
     const created = await repository.createFrozen({
         operationId: 'operation-1',
@@ -39,14 +61,18 @@ test('createFrozen persists only sorted public operation metadata', async () => 
         nodes: [
             {
                 node: 'node-b',
-                candidateHash: 'sha256:bbb',
-                candidate: 'secret candidate b',
-                rawOutput: 'secret output b',
+                candidateHash: bridgeCandidate.sha256,
+                candidate: {
+                    ...bridgeCandidate,
+                    sshPassword: 'ssh-secret-canary',
+                },
+                rawShell: 'raw-shell-canary',
             },
             {
                 node: 'node-a',
-                candidateHash: 'sha256:aaa',
-                psk: 'secret psk a',
+                candidateHash: portalCandidate.sha256,
+                candidate: portalCandidate,
+                tunnelPsk: 'tunnel-secret-canary',
             },
         ],
         secret: 'top-level secret',
@@ -64,23 +90,28 @@ test('createFrozen persists only sorted public operation metadata', async () => 
             {
                 node: 'node-a',
                 state: 'pending',
-                candidateHash: 'sha256:aaa',
+                candidateHash: portalCandidate.sha256,
+                candidate: portalCandidate,
                 backupId: '',
             },
             {
                 node: 'node-b',
                 state: 'pending',
-                candidateHash: 'sha256:bbb',
+                candidateHash: bridgeCandidate.sha256,
+                candidate: bridgeCandidate,
                 backupId: '',
             },
         ],
     };
     assert.deepEqual(created, expected);
     assert.deepEqual(model.calls, [{ method: 'create', document: expected }]);
-    assert.doesNotMatch(JSON.stringify(model.calls), /secret|candidate b|output b|psk/i);
+    assert.doesNotMatch(
+        JSON.stringify(model.calls),
+        /sshPassword|rawShell|tunnelPsk|secret-canary|raw-shell-canary/i,
+    );
 });
 
-test('claim atomically claims only queued or expired active operations', async () => {
+test('claim reads only durable candidates and never resets later active phases', async () => {
     const model = createModel();
     const claimed = { _id: 'operation-1', status: 'preparing' };
     model.findOneAndUpdate = async (query, update, options) => {
@@ -104,8 +135,18 @@ test('claim atomically claims only queued or expired active operations', async (
             $or: [
                 { status: 'queued' },
                 {
-                    status: { $in: ['preparing', 'committing', 'rolling_back'] },
+                    status: 'preparing',
                     leaseUntil: { $lte: NOW },
+                    nodes: {
+                        $not: {
+                            $elemMatch: {
+                                $or: [
+                                    { state: { $ne: 'pending' } },
+                                    { backupId: { $ne: '' } },
+                                ],
+                            },
+                        },
+                    },
                 },
             ],
         },
@@ -117,7 +158,27 @@ test('claim atomically claims only queued or expired active operations', async (
             },
             $inc: { attempts: 1 },
         },
-        options: { new: true, runValidators: true },
+        options: {
+            new: true,
+            runValidators: true,
+            lean: true,
+            projection: {
+                _id: 1,
+                topologyRevision: 1,
+                priorDeployedRevision: 1,
+                status: 1,
+                attempts: 1,
+                leaseOwner: 1,
+                leaseUntil: 1,
+                'nodes.node': 1,
+                'nodes.state': 1,
+                'nodes.candidateHash': 1,
+                'nodes.candidate.mediaType': 1,
+                'nodes.candidate.bytes': 1,
+                'nodes.candidate.sha256': 1,
+                'nodes.backupId': 1,
+            },
+        },
     }]);
 });
 

@@ -1,5 +1,7 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+
 const EXECUTOR_METHODS = Object.freeze([
     'prepare',
     'commit',
@@ -7,6 +9,40 @@ const EXECUTOR_METHODS = Object.freeze([
     'cleanupPrepared',
     'rollback',
 ]);
+const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
+const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const CANDIDATE_KEYS = Object.freeze(['bytes', 'mediaType', 'sha256']);
+const CANDIDATE_DOCUMENT_KEYS = Object.freeze([
+    'checks',
+    'kind',
+    'links',
+    'mode',
+    'nodeRef',
+    'role',
+    'schemaVersion',
+    'targetProfile',
+]);
+const TARGET_BY_ROLE = Object.freeze({
+    portal: Object.freeze({
+        targetProfile: 'xray-main',
+        serviceUnit: 'xray.service',
+        serviceUnitPath: '/etc/systemd/system/xray.service',
+        configPath: '/usr/local/etc/xray/config.json',
+    }),
+    relay: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+    bridge: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+});
 
 class LeaseLostError extends Error {
     constructor() {
@@ -18,9 +54,142 @@ class LeaseLostError extends Error {
 
 function entityId(value) {
     const id = value !== null && typeof value === 'object'
-        ? value._id ?? value.id ?? value.node
+        ? value.operationId ?? value._id ?? value.id ?? value.node
         : value;
     return id === null || id === undefined ? '' : String(id);
+}
+
+function deepFreeze(value) {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+    Object.values(value).forEach(deepFreeze);
+    return Object.freeze(value);
+}
+
+function hasExactKeys(value, keys) {
+    return Boolean(value)
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(keys);
+}
+
+function validNodeRef(role, nodeRef) {
+    if (role === 'relay') return /^relay-[1-9][0-9]*$/.test(nodeRef);
+    return nodeRef === role;
+}
+
+function validLinks(links) {
+    return Array.isArray(links) && links.every(link => (
+        hasExactKeys(link, ['direction', 'linkRef', 'peerRef', 'port'])
+        && /^link-[1-9][0-9]*$/.test(link.linkRef)
+        && ['inbound', 'outbound'].includes(link.direction)
+        && /^(?:portal|bridge|relay-[1-9][0-9]*)$/.test(link.peerRef)
+        && Number.isSafeInteger(link.port)
+        && link.port >= 1
+        && link.port <= 65535
+    ));
+}
+
+function validChecks(checks, target) {
+    return Array.isArray(checks) && checks.every(check => {
+        if (check?.type === 'service') {
+            return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
+                && check.serviceUnit === target.serviceUnit
+                && check.expectedState === 'active';
+        }
+        if (check?.type === 'port') {
+            return hasExactKeys(check, ['expectedState', 'port', 'protocol', 'type'])
+                && check.protocol === 'tcp'
+                && Number.isSafeInteger(check.port)
+                && check.port >= 1
+                && check.port <= 65535
+                && check.expectedState === 'listening';
+        }
+        return false;
+    });
+}
+
+function durableNodePlan(metadata) {
+    const node = entityId(metadata?.node);
+    const candidate = metadata?.candidate;
+    if (!SAFE_ID_PATTERN.test(node)
+        || metadata?.state !== 'pending'
+        || metadata?.backupId !== ''
+        || !hasExactKeys(candidate, CANDIDATE_KEYS)
+        || candidate.mediaType !== CANDIDATE_MEDIA_TYPE
+        || !Array.isArray(candidate.bytes)
+        || candidate.bytes.length === 0
+        || candidate.bytes.length > 4 * 1024 * 1024
+        || candidate.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
+        || typeof candidate.sha256 !== 'string'
+        || !DIGEST_PATTERN.test(candidate.sha256)
+        || metadata.candidateHash !== candidate.sha256) {
+        throw new TypeError('Invalid durable topology candidate');
+    }
+
+    const bytes = Buffer.from(candidate.bytes);
+    const content = bytes.toString('utf8');
+    if (!Buffer.from(content, 'utf8').equals(bytes)
+        || createHash('sha256').update(bytes).digest('hex') !== candidate.sha256) {
+        throw new TypeError('Invalid durable topology candidate');
+    }
+    let document;
+    try {
+        document = JSON.parse(content);
+    } catch {
+        throw new TypeError('Invalid durable topology candidate');
+    }
+    const target = TARGET_BY_ROLE[document?.role];
+    if (content !== `${JSON.stringify(document)}\n`
+        || !hasExactKeys(document, CANDIDATE_DOCUMENT_KEYS)
+        || document.schemaVersion !== 1
+        || document.kind !== 'xray-topology-node-candidate'
+        || !['forward', 'reverse'].includes(document.mode)
+        || !target
+        || !validNodeRef(document.role, document.nodeRef)
+        || document.targetProfile !== target.targetProfile
+        || !validLinks(document.links)
+        || !validChecks(document.checks, target)) {
+        throw new TypeError('Invalid durable topology candidate');
+    }
+
+    return {
+        node,
+        nodeRef: document.nodeRef,
+        role: document.role,
+        ...target,
+        candidate: {
+            mediaType: candidate.mediaType,
+            bytes: [...candidate.bytes],
+            sha256: candidate.sha256,
+        },
+        candidateHash: metadata.candidateHash,
+        checks: document.checks,
+    };
+}
+
+function durablePlan(operation, operationId) {
+    if (!operation
+        || entityId(operation) !== operationId
+        || operation.status !== 'preparing'
+        || !Number.isSafeInteger(operation.topologyRevision)
+        || operation.topologyRevision < 0
+        || !Number.isSafeInteger(operation.priorDeployedRevision)
+        || operation.priorDeployedRevision < 0
+        || !Array.isArray(operation.nodes)
+        || operation.nodes.length === 0) {
+        throw new TypeError('Invalid durable topology operation');
+    }
+    const nodes = operation.nodes.map(durableNodePlan)
+        .sort((left, right) => left.node.localeCompare(right.node));
+    if (new Set(nodes.map(node => node.node)).size !== nodes.length) {
+        throw new TypeError('Invalid durable topology operation');
+    }
+    return deepFreeze({
+        operationId,
+        topologyRevision: operation.topologyRevision,
+        priorDeployedRevision: operation.priorDeployedRevision,
+        nodes,
+    });
 }
 
 function isDeepFrozen(value) {
@@ -249,9 +418,11 @@ class TopologyOperationWorker {
         return { claimed: true, operationId, status };
     }
 
-    async run(plan) {
-        const nodes = orderedPlanNodes(plan);
-        const operationId = entityId(plan.operationId);
+    async run(operationIdentity) {
+        const operationId = entityId(operationIdentity);
+        if (!SAFE_ID_PATTERN.test(operationId)) {
+            throw new TypeError('Topology operation worker requires an operation id');
+        }
         if (this.running.has(operationId)) {
             return { claimed: false, operationId };
         }
@@ -264,7 +435,12 @@ class TopologyOperationWorker {
                 now: this.clock.now(),
             });
             if (!operation) return { claimed: false, operationId };
-            if (!matchesFrozenMetadata(operation, plan, nodes)) {
+            let plan;
+            let nodes;
+            try {
+                plan = durablePlan(operation, operationId);
+                nodes = orderedPlanNodes(plan);
+            } catch {
                 const failed = await this.operationRepository.finishClaimed({
                     operationId,
                     owner: this.workerId,
