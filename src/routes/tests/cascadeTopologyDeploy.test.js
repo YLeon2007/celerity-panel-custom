@@ -377,6 +377,38 @@ test('deployment API returns only the public deployment evidence contract', asyn
     );
 });
 
+test('deployment API returns 202 with only the strict queued operation projection', async () => {
+    const calls = [];
+    const router = createCascadeTopologyDeployRouter({
+        topologyDeploymentService: {
+            async deploy(input) {
+                calls.push(input);
+                return {
+                    operationId: 'operation-queued',
+                    topologyRevision: 7,
+                    status: 'queued',
+                    candidates: [{ bytes: 'candidate-secret' }],
+                    compiledTopology: { password: 'must-not-leak' },
+                };
+            },
+        },
+        ...guardHarness([]),
+    });
+
+    const response = await request(router, {
+        headers: { 'x-test-auth': 'api-write' },
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(response.body, {
+        operationId: 'operation-queued',
+        topologyRevision: 7,
+        status: 'queued',
+    });
+    assert.deepEqual(calls, [{ expectedTopologyRevision: 7 }]);
+    assert.doesNotMatch(JSON.stringify(response.body), /candidate|compiled|password|secret/i);
+});
+
 test('legacy deploy entry points are fail-closed while explicit undeploy remains separate', () => {
     assert.doesNotMatch(CASCADE_ROUTE_SOURCE, /cascadeService\.deployChain\s*\(/);
     assert.doesNotMatch(CASCADE_ROUTE_SOURCE, /cascadeService\.deployLink\s*\(/);
@@ -475,6 +507,19 @@ test('OpenAPI advertises only the revision-safe topology deployment endpoint', (
     assert.equal(operation['x-rateLimit'], '10 deploy requests per minute');
     assert.match(operation.description, /fails closed/i);
     assert.match(operation.description, /TOPOLOGY_DEPLOYMENT_UNAVAILABLE/);
+    assert.deepEqual(
+        operation.responses[202].content['application/json'].schema,
+        {
+            type: 'object',
+            additionalProperties: false,
+            required: ['operationId', 'topologyRevision', 'status'],
+            properties: {
+                operationId: { type: 'string' },
+                topologyRevision: { type: 'integer', minimum: 0 },
+                status: { type: 'string', enum: ['queued'] },
+            },
+        },
+    );
     assert.match(english.info.description, /POST \/cascade\/topology\/deploy/);
     assert.doesNotMatch(english.info.description, /POST \/cascade\/chain\/deploy/);
     assert.match(russian.info.description, /POST \/cascade\/topology\/deploy/);

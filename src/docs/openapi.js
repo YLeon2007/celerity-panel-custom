@@ -2598,6 +2598,23 @@ See the request body examples panel for both flavours.`,
                             },
                         },
                     },
+                    202: {
+                        description: 'Topology operation accepted and queued',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    required: ['operationId', 'topologyRevision', 'status'],
+                                    properties: {
+                                        operationId: { type: 'string' },
+                                        topologyRevision: { type: 'integer', minimum: 0 },
+                                        status: { type: 'string', enum: ['queued'] },
+                                    },
+                                },
+                            },
+                        },
+                    },
                     400: { description: 'Closed request schema or revision validation failed' },
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },

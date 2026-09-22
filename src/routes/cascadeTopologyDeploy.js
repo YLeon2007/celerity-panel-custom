@@ -83,7 +83,7 @@ function normalizeDeployRequest(body) {
 
 function publicResult(result = {}) {
     const body = {};
-    for (const field of ['operationId', 'topologyRevision', 'deployedRevision']) {
+    for (const field of ['operationId', 'topologyRevision', 'deployedRevision', 'status']) {
         if (result[field] !== undefined) body[field] = result[field];
     }
     if (Array.isArray(result.nodeEvidence)) {
@@ -179,7 +179,8 @@ function createCascadeTopologyDeployRouter({
         async (req, res) => {
             try {
                 const result = await deploymentService.deploy(normalizeDeployRequest(req.body));
-                return res.json(publicResult(result));
+                const status = result?.status === 'queued' ? 202 : 200;
+                return res.status(status).json(publicResult(result));
             } catch (error) {
                 return sendError(res, error, routeLogger);
             }
