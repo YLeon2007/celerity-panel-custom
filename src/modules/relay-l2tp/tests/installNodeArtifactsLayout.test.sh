@@ -25,6 +25,7 @@ readonly -a PAYLOADS=(
     apply-firewall-policy.sh
     start-l2tp.sh
     sync-users.sh
+    verify-users.sh
     verify.sh
     commit.sh
     rollback.sh

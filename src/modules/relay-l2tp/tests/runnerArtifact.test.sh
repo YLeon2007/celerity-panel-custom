@@ -87,10 +87,11 @@ make_sibling_artifact activate-xray.sh
 make_sibling_artifact apply-firewall-policy.sh
 make_sibling_artifact start-l2tp.sh
 make_sibling_artifact sync-users.sh
+make_sibling_artifact verify-users.sh
 make_sibling_artifact verify.sh
 make_sibling_artifact commit.sh
 make_sibling_artifact rollback.sh
-for forbidden in preflight.sh install-runtime.sh backup.sh apply.sh compose-xray-fragment.sh validate-xray.sh materialize-nft-candidate.sh validate-nft.sh activate-xray.sh apply-firewall-policy.sh start-l2tp.sh sync-users.sh verify.sh commit.sh rollback.sh apt apt-get systemctl nft; do
+for forbidden in preflight.sh install-runtime.sh backup.sh apply.sh compose-xray-fragment.sh validate-xray.sh materialize-nft-candidate.sh validate-nft.sh activate-xray.sh apply-firewall-policy.sh start-l2tp.sh sync-users.sh verify-users.sh verify.sh commit.sh rollback.sh apt apt-get systemctl nft; do
     make_forbidden_command "$forbidden"
 done
 
@@ -150,12 +151,13 @@ declare -A command_artifacts=(
     [validate_xray]='validate-xray.sh'
     [apply_firewall_policy]='apply-firewall-policy.sh'
     [start_l2tp]='start-l2tp.sh'
-    [sync_users]='sync-users.sh'
+    [sync-users]='sync-users.sh'
+    [verify-users]='verify-users.sh'
     [verify]='verify.sh'
     [commit]='commit.sh'
     [rollback]='rollback.sh'
 )
-for command in compose_xray_fragment validate_xray apply_firewall_policy start_l2tp sync_users verify commit rollback; do
+for command in compose_xray_fragment validate_xray apply_firewall_policy start_l2tp sync-users verify-users verify commit rollback; do
     rm -f "$TMP_DIR/call.log"
     invoke_runner "$command" --operation-id operation-20 --command "$command"
     [[ "$status" -eq 0 ]] || fail "$command dispatch failed"
@@ -207,6 +209,8 @@ mapfile -t call <"$TMP_DIR/call.log"
 
 expect_error unknown-command UNKNOWN_COMMAND \
     --operation-id operation-21 --command install_runtime_raw
+expect_error legacy-underscore-sync-command UNKNOWN_COMMAND \
+    --operation-id operation-21 --command sync_users
 expect_error missing-arguments INVALID_ARGUMENTS \
     --operation-id operation-21
 expect_error extra-arguments INVALID_ARGUMENTS \

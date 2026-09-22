@@ -335,8 +335,8 @@ test('release manifest binds source, package contents, host integration requirem
             root: 'module/node-artifacts/l2tp',
             executables: executableNodeArtifacts,
         });
-        assert.equal(manifest.nodeArtifacts.executables.length, 18);
-        assert.equal(new Set(manifest.nodeArtifacts.executables.map(file => file.path)).size, 18);
+        assert.equal(manifest.nodeArtifacts.executables.length, 19);
+        assert.equal(new Set(manifest.nodeArtifacts.executables.map(file => file.path)).size, 19);
         assert.equal(
             manifest.nodeArtifacts.executables.some(file => (
                 file.path === 'module/node-artifacts/l2tp/materialize-nft-candidate.sh'
@@ -372,7 +372,7 @@ test('changing a node payload invalidates verification even when its generic fil
         const extracted = path.join(tempRoot, 'extracted');
         const rootName = 'relay-l2tp-0.1.0';
         const releaseRoot = path.join(extracted, rootName);
-        const payloadPath = 'module/node-artifacts/l2tp/runner.sh';
+        const payloadPath = 'module/node-artifacts/l2tp/verify-users.sh';
         extractArchive(built.archivePath, extracted);
 
         const absolutePayloadPath = path.join(releaseRoot, ...payloadPath.split('/'));
@@ -392,7 +392,7 @@ test('changing a node payload invalidates verification even when its generic fil
 
         const result = runVerifyResult(tamperedArchive, tamperedChecksum);
         assert.notEqual(result.status, 0);
-        assert.match(result.stderr, /node artifact digest pin mismatch: module\/node-artifacts\/l2tp\/runner\.sh/i);
+        assert.match(result.stderr, /node artifact digest pin mismatch: module\/node-artifacts\/l2tp\/verify-users\.sh/i);
         assert.equal(result.stderr.includes('release-verifier-tamper-probe'), false);
     } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });

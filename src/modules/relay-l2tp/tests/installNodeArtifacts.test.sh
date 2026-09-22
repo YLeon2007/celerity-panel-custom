@@ -23,6 +23,7 @@ readonly -a PAYLOADS=(
     apply-firewall-policy.sh
     start-l2tp.sh
     sync-users.sh
+    verify-users.sh
     verify.sh
     commit.sh
     rollback.sh
@@ -79,6 +80,7 @@ inspect_installed_metadata() {
         /usr/local/lib/celerity/relay-l2tp \
         /usr/local/lib/celerity/relay-l2tp/runner.sh \
         /usr/local/lib/celerity/relay-l2tp/receive-artifact.py \
+        /usr/local/lib/celerity/relay-l2tp/verify-users.sh \
         /var/lib/celerity/l2tp/operations
 }
 
@@ -121,7 +123,9 @@ mapfile -t metadata < <(inspect_installed_metadata)
     || fail 'runner is not an exact root-owned mode 0755 executable'
 [[ "${metadata[2]}" == '0:0:755:regular file' ]] \
     || fail 'receiver is not an exact root-owned mode 0755 executable'
-[[ "${metadata[3]}" == '0:0:700:directory' ]] \
+[[ "${metadata[3]}" == '0:0:755:regular file' ]] \
+    || fail 'user verifier is not an exact root-owned mode 0755 executable'
+[[ "${metadata[4]}" == '0:0:700:directory' ]] \
     || fail 'operations root is not an exact root-owned mode 0700 directory'
 
 for payload in "${PAYLOADS[@]}"; do

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 declare -Ar PAYLOAD_SHA256=(
-    [runner.sh]='ac31c4c7263895a066a06bc0217190b532650ba665a7cab588a647530f1a9ab0'
+    [runner.sh]='a078129a1ee7f4692cd68d4b7f803c7eae8fb87a7868a25ae8cf9f685d082ae1'
     [receive-artifact.py]='e4a107d0220284c358534ea0a7f2b8ec8a7f3952956eeebb33a7a68450988f4b'
     [apply.sh]='dfd396096bd85c2e931682f05840d2f6cce5246212288f6f2b91e2e660ccbe95'
     [preflight.sh]='a5f2c845beb4cdc781688efee00745f4edca98f7e5599a78007e411d9b2d709e'
@@ -14,6 +14,7 @@ declare -Ar PAYLOAD_SHA256=(
     [apply-firewall-policy.sh]='1d6f0ad0f1e973ea6b8c8ba9810e7237044ab95734541bc0f8c98be159dc6aba'
     [start-l2tp.sh]='2fd5026e7ddbb5e4b2f748817494edef06b33fd002012de19a1f981b17283692'
     [sync-users.sh]='49fa1c74dd16654a82363be5b639e65f512ca16f7ca0ffb848988a822127c9d3'
+    [verify-users.sh]='a06942b268e0b6379ac81a9048efd203ded02953ae399765aae2eb54aef5ea61'
     [verify.sh]='82d3334f97afb9a2ce0b99991dfb8ac7d94258534c8f2d8aa917b66d1183a4ae'
     [commit.sh]='bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b'
     [rollback.sh]='63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091'
@@ -38,6 +39,7 @@ readonly -a PAYLOADS=(
     apply-firewall-policy.sh
     start-l2tp.sh
     sync-users.sh
+    verify-users.sh
     verify.sh
     commit.sh
     rollback.sh

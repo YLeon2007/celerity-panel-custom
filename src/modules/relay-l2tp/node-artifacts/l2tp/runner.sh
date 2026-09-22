@@ -69,8 +69,11 @@ case "$COMMAND" in
     start_l2tp)
         exec_artifact "$ARTIFACT_DIR/start-l2tp.sh" "$OPERATION_DIR"
         ;;
-    sync_users)
+    sync-users)
         exec_artifact "$ARTIFACT_DIR/sync-users.sh" "$OPERATION_DIR"
+        ;;
+    verify-users)
+        exec_artifact "$ARTIFACT_DIR/verify-users.sh" "$OPERATION_DIR"
         ;;
     verify)
         exec_artifact "$ARTIFACT_DIR/verify.sh" "$OPERATION_DIR"

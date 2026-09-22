@@ -35,6 +35,7 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
     'runner.sh',
     'start-l2tp.sh',
     'sync-users.sh',
+    'verify-users.sh',
     'validate-nft.sh',
     'validate-xray.sh',
     'verify.sh',
