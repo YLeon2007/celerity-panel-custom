@@ -38,6 +38,15 @@ function createOperationRepository(initialOperations = []) {
             const operation = operations.find(candidate => candidate.id === request.operationId);
             if (operation) operation.status = request.status;
         },
+        async succeedClaimed(request) {
+            calls.push({ method: 'succeedClaimed', request });
+            const operation = operations.find(candidate => candidate.id === request.operationId);
+            if (!operation || operation.status !== 'running' || operation.leaseOwner !== request.owner) {
+                return false;
+            }
+            operation.status = 'succeeded';
+            return true;
+        },
     };
 }
 
@@ -366,9 +375,14 @@ test('runs standalone sync_users with typed verification and finalizes before su
     const executed = [];
     const events = [];
     const setStatus = operationRepository.setStatus;
+    const succeedClaimed = operationRepository.succeedClaimed;
     operationRepository.setStatus = async request => {
         events.push({ method: 'setStatus', status: request.status });
         return setStatus.call(operationRepository, request);
+    };
+    operationRepository.succeedClaimed = async request => {
+        events.push({ method: 'succeedClaimed', status: 'succeeded' });
+        return succeedClaimed.call(operationRepository, request);
     };
     const worker = createWorker(operationRepository, {
         userSnapshotResolver: async request => {
@@ -470,7 +484,7 @@ test('runs standalone sync_users with typed verification and finalizes before su
     });
     assert.ok(
         events.findIndex(event => event.method === 'finalizeVerifiedSync')
-            < events.findIndex(event => event.method === 'setStatus' && event.status === 'succeeded'),
+            < events.findIndex(event => event.method === 'succeedClaimed'),
     );
     assert.doesNotMatch(
         JSON.stringify({ operation, repositoryCalls: operationRepository.calls, result }),
@@ -1657,9 +1671,14 @@ test('success is persisted only after verify and before releasing the lock', asy
         plan: { steps: [{ type: 'verify' }] },
     }]);
     const setStatus = operationRepository.setStatus;
+    const succeedClaimed = operationRepository.succeedClaimed;
     operationRepository.setStatus = async request => {
         events.push({ method: 'setStatus', status: request.status });
         return setStatus(request);
+    };
+    operationRepository.succeedClaimed = async request => {
+        events.push({ method: 'succeedClaimed', request });
+        return succeedClaimed(request);
     };
     const worker = createWorker(operationRepository, {
         lockService: {
@@ -1697,7 +1716,21 @@ test('success is persisted only after verify and before releasing the lock', asy
             },
         },
         { method: 'executeStep', step: 'verify' },
-        { method: 'setStatus', status: 'succeeded' },
+        {
+            method: 'succeedClaimed',
+            request: {
+                operationId: 'operation-success',
+                owner: 'worker-1',
+                now: NOW,
+                step: 'verify',
+                journal: {
+                    at: NOW,
+                    level: 'info',
+                    code: 'L2TP_OPERATION_SUCCEEDED',
+                    message: 'L2TP operation succeeded after verification',
+                },
+            },
+        },
         {
             method: 'release',
             request: {
@@ -1708,17 +1741,14 @@ test('success is persisted only after verify and before releasing the lock', asy
         },
     ]);
     assert.deepEqual(
-        operationRepository.calls.filter(call => call.method === 'setStatus'),
+        operationRepository.calls.filter(call => call.method === 'succeedClaimed'),
         [{
-            method: 'setStatus',
+            method: 'succeedClaimed',
             request: {
                 operationId: 'operation-success',
-                status: 'succeeded',
+                owner: 'worker-1',
+                now: NOW,
                 step: 'verify',
-                progress: 100,
-                errorCode: '',
-                errorMessage: '',
-                finishedAt: NOW,
                 journal: {
                     at: NOW,
                     level: 'info',
@@ -1730,14 +1760,55 @@ test('success is persisted only after verify and before releasing the lock', asy
     );
 });
 
+test('does not report success when the terminal owner-and-lease CAS rejects', async () => {
+    const operationRepository = createOperationRepository([{
+        id: 'operation-terminal-cas',
+        node: 'node-terminal-cas',
+        status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    operationRepository.succeedClaimed = async request => {
+        operationRepository.calls.push({ method: 'succeedClaimed', request });
+        return false;
+    };
+    const worker = createWorker(operationRepository, {
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: { async executeStep() {} },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-terminal-cas',
+        status: 'running',
+        stopped: true,
+        errorCode: 'L2TP_LEASE_RENEWAL_FAILED',
+    });
+    assert.equal(
+        operationRepository.calls.some(call => (
+            call.method === 'setStatus' && call.request.status === 'succeeded'
+        )),
+        false,
+    );
+});
+
 test('verified install state is reconciled before the operation can become succeeded', async () => {
     const events = [];
     const { operation } = createInstallOperation('operation-reconcile-success');
     const operationRepository = createOperationRepository([operation]);
     const setStatus = operationRepository.setStatus;
+    const succeedClaimed = operationRepository.succeedClaimed;
     operationRepository.setStatus = async request => {
         events.push({ method: 'setStatus', status: request.status });
         return setStatus(request);
+    };
+    operationRepository.succeedClaimed = async request => {
+        events.push({ method: 'succeedClaimed' });
+        return succeedClaimed(request);
     };
     const worker = createWorker(operationRepository, {
         operationMaterializer: materializeInstallOperation,
@@ -1778,9 +1849,7 @@ test('verified install state is reconciled before the operation can become succe
         status: 'succeeded',
     });
     const reconcileIndex = events.findIndex(event => event.method === 'reconcile');
-    const successIndex = events.findIndex(event => (
-        event.method === 'setStatus' && event.status === 'succeeded'
-    ));
+    const successIndex = events.findIndex(event => event.method === 'succeedClaimed');
     const releaseIndex = events.findIndex(event => event.method === 'release');
     assert.ok(reconcileIndex > events.findIndex(event => (
         event.method === 'executeStep' && event.step === 'verify'

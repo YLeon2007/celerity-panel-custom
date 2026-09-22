@@ -826,14 +826,11 @@ class L2tpOperationWorker {
                     return { claimed: true, operationId, status: 'rolled_back' };
                 }
             }
-            await this.operationRepository.setStatus({
+            const succeeded = await this.operationRepository.succeedClaimed({
                 operationId,
-                status: 'succeeded',
+                owner: this.workerId,
+                now: finishedAt,
                 step: finalStep,
-                progress: 100,
-                errorCode: '',
-                errorMessage: '',
-                finishedAt,
                 journal: {
                     at: finishedAt,
                     level: 'info',
@@ -841,6 +838,7 @@ class L2tpOperationWorker {
                     message: 'L2TP operation succeeded after verification',
                 },
             });
+            if (succeeded !== true) return leaseLostResult();
 
             return { claimed: true, operationId, status: 'succeeded' };
         } finally {
