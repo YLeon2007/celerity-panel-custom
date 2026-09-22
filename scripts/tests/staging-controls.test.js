@@ -1256,10 +1256,13 @@ test('rollback refuses to restore when the retained install Git identity differs
         const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
         fs.mkdirSync(installDir, { recursive: true });
         fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), 'candidate source\n');
+        fs.writeFileSync(path.join(installDir, '.gitignore'), '.env\n');
+        fs.copyFileSync(fixture.configEnv, path.join(installDir, '.env'));
+        fs.chmodSync(path.join(installDir, '.env'), 0o600);
         runChecked('git', ['init', '--quiet'], { cwd: installDir });
         runChecked('git', ['config', 'user.name', 'Staging Test'], { cwd: installDir });
         runChecked('git', ['config', 'user.email', 'staging-test@example.invalid'], { cwd: installDir });
-        runChecked('git', ['add', 'docker-compose.yml'], { cwd: installDir });
+        runChecked('git', ['add', 'docker-compose.yml', '.gitignore'], { cwd: installDir });
         runChecked('git', ['commit', '--quiet', '-m', 'different baseline'], { cwd: installDir });
 
         const result = run(rollbackScript, fixture.args(['--execute', 'true']), { env: fixture.rollbackEnv });
@@ -1278,6 +1281,8 @@ test('rollback rejects symlinked retained Git metadata before source restoration
     try {
         const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
         runChecked('git', ['clone', '--quiet', '--no-local', fixture.sourceStage, installDir]);
+        fs.copyFileSync(fixture.configEnv, path.join(installDir, '.env'));
+        fs.chmodSync(path.join(installDir, '.env'), 0o600);
         const gitMetadata = path.join(installDir, '.git');
         const externalGitMetadata = path.join(fixture.root, 'external-retained-git-metadata');
         fs.renameSync(gitMetadata, externalGitMetadata);
