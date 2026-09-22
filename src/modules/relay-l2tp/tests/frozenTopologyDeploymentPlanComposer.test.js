@@ -5,9 +5,59 @@ const { createHash } = require('node:crypto');
 const Module = require('node:module');
 const test = require('node:test');
 
+const { generateXrayConfig } = require('../../../services/configGenerator');
+
 const {
     composeFrozenTopologyDeploymentPlan,
 } = require('../services/frozenTopologyDeploymentPlanComposer');
+
+function nodeMetadata(id, role, index) {
+    return {
+        id,
+        role,
+        type: 'xray',
+        active: true,
+        cascadeRole: role,
+        ip: `192.0.2.${index}`,
+        domain: `${role}.example.test`,
+        port: 24000 + index,
+        xray: {
+            accessLogs: { enabled: role === 'portal' },
+            apiPort: 61000 + index,
+            inboundTag: `client-${role}`,
+            transport: 'tcp',
+            security: 'none',
+            extraInbounds: role === 'portal' ? [{
+                id: 'extra-portal',
+                label: 'Portal extra',
+                uniqueName: false,
+                port: 25000 + index,
+                inboundTag: 'client-portal-extra',
+                transport: 'ws',
+                security: 'none',
+                wsPath: '/portal-extra',
+            }] : [],
+        },
+    };
+}
+
+function canonicalJson(value) {
+    if (Array.isArray(value)) return value.map(canonicalJson);
+    if (value === null || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalJson(value[key])]),
+    );
+}
+
+function candidateConfig(node) {
+    const content = Buffer.from(node.candidate.bytes).toString('utf8');
+    const config = JSON.parse(content);
+    assert.equal(content, `${JSON.stringify(canonicalJson(config))}\n`);
+    assert.ok(Array.isArray(config.inbounds));
+    assert.ok(Array.isArray(config.outbounds));
+    assert.ok(config.routing && Array.isArray(config.routing.rules));
+    return config;
+}
 
 function reverseChainInput() {
     return {
@@ -34,20 +84,37 @@ function reverseChainInput() {
             groups: [],
         },
         nodeMetadata: [
-            { id: 'node-relay-object-id', role: 'relay', ssh: { password: 'relay-secret' } },
-            { id: 'node-bridge-object-id', role: 'bridge', privateKey: 'bridge-secret' },
-            { id: 'node-portal-object-id', role: 'portal', agentToken: 'portal-secret' },
+            {
+                ...nodeMetadata('node-relay-object-id', 'relay', 2),
+                ssh: { password: 'relay-secret' },
+            },
+            {
+                ...nodeMetadata('node-bridge-object-id', 'bridge', 3),
+                privateKey: 'bridge-secret',
+            },
+            {
+                ...nodeMetadata('node-portal-object-id', 'portal', 1),
+                agentToken: 'portal-secret',
+            },
         ],
         linkMetadata: [
             {
                 id: 'link-relay-bridge-object-id',
                 tunnelPort: 12002,
                 tunnelUuid: 'relay-bridge-secret',
+                tunnelDomain: 'reverse.example.test',
+                tunnelProtocol: 'vless',
+                tunnelSecurity: 'none',
+                tunnelTransport: 'tcp',
             },
             {
                 id: 'link-portal-relay-object-id',
                 tunnelPort: 12001,
                 tunnelUuid: 'portal-relay-secret',
+                tunnelDomain: 'reverse.example.test',
+                tunnelProtocol: 'vless',
+                tunnelSecurity: 'none',
+                tunnelTransport: 'tcp',
             },
         ],
         compiledTopology: {
@@ -103,7 +170,37 @@ test('composes frozen secret-free reverse candidates in Portal to Relay to Bridg
         assert.equal(Object.isFrozen(node), true);
         assert.equal(Object.isFrozen(node.candidate), true);
         assert.equal(Object.isFrozen(node.candidate.bytes), true);
+        candidateConfig(node);
     }
+
+    const configs = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, candidateConfig(node)]));
+    for (const [nodeRef, config] of Object.entries(configs)) {
+        assert(config.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), nodeRef);
+        assert(config.inbounds.some(inbound => inbound.tag === `client-${nodeRef.replace('-1', '')}`), nodeRef);
+    }
+    assert.deepEqual(configs.portal.reverse.portals, [{
+        tag: 'portal-link-1',
+        domain: 'link-1.reverse.example.test',
+    }]);
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'bridge-conn-link-1'));
+    assert(configs.portal.routing.rules.some(rule => (
+        rule.inboundTag?.includes('client-portal') && rule.outboundTag === 'portal-link-1'
+    )));
+    assert.deepEqual(configs['relay-1'].reverse.bridges, [{
+        tag: 'bridge-up',
+        domain: 'link-1.reverse.example.test',
+    }]);
+    assert.deepEqual(configs['relay-1'].reverse.portals, [{
+        tag: 'portal-down-link-2',
+        domain: 'link-2.reverse.example.test',
+    }]);
+    assert(configs['relay-1'].outbounds.some(outbound => outbound.tag === 'tunnel-up'));
+    assert(configs['relay-1'].inbounds.some(inbound => inbound.tag === 'conn-down-link-2'));
+    assert.deepEqual(configs.bridge.reverse.bridges, [{
+        tag: 'bridge-link-2',
+        domain: 'link-2.reverse.example.test',
+    }]);
+    assert(configs.bridge.outbounds.some(outbound => outbound.tag === 'tunnel-link-2'));
     assert.equal(Object.isFrozen(plan), true);
     assert.equal(Object.isFrozen(plan.nodes), true);
 });
@@ -192,22 +289,119 @@ test('composes forward plans in Bridge to Relay to Portal order with exact check
         ],
     ]);
 
-    const bridgeCandidate = JSON.parse(Buffer.from(plan.nodes[0].candidate.bytes).toString('utf8'));
-    assert.deepEqual(bridgeCandidate, {
-        schemaVersion: 1,
-        kind: 'xray-topology-node-candidate',
-        mode: 'forward',
-        nodeRef: 'bridge',
-        role: 'bridge',
-        targetProfile: 'xray-bridge',
-        links: [{
-            linkRef: 'link-2',
-            direction: 'inbound',
-            peerRef: 'relay-1',
-            port: 12002,
-        }],
-        checks: plan.nodes[0].checks,
+    const configs = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, candidateConfig(node)]));
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'client-portal-extra'));
+    assert(configs.portal.outbounds.some(outbound => outbound.tag === 'fwd-link-1'));
+    const exitOutbound = configs.portal.outbounds.find(outbound => outbound.tag === 'fwd-link-2');
+    assert.deepEqual(exitOutbound.proxySettings, { tag: 'fwd-link-1', transportLayer: true });
+    assert(configs.portal.routing.rules.some(rule => (
+        rule.inboundTag?.includes('client-portal')
+        && rule.inboundTag?.includes('client-portal-extra')
+        && rule.outboundTag === 'fwd-link-2'
+    )));
+    assert(configs['relay-1'].inbounds.some(inbound => inbound.tag === 'fwd-hop-link-1'));
+    assert(configs['relay-1'].routing.rules.some(rule => (
+        rule.inboundTag?.includes('fwd-hop-link-1') && rule.outboundTag === 'direct'
+    )));
+    assert(configs.bridge.inbounds.some(inbound => inbound.tag === 'fwd-hop-link-2'));
+});
+
+test('composes every relay in a longer reverse v1 chain', () => {
+    const input = reverseChainInput();
+    const relayBridge = input.snapshot.links.find(link => (
+        link.id === 'link-relay-bridge-object-id'
+    ));
+    relayBridge.target = 'node-relay-two-object-id';
+    input.snapshot.nodes.push({ id: 'node-relay-two-object-id', role: 'relay' });
+    input.snapshot.links.push({
+        id: 'link-relay-two-bridge-object-id',
+        source: 'node-relay-two-object-id',
+        target: 'node-bridge-object-id',
+        mode: 'reverse',
     });
+    input.nodeMetadata.push(nodeMetadata('node-relay-two-object-id', 'relay', 4));
+    input.linkMetadata.find(link => link.id === relayBridge.id).target = 'node-relay-two-object-id';
+    input.linkMetadata.push({
+        id: 'link-relay-two-bridge-object-id',
+        tunnelPort: 12003,
+        tunnelDomain: 'reverse.example.test',
+        tunnelProtocol: 'vless',
+        tunnelSecurity: 'none',
+        tunnelTransport: 'tcp',
+    });
+    input.compiledTopology.relays.push({
+        nodeId: 'node-relay-two-object-id',
+        routeGroups: [],
+    });
+
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.deepEqual(
+        plan.nodes.map(node => node.nodeRef),
+        ['portal', 'relay-1', 'relay-2', 'bridge'],
+    );
+    for (const nodeRef of ['relay-1', 'relay-2']) {
+        const config = candidateConfig(plan.nodes.find(node => node.nodeRef === nodeRef));
+        assert.equal(config.reverse.bridges.length, 1);
+        assert.equal(config.reverse.portals.length, 1);
+    }
+});
+
+test('composes a direct Portal to Bridge forward v1 chain without relays', () => {
+    const input = forwardChainInput();
+    input.snapshot.nodes = input.snapshot.nodes.filter(node => node.role !== 'relay');
+    input.snapshot.links = [{
+        id: 'link-portal-bridge-object-id',
+        source: 'node-portal-object-id',
+        target: 'node-bridge-object-id',
+        mode: 'forward',
+    }];
+    input.nodeMetadata = input.nodeMetadata.filter(node => node.role !== 'relay');
+    input.linkMetadata = [{
+        id: 'link-portal-bridge-object-id',
+        tunnelPort: 12001,
+        tunnelDomain: 'forward.example.test',
+        tunnelProtocol: 'vless',
+        tunnelSecurity: 'none',
+        tunnelTransport: 'tcp',
+    }];
+    input.compiledTopology.relays = [];
+
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.deepEqual(plan.nodes.map(node => node.nodeRef), ['bridge', 'portal']);
+    const portal = candidateConfig(plan.nodes.find(node => node.nodeRef === 'portal'));
+    const bridge = candidateConfig(plan.nodes.find(node => node.nodeRef === 'bridge'));
+    assert(portal.outbounds.some(outbound => outbound.tag === 'fwd-link-1'));
+    assert(bridge.inbounds.some(inbound => inbound.tag === 'fwd-hop-link-1'));
+});
+
+test('preserves the official Xray generator baseline before adding cascade pieces', () => {
+    const input = reverseChainInput();
+    const portalMetadata = input.nodeMetadata.find(node => node.role === 'portal');
+    const baseline = JSON.parse(generateXrayConfig(portalMetadata, []));
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    const portal = candidateConfig(plan.nodes.find(node => node.role === 'portal'));
+
+    assert.deepEqual(portal.log, baseline.log);
+    assert.deepEqual(portal.api, baseline.api);
+    assert.deepEqual(portal.stats, baseline.stats);
+    assert.deepEqual(portal.policy, baseline.policy);
+    for (const inbound of baseline.inbounds) {
+        assert.deepEqual(portal.inbounds.find(candidate => candidate.tag === inbound.tag), inbound);
+    }
+});
+
+test('rejects a cascade listener that collides with a preserved server inbound', () => {
+    const input = reverseChainInput();
+    input.nodeMetadata.find(node => node.role === 'portal').port = 12001;
+
+    assert.throws(
+        () => composeFrozenTopologyDeploymentPlan(input),
+        {
+            name: 'FrozenTopologyDeploymentPlanError',
+            code: 'XRAY_CONFIG_GENERATION_FAILED',
+            message: 'Failed to generate a frozen Xray topology candidate',
+        },
+    );
 });
 
 test('rejects a topology node with a missing role', () => {
@@ -264,7 +458,7 @@ test('does not project hostile fields, object ids, or secrets into a candidate p
     const plan = composeFrozenTopologyDeploymentPlan(input);
     const serialized = JSON.stringify(plan);
     const forbiddenKeys = new Set([
-        '_id', 'id', 'nodeId', 'linkId', 'objectId',
+        '_id', 'nodeId', 'linkId', 'objectId',
         'command', 'argv', 'shell', 'stdin', 'password', 'privateKey', 'agentToken', 'tunnelUuid',
     ]);
     const visit = value => {
@@ -280,10 +474,10 @@ test('does not project hostile fields, object ids, or secrets into a candidate p
     assert.deepEqual(input, untouched);
 });
 
-test('loads and composes without database, SSH, filesystem, or CascadeService dependencies', () => {
+test('loads and composes without database, SSH, or CascadeService dependencies', () => {
     const modulePath = require.resolve('../services/frozenTopologyDeploymentPlanComposer');
     const originalLoad = Module._load;
-    const blocked = /(?:mongoose|node:fs|node:net|node:ssh|cascadeService|nodeSSH|repositories|models)/i;
+    const blocked = /(?:mongoose|node:net|node:ssh|cascadeService|nodeSSH|repositories|models)/i;
     delete require.cache[modulePath];
     Module._load = function guardedLoad(request, parent, isMain) {
         assert.doesNotMatch(request, blocked);

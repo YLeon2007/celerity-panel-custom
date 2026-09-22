@@ -15,8 +15,83 @@ const NODE_METADATA_FILTER = Object.freeze({
     cascadeRole: Object.freeze({ $in: SUPPORTED_ROLES }),
 });
 const LINK_METADATA_FILTER = Object.freeze({ active: true });
-const NODE_METADATA_SELECT = '_id cascadeRole';
-const LINK_METADATA_SELECT = '_id portalNode bridgeNode mode tunnelPort';
+const NODE_METADATA_SELECT = Object.freeze([
+    '_id',
+    'type',
+    'active',
+    'cascadeRole',
+    'ip',
+    'domain',
+    'sni',
+    'port',
+    'xray.accessLogs.enabled',
+    'xray.apiPort',
+    'xray.inboundTag',
+    'xray.transport',
+    'xray.security',
+    'xray.flow',
+    'xray.alpn',
+    'xray.realityDest',
+    'xray.realitySni',
+    'xray.realityPrivateKey',
+    'xray.realityShortIds',
+    'xray.realitySpiderX',
+    'xray.wsPath',
+    'xray.wsHost',
+    'xray.grpcServiceName',
+    'xray.xhttpPath',
+    'xray.xhttpHost',
+    'xray.xhttpMode',
+    'xray.fallbackDest',
+    'xray.extraInbounds',
+    'xray.tlsSource',
+    'xray.manualCert',
+    '+xray.manualKey',
+].join(' '));
+const LINK_METADATA_SELECT = Object.freeze([
+    '_id',
+    'portalNode',
+    'bridgeNode',
+    'mode',
+    'tunnelPort',
+    'tunnelDomain',
+    'tunnelProtocol',
+    'tunnelSecurity',
+    'tunnelTransport',
+    'tcpFastOpen',
+    'tcpKeepAlive',
+    'tcpNoDelay',
+    'wsPath',
+    'wsHost',
+    'grpcServiceName',
+    'xhttpPath',
+    'xhttpHost',
+    'xhttpMode',
+    'tlsServerName',
+    'muxEnabled',
+    'muxConcurrency',
+    'geoRouting',
+].join(' '));
+const LINK_CONFIG_FIELDS = Object.freeze([
+    'tunnelPort',
+    'tunnelDomain',
+    'tunnelProtocol',
+    'tunnelSecurity',
+    'tunnelTransport',
+    'tcpFastOpen',
+    'tcpKeepAlive',
+    'tcpNoDelay',
+    'wsPath',
+    'wsHost',
+    'grpcServiceName',
+    'xhttpPath',
+    'xhttpHost',
+    'xhttpMode',
+    'tlsServerName',
+    'muxEnabled',
+    'muxConcurrency',
+    'geoRouting',
+]);
 
 class TopologyOperationPlanMaterializerError extends Error {
     constructor(code, message) {
@@ -100,7 +175,17 @@ function projectNodeMetadata(rows) {
         if (!SUPPORTED_ROLES.includes(role)) {
             fail('UNSAFE_NODE_METADATA_ROLE', 'Hydrated topology node metadata requires a supported role');
         }
-        return { id, role };
+        return {
+            id,
+            role,
+            type: row?.type,
+            active: row?.active,
+            ip: row?.ip,
+            domain: row?.domain,
+            sni: row?.sni,
+            port: row?.port,
+            xray: row?.xray === undefined ? undefined : structuredClone(row.xray),
+        };
     }).sort((left, right) => left.id.localeCompare(right.id, 'en'));
 }
 
@@ -116,13 +201,16 @@ function projectLinkMetadata(rows) {
         if (!SUPPORTED_MODES.includes(mode)) {
             fail('UNSAFE_LINK_METADATA_MODE', 'Hydrated topology link metadata requires a supported mode');
         }
-        return {
+        const projected = {
             id,
             source: assertSafeId(String(source), 'UNSAFE_LINK_METADATA_ENDPOINT'),
             target: assertSafeId(String(target), 'UNSAFE_LINK_METADATA_ENDPOINT'),
             mode,
-            tunnelPort: row.tunnelPort,
         };
+        for (const field of LINK_CONFIG_FIELDS) {
+            if (row[field] !== undefined) projected[field] = structuredClone(row[field]);
+        }
+        return projected;
     }).sort((left, right) => left.id.localeCompare(right.id, 'en'));
 }
 

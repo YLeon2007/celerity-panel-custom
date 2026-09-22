@@ -1,6 +1,73 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
+const configGenerator = require('../../../services/configGenerator');
+const { composeXrayConfig } = require('./xrayConfigComposer');
+
+const XRAY_CONFIG_FIELDS = Object.freeze([
+    'apiPort',
+    'inboundTag',
+    'transport',
+    'security',
+    'flow',
+    'alpn',
+    'realityDest',
+    'realitySni',
+    'realityPrivateKey',
+    'realityShortIds',
+    'realitySpiderX',
+    'wsPath',
+    'wsHost',
+    'grpcServiceName',
+    'xhttpPath',
+    'xhttpHost',
+    'xhttpMode',
+    'fallbackDest',
+    'tlsSource',
+    'manualCert',
+    'manualKey',
+]);
+const EXTRA_INBOUND_FIELDS = Object.freeze([
+    'id',
+    'label',
+    'uniqueName',
+    'port',
+    'inboundTag',
+    'transport',
+    'security',
+    'flow',
+    'alpn',
+    'realityDest',
+    'realitySni',
+    'realityPrivateKey',
+    'realityShortIds',
+    'realitySpiderX',
+    'wsPath',
+    'wsHost',
+    'grpcServiceName',
+    'xhttpPath',
+    'xhttpHost',
+    'xhttpMode',
+    'fallbackDest',
+]);
+const LINK_CONFIG_FIELDS = Object.freeze([
+    'tunnelDomain',
+    'tunnelProtocol',
+    'tunnelSecurity',
+    'tunnelTransport',
+    'tcpFastOpen',
+    'tcpKeepAlive',
+    'tcpNoDelay',
+    'wsPath',
+    'wsHost',
+    'grpcServiceName',
+    'xhttpPath',
+    'xhttpHost',
+    'xhttpMode',
+    'tlsServerName',
+    'muxEnabled',
+    'muxConcurrency',
+]);
 
 const TARGETS_BY_ROLE = Object.freeze({
     portal: Object.freeze({
@@ -197,17 +264,192 @@ function assertPort(value) {
     return value;
 }
 
-function candidateForNode({ mode, nodeId, node, nodeRef, refs, orderedLinks, linkMetadataById }) {
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function cloneAllowed(source, fields) {
+    const projected = {};
+    if (!isPlainObject(source)) return projected;
+    for (const field of fields) {
+        if (source[field] !== undefined) projected[field] = structuredClone(source[field]);
+    }
+    return projected;
+}
+
+function projectXrayConfig(metadata) {
+    const source = isPlainObject(metadata?.xray) ? metadata.xray : {};
+    const xray = cloneAllowed(source, XRAY_CONFIG_FIELDS);
+    xray.accessLogs = { enabled: source.accessLogs?.enabled === true };
+    xray.extraInbounds = Array.isArray(source.extraInbounds)
+        ? source.extraInbounds.map(inbound => cloneAllowed(inbound, EXTRA_INBOUND_FIELDS))
+        : [];
+    return xray;
+}
+
+function projectNodeConfig(metadata, node, nodeRef) {
+    if (metadata?.type !== 'xray' || metadata?.active !== true) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'INVALID_NODE_CONFIG',
+            'Every topology node requires active Xray server configuration',
+        );
+    }
+    if (typeof metadata.ip !== 'string' || metadata.ip.length === 0 || /\s/.test(metadata.ip)) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'INVALID_NODE_CONFIG',
+            'Every topology node requires a valid Xray server address',
+        );
+    }
+    return {
+        _id: nodeRef,
+        type: 'xray',
+        active: true,
+        cascadeRole: node.role,
+        ip: metadata.ip,
+        ...(typeof metadata.domain === 'string' ? { domain: metadata.domain } : {}),
+        ...(typeof metadata.sni === 'string' ? { sni: metadata.sni } : {}),
+        ...(metadata.port === undefined ? {} : { port: assertPort(metadata.port) }),
+        xray: projectXrayConfig(metadata),
+    };
+}
+
+function deterministicTunnelUuid(linkIdentity) {
+    // Stored tunnel credentials are deliberately not materialized. Both ends
+    // instead receive the same candidate-local UUID derived from the frozen
+    // link identity, so the complete config remains restart-deterministic.
+    const hex = createHash('sha256')
+        .update(`celerity-topology-v1:${linkIdentity}`)
+        .digest('hex')
+        .slice(0, 32)
+        .split('');
+    hex[12] = '5';
+    hex[16] = ['8', '9', 'a', 'b'][Number.parseInt(hex[16], 16) % 4];
+    return [
+        hex.slice(0, 8).join(''),
+        hex.slice(8, 12).join(''),
+        hex.slice(12, 16).join(''),
+        hex.slice(16, 20).join(''),
+        hex.slice(20).join(''),
+    ].join('-');
+}
+
+function projectGeoRouting(metadata) {
+    const source = metadata?.geoRouting;
+    if (!isPlainObject(source)) return undefined;
+    return {
+        enabled: source.enabled === true,
+        domains: Array.isArray(source.domains)
+            ? source.domains.filter(value => typeof value === 'string')
+            : [],
+        geoip: Array.isArray(source.geoip)
+            ? source.geoip.filter(value => typeof value === 'string')
+            : [],
+    };
+}
+
+function projectCascadeLink(entry, index, metadata, nodeConfigsById) {
+    const linkRef = `link-${index + 1}`;
+    const projected = {
+        _id: linkRef,
+        portalNode: nodeConfigsById.get(entry.source),
+        bridgeNode: nodeConfigsById.get(entry.target),
+        tunnelUuid: deterministicTunnelUuid(entry.id),
+        tunnelPort: assertPort(metadata.tunnelPort),
+        ...cloneAllowed(metadata, LINK_CONFIG_FIELDS),
+    };
+    const geoRouting = projectGeoRouting(metadata);
+    if (geoRouting) projected.geoRouting = geoRouting;
+    return projected;
+}
+
+function parseGeneratedConfig(generated) {
+    const config = typeof generated === 'string' ? JSON.parse(generated) : structuredClone(generated);
+    if (!isPlainObject(config)
+        || !Array.isArray(config.inbounds)
+        || !Array.isArray(config.outbounds)
+        || !isPlainObject(config.routing)
+        || !Array.isArray(config.routing.rules)) {
+        throw new TypeError('Invalid generated Xray configuration');
+    }
+    return config;
+}
+
+function clientInboundTags(nodeConfig) {
+    return [
+        nodeConfig.xray.inboundTag || 'vless-in',
+        ...nodeConfig.xray.extraInbounds.map(inbound => inbound.inboundTag).filter(Boolean),
+    ];
+}
+
+function composeBaselineWithCascade(baseline, cascade) {
+    const config = composeXrayConfig(baseline, [{
+        id: 'topology-cascade',
+        inbounds: cascade.inbounds || [],
+        outbounds: cascade.outbounds || [],
+        routingRules: cascade.routing.rules,
+    }]);
+    if (cascade.reverse !== undefined) config.reverse = structuredClone(cascade.reverse);
+    if (cascade.routing.balancers !== undefined) {
+        config.routing.balancers = structuredClone(cascade.routing.balancers);
+    }
+    return config;
+}
+
+function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById }) {
+    const nodeConfigsById = new Map(chain.orderedNodes.map(({ id, node }) => [
+        id,
+        projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
+    ]));
+    const links = chain.orderedLinks.map((entry, index) => projectCascadeLink(
+        entry,
+        index,
+        linkMetadataById.get(entry.id),
+        nodeConfigsById,
+    ));
+    const configs = new Map();
+
+    for (let index = 0; index < chain.orderedNodes.length; index += 1) {
+        const { id, node } = chain.orderedNodes[index];
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+
+        if (chain.mode === 'forward') {
+            if (node.role === 'portal') {
+                configGenerator.applyForwardChain(config, links, clientInboundTags(nodeConfig));
+            } else {
+                configGenerator.applyForwardHopInbound(config, [links[index - 1]]);
+            }
+        } else if (node.role === 'portal') {
+            configGenerator.applyReversePortal(config, [links[index]], clientInboundTags(nodeConfig));
+        } else if (node.role === 'relay') {
+            const cascade = parseGeneratedConfig(configGenerator.generateRelayConfig(
+                links[index - 1],
+                links[index - 1].portalNode,
+                [links[index]],
+            ));
+            config = composeBaselineWithCascade(config, cascade);
+        } else {
+            const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig([links[index - 1]]));
+            cascade.inbounds = cascade.inbounds || [];
+            config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
+        }
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+    return configs;
+}
+
+function canonicalize(value) {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!isPlainObject(value)) return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalize(value[key])]),
+    );
+}
+
+function candidateForNode({ mode, nodeId, node, nodeRef, orderedLinks, linkMetadataById, config }) {
     const target = TARGETS_BY_ROLE[node.role];
-    const incidentLinks = orderedLinks
-        .map((entry, index) => ({ ...entry, index }))
-        .filter(entry => entry.source === nodeId || entry.target === nodeId)
-        .map(entry => ({
-            linkRef: `link-${entry.index + 1}`,
-            direction: entry.source === nodeId ? 'outbound' : 'inbound',
-            peerRef: refs.get(entry.source === nodeId ? entry.target : entry.source),
-            port: assertPort(linkMetadataById.get(entry.id).tunnelPort),
-        }));
     const listeningPorts = orderedLinks
         .filter(entry => (mode === 'reverse' ? entry.source : entry.target) === nodeId)
         .map(entry => assertPort(linkMetadataById.get(entry.id).tunnelPort))
@@ -221,17 +463,7 @@ function candidateForNode({ mode, nodeId, node, nodeRef, refs, orderedLinks, lin
             expectedState: 'listening',
         })),
     ];
-    const candidateDocument = {
-        schemaVersion: 1,
-        kind: 'xray-topology-node-candidate',
-        mode,
-        nodeRef,
-        role: node.role,
-        targetProfile: target.targetProfile,
-        links: incidentLinks,
-        checks,
-    };
-    const bytes = Buffer.from(`${JSON.stringify(candidateDocument)}\n`, 'utf8');
+    const bytes = Buffer.from(`${JSON.stringify(canonicalize(config))}\n`, 'utf8');
 
     return {
         nodeRef,
@@ -315,6 +547,21 @@ function composeFrozenTopologyDeploymentPlan({
     }
 
     const refs = topologyRefs(chain.orderedNodes);
+    let candidateConfigsById;
+    try {
+        candidateConfigsById = buildCandidateConfigs({
+            chain,
+            refs,
+            nodeMetadataById,
+            linkMetadataById,
+        });
+    } catch (error) {
+        if (error instanceof FrozenTopologyDeploymentPlanError) throw error;
+        throw new FrozenTopologyDeploymentPlanError(
+            'XRAY_CONFIG_GENERATION_FAILED',
+            'Failed to generate a frozen Xray topology candidate',
+        );
+    }
     const deploymentOrder = chain.mode === 'forward'
         ? [...chain.orderedNodes].reverse()
         : chain.orderedNodes;
@@ -323,9 +570,9 @@ function composeFrozenTopologyDeploymentPlan({
         nodeId: id,
         node,
         nodeRef: refs.get(id),
-        refs,
         orderedLinks: chain.orderedLinks,
         linkMetadataById,
+        config: candidateConfigsById.get(id),
     }));
 
     return deepFreeze({

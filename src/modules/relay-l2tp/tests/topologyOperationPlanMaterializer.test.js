@@ -98,17 +98,62 @@ function metadataRows() {
         nodes: [
             {
                 _id: 'bridge-1',
+                type: 'xray',
+                active: true,
                 cascadeRole: 'bridge',
+                ip: '192.0.2.30',
+                domain: 'bridge.example.test',
+                port: 24443,
+                xray: {
+                    apiPort: 61003,
+                    inboundTag: 'client-bridge',
+                    transport: 'tcp',
+                    security: 'none',
+                },
                 ssh: { privateKey: SECRET_CANARIES[1], password: SECRET_CANARIES[0] },
             },
             {
                 _id: 'portal-1',
+                type: 'xray',
+                active: true,
                 cascadeRole: 'portal',
+                ip: '192.0.2.10',
+                domain: 'portal.example.test',
+                port: 20443,
+                xray: {
+                    accessLogs: { enabled: true },
+                    apiPort: 61001,
+                    inboundTag: 'client-portal',
+                    transport: 'tcp',
+                    security: 'none',
+                    extraInbounds: [{
+                        id: 'portal-extra',
+                        label: 'Portal extra',
+                        port: 21443,
+                        inboundTag: 'client-portal-extra',
+                        transport: 'ws',
+                        security: 'none',
+                        wsPath: '/extra',
+                        rawCommand: SECRET_CANARIES[5],
+                    }],
+                    agentToken: SECRET_CANARIES[2],
+                },
                 customConfig: SECRET_CANARIES[2],
             },
             {
                 _id: 'relay-1',
+                type: 'xray',
+                active: true,
                 cascadeRole: 'relay',
+                ip: '192.0.2.20',
+                domain: 'relay.example.test',
+                port: 22443,
+                xray: {
+                    apiPort: 61002,
+                    inboundTag: 'client-relay',
+                    transport: 'tcp',
+                    security: 'none',
+                },
                 initScript: SECRET_CANARIES[5],
             },
         ],
@@ -119,6 +164,10 @@ function metadataRows() {
                 bridgeNode: 'relay-1',
                 mode: 'reverse',
                 tunnelPort: 12001,
+                tunnelDomain: 'reverse.example.test',
+                tunnelProtocol: 'vless',
+                tunnelSecurity: 'none',
+                tunnelTransport: 'tcp',
                 tunnelUuid: SECRET_CANARIES[3],
             },
             {
@@ -127,6 +176,10 @@ function metadataRows() {
                 bridgeNode: 'bridge-1',
                 mode: 'reverse',
                 tunnelPort: 12002,
+                tunnelDomain: 'reverse.example.test',
+                tunnelProtocol: 'vless',
+                tunnelSecurity: 'none',
+                tunnelTransport: 'tcp',
                 realityPrivateKey: SECRET_CANARIES[4],
             },
         ],
@@ -166,7 +219,21 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     for (const node of plan.nodes) {
         const bytes = Buffer.from(node.candidate.bytes);
         assert.equal(node.candidate.sha256, createHash('sha256').update(bytes).digest('hex'));
+        const config = JSON.parse(bytes.toString('utf8'));
+        assert.ok(Array.isArray(config.inbounds));
+        assert.ok(Array.isArray(config.outbounds));
+        assert.ok(config.routing && Array.isArray(config.routing.rules));
+        assert(config.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
     }
+    const portal = JSON.parse(Buffer.from(plan.nodes[0].candidate.bytes).toString('utf8'));
+    assert(portal.inbounds.some(inbound => (
+        inbound.tag === 'client-portal' && inbound.port === 20443
+    )));
+    assert(portal.inbounds.some(inbound => (
+        inbound.tag === 'client-portal-extra' && inbound.port === 21443
+    )));
+    assert(portal.inbounds.some(inbound => inbound.tag === 'bridge-conn-link-1'));
+    assert.equal(portal.reverse.portals[0].domain, 'link-1.reverse.example.test');
 
     const serialized = JSON.stringify(plan);
     for (const secret of SECRET_CANARIES) assert.equal(serialized.includes(secret), false);
@@ -199,6 +266,8 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     ]);
     assert.deepEqual(HyNode.writes, []);
     assert.deepEqual(CascadeLink.writes, []);
+    assert.doesNotMatch(NODE_METADATA_SELECT, /ssh|customConfig|initScript|agentToken/i);
+    assert.doesNotMatch(LINK_METADATA_SELECT, /tunnelUuid|privateKey|rawCommand/i);
 
     await Promise.resolve();
     assert.equal(HyNode.calls.filter(call => call.method === 'find').length, 1);
