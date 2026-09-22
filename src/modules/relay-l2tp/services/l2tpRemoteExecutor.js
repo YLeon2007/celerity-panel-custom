@@ -11,7 +11,8 @@ const STEP_COMMANDS = Object.freeze({
     activate_xray: 'activate_xray',
     apply_firewall_policy: 'apply_firewall_policy',
     start_l2tp: 'start_l2tp',
-    sync_users: 'sync_users',
+    sync_users: 'sync-users',
+    verify_users: 'verify-users',
     verify: 'verify',
     commit: 'commit',
 });
@@ -19,7 +20,38 @@ const STEP_ARTIFACT_PATHS = Object.freeze({
     preflight: Object.freeze({ desired: 'desired.json' }),
     stage_managed_files: Object.freeze({ artifact: 'artifacts.json' }),
     compose_xray_fragment: Object.freeze({ xrayCandidate: 'xray-candidate.json' }),
+    sync_users: Object.freeze({ desired: 'desired.json' }),
 });
+const DESIRED_USER_KEYS = Object.freeze(['enabled', 'ipAddress', 'login', 'password']);
+const DESIRED_USERS_KEYS = Object.freeze(['credentialRevision', 'users']);
+const USER_VERIFICATION_RESULT_KEYS = Object.freeze([
+    'code',
+    'credentialRevision',
+    'enabledUserCount',
+    'managedUserCount',
+    'ok',
+]);
+const USER_VERIFICATION_FAILURE_CODES = new Set([
+    'MANAGED_USERS_MISSING',
+    'MANAGED_USERS_EXTRA',
+    'MANAGED_USERS_DUPLICATE',
+    'MANAGED_USERS_ALTERED',
+    'DISABLED_USERS_PRESENT',
+    'MANAGED_BLOCK_INVALID',
+    'CHAP_SECRETS_INVALID',
+]);
+const LOGIN_PATTERN = /^[A-Za-z0-9._@-]{1,64}$/;
+const RAW_COMMAND_FIELDS = Object.freeze([
+    'args',
+    'arguments',
+    'argv',
+    'command',
+    'cwd',
+    'env',
+    'options',
+    'shell',
+    'stdin',
+]);
 
 class L2tpRemoteExecutorError extends Error {
     constructor(code, message) {
@@ -48,9 +80,10 @@ function artifactError(code, message) {
     return new L2tpRemoteExecutorError(code, message);
 }
 
-function validatedArtifacts(step) {
+function validatedArtifacts(operation, step) {
     const expectedArtifacts = STEP_ARTIFACT_PATHS[step.type];
     const artifacts = step.artifacts;
+    const artifactsRequired = step.type !== 'sync_users' || operation?.kind === 'sync_users';
 
     if (!expectedArtifacts) {
         if (artifacts === undefined || (Array.isArray(artifacts) && artifacts.length === 0)) {
@@ -60,6 +93,13 @@ function validatedArtifacts(step) {
             'ARTIFACT_NOT_ALLOWED',
             'Artifact is not allowed for this L2TP operation step',
         );
+    }
+
+    if (
+        !artifactsRequired
+        && (artifacts === undefined || (Array.isArray(artifacts) && artifacts.length === 0))
+    ) {
+        return [];
     }
 
     const expectedEntries = Object.entries(expectedArtifacts);
@@ -99,6 +139,131 @@ function validatedArtifacts(step) {
     });
 }
 
+function hasExactKeys(value, expectedKeys) {
+    return value
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expectedKeys);
+}
+
+function isCanonicalIpv4(value) {
+    if (typeof value !== 'string') return false;
+    const octets = value.split('.');
+    return octets.length === 4
+        && octets.every(octet => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
+}
+
+function desiredUsersError(code, message) {
+    return new L2tpRemoteExecutorError(code, message);
+}
+
+function parseDesiredUsersExpectation(content, operation) {
+    const expectedCredentialRevision = operation?.plan?.desired?.credentialRevision;
+    if (
+        !Number.isSafeInteger(expectedCredentialRevision)
+        || expectedCredentialRevision < 1
+    ) {
+        throw desiredUsersError(
+            'CREDENTIAL_REVISION_INVALID',
+            'Invalid L2TP user credential revision',
+        );
+    }
+
+    let desired;
+    try {
+        desired = JSON.parse(content);
+    } catch {
+        throw desiredUsersError(
+            'DESIRED_USERS_INVALID',
+            'Invalid desired L2TP users artifact',
+        );
+    }
+    if (
+        !hasExactKeys(desired, DESIRED_USERS_KEYS)
+        || !Number.isSafeInteger(desired.credentialRevision)
+        || desired.credentialRevision < 1
+        || !Array.isArray(desired.users)
+    ) {
+        throw desiredUsersError(
+            'DESIRED_USERS_INVALID',
+            'Invalid desired L2TP users artifact',
+        );
+    }
+    if (desired.credentialRevision !== expectedCredentialRevision) {
+        throw desiredUsersError(
+            'CREDENTIAL_REVISION_MISMATCH',
+            'L2TP user credential revision does not match the operation',
+        );
+    }
+
+    const logins = new Set();
+    let expectedEnabledUserCount = 0;
+    for (const user of desired.users) {
+        if (
+            !hasExactKeys(user, DESIRED_USER_KEYS)
+            || typeof user.login !== 'string'
+            || !LOGIN_PATTERN.test(user.login)
+            || logins.has(user.login)
+            || typeof user.password !== 'string'
+            || user.password.length === 0
+            || /[\r\n\0]/.test(user.password)
+            || !isCanonicalIpv4(user.ipAddress)
+            || typeof user.enabled !== 'boolean'
+        ) {
+            throw desiredUsersError(
+                'DESIRED_USERS_INVALID',
+                'Invalid desired L2TP users artifact',
+            );
+        }
+        logins.add(user.login);
+        if (user.enabled) expectedEnabledUserCount += 1;
+    }
+
+    return { expectedCredentialRevision, expectedEnabledUserCount };
+}
+
+function invalidUserVerificationResult() {
+    return new L2tpRemoteExecutorError(
+        'USER_VERIFICATION_INVALID',
+        'Invalid L2TP user verification result',
+    );
+}
+
+function sanitizeUserVerificationResult(value, expectation) {
+    if (
+        !hasExactKeys(value, USER_VERIFICATION_RESULT_KEYS)
+        || typeof value.ok !== 'boolean'
+        || !Number.isSafeInteger(value.credentialRevision)
+        || value.credentialRevision !== expectation.expectedCredentialRevision
+        || !Number.isSafeInteger(value.enabledUserCount)
+        || value.enabledUserCount !== expectation.expectedEnabledUserCount
+        || !Number.isSafeInteger(value.managedUserCount)
+        || value.managedUserCount < 0
+        || Object.is(value.managedUserCount, -0)
+        || typeof value.code !== 'string'
+    ) {
+        throw invalidUserVerificationResult();
+    }
+    if (value.ok) {
+        if (
+            value.code !== 'USERS_VERIFIED'
+            || value.managedUserCount !== expectation.expectedEnabledUserCount
+        ) {
+            throw invalidUserVerificationResult();
+        }
+    } else if (!USER_VERIFICATION_FAILURE_CODES.has(value.code)) {
+        throw invalidUserVerificationResult();
+    }
+
+    return {
+        ok: value.ok,
+        credentialRevision: value.credentialRevision,
+        enabledUserCount: value.enabledUserCount,
+        managedUserCount: value.managedUserCount,
+        code: value.code,
+    };
+}
+
 async function uploadRootFile(transport, request) {
     try {
         await transport.uploadRootFile(request);
@@ -112,7 +277,7 @@ async function uploadRootFile(transport, request) {
 
 async function runArtifactCommand(transport, request) {
     try {
-        await transport.runArtifactCommand(request);
+        return await transport.runArtifactCommand(request);
     } catch {
         throw new L2tpRemoteExecutorError(
             'REMOTE_COMMAND_FAILED',
@@ -137,6 +302,8 @@ function nodeExecutionUnavailableError() {
 
 class L2tpRemoteExecutor {
     #transportPromises = new Map();
+
+    #userVerificationExpectations = new Map();
 
     constructor({ transport, transportResolver } = {}) {
         const hasTransport = transport !== undefined && transport !== null;
@@ -182,8 +349,9 @@ class L2tpRemoteExecutor {
     }
 
     releaseOperation(operation) {
+        const operationId = String(operation._id ?? operation.id);
+        this.#userVerificationExpectations.delete(operationId);
         if (!this.transport) {
-            const operationId = String(operation._id ?? operation.id);
             this.#transportPromises.delete(operationId);
         }
     }
@@ -196,7 +364,7 @@ class L2tpRemoteExecutor {
                 'Unsupported L2TP operation step',
             );
         }
-        if (['command', 'argv', 'shell'].some(field => Object.hasOwn(step, field))) {
+        if (RAW_COMMAND_FIELDS.some(field => Object.hasOwn(step, field))) {
             throw new L2tpRemoteExecutorError(
                 'RAW_COMMAND_NOT_ALLOWED',
                 'Raw commands are not accepted by the L2TP executor',
@@ -204,9 +372,21 @@ class L2tpRemoteExecutor {
         }
 
         const operationId = String(operation._id ?? operation.id);
-        const artifacts = validatedArtifacts(step);
-        const transport = await this.resolveTransport(operation);
+        const artifacts = validatedArtifacts(operation, step);
+        const desiredExpectation = step.type === 'sync_users' && artifacts.length === 1
+            ? parseDesiredUsersExpectation(artifacts[0].content, operation)
+            : null;
+        const verificationExpectation = step.type === 'verify_users'
+            ? this.#userVerificationExpectations.get(operationId)
+            : null;
+        if (step.type === 'verify_users' && !verificationExpectation) {
+            throw new L2tpRemoteExecutorError(
+                'USER_VERIFICATION_EXPECTATION_MISSING',
+                'L2TP user verification expectation is unavailable',
+            );
+        }
 
+        const transport = await this.resolveTransport(operation);
         for (const artifact of artifacts) {
             await uploadRootFile(transport, {
                 operationId,
@@ -219,10 +399,26 @@ class L2tpRemoteExecutor {
             });
         }
 
-        await runArtifactCommand(transport, {
+        const commandResult = await runArtifactCommand(transport, {
             operationId,
             command,
+            ...(step.type === 'verify_users' ? verificationExpectation : {}),
         });
+
+        if (desiredExpectation) {
+            this.#userVerificationExpectations.set(operationId, desiredExpectation);
+        }
+        if (step.type === 'verify_users') {
+            return sanitizeUserVerificationResult(commandResult, verificationExpectation);
+        }
+        if (step.type === 'sync_users' && operation.kind === 'sync_users') {
+            const verifierResult = await runArtifactCommand(transport, {
+                operationId,
+                command: 'verify-users',
+                ...desiredExpectation,
+            });
+            return sanitizeUserVerificationResult(verifierResult, desiredExpectation);
+        }
 
         return {
             ok: true,

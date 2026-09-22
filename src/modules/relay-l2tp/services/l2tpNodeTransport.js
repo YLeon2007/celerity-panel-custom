@@ -16,7 +16,8 @@ const ARTIFACT_COMMANDS = Object.freeze([
     'activate_xray',
     'apply_firewall_policy',
     'start_l2tp',
-    'sync_users',
+    'sync-users',
+    'verify-users',
     'verify',
     'commit',
     'rollback',
@@ -38,6 +39,32 @@ const ROOT_ARTIFACTS = Object.freeze({
         remotePath: 'candidate/xray.json',
     }),
 });
+const ROOT_FILE_REQUEST_KEYS = Object.freeze([
+    'content',
+    'group',
+    'mode',
+    'operationId',
+    'owner',
+    'path',
+    'type',
+]);
+const VERIFY_USER_RESULT_KEYS = Object.freeze([
+    'code',
+    'credentialRevision',
+    'enabledUserCount',
+    'managedUserCount',
+    'ok',
+]);
+const VERIFY_USER_FAILURE_STATUSES = Object.freeze({
+    MANAGED_USERS_MISSING: new Set([65]),
+    MANAGED_USERS_EXTRA: new Set([65]),
+    MANAGED_USERS_DUPLICATE: new Set([65]),
+    MANAGED_USERS_ALTERED: new Set([65]),
+    DISABLED_USERS_PRESENT: new Set([65]),
+    MANAGED_BLOCK_INVALID: new Set([65]),
+    CHAP_SECRETS_INVALID: new Set([65, 66, 77]),
+});
+const VERIFY_USER_FAILURE_CODES = new Set(Object.keys(VERIFY_USER_FAILURE_STATUSES));
 
 class L2tpNodeTransportError extends Error {
     constructor(code, message) {
@@ -103,6 +130,20 @@ function assertArtifactContent(content) {
     }
 }
 
+function assertRootFileRequest(request) {
+    if (
+        !request
+        || typeof request !== 'object'
+        || Array.isArray(request)
+        || Object.keys(request).some(key => !ROOT_FILE_REQUEST_KEYS.includes(key))
+    ) {
+        throw new L2tpNodeTransportError(
+            'INVALID_ARTIFACT_REQUEST',
+            'Invalid L2TP artifact upload request',
+        );
+    }
+}
+
 function assertArtifactCommand(command) {
     if (!ARTIFACT_COMMAND_SET.has(command)) {
         throw new L2tpNodeTransportError(
@@ -110,6 +151,94 @@ function assertArtifactCommand(command) {
             'Unsupported L2TP artifact command',
         );
     }
+}
+
+function assertCommandExpectation(request) {
+    const isVerification = request.command === 'verify-users';
+    const expectedKeys = isVerification
+        ? [
+            'command',
+            'expectedCredentialRevision',
+            'expectedEnabledUserCount',
+            'operationId',
+        ]
+        : ['command', 'operationId'];
+    const actualKeys = Object.keys(request).sort();
+    if (
+        JSON.stringify(actualKeys) !== JSON.stringify(expectedKeys)
+        || (isVerification && (
+            !Number.isSafeInteger(request.expectedCredentialRevision)
+            || request.expectedCredentialRevision < 1
+            || !Number.isSafeInteger(request.expectedEnabledUserCount)
+            || request.expectedEnabledUserCount < 0
+        ))
+    ) {
+        throw new L2tpNodeTransportError(
+            'INVALID_COMMAND_EXPECTATION',
+            'Invalid L2TP artifact command expectation',
+        );
+    }
+}
+
+function parseVerifyUsersExecResult(result, expectedCredentialRevision, expectedEnabledUserCount) {
+    if (
+        !result
+        || typeof result !== 'object'
+        || typeof result.stdout !== 'string'
+        || (result.stderr !== undefined && result.stderr !== '')
+        || !result.stdout.endsWith('\n')
+    ) {
+        throw new Error('Invalid user verification response');
+    }
+    const serialized = result.stdout.slice(0, -1);
+    if (!serialized || /[\r\n]/.test(serialized)) {
+        throw new Error('Invalid user verification response');
+    }
+
+    let value;
+    try {
+        value = JSON.parse(serialized);
+    } catch {
+        throw new Error('Invalid user verification response');
+    }
+    if (
+        !value
+        || typeof value !== 'object'
+        || Array.isArray(value)
+        || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(VERIFY_USER_RESULT_KEYS)
+        || typeof value.ok !== 'boolean'
+        || value.credentialRevision !== expectedCredentialRevision
+        || value.enabledUserCount !== expectedEnabledUserCount
+        || !Number.isSafeInteger(value.managedUserCount)
+        || value.managedUserCount < 0
+        || typeof value.code !== 'string'
+    ) {
+        throw new Error('Invalid user verification response');
+    }
+    const status = Object.hasOwn(result, 'code') ? result.code : undefined;
+    if (value.ok) {
+        if (
+            status !== 0
+            || value.code !== 'USERS_VERIFIED'
+            || value.managedUserCount !== expectedEnabledUserCount
+        ) {
+            throw new Error('Invalid user verification response');
+        }
+    } else if (
+        !Number.isInteger(status)
+        || status === 0
+        || !VERIFY_USER_FAILURE_CODES.has(value.code)
+        || !VERIFY_USER_FAILURE_STATUSES[value.code].has(status)
+    ) {
+        throw new Error('Invalid user verification response');
+    }
+    return {
+        ok: value.ok,
+        credentialRevision: value.credentialRevision,
+        enabledUserCount: value.enabledUserCount,
+        managedUserCount: value.managedUserCount,
+        code: value.code,
+    };
 }
 
 function assertSuccessfulExec(result) {
@@ -123,7 +252,17 @@ class L2tpNodeTransport {
         this.nodeSSH = nodeSSH;
     }
 
-    async uploadRootFile({ operationId, type, path, content, owner, group, mode }) {
+    async uploadRootFile(request) {
+        assertRootFileRequest(request);
+        const {
+            operationId,
+            type,
+            path,
+            content,
+            owner,
+            group,
+            mode,
+        } = request;
         assertOperationId(operationId);
         const artifact = assertRootArtifact(type, path);
         assertRootFileMetadata({ owner, group, mode });
@@ -146,16 +285,29 @@ class L2tpNodeTransport {
         return { ok: true, path: remotePath };
     }
 
-    async runArtifactCommand({ operationId, command }) {
+    async runArtifactCommand(request) {
+        if (!request || typeof request !== 'object' || Array.isArray(request)) {
+            throw new L2tpNodeTransportError(
+                'INVALID_COMMAND_EXPECTATION',
+                'Invalid L2TP artifact command expectation',
+            );
+        }
+        const {
+            operationId,
+            command,
+            expectedCredentialRevision,
+            expectedEnabledUserCount,
+        } = request;
         assertOperationId(operationId);
         assertArtifactCommand(command);
+        assertCommandExpectation(request);
 
         let result;
         try {
             result = await this.nodeSSH.exec(
                 `${ARTIFACT_RUNNER_PATH} --operation-id ${operationId} --command ${command}`,
             );
-            if (command !== 'preflight') assertSuccessfulExec(result);
+            if (command !== 'preflight' && command !== 'verify-users') assertSuccessfulExec(result);
         } catch {
             throw new L2tpNodeTransportError(
                 'REMOTE_COMMAND_FAILED',
@@ -164,6 +316,20 @@ class L2tpNodeTransport {
         }
 
         if (command === 'preflight') return parsePreflightExecResult(result);
+        if (command === 'verify-users') {
+            try {
+                return parseVerifyUsersExecResult(
+                    result,
+                    expectedCredentialRevision,
+                    expectedEnabledUserCount,
+                );
+            } catch {
+                throw new L2tpNodeTransportError(
+                    'REMOTE_COMMAND_FAILED',
+                    'Failed to run an L2TP artifact command',
+                );
+            }
+        }
         return { ok: true, operationId, command };
     }
 }

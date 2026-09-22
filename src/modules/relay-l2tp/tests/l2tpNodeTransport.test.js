@@ -5,7 +5,7 @@ const test = require('node:test');
 
 const { L2tpNodeTransport } = require('../services/l2tpNodeTransport');
 
-function createNodeSSHFacade() {
+function createNodeSSHFacade(response = { code: 0, stdout: '', stderr: '' }) {
     const calls = [];
 
     return {
@@ -14,7 +14,7 @@ function createNodeSSHFacade() {
             calls.push(options === undefined
                 ? { method: 'exec', command }
                 : { method: 'exec', command, options });
-            return { code: 0, stdout: '', stderr: '' };
+            return response;
         },
         async writeFile(path, content) {
             calls.push({ method: 'writeFile', path, content });
@@ -139,8 +139,52 @@ test('uploadRootFile accepts only exact typed artifact names', async () => {
     }
 });
 
+test('uploadRootFile rejects generic or extra request fields before invoking the facade', async () => {
+    for (const extra of [
+        { command: 'id' },
+        { argv: ['--raw'] },
+        { shell: 'id' },
+        { destination: '/tmp/desired.json' },
+    ]) {
+        const nodeSSH = createNodeSSHFacade();
+        const transport = new L2tpNodeTransport({ nodeSSH });
+
+        await assert.rejects(
+            transport.uploadRootFile({
+                operationId: 'operation-exact-upload',
+                type: 'desired',
+                path: 'desired.json',
+                content: '{}',
+                owner: 'root',
+                group: 'root',
+                mode: 0o600,
+                ...extra,
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpNodeTransportError');
+                assert.equal(error.code, 'INVALID_ARTIFACT_REQUEST');
+                assert.equal(error.message, 'Invalid L2TP artifact upload request');
+                assert.doesNotMatch(JSON.stringify(error), /\bid\b|--raw|\/tmp/);
+                return true;
+            },
+        );
+        assert.deepEqual(nodeSSH.calls, []);
+    }
+});
+
 test('runArtifactCommand maps every typed command to the fixed artifact runner', async () => {
-    const nodeSSH = createNodeSSHFacade();
+    const verifierResult = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 2,
+        managedUserCount: 2,
+        code: 'USERS_VERIFIED',
+    };
+    const nodeSSH = createNodeSSHFacade({
+        code: 0,
+        stdout: `${JSON.stringify(verifierResult)}\n`,
+        stderr: '',
+    });
     const transport = new L2tpNodeTransport({ nodeSSH });
     const commands = [
         'preflight',
@@ -153,22 +197,30 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
         'activate_xray',
         'apply_firewall_policy',
         'start_l2tp',
-        'sync_users',
+        'sync-users',
+        'verify-users',
         'verify',
         'commit',
         'rollback',
     ];
 
     for (const command of commands) {
+        const request = { operationId: 'operation-18', command };
+        if (command === 'verify-users') {
+            request.expectedCredentialRevision = 42;
+            request.expectedEnabledUserCount = 2;
+        }
         assert.deepEqual(
-            await transport.runArtifactCommand({ operationId: 'operation-18', command }),
+            await transport.runArtifactCommand(request),
             command === 'preflight'
                 ? {
                     ok: false,
                     checks: [],
                     error: { code: 'PREFLIGHT_RESPONSE_INVALID' },
                 }
-                : { ok: true, operationId: 'operation-18', command },
+                : command === 'verify-users'
+                    ? verifierResult
+                    : { ok: true, operationId: 'operation-18', command },
         );
     }
 
@@ -179,6 +231,171 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
             command: `/usr/local/bin/celerity-l2tp-artifact-runner --operation-id operation-18 --command ${command}`,
         })),
     );
+});
+
+test('verify-users returns only a strict result bound to the requested revision and count', async () => {
+    const secret = 'verify-transport-secret-canary';
+    const strictResult = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 2,
+        managedUserCount: 2,
+        code: 'USERS_VERIFIED',
+    };
+    const nodeSSH = {
+        calls: [],
+        async exec(command) {
+            this.calls.push(command);
+            return {
+                code: 0,
+                stdout: `${JSON.stringify(strictResult)}\n`,
+                stderr: '',
+                diagnostics: secret,
+            };
+        },
+    };
+    const transport = new L2tpNodeTransport({ nodeSSH });
+
+    const result = await transport.runArtifactCommand({
+        operationId: 'operation-user-verify',
+        command: 'verify-users',
+        expectedCredentialRevision: 42,
+        expectedEnabledUserCount: 2,
+    });
+
+    assert.deepEqual(nodeSSH.calls, [
+        '/usr/local/bin/celerity-l2tp-artifact-runner --operation-id operation-user-verify --command verify-users',
+    ]);
+    assert.deepEqual(result, strictResult);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
+
+test('verify-users preserves strict mismatch results without exposing remote diagnostics', async () => {
+    const secret = 'verify-mismatch-secret-canary';
+    const strictResult = {
+        ok: false,
+        credentialRevision: 42,
+        enabledUserCount: 2,
+        managedUserCount: 3,
+        code: 'DISABLED_USERS_PRESENT',
+    };
+    const transport = new L2tpNodeTransport({
+        nodeSSH: {
+            async exec() {
+                return {
+                    code: 65,
+                    stdout: `${JSON.stringify(strictResult)}\n`,
+                    stderr: '',
+                    diagnostics: secret,
+                };
+            },
+        },
+    });
+
+    const result = await transport.runArtifactCommand({
+        operationId: 'operation-user-mismatch',
+        command: 'verify-users',
+        expectedCredentialRevision: 42,
+        expectedEnabledUserCount: 2,
+    });
+
+    assert.deepEqual(result, strictResult);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
+
+test('verify-users rejects raw, foreign, or mismatched output with a sanitized error', async () => {
+    const secret = 'verify-invalid-output-secret-canary';
+    const base = {
+        ok: true,
+        credentialRevision: 42,
+        enabledUserCount: 2,
+        managedUserCount: 2,
+        code: 'USERS_VERIFIED',
+    };
+    const responses = [
+        { code: 0, stdout: `${secret}\n${JSON.stringify(base)}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, raw: secret })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, credentialRevision: 41 })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, enabledUserCount: 3, managedUserCount: 3 })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, code: 'FOREIGN_RESULT' })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, ok: 1 })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, managedUserCount: '2' })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, managedUserCount: 1.5 })}\n`, stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...base, code: { secret } })}\n`, stderr: '' },
+        {
+            code: 17,
+            stdout: `${JSON.stringify({
+                ...base,
+                ok: false,
+                managedUserCount: 3,
+                code: 'DISABLED_USERS_PRESENT',
+            })}\n`,
+            stderr: '',
+        },
+        { code: 0, stdout: `${JSON.stringify(base)}\n`, stderr: secret },
+        { code: 17, stdout: `${JSON.stringify(base)}\n`, stderr: '' },
+    ];
+
+    for (const response of responses) {
+        const transport = new L2tpNodeTransport({
+            nodeSSH: { async exec() { return response; } },
+        });
+        await assert.rejects(
+            transport.runArtifactCommand({
+                operationId: 'operation-user-invalid',
+                command: 'verify-users',
+                expectedCredentialRevision: 42,
+                expectedEnabledUserCount: 2,
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpNodeTransportError');
+                assert.equal(error.code, 'REMOTE_COMMAND_FAILED');
+                assert.equal(error.message, 'Failed to run an L2TP artifact command');
+                assert.equal(Object.hasOwn(error, 'cause'), false);
+                assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+                return true;
+            },
+        );
+    }
+});
+
+test('verify-users requires exact typed expectation metadata and rejects it on foreign commands', async () => {
+    const invalidRequests = [
+        { operationId: 'operation-metadata', command: 'verify-users' },
+        {
+            operationId: 'operation-metadata',
+            command: 'verify-users',
+            expectedCredentialRevision: 0,
+            expectedEnabledUserCount: 2,
+        },
+        {
+            operationId: 'operation-metadata',
+            command: 'verify-users',
+            expectedCredentialRevision: 42,
+            expectedEnabledUserCount: -1,
+        },
+        {
+            operationId: 'operation-metadata',
+            command: 'sync-users',
+            expectedCredentialRevision: 42,
+            expectedEnabledUserCount: 2,
+        },
+    ];
+
+    for (const request of invalidRequests) {
+        const nodeSSH = createNodeSSHFacade();
+        const transport = new L2tpNodeTransport({ nodeSSH });
+        await assert.rejects(
+            transport.runArtifactCommand(request),
+            error => {
+                assert.equal(error.name, 'L2tpNodeTransportError');
+                assert.equal(error.code, 'INVALID_COMMAND_EXPECTATION');
+                assert.equal(error.message, 'Invalid L2TP artifact command expectation');
+                return true;
+            },
+        );
+        assert.deepEqual(nodeSSH.calls, []);
+    }
 });
 
 test('preflight returns only validated structured output from the fixed artifact runner', async () => {
