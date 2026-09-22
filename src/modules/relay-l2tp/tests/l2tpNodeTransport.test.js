@@ -162,7 +162,13 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
     for (const command of commands) {
         assert.deepEqual(
             await transport.runArtifactCommand({ operationId: 'operation-18', command }),
-            { ok: true, operationId: 'operation-18', command },
+            command === 'preflight'
+                ? {
+                    ok: false,
+                    checks: [],
+                    error: { code: 'PREFLIGHT_RESPONSE_INVALID' },
+                }
+                : { ok: true, operationId: 'operation-18', command },
         );
     }
 
@@ -173,6 +179,132 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
             command: `/usr/local/bin/celerity-l2tp-artifact-runner --operation-id operation-18 --command ${command}`,
         })),
     );
+});
+
+test('preflight returns only validated structured output from the fixed artifact runner', async () => {
+    const secret = 'preflight-transport-output-secret';
+    const stdout = [
+        '{"check":"os","status":"ok","id":"debian","version":"13"}',
+        '{"check":"client_cidr","status":"ok","cidr":"10.77.0.0/24"}',
+        '{"check":"xray","status":"ok","version":"Xray 26.3.27"}',
+        '{"check":"xray_config","status":"ok","path":"/usr/local/etc/xray/config.json"}',
+        '{"check":"xray_unit","status":"ok","unit":"xray.service"}',
+    ].join('\n') + '\n';
+    const nodeSSH = {
+        calls: [],
+        async exec(command) {
+            this.calls.push({ method: 'exec', command });
+            return { code: 0, stdout, stderr: secret };
+        },
+    };
+    const transport = new L2tpNodeTransport({ nodeSSH });
+
+    const result = await transport.runArtifactCommand({
+        operationId: 'preflight-operation',
+        command: 'preflight',
+    });
+
+    assert.deepEqual(nodeSSH.calls, [{
+        method: 'exec',
+        command: '/usr/local/bin/celerity-l2tp-artifact-runner --operation-id preflight-operation --command preflight',
+    }]);
+    assert.deepEqual(result, {
+        ok: true,
+        checks: [
+            { check: 'os', status: 'ok', id: 'debian', version: '13' },
+            { check: 'client_cidr', status: 'ok', cidr: '10.77.0.0/24' },
+            { check: 'xray', status: 'ok', version: 'Xray 26.3.27' },
+            {
+                check: 'xray_config',
+                status: 'ok',
+                path: '/usr/local/etc/xray/config.json',
+            },
+            { check: 'xray_unit', status: 'ok', unit: 'xray.service' },
+        ],
+    });
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
+
+test('preflight exposes a validated artifact failure without remote diagnostics', async () => {
+    const secret = 'preflight-artifact-failure-secret';
+    const nodeSSH = {
+        async exec() {
+            return {
+                code: 69,
+                stdout: `${JSON.stringify({
+                    check: 'os',
+                    status: 'error',
+                    code: 'UNSUPPORTED_OS',
+                    id: 'alpine',
+                    version: '3.20',
+                    diagnostics: secret,
+                    node: { ssh: { password: secret } },
+                })}\n`,
+                stderr: secret,
+            };
+        },
+    };
+    const transport = new L2tpNodeTransport({ nodeSSH });
+
+    const result = await transport.runArtifactCommand({
+        operationId: 'preflight-failed',
+        command: 'preflight',
+    });
+
+    assert.deepEqual(result, {
+        ok: false,
+        checks: [{
+            check: 'os',
+            status: 'error',
+            code: 'UNSUPPORTED_OS',
+            id: 'alpine',
+            version: '3.20',
+        }],
+        error: { code: 'UNSUPPORTED_OS' },
+    });
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+});
+
+test('preflight fails closed on empty, malformed, or unrecognized command output', async t => {
+    const secret = 'unvalidated-preflight-output-secret';
+    const responses = [
+        { code: 0, stdout: '', stderr: secret },
+        { code: 0, stdout: '{not-json}\n', stderr: secret },
+        {
+            code: 0,
+            stdout: `${JSON.stringify({ check: 'ssh', status: 'ok', output: secret })}\n`,
+            stderr: secret,
+        },
+        {
+            code: 70,
+            stdout: `${JSON.stringify({
+                check: 'xray',
+                status: 'error',
+                code: secret,
+            })}\n`,
+            stderr: secret,
+        },
+    ];
+
+    for (const [index, response] of responses.entries()) {
+        await t.test(String(index), async () => {
+            const transport = new L2tpNodeTransport({
+                nodeSSH: { async exec() { return response; } },
+            });
+
+            const result = await transport.runArtifactCommand({
+                operationId: `preflight-invalid-${index}`,
+                command: 'preflight',
+            });
+
+            assert.deepEqual(result, {
+                ok: false,
+                checks: [],
+                error: { code: 'PREFLIGHT_RESPONSE_INVALID' },
+            });
+            assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+        });
+    }
 });
 
 test('rejects invalid operation ids before invoking the NodeSSH facade', async () => {

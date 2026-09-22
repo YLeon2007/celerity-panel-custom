@@ -1,5 +1,7 @@
 'use strict';
 
+const { parsePreflightExecResult } = require('./l2tpPreflightResult');
+
 const REMOTE_OPERATIONS_ROOT = '/var/lib/celerity/l2tp/operations';
 const ARTIFACT_RUNNER_PATH = '/usr/local/bin/celerity-l2tp-artifact-runner';
 const ARTIFACT_RECEIVER_PATH = '/usr/local/bin/celerity-l2tp-artifact-receiver';
@@ -148,10 +150,12 @@ class L2tpNodeTransport {
         assertOperationId(operationId);
         assertArtifactCommand(command);
 
+        let result;
         try {
-            assertSuccessfulExec(await this.nodeSSH.exec(
+            result = await this.nodeSSH.exec(
                 `${ARTIFACT_RUNNER_PATH} --operation-id ${operationId} --command ${command}`,
-            ));
+            );
+            if (command !== 'preflight') assertSuccessfulExec(result);
         } catch {
             throw new L2tpNodeTransportError(
                 'REMOTE_COMMAND_FAILED',
@@ -159,6 +163,7 @@ class L2tpNodeTransport {
             );
         }
 
+        if (command === 'preflight') return parsePreflightExecResult(result);
         return { ok: true, operationId, command };
     }
 }
