@@ -89,6 +89,7 @@ readonly BACKUP_METADATA="$BACKUP_DIR/receipt.fields"
 readonly BACKUP_CONFIG="$BACKUP_DIR/config.json"
 readonly BACKUP_ABSENT="$BACKUP_DIR/config.absent"
 readonly XRAY_PATH="$ROOT_PREFIX/usr/local/bin/xray"
+readonly XRAY_ASSET_DIR="$ROOT_PREFIX/usr/local/share/xray"
 readonly SYSTEMCTL_PATH="$ROOT_PREFIX/usr/bin/systemctl"
 
 emit_receipt() {
@@ -207,7 +208,11 @@ prepare_candidate() {
         || fail 'STATE_WRITE_FAILED' 70
     TEMPORARY_FILE=''
     [[ -x "$XRAY_PATH" ]] || fail 'XRAY_UNAVAILABLE' 69
-    "$XRAY_PATH" run -test -config "$CANDIDATE_PATH" >/dev/null 2>&1 \
+    [[ -d "$XRAY_ASSET_DIR" && ! -L "$XRAY_ASSET_DIR" \
+        && -r "$XRAY_ASSET_DIR" && -x "$XRAY_ASSET_DIR" ]] \
+        || fail 'XRAY_ASSETS_UNAVAILABLE' 69
+    XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" \
+        "$XRAY_PATH" run -test -config "$CANDIDATE_PATH" >/dev/null 2>&1 \
         || fail 'CANDIDATE_INVALID' 65
 
     config_parent="${CONFIG_PATH%/*}"
@@ -263,7 +268,11 @@ verify_candidate() {
     file_hash_matches "$CONFIG_PATH" || fail 'VERIFICATION_FAILED' 65
     [[ -x "$XRAY_PATH" && -x "$SYSTEMCTL_PATH" ]] \
         || fail 'VERIFICATION_UNAVAILABLE' 69
-    "$XRAY_PATH" run -test -config "$CONFIG_PATH" >/dev/null 2>&1 \
+    [[ -d "$XRAY_ASSET_DIR" && ! -L "$XRAY_ASSET_DIR" \
+        && -r "$XRAY_ASSET_DIR" && -x "$XRAY_ASSET_DIR" ]] \
+        || fail 'XRAY_ASSETS_UNAVAILABLE' 69
+    XRAY_LOCATION_ASSET="$XRAY_ASSET_DIR" \
+        "$XRAY_PATH" run -test -config "$CONFIG_PATH" >/dev/null 2>&1 \
         || fail 'VERIFICATION_FAILED' 65
     "$SYSTEMCTL_PATH" is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 \
         || fail 'VERIFICATION_FAILED' 65

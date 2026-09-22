@@ -65,7 +65,9 @@ printf '%s\n' '{"old":"bridge"}' >"$TEST_ROOT/usr/local/etc/xray-bridge/config.j
 printf '%s\n' 'outside-rollback-scope' >"$TEST_ROOT/do-not-touch"
 
 printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
-    'printf '\''xray %s\n'\'' "$*" >>"${CELERITY_TOPOLOGY_ROOT}/xray.log"' \
+    'printf '\''xray asset=%s %s\n'\'' "${XRAY_LOCATION_ASSET-}" "$*" >>"${CELERITY_TOPOLOGY_ROOT}/xray.log"' \
+    '[[ "${XRAY_LOCATION_ASSET-}" == "${CELERITY_TOPOLOGY_ROOT}/usr/local/share/xray" ]]' \
+    '[[ -d "$XRAY_LOCATION_ASSET" && ! -L "$XRAY_LOCATION_ASSET" && -r "$XRAY_LOCATION_ASSET" && -x "$XRAY_LOCATION_ASSET" ]]' \
     '[[ "$1" == "run" && "$2" == "-test" && "$3" == "-config" && -f "$4" && ! -L "$4" ]]' \
     '[[ "$4" == "${CELERITY_TOPOLOGY_ROOT}/var/lib/celerity/topology/operations/"*/xray-*/candidate.json \
         || "$4" == "${CELERITY_TOPOLOGY_ROOT}/usr/local/etc/xray/config.json" \
@@ -79,6 +81,18 @@ printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
     'exit 64' \
     >"$TEST_ROOT/usr/bin/systemctl"
 chmod +x "$TEST_ROOT/usr/bin/systemctl"
+
+asset_candidate=$'{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[]}\n'
+asset_hash="sha256:$(printf '%s' "$asset_candidate" | sha256sum | cut -d' ' -f1)"
+invoke missing-assets-prepare prepare missing-assets-operation missing-assets-node "$asset_hash" missing-assets-backup xray-main "$asset_candidate"
+[[ "$status" -ne 0 ]] || fail 'prepare accepted a missing fixed Xray asset directory'
+[[ "$errors" == '{"ok":false,"code":"XRAY_ASSETS_UNAVAILABLE"}' ]] \
+    || fail 'missing fixed Xray assets returned the wrong error'
+[[ ! -e "$TEST_ROOT/xray.log" ]] || fail 'missing fixed Xray assets reached Xray validation'
+[[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'missing fixed Xray assets reached service activation'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'missing fixed Xray assets mutated the active config'
+mkdir -p "$TEST_ROOT/usr/local/share/xray"
 
 metadata_candidate=$'{"schemaVersion":1,"kind":"xray-topology-node-candidate","mode":"forward","nodeRef":"portal","role":"portal","targetProfile":"xray-main","links":[],"checks":[]}\n'
 metadata_hash="sha256:$(printf '%s' "$metadata_candidate" | sha256sum | cut -d' ' -f1)"
@@ -97,8 +111,8 @@ invoke invalid-xray-prepare prepare invalid-xray-operation invalid-xray-node "$i
 [[ "$status" -ne 0 ]] || fail 'Xray-invalid candidate was accepted'
 [[ "$errors" == '{"ok":false,"code":"CANDIDATE_INVALID"}' ]] \
     || fail 'Xray-invalid candidate returned the wrong error'
-[[ "$(<"$TEST_ROOT/xray.log")" == 'xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/invalid-xray-operation/xray-main/candidate.json' ]] \
-    || fail 'Xray validation did not target the staged candidate'
+[[ "$(<"$TEST_ROOT/xray.log")" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/invalid-xray-operation/xray-main/candidate.json' ]] \
+    || fail 'Xray validation was not bound to the fixed assets and staged candidate'
 [[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'failed Xray validation reached service activation'
 /usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
     || fail 'failed Xray validation mutated the active config'
@@ -121,8 +135,8 @@ invoke main-prepare prepare "$main_operation" "$main_node" "$main_hash" "$main_b
     || fail 'prepare mutated the active main config'
 [[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == '{"old":"bridge"}' ]] \
     || fail 'prepare mutated the bridge config'
-[[ "$(<"$TEST_ROOT/xray.log")" == 'xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' ]] \
-    || fail 'prepare did not validate the staged main config'
+[[ "$(<"$TEST_ROOT/xray.log")" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' ]] \
+    || fail 'prepare did not bind the staged main config to the fixed Xray assets'
 
 invoke main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
 [[ "$status" -eq 0 ]] || fail 'xray-main commit failed'
@@ -135,10 +149,28 @@ invoke main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_bac
 [[ "$(<"$TEST_ROOT/systemctl.log")" == 'systemctl restart xray.service' ]] \
     || fail 'main commit used a non-fixed service'
 
+xray_calls_before_missing_assets="$(<"$TEST_ROOT/xray.log")"
+systemctl_calls_before_missing_assets="$(<"$TEST_ROOT/systemctl.log")"
+rmdir "$TEST_ROOT/usr/local/share/xray"
+invoke missing-assets-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 ]] || fail 'verify accepted a missing fixed Xray asset directory'
+[[ "$errors" == '{"ok":false,"code":"XRAY_ASSETS_UNAVAILABLE"}' ]] \
+    || fail 'active verification with missing Xray assets returned the wrong error'
+[[ "$(<"$TEST_ROOT/xray.log")" == "$xray_calls_before_missing_assets" ]] \
+    || fail 'active verification reached Xray with missing fixed assets'
+[[ "$(<"$TEST_ROOT/systemctl.log")" == "$systemctl_calls_before_missing_assets" ]] \
+    || fail 'active verification reached systemctl with missing fixed assets'
+mkdir -p "$TEST_ROOT/usr/local/share/xray"
+
 invoke main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
 [[ "$status" -eq 0 ]] || fail 'xray-main verify failed'
 [[ "$output" == "$(receipt verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
     || fail 'xray-main verify receipt was not strict and bound'
+mapfile -t xray_calls <"$TEST_ROOT/xray.log"
+[[ "${#xray_calls[@]}" -eq 2 \
+    && "${xray_calls[0]}" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' \
+    && "${xray_calls[1]}" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/usr/local/etc/xray/config.json' ]] \
+    || fail 'active verification was not bound to the fixed Xray assets and config'
 mapfile -t systemctl_calls <"$TEST_ROOT/systemctl.log"
 [[ "${#systemctl_calls[@]}" -eq 2 \
     && "${systemctl_calls[0]}" == 'systemctl restart xray.service' \
