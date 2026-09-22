@@ -395,7 +395,7 @@ test('runs standalone sync_users with typed verification and finalizes before su
         userSyncReconciler: {
             async finalizeVerifiedSync(request) {
                 events.push({ method: 'finalizeVerifiedSync', request });
-                return { finalized: true };
+                return { ok: true };
             },
         },
         lockService: {
@@ -674,6 +674,74 @@ test('rolls back and never succeeds when guarded user sync finalization rejects 
         assert.equal(statuses.some(call => call.request.status === 'succeeded'), false);
         assert.ok(statuses.every(call => !JSON.stringify(call).includes('database detail')));
     }
+});
+
+test('rolls back and never succeeds when user sync finalization returns a rejected result', async () => {
+    const password = 'finalization-private-password';
+    const operationRepository = createOperationRepository([
+        createSyncUsersOperation('operation-finalize-rejected-result'),
+    ]);
+    const events = [];
+    const worker = createWorker(operationRepository, {
+        userSnapshotResolver: async () => ({
+            credentialRevision: 9,
+            users: [{
+                id: 'user-alice',
+                relayNode: 'relay-1',
+                login: 'alice',
+                password,
+                ip: '10.77.0.10',
+                enabled: true,
+                desiredRevision: 9,
+            }],
+        }),
+        userSyncReconciler: {
+            async finalizeVerifiedSync() {
+                events.push('finalize');
+                return {
+                    ok: false,
+                    error: { code: 'L2TP_USER_SYNC_FINALIZE_REJECTED' },
+                };
+            },
+        },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep({ step }) {
+                events.push(step.type);
+                return step.type === 'verify_users'
+                    ? {
+                        ok: true,
+                        credentialRevision: 9,
+                        enabledUserCount: 1,
+                        managedUserCount: 1,
+                        code: 'USERS_VERIFIED',
+                    }
+                    : { ok: true };
+            },
+            async rollback(request) {
+                events.push('rollback');
+                assert.deepEqual(request.failedStep, { type: 'user_sync_finalization' });
+                assert.equal(request.error.code, 'USER_SYNC_FINALIZATION_FAILED');
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-finalize-rejected-result',
+        status: 'rolled_back',
+    });
+    assert.deepEqual(events, ['backup', 'sync_users', 'verify_users', 'finalize', 'rollback']);
+    const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+    assert.deepEqual(statuses.map(call => call.request.status), ['rolling_back', 'rolled_back']);
+    assert.equal(statuses.some(call => call.request.status === 'succeeded'), false);
+    assert.doesNotMatch(JSON.stringify({ result, statuses }), new RegExp(password));
 });
 
 test('rejects invalid claimed install plans before resolving secrets or remote work', async () => {

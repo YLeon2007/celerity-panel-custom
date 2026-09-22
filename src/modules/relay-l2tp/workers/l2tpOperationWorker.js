@@ -750,7 +750,7 @@ class L2tpOperationWorker {
                         verification: userVerification,
                         workerId: this.workerId,
                     });
-                    if (!finalized) {
+                    if (finalized?.ok !== true) {
                         throw new Error('L2TP user sync finalization was rejected');
                     }
                     await heartbeat.waitForIdle();
