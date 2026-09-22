@@ -14,9 +14,9 @@ declare -Ar PAYLOAD_SHA256=(
     [apply-firewall-policy.sh]='1d6f0ad0f1e973ea6b8c8ba9810e7237044ab95734541bc0f8c98be159dc6aba'
     [start-l2tp.sh]='2fd5026e7ddbb5e4b2f748817494edef06b33fd002012de19a1f981b17283692'
     [sync-users.sh]='49fa1c74dd16654a82363be5b639e65f512ca16f7ca0ffb848988a822127c9d3'
-    [verify.sh]='d5f2cd79f09f2e712de64ea39e37dd3d23adc13fa6d869782e586318eb173780'
+    [verify.sh]='82d3334f97afb9a2ce0b99991dfb8ac7d94258534c8f2d8aa917b66d1183a4ae'
     [commit.sh]='bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b'
-    [rollback.sh]='4f07568fd46e87661bf034968065508b7f17f63f918422ac758c152f52e2234f'
+    [rollback.sh]='63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091'
     [install-runtime.sh]='43157074ad65505ca433bd5b3365c398412c36764203fac392bf59cb49b91bb4'
 )
 readonly RECEIVER_LINK_NAME='celerity-l2tp-artifact-receiver'
