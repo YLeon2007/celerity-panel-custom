@@ -17,6 +17,7 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
     'compose-xray-fragment.sh',
     'install-runtime.sh',
     'install.sh',
+    'materialize-nft-candidate.sh',
     'preflight.sh',
     'receive-artifact.py',
     'rollback.sh',
@@ -29,6 +30,11 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
 ].map(name => `${NODE_ARTIFACT_ROOT}/${name}`).sort((left, right) => left.localeCompare(right, 'en')));
 const REQUIRED_CONTENTS = Object.freeze({
     migrationRegistry: 'module/migrations/index.js',
+    migrations: Object.freeze([
+        'module/migrations/index.js',
+        'module/migrations/migrationRunner.js',
+        'module/migrations/migrationStateRepository.js',
+    ]),
     panel: Object.freeze({
         views: Object.freeze(['module/views/l2tp.ejs']),
         routes: Object.freeze(['module/routes/panel.js', 'module/routes/panelOverview.js']),
@@ -40,6 +46,21 @@ const REQUIRED_CONTENTS = Object.freeze({
         topologySchema: 'topology.schema.json',
         topologyTransfer: 'topology-transfer.js',
     }),
+});
+const REQUIRED_HOST_INTEGRATION = Object.freeze({
+    artifactScope: 'module-only',
+    fullPanelSourceBundleRequired: true,
+    policy: 'Root lifecycle, migration bootstrap, and panel mounting are host integrations outside this module archive; deploy with the full panel source bundle matching source.commit and source.tree.',
+    entryPoints: Object.freeze([
+        'index.js',
+        'src/modules/createL2tpPanelHost.js',
+        'src/modules/createL2tpStartupLifecycle.js',
+        'src/modules/l2tpActiveHostProvider.js',
+        'src/modules/l2tpMigrationBootstrap.js',
+        'src/modules/l2tpRuntimeLifecycleHook.js',
+        'src/routes/panel/index.js',
+        'views/l2tp.ejs',
+    ]),
 });
 
 function fail(message) {
@@ -111,6 +132,9 @@ function assertManifestShape(manifest) {
     if (JSON.stringify(manifest.contents) !== JSON.stringify(REQUIRED_CONTENTS)) {
         fail('Release content contract does not match the relay-l2tp package');
     }
+    if (JSON.stringify(manifest.hostIntegration) !== JSON.stringify(REQUIRED_HOST_INTEGRATION)) {
+        fail('Full panel source bundle requirement does not match the relay-l2tp package');
+    }
     if (manifest.nodeArtifacts?.root !== NODE_ARTIFACT_ROOT
         || !Array.isArray(manifest.nodeArtifacts.executables)
         || manifest.nodeArtifacts.executables.length === 0) {
@@ -172,6 +196,7 @@ function verifyArtifact({ archivePath, checksumPath }) {
         }
         const requiredContentPaths = [
             manifest.contents.migrationRegistry,
+            ...manifest.contents.migrations,
             ...manifest.contents.panel.views,
             ...manifest.contents.panel.routes,
             ...Object.values(manifest.contents.tools),

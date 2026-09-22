@@ -105,7 +105,14 @@ function createBuildTargetFixture(prefix) {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
     const fixtureRepo = path.join(tempRoot, 'repo');
     for (const relativePath of [
+        'index.js',
         'src/modules/relay-l2tp',
+        'src/modules/createL2tpPanelHost.js',
+        'src/modules/createL2tpStartupLifecycle.js',
+        'src/modules/l2tpActiveHostProvider.js',
+        'src/modules/l2tpMigrationBootstrap.js',
+        'src/modules/l2tpRuntimeLifecycleHook.js',
+        'src/routes/panel/index.js',
         'scripts/relay-l2tp-artifact',
         'views/l2tp.ejs',
     ]) {
@@ -253,7 +260,7 @@ test('archive contains exactly module source and explicit release metadata in so
     }
 });
 
-test('release manifest binds source commit/tree, package contents, node executables, and every payload hash', () => {
+test('release manifest binds source, package contents, host integration requirement, node executables, and payload hashes', () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-l2tp-manifest-'));
     try {
         const built = runBuild(path.join(tempRoot, 'out'));
@@ -279,6 +286,11 @@ test('release manifest binds source commit/tree, package contents, node executab
         assert.equal(manifest.topologyTransfer.schema, 'topology.schema.json');
         assert.deepEqual(manifest.contents, {
             migrationRegistry: 'module/migrations/index.js',
+            migrations: [
+                'module/migrations/index.js',
+                'module/migrations/migrationRunner.js',
+                'module/migrations/migrationStateRepository.js',
+            ],
             panel: {
                 views: ['module/views/l2tp.ejs'],
                 routes: ['module/routes/panel.js', 'module/routes/panelOverview.js'],
@@ -290,6 +302,21 @@ test('release manifest binds source commit/tree, package contents, node executab
                 topologySchema: 'topology.schema.json',
                 topologyTransfer: 'topology-transfer.js',
             },
+        });
+        assert.deepEqual(manifest.hostIntegration, {
+            artifactScope: 'module-only',
+            fullPanelSourceBundleRequired: true,
+            policy: 'Root lifecycle, migration bootstrap, and panel mounting are host integrations outside this module archive; deploy with the full panel source bundle matching source.commit and source.tree.',
+            entryPoints: [
+                'index.js',
+                'src/modules/createL2tpPanelHost.js',
+                'src/modules/createL2tpStartupLifecycle.js',
+                'src/modules/l2tpActiveHostProvider.js',
+                'src/modules/l2tpMigrationBootstrap.js',
+                'src/modules/l2tpRuntimeLifecycleHook.js',
+                'src/routes/panel/index.js',
+                'views/l2tp.ejs',
+            ],
         });
 
         const payloadFiles = archiveFiles(built.archivePath)
@@ -308,8 +335,14 @@ test('release manifest binds source commit/tree, package contents, node executab
             root: 'module/node-artifacts/l2tp',
             executables: executableNodeArtifacts,
         });
-        assert.equal(manifest.nodeArtifacts.executables.length, 17);
-        assert.equal(new Set(manifest.nodeArtifacts.executables.map(file => file.path)).size, 17);
+        assert.equal(manifest.nodeArtifacts.executables.length, 18);
+        assert.equal(new Set(manifest.nodeArtifacts.executables.map(file => file.path)).size, 18);
+        assert.equal(
+            manifest.nodeArtifacts.executables.some(file => (
+                file.path === 'module/node-artifacts/l2tp/materialize-nft-candidate.sh'
+            )),
+            true,
+        );
     } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });
     }

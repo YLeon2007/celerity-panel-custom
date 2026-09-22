@@ -28,6 +28,7 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
     'compose-xray-fragment.sh',
     'install-runtime.sh',
     'install.sh',
+    'materialize-nft-candidate.sh',
     'preflight.sh',
     'receive-artifact.py',
     'rollback.sh',
@@ -40,6 +41,11 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
 ].map(name => `${NODE_ARTIFACT_ROOT}/${name}`).sort((left, right) => left.localeCompare(right, 'en')));
 const RELEASE_CONTENTS = Object.freeze({
     migrationRegistry: 'module/migrations/index.js',
+    migrations: Object.freeze([
+        'module/migrations/index.js',
+        'module/migrations/migrationRunner.js',
+        'module/migrations/migrationStateRepository.js',
+    ]),
     panel: Object.freeze({
         views: Object.freeze(['module/views/l2tp.ejs']),
         routes: Object.freeze(['module/routes/panel.js', 'module/routes/panelOverview.js']),
@@ -51,6 +57,21 @@ const RELEASE_CONTENTS = Object.freeze({
         topologySchema: 'topology.schema.json',
         topologyTransfer: 'topology-transfer.js',
     }),
+});
+const HOST_INTEGRATION = Object.freeze({
+    artifactScope: 'module-only',
+    fullPanelSourceBundleRequired: true,
+    policy: 'Root lifecycle, migration bootstrap, and panel mounting are host integrations outside this module archive; deploy with the full panel source bundle matching source.commit and source.tree.',
+    entryPoints: Object.freeze([
+        'index.js',
+        'src/modules/createL2tpPanelHost.js',
+        'src/modules/createL2tpStartupLifecycle.js',
+        'src/modules/l2tpActiveHostProvider.js',
+        'src/modules/l2tpMigrationBootstrap.js',
+        'src/modules/l2tpRuntimeLifecycleHook.js',
+        'src/routes/panel/index.js',
+        'views/l2tp.ejs',
+    ]),
 });
 const FIXED_MODE = 0o644;
 const FIXED_EXECUTABLE_MODE = 0o755;
@@ -171,6 +192,9 @@ function buildArtifact({ repoRoot, outputDir, sourceRef = 'HEAD' }) {
     const stageRoot = path.join(tempRoot, archiveBaseName);
 
     try {
+        for (const entryPoint of HOST_INTEGRATION.entryPoints) {
+            readSourceFile(absoluteRepoRoot, source.commit, entryPoint);
+        }
         const sourceEntries = listModuleSourceEntries(absoluteRepoRoot, source.commit);
         if (sourceEntries.length === 0) fail('No relay-l2tp source files found in build target');
 
@@ -230,6 +254,7 @@ function buildArtifact({ repoRoot, outputDir, sourceRef = 'HEAD' }) {
             },
             source,
             contents: RELEASE_CONTENTS,
+            hostIntegration: HOST_INTEGRATION,
             nodeArtifacts: {
                 root: NODE_ARTIFACT_ROOT,
                 executables: nodeExecutables,
