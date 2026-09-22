@@ -135,6 +135,19 @@ function createL2tpStartupLifecycle({
 } = {}) {
     const enabled = readEnabled(config);
     if (enabled) assertEnabledDependencies(hostDependencies);
+    if (!enabled) {
+        const disabledState = () => lifecycleState({
+            enabled: false,
+            started: false,
+            stopped: false,
+        });
+        return {
+            start: disabledState,
+            async stop() {
+                return disabledState();
+            },
+        };
+    }
     const hostFactory = createPanelHost
         ?? require('./createL2tpPanelHost').createL2tpPanelHost;
     const host = hostFactory({

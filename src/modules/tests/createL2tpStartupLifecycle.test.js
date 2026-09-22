@@ -36,7 +36,7 @@ function createEnabledHostDependencies() {
     };
 }
 
-test('false or missing enable flag constructs a dormant host and startup never starts it', () => {
+test('false or missing enable flag constructs no host and startup never starts it', () => {
     for (const config of [undefined, { enabled: false }]) {
         const calls = [];
         const host = {
@@ -56,10 +56,7 @@ test('false or missing enable flag constructs a dormant host and startup never s
             },
         });
 
-        assert.deepEqual(calls, [{
-            kind: 'create',
-            dependencies: { workerLifecycle: { enabled: false } },
-        }]);
+        assert.deepEqual(calls, []);
         assert.deepEqual(lifecycle.start(), {
             enabled: false,
             started: false,
