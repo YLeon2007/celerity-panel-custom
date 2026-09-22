@@ -68,6 +68,7 @@ function l2tpOperation(overrides = {}) {
 function topologyOperation(overrides = {}) {
     return new TopologyOperation({
         topologyRevision: 1,
+        priorDeployedRevision: 0,
         status: 'queued',
         ...overrides,
     });
@@ -425,4 +426,28 @@ test('topology operation retains durable per-node deployment state', () => {
         'nodes.0.state',
         'enum',
     );
+});
+
+test('topology operation retains durable deployment and lease fences', () => {
+    const leaseUntil = new Date('2026-09-22T10:00:30.000Z');
+    const operation = topologyOperation({
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+        attempts: 2,
+        leaseOwner: 'worker-1',
+        leaseUntil,
+        finishedAt: new Date('2026-09-22T10:01:00.000Z'),
+    });
+
+    assert.equal(operation.validateSync(), undefined);
+    assert.equal(operation.priorDeployedRevision, 5);
+    assert.equal(operation.attempts, 2);
+    assert.equal(operation.leaseOwner, 'worker-1');
+    assert.equal(operation.leaseUntil.getTime(), leaseUntil.getTime());
+    assertValidationKind(
+        topologyOperation({ priorDeployedRevision: undefined }),
+        'priorDeployedRevision',
+        'required',
+    );
+    assertValidationKind(topologyOperation({ attempts: -1 }), 'attempts', 'min');
 });

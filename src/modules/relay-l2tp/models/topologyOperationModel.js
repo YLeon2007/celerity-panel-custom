@@ -40,11 +40,20 @@ const topologyOperationSchema = new mongoose.Schema({
         required: true,
         min: 0,
     },
+    priorDeployedRevision: {
+        type: Number,
+        required: true,
+        min: 0,
+    },
     status: {
         type: String,
         enum: OPERATION_STATUSES,
         required: true,
     },
+    attempts: { type: Number, min: 0, default: 0, required: true },
+    leaseOwner: { type: String, default: '', trim: true },
+    leaseUntil: { type: Date, default: null },
+    finishedAt: { type: Date, default: null },
     nodes: { type: [topologyNodeSchema], default: [] },
 }, { timestamps: true });
 
