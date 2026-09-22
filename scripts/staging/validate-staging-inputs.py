@@ -146,8 +146,13 @@ def validate_module_artifact(args: argparse.Namespace) -> None:
                 manifest = json.loads(content)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 refuse("module release manifest is invalid")
-            if manifest.get("sourceCommit") != args.expected_source_commit:
+            source = manifest.get("source")
+            if not isinstance(source, dict):
+                refuse("module artifact source identity is missing or invalid")
+            if source.get("commit") != args.expected_source_commit:
                 refuse("module artifact source commit does not match")
+            if source.get("tree") != args.expected_source_tree:
+                refuse("module artifact source tree does not match")
             module = manifest.get("module")
             if not isinstance(module, dict) or module.get("id") != "relay-l2tp":
                 refuse("module artifact identity does not match relay-l2tp")

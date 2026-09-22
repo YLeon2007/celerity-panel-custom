@@ -9,10 +9,12 @@ const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const repoRoot = path.resolve(__dirname, '../..');
+const buildArtifactScript = path.join(repoRoot, 'scripts', 'build-relay-l2tp-artifact.js');
 const buildBundleScript = path.join(repoRoot, 'scripts', 'staging', 'build-source-bundle.sh');
 const deployScript = path.join(repoRoot, 'scripts', 'staging', 'deploy.sh');
 const precheckScript = path.join(repoRoot, 'scripts', 'staging', 'precheck.sh');
 const rollbackScript = path.join(repoRoot, 'scripts', 'staging', 'rollback.sh');
+const validateInputsScript = path.join(repoRoot, 'scripts', 'staging', 'validate-staging-inputs.py');
 const sourceCommit = 'a'.repeat(40);
 const sourceTree = 'b'.repeat(40);
 
@@ -81,9 +83,9 @@ function createMinimalPrecheckFixture() {
     ].join('\n'));
     fs.writeFileSync(path.join(sourceRoot, 'index.js'), "'use strict';\n");
     fs.writeFileSync(path.join(artifactStage, 'release-manifest.json'), `${JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         module: { id: 'relay-l2tp', version: '0.1.0' },
-        sourceCommit,
+        source: { commit: sourceCommit, tree: sourceTree },
         files: [],
     }, null, 2)}\n`);
     let packed = spawnSync('tar', ['-czf', bundle, '-C', bundleStage, 'manifest.env', 'source'], { encoding: 'utf8' });
@@ -117,6 +119,7 @@ function createMinimalPrecheckFixture() {
         root,
         bundle,
         artifact,
+        artifactStage,
         configEnv,
         configRef,
         dockerLog,
@@ -142,6 +145,31 @@ function createMinimalPrecheckFixture() {
             fs.rmSync(root, { recursive: true, force: true });
         },
     };
+}
+
+function rewriteModuleArtifact(fixture, mutateManifest) {
+    const manifestPath = path.join(fixture.artifactStage, 'release-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    mutateManifest(manifest);
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    const packed = spawnSync('tar', [
+        '-czf', fixture.artifact,
+        '-C', path.dirname(fixture.artifactStage),
+        path.basename(fixture.artifactStage),
+    ], { encoding: 'utf8' });
+    assert.equal(packed.status, 0, packed.stderr || packed.stdout);
+}
+
+function validateStagingInputs(fixture, extractName) {
+    return spawnSync('python3', [
+        validateInputsScript,
+        '--source-bundle', fixture.bundle,
+        '--module-artifact', fixture.artifact,
+        '--config-env-file', fixture.configEnv,
+        '--expected-source-commit', sourceCommit,
+        '--expected-source-tree', sourceTree,
+        '--extract-source', path.join(fixture.root, extractName),
+    ], { cwd: repoRoot, encoding: 'utf8' });
 }
 
 function createRollbackFixture() {
@@ -274,6 +302,101 @@ test('source bundle builder produces deterministic archives from an exact clean 
         assert.match(manifest, /worktree_clean=true/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('staging validator accepts real source and module artifacts from the same exact commit and tree', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'celerity-staging-identity-'));
+    try {
+        const exactSource = path.join(root, 'exact-source');
+        runChecked('git', ['clone', '--quiet', '--no-local', repoRoot, exactSource]);
+        const commit = runChecked('git', ['rev-parse', 'HEAD^{commit}'], { cwd: exactSource });
+        const tree = runChecked('git', ['rev-parse', 'HEAD^{tree}'], { cwd: exactSource });
+        const bundle = path.join(root, 'source.tar.gz');
+        const artifactOutput = path.join(root, 'artifact');
+        const configEnv = path.join(root, 'test.env');
+        const extractedSource = path.join(root, 'extracted-source');
+
+        let result = run(buildBundleScript, [
+            '--target', 'test',
+            '--repo-root', exactSource,
+            '--output', bundle,
+            '--expected-source-commit', commit,
+            '--expected-source-tree', tree,
+        ]);
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+
+        result = spawnSync(process.execPath, [
+            buildArtifactScript,
+            '--repo-root', exactSource,
+            '--output-dir', artifactOutput,
+            '--source-ref', commit,
+        ], { cwd: repoRoot, encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const built = JSON.parse(result.stdout);
+        assert.deepEqual(built.source, { commit, tree });
+        fs.writeFileSync(configEnv, [
+            'PANEL_DOMAIN=test.infograd.online',
+            'L2TP_EXECUTION_ENABLED=true',
+            '',
+        ].join('\n'));
+
+        result = spawnSync('python3', [
+            validateInputsScript,
+            '--source-bundle', bundle,
+            '--module-artifact', built.artifactPath,
+            '--config-env-file', configEnv,
+            '--expected-source-commit', commit,
+            '--expected-source-tree', tree,
+            '--extract-source', extractedSource,
+        ], { cwd: repoRoot, encoding: 'utf8' });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.equal(fs.existsSync(path.join(extractedSource, 'docker-compose.yml')), true);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('staging validator rejects missing or mismatched nested source identity despite matching legacy fields', () => {
+    const cases = [
+        {
+            name: 'missing-commit',
+            source: { tree: sourceTree },
+            expected: /module artifact source commit does not match/,
+        },
+        {
+            name: 'mismatched-commit',
+            source: { commit: 'c'.repeat(40), tree: sourceTree },
+            expected: /module artifact source commit does not match/,
+        },
+        {
+            name: 'missing-tree',
+            source: { commit: sourceCommit },
+            expected: /module artifact source tree does not match/,
+        },
+        {
+            name: 'mismatched-tree',
+            source: { commit: sourceCommit, tree: 'd'.repeat(40) },
+            expected: /module artifact source tree does not match/,
+        },
+    ];
+
+    for (const testCase of cases) {
+        const fixture = createMinimalPrecheckFixture();
+        try {
+            rewriteModuleArtifact(fixture, manifest => {
+                manifest.source = testCase.source;
+                manifest.sourceCommit = sourceCommit;
+                manifest.sourceTree = sourceTree;
+            });
+            const result = validateStagingInputs(fixture, `extracted-${testCase.name}`);
+
+            assert.notEqual(result.status, 0, `${testCase.name} must be refused`);
+            assert.match(result.stderr, testCase.expected);
+        } finally {
+            fixture.cleanup();
+        }
     }
 });
 
