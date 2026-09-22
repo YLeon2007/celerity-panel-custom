@@ -117,6 +117,12 @@ if [[ "$mode" == 'plan' ]]; then
     exit 0
 fi
 
+install_root_identity=$install_root
+backup_root_identity=$backup_root
+install_root=$(resolve_control_path "$install_root")
+backup_root=$(resolve_control_path "$backup_root")
+backup_dir="$backup_root/$backup_id"
+
 [[ -d "$install_root" && ! -L "$install_root" ]] \
     || fail "install root must already be the real $CELERITY_INSTALL_ROOT directory"
 [[ -f "$install_root/$CELERITY_COMPOSE_FILE" && ! -L "$install_root/$CELERITY_COMPOSE_FILE" ]] \
@@ -140,6 +146,7 @@ python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --expected-source-commit "$expected_source_commit" \
     --expected-source-tree "$expected_source_tree" \
     --extract-source "$staged_source"
+install -m 0600 -- "$config_env_file" "$staged_source/.env"
 
 while IFS= read -r -d '' javascript_file; do
     node --check "$javascript_file" >/dev/null \
@@ -217,8 +224,8 @@ cat > "$backup_dir/backup-manifest.env" <<EOF
 schema_version=1
 target=$target
 host_identity=$host_identity
-install_root=$install_root
-backup_root=$backup_root
+install_root=$install_root_identity
+backup_root=$backup_root_identity
 backup_id=$backup_id
 operation_id=$operation_id
 compose_file=$CELERITY_COMPOSE_FILE

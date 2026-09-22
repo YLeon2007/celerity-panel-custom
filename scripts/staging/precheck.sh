@@ -77,6 +77,7 @@ python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --expected-source-commit "$expected_source_commit" \
     --expected-source-tree "$expected_source_tree" \
     --extract-source "$extracted_source"
+install -m 0600 -- "$config_env_file" "$extracted_source/.env"
 
 compose_path="$extracted_source/$CELERITY_COMPOSE_FILE"
 compose_base=(

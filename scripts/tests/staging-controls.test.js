@@ -105,6 +105,33 @@ function createMinimalPrecheckFixture() {
     fs.writeFileSync(dockerMock, [
         '#!/bin/sh',
         'printf "%s\\n" "$*" >> "$MOCK_DOCKER_LOG"',
+        'project_directory=',
+        'config_env_file=',
+        'previous=',
+        'for argument do',
+        '  case "$previous" in',
+        '    project-directory) project_directory=$argument ;;',
+        '    env-file) config_env_file=$argument ;;',
+        '  esac',
+        '  case "$argument" in',
+        '    --project-directory) previous=project-directory ;;',
+        '    --env-file) previous=env-file ;;',
+        '    *) previous= ;;',
+        '  esac',
+        'done',
+        'if [ "${MOCK_REQUIRE_SERVICE_ENV:-0}" = 1 ]; then',
+        'case " $* " in',
+        '  *" config --quiet "*|*" config --services "*)',
+        '    service_env_file=$project_directory/.env',
+        '    [ -f "$config_env_file" ] || exit 94',
+        '    [ -f "$service_env_file" ] || exit 95',
+        '    service_env_mode=$(stat -c %a "$service_env_file") || exit 96',
+        '    [ "$service_env_mode" = 600 ] || exit 97',
+        '    cmp -s "$config_env_file" "$service_env_file" || exit 98',
+        '    printf "service-env=%s mode=%s\\n" "$service_env_file" "$service_env_mode" >> "$MOCK_DOCKER_LOG"',
+        '    ;;',
+        'esac',
+        'fi',
         'case " $* " in',
         '  *" config --services "*) printf "backend\\ncaddy\\nmongo\\nredis\\nupdater\\n" ;;',
         '  *" config --quiet "*) : ;;',
@@ -127,6 +154,7 @@ function createMinimalPrecheckFixture() {
         env: {
             PATH: `${mockBin}:${process.env.PATH}`,
             MOCK_DOCKER_LOG: dockerLog,
+            MOCK_REQUIRE_SERVICE_ENV: '1',
         },
         args: [
             '--target', 'test',
@@ -194,6 +222,51 @@ function runDeployPlan(fixture) {
         '--mongo-dump-hook', mongoDumpHook,
         '--plan-only', 'true',
     ], { env: fixture.env });
+}
+
+function createDeployExecuteFixture() {
+    const fixture = createMinimalPrecheckFixture();
+    const testFsRoot = path.join(fixture.root, 'fs-root');
+    const installDir = path.join(testFsRoot, 'opt', 'hysteria-panel');
+    const backupRootDir = path.join(testFsRoot, 'opt', 'hysteria-panel-test-backups');
+    const hookLog = path.join(fixture.root, 'mongo-dump-hook.log');
+    const mongoDumpHook = path.join(fixture.root, 'mongo-dump-hook.sh');
+
+    fs.mkdirSync(path.join(installDir, 'config', 'test'), { recursive: true });
+    fs.copyFileSync(
+        path.join(fixture.root, 'bundle-stage', 'source', 'docker-compose.yml'),
+        path.join(installDir, 'docker-compose.yml'),
+    );
+    fs.writeFileSync(path.join(installDir, '.env'), 'OLD_SECRET=must-not-appear\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(installDir, 'obsolete.js'), "'use strict';\n");
+    fs.writeFileSync(path.join(installDir, 'config', 'test', 'obsolete.conf'), 'obsolete\n');
+    fs.writeFileSync(mongoDumpHook, [
+        '#!/bin/sh',
+        'printf "called\\n" >> "$HOOK_LOG"',
+        'printf "mongo-backup-fixture\\n" > "$MONGO_DUMP_OUTPUT"',
+        '',
+    ].join('\n'), { mode: 0o755 });
+
+    return {
+        ...fixture,
+        testFsRoot,
+        installDir,
+        backupRootDir,
+        hookLog,
+        mongoDumpHook,
+        executeArgs: [
+            ...fixture.args,
+            '--operation-id', '20260922T120000Z',
+            '--mongo-dump-hook', mongoDumpHook,
+            '--execute', 'true',
+        ],
+        executeEnv: {
+            ...fixture.env,
+            CELERITY_STAGING_TEST_MODE: '1',
+            CELERITY_STAGING_TEST_FS_ROOT: testFsRoot,
+            HOOK_LOG: hookLog,
+        },
+    };
 }
 
 function createRollbackFixture() {
@@ -284,6 +357,7 @@ function createRollbackFixture() {
         args,
         rollbackEnv: {
             ...fixture.env,
+            MOCK_REQUIRE_SERVICE_ENV: '0',
             CELERITY_STAGING_TEST_MODE: '1',
             CELERITY_STAGING_TEST_FS_ROOT: testFsRoot,
             HOOK_LOG: hookLog,
@@ -512,7 +586,60 @@ test('precheck validates the pinned clean bundle, module artifact, compose layou
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /precheck ok/);
         assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
-        assert.match(fs.readFileSync(fixture.dockerLog, 'utf8'), /config --services/);
+        const dockerCalls = fs.readFileSync(fixture.dockerLog, 'utf8');
+        assert.match(dockerCalls, /config --quiet/);
+        assert.match(dockerCalls, /config --services/);
+        const composeEnvObservations = [...dockerCalls.matchAll(/^service-env=(.+) mode=(\d+)$/gm)];
+        assert.equal(composeEnvObservations.length, 2, dockerCalls);
+        for (const [, serviceEnv, mode] of composeEnvObservations) {
+            assert.equal(mode, '600');
+            assert.notEqual(serviceEnv, fixture.configEnv, '--env-file must not stand in for service env_file');
+            assert.equal(fs.existsSync(serviceEnv), false, 'temporary Compose .env must be cleaned up');
+        }
+        const archiveEntries = runChecked('tar', ['-tzf', fixture.bundle]).split('\n');
+        assert.equal(archiveEntries.includes('source/.env'), false, 'temporary Compose .env must not enter the source bundle');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy execute validates temporary staged Compose env without retaining or archiving it', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.executeArgs, { env: fixture.executeEnv });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /deploy ok/);
+        assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
+        assert.equal(fs.readFileSync(fixture.hookLog, 'utf8'), 'called\n');
+        assert.equal(fs.existsSync(path.join(fixture.installDir, 'obsolete.js')), false);
+        assert.equal(fs.existsSync(path.join(fixture.installDir, 'config', 'test', 'obsolete.conf')), false);
+        assert.equal(sha256(path.join(fixture.installDir, '.env')), sha256(fixture.configEnv));
+        assert.equal(fs.statSync(path.join(fixture.installDir, '.env')).mode & 0o777, 0o600);
+
+        const dockerCalls = fs.readFileSync(fixture.dockerLog, 'utf8');
+        assert.match(dockerCalls, /config --quiet/);
+        assert.match(dockerCalls, /config --services/);
+        assert.match(dockerCalls, /build backend/);
+        assert.match(dockerCalls, /up -d --no-deps backend/);
+        assert.match(dockerCalls, /ps --status running --services backend/);
+        const composeEnvObservations = [...dockerCalls.matchAll(/^service-env=(.+) mode=(\d+)$/gm)];
+        assert.equal(composeEnvObservations.length, 4, dockerCalls);
+        const installedEnv = path.join(fixture.installDir, '.env');
+        const temporaryEnvObservations = composeEnvObservations.filter(([, serviceEnv]) => serviceEnv !== installedEnv);
+        assert.equal(temporaryEnvObservations.length, 3, dockerCalls);
+        assert.equal(new Set(temporaryEnvObservations.map(([, serviceEnv]) => serviceEnv)).size, 2, dockerCalls);
+        for (const [, serviceEnv, mode] of temporaryEnvObservations) {
+            assert.equal(mode, '600');
+            assert.notEqual(serviceEnv, fixture.configEnv, '--env-file must not stand in for service env_file');
+            assert.equal(fs.existsSync(serviceEnv), false, 'temporary Compose .env must be cleaned up');
+        }
+
+        const backupDir = path.join(fixture.backupRootDir, '20260922T120000Z-aaaaaaaaaaaa');
+        const archivedSourceEntries = runChecked('tar', ['-tzf', path.join(backupDir, 'source.tar.gz')]);
+        assert.doesNotMatch(archivedSourceEntries, /(^|\/)\.env$/m);
+        const sourceBundleEntries = runChecked('tar', ['-tzf', fixture.bundle]);
+        assert.doesNotMatch(sourceBundleEntries, /^source\/\.env$/m);
     } finally {
         fixture.cleanup();
     }
