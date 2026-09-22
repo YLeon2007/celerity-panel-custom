@@ -125,8 +125,8 @@ function createTopologyTransferDraftService(dependencies) {
 }
 
 function createTopologyDeploymentService(dependencies) {
-    return require('./services/topologyDeploymentService')
-        .createTopologyDeploymentService(dependencies);
+    return require('./runtime/createTopologyOperationRuntime')
+        .createTopologyOperationRuntime(dependencies);
 }
 
 module.exports = {

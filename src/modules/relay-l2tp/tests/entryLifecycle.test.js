@@ -366,33 +366,144 @@ test('root service factory lazily composes the topology transfer draft service',
     assert.deepEqual(calls, [models]);
 });
 
-test('root factories preserve transfer registration and lazily compose deployment', () => {
+test('root deployment factory stays unavailable without the exact test runtime opt-in', async () => {
     const entry = require('..');
     assert.equal(typeof entry.createTopologyTransferDraftService, 'function');
     assert.equal(typeof entry.createTopologyDeploymentService, 'function');
 
-    const dependencies = {
-        SnapshotRepository: class SnapshotRepository {
-            async readDraft() {}
+    const calls = [];
+    const unavailable = entry.createTopologyDeploymentService({
+        env: {
+            L2TP_EXECUTION_ENABLED: 'true',
+            L2TP_MIGRATIONS_ENABLED: 'true',
         },
-        DeploymentRepository: class DeploymentRepository {
-            constructor({ snapshotReader }) {
-                this.snapshotReader = snapshotReader;
-            }
-
-            async pinTopology() {}
-
-            async markDeployed() {}
+        createTopologyOperationExecutor() {
+            calls.push('createTopologyOperationExecutor');
+            throw new Error('must not create an executor in disabled mode');
         },
-        CascadeTopologyState: {},
-        cascadeNodeDeployer: { async deployNode() {} },
-        cascadeNodeVerifier: { async verifyNode() {} },
-        cascadeNodeRestorer: { async restoreNode() {} },
-        transactionRunner: async work => work(),
+        cascadeNodeDeployer: {
+            async deployNode() {
+                calls.push('legacy.deployNode');
+            },
+        },
+        cascadeNodeVerifier: {
+            async verifyNode() {
+                calls.push('legacy.verifyNode');
+            },
+        },
+        cascadeNodeRestorer: {
+            async restoreNode() {
+                calls.push('legacy.restoreNode');
+            },
+        },
+    });
+
+    await assert.rejects(
+        unavailable.deploy({ expectedTopologyRevision: 7 }),
+        error => error?.code === 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+    );
+    assert.deepEqual(calls, []);
+});
+
+test('root deployment factory exposes only the exact opted-in queued composition', () => {
+    const entry = require('..');
+    const calls = [];
+    const executor = {
+        async prepare() {},
+        async commit() {},
+        async verify() {},
+        async cleanupPrepared() {},
+        async rollback() {},
     };
-    const service = entry.createTopologyDeploymentService(dependencies);
+    class SnapshotRepository {
+        constructor(dependencies) {
+            calls.push({ kind: 'snapshot', dependencies });
+        }
 
-    assert.equal(typeof service.deploy, 'function');
+        async readDraft() {}
+    }
+    class DeploymentRepository {
+        constructor(dependencies) {
+            calls.push({ kind: 'deployment', dependencies });
+        }
+
+        async pinTopology() {}
+
+        async markDeployed() {}
+    }
+    class PlanMaterializer {
+        constructor(dependencies) {
+            calls.push({ kind: 'materializer', dependencies });
+        }
+
+        async materialize() {}
+    }
+    class OperationRepository {
+        constructor(dependencies) {
+            calls.push({ kind: 'operationRepository', dependencies });
+        }
+
+        async createFrozen() {}
+    }
+    class OperationWorker {
+        constructor(dependencies) {
+            calls.push({ kind: 'worker', dependencies });
+        }
+
+        async run() {}
+    }
+    class Coordinator {
+        constructor(dependencies) {
+            calls.push({ kind: 'coordinator', dependencies });
+        }
+
+        async deploy() {
+            return { status: 'queued' };
+        }
+    }
+    const models = {
+        HyNode: {},
+        CascadeLink: {},
+        CascadeRouteGroup: {},
+        CascadeTopologyState: {},
+        RelayL2tpState: {},
+        TopologyOperation: {},
+    };
+
+    const service = entry.createTopologyDeploymentService({
+        ...models,
+        env: {
+            L2TP_EXECUTION_ENABLED: 'true',
+            L2TP_MIGRATIONS_ENABLED: 'true',
+            TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+        },
+        createTopologyOperationExecutor(dependencies) {
+            calls.push({ kind: 'executor', dependencies });
+            return executor;
+        },
+        SnapshotRepository,
+        DeploymentRepository,
+        PlanMaterializer,
+        OperationRepository,
+        OperationWorker,
+        Coordinator,
+        transactionRunner: async work => work(),
+        clock: { now: () => new Date('2026-09-23T00:00:00.000Z') },
+        workerId: 'entry-topology-test-worker',
+        leaseMs: 30_000,
+    });
+
+    assert.ok(service instanceof Coordinator);
+    assert.deepEqual(calls.map(call => call.kind), [
+        'snapshot',
+        'deployment',
+        'materializer',
+        'operationRepository',
+        'executor',
+        'worker',
+        'coordinator',
+    ]);
+    assert.equal(calls.some(call => call.kind === 'worker.run'), false);
 });
 
 test('registerMigrations lazily registers the ordered module migration registry', () => {

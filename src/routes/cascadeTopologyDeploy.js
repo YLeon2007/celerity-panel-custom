@@ -10,6 +10,7 @@ const relayL2tpModule = require('../modules/relay-l2tp');
 const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
 const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
 const {
     requirePanelCsrf,
 } = require('./panel/csrf');
@@ -21,6 +22,7 @@ const DEFAULT_MODELS = Object.freeze({
     CascadeRouteGroup,
     CascadeTopologyState,
     RelayL2tpState,
+    TopologyOperation,
 });
 
 const ERROR_STATUS_BY_CODE = new Map([
