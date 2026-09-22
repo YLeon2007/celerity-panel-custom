@@ -51,10 +51,22 @@ function createMinimalPrecheckFixture() {
     const configRef = path.join(root, 'worker.conf');
     const mockBin = path.join(root, 'mock-bin');
     const dockerLog = path.join(root, 'docker.log');
+    const commandLog = path.join(root, 'commands.log');
+    const dockerState = path.join(root, 'docker-state');
+    const untouchedServices = ['mongo', 'redis', 'caddy', 'updater'];
+    const untouchedState = Object.fromEntries(untouchedServices.map((service, index) => [service, {
+        id: String(index + 1).repeat(64),
+        restartCount: String(index),
+    }]));
 
     fs.mkdirSync(sourceRoot, { recursive: true });
     fs.mkdirSync(artifactStage, { recursive: true });
     fs.mkdirSync(mockBin, { recursive: true });
+    fs.mkdirSync(dockerState, { recursive: true });
+    for (const [service, state] of Object.entries(untouchedState)) {
+        fs.writeFileSync(path.join(dockerState, `${service}.id`), `${state.id}\n`);
+        fs.writeFileSync(path.join(dockerState, `${service}.restart`), `${state.restartCount}\n`);
+    }
     fs.writeFileSync(path.join(bundleStage, 'manifest.env'), [
         'schema_version=1',
         `source_commit=${sourceCommit}`,
@@ -105,6 +117,7 @@ function createMinimalPrecheckFixture() {
     fs.writeFileSync(dockerMock, [
         '#!/bin/sh',
         'printf "%s\\n" "$*" >> "$MOCK_DOCKER_LOG"',
+        '[ -z "${MOCK_COMMAND_LOG:-}" ] || printf "docker %s\\n" "$*" >> "$MOCK_COMMAND_LOG"',
         'project_directory=',
         'config_env_file=',
         'previous=',
@@ -120,26 +133,85 @@ function createMinimalPrecheckFixture() {
         '  esac',
         'done',
         'if [ "${MOCK_REQUIRE_SERVICE_ENV:-0}" = 1 ]; then',
-        'case " $* " in',
-        '  *" config --quiet "*|*" config --services "*)',
-        '    service_env_file=$project_directory/.env',
-        '    [ -f "$config_env_file" ] || exit 94',
-        '    [ -f "$service_env_file" ] || exit 95',
-        '    service_env_mode=$(stat -c %a "$service_env_file") || exit 96',
-        '    [ "$service_env_mode" = 600 ] || exit 97',
-        '    cmp -s "$config_env_file" "$service_env_file" || exit 98',
-        '    printf "service-env=%s mode=%s\\n" "$service_env_file" "$service_env_mode" >> "$MOCK_DOCKER_LOG"',
-        '    ;;',
-        'esac',
+        '  case " $* " in',
+        '    *" config --quiet "*|*" config --services "*)',
+        '      service_env_file=$project_directory/.env',
+        '      [ -f "$config_env_file" ] || exit 94',
+        '      [ -f "$service_env_file" ] || exit 95',
+        '      service_env_mode=$(stat -c %a "$service_env_file") || exit 96',
+        '      [ "$service_env_mode" = 600 ] || exit 97',
+        '      cmp -s "$config_env_file" "$service_env_file" || exit 98',
+        '      printf "service-env=%s mode=%s\\n" "$service_env_file" "$service_env_mode" >> "$MOCK_DOCKER_LOG"',
+        '      ;;',
+        '  esac',
+        'fi',
+        'if [ "${1:-}" = "inspect" ]; then',
+        '  [ "$#" -eq 4 ] || exit 96',
+        '  [ "$2" = "--format" ] || exit 96',
+        '  [ "$3" = "{{.Id}} {{.RestartCount}}" ] || exit 96',
+        '  container_id=$4',
+        '  for service in mongo redis caddy updater; do',
+        '    current_id=$(tr -d "\\n" < "$MOCK_DOCKER_STATE/$service.id")',
+        '    if [ "$container_id" = "$current_id" ]; then',
+        '      restart_count=$(tr -d "\\n" < "$MOCK_DOCKER_STATE/$service.restart")',
+        '      printf "%s %s\\n" "$current_id" "$restart_count"',
+        '      exit 0',
+        '    fi',
+        '  done',
+        '  exit 96',
         'fi',
         'case " $* " in',
         '  *" config --services "*) printf "backend\\ncaddy\\nmongo\\nredis\\nupdater\\n" ;;',
         '  *" config --quiet "*) : ;;',
         '  *" build backend "*) : ;;',
-        '  *" up -d --no-deps backend "*) : ;;',
-        '  *" ps --status running --services backend "*) printf "backend\\n" ;;',
+        '  *" up -d --no-deps backend "*)',
+        '    case "${MOCK_MUTATE_SERVICE:-}" in',
+        '      mongo|redis|caddy|updater)',
+        '        [ -z "${MOCK_AFTER_ID:-}" ] || printf "%s\\n" "$MOCK_AFTER_ID" > "$MOCK_DOCKER_STATE/$MOCK_MUTATE_SERVICE.id"',
+        '        [ -z "${MOCK_AFTER_RESTART_COUNT:-}" ] || printf "%s\\n" "$MOCK_AFTER_RESTART_COUNT" > "$MOCK_DOCKER_STATE/$MOCK_MUTATE_SERVICE.restart"',
+        '        ;;',
+        '      "") : ;;',
+        '      *) exit 96 ;;',
+        '    esac',
+        '    ;;',
+        '  *" ps --status running --services backend "*)',
+        '    if [ -n "${MOCK_BACKEND_RUNNING_OUTPUT+x}" ]; then',
+        '      printf "%s" "$MOCK_BACKEND_RUNNING_OUTPUT"',
+        '    else',
+        '      printf "backend\\n"',
+        '    fi',
+        '    ;;',
+        '  *" ps --status running --quiet "*)',
+        '    service=',
+        '    for argument in "$@"; do service=$argument; done',
+        '    case "$service" in mongo|redis|caddy|updater) ;; *) exit 96 ;; esac',
+        '    [ -s "$MOCK_DOCKER_STATE/$service.id" ] || exit 96',
+        '    cat "$MOCK_DOCKER_STATE/$service.id"',
+        '    ;;',
         '  *) exit 97 ;;',
         'esac',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    const curlMock = path.join(mockBin, 'curl');
+    fs.writeFileSync(curlMock, [
+        '#!/bin/sh',
+        'printf "curl %s\\n" "$*" >> "$MOCK_COMMAND_LOG"',
+        '[ "$#" -eq 6 ] || exit 98',
+        '[ "$1" = "--fail" ] || exit 98',
+        '[ "$2" = "--silent" ] || exit 98',
+        '[ "$3" = "--show-error" ] || exit 98',
+        '[ "$4" = "--max-time" ] || exit 98',
+        '[ "$5" = "10" ] || exit 98',
+        '[ "$6" = "https://test.infograd.online/health" ] || exit 98',
+        'exit "${MOCK_CURL_EXIT:-0}"',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    const rsyncMock = path.join(mockBin, 'rsync');
+    const realRsync = runChecked('sh', ['-c', 'command -v rsync']);
+    fs.writeFileSync(rsyncMock, [
+        '#!/bin/sh',
+        '[ -z "${MOCK_COMMAND_LOG:-}" ] || printf "rsync %s\\n" "$*" >> "$MOCK_COMMAND_LOG"',
+        'exec "$MOCK_REAL_RSYNC" "$@"',
         '',
     ].join('\n'), { mode: 0o755 });
 
@@ -151,9 +223,16 @@ function createMinimalPrecheckFixture() {
         configEnv,
         configRef,
         dockerLog,
+        commandLog,
+        dockerState,
+        untouchedServices,
+        untouchedState,
         env: {
             PATH: `${mockBin}:${process.env.PATH}`,
             MOCK_DOCKER_LOG: dockerLog,
+            MOCK_COMMAND_LOG: commandLog,
+            MOCK_DOCKER_STATE: dockerState,
+            MOCK_REAL_RSYNC: realRsync,
             MOCK_REQUIRE_SERVICE_ENV: '1',
         },
         args: [
@@ -227,23 +306,24 @@ function runDeployPlan(fixture) {
 function createDeployExecuteFixture() {
     const fixture = createMinimalPrecheckFixture();
     const testFsRoot = path.join(fixture.root, 'fs-root');
-    const installDir = path.join(testFsRoot, 'opt', 'hysteria-panel');
-    const backupRootDir = path.join(testFsRoot, 'opt', 'hysteria-panel-test-backups');
+    const installDir = path.join(testFsRoot, '/opt/hysteria-panel');
+    const backupRootDir = path.join(testFsRoot, '/opt/hysteria-panel-test-backups');
     const hookLog = path.join(fixture.root, 'mongo-dump-hook.log');
     const mongoDumpHook = path.join(fixture.root, 'mongo-dump-hook.sh');
 
     fs.mkdirSync(path.join(installDir, 'config', 'test'), { recursive: true });
+    fs.mkdirSync(backupRootDir, { recursive: true });
     fs.copyFileSync(
         path.join(fixture.root, 'bundle-stage', 'source', 'docker-compose.yml'),
         path.join(installDir, 'docker-compose.yml'),
     );
-    fs.writeFileSync(path.join(installDir, '.env'), 'OLD_SECRET=must-not-appear\n', { mode: 0o600 });
-    fs.writeFileSync(path.join(installDir, 'obsolete.js'), "'use strict';\n");
-    fs.writeFileSync(path.join(installDir, 'config', 'test', 'obsolete.conf'), 'obsolete\n');
+    fs.copyFileSync(fixture.configEnv, path.join(installDir, '.env'));
+    fs.writeFileSync(path.join(installDir, 'old.js'), "'use strict';\n");
+    fs.writeFileSync(path.join(installDir, 'config', 'test', 'old.conf'), 'old-test-config\n');
     fs.writeFileSync(mongoDumpHook, [
         '#!/bin/sh',
         'printf "called\\n" >> "$HOOK_LOG"',
-        'printf "mongo-backup-fixture\\n" > "$MONGO_DUMP_OUTPUT"',
+        'printf "mongo-backup\\n" > "$MONGO_DUMP_OUTPUT"',
         '',
     ].join('\n'), { mode: 0o755 });
 
@@ -254,13 +334,13 @@ function createDeployExecuteFixture() {
         backupRootDir,
         hookLog,
         mongoDumpHook,
-        executeArgs: [
+        deployArgs: [
             ...fixture.args,
             '--operation-id', '20260922T120000Z',
             '--mongo-dump-hook', mongoDumpHook,
             '--execute', 'true',
         ],
-        executeEnv: {
+        deployEnv: {
             ...fixture.env,
             CELERITY_STAGING_TEST_MODE: '1',
             CELERITY_STAGING_TEST_FS_ROOT: testFsRoot,
@@ -357,7 +437,6 @@ function createRollbackFixture() {
         args,
         rollbackEnv: {
             ...fixture.env,
-            MOCK_REQUIRE_SERVICE_ENV: '0',
             CELERITY_STAGING_TEST_MODE: '1',
             CELERITY_STAGING_TEST_FS_ROOT: testFsRoot,
             HOOK_LOG: hookLog,
@@ -587,59 +666,185 @@ test('precheck validates the pinned clean bundle, module artifact, compose layou
         assert.match(result.stdout, /precheck ok/);
         assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
         const dockerCalls = fs.readFileSync(fixture.dockerLog, 'utf8');
-        assert.match(dockerCalls, /config --quiet/);
         assert.match(dockerCalls, /config --services/);
-        const composeEnvObservations = [...dockerCalls.matchAll(/^service-env=(.+) mode=(\d+)$/gm)];
-        assert.equal(composeEnvObservations.length, 2, dockerCalls);
-        for (const [, serviceEnv, mode] of composeEnvObservations) {
+        const temporaryEnvs = [...dockerCalls.matchAll(/^service-env=(.+) mode=(\d+)$/gm)];
+        assert.equal(temporaryEnvs.length, 2, dockerCalls);
+        for (const [, serviceEnv, mode] of temporaryEnvs) {
             assert.equal(mode, '600');
-            assert.notEqual(serviceEnv, fixture.configEnv, '--env-file must not stand in for service env_file');
-            assert.equal(fs.existsSync(serviceEnv), false, 'temporary Compose .env must be cleaned up');
+            assert.notEqual(serviceEnv, fixture.configEnv, '--env-file must not substitute service env_file');
+            assert.equal(fs.existsSync(serviceEnv), false, 'temporary Compose env must be cleaned up');
         }
         const archiveEntries = runChecked('tar', ['-tzf', fixture.bundle]).split('\n');
-        assert.equal(archiveEntries.includes('source/.env'), false, 'temporary Compose .env must not enter the source bundle');
+        assert.equal(archiveEntries.includes('source/.env'), false, 'temporary Compose env must not enter source bundle');
     } finally {
         fixture.cleanup();
     }
 });
 
-test('deploy execute validates temporary staged Compose env without retaining or archiving it', () => {
+test('deploy execute honors the guarded isolated test filesystem', () => {
     const fixture = createDeployExecuteFixture();
     try {
-        const result = run(deployScript, fixture.executeArgs, { env: fixture.executeEnv });
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
 
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /deploy ok/);
         assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
         assert.equal(fs.readFileSync(fixture.hookLog, 'utf8'), 'called\n');
-        assert.equal(fs.existsSync(path.join(fixture.installDir, 'obsolete.js')), false);
-        assert.equal(fs.existsSync(path.join(fixture.installDir, 'config', 'test', 'obsolete.conf')), false);
-        assert.equal(sha256(path.join(fixture.installDir, '.env')), sha256(fixture.configEnv));
-        assert.equal(fs.statSync(path.join(fixture.installDir, '.env')).mode & 0o777, 0o600);
+        assert.equal(fs.existsSync(path.join(fixture.installDir, 'old.js')), false);
+    } finally {
+        fixture.cleanup();
+    }
+});
 
-        const dockerCalls = fs.readFileSync(fixture.dockerLog, 'utf8');
-        assert.match(dockerCalls, /config --quiet/);
-        assert.match(dockerCalls, /config --services/);
-        assert.match(dockerCalls, /build backend/);
-        assert.match(dockerCalls, /up -d --no-deps backend/);
-        assert.match(dockerCalls, /ps --status running --services backend/);
-        const composeEnvObservations = [...dockerCalls.matchAll(/^service-env=(.+) mode=(\d+)$/gm)];
-        assert.equal(composeEnvObservations.length, 4, dockerCalls);
-        const installedEnv = path.join(fixture.installDir, '.env');
-        const temporaryEnvObservations = composeEnvObservations.filter(([, serviceEnv]) => serviceEnv !== installedEnv);
-        assert.equal(temporaryEnvObservations.length, 3, dockerCalls);
-        assert.equal(new Set(temporaryEnvObservations.map(([, serviceEnv]) => serviceEnv)).size, 2, dockerCalls);
-        for (const [, serviceEnv, mode] of temporaryEnvObservations) {
-            assert.equal(mode, '600');
-            assert.notEqual(serviceEnv, fixture.configEnv, '--env-file must not stand in for service env_file');
-            assert.equal(fs.existsSync(serviceEnv), false, 'temporary Compose .env must be cleaned up');
+test('deploy checks public HTTPS health with fixed curl semantics after backend update', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        const backendUpdate = calls.findIndex(call => call.includes(' up -d --no-deps backend'));
+        const backendRunning = calls.findIndex(call => call.includes(' ps --status running --services backend'));
+        const publicHealth = calls.indexOf(
+            'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health',
+        );
+        assert.ok(backendUpdate >= 0, 'backend update command must be executed');
+        assert.ok(backendRunning > backendUpdate, 'backend running check must follow its update');
+        assert.ok(publicHealth > backendRunning, 'public HTTPS health must follow the backend running check');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy snapshots and rechecks untouched container identities and restart counts', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        const sourceReplacement = calls.findIndex(call => call.startsWith('rsync --archive --delete '));
+        const backendUpdate = calls.findIndex(call => call.includes(' up -d --no-deps backend'));
+        const publicHealth = calls.indexOf(
+            'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health',
+        );
+        assert.ok(sourceReplacement >= 0, 'source replacement must be executed');
+        assert.ok(backendUpdate > sourceReplacement, 'backend update must follow source replacement');
+        assert.ok(publicHealth > backendUpdate, 'public health must follow backend update');
+
+        for (const service of fixture.untouchedServices) {
+            const expected = fixture.untouchedState[service];
+            const psSuffix = ` ps --status running --quiet ${service}`;
+            const psCalls = calls
+                .map((call, index) => ({ call, index }))
+                .filter(entry => entry.call.endsWith(psSuffix));
+            const inspectCall = `docker inspect --format {{.Id}} {{.RestartCount}} ${expected.id}`;
+            const inspectCalls = calls
+                .map((call, index) => ({ call, index }))
+                .filter(entry => entry.call === inspectCall);
+
+            assert.equal(psCalls.length, 2, `${service} identity must be queried before and after`);
+            assert.equal(inspectCalls.length, 2, `${service} restart count must be inspected before and after`);
+            assert.ok(psCalls[0].index < sourceReplacement, `${service} identity must be captured before source replacement`);
+            assert.ok(inspectCalls[0].index < sourceReplacement, `${service} restart count must be captured before source replacement`);
+            assert.ok(psCalls[1].index > publicHealth, `${service} identity must be rechecked after public health`);
+            assert.ok(inspectCalls[1].index > publicHealth, `${service} restart count must be rechecked after public health`);
         }
+    } finally {
+        fixture.cleanup();
+    }
+});
 
-        const backupDir = path.join(fixture.backupRootDir, '20260922T120000Z-aaaaaaaaaaaa');
-        const archivedSourceEntries = runChecked('tar', ['-tzf', path.join(backupDir, 'source.tar.gz')]);
-        assert.doesNotMatch(archivedSourceEntries, /(^|\/)\.env$/m);
-        const sourceBundleEntries = runChecked('tar', ['-tzf', fixture.bundle]);
-        assert.doesNotMatch(sourceBundleEntries, /^source\/\.env$/m);
+test('deploy fails closed when an untouched service is missing before replacement', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        fs.writeFileSync(path.join(fixture.dockerState, 'mongo.id'), '');
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /untouched service mongo is not running/);
+        assert.doesNotMatch(result.stdout, /deploy ok/);
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8');
+        assert.doesNotMatch(calls, /^rsync /m, 'source replacement must not start without the snapshot');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy fails closed when an untouched service container identity changes', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, {
+            env: {
+                ...fixture.deployEnv,
+                MOCK_MUTATE_SERVICE: 'mongo',
+                MOCK_AFTER_ID: '9'.repeat(64),
+            },
+        });
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /untouched service mongo container identity changed/);
+        assert.doesNotMatch(result.stdout, /deploy ok/);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy fails closed when an untouched service restart count changes', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, {
+            env: {
+                ...fixture.deployEnv,
+                MOCK_MUTATE_SERVICE: 'updater',
+                MOCK_AFTER_RESTART_COUNT: '4',
+            },
+        });
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /untouched service updater restart count changed/);
+        assert.doesNotMatch(result.stdout, /deploy ok/);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy fails closed unless the running service result is exactly backend', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, {
+            env: { ...fixture.deployEnv, MOCK_BACKEND_RUNNING_OUTPUT: 'backend\nmongo\n' },
+        });
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /backend is not reported running after deploy/);
+        assert.doesNotMatch(result.stdout, /deploy ok/);
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8');
+        assert.doesNotMatch(calls, /^curl /m, 'public request must not run after the backend gate fails');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy fails closed when the public HTTPS health request fails', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const result = run(deployScript, fixture.deployArgs, {
+            env: { ...fixture.deployEnv, MOCK_CURL_EXIT: '22' },
+        });
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /public HTTPS health validation failed/);
+        assert.doesNotMatch(result.stdout, /deploy ok/);
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        for (const service of fixture.untouchedServices) {
+            const psSuffix = ` ps --status running --quiet ${service}`;
+            assert.equal(
+                calls.filter(call => call.endsWith(psSuffix)).length,
+                1,
+                `${service} post-check must not run after public health fails`,
+            );
+        }
     } finally {
         fixture.cleanup();
     }
@@ -673,6 +878,8 @@ test('deploy plan is deterministic, backs up source config and Mongo, and scopes
         assert.match(first.stdout, /backup_steps=source,config,mongo/);
         assert.match(first.stdout, /container_build=backend/);
         assert.match(first.stdout, /container_restart=backend --no-deps/);
+        assert.match(first.stdout, /untouched_services=mongo,redis,caddy,updater/);
+        assert.match(first.stdout, /untouched_verification=container-id,restart-count/);
         assert.match(first.stdout, /node_mutation=none/);
         assert.match(first.stdout, /health_template=.*ps backend/);
         assert.doesNotMatch(first.stdout, /must-not-appear/);

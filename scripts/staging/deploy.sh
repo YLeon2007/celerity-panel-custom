@@ -107,6 +107,8 @@ print_plan() {
         "config_destinations=$destinations" \
         "container_build=$CELERITY_APP_SERVICE" \
         "container_restart=$CELERITY_APP_SERVICE --no-deps" \
+        'untouched_services=mongo,redis,caddy,updater' \
+        'untouched_verification=container-id,restart-count' \
         'node_mutation=none' \
         "health_template=docker compose --project-directory $install_root --env-file $install_root/.env -f $install_root/$CELERITY_COMPOSE_FILE ps $CELERITY_APP_SERVICE" \
         "health_template=curl --fail --silent --show-error --max-time 10 https://$CELERITY_TEST_HOST/health"
@@ -117,18 +119,19 @@ if [[ "$mode" == 'plan' ]]; then
     exit 0
 fi
 
-install_root_identity=$install_root
-backup_root_identity=$backup_root
-install_root=$(resolve_control_path "$install_root")
-backup_root=$(resolve_control_path "$backup_root")
-backup_dir="$backup_root/$backup_id"
-
-[[ -d "$install_root" && ! -L "$install_root" ]] \
+install_root_path=$(resolve_control_path "$install_root")
+[[ -d "$install_root_path" && ! -L "$install_root_path" ]] \
     || fail "install root must already be the real $CELERITY_INSTALL_ROOT directory"
-[[ -f "$install_root/$CELERITY_COMPOSE_FILE" && ! -L "$install_root/$CELERITY_COMPOSE_FILE" ]] \
+install_root_path=$(cd -- "$install_root_path" && pwd -P)
+expected_install_root_path=$(resolve_control_path "$install_root")
+expected_install_parent=$(cd -- "$(dirname -- "$expected_install_root_path")" && pwd -P)
+[[ "$install_root_path" == "$expected_install_parent/$(basename -- "$install_root")" ]] \
+    || fail 'install root resolved outside the guarded test path'
+[[ -f "$install_root_path/$CELERITY_COMPOSE_FILE" && ! -L "$install_root_path/$CELERITY_COMPOSE_FILE" ]] \
     || fail 'installed Compose file must be a regular file'
-[[ -f "$install_root/.env" && ! -L "$install_root/.env" ]] \
+[[ -f "$install_root_path/.env" && ! -L "$install_root_path/.env" ]] \
     || fail 'installed .env must be a regular file'
+backup_root_path=$(resolve_control_path "$backup_root")
 command -v rsync >/dev/null 2>&1 || fail 'rsync is required for exact source replacement'
 
 runtime_root=$(mktemp -d)
@@ -139,6 +142,63 @@ cleanup() {
 }
 trap cleanup EXIT
 staged_source="$runtime_root/source"
+
+untouched_services=(mongo redis caddy updater)
+declare -A untouched_container_ids=()
+declare -A untouched_restart_counts=()
+current_untouched_container_id=''
+current_untouched_restart_count=''
+
+read_untouched_service_state() {
+    local service=$1
+    local container_ref
+    local inspected_state
+    local inspected_id
+    local restart_count
+    local unexpected
+
+    if ! container_ref=$("${compose[@]}" ps --status running --quiet "$service" 2>/dev/null); then
+        fail "untouched service $service is not running"
+    fi
+    [[ "$container_ref" =~ ^[0-9a-f]{12,64}$ ]] \
+        || fail "untouched service $service must have exactly one running container"
+    if ! inspected_state=$(docker inspect \
+        --format '{{.Id}} {{.RestartCount}}' \
+        "$container_ref" 2>/dev/null); then
+        fail "untouched service $service container state is unavailable"
+    fi
+    [[ "$inspected_state" != *$'\n'* ]] \
+        || fail "untouched service $service container state is invalid"
+    read -r inspected_id restart_count unexpected <<< "$inspected_state"
+    [[ "$inspected_id" =~ ^[0-9a-f]{64}$ \
+        && "$restart_count" =~ ^[0-9]+$ \
+        && -z "$unexpected" \
+        && "$inspected_id" == "$container_ref"* ]] \
+        || fail "untouched service $service container state is invalid"
+    current_untouched_container_id=$inspected_id
+    current_untouched_restart_count=$restart_count
+}
+
+capture_untouched_service_states() {
+    local service
+    for service in "${untouched_services[@]}"; do
+        read_untouched_service_state "$service"
+        untouched_container_ids[$service]=$current_untouched_container_id
+        untouched_restart_counts[$service]=$current_untouched_restart_count
+    done
+}
+
+verify_untouched_service_states() {
+    local service
+    for service in "${untouched_services[@]}"; do
+        read_untouched_service_state "$service"
+        [[ "$current_untouched_container_id" == "${untouched_container_ids[$service]}" ]] \
+            || fail "untouched service $service container identity changed"
+        [[ "$current_untouched_restart_count" == "${untouched_restart_counts[$service]}" ]] \
+            || fail "untouched service $service restart count changed"
+    done
+}
+
 python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --source-bundle "$source_bundle" \
     --module-artifact "$module_artifact" \
@@ -162,15 +222,17 @@ staged_compose=(
 "${staged_compose[@]}" config --quiet >/dev/null 2>&1 \
     || fail 'staged Compose preflight failed'
 
-mkdir -p -m 0700 -- "$backup_root"
-[[ -d "$backup_root" && ! -L "$backup_root" ]] || fail 'backup root must not be a symlink'
-lock_dir="$backup_root/.deploy-lock"
+mkdir -p -m 0700 -- "$backup_root_path"
+[[ -d "$backup_root_path" && ! -L "$backup_root_path" ]] || fail 'backup root must not be a symlink'
+backup_root_path=$(cd -- "$backup_root_path" && pwd -P)
+backup_dir_path="$backup_root_path/$backup_id"
+lock_dir="$backup_root_path/.deploy-lock"
 mkdir -- "$lock_dir" 2>/dev/null || fail 'another staging control operation is active'
-[[ ! -e "$backup_dir" ]] || fail 'timestamped backup destination already exists'
-mkdir -m 0700 -- "$backup_dir"
-printf 'incomplete\n' > "$backup_dir/STATE"
+[[ ! -e "$backup_dir_path" ]] || fail 'timestamped backup destination already exists'
+mkdir -m 0700 -- "$backup_dir_path"
+printf 'incomplete\n' > "$backup_dir_path/STATE"
 
-source_archive="$backup_dir/source.tar.gz"
+source_archive="$backup_dir_path/source.tar.gz"
 tar \
     --sort=name \
     --format=posix \
@@ -186,12 +248,12 @@ tar \
     --exclude='./logs' \
     --exclude='./backups' \
     --exclude='./greenlock.d' \
-    -C "$install_root" \
+    -C "$install_root_path" \
     -czf "$source_archive" \
     .
-install -m 0600 -- "$install_root/.env" "$backup_dir/config.env"
+install -m 0600 -- "$install_root_path/.env" "$backup_dir_path/config.env"
 config_test_present='false'
-if [[ -d "$install_root/config/test" && ! -L "$install_root/config/test" ]]; then
+if [[ -d "$install_root_path/config/test" && ! -L "$install_root_path/config/test" ]]; then
     config_test_present='true'
     tar \
         --sort=name \
@@ -200,17 +262,17 @@ if [[ -d "$install_root/config/test" && ! -L "$install_root/config/test" ]]; the
         --owner=0 \
         --group=0 \
         --numeric-owner \
-        -C "$install_root/config" \
-        -czf "$backup_dir/config-test.tar.gz" \
+        -C "$install_root_path/config" \
+        -czf "$backup_dir_path/config-test.tar.gz" \
         test
-elif [[ -e "$install_root/config/test" ]]; then
+elif [[ -e "$install_root_path/config/test" ]]; then
     fail 'installed config/test must be a real directory when present'
 fi
 
-mongo_dump_output="$backup_dir/mongo.archive.gz"
-if ! BACKUP_DIR="$backup_dir" \
+mongo_dump_output="$backup_dir_path/mongo.archive.gz"
+if ! BACKUP_DIR="$backup_dir_path" \
     MONGO_DUMP_OUTPUT="$mongo_dump_output" \
-    INSTALL_ROOT="$install_root" \
+    INSTALL_ROOT="$install_root_path" \
     COMPOSE_FILE="$CELERITY_COMPOSE_FILE" \
     APP_SERVICE="$CELERITY_APP_SERVICE" \
     "$mongo_dump_hook" >/dev/null 2>&1; then
@@ -220,12 +282,12 @@ fi
     || fail 'Mongo dump hook did not create a non-empty regular archive'
 chmod 0600 "$mongo_dump_output"
 
-cat > "$backup_dir/backup-manifest.env" <<EOF
+cat > "$backup_dir_path/backup-manifest.env" <<EOF
 schema_version=1
 target=$target
 host_identity=$host_identity
-install_root=$install_root_identity
-backup_root=$backup_root_identity
+install_root=$install_root
+backup_root=$backup_root
 backup_id=$backup_id
 operation_id=$operation_id
 compose_file=$CELERITY_COMPOSE_FILE
@@ -235,12 +297,20 @@ deployed_source_tree=$expected_source_tree
 config_test_present=$config_test_present
 EOF
 (
-    cd -- "$backup_dir"
+    cd -- "$backup_dir_path"
     checksum_files=(backup-manifest.env config.env mongo.archive.gz source.tar.gz)
     [[ "$config_test_present" == 'false' ]] || checksum_files+=(config-test.tar.gz)
     sha256sum --binary -- "${checksum_files[@]}" > SHA256SUMS
 )
-printf 'complete\n' > "$backup_dir/STATE"
+printf 'complete\n' > "$backup_dir_path/STATE"
+
+compose=(
+    docker compose
+    --project-directory "$install_root_path"
+    --env-file "$install_root_path/.env"
+    -f "$install_root_path/$CELERITY_COMPOSE_FILE"
+)
+capture_untouched_service_states
 
 rsync \
     --archive \
@@ -253,20 +323,20 @@ rsync \
     --exclude='logs/' \
     --exclude='backups/' \
     --exclude='greenlock.d/' \
-    "$staged_source/" "$install_root/"
-install -m 0600 -- "$config_env_file" "$install_root/.env"
-rm -rf -- "$install_root/config/test"
+    "$staged_source/" "$install_root_path/"
+install -m 0600 -- "$config_env_file" "$install_root_path/.env"
+rm -rf -- "$install_root_path/config/test"
 if ((${#config_file_refs[@]})); then
-    mkdir -p -m 0700 -- "$install_root/config/test"
+    mkdir -p -m 0700 -- "$install_root_path/config/test"
 fi
 for config_ref in "${config_file_refs[@]}"; do
     destination=${config_ref%%=*}
     local_file=${config_ref#*=}
-    destination_path="$install_root/$destination"
+    destination_path="$install_root_path/$destination"
     mkdir -p -m 0700 -- "$(dirname -- "$destination_path")"
     install -m 0600 -- "$local_file" "$destination_path"
 done
-cat > "$install_root/.celerity-staging-source.env" <<EOF
+cat > "$install_root_path/.celerity-staging-source.env" <<EOF
 source_commit=$expected_source_commit
 source_tree=$expected_source_tree
 source_bundle_sha256=$source_bundle_sha256
@@ -274,14 +344,8 @@ module_artifact_sha256=$module_artifact_sha256
 target=test
 host_identity=$CELERITY_TEST_HOST
 EOF
-chmod 0644 "$install_root/.celerity-staging-source.env"
+chmod 0644 "$install_root_path/.celerity-staging-source.env"
 
-compose=(
-    docker compose
-    --project-directory "$install_root"
-    --env-file "$install_root/.env"
-    -f "$install_root/$CELERITY_COMPOSE_FILE"
-)
 "${compose[@]}" config --quiet >/dev/null 2>&1 \
     || fail 'installed Compose validation failed'
 "${compose[@]}" build "$CELERITY_APP_SERVICE"
@@ -290,8 +354,17 @@ running_services=$("${compose[@]}" ps --status running --services "$CELERITY_APP
     || fail 'backend health validation failed'
 [[ "$running_services" == "$CELERITY_APP_SERVICE" ]] \
     || fail 'backend is not reported running after deploy'
+if ! curl \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 10 \
+    "https://$CELERITY_TEST_HOST/health" >/dev/null; then
+    fail 'public HTTPS health validation failed'
+fi
+verify_untouched_service_states
 
 printf '%s\n' \
     'deploy ok' \
     "backup_dir=$backup_dir" \
-    "backup_manifest_sha256=$(sha256_file "$backup_dir/backup-manifest.env")"
+    "backup_manifest_sha256=$(sha256_file "$backup_dir_path/backup-manifest.env")"
