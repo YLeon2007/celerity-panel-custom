@@ -29,6 +29,7 @@ const HyUser = require('./src/models/hyUserModel');
 const HyNode = require('./src/models/hyNodeModel');
 const backupService = require('./src/services/backupService');
 const homepageService = require('./src/services/homepageService');
+const { createL2tpRootLifecycle } = require('./src/modules/l2tpRuntimeLifecycleHook');
 
 const usersRoutes = require('./src/routes/users');
 const nodesRoutes = require('./src/routes/nodes');
@@ -44,6 +45,7 @@ const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
 const helmet = require('helmet');
 const app = express();
+const l2tpRootLifecycle = createL2tpRootLifecycle();
 
 app.set('trust proxy', 1);
 
@@ -505,6 +507,8 @@ async function startServer() {
     try {
         await connectMongo();
         logger.info('[MongoDB] Connected');
+
+        l2tpRootLifecycle.startAfterDatabase();
         
         await cacheService.connect();
 
@@ -1171,6 +1175,7 @@ async function shutdown(signal) {
     await Promise.all(
         activeServers.map(s => new Promise(resolve => s.close(resolve)))
     );
+    await l2tpRootLifecycle.stop();
     if (cacheService.isConnected()) {
         await cacheService.redis.quit().catch(() => {});
     }

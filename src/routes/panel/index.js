@@ -90,6 +90,7 @@ const router = createPanelRouter();
 Object.defineProperties(router, {
     createPanelRouter: { value: createPanelRouter },
     exposePanelCsrfToken: { value: exposePanelCsrfToken },
+    l2tpRateLimiter: { value: l2tpRateLimiter },
     renderL2tpPage: { value: renderL2tpPage },
 });
 
