@@ -1,0 +1,349 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
+const test = require('node:test');
+
+const {
+    LINK_METADATA_FILTER,
+    LINK_METADATA_SELECT,
+    NODE_METADATA_FILTER,
+    NODE_METADATA_SELECT,
+    TEST_TOPOLOGY_HOST_IDENTITY,
+    TEST_TOPOLOGY_TARGET,
+    TopologyOperationPlanMaterializer,
+} = require('../services/topologyOperationPlanMaterializer');
+
+const SECRET_CANARIES = Object.freeze([
+    'node-ssh-password-canary',
+    'node-private-key-canary',
+    'node-config-secret-canary',
+    'link-tunnel-uuid-canary',
+    'link-private-key-canary',
+    'raw-command-canary',
+]);
+
+function createReadModel(rows, label) {
+    const calls = [];
+    const writes = [];
+    const rejectWrite = method => async (...args) => {
+        writes.push({ method, args });
+        assert.fail(`${label}.${method} must not be called`);
+    };
+    return {
+        calls,
+        writes,
+        find(filter) {
+            calls.push({ method: 'find', filter });
+            return {
+                select(paths) {
+                    calls.push({ method: 'select', paths });
+                    return this;
+                },
+                async lean() {
+                    calls.push({ method: 'lean' });
+                    return structuredClone(rows);
+                },
+            };
+        },
+        create: rejectWrite('create'),
+        updateOne: rejectWrite('updateOne'),
+        findOneAndUpdate: rejectWrite('findOneAndUpdate'),
+        deleteOne: rejectWrite('deleteOne'),
+    };
+}
+
+function pinnedSnapshot() {
+    return {
+        revision: 17,
+        topology: {
+            nodes: [
+                { id: 'relay-1', role: 'relay', password: SECRET_CANARIES[0] },
+                { id: 'bridge-1', role: 'bridge', command: SECRET_CANARIES[5] },
+                { id: 'portal-1', role: 'portal', privateKey: SECRET_CANARIES[1] },
+            ],
+            links: [
+                {
+                    id: 'relay-bridge',
+                    source: 'relay-1',
+                    target: 'bridge-1',
+                    mode: 'reverse',
+                    tunnelUuid: SECRET_CANARIES[3],
+                },
+                {
+                    id: 'portal-relay',
+                    source: 'portal-1',
+                    target: 'relay-1',
+                    mode: 'reverse',
+                    rawCommand: SECRET_CANARIES[5],
+                },
+            ],
+            groups: [{ secret: SECRET_CANARIES[2], shell: SECRET_CANARIES[5] }],
+        },
+        compiled: {
+            valid: true,
+            errors: [],
+            relays: [{
+                nodeId: 'relay-1',
+                routeGroups: [{ secret: SECRET_CANARIES[2], command: SECRET_CANARIES[5] }],
+            }],
+            generatedConfig: SECRET_CANARIES[2],
+        },
+        ssh: { password: SECRET_CANARIES[0] },
+    };
+}
+
+function metadataRows() {
+    return {
+        nodes: [
+            {
+                _id: 'bridge-1',
+                cascadeRole: 'bridge',
+                ssh: { privateKey: SECRET_CANARIES[1], password: SECRET_CANARIES[0] },
+            },
+            {
+                _id: 'portal-1',
+                cascadeRole: 'portal',
+                customConfig: SECRET_CANARIES[2],
+            },
+            {
+                _id: 'relay-1',
+                cascadeRole: 'relay',
+                initScript: SECRET_CANARIES[5],
+            },
+        ],
+        links: [
+            {
+                _id: 'portal-relay',
+                portalNode: 'portal-1',
+                bridgeNode: 'relay-1',
+                mode: 'reverse',
+                tunnelPort: 12001,
+                tunnelUuid: SECRET_CANARIES[3],
+            },
+            {
+                _id: 'relay-bridge',
+                portalNode: 'relay-1',
+                bridgeNode: 'bridge-1',
+                mode: 'reverse',
+                tunnelPort: 12002,
+                realityPrivateKey: SECRET_CANARIES[4],
+            },
+        ],
+    };
+}
+
+function createMaterializer(rows = metadataRows()) {
+    const HyNode = createReadModel(rows.nodes, 'HyNode');
+    const CascadeLink = createReadModel(rows.links, 'CascadeLink');
+    return {
+        HyNode,
+        CascadeLink,
+        materializer: new TopologyOperationPlanMaterializer({ HyNode, CascadeLink }),
+    };
+}
+
+function isDeepFrozen(value) {
+    if (value === null || typeof value !== 'object') return true;
+    return Object.isFrozen(value) && Object.values(value).every(isDeepFrozen);
+}
+
+test('materializes one deterministic frozen test plan from allowlisted snapshot reads', async () => {
+    const { HyNode, CascadeLink, materializer } = createMaterializer();
+
+    const plan = await materializer.materialize({
+        target: 'test',
+        hostIdentity: 'test.infograd.online',
+        pinnedSnapshot: pinnedSnapshot(),
+    });
+
+    assert.equal(TEST_TOPOLOGY_TARGET, 'test');
+    assert.equal(TEST_TOPOLOGY_HOST_IDENTITY, 'test.infograd.online');
+    assert.equal(isDeepFrozen(plan), true);
+    assert.deepEqual(Object.keys(plan).sort(), ['mode', 'nodes', 'schemaVersion']);
+    assert.deepEqual(plan.nodes.map(node => node.nodeRef), ['portal', 'relay-1', 'bridge']);
+    assert.deepEqual(plan.nodes.map(node => node.role), ['portal', 'relay', 'bridge']);
+    for (const node of plan.nodes) {
+        const bytes = Buffer.from(node.candidate.bytes);
+        assert.equal(node.candidate.sha256, createHash('sha256').update(bytes).digest('hex'));
+    }
+
+    const serialized = JSON.stringify(plan);
+    for (const secret of SECRET_CANARIES) assert.equal(serialized.includes(secret), false);
+    assert.doesNotMatch(
+        serialized,
+        /password|privateKey|configSecret|tunnelUuid|rawCommand|command|shell|ssh/i,
+    );
+
+    assert.deepEqual(HyNode.calls, [
+        {
+            method: 'find',
+            filter: {
+                ...NODE_METADATA_FILTER,
+                _id: { $in: ['bridge-1', 'portal-1', 'relay-1'] },
+            },
+        },
+        { method: 'select', paths: NODE_METADATA_SELECT },
+        { method: 'lean' },
+    ]);
+    assert.deepEqual(CascadeLink.calls, [
+        {
+            method: 'find',
+            filter: {
+                ...LINK_METADATA_FILTER,
+                _id: { $in: ['portal-relay', 'relay-bridge'] },
+            },
+        },
+        { method: 'select', paths: LINK_METADATA_SELECT },
+        { method: 'lean' },
+    ]);
+    assert.deepEqual(HyNode.writes, []);
+    assert.deepEqual(CascadeLink.writes, []);
+
+    await Promise.resolve();
+    assert.equal(HyNode.calls.filter(call => call.method === 'find').length, 1);
+    assert.equal(CascadeLink.calls.filter(call => call.method === 'find').length, 1);
+});
+
+test('sanitizes metadata read failures without returning database or secret details', async () => {
+    const secret = 'database-password-canary';
+    const HyNode = createReadModel(metadataRows().nodes, 'HyNode');
+    const CascadeLink = {
+        find() {
+            return {
+                select() {
+                    return this;
+                },
+                async lean() {
+                    throw new Error(`database unavailable: ${secret}`);
+                },
+            };
+        },
+    };
+    const materializer = new TopologyOperationPlanMaterializer({ HyNode, CascadeLink });
+
+    await assert.rejects(
+        materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: pinnedSnapshot(),
+        }),
+        error => {
+            assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
+            assert.equal(error.code, 'TOPOLOGY_METADATA_READ_FAILED');
+            assert.equal(error.message, 'Pinned topology metadata could not be loaded');
+            assert.equal(Object.hasOwn(error, 'cause'), false);
+            assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+            return true;
+        },
+    );
+    assert.deepEqual(HyNode.writes, []);
+});
+
+test('rejects missing, unsafe, non-test, and invalid role identities before metadata reads', async () => {
+    const cases = [
+        {
+            name: 'missing target',
+            input: { target: undefined, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            code: 'UNSAFE_TOPOLOGY_TARGET',
+        },
+        {
+            name: 'non-test target',
+            input: { target: 'production', hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            code: 'UNSAFE_TOPOLOGY_TARGET',
+        },
+        {
+            name: 'missing host identity',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: undefined },
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
+        },
+        {
+            name: 'coercible host identity',
+            input: {
+                target: TEST_TOPOLOGY_TARGET,
+                hostIdentity: { toString: () => TEST_TOPOLOGY_HOST_IDENTITY },
+            },
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
+        },
+        {
+            name: 'non-test host identity',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: 'panel.infograd.online' },
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
+        },
+        {
+            name: 'missing node role',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                delete snapshot.topology.nodes[0].role;
+            },
+            code: 'UNSAFE_TOPOLOGY_NODE_ROLE',
+        },
+        {
+            name: 'non-topology node role',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                snapshot.topology.nodes[0].role = 'standalone';
+            },
+            code: 'UNSAFE_TOPOLOGY_NODE_ROLE',
+        },
+        {
+            name: 'duplicate portal role topology',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                snapshot.topology.nodes.find(node => node.role === 'relay').role = 'portal';
+            },
+            code: 'INVALID_TOPOLOGY_ROLES',
+        },
+    ];
+
+    for (const testCase of cases) {
+        const snapshot = pinnedSnapshot();
+        testCase.mutate?.(snapshot);
+        const { HyNode, CascadeLink, materializer } = createMaterializer();
+        await assert.rejects(
+            materializer.materialize({ ...testCase.input, pinnedSnapshot: snapshot }),
+            error => {
+                assert.equal(error.code, testCase.code, testCase.name);
+                assert.doesNotMatch(error.message, /production|panel\.infograd|standalone/i);
+                return true;
+            },
+        );
+        assert.deepEqual(HyNode.calls, [], testCase.name);
+        assert.deepEqual(CascadeLink.calls, [], testCase.name);
+    }
+});
+
+test('normalizes pinned and hydrated row order into identical composer inputs and plan hashes', async () => {
+    const firstRows = metadataRows();
+    const secondRows = metadataRows();
+    secondRows.nodes.reverse();
+    secondRows.links.reverse();
+    const first = createMaterializer(firstRows);
+    const second = createMaterializer(secondRows);
+    const firstSnapshot = pinnedSnapshot();
+    const secondSnapshot = pinnedSnapshot();
+    secondSnapshot.topology.nodes.reverse();
+    secondSnapshot.topology.links.reverse();
+    secondSnapshot.compiled.relays.reverse();
+
+    const [firstPlan, secondPlan] = await Promise.all([
+        first.materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: firstSnapshot,
+        }),
+        second.materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: secondSnapshot,
+        }),
+    ]);
+
+    assert.deepEqual(secondPlan, firstPlan);
+    assert.deepEqual(
+        secondPlan.nodes.map(node => node.candidate.sha256),
+        firstPlan.nodes.map(node => node.candidate.sha256),
+    );
+    assert.deepEqual(second.HyNode.calls, first.HyNode.calls);
+    assert.deepEqual(second.CascadeLink.calls, first.CascadeLink.calls);
+});
