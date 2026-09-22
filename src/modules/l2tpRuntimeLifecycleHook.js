@@ -1,6 +1,9 @@
 'use strict';
 
 const {
+    createL2tpMigrationBootstrap,
+} = require('./l2tpMigrationBootstrap');
+const {
     createL2tpStartupLifecycle,
 } = require('./createL2tpStartupLifecycle');
 const {
@@ -183,29 +186,39 @@ function createL2tpRootHostDependencies({
 
 function createL2tpRootLifecycle({
     env = process.env,
+    createMigrationBootstrap = createL2tpMigrationBootstrap,
     createHostDependencies = createL2tpRootHostDependencies,
     createRuntimeLifecycleHook = createL2tpRuntimeLifecycleHook,
     activeHostProvider = l2tpActiveHostProvider,
 } = {}) {
     let lifecycle;
+    let startPromise;
     let stopPromise;
 
     return {
         startAfterDatabase() {
-            if (lifecycle === undefined) {
-                lifecycle = createRuntimeLifecycleHook({
-                    env,
-                    createHostDependencies,
-                    activeHostProvider,
+            if (startPromise === undefined) {
+                startPromise = Promise.resolve().then(async () => {
+                    const migrationBootstrap = createMigrationBootstrap({ env });
+                    await migrationBootstrap.run();
+                    lifecycle = createRuntimeLifecycleHook({
+                        env,
+                        createHostDependencies,
+                        activeHostProvider,
+                    });
+                    return lifecycle;
                 });
             }
-            return lifecycle;
+            return startPromise;
         },
         stop() {
             if (stopPromise === undefined) {
-                stopPromise = lifecycle === undefined
+                stopPromise = startPromise === undefined
                     ? Promise.resolve()
-                    : Promise.resolve().then(() => lifecycle.stop());
+                    : startPromise.then(
+                        () => lifecycle.stop(),
+                        () => undefined,
+                    );
             }
             return stopPromise;
         },

@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
@@ -140,7 +142,7 @@ test('enabled mode forwards factory dependencies and starts the lifecycle once',
     ]);
 });
 
-test('root lifecycle starts only after the database boundary and stops its retained handle once', async () => {
+test('root lifecycle awaits migrations once after the database boundary before runtime startup', async () => {
     const calls = [];
     const lifecycle = {
         async stop() {
@@ -150,6 +152,21 @@ test('root lifecycle starts only after the database boundary and stops its retai
     };
     const rootLifecycle = createL2tpRootLifecycle({
         env: { L2TP_EXECUTION_ENABLED: 'false' },
+        createMigrationBootstrap(options) {
+            calls.push({ kind: 'createMigrationBootstrap', options });
+            return {
+                async run() {
+                    calls.push('migrate');
+                    return {
+                        enabled: false,
+                        ran: false,
+                        steps: [],
+                        appliedMigrationIds: [],
+                        skippedMigrationIds: [],
+                    };
+                },
+            };
+        },
         createHostDependencies() {
             throw new Error('disabled root lifecycle must not construct dependencies');
         },
@@ -160,22 +177,93 @@ test('root lifecycle starts only after the database boundary and stops its retai
     });
 
     assert.deepEqual(calls, []);
-    assert.strictEqual(rootLifecycle.startAfterDatabase(), lifecycle);
-    assert.strictEqual(rootLifecycle.startAfterDatabase(), lifecycle);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].kind, 'create');
+    const firstStart = rootLifecycle.startAfterDatabase();
+    const secondStart = rootLifecycle.startAfterDatabase();
+    assert.strictEqual(firstStart, secondStart);
+    assert.strictEqual(await firstStart, lifecycle);
+    assert.strictEqual(await secondStart, lifecycle);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].kind, 'createMigrationBootstrap');
     assert.deepEqual(calls[0].options.env, { L2TP_EXECUTION_ENABLED: 'false' });
-    assert.equal(typeof calls[0].options.createHostDependencies, 'function');
+    assert.equal(calls[1], 'migrate');
+    assert.equal(calls[2].kind, 'create');
+    assert.deepEqual(calls[2].options.env, { L2TP_EXECUTION_ENABLED: 'false' });
+    assert.equal(typeof calls[2].options.createHostDependencies, 'function');
 
     const firstStop = rootLifecycle.stop();
     const secondStop = rootLifecycle.stop();
     assert.strictEqual(firstStop, secondStop);
     assert.deepEqual(await firstStop, { stopped: true });
     assert.deepEqual(await secondStop, { stopped: true });
-    assert.deepEqual(calls.map(call => call.kind ?? call), ['create', 'stop']);
+    assert.deepEqual(
+        calls.map(call => call.kind ?? call),
+        ['createMigrationBootstrap', 'migrate', 'create', 'stop'],
+    );
 });
 
-test('root lifecycle propagates invalid enable configuration before creating dependencies', () => {
+test('application startup awaits the post-database L2TP lifecycle boundary', () => {
+    const rootEntrySource = fs.readFileSync(path.resolve(__dirname, '../../../index.js'), 'utf8');
+
+    assert.match(
+        rootEntrySource,
+        /await\s+l2tpRootLifecycle\.startAfterDatabase\(\);/,
+    );
+});
+
+test('enabled migration failure blocks runtime creation, worker start, and active host publication', async () => {
+    const migrationError = new Error('module migration failed');
+    let migrationRuns = 0;
+    let lifecycleCreations = 0;
+    let workerStarts = 0;
+    let activeHost = null;
+    const activeHostProvider = {
+        installActiveHost(host) {
+            activeHost = host;
+        },
+        getActiveHost() {
+            return activeHost;
+        },
+    };
+    const rootLifecycle = createL2tpRootLifecycle({
+        env: {
+            L2TP_EXECUTION_ENABLED: 'true',
+            L2TP_MIGRATIONS_ENABLED: 'true',
+        },
+        activeHostProvider,
+        createMigrationBootstrap() {
+            return {
+                async run() {
+                    migrationRuns += 1;
+                    throw migrationError;
+                },
+            };
+        },
+        createHostDependencies() {
+            workerStarts += 1;
+            return {};
+        },
+        createRuntimeLifecycleHook() {
+            lifecycleCreations += 1;
+            workerStarts += 1;
+            activeHostProvider.installActiveHost({ active: true });
+            return { async stop() {} };
+        },
+    });
+
+    const firstStart = rootLifecycle.startAfterDatabase();
+    const secondStart = rootLifecycle.startAfterDatabase();
+    assert.strictEqual(firstStart, secondStart);
+    await assert.rejects(firstStart, error => error === migrationError);
+    await assert.rejects(secondStart, error => error === migrationError);
+
+    assert.equal(migrationRuns, 1);
+    assert.equal(lifecycleCreations, 0);
+    assert.equal(workerStarts, 0);
+    assert.equal(activeHostProvider.getActiveHost(), null);
+    assert.equal(await rootLifecycle.stop(), undefined);
+});
+
+test('root lifecycle propagates invalid enable configuration before creating dependencies', async () => {
     let dependencyConstructions = 0;
     const rootLifecycle = createL2tpRootLifecycle({
         env: { L2TP_EXECUTION_ENABLED: 'yes' },
@@ -185,8 +273,8 @@ test('root lifecycle propagates invalid enable configuration before creating dep
         },
     });
 
-    assert.throws(
-        () => rootLifecycle.startAfterDatabase(),
+    await assert.rejects(
+        rootLifecycle.startAfterDatabase(),
         /L2TP_EXECUTION_ENABLED must be exactly "true" or "false"/,
     );
     assert.equal(dependencyConstructions, 0);

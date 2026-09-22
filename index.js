@@ -508,7 +508,7 @@ async function startServer() {
         await connectMongo();
         logger.info('[MongoDB] Connected');
 
-        l2tpRootLifecycle.startAfterDatabase();
+        await l2tpRootLifecycle.startAfterDatabase();
         
         await cacheService.connect();
 
