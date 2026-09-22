@@ -44,6 +44,46 @@ class L2tpOperationRepository {
         return result.matchedCount === 1;
     }
 
+    /**
+     * Atomically marks a claimed operation successful only while `owner` still
+     * owns its running, unexpired lease at `now`. On success, `now` is also the
+     * terminal timestamp and the supplied journal entry is appended.
+     *
+     * @param {object} input
+     * @param {*} input.operationId Durable operation identity.
+     * @param {string} input.owner Expected lease owner.
+     * @param {Date} input.now Lease-fence time and persisted `finishedAt`.
+     * @param {string} input.step Final verified step.
+     * @param {object} input.journal Sanitized terminal journal entry.
+     * @returns {Promise<boolean>} `true` when the CAS transition matched;
+     * `false` when ownership, status, lease validity, or identity did not match.
+     */
+    async succeedClaimed({ operationId, owner, now, step, journal }) {
+        const result = await this.model.updateOne({
+            _id: operationId,
+            status: 'running',
+            leaseOwner: owner,
+            leaseUntil: { $gt: now },
+        }, {
+            $set: {
+                status: 'succeeded',
+                step,
+                progress: 100,
+                errorCode: '',
+                errorMessage: '',
+                finishedAt: now,
+            },
+            $push: {
+                logs: {
+                    $each: [journal],
+                    $slice: -100,
+                },
+            },
+        }, { runValidators: true });
+
+        return result.matchedCount === 1;
+    }
+
     async recordStep({ operationId, step, progress, journal }) {
         return this.model.updateOne({ _id: operationId }, {
             $set: { step, progress },

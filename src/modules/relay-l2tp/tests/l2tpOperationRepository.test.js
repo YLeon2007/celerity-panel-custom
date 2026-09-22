@@ -23,6 +23,37 @@ function createModel(result = null) {
     };
 }
 
+function createCasModel(operation) {
+    const calls = [];
+    const document = { logs: [], ...operation };
+
+    return {
+        calls,
+        document,
+        async updateOne(query, update, options) {
+            calls.push({ method: 'updateOne', query, update, options });
+            const matches = query._id === document._id
+                && (query.status === undefined || query.status === document.status)
+                && (query.leaseOwner === undefined || query.leaseOwner === document.leaseOwner)
+                && (
+                    query.leaseUntil === undefined
+                    || document.leaseUntil > query.leaseUntil.$gt
+                );
+            if (!matches) {
+                return { acknowledged: true, matchedCount: 0, modifiedCount: 0 };
+            }
+
+            Object.assign(document, update.$set);
+            const pushedLogs = update.$push?.logs;
+            if (pushedLogs) {
+                document.logs.push(...pushedLogs.$each);
+                document.logs = document.logs.slice(pushedLogs.$slice);
+            }
+            return { acknowledged: true, matchedCount: 1, modifiedCount: 1 };
+        },
+    };
+}
+
 test('claimNext query excludes running operations with unexpired foreign leases', async () => {
     const claimedOperation = { _id: 'operation-1', status: 'running' };
     const model = createModel(claimedOperation);
@@ -98,6 +129,112 @@ test('renewLease extends only the current unexpired lease owned by the running w
         },
         options: { runValidators: true },
     }]);
+});
+
+test('succeedClaimed marks the currently claimed operation succeeded', async () => {
+    const journal = {
+        at: NOW,
+        level: 'info',
+        code: 'L2TP_OPERATION_SUCCEEDED',
+        message: 'L2TP operation succeeded after verification',
+    };
+    const model = createCasModel({
+        _id: 'operation-1',
+        status: 'running',
+        leaseOwner: 'worker-1',
+        leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+        errorCode: 'OLD_ERROR',
+        errorMessage: 'old error',
+    });
+    const repository = new L2tpOperationRepository({ model });
+
+    const succeeded = await repository.succeedClaimed({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        now: NOW,
+        step: 'verify',
+        journal,
+    });
+
+    assert.equal(succeeded, true);
+    assert.deepEqual(model.document, {
+        _id: 'operation-1',
+        status: 'succeeded',
+        leaseOwner: 'worker-1',
+        leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+        step: 'verify',
+        progress: 100,
+        errorCode: '',
+        errorMessage: '',
+        finishedAt: NOW,
+        logs: [journal],
+    });
+});
+
+test('succeedClaimed rejects a stale owner after the lease changes hands', async () => {
+    const operation = {
+        _id: 'operation-1',
+        status: 'running',
+        leaseOwner: 'worker-2',
+        leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+    };
+    const model = createCasModel(operation);
+    const repository = new L2tpOperationRepository({ model });
+
+    const succeeded = await repository.succeedClaimed({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        now: NOW,
+        step: 'verify',
+        journal: { at: NOW, level: 'info', code: 'SUCCEEDED', message: 'done' },
+    });
+
+    assert.equal(succeeded, false);
+    assert.deepEqual(model.document, { logs: [], ...operation });
+});
+
+test('succeedClaimed rejects a lease that has expired at the CAS time', async () => {
+    const operation = {
+        _id: 'operation-1',
+        status: 'running',
+        leaseOwner: 'worker-1',
+        leaseUntil: NOW,
+    };
+    const model = createCasModel(operation);
+    const repository = new L2tpOperationRepository({ model });
+
+    const succeeded = await repository.succeedClaimed({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        now: NOW,
+        step: 'verify',
+        journal: { at: NOW, level: 'info', code: 'SUCCEEDED', message: 'done' },
+    });
+
+    assert.equal(succeeded, false);
+    assert.deepEqual(model.document, { logs: [], ...operation });
+});
+
+test('succeedClaimed rejects an operation outside the running status', async () => {
+    const operation = {
+        _id: 'operation-1',
+        status: 'rolling_back',
+        leaseOwner: 'worker-1',
+        leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+    };
+    const model = createCasModel(operation);
+    const repository = new L2tpOperationRepository({ model });
+
+    const succeeded = await repository.succeedClaimed({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        now: NOW,
+        step: 'verify',
+        journal: { at: NOW, level: 'info', code: 'SUCCEEDED', message: 'done' },
+    });
+
+    assert.equal(succeeded, false);
+    assert.deepEqual(model.document, { logs: [], ...operation });
 });
 
 test('recordStep atomically stores progress and appends a bounded journal entry', async () => {
