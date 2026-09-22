@@ -13,6 +13,7 @@ const LIFECYCLE_EXPORTS = [
     'registerMigrations',
     'registerConfigFragments',
     'registerRoutes',
+    'createTopologyTransferDraftService',
 ];
 
 test('imports the lifecycle entry without loading runtime integrations', () => {
@@ -292,6 +293,7 @@ test('registerModels returns the module model constructors without a registry ho
         'TopologyOperation',
         'NodeOperationLock',
         'RelayL2tpMigrationState',
+        'RelayL2tpTopologyTransferDraft',
     ]);
 });
 
@@ -316,6 +318,7 @@ test('registerModels registers and returns the exact module model constructors',
         'TopologyOperation',
         'NodeOperationLock',
         'RelayL2tpMigrationState',
+        'RelayL2tpTopologyTransferDraft',
     ];
     const expectedModels = {
         RelayL2tpState: require('../models/relayL2tpStateModel'),
@@ -326,6 +329,7 @@ test('registerModels registers and returns the exact module model constructors',
         TopologyOperation: require('../models/topologyOperationModel'),
         NodeOperationLock: require('../models/nodeOperationLockModel'),
         RelayL2tpMigrationState: require('../models/relayL2tpMigrationStateModel'),
+        RelayL2tpTopologyTransferDraft: require('../models/relayL2tpTopologyTransferDraftModel'),
     };
 
     assert.deepEqual(Object.keys(models), expectedNames);
@@ -334,6 +338,31 @@ test('registerModels registers and returns the exact module model constructors',
     }
     assert.deepEqual(registrations, Object.entries(expectedModels));
     assert.equal(mongoose.connection.readyState, connectionStateBefore);
+});
+
+test('root service factory lazily composes the topology transfer draft service', () => {
+    const models = {
+        HyNode: {},
+        CascadeLink: {},
+        CascadeRouteGroup: {},
+        RelayL2tpState: {},
+        RelayL2tpTopologyTransferDraft: {},
+    };
+    const calls = [];
+    class Repository {
+        constructor(dependencies) {
+            calls.push(dependencies);
+        }
+    }
+
+    const service = require('..').createTopologyTransferDraftService({
+        ...models,
+        Repository,
+    });
+
+    assert.equal(typeof service.exportCurrentTopology, 'function');
+    assert.equal(typeof service.importTopologyDraft, 'function');
+    assert.deepEqual(calls, [models]);
 });
 
 test('registerMigrations lazily registers the ordered module migration registry', () => {

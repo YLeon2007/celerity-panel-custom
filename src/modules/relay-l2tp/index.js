@@ -18,6 +18,7 @@ function registerModels({ modelRegistry } = {}) {
         TopologyOperation: require('./models/topologyOperationModel'),
         NodeOperationLock: require('./models/nodeOperationLockModel'),
         RelayL2tpMigrationState: require('./models/relayL2tpMigrationStateModel'),
+        RelayL2tpTopologyTransferDraft: require('./models/relayL2tpTopologyTransferDraftModel'),
     };
 
     if (modelRegistry) {
@@ -118,6 +119,11 @@ function registerRoutes(context) {
     panelRouter.use('/', l2tpRouter);
 }
 
+function createTopologyTransferDraftService(dependencies) {
+    return require('./services/topologyTransferDraftService')
+        .createTopologyTransferDraftService(dependencies);
+}
+
 module.exports = {
     manifest,
     validateHost,
@@ -125,4 +131,5 @@ module.exports = {
     registerMigrations,
     registerConfigFragments,
     registerRoutes,
+    createTopologyTransferDraftService,
 };
