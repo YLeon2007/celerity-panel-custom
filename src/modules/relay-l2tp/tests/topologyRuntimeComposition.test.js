@@ -5,6 +5,7 @@ const test = require('node:test');
 
 const {
     REQUIRED_TEST_RUNTIME_FLAGS,
+    createTopologyOperationExecutor,
     createTopologyOperationRuntime,
     isTopologyTestExecutionEnabled,
 } = require('../runtime/createTopologyOperationRuntime');
@@ -22,6 +23,9 @@ const {
     TEST_TOPOLOGY_TARGET,
     TopologyOperationPlanMaterializer,
 } = require('../services/topologyOperationPlanMaterializer');
+const {
+    TopologyOperationExecutor,
+} = require('../services/topologyOperationExecutor');
 const {
     TopologyOperationCoordinator,
 } = require('../services/topologyOperationCoordinator');
@@ -56,7 +60,7 @@ function modelWith(methodNames, calls) {
 function compositionDependencies(calls = []) {
     return {
         env: ENABLED_ENV,
-        HyNode: modelWith(['find'], calls),
+        HyNode: modelWith(['find', 'findById'], calls),
         CascadeLink: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeRouteGroup: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate'], calls),
@@ -106,6 +110,22 @@ test('test topology runtime requires all three exact opt-in flags', async () => 
     ];
 
     for (const env of disabledEnvironments) {
+        let resolverCapabilityReads = 0;
+        const guardedHyNode = {};
+        Object.defineProperty(guardedHyNode, 'findById', {
+            get() {
+                resolverCapabilityReads += 1;
+                throw new Error('default executor factory must remain disabled');
+            },
+        });
+        const defaultService = createTopologyOperationRuntime({
+            env,
+            HyNode: guardedHyNode,
+            NodeSSH: class FakeNodeSSH {},
+        });
+        await assertUnavailable(defaultService);
+        assert.equal(resolverCapabilityReads, 0, JSON.stringify(env));
+
         let executorFactoryCalls = 0;
         let workerConstructions = 0;
         const service = createTopologyOperationRuntime({
@@ -127,9 +147,49 @@ test('test topology runtime requires all three exact opt-in flags', async () => 
     }
 });
 
-test('enabled composition requires a synchronous typed executor factory and fails closed', async () => {
+test('default typed executor factory only constructs the fixed test contour', () => {
+    const HyNode = modelWith(['findById'], []);
+    class FakeNodeSSH {}
+
+    const executor = createTopologyOperationExecutor({
+        HyNode,
+        NodeSSH: FakeNodeSSH,
+        target: TEST_TOPOLOGY_TARGET,
+        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+    });
+
+    assert.ok(executor instanceof TopologyOperationExecutor);
+    for (const contour of [
+        { target: 'production', hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+        { target: TEST_TOPOLOGY_TARGET, hostIdentity: 'panel.infograd.online' },
+        { target: TEST_TOPOLOGY_TARGET, hostIdentity: undefined },
+    ]) {
+        assert.equal(createTopologyOperationExecutor({
+            HyNode,
+            NodeSSH: FakeNodeSSH,
+            ...contour,
+        }), undefined);
+    }
+});
+
+test('enabled composition builds the real typed executor with the injected NodeSSH adapter', () => {
+    const calls = [];
+    const dependencies = compositionDependencies(calls);
+    class FakeNodeSSH {}
+
+    const service = createTopologyOperationRuntime({
+        ...dependencies,
+        NodeSSH: FakeNodeSSH,
+    });
+
+    assert.ok(service instanceof TopologyOperationCoordinator);
+    assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
+    assert.deepEqual(calls, []);
+});
+
+test('enabled composition rejects invalid typed executor factory overrides and fails closed', async () => {
     for (const createTopologyOperationExecutor of [
-        undefined,
+        null,
         () => undefined,
         () => ({}),
         () => Promise.resolve(typedExecutor([])),

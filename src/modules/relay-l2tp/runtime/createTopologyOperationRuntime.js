@@ -10,6 +10,15 @@ const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
 const {
+    TopologyNodeExecutionResolver,
+} = require('../services/topologyNodeExecutionResolver');
+const {
+    TopologyNodeTransportFactory,
+} = require('../services/topologyNodeTransportFactory');
+const {
+    TopologyOperationExecutor,
+} = require('../services/topologyOperationExecutor');
+const {
     TEST_TOPOLOGY_HOST_IDENTITY,
     TEST_TOPOLOGY_TARGET,
     TopologyOperationPlanMaterializer,
@@ -20,6 +29,9 @@ const {
 const {
     unavailableTopologyDeploymentService,
 } = require('../services/topologyDeploymentService');
+const {
+    TopologyRunnerBootstrapper,
+} = require('../services/topologyRunnerBootstrapper');
 const {
     TopologyOperationWorker,
 } = require('../workers/topologyOperationWorker');
@@ -56,6 +68,33 @@ function optional(value, name) {
     return value === undefined ? {} : { [name]: value };
 }
 
+function createTopologyOperationExecutor({
+    HyNode,
+    NodeSSH,
+    hostIdentity,
+    target,
+} = {}) {
+    if (target !== TEST_TOPOLOGY_TARGET
+        || hostIdentity !== TEST_TOPOLOGY_HOST_IDENTITY) {
+        return undefined;
+    }
+    const NodeSSHAdapter = NodeSSH === undefined
+        ? require('../../../services/nodeSSH')
+        : NodeSSH;
+    const nodeExecutionResolver = new TopologyNodeExecutionResolver({
+        HyNode,
+        NodeSSH: NodeSSHAdapter,
+        target,
+        hostIdentity,
+    });
+    return new TopologyOperationExecutor({
+        target,
+        nodeExecutionResolver,
+        NodeTransportFactory: TopologyNodeTransportFactory,
+        RunnerBootstrapper: TopologyRunnerBootstrapper,
+    });
+}
+
 function createTopologyOperationRuntime(dependencies = {}) {
     if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
         return unavailableTopologyDeploymentService;
@@ -69,7 +108,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
         CascadeTopologyState,
         RelayL2tpState,
         TopologyOperation,
-        createTopologyOperationExecutor,
+        NodeSSH,
+        createTopologyOperationExecutor: executorFactoryOverride,
         transactionRunner,
         clock = DEFAULT_CLOCK,
         workerId = `topology-test-${process.pid}`,
@@ -86,8 +126,14 @@ function createTopologyOperationRuntime(dependencies = {}) {
         onWorkerError,
     } = dependencies;
 
+    const executorFactory = executorFactoryOverride === undefined
+        ? executorDependencies => createTopologyOperationExecutor({
+            ...executorDependencies,
+            NodeSSH,
+        })
+        : executorFactoryOverride;
     if (!isTopologyTestExecutionEnabled(env)
-        || typeof createTopologyOperationExecutor !== 'function') {
+        || typeof executorFactory !== 'function') {
         return unavailableTopologyDeploymentService;
     }
 
@@ -107,7 +153,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         });
         const planMaterializer = new PlanMaterializer({ HyNode, CascadeLink });
         const operationRepository = new OperationRepository({ model: TopologyOperation });
-        const executor = createTopologyOperationExecutor(Object.freeze({
+        const executor = executorFactory(Object.freeze({
             HyNode,
             hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
             target: TEST_TOPOLOGY_TARGET,
@@ -141,6 +187,7 @@ module.exports = {
     DEFAULT_LEASE_MS,
     EXECUTOR_METHODS,
     REQUIRED_TEST_RUNTIME_FLAGS,
+    createTopologyOperationExecutor,
     createTopologyOperationRuntime,
     isTopologyTestExecutionEnabled,
     isTypedExecutor,
