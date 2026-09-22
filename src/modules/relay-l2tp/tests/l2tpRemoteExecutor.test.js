@@ -153,7 +153,7 @@ test('maps every install-plan step to its same-name allowlisted command', async 
     );
 });
 
-test('standalone sync_users uploads exact transient desired users then syncs and verifies', async () => {
+test('standalone sync_users uploads exact transient desired users and records only a verifier expectation', async () => {
     const calls = [];
     const secret = 'standalone-sync-secret-canary';
     const content = JSON.stringify({
@@ -210,17 +210,12 @@ test('standalone sync_users uploads exact transient desired users then syncs and
             method: 'runArtifactCommand',
             request: { operationId: 'operation-standalone-users', command: 'sync-users' },
         },
-        {
-            method: 'runArtifactCommand',
-            request: {
-                operationId: 'operation-standalone-users',
-                command: 'verify-users',
-                expectedCredentialRevision: 42,
-                expectedEnabledUserCount: 1,
-            },
-        },
     ]);
-    assert.deepEqual(result, verifierResult);
+    assert.deepEqual(result, {
+        ok: true,
+        operationId: 'operation-standalone-users',
+        step: 'sync_users',
+    });
     assert.doesNotMatch(JSON.stringify({ result, commands: calls.slice(1) }), new RegExp(secret));
 });
 
@@ -278,7 +273,7 @@ test('verify_users maps to the fixed verifier command with the cached typed expe
     assert.doesNotMatch(JSON.stringify({ calls, result }), /verify-step-secret/);
 });
 
-test('standalone sync_users returns a strict sanitized mismatch attestation', async () => {
+test('verify_users returns a strict sanitized mismatch attestation', async () => {
     const mismatch = {
         ok: false,
         credentialRevision: 42,
@@ -295,12 +290,13 @@ test('standalone sync_users returns a strict sanitized mismatch attestation', as
         },
     });
 
-    const result = await executor.executeStep({
-        operation: {
-            id: 'operation-user-mismatch',
-            kind: 'sync_users',
-            plan: { desired: { credentialRevision: 42 } },
-        },
+    const operation = {
+        id: 'operation-user-mismatch',
+        kind: 'sync_users',
+        plan: { desired: { credentialRevision: 42 } },
+    };
+    await executor.executeStep({
+        operation,
         step: {
             type: 'sync_users',
             artifacts: [{
@@ -315,6 +311,7 @@ test('standalone sync_users returns a strict sanitized mismatch attestation', as
             }],
         },
     });
+    const result = await executor.executeStep({ operation, step: { type: 'verify_users' } });
 
     assert.deepEqual(result, mismatch);
     assert.doesNotMatch(JSON.stringify(result), /mismatch-secret/);
@@ -435,18 +432,20 @@ test('standalone sync_users rejects untrusted verifier results without leaking t
             },
         };
         const executor = new L2tpRemoteExecutor({ transport });
+        const operation = {
+            id: 'operation-untrusted-verifier',
+            kind: 'sync_users',
+            plan: { desired: { credentialRevision: 42 } },
+        };
+        await executor.executeStep({
+            operation,
+            step: {
+                type: 'sync_users',
+                artifacts: [{ type: 'desired', path: 'desired.json', content: desiredContent }],
+            },
+        });
         await assert.rejects(
-            executor.executeStep({
-                operation: {
-                    id: 'operation-untrusted-verifier',
-                    kind: 'sync_users',
-                    plan: { desired: { credentialRevision: 42 } },
-                },
-                step: {
-                    type: 'sync_users',
-                    artifacts: [{ type: 'desired', path: 'desired.json', content: desiredContent }],
-                },
-            }),
+            executor.executeStep({ operation, step: { type: 'verify_users' } }),
             error => {
                 assert.equal(error.name, 'L2tpRemoteExecutorError');
                 assert.equal(error.code, 'USER_VERIFICATION_INVALID');

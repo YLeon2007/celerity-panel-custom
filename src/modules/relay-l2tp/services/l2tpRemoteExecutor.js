@@ -411,14 +411,6 @@ class L2tpRemoteExecutor {
         if (step.type === 'verify_users') {
             return sanitizeUserVerificationResult(commandResult, verificationExpectation);
         }
-        if (step.type === 'sync_users' && operation.kind === 'sync_users') {
-            const verifierResult = await runArtifactCommand(transport, {
-                operationId,
-                command: 'verify-users',
-                ...desiredExpectation,
-            });
-            return sanitizeUserVerificationResult(verifierResult, desiredExpectation);
-        }
 
         return {
             ok: true,
