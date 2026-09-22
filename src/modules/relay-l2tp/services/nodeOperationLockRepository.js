@@ -51,6 +51,15 @@ class NodeOperationLockRepository {
         return result.matchedCount === 1;
     }
 
+    async deleteOwned({ node, owner, operationId }) {
+        const result = await this.model.deleteOne({
+            node,
+            owner,
+            operationId,
+        });
+        return result.deletedCount === 1;
+    }
+
     async deleteByNode(node) {
         const result = await this.model.deleteOne({ node });
         return result.deletedCount === 1;

@@ -107,12 +107,13 @@ class NodeOperationLockService {
     }
 
     async release({ node, owner, operationId }) {
-        const currentLock = await this.repository.findByNode(node);
-        const ownsLock = currentLock
-            && String(currentLock.owner) === String(owner)
-            && String(currentLock.operationId) === String(operationId);
+        const released = await this.repository.deleteOwned({
+            node,
+            owner,
+            operationId,
+        });
 
-        if (!ownsLock) {
+        if (!released) {
             return {
                 ok: false,
                 error: {
@@ -121,8 +122,6 @@ class NodeOperationLockService {
                 },
             };
         }
-
-        await this.repository.deleteByNode(node);
 
         return {
             ok: true,

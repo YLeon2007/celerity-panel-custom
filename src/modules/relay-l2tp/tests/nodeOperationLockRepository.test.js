@@ -55,7 +55,11 @@ test('adapts the lock model to the concrete lock-service repository contract', a
         now: new Date('2026-09-22T12:00:00.000Z'),
         leaseUntil: new Date('2026-09-22T12:02:00.000Z'),
     }), true);
-    assert.equal(await repository.deleteByNode('node-a'), true);
+    assert.equal(await repository.deleteOwned({
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+    }), true);
 
     assert.deepEqual(calls, [
         { method: 'findOne', filter: { node: 'node-a' } },
@@ -87,11 +91,18 @@ test('adapts the lock model to the concrete lock-service repository contract', a
             update: { $set: { leaseUntil: new Date('2026-09-22T12:02:00.000Z') } },
             options: { runValidators: true },
         },
-        { method: 'deleteOne', filter: { node: 'node-a' } },
+        {
+            method: 'deleteOne',
+            filter: {
+                node: 'node-a',
+                owner: 'worker-a',
+                operationId: 'operation-a',
+            },
+        },
     ]);
 });
 
-test('reports unmatched renewals and deletions without model objects in results', async () => {
+test('reports unmatched renewals and owned deletions without model objects in results', async () => {
     const model = {
         async updateOne() { return { matchedCount: 0 }; },
         async deleteOne() { return { deletedCount: 0 }; },
@@ -105,5 +116,9 @@ test('reports unmatched renewals and deletions without model objects in results'
         now: new Date('2026-09-22T12:00:00.000Z'),
         leaseUntil: new Date('2026-09-22T12:01:00.000Z'),
     }), false);
-    assert.equal(await repository.deleteByNode('node-a'), false);
+    assert.equal(await repository.deleteOwned({
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+    }), false);
 });

@@ -37,9 +37,16 @@ function createRepository(initialLocks = []) {
             lock.leaseUntil = request.leaseUntil;
             return true;
         },
-        async deleteByNode(node) {
-            calls.push({ method: 'deleteByNode', node });
-            return locks.delete(String(node));
+        async deleteOwned(request) {
+            calls.push({ method: 'deleteOwned', request: { ...request } });
+            const lock = locks.get(String(request.node));
+            const matches = lock
+                && String(lock.owner) === String(request.owner)
+                && String(lock.operationId) === String(request.operationId);
+            if (!matches) return false;
+
+            locks.delete(String(request.node));
+            return true;
         },
     };
 }
@@ -218,10 +225,71 @@ test('release removes a lease for the matching owner and operation', async () =>
         code: RESULT_CODES.RELEASED,
         node: 'node-a',
     });
-    assert.deepEqual(repository.calls.at(-1), {
-        method: 'deleteByNode',
+    assert.deepEqual(repository.calls, [{
+        method: 'deleteOwned',
+        request: {
+            node: 'node-a',
+            owner: 'worker-a',
+            operationId: 'operation-a',
+        },
+    }]);
+});
+
+test('release cannot delete a successor that replaces the predecessor before deletion', async () => {
+    const predecessor = {
         node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
+    };
+    const successor = {
+        node: 'node-a',
+        owner: 'worker-b',
+        operationId: 'operation-b',
+        leaseUntil: new Date('2026-09-21T12:02:00.000Z'),
+    };
+    let currentLock = { ...predecessor };
+    const calls = [];
+    const repository = {
+        async findByNode(node) {
+            calls.push({ method: 'findByNode', node });
+            const observedLock = currentLock;
+            currentLock = { ...successor };
+            return observedLock;
+        },
+        async deleteByNode(node) {
+            calls.push({ method: 'deleteByNode', node });
+            if (!currentLock || String(currentLock.node) !== String(node)) return false;
+            currentLock = null;
+            return true;
+        },
+        async deleteOwned(request) {
+            calls.push({ method: 'deleteOwned', request: { ...request } });
+            currentLock = { ...successor };
+            const matches = String(currentLock.node) === String(request.node)
+                && String(currentLock.owner) === String(request.owner)
+                && String(currentLock.operationId) === String(request.operationId);
+            if (matches) currentLock = null;
+            return matches;
+        },
+    };
+    const service = createService(repository);
+
+    const result = await service.release({
+        node: predecessor.node,
+        owner: predecessor.owner,
+        operationId: predecessor.operationId,
     });
+
+    assert.equal(calls.some(call => call.method === 'findByNode'), false);
+    assert.deepEqual(result, {
+        ok: false,
+        error: {
+            code: RESULT_CODES.NOT_OWNED,
+            node: 'node-a',
+        },
+    });
+    assert.deepEqual(currentLock, successor);
 });
 
 test('release leaves a lease untouched unless owner and operation both match', async t => {
@@ -261,10 +329,20 @@ test('release leaves a lease untouched unless owner and operation both match', a
                     node: 'node-a',
                 },
             });
-            assert.equal(
-                repository.calls.some(call => call.method === 'deleteByNode'),
-                false,
-            );
+            assert.deepEqual(repository.calls, [{
+                method: 'deleteOwned',
+                request: {
+                    node: 'node-a',
+                    owner: releaseRequest.owner,
+                    operationId: releaseRequest.operationId,
+                },
+            }]);
+            assert.deepEqual(await repository.findByNode('node-a'), {
+                node: 'node-a',
+                owner: 'worker-a',
+                operationId: 'operation-a',
+                leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
+            });
         });
     }
 });
