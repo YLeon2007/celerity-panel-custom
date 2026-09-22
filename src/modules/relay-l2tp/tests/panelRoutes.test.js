@@ -103,6 +103,49 @@ test('GET L2TP page requires completed onboarding before loading panel data', as
     assert.equal(overviewCalls, 0);
 });
 
+test('GET L2TP page renders route groups with the session-bound CSRF token', async () => {
+    const calls = [];
+    const router = createRouter({
+        l2tpService: {},
+        requireAuth(req, res, next) {
+            calls.push('requireAuth');
+            res.locals.csrfToken = 'session-bound-token';
+            next();
+        },
+        requireOnboarding(req, res, next) {
+            calls.push('requireOnboarding');
+            next();
+        },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        async loadPanelOverview() {
+            calls.push('loadPanelOverview');
+            return {
+                csrfToken: 'overview-must-not-override-session-token',
+                routeGroups: [{
+                    id: 'group-1',
+                    name: 'Primary route',
+                    mode: 'reverse',
+                    strategy: 'priority-failover',
+                    paths: [],
+                }],
+                relays: [],
+                operations: [],
+                topologyRevision: 7,
+            };
+        },
+    });
+
+    const response = await request(router, { path: '/l2tp' });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.title, 'L2TP');
+    assert.equal(response.body.page, 'l2tp');
+    assert.equal(response.body.csrfToken, 'session-bound-token');
+    assert.equal(response.body.routeGroups[0].strategy, 'priority-failover');
+    assert.deepEqual(calls, ['requireAuth', 'requireOnboarding', 'loadPanelOverview']);
+});
+
 test('all L2TP status and operation routes require completed onboarding', async () => {
     let serviceCalls = 0;
     const serviceMethod = async () => {

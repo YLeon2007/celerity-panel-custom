@@ -212,10 +212,10 @@ function createL2tpRouter({
         try {
             const overview = await loadPanelOverview();
             renderPage(res, {
+                ...overview,
                 title: 'L2TP',
                 page: 'l2tp',
                 csrfToken: res.locals.csrfToken,
-                ...overview,
             });
         } catch (error) {
             res.status(500).send('Internal server error');

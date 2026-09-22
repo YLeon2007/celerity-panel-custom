@@ -5,6 +5,75 @@
     </div>
 </section>
 
+<section class="card" data-l2tp-route-groups>
+    <h2>Route groups</h2>
+    <p class="muted">Priority failover across explicit, ordered cascade links.</p>
+    <form data-route-group-form>
+        <input type="hidden" name="routeGroupId" value="">
+        <label>Name
+            <input type="text" name="name" maxlength="128" required>
+        </label>
+        <label>Mode
+            <select name="mode" required>
+                <option value="reverse">Reverse</option>
+                <option value="forward">Forward</option>
+            </select>
+        </label>
+        <label>Strategy
+            <input type="text" value="priority-failover" readonly aria-readonly="true">
+        </label>
+        <div data-route-group-paths>
+            <fieldset class="card" data-route-group-path-row>
+                <legend>Path</legend>
+                <label>Path key
+                    <input type="text" name="pathKey" maxlength="64" required>
+                </label>
+                <label>Ordered link IDs
+                    <input type="text" name="linkIds" required placeholder="link id, link id">
+                </label>
+                <label>Priority
+                    <input type="number" name="priority" step="any" required>
+                </label>
+                <button type="button" data-route-group-action="remove-path">Remove path</button>
+            </fieldset>
+        </div>
+        <div class="form-actions">
+            <button type="button" data-route-group-action="add-path">Add path</button>
+            <button type="submit" data-route-group-action="save">Create group</button>
+            <button type="button" data-route-group-action="cancel" hidden>Cancel edit</button>
+        </div>
+        <output data-route-group-result aria-live="polite"></output>
+    </form>
+    <p class="muted" data-route-group-empty><%= routeGroups && routeGroups.length ? 'Loading route groups…' : 'No route groups.' %></p>
+    <div data-route-group-list></div>
+    <template data-route-group-path-template>
+        <fieldset class="card" data-route-group-path-row>
+            <legend>Path</legend>
+            <label>Path key
+                <input type="text" name="pathKey" maxlength="64" required>
+            </label>
+            <label>Ordered link IDs
+                <input type="text" name="linkIds" required placeholder="link id, link id">
+            </label>
+            <label>Priority
+                <input type="number" name="priority" step="any" required>
+            </label>
+            <button type="button" data-route-group-action="remove-path">Remove path</button>
+        </fieldset>
+    </template>
+    <template data-route-group-item-template>
+        <article class="card" data-route-group-item>
+            <h3 data-route-group-name></h3>
+            <p data-route-group-summary></p>
+            <ul data-route-group-path-list></ul>
+            <div class="form-actions">
+                <button type="button" data-route-group-action="edit">Edit</button>
+                <button type="button" data-route-group-action="remove">Remove</button>
+            </div>
+        </article>
+    </template>
+</section>
+
 <section class="card">
     <h2>Relay nodes</h2>
     <% if (!relays || relays.length === 0) { %>
@@ -116,6 +185,18 @@
 <script>
 (() => {
     const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
+    const ROUTE_GROUPS_URL = '/api/cascade/route-groups';
+    const ROUTE_GROUP_STRATEGY = 'priority-failover';
+    const routeGroupRoot = document.querySelector('[data-l2tp-route-groups]');
+    const routeGroupForm = routeGroupRoot.querySelector('[data-route-group-form]');
+    const routeGroupPaths = routeGroupRoot.querySelector('[data-route-group-paths]');
+    const routeGroupPathTemplate = routeGroupRoot.querySelector('[data-route-group-path-template]');
+    const routeGroupItemTemplate = routeGroupRoot.querySelector('[data-route-group-item-template]');
+    const routeGroupList = routeGroupRoot.querySelector('[data-route-group-list]');
+    const routeGroupEmpty = routeGroupRoot.querySelector('[data-route-group-empty]');
+    const routeGroupOutput = routeGroupRoot.querySelector('[data-route-group-result]');
+    const routeGroupSave = routeGroupRoot.querySelector('[data-route-group-action="save"]');
+    const routeGroupCancel = routeGroupRoot.querySelector('[data-route-group-action="cancel"]');
 
     function setResult(output, value) {
         output.textContent = value;
@@ -164,6 +245,251 @@
             return await response.json();
         } catch {
             return {};
+        }
+    }
+
+    function routeGroupError(code) {
+        const error = new Error(code);
+        error.code = code;
+        return error;
+    }
+
+    function buildRouteGroupPayload(form) {
+        const name = String(form.elements.name.value || '').trim();
+        const mode = String(form.elements.mode.value || '');
+        if (!name || name.length > 128) throw routeGroupError('INVALID_ROUTE_GROUP_NAME');
+        if (!['reverse', 'forward'].includes(mode)) throw routeGroupError('INVALID_ROUTE_GROUP_MODE');
+
+        const rows = [...form.querySelectorAll('[data-route-group-path-row]')];
+        if (rows.length === 0 || rows.length > 32) {
+            throw routeGroupError('INVALID_ROUTE_GROUP_PATHS');
+        }
+        const paths = rows.map((row) => {
+            const pathKey = String(row.querySelector('[name="pathKey"]').value || '').trim();
+            const linkIds = String(row.querySelector('[name="linkIds"]').value || '')
+                .split(',')
+                .map(linkId => linkId.trim())
+                .filter(Boolean);
+            const priority = Number(row.querySelector('[name="priority"]').value);
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pathKey)) {
+                throw routeGroupError('INVALID_ROUTE_GROUP_PATH_KEY');
+            }
+            if (
+                linkIds.length === 0
+                || linkIds.length > 32
+                || linkIds.some(linkId => !/^[a-fA-F0-9]{24}$/.test(linkId))
+                || new Set(linkIds).size !== linkIds.length
+            ) {
+                throw routeGroupError('INVALID_ROUTE_GROUP_LINK_IDS');
+            }
+            if (!Number.isFinite(priority) || priority <= 0) {
+                throw routeGroupError('INVALID_ROUTE_GROUP_PRIORITY');
+            }
+            return {
+                pathKey,
+                linkIds,
+                priority,
+            };
+        });
+        if (new Set(paths.map(path => path.pathKey)).size !== paths.length) {
+            throw routeGroupError('DUPLICATE_ROUTE_GROUP_PATH_KEY');
+        }
+        if (new Set(paths.map(path => path.priority)).size !== paths.length) {
+            throw routeGroupError('DUPLICATE_ROUTE_GROUP_PRIORITY');
+        }
+        return {
+            name,
+            mode,
+            strategy: ROUTE_GROUP_STRATEGY,
+            paths,
+        };
+    }
+
+    function routeGroupUrl(routeGroupId) {
+        return routeGroupId
+            ? `${ROUTE_GROUPS_URL}/${encodeURIComponent(routeGroupId)}`
+            : ROUTE_GROUPS_URL;
+    }
+
+    function safeRequestError(response, result, fallback) {
+        if (response.status === 401) return 'SESSION_REQUIRED';
+        if (response.status === 403) return 'REQUEST_FORBIDDEN';
+        if (response.status === 429) return 'RATE_LIMITED';
+        const code = result?.error?.code || result?.code;
+        return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)
+            ? code
+            : fallback;
+    }
+
+    function normalizeRouteGroup(value) {
+        if (!value || typeof value !== 'object') return null;
+        const id = String(value.id || value._id || '');
+        const name = typeof value.name === 'string' ? value.name.trim() : '';
+        const mode = value.mode;
+        const strategy = value.strategy;
+        if (
+            !/^[a-fA-F0-9]{24}$/.test(id)
+            || !name
+            || name.length > 128
+            || !['reverse', 'forward'].includes(mode)
+            || strategy !== ROUTE_GROUP_STRATEGY
+            || !Array.isArray(value.paths)
+        ) return null;
+
+        const paths = value.paths.map((path) => {
+            const pathKey = typeof path?.pathKey === 'string' ? path.pathKey.trim() : '';
+            const linkIds = Array.isArray(path?.linkIds)
+                ? path.linkIds.map(linkId => String(linkId))
+                : [];
+            const priority = Number(path?.priority);
+            if (
+                !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pathKey)
+                || linkIds.length === 0
+                || linkIds.some(linkId => !/^[a-fA-F0-9]{24}$/.test(linkId))
+                || !Number.isFinite(priority)
+                || priority <= 0
+            ) return null;
+            return { pathKey, linkIds, priority };
+        });
+        if (paths.some(path => path === null)) return null;
+        return { id, name, mode, strategy, paths };
+    }
+
+    function createRouteGroupPathRow(path = {}) {
+        const row = routeGroupPathTemplate.content.firstElementChild.cloneNode(true);
+        row.querySelector('[name="pathKey"]').value = path.pathKey || '';
+        row.querySelector('[name="linkIds"]').value = Array.isArray(path.linkIds)
+            ? path.linkIds.join(', ')
+            : '';
+        row.querySelector('[name="priority"]').value = path.priority || '';
+        row.querySelector('[data-route-group-action="remove-path"]').addEventListener('click', () => {
+            if (routeGroupPaths.querySelectorAll('[data-route-group-path-row]').length === 1) {
+                setResult(routeGroupOutput, 'ROUTE_GROUP_PATH_REQUIRED');
+                return;
+            }
+            row.remove();
+        });
+        return row;
+    }
+
+    function resetRouteGroupForm() {
+        routeGroupForm.reset();
+        routeGroupForm.elements.routeGroupId.value = '';
+        routeGroupPaths.replaceChildren(createRouteGroupPathRow());
+        routeGroupSave.textContent = 'Create group';
+        routeGroupCancel.hidden = true;
+    }
+
+    function editRouteGroup(group) {
+        routeGroupForm.elements.routeGroupId.value = group.id;
+        routeGroupForm.elements.name.value = group.name;
+        routeGroupForm.elements.mode.value = group.mode;
+        routeGroupPaths.replaceChildren(...group.paths.map(createRouteGroupPathRow));
+        routeGroupSave.textContent = 'Update group';
+        routeGroupCancel.hidden = false;
+        setResult(routeGroupOutput, '');
+        routeGroupForm.elements.name.focus();
+    }
+
+    function refreshRouteGroupSelectors(groups) {
+        document.querySelectorAll('[data-l2tp-form] select[name="routeGroupId"]').forEach((selector) => {
+            const selectedId = selector.value;
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = 'Select route group';
+            selector.replaceChildren(placeholder);
+            for (const group of groups) {
+                const option = document.createElement('option');
+                option.value = group.id;
+                option.textContent = `${group.name} (${group.mode}, ${group.strategy})`;
+                selector.append(option);
+            }
+            if (groups.some(group => group.id === selectedId)) selector.value = selectedId;
+        });
+    }
+
+    async function removeRouteGroup(group, button) {
+        if (!window.confirm(`Remove route group “${group.name}”?`)) return;
+        button.disabled = true;
+        setResult(routeGroupOutput, 'Working…');
+        try {
+            const response = await fetch(routeGroupUrl(group.id), {
+                method: 'DELETE',
+                credentials: 'same-origin',
+                headers: {
+                    'accept': 'application/json',
+                    'x-csrf-token': csrfToken,
+                },
+            });
+            const result = await parseResponse(response);
+            if (!response.ok) {
+                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_REMOVE_FAILED'));
+                return;
+            }
+            if (routeGroupForm.elements.routeGroupId.value === group.id) resetRouteGroupForm();
+            setResult(routeGroupOutput, 'Route group removed');
+            await loadRouteGroups();
+        } catch {
+            setResult(routeGroupOutput, 'ROUTE_GROUP_REMOVE_FAILED');
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    function renderRouteGroups(groups) {
+        routeGroupList.replaceChildren();
+        routeGroupEmpty.hidden = groups.length !== 0;
+        routeGroupEmpty.textContent = groups.length === 0 ? 'No route groups.' : '';
+        for (const group of groups) {
+            const item = routeGroupItemTemplate.content.firstElementChild.cloneNode(true);
+            item.querySelector('[data-route-group-name]').textContent = group.name;
+            item.querySelector('[data-route-group-summary]').textContent =
+                `${group.mode} · ${group.strategy}`;
+            const pathList = item.querySelector('[data-route-group-path-list]');
+            for (const path of group.paths) {
+                const pathItem = document.createElement('li');
+                pathItem.textContent =
+                    `${path.pathKey}: ${path.linkIds.join(' → ')} (priority ${path.priority})`;
+                pathList.append(pathItem);
+            }
+            item.querySelector('[data-route-group-action="edit"]').addEventListener(
+                'click',
+                () => editRouteGroup(group),
+            );
+            const removeButton = item.querySelector('[data-route-group-action="remove"]');
+            removeButton.addEventListener('click', () => removeRouteGroup(group, removeButton));
+            routeGroupList.append(item);
+        }
+    }
+
+    async function loadRouteGroups() {
+        try {
+            const response = await fetch(ROUTE_GROUPS_URL, {
+                credentials: 'same-origin',
+                headers: {
+                    'accept': 'application/json',
+                    'x-csrf-token': csrfToken,
+                },
+            });
+            const result = await parseResponse(response);
+            if (!response.ok) {
+                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_LIST_FAILED'));
+                return;
+            }
+            if (!Array.isArray(result)) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
+            const groups = result.map(normalizeRouteGroup);
+            if (groups.some(group => group === null)) {
+                throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
+            }
+            renderRouteGroups(groups);
+            refreshRouteGroupSelectors(groups);
+        } catch (error) {
+            setResult(
+                routeGroupOutput,
+                error?.code === 'ROUTE_GROUP_LIST_INVALID'
+                    ? error.code
+                    : 'ROUTE_GROUP_LIST_FAILED',
+            );
         }
     }
 
@@ -223,6 +549,61 @@
             setResult(output, 'USER_LIST_FAILED');
         }
     }
+
+    routeGroupRoot.querySelector('[data-route-group-action="add-path"]').addEventListener('click', () => {
+        routeGroupPaths.append(createRouteGroupPathRow());
+    });
+    routeGroupCancel.addEventListener('click', () => {
+        resetRouteGroupForm();
+        setResult(routeGroupOutput, '');
+    });
+    routeGroupForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!routeGroupForm.reportValidity()) return;
+
+        const routeGroupId = String(routeGroupForm.elements.routeGroupId.value || '');
+        if (routeGroupId && !/^[a-fA-F0-9]{24}$/.test(routeGroupId)) {
+            setResult(routeGroupOutput, 'INVALID_ROUTE_GROUP_ID');
+            return;
+        }
+
+        let payload;
+        try {
+            payload = buildRouteGroupPayload(routeGroupForm);
+        } catch (error) {
+            setResult(routeGroupOutput, error?.code || 'INVALID_ROUTE_GROUP');
+            return;
+        }
+
+        routeGroupSave.disabled = true;
+        setResult(routeGroupOutput, 'Working…');
+        try {
+            const response = await fetch(routeGroupUrl(routeGroupId), {
+                method: routeGroupId ? 'PUT' : 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'accept': 'application/json',
+                    'content-type': 'application/json',
+                    'x-csrf-token': csrfToken,
+                },
+                body: JSON.stringify(payload),
+            });
+            const result = await parseResponse(response);
+            if (!response.ok) {
+                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_SAVE_FAILED'));
+                return;
+            }
+            resetRouteGroupForm();
+            setResult(routeGroupOutput, routeGroupId ? 'Route group updated' : 'Route group created');
+            await loadRouteGroups();
+        } catch {
+            setResult(routeGroupOutput, 'ROUTE_GROUP_SAVE_FAILED');
+        } finally {
+            routeGroupSave.disabled = false;
+        }
+    });
+    resetRouteGroupForm();
+    void loadRouteGroups();
 
     document.querySelectorAll('[data-l2tp-relay]').forEach((relay) => {
         const nodeId = relay.dataset.nodeId;
