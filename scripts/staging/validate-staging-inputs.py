@@ -190,7 +190,7 @@ def validate_config_env(args: argparse.Namespace) -> None:
         if line.startswith("export ") or "=" not in line:
             refuse("test config must use strict KEY=value syntax")
         key, value = line.split("=", 1)
-        if key in {"PANEL_DOMAIN", "L2TP_EXECUTION_ENABLED"}:
+        if key in {"PANEL_DOMAIN", "L2TP_EXECUTION_ENABLED", "L2TP_MIGRATIONS_ENABLED"}:
             if key in required:
                 refuse("test config contains duplicate required keys")
             required[key] = value
@@ -198,6 +198,11 @@ def validate_config_env(args: argparse.Namespace) -> None:
         refuse("test config PANEL_DOMAIN must match the test host")
     if required.get("L2TP_EXECUTION_ENABLED") != "true":
         refuse("test config requires L2TP_EXECUTION_ENABLED=true exactly")
+    if required.get("L2TP_MIGRATIONS_ENABLED") != "true":
+        refuse(
+            "test config with L2TP_EXECUTION_ENABLED=true requires "
+            "L2TP_MIGRATIONS_ENABLED=true exactly"
+        )
 
 
 def parse_args() -> argparse.Namespace:

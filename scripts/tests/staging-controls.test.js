@@ -96,6 +96,7 @@ function createMinimalPrecheckFixture() {
     fs.writeFileSync(configEnv, [
         'PANEL_DOMAIN=test.infograd.online',
         'L2TP_EXECUTION_ENABLED=true',
+        'L2TP_MIGRATIONS_ENABLED=true',
         'FIXTURE_SECRET=must-not-appear',
         '',
     ].join('\n'), { mode: 0o600 });
@@ -170,6 +171,29 @@ function validateStagingInputs(fixture, extractName) {
         '--expected-source-tree', sourceTree,
         '--extract-source', path.join(fixture.root, extractName),
     ], { cwd: repoRoot, encoding: 'utf8' });
+}
+
+function writeEnabledTestConfig(fixture, migrationValue) {
+    const lines = [
+        'PANEL_DOMAIN=test.infograd.online',
+        'L2TP_EXECUTION_ENABLED=true',
+    ];
+    if (migrationValue !== undefined) {
+        lines.push(`L2TP_MIGRATIONS_ENABLED=${migrationValue}`);
+    }
+    lines.push('');
+    fs.writeFileSync(fixture.configEnv, lines.join('\n'), { mode: 0o600 });
+}
+
+function runDeployPlan(fixture) {
+    const mongoDumpHook = path.join(fixture.root, 'mongo-dump-hook.sh');
+    fs.writeFileSync(mongoDumpHook, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    return run(deployScript, [
+        ...fixture.args,
+        '--operation-id', '20260922T120000Z',
+        '--mongo-dump-hook', mongoDumpHook,
+        '--plan-only', 'true',
+    ], { env: fixture.env });
 }
 
 function createRollbackFixture() {
@@ -415,6 +439,53 @@ test('precheck refuses a production host identity', () => {
 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /host identity must be exactly test\.infograd\.online/);
+});
+
+test('deploy refuses enabled execution with missing migration bootstrap before printing a plan', () => {
+    const fixture = createMinimalPrecheckFixture();
+    try {
+        writeEnabledTestConfig(fixture, undefined);
+        const result = runDeployPlan(fixture);
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /requires L2TP_MIGRATIONS_ENABLED=true/);
+        assert.doesNotMatch(result.stdout, /deploy_plan_version/);
+        assert.equal(fs.existsSync(fixture.dockerLog), false, 'config rejection must happen before Compose');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy refuses enabled execution with migrations explicitly disabled before printing a plan', () => {
+    const fixture = createMinimalPrecheckFixture();
+    try {
+        writeEnabledTestConfig(fixture, 'false');
+        const result = runDeployPlan(fixture);
+
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /requires L2TP_MIGRATIONS_ENABLED=true/);
+        assert.doesNotMatch(result.stdout, /deploy_plan_version/);
+        assert.equal(fs.existsSync(fixture.dockerLog), false, 'config rejection must happen before Compose');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy refuses non-boolean migration flags before printing a plan', () => {
+    for (const value of ['', 'TRUE', 'False', '1', '0', 'yes']) {
+        const fixture = createMinimalPrecheckFixture();
+        try {
+            writeEnabledTestConfig(fixture, value);
+            const result = runDeployPlan(fixture);
+
+            assert.notEqual(result.status, 0, `L2TP_MIGRATIONS_ENABLED=${value}`);
+            assert.match(result.stderr, /requires L2TP_MIGRATIONS_ENABLED=true exactly/);
+            assert.doesNotMatch(result.stdout, /deploy_plan_version/);
+            assert.equal(fs.existsSync(fixture.dockerLog), false, 'config rejection must happen before Compose');
+        } finally {
+            fixture.cleanup();
+        }
+    }
 });
 
 test('precheck rejects a source bundle checksum mismatch before extraction', () => {
