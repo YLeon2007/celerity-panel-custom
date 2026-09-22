@@ -201,6 +201,12 @@ function projectLinkMetadata(rows) {
         if (!SUPPORTED_MODES.includes(mode)) {
             fail('UNSAFE_LINK_METADATA_MODE', 'Hydrated topology link metadata requires a supported mode');
         }
+        if (row?.tunnelSecurity === 'reality') {
+            fail(
+                'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY',
+                'Reality topology tunnel security is unsupported',
+            );
+        }
         const projected = {
             id,
             source: assertSafeId(String(source), 'UNSAFE_LINK_METADATA_ENDPOINT'),

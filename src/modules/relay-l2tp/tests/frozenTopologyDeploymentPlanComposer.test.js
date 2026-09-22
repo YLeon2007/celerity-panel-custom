@@ -220,6 +220,39 @@ test('rejects hydrated link metadata that does not match its frozen link', () =>
     );
 });
 
+test('rejects Reality tunnel security before candidate generation', () => {
+    const input = reverseChainInput();
+    const realityPrivateKey = 'reality-private-key-canary';
+    input.linkMetadata[0].tunnelSecurity = 'reality';
+    input.linkMetadata[0].realityPrivateKey = realityPrivateKey;
+    const portalMetadata = input.nodeMetadata.find(node => node.role === 'portal');
+    const portalXray = portalMetadata.xray;
+    let candidateGenerationReads = 0;
+    Object.defineProperty(portalMetadata, 'xray', {
+        configurable: true,
+        enumerable: true,
+        get() {
+            candidateGenerationReads += 1;
+            return portalXray;
+        },
+    });
+
+    assert.throws(
+        () => composeFrozenTopologyDeploymentPlan(input),
+        error => {
+            assert.equal(error.name, 'FrozenTopologyDeploymentPlanError');
+            assert.equal(error.code, 'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY');
+            assert.equal(error.message, 'Reality topology tunnel security is unsupported');
+            assert.doesNotMatch(
+                `${error.name}:${error.code}:${error.message}`,
+                new RegExp(realityPrivateKey),
+            );
+            return true;
+        },
+    );
+    assert.equal(candidateGenerationReads, 0);
+});
+
 test('rejects compiled relay data for a node outside the frozen topology', () => {
     const input = reverseChainInput();
     input.compiledTopology.relays[0].nodeId = 'missing-node-object-id';

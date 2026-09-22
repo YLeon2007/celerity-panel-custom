@@ -274,6 +274,35 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     assert.equal(CascadeLink.calls.filter(call => call.method === 'find').length, 1);
 });
 
+test('rejects Reality tunnel security during allowlisted hydration without leaking secrets', async () => {
+    const rows = metadataRows();
+    rows.links[0].tunnelSecurity = 'reality';
+    rows.links[0].realityPrivateKey = SECRET_CANARIES[4];
+    const { HyNode, CascadeLink, materializer } = createMaterializer(rows);
+
+    await assert.rejects(
+        materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: pinnedSnapshot(),
+        }),
+        error => {
+            assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
+            assert.equal(error.code, 'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY');
+            assert.equal(error.message, 'Reality topology tunnel security is unsupported');
+            assert.doesNotMatch(
+                `${error.name}:${error.code}:${error.message}`,
+                new RegExp(SECRET_CANARIES[4]),
+            );
+            return true;
+        },
+    );
+    assert.equal(CascadeLink.calls.some(call => call.method === 'lean'), true);
+    assert.deepEqual(HyNode.writes, []);
+    assert.deepEqual(CascadeLink.writes, []);
+    assert.doesNotMatch(LINK_METADATA_SELECT, /realityPrivateKey|privateKey/i);
+});
+
 test('sanitizes metadata read failures without returning database or secret details', async () => {
     const secret = 'database-password-canary';
     const HyNode = createReadModel(metadataRows().nodes, 'HyNode');

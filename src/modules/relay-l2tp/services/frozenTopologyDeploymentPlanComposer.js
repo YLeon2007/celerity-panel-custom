@@ -544,6 +544,12 @@ function composeFrozenTopologyDeploymentPlan({
                 'Hydrated link metadata must match the validated topology snapshot',
             );
         }
+        if (metadata.tunnelSecurity === 'reality') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY',
+                'Reality topology tunnel security is unsupported',
+            );
+        }
     }
 
     const refs = topologyRefs(chain.orderedNodes);
