@@ -21,6 +21,9 @@ const INSTALL_STEP_ARTIFACTS = Object.freeze({
     stage_managed_files: Object.freeze([
         Object.freeze({ type: 'artifact', path: 'artifacts.json' }),
     ]),
+    compose_xray_fragment: Object.freeze([
+        Object.freeze({ type: 'xrayCandidate', path: 'xray-candidate.json' }),
+    ]),
 });
 
 class L2tpOperationMaterializationError extends Error {

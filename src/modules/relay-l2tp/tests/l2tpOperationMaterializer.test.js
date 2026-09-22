@@ -94,6 +94,13 @@ test('prepares a durable install plan with typed artifact references and no secr
             artifacts: [{ type: 'artifact', path: 'artifacts.json' }],
         },
     );
+    assert.deepEqual(
+        result.persistedPlan.steps.find(step => step.type === 'compose_xray_fragment'),
+        {
+            type: 'compose_xray_fragment',
+            artifacts: [{ type: 'xrayCandidate', path: 'xray-candidate.json' }],
+        },
+    );
     assert.deepEqual(result.remoteArtifacts, []);
 
     const serializedPlan = JSON.stringify(result.persistedPlan);

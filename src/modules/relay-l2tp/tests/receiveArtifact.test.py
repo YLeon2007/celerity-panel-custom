@@ -95,6 +95,56 @@ class ReceiveArtifactFixtureTest(unittest.TestCase):
         self.assertTrue(stat.S_ISREG(artifact.lstat().st_mode))
         self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
 
+    def test_maps_candidate_staging_name_to_fixed_nested_xray_path(self):
+        content = b'{"marker":"candidate-content"}\n'
+
+        self.receive(artifact_name="xray-candidate.json", content=content)
+
+        operation = self.root / "operation-17"
+        candidate_directory = operation / "candidate"
+        candidate = candidate_directory / "xray.json"
+        self.assertTrue(candidate_directory.is_dir())
+        self.assertFalse(candidate_directory.is_symlink())
+        self.assertEqual(stat.S_IMODE(candidate_directory.stat().st_mode), 0o700)
+        self.assertEqual(
+            (candidate_directory.stat().st_uid, candidate_directory.stat().st_gid),
+            (self.uid, self.gid),
+        )
+        self.assertEqual(candidate.read_bytes(), content)
+        self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
+        self.assertFalse((operation / "xray-candidate.json").exists())
+        self.assertEqual([path.name for path in operation.iterdir()], ["candidate"])
+        self.assertEqual([path.name for path in candidate_directory.iterdir()], ["xray.json"])
+
+    def test_rejects_unsafe_candidate_directory_without_touching_target(self):
+        outside = Path(self.temp.name) / "outside-candidate"
+        outside.mkdir()
+        operation = self.root / "operation-candidate-link"
+        operation.mkdir(mode=0o700)
+        (operation / "candidate").symlink_to(outside, target_is_directory=True)
+
+        self.assert_receiver_error(
+            "UNSAFE_ARTIFACT_DIRECTORY",
+            lambda: self.receive(
+                operation_id="operation-candidate-link",
+                artifact_name="xray-candidate.json",
+            ),
+        )
+        self.assertEqual(list(outside.iterdir()), [])
+
+        insecure_operation = self.root / "operation-candidate-mode"
+        insecure_operation.mkdir(mode=0o700)
+        insecure_candidate = insecure_operation / "candidate"
+        insecure_candidate.mkdir(mode=0o755)
+        self.assert_receiver_error(
+            "UNSAFE_ARTIFACT_DIRECTORY",
+            lambda: self.receive(
+                operation_id="operation-candidate-mode",
+                artifact_name="xray-candidate.json",
+            ),
+        )
+        self.assertEqual(list(insecure_candidate.iterdir()), [])
+
     def test_rejects_symlinked_operation_directory_without_touching_target(self):
         outside = Path(self.temp.name) / "outside"
         outside.mkdir()
@@ -163,6 +213,8 @@ class ReceiveArtifactFixtureTest(unittest.TestCase):
             ("../escape", "desired.json", "INVALID_OPERATION_ID"),
             ("operation-17", "other.json", "ARTIFACT_NOT_ALLOWED"),
             ("operation-17", "../desired.json", "ARTIFACT_NOT_ALLOWED"),
+            ("operation-17", "candidate/xray.json", "ARTIFACT_NOT_ALLOWED"),
+            ("operation-17", "xray.json", "ARTIFACT_NOT_ALLOWED"),
         ):
             with self.subTest(operation_id=operation_id, artifact_name=artifact_name):
                 self.assert_receiver_error(

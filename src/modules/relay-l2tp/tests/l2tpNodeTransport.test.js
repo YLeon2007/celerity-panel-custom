@@ -61,6 +61,33 @@ test('uploadRootFile sends an exact typed artifact to the fixed receiver over st
     });
 });
 
+test('uploadRootFile maps the exact candidate type and staging name to candidate/xray.json', async () => {
+    const nodeSSH = createNodeSSHFacade();
+    const transport = new L2tpNodeTransport({ nodeSSH });
+    const content = '{"marker":"candidate-content-must-use-stdin"}';
+
+    const result = await transport.uploadRootFile({
+        operationId: 'operation-xray-candidate',
+        type: 'xrayCandidate',
+        path: 'xray-candidate.json',
+        content,
+        owner: 'root',
+        group: 'root',
+        mode: 0o600,
+    });
+
+    assert.deepEqual(nodeSSH.calls, [{
+        method: 'exec',
+        command: '/usr/local/bin/celerity-l2tp-artifact-receiver --operation-id operation-xray-candidate --artifact-name xray-candidate.json',
+        options: { stdin: content },
+    }]);
+    assert.equal(nodeSSH.calls[0].command.includes(content), false);
+    assert.deepEqual(result, {
+        ok: true,
+        path: '/var/lib/celerity/l2tp/operations/operation-xray-candidate/candidate/xray.json',
+    });
+});
+
 test('uploadRootFile accepts only exact typed artifact names', async () => {
     const acceptedNodeSSH = createNodeSSHFacade();
     const transport = new L2tpNodeTransport({ nodeSSH: acceptedNodeSSH });
@@ -82,6 +109,10 @@ test('uploadRootFile accepts only exact typed artifact names', async () => {
         { type: 'desired', path: 'other.json' },
         { type: 'shell', path: 'desired.json' },
         { type: undefined, path: 'desired.json' },
+        { type: 'xrayCandidate', path: 'candidate/xray.json' },
+        { type: 'xrayCandidate', path: 'xray.json' },
+        { type: 'artifact', path: 'xray-candidate.json' },
+        { type: 'xray_candidate', path: 'xray-candidate.json' },
     ]) {
         const nodeSSH = createNodeSSHFacade();
         const candidate = new L2tpNodeTransport({ nodeSSH });

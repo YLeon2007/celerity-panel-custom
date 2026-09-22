@@ -45,6 +45,7 @@ function createDependencies() {
             async release() {},
         },
         secretResolver: async () => ({ psk: 'resolved-in-memory-only' }),
+        candidateService: { async buildCandidate() {} },
         requireAuth(req, res, next) { next(); },
         requireOnboarding(req, res, next) { next(); },
         csrf(req, res, next) { next(); },
@@ -88,6 +89,7 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.worker.executor.transport, dependencies.transport);
     assert.strictEqual(runtime.worker.lockService, dependencies.lockService);
     assert.strictEqual(runtime.worker.secretResolver, dependencies.secretResolver);
+    assert.strictEqual(runtime.worker.candidateService, dependencies.candidateService);
     assert.equal(typeof runtime.worker.operationMaterializer, 'function');
     assert.strictEqual(
         runtime.service.operationMaterializer,
@@ -122,6 +124,7 @@ test('does not surface injected model or transport secrets', () => {
     dependencies.operationModel.connectionString = 'mongodb://model-secret';
     dependencies.transport.privateKey = 'transport-private-key';
     dependencies.secretResolver.privateKey = 'resolver-private-key';
+    dependencies.candidateService.privateKey = 'candidate-private-key';
 
     const runtime = createL2tpRuntime(dependencies);
     const serializedRuntime = JSON.stringify(runtime);
@@ -131,6 +134,7 @@ test('does not surface injected model or transport secrets', () => {
     assert.doesNotMatch(serializedRuntime, /resolver-private-key/);
     assert.doesNotMatch(serializedRuntime, /state-management-secret/);
     assert.doesNotMatch(serializedRuntime, /secret-box-private-key/);
+    assert.doesNotMatch(serializedRuntime, /candidate-private-key/);
     assert.equal(Object.hasOwn(runtime, 'operationModel'), false);
     assert.equal(Object.hasOwn(runtime, 'transport'), false);
     for (const propertyName of ['repository', 'secretBox', 'secretKey', 'randomBytes']) {
@@ -148,6 +152,7 @@ test('does not surface injected model or transport secrets', () => {
         'lockService',
         'executor',
         'secretResolver',
+        'candidateService',
         'operationMaterializer',
         'clock',
         'timer',
@@ -282,6 +287,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
         'transport',
         'lockService',
         'secretResolver',
+        'candidateService',
         'requireAuth',
         'requireOnboarding',
         'csrf',

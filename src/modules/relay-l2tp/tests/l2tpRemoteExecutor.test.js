@@ -29,6 +29,13 @@ function materializedArtifactsFor(type) {
     if (type === 'stage_managed_files') {
         return [{ type: 'artifact', path: 'artifacts.json', content: '{}\n' }];
     }
+    if (type === 'compose_xray_fragment') {
+        return [{
+            type: 'xrayCandidate',
+            path: 'xray-candidate.json',
+            content: '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}',
+        }];
+    }
     return undefined;
 }
 
@@ -79,6 +86,49 @@ test('preflight uploads its root-only desired file before its fixed command', as
     assert.doesNotMatch(JSON.stringify(transport.calls[1]), new RegExp(secret));
 });
 
+test('compose uploads only the fixed Xray candidate artifact before its fixed command', async () => {
+    const transport = createTransport();
+    const executor = new L2tpRemoteExecutor({ transport });
+    const content = '{"inbounds":[],"outbounds":[],"routing":{"rules":[]},"marker":"private-candidate"}';
+
+    const result = await executor.executeStep({
+        operation: { id: 'operation-candidate' },
+        step: {
+            type: 'compose_xray_fragment',
+            artifacts: [{ type: 'xrayCandidate', path: 'xray-candidate.json', content }],
+        },
+    });
+
+    assert.deepEqual(transport.calls, [
+        {
+            method: 'uploadRootFile',
+            request: {
+                operationId: 'operation-candidate',
+                type: 'xrayCandidate',
+                path: 'xray-candidate.json',
+                content,
+                owner: 'root',
+                group: 'root',
+                mode: 0o600,
+            },
+        },
+        {
+            method: 'runArtifactCommand',
+            request: {
+                operationId: 'operation-candidate',
+                command: 'compose_xray_fragment',
+            },
+        },
+    ]);
+    assert.deepEqual(result, {
+        ok: true,
+        operationId: 'operation-candidate',
+        step: 'compose_xray_fragment',
+    });
+    assert.doesNotMatch(JSON.stringify(result), /private-candidate/);
+    assert.doesNotMatch(JSON.stringify(transport.calls[1]), /private-candidate/);
+});
+
 test('maps every install-plan step to its same-name allowlisted command', async () => {
     const transport = createTransport();
     const executor = new L2tpRemoteExecutor({ transport });
@@ -103,10 +153,11 @@ test('maps every install-plan step to its same-name allowlisted command', async 
     );
 });
 
-test('requires exactly one materialized typed artifact only on its two declared steps', async () => {
+test('requires exactly one materialized typed artifact only on its three declared steps', async () => {
     const invalidCases = [
         { step: { type: 'preflight' } },
         { step: { type: 'stage_managed_files', artifacts: [] } },
+        { step: { type: 'compose_xray_fragment' } },
         {
             step: {
                 type: 'preflight',
@@ -136,6 +187,16 @@ test('requires exactly one materialized typed artifact only on its two declared 
                     path: 'artifacts.json',
                     content: '{}',
                     checksum: 'caller-controlled',
+                }],
+            },
+        },
+        {
+            step: {
+                type: 'compose_xray_fragment',
+                artifacts: [{
+                    type: 'xrayCandidate',
+                    path: 'xray-candidate.json',
+                    content: Buffer.from('{}'),
                 }],
             },
         },
@@ -240,6 +301,18 @@ test('rejects artifacts outside the typed step and filename allowlist', async ()
         {
             step: 'backup',
             artifact: { type: 'desired', path: 'desired.json', content: '{}' },
+        },
+        {
+            step: 'compose_xray_fragment',
+            artifact: { type: 'xrayCandidate', path: 'candidate/xray.json', content: '{}' },
+        },
+        {
+            step: 'compose_xray_fragment',
+            artifact: { type: 'artifact', path: 'xray-candidate.json', content: '{}' },
+        },
+        {
+            step: 'validate_xray',
+            artifact: { type: 'xrayCandidate', path: 'xray-candidate.json', content: '{}' },
         },
     ];
 

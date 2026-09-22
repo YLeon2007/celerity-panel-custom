@@ -14,7 +14,11 @@ from typing import BinaryIO
 
 OPERATIONS_ROOT = "/var/lib/celerity/l2tp/operations"
 OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-ARTIFACT_NAMES = frozenset(("desired.json", "artifacts.json"))
+ARTIFACT_TARGETS = {
+    "desired.json": (None, "desired.json"),
+    "artifacts.json": (None, "artifacts.json"),
+    "xray-candidate.json": ("candidate", "xray.json"),
+}
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 READ_SIZE = 64 * 1024
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -78,9 +82,33 @@ def _open_operation_directory(root_descriptor: int, operation_id: str, uid: int,
     return descriptor
 
 
-def _assert_safe_existing_target(operation_descriptor: int, artifact_name: str, uid: int, gid: int) -> None:
+def _open_artifact_directory(
+    operation_descriptor: int,
+    directory_name: str,
+    uid: int,
+    gid: int,
+) -> int:
     try:
-        target = os.stat(artifact_name, dir_fd=operation_descriptor, follow_symlinks=False)
+        os.mkdir(directory_name, 0o700, dir_fd=operation_descriptor)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReceiverError("UNSAFE_ARTIFACT_DIRECTORY") from error
+
+    try:
+        descriptor = os.open(directory_name, DIRECTORY_FLAGS, dir_fd=operation_descriptor)
+    except OSError as error:
+        raise ReceiverError("UNSAFE_ARTIFACT_DIRECTORY") from error
+
+    if not _is_secure(os.fstat(descriptor), stat.S_IFDIR, 0o700, uid, gid):
+        os.close(descriptor)
+        raise ReceiverError("UNSAFE_ARTIFACT_DIRECTORY")
+    return descriptor
+
+
+def _assert_safe_existing_target(directory_descriptor: int, artifact_name: str, uid: int, gid: int) -> None:
+    try:
+        target = os.stat(artifact_name, dir_fd=directory_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return
     except OSError as error:
@@ -90,11 +118,11 @@ def _assert_safe_existing_target(operation_descriptor: int, artifact_name: str, 
         raise ReceiverError("UNSAFE_ARTIFACT_TARGET")
 
 
-def _create_temporary_artifact(operation_descriptor: int) -> tuple[int, str]:
+def _create_temporary_artifact(directory_descriptor: int) -> tuple[int, str]:
     for _ in range(8):
         name = f".upload-{secrets.token_hex(16)}"
         try:
-            return os.open(name, FILE_FLAGS, 0o600, dir_fd=operation_descriptor), name
+            return os.open(name, FILE_FLAGS, 0o600, dir_fd=directory_descriptor), name
         except FileExistsError:
             continue
         except OSError as error:
@@ -118,13 +146,16 @@ def receive_artifact(
 
     if not isinstance(operation_id, str) or OPERATION_ID_PATTERN.fullmatch(operation_id) is None:
         raise ReceiverError("INVALID_OPERATION_ID")
-    if artifact_name not in ARTIFACT_NAMES:
+    target = ARTIFACT_TARGETS.get(artifact_name)
+    if target is None:
         raise ReceiverError("ARTIFACT_NOT_ALLOWED")
+    directory_name, target_name = target
 
     operation_uid = expected_uid if expected_operation_uid is None else expected_operation_uid
     operation_gid = expected_gid if expected_operation_gid is None else expected_operation_gid
     root_descriptor = _open_operations_root(operations_root, expected_uid, expected_gid)
     operation_descriptor = -1
+    artifact_directory_descriptor = -1
     temporary_descriptor = -1
     temporary_name: str | None = None
     replaced = False
@@ -136,13 +167,23 @@ def receive_artifact(
             operation_uid,
             operation_gid,
         )
+        artifact_directory_descriptor = operation_descriptor
+        if directory_name is not None:
+            artifact_directory_descriptor = _open_artifact_directory(
+                operation_descriptor,
+                directory_name,
+                operation_uid,
+                operation_gid,
+            )
         _assert_safe_existing_target(
-            operation_descriptor,
-            artifact_name,
+            artifact_directory_descriptor,
+            target_name,
             operation_uid,
             operation_gid,
         )
-        temporary_descriptor, temporary_name = _create_temporary_artifact(operation_descriptor)
+        temporary_descriptor, temporary_name = _create_temporary_artifact(
+            artifact_directory_descriptor,
+        )
 
         total = 0
         while True:
@@ -165,19 +206,19 @@ def receive_artifact(
         os.close(temporary_descriptor)
         temporary_descriptor = -1
         _assert_safe_existing_target(
-            operation_descriptor,
-            artifact_name,
+            artifact_directory_descriptor,
+            target_name,
             operation_uid,
             operation_gid,
         )
         os.replace(
             temporary_name,
-            artifact_name,
-            src_dir_fd=operation_descriptor,
-            dst_dir_fd=operation_descriptor,
+            target_name,
+            src_dir_fd=artifact_directory_descriptor,
+            dst_dir_fd=artifact_directory_descriptor,
         )
         replaced = True
-        os.fsync(operation_descriptor)
+        os.fsync(artifact_directory_descriptor)
     except ReceiverError:
         raise
     except OSError as error:
@@ -185,13 +226,15 @@ def receive_artifact(
     finally:
         if temporary_descriptor >= 0:
             os.close(temporary_descriptor)
-        if temporary_name is not None and not replaced and operation_descriptor >= 0:
+        if temporary_name is not None and not replaced and artifact_directory_descriptor >= 0:
             try:
-                os.unlink(temporary_name, dir_fd=operation_descriptor)
+                os.unlink(temporary_name, dir_fd=artifact_directory_descriptor)
             except FileNotFoundError:
                 pass
             except OSError:
                 pass
+        if artifact_directory_descriptor >= 0 and artifact_directory_descriptor != operation_descriptor:
+            os.close(artifact_directory_descriptor)
         if operation_descriptor >= 0:
             os.close(operation_descriptor)
         os.close(root_descriptor)

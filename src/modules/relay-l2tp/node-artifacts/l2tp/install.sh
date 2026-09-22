@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 declare -Ar PAYLOAD_SHA256=(
     [runner.sh]='3c512b9990f90b57e496791e8faea1fd549f9311d005c0150f630b93e787bf61'
-    [receive-artifact.py]='b9c602a7af257a774addebe25042fca8fc83b9e0d544207e2228dd78a448a8b2'
+    [receive-artifact.py]='e4a107d0220284c358534ea0a7f2b8ec8a7f3952956eeebb33a7a68450988f4b'
     [apply.sh]='dfd396096bd85c2e931682f05840d2f6cce5246212288f6f2b91e2e660ccbe95'
     [preflight.sh]='a5f2c845beb4cdc781688efee00745f4edca98f7e5599a78007e411d9b2d709e'
     [backup.sh]='4aa837b461ae85627dd8f4b06fb785939b3bb6942fc85fe605c8aa7d4548b9eb'

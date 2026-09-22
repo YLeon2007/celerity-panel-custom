@@ -4,6 +4,17 @@ const INSTALL_PLAN_ERROR_CODES = new Set([
     'INSTALL_PLAN_REJECTED',
     'INVALID_INSTALL_PLAN',
 ]);
+const XRAY_CANDIDATE_ARTIFACT = Object.freeze({
+    stepType: 'compose_xray_fragment',
+    type: 'xrayCandidate',
+    path: 'xray-candidate.json',
+});
+
+function candidateBuildError() {
+    const error = new Error('Failed to build the L2TP Xray candidate');
+    error.code = 'XRAY_CANDIDATE_FAILED';
+    return error;
+}
 
 function entityId(entity) {
     const value = entity !== null && typeof entity === 'object'
@@ -82,6 +93,7 @@ class L2tpOperationWorker {
         lockService,
         executor,
         secretResolver,
+        candidateService,
         operationMaterializer,
         workerId,
         leaseMs,
@@ -93,6 +105,7 @@ class L2tpOperationWorker {
         this.lockService = lockService;
         this.executor = executor;
         this.secretResolver = secretResolver;
+        this.candidateService = candidateService;
         this.operationMaterializer = operationMaterializer;
         this.workerId = workerId;
         this.leaseMs = leaseMs;
@@ -153,7 +166,27 @@ class L2tpOperationWorker {
         }
     }
 
-    async materializeInstallSteps({ operation, operationId, plan }) {
+    async buildInstallCandidate(plan) {
+        try {
+            if (typeof this.candidateService?.buildCandidate !== 'function') {
+                throw new TypeError('L2TP Xray candidate service is unavailable');
+            }
+            const candidate = await this.candidateService.buildCandidate({ plan });
+            if (
+                !candidate
+                || typeof candidate !== 'object'
+                || candidate.operationId !== plan.operationId
+                || typeof candidate.content !== 'string'
+            ) {
+                throw new TypeError('L2TP Xray candidate service returned an invalid candidate');
+            }
+            return candidate.content;
+        } catch {
+            throw candidateBuildError();
+        }
+    }
+
+    async materializeInstallSteps({ operation, operationId, plan, candidateContent }) {
         if (typeof this.secretResolver !== 'function') {
             throw new TypeError('L2TP operation secret resolver is unavailable');
         }
@@ -170,7 +203,10 @@ class L2tpOperationWorker {
         }
         return attachRemoteArtifacts(
             materialized.persistedPlan,
-            materialized.remoteArtifacts,
+            [
+                ...materialized.remoteArtifacts,
+                { ...XRAY_CANDIDATE_ARTIFACT, content: candidateContent },
+            ],
         );
     }
 
@@ -290,6 +326,19 @@ class L2tpOperationWorker {
             return { claimed: true, operationId, status: 'failed' };
         }
 
+        let candidateContent = null;
+        if (preparedInstallPlan) {
+            try {
+                candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
+            } catch {
+                return this.failClaimedOperation({
+                    operationId,
+                    errorCode: 'XRAY_CANDIDATE_FAILED',
+                    errorMessage: 'Failed to build the L2TP Xray candidate',
+                });
+            }
+        }
+
         const lockRequest = {
             node: operation.node,
             owner: this.workerId,
@@ -341,6 +390,7 @@ class L2tpOperationWorker {
                         operation,
                         operationId,
                         plan: preparedInstallPlan,
+                        candidateContent,
                     });
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();

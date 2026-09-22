@@ -22,9 +22,19 @@ const ARTIFACT_COMMANDS = Object.freeze([
 const ARTIFACT_COMMAND_SET = new Set(ARTIFACT_COMMANDS);
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ROOT_FILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
-const ROOT_ARTIFACT_PATHS = Object.freeze({
-    desired: 'desired.json',
-    artifact: 'artifacts.json',
+const ROOT_ARTIFACTS = Object.freeze({
+    desired: Object.freeze({
+        stagingPath: 'desired.json',
+        remotePath: 'desired.json',
+    }),
+    artifact: Object.freeze({
+        stagingPath: 'artifacts.json',
+        remotePath: 'artifacts.json',
+    }),
+    xrayCandidate: Object.freeze({
+        stagingPath: 'xray-candidate.json',
+        remotePath: 'candidate/xray.json',
+    }),
 });
 
 class L2tpNodeTransportError extends Error {
@@ -54,13 +64,23 @@ function assertRootFilePath(path) {
 }
 
 function assertRootArtifact(type, path) {
-    assertRootFilePath(path);
-    if (!Object.hasOwn(ROOT_ARTIFACT_PATHS, type) || ROOT_ARTIFACT_PATHS[type] !== path) {
+    const artifact = Object.hasOwn(ROOT_ARTIFACTS, type)
+        ? ROOT_ARTIFACTS[type]
+        : null;
+    if (artifact && artifact.stagingPath !== path) {
         throw new L2tpNodeTransportError(
             'ARTIFACT_NOT_ALLOWED',
             'Artifact is not allowed for L2TP root upload',
         );
     }
+    assertRootFilePath(path);
+    if (!artifact) {
+        throw new L2tpNodeTransportError(
+            'ARTIFACT_NOT_ALLOWED',
+            'Artifact is not allowed for L2TP root upload',
+        );
+    }
+    return artifact;
 }
 
 function assertRootFileMetadata({ owner, group, mode }) {
@@ -103,12 +123,11 @@ class L2tpNodeTransport {
 
     async uploadRootFile({ operationId, type, path, content, owner, group, mode }) {
         assertOperationId(operationId);
-        assertRootFilePath(path);
+        const artifact = assertRootArtifact(type, path);
         assertRootFileMetadata({ owner, group, mode });
         assertArtifactContent(content);
-        assertRootArtifact(type, path);
 
-        const remotePath = `${REMOTE_OPERATIONS_ROOT}/${operationId}/${path}`;
+        const remotePath = `${REMOTE_OPERATIONS_ROOT}/${operationId}/${artifact.remotePath}`;
 
         try {
             assertSuccessfulExec(await this.nodeSSH.exec(

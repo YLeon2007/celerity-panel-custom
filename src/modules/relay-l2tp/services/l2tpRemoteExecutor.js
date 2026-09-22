@@ -18,6 +18,7 @@ const STEP_COMMANDS = Object.freeze({
 const STEP_ARTIFACT_PATHS = Object.freeze({
     preflight: Object.freeze({ desired: 'desired.json' }),
     stage_managed_files: Object.freeze({ artifact: 'artifacts.json' }),
+    compose_xray_fragment: Object.freeze({ xrayCandidate: 'xray-candidate.json' }),
 });
 
 class L2tpRemoteExecutorError extends Error {

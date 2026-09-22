@@ -100,6 +100,7 @@ function createWorker(operationRepository, overrides = {}) {
         executor: overrides.executor || {},
         secretResolver: overrides.secretResolver,
         operationMaterializer: overrides.operationMaterializer,
+        candidateService: overrides.candidateService,
         workerId: 'worker-1',
         leaseMs: overrides.leaseMs || 30_000,
         clock: overrides.clock || createClock(),
@@ -159,9 +160,11 @@ function createInstallOperation(id = 'operation-install') {
 
 test('claims an install once and resolves its PSK once before typed artifact uploads', async () => {
     const secret = 'worker-jit-psk-secret';
+    const candidateContent = '{"inbounds":[{"tag":"relay-l2tp-group-a"}],"outbounds":[],"routing":{"rules":[]}}';
     const { operation } = createInstallOperation('operation-jit');
     const operationRepository = createOperationRepository([operation]);
     const resolverCalls = [];
+    const candidateCalls = [];
     const lockCalls = [];
     const transportCalls = [];
     const executor = new L2tpRemoteExecutor({
@@ -177,6 +180,21 @@ test('claims an install once and resolves its PSK once before typed artifact upl
     const worker = createWorker(operationRepository, {
         executor,
         operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate(request) {
+                candidateCalls.push(request);
+                assert.equal(
+                    operationRepository.operations[0].status,
+                    'running',
+                    'operation must be claimed first',
+                );
+                assert.deepEqual(transportCalls, [], 'candidate must be built before remote work');
+                return {
+                    operationId: request.plan.operationId,
+                    content: candidateContent,
+                };
+            },
+        },
         secretResolver: async request => {
             resolverCalls.push(request);
             assert.equal(
@@ -216,10 +234,11 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         credentialRevision: 9,
         secret: 'psk',
     }]);
+    assert.deepEqual(candidateCalls, [{ plan: operation.plan }]);
     assert.deepEqual(lockCalls.map(call => call.method), ['acquire', 'release']);
 
     const uploads = transportCalls.filter(call => call.method === 'uploadRootFile');
-    assert.equal(uploads.length, 2);
+    assert.equal(uploads.length, 3);
     assert.deepEqual(
         uploads.map(call => ({
             type: call.request.type,
@@ -228,12 +247,14 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         [
             { type: 'desired', path: 'desired.json' },
             { type: 'artifact', path: 'artifacts.json' },
+            { type: 'xrayCandidate', path: 'xray-candidate.json' },
         ],
     );
     assert.deepEqual(JSON.parse(uploads[0].request.content), {
         clientCidr: '10.77.0.0/24',
     });
     assert.match(uploads[1].request.content, new RegExp(secret));
+    assert.equal(uploads[2].request.content, candidateContent);
     assert.deepEqual(
         transportCalls
             .filter(call => call.method === 'runArtifactCommand')
@@ -254,12 +275,21 @@ test('claims an install once and resolves its PSK once before typed artifact upl
                 && call.request.command === 'stage_managed_files'
             )),
     );
-    assert.doesNotMatch(JSON.stringify({
+    assert.ok(
+        transportCalls.indexOf(uploads[2])
+            < transportCalls.findIndex(call => (
+                call.method === 'runArtifactCommand'
+                && call.request.command === 'compose_xray_fragment'
+            )),
+    );
+    const externallyVisible = JSON.stringify({
         operation,
         repositoryCalls: operationRepository.calls,
         first,
         second,
-    }), new RegExp(secret));
+    });
+    assert.doesNotMatch(externallyVisible, new RegExp(secret));
+    assert.equal(externallyVisible.includes(candidateContent), false);
     assert.equal(
         operation.plan.steps.some(step => (
             step.artifacts?.some(artifact => Object.hasOwn(artifact, 'content'))
@@ -302,6 +332,7 @@ test('rejects invalid claimed install plans before resolving secrets or remote w
 
     for (const testCase of cases) {
         let resolverCalls = 0;
+        let candidateCalls = 0;
         let lockCalls = 0;
         const transportCalls = [];
         const operationRepository = createOperationRepository([{
@@ -312,6 +343,12 @@ test('rejects invalid claimed install plans before resolving secrets or remote w
         }]);
         const worker = createWorker(operationRepository, {
             operationMaterializer: materializeInstallOperation,
+            candidateService: {
+                async buildCandidate() {
+                    candidateCalls += 1;
+                    return { operationId: 'must-not-build', content: '{}' };
+                },
+            },
             secretResolver: async () => {
                 resolverCalls += 1;
                 return { psk: 'must-not-resolve' };
@@ -337,9 +374,61 @@ test('rejects invalid claimed install plans before resolving secrets or remote w
 
         assert.equal(result.status, 'failed', testCase.name);
         assert.equal(resolverCalls, 0, testCase.name);
+        assert.equal(candidateCalls, 0, testCase.name);
         assert.equal(lockCalls, 0, testCase.name);
         assert.deepEqual(transportCalls, [], testCase.name);
         assert.equal(failure.request.errorCode, testCase.expectedCode, testCase.name);
+    }
+});
+
+test('candidate rejection is sanitized and performs no secret resolution or remote work', async () => {
+    const leakedCandidate = 'candidate-error-must-not-leak';
+    for (const code of ['BLOCKED_TOPOLOGY', 'XRAY_CONFIG_GENERATION_FAILED']) {
+        const { operation } = createInstallOperation(`operation-${code.toLowerCase()}`);
+        const operationRepository = createOperationRepository([operation]);
+        const transportCalls = [];
+        let resolverCalls = 0;
+        const worker = createWorker(operationRepository, {
+            operationMaterializer: materializeInstallOperation,
+            candidateService: {
+                async buildCandidate() {
+                    throw Object.assign(new Error(`${code}: ${leakedCandidate}`), { code });
+                },
+            },
+            secretResolver: async () => {
+                resolverCalls += 1;
+                return { psk: 'must-not-resolve' };
+            },
+            executor: new L2tpRemoteExecutor({
+                transport: {
+                    async uploadRootFile(request) { transportCalls.push(request); },
+                    async runArtifactCommand(request) { transportCalls.push(request); },
+                },
+            }),
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async renew() { return { ok: true }; },
+                async release() { return { ok: true }; },
+            },
+        });
+
+        const result = await worker.runOnce();
+        const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+
+        assert.deepEqual(result, {
+            claimed: true,
+            operationId: operation.id,
+            status: 'failed',
+        });
+        assert.equal(resolverCalls, 0);
+        assert.deepEqual(transportCalls, []);
+        assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
+        assert.equal(statuses[0].request.errorCode, 'XRAY_CANDIDATE_FAILED');
+        assert.equal(statuses[0].request.errorMessage, 'Failed to build the L2TP Xray candidate');
+        assert.doesNotMatch(
+            JSON.stringify({ result, repositoryCalls: operationRepository.calls }),
+            new RegExp(leakedCandidate),
+        );
     }
 });
 
@@ -351,6 +440,14 @@ test('secret resolution failure is sanitized and performs no remote command or r
     const lockCalls = [];
     const worker = createWorker(operationRepository, {
         operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate({ plan }) {
+                return {
+                    operationId: plan.operationId,
+                    content: '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}',
+                };
+            },
+        },
         secretResolver: async () => {
             throw Object.assign(new Error(`vault failure: ${leakedSecret}`), {
                 code: leakedSecret,
