@@ -65,7 +65,10 @@ chmod +x "$TMP_DIR/lib/runner.sh"
 ln -s "$TMP_DIR/lib/runner.sh" "$TMP_DIR/bin/celerity-l2tp-artifact-runner"
 make_sibling_artifact preflight.sh
 make_sibling_artifact apply.sh
-for forbidden in preflight.sh apply.sh apt apt-get systemctl nft; do
+make_sibling_artifact validate-xray.sh
+make_sibling_artifact validate-nft.sh
+make_sibling_artifact rollback.sh
+for forbidden in preflight.sh apply.sh validate-xray.sh validate-nft.sh rollback.sh apt apt-get systemctl nft; do
     make_forbidden_command "$forbidden"
 done
 
@@ -99,13 +102,23 @@ mapfile -t call <"$TMP_DIR/call.log"
 [[ "${call[1]}" == "/var/lib/celerity/l2tp/operations/$max_operation_id/desired.json" ]] \
     || fail 'maximum-length operation id was not passed as data'
 
+declare -A command_artifacts=(
+    [validate_xray]='validate-xray.sh'
+    [validate_nft]='validate-nft.sh'
+    [rollback]='rollback.sh'
+)
 for command in validate_xray validate_nft rollback; do
     rm -f "$TMP_DIR/call.log"
-    invoke_runner "not-implemented-$command" --operation-id operation-20 --command "$command"
-    [[ "$status" -ne 0 ]] || fail "$command unexpectedly succeeded"
-    [[ "$(<"$output")" == "{\"status\":\"error\",\"code\":\"NOT_IMPLEMENTED\",\"command\":\"$command\"}" ]] \
-        || fail "$command returned the wrong structured error"
-    [[ ! -e "$TMP_DIR/call.log" ]] || fail "$command invoked an artifact"
+    invoke_runner "$command" --operation-id operation-20 --command "$command"
+    [[ "$status" -eq 0 ]] || fail "$command dispatch failed"
+    artifact="${command_artifacts[$command]}"
+    [[ "$(<"$output")" == "{\"status\":\"ok\",\"artifact\":\"$artifact\"}" ]] \
+        || fail "$command did not execute the fixed sibling artifact"
+    mapfile -t call <"$TMP_DIR/call.log"
+    [[ "${#call[@]}" -eq 2 ]] || fail "$command received an unexpected argument count"
+    [[ "${call[0]}" == "$artifact" ]] || fail "$command invoked the wrong artifact"
+    [[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+        || fail "$command received the wrong operation directory"
 done
 
 expect_error unknown-command UNKNOWN_COMMAND \

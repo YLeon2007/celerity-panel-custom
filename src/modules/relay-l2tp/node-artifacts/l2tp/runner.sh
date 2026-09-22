@@ -40,9 +40,14 @@ case "$COMMAND" in
     stage_managed_files)
         exec_artifact "$ARTIFACT_DIR/apply.sh" "$OPERATION_DIR/artifacts.json" '/'
         ;;
-    validate_xray|validate_nft|rollback)
-        printf '{"status":"error","code":"NOT_IMPLEMENTED","command":"%s"}\n' "$COMMAND" >&2
-        exit 69
+    validate_xray)
+        exec_artifact "$ARTIFACT_DIR/validate-xray.sh" "$OPERATION_DIR"
+        ;;
+    validate_nft)
+        exec_artifact "$ARTIFACT_DIR/validate-nft.sh" "$OPERATION_DIR"
+        ;;
+    rollback)
+        exec_artifact "$ARTIFACT_DIR/rollback.sh" "$OPERATION_DIR"
         ;;
     *)
         emit_error 'UNKNOWN_COMMAND'
