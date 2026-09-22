@@ -159,6 +159,7 @@ class L2tpOperationWorker {
         }
         const secrets = await this.secretResolver({
             operationId,
+            kind: operation.kind,
             nodeId: entityId(operation.node),
             credentialRevision: plan.desired?.credentialRevision,
             secret: 'psk',

@@ -211,6 +211,7 @@ test('claims an install once and resolves its PSK once before typed artifact upl
     assert.deepEqual(second, { claimed: false });
     assert.deepEqual(resolverCalls, [{
         operationId: 'operation-jit',
+        kind: 'install',
         nodeId: 'relay-1',
         credentialRevision: 9,
         secret: 'psk',
