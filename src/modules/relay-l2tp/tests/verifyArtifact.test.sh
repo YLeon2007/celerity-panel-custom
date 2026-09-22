@@ -24,6 +24,7 @@ invoke_verify() {
         CALL_LOG="$TMP_DIR/call.log" \
         MUTATION_LOG="$TMP_DIR/mutation.log" \
         NFT_STATUS="${NFT_STATUS:-0}" \
+        RULE_FWMARK="${RULE_FWMARK:-0x4d}" \
         unshare --user --map-root-user "$ARTIFACT" "$@" >"$output" 2>&1
     status=$?
     set -e
@@ -63,7 +64,7 @@ cat >"$TMP_DIR/bin/ip" <<'STUB'
 set -Eeuo pipefail
 printf 'ip %s\n' "$*" >>"$CALL_LOG"
 case "$*" in
-    '-4 rule show priority 10077') printf '%s\n' '10077: from all fwmark 0x4d lookup 177' ;;
+    '-4 rule show priority 10077') printf '10077: from all fwmark %s lookup 177\n' "$RULE_FWMARK" ;;
     '-4 route show table 177 type local') printf '%s\n' 'local 0.0.0.0/0 dev lo scope host' ;;
     *) exit 90 ;;
 esac
@@ -98,6 +99,14 @@ mapfile -t calls <"$TMP_DIR/call.log"
     || fail 'verification did not record a sanitized operation-local marker'
 [[ ! -s "$TMP_DIR/mutation.log" ]] || fail 'verification invoked a fallback mutation command'
 ! grep -Fq -- 'must-not-leak' "$output" || fail 'verification leaked desired secrets'
+
+rm -f "$TMP_DIR/operation/state/verified.json"
+RULE_FWMARK=0x4e invoke_verify fwmark-mismatch "$TMP_DIR/operation"
+[[ "$status" -ne 0 ]] || fail 'rule with the wrong fwmark was accepted'
+[[ "$(<"$output")" == '{"status":"error","code":"IP_RULE_VERIFY_FAILED"}' ]] \
+    || fail 'fwmark mismatch returned the wrong structured error'
+[[ ! -e "$TMP_DIR/operation/state/verified.json" ]] \
+    || fail 'fwmark mismatch wrote a verified marker'
 
 NFT_STATUS=23 invoke_verify nft-failure "$TMP_DIR/operation"
 [[ "$status" -ne 0 ]] || fail 'missing nft namespace was accepted'

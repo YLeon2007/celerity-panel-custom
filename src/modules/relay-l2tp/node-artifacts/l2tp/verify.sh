@@ -107,9 +107,27 @@ if ! "$nft_path" list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
     exit 70
 fi
 rule_state="$($ip_path -4 rule show priority "$PRIORITY" 2>/dev/null || true)"
-if [[ -z "$rule_state" \
-    || "$rule_state" != *"fwmark "* \
-    || ( "$rule_state" != *"lookup $route_table"* && "$rule_state" != *"table $route_table"* ) ]]; then
+if ! RULE_STATE="$rule_state" python3 - "$fwmark" "$route_table" "$PRIORITY" <<'PY'
+import os
+import re
+import sys
+
+fwmark, route_table, priority = (int(value) for value in sys.argv[1:])
+for line in os.environ.get('RULE_STATE', '').splitlines():
+    priority_match = re.match(r'^\s*(\d+):(?:\s|$)', line)
+    mark_match = re.search(r'(?:^|\s)fwmark\s+(\S+)(?:\s|$)', line)
+    table_match = re.search(r'(?:^|\s)(?:lookup|table)\s+(\d+)(?:\s|$)', line)
+    if priority_match is None or mark_match is None or table_match is None:
+        continue
+    try:
+        installed_mark = int(mark_match.group(1), 0)
+    except ValueError:
+        continue
+    if int(priority_match.group(1)) == priority and installed_mark == fwmark and int(table_match.group(1)) == route_table:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+then
     emit_error 'IP_RULE_VERIFY_FAILED'
     exit 70
 fi

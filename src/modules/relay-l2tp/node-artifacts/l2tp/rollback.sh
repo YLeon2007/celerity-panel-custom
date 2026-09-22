@@ -26,6 +26,7 @@ MANAGED_PATHS = frozenset((
     'usr/local/etc/xray/config.json',
 ))
 SAFE_FILE_MODES = frozenset((0o600, 0o640, 0o644))
+MISSING = object()
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 FILE_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC
 FILE_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
@@ -208,32 +209,57 @@ def parse_backup(value):
     return parsed_files, parsed_absent
 
 
-def parse_marker(state, name, keys):
+def parse_optional_marker(state, name):
+    try:
+        os.stat(name, dir_fd=state, follow_symlinks=False)
+    except FileNotFoundError:
+        return MISSING
+    except OSError as error:
+        raise RollbackError('ROLLBACK_STATE_INVALID', 66) from error
     return parse_json(read_regular(state, name, 'ROLLBACK_STATE_INVALID'), 'ROLLBACK_STATE_INVALID')
 
 
 def restore_system_state(state):
-    firewall = parse_marker(state, 'firewall.applied.json', {'fwmark', 'routeTable', 'priority'})
-    xray = parse_marker(state, 'xray.before.json', {'wasActive'})
-    services = parse_marker(state, 'l2tp-services.before.json', {'strongswan-starter.service', 'xl2tpd.service'})
-    if (
-        set(firewall) != {'fwmark', 'routeTable', 'priority'}
+    markers = {
+        'firewall.applied.json': parse_optional_marker(state, 'firewall.applied.json'),
+        'xray.before.json': parse_optional_marker(state, 'xray.before.json'),
+        'l2tp-services.before.json': parse_optional_marker(state, 'l2tp-services.before.json'),
+    }
+    firewall = markers['firewall.applied.json']
+    xray = markers['xray.before.json']
+    services = markers['l2tp-services.before.json']
+    if firewall is not MISSING and (
+        not isinstance(firewall, dict)
+        or set(firewall) != {'fwmark', 'routeTable', 'priority'}
         or any(isinstance(firewall[key], bool) or not isinstance(firewall[key], int) or firewall[key] < 1 for key in firewall)
-        or set(xray) != {'wasActive'} or type(xray['wasActive']) is not bool
+    ):
+        raise RollbackError('ROLLBACK_STATE_INVALID', 66)
+    if xray is not MISSING and (
+        not isinstance(xray, dict)
+        or set(xray) != {'wasActive'}
+        or type(xray['wasActive']) is not bool
+    ):
+        raise RollbackError('ROLLBACK_STATE_INVALID', 66)
+    if services is not MISSING and (
+        not isinstance(services, dict)
         or set(services) != {'strongswan-starter.service', 'xl2tpd.service'}
         or any(type(value) is not bool for value in services.values())
     ):
         raise RollbackError('ROLLBACK_STATE_INVALID', 66)
     try:
-        subprocess.run(['ip', '-4', 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(firewall['routeTable'])], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['ip', '-4', 'rule', 'del', 'priority', str(firewall['priority']), 'fwmark', str(firewall['fwmark']), 'table', str(firewall['routeTable'])], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['nft', 'delete', 'table', 'inet', 'celerity_l2tp'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['systemctl', 'restart' if xray['wasActive'] else 'stop', 'xray.service'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for service in ('strongswan-starter.service', 'xl2tpd.service'):
-            subprocess.run(['systemctl', 'restart' if services[service] else 'stop', service], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if firewall is not MISSING:
+            subprocess.run(['ip', '-4', 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(firewall['routeTable'])], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['ip', '-4', 'rule', 'del', 'priority', str(firewall['priority']), 'fwmark', str(firewall['fwmark']), 'table', str(firewall['routeTable'])], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['nft', 'delete', 'table', 'inet', 'celerity_l2tp'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if xray is not MISSING:
+            subprocess.run(['systemctl', 'restart' if xray['wasActive'] else 'stop', 'xray.service'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if services is not MISSING:
+            for service in ('strongswan-starter.service', 'xl2tpd.service'):
+                subprocess.run(['systemctl', 'restart' if services[service] else 'stop', service], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError) as error:
         raise RollbackError('ROLLBACK_SYSTEM_FAILED', 70) from error
-    return 3
+    present = [name for name, marker in markers.items() if marker is not MISSING]
+    return present, firewall is not MISSING, (1 if xray is not MISSING else 0) + (2 if services is not MISSING else 0)
 
 
 def unlink_marker(state, name):
@@ -268,17 +294,20 @@ def run():
             finally:
                 os.close(parent)
         state = secure_child_directory(operation, 'state', 'ROLLBACK_STATE_INVALID')
-        services_reverted = restore_system_state(state)
-        for marker in ('firewall.applied.json', 'xray.before.json', 'l2tp-services.before.json'):
+        present_markers, firewall_reverted, services_reverted = restore_system_state(state)
+        for marker in present_markers:
             unlink_marker(state, marker)
-        atomic_write(state, 'rolled-back.json', b'{"status":"rolled_back"}\n', 0o600)
-        return {
+        result = {
             'status': 'ok',
             'restored': len(files),
             'removed': len(absent),
-            'firewallReverted': True,
+            'firewallReverted': firewall_reverted,
             'servicesReverted': services_reverted,
         }
+        completion = dict(result)
+        completion['status'] = 'rolled_back'
+        atomic_write(state, 'rolled-back.json', (json.dumps(completion, separators=(',', ':')) + '\n').encode('ascii'), 0o600)
+        return result
     finally:
         if state >= 0:
             os.close(state)

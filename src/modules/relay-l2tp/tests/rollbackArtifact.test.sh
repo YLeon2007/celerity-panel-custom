@@ -96,7 +96,7 @@ cat >"$TMP_DIR/bin/systemctl" <<'STUB'
 set -Eeuo pipefail
 printf 'systemctl %s\n' "$*" >>"$COMMAND_LOG"
 case "$*" in
-    'stop xray.service'|'restart strongswan-starter.service'|'stop xl2tpd.service') exit 0 ;;
+    'stop xray.service'|'restart xray.service'|'restart strongswan-starter.service'|'stop xl2tpd.service') exit 0 ;;
     *) exit 90 ;;
 esac
 STUB
@@ -147,6 +147,62 @@ expected_calls=(
     && ! -e "$TMP_DIR/operation/state/xray.before.json" \
     && ! -e "$TMP_DIR/operation/state/l2tp-services.before.json" ]] \
     || fail 'rollback retained applied-state ownership markers'
+[[ "$(<"$TMP_DIR/operation/state/rolled-back.json")" == '{"status":"rolled_back","restored":3,"removed":4,"firewallReverted":true,"servicesReverted":3}' ]] \
+    || fail 'rollback completion marker recorded inaccurate counts'
+
+partial_operation="$TMP_DIR/partial-operation"
+mkdir -p "$partial_operation/state"
+write_current_files "$TMP_DIR/root"
+printf '%s\n' '{"files":[{"path":"usr/local/etc/xray/config.json","mode":420,"content":"{\"partial-old\":true}\n"}],"absent":["etc/nftables.d/celerity-l2tp.nft"]}' \
+    >"$partial_operation/backup.json"
+printf '%s\n' '{"wasActive":true}' >"$partial_operation/state/xray.before.json"
+printf '%s\n' '{"keep":true}' >"$partial_operation/state/unrelated.json"
+chmod 700 "$partial_operation" "$partial_operation/state"
+chmod 600 \
+    "$partial_operation/backup.json" \
+    "$partial_operation/state/xray.before.json" \
+    "$partial_operation/state/unrelated.json"
+invoke_rollback partial-xray "$partial_operation"
+[[ "$status" -eq 0 ]] || fail 'partial Xray rollback failed without firewall or L2TP service markers'
+[[ "$(<"$output")" == '{"status":"ok","restored":1,"removed":1,"firewallReverted":false,"servicesReverted":1}' ]] \
+    || fail 'partial Xray rollback returned inaccurate counts'
+[[ "$(<"$TMP_DIR/root/usr/local/etc/xray/config.json")" == '{"partial-old":true}' ]] \
+    || fail 'partial rollback did not restore the backed-up Xray config'
+[[ ! -e "$TMP_DIR/root/etc/nftables.d/celerity-l2tp.nft" ]] \
+    || fail 'partial rollback did not remove a backed-up absent file'
+[[ "$(<"$TMP_DIR/command.log")" == 'systemctl restart xray.service' ]] \
+    || fail 'partial rollback ran commands unrelated to present state markers'
+[[ ! -e "$partial_operation/state/xray.before.json" ]] \
+    || fail 'partial rollback retained the present Xray marker'
+[[ -f "$partial_operation/state/unrelated.json" ]] \
+    || fail 'partial rollback removed an unrelated state marker'
+[[ "$(<"$partial_operation/state/rolled-back.json")" == '{"status":"rolled_back","restored":1,"removed":1,"firewallReverted":false,"servicesReverted":1}' ]] \
+    || fail 'partial rollback completion marker recorded inaccurate counts'
+
+malformed_operation="$TMP_DIR/malformed-operation"
+mkdir -p "$malformed_operation/state"
+write_current_files "$TMP_DIR/root"
+printf '%s\n' '{"files":[{"path":"usr/local/etc/xray/config.json","mode":420,"content":"{\"malformed-old\":true}\n"}],"absent":[]}' \
+    >"$malformed_operation/backup.json"
+printf '%s\n' 'null' >"$malformed_operation/state/firewall.applied.json"
+printf '%s\n' '{"wasActive":true}' >"$malformed_operation/state/xray.before.json"
+chmod 700 "$malformed_operation" "$malformed_operation/state"
+chmod 600 \
+    "$malformed_operation/backup.json" \
+    "$malformed_operation/state/firewall.applied.json" \
+    "$malformed_operation/state/xray.before.json"
+invoke_rollback malformed-marker "$malformed_operation"
+[[ "$status" -ne 0 ]] || fail 'rollback accepted a malformed present marker'
+[[ "$(<"$output")" == '{"status":"error","code":"ROLLBACK_STATE_INVALID"}' ]] \
+    || fail 'malformed marker returned the wrong structured error'
+[[ "$(<"$TMP_DIR/root/usr/local/etc/xray/config.json")" == '{"malformed-old":true}' ]] \
+    || fail 'malformed state prevented restoration of the backed-up file'
+[[ ! -e "$TMP_DIR/command.log" ]] \
+    || fail 'malformed marker allowed a related system command'
+[[ -f "$malformed_operation/state/firewall.applied.json" \
+    && -f "$malformed_operation/state/xray.before.json" \
+    && ! -e "$malformed_operation/state/rolled-back.json" ]] \
+    || fail 'failed rollback changed lifecycle markers or recorded completion'
 
 missing_operation="$TMP_DIR/missing-operation"
 mkdir -p "$missing_operation/state"
