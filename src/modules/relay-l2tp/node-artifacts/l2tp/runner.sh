@@ -53,6 +53,11 @@ case "$COMMAND" in
         exec_artifact "$ARTIFACT_DIR/validate-xray.sh" "$OPERATION_DIR"
         ;;
     validate_nft)
+        if [[ ! -x "$ARTIFACT_DIR/materialize-nft-candidate.sh" ]]; then
+            emit_error 'ARTIFACT_UNAVAILABLE'
+            exit 69
+        fi
+        "$ARTIFACT_DIR/materialize-nft-candidate.sh" "$OPERATION_DIR" >/dev/null
         exec_artifact "$ARTIFACT_DIR/validate-nft.sh" "$OPERATION_DIR"
         ;;
     activate_xray)

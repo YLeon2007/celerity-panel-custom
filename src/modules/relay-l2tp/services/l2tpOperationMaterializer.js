@@ -113,6 +113,7 @@ function materializeInstallOperation(
                 path: 'desired.json',
                 content: `${JSON.stringify({
                     clientCidr: persistedPlan.desired.clientCidr,
+                    users: [],
                 })}\n`,
             },
             {

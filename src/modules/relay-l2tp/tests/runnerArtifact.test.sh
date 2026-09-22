@@ -15,10 +15,21 @@ make_sibling_artifact() {
     local name="$1"
     {
         printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
-        printf '%s\n' 'printf '\''%s\n'\'' "${0##*/}" "$@" >"$RUNNER_CALL_LOG"'
+        printf '%s\n' 'printf '\''%s\n'\'' "${0##*/}" "$@" >>"$RUNNER_CALL_LOG"'
         printf '%s\n' 'printf '\''{"status":"ok","artifact":"%s"}\n'\'' "${0##*/}"'
     } >"$TMP_DIR/lib/$name"
     chmod +x "$TMP_DIR/lib/$name"
+}
+
+make_materializer_artifact() {
+    cat >"$TMP_DIR/lib/materialize-nft-candidate.sh" <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "${0##*/}" "$@" >>"$RUNNER_CALL_LOG"
+printf '%s\n' '{"status":"ok","artifact":"materialize-nft-candidate.sh"}'
+exit "${MATERIALIZE_NFT_STATUS:-0}"
+STUB
+    chmod +x "$TMP_DIR/lib/materialize-nft-candidate.sh"
 }
 
 make_forbidden_command() {
@@ -40,6 +51,7 @@ invoke_runner() {
     PATH="$TMP_DIR/bin:$PATH" \
         RUNNER_CALL_LOG="$TMP_DIR/call.log" \
         MUTATION_LOG="$TMP_DIR/mutations.log" \
+        MATERIALIZE_NFT_STATUS="${MATERIALIZE_NFT_STATUS:-0}" \
         "$TMP_DIR/bin/celerity-l2tp-artifact-runner" "$@" >"$output" 2>&1
     status=$?
     set -e
@@ -69,6 +81,7 @@ make_sibling_artifact backup.sh
 make_sibling_artifact apply.sh
 make_sibling_artifact compose-xray-fragment.sh
 make_sibling_artifact validate-xray.sh
+make_materializer_artifact
 make_sibling_artifact validate-nft.sh
 make_sibling_artifact activate-xray.sh
 make_sibling_artifact apply-firewall-policy.sh
@@ -77,7 +90,7 @@ make_sibling_artifact sync-users.sh
 make_sibling_artifact verify.sh
 make_sibling_artifact commit.sh
 make_sibling_artifact rollback.sh
-for forbidden in preflight.sh install-runtime.sh backup.sh apply.sh compose-xray-fragment.sh validate-xray.sh validate-nft.sh activate-xray.sh apply-firewall-policy.sh start-l2tp.sh sync-users.sh verify.sh commit.sh rollback.sh apt apt-get systemctl nft; do
+for forbidden in preflight.sh install-runtime.sh backup.sh apply.sh compose-xray-fragment.sh validate-xray.sh materialize-nft-candidate.sh validate-nft.sh activate-xray.sh apply-firewall-policy.sh start-l2tp.sh sync-users.sh verify.sh commit.sh rollback.sh apt apt-get systemctl nft; do
     make_forbidden_command "$forbidden"
 done
 
@@ -135,7 +148,6 @@ mapfile -t call <"$TMP_DIR/call.log"
 declare -A command_artifacts=(
     [compose_xray_fragment]='compose-xray-fragment.sh'
     [validate_xray]='validate-xray.sh'
-    [validate_nft]='validate-nft.sh'
     [apply_firewall_policy]='apply-firewall-policy.sh'
     [start_l2tp]='start-l2tp.sh'
     [sync_users]='sync-users.sh'
@@ -143,7 +155,7 @@ declare -A command_artifacts=(
     [commit]='commit.sh'
     [rollback]='rollback.sh'
 )
-for command in compose_xray_fragment validate_xray validate_nft apply_firewall_policy start_l2tp sync_users verify commit rollback; do
+for command in compose_xray_fragment validate_xray apply_firewall_policy start_l2tp sync_users verify commit rollback; do
     rm -f "$TMP_DIR/call.log"
     invoke_runner "$command" --operation-id operation-20 --command "$command"
     [[ "$status" -eq 0 ]] || fail "$command dispatch failed"
@@ -156,6 +168,30 @@ for command in compose_xray_fragment validate_xray validate_nft apply_firewall_p
     [[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
         || fail "$command received the wrong operation directory"
 done
+
+rm -f "$TMP_DIR/call.log"
+invoke_runner validate_nft --operation-id operation-20 --command validate_nft
+[[ "$status" -eq 0 ]] || fail 'validate_nft dispatch failed'
+[[ "$(<"$output")" == '{"status":"ok","artifact":"validate-nft.sh"}' ]] \
+    || fail 'validate_nft did not return only the validator result'
+mapfile -t call <"$TMP_DIR/call.log"
+[[ "${#call[@]}" -eq 4 ]] || fail 'validate_nft did not invoke exactly two fixed artifacts'
+[[ "${call[0]}" == 'materialize-nft-candidate.sh' \
+    && "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' \
+    && "${call[2]}" == 'validate-nft.sh' \
+    && "${call[3]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    || fail 'validate_nft did not materialize the fixed candidate before validation'
+
+rm -f "$TMP_DIR/call.log"
+MATERIALIZE_NFT_STATUS=23 invoke_runner validate_nft-materializer-failure \
+    --operation-id operation-20 --command validate_nft
+unset MATERIALIZE_NFT_STATUS
+[[ "$status" -ne 0 ]] || fail 'validate_nft continued after candidate materialization failed'
+mapfile -t call <"$TMP_DIR/call.log"
+[[ "${#call[@]}" -eq 2 \
+    && "${call[0]}" == 'materialize-nft-candidate.sh' \
+    && "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    || fail 'validate_nft invoked the validator after materialization failed'
 
 rm -f "$TMP_DIR/call.log"
 invoke_runner activate_xray --operation-id operation-20 --command activate_xray

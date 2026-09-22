@@ -65,6 +65,52 @@ invoke_sync idempotent "$TMP_DIR/operation"
 [[ "$(<"$output")" == '{"status":"ok","changed":0,"managedUsers":1,"disabledUsers":1}' ]] \
     || fail 'idempotent user sync returned the wrong result'
 
+ROOT_DIR="$ROOT_DIR" node >"$TMP_DIR/operation/desired.json" <<'NODE'
+const { INSTALL_STEP_TYPES } = require(
+    `${process.env.ROOT_DIR}/src/modules/relay-l2tp/services/l2tpProvisionPlanService`,
+);
+const { materializeInstallOperation } = require(
+    `${process.env.ROOT_DIR}/src/modules/relay-l2tp/services/l2tpOperationMaterializer`,
+);
+const desired = {
+    clientCidr: '10.77.0.0/24',
+    localAddress: '10.77.0.1',
+    poolStart: '10.77.0.10',
+    poolEnd: '10.77.0.200',
+    dnsServers: ['1.1.1.1'],
+    tproxyPort: 12345,
+    fwmark: 77,
+    routeTable: 177,
+};
+const result = materializeInstallOperation({
+    plan: {
+        ok: true,
+        operationId: 'materialized-without-user-credentials',
+        desired,
+        steps: INSTALL_STEP_TYPES.map(type => ({ type })),
+    },
+    secrets: { psk: 'transient-psk-not-for-desired' },
+});
+const remoteDesired = result.remoteArtifacts.find(artifact => artifact.type === 'desired');
+process.stdout.write(remoteDesired.content);
+NODE
+node -e '
+const fs = require("node:fs");
+const desired = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+if (!Array.isArray(desired.users) || desired.users.length !== 0) process.exit(1);
+if (JSON.stringify(desired).match(/password|psk|secret/i)) process.exit(1);
+' "$TMP_DIR/operation/desired.json" \
+    || fail 'materialized desired did not contain an explicit credential-free users array'
+invoke_sync materialized-without-credentials "$TMP_DIR/operation"
+[[ "$status" -eq 0 ]] || fail 'sync users rejected materialized desired without user credentials'
+[[ "$(<"$output")" == '{"status":"ok","changed":1,"managedUsers":0,"disabledUsers":0}' ]] \
+    || fail 'credential-free materialized desired returned the wrong result'
+expected_without_users='local line must survive
+# BEGIN CELERITY MANAGED L2TP USERS
+# END CELERITY MANAGED L2TP USERS'
+[[ "$(<"$TMP_DIR/root/etc/ppp/chap-secrets")" == "$expected_without_users" ]] \
+    || fail 'credential-free materialized desired did not clear only managed users'
+
 before="$(<"$TMP_DIR/root/etc/ppp/chap-secrets")"
 printf '%s\n' '{"users":[{"login":"alice","password":"first-secret","ipAddress":"10.77.0.10","enabled":true},{"login":"alice","password":"second-secret","ipAddress":"10.77.0.11","enabled":true}]}' \
     >"$TMP_DIR/operation/desired.json"

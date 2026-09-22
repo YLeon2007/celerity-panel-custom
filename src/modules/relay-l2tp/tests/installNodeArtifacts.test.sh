@@ -17,6 +17,7 @@ readonly -a PAYLOADS=(
     backup.sh
     compose-xray-fragment.sh
     validate-xray.sh
+    materialize-nft-candidate.sh
     validate-nft.sh
     activate-xray.sh
     apply-firewall-policy.sh

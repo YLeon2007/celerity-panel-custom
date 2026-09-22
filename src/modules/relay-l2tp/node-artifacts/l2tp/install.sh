@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 declare -Ar PAYLOAD_SHA256=(
-    [runner.sh]='3c512b9990f90b57e496791e8faea1fd549f9311d005c0150f630b93e787bf61'
+    [runner.sh]='ac31c4c7263895a066a06bc0217190b532650ba665a7cab588a647530f1a9ab0'
     [receive-artifact.py]='e4a107d0220284c358534ea0a7f2b8ec8a7f3952956eeebb33a7a68450988f4b'
     [apply.sh]='dfd396096bd85c2e931682f05840d2f6cce5246212288f6f2b91e2e660ccbe95'
     [preflight.sh]='a5f2c845beb4cdc781688efee00745f4edca98f7e5599a78007e411d9b2d709e'
@@ -18,6 +18,7 @@ declare -Ar PAYLOAD_SHA256=(
     [commit.sh]='bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b'
     [rollback.sh]='63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091'
     [install-runtime.sh]='43157074ad65505ca433bd5b3365c398412c36764203fac392bf59cb49b91bb4'
+    [materialize-nft-candidate.sh]='2ce54eded17460e7a4a0d53748a9f177036b4656e4b6a265f18c32f04c63f6d3'
 )
 readonly RECEIVER_LINK_NAME='celerity-l2tp-artifact-receiver'
 readonly RUNNER_LINK_NAME='celerity-l2tp-artifact-runner'
@@ -41,6 +42,7 @@ readonly -a PAYLOADS=(
     commit.sh
     rollback.sh
     install-runtime.sh
+    materialize-nft-candidate.sh
 )
 TEMPORARY_TARGETS=()
 

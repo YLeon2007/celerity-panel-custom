@@ -155,7 +155,7 @@ test('materializes fixed preflight JSON and generated artifacts only after secre
             stepType: 'preflight',
             type: 'desired',
             path: 'desired.json',
-            content: '{"clientCidr":"10.77.0.0/24"}\n',
+            content: '{"clientCidr":"10.77.0.0/24","users":[]}\n',
         },
         {
             stepType: 'stage_managed_files',
