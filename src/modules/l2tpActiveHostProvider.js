@@ -31,6 +31,13 @@ function assertActiveHost(host) {
     if (typeof runtime.stateManagementService?.configureRelay !== 'function') {
         throw new TypeError('L2TP active host runtime requires stateManagementService.configureRelay');
     }
+    for (const methodName of ['createUser', 'listUsers', 'updateUser', 'disableUser']) {
+        if (typeof runtime.userManagementService?.[methodName] !== 'function') {
+            throw new TypeError(
+                `L2TP active host runtime userManagementService requires ${methodName}`,
+            );
+        }
+    }
     if (typeof host.loadPanelOverview !== 'function') {
         throw new TypeError('L2TP active host requires loadPanelOverview');
     }
@@ -96,10 +103,25 @@ function createL2tpRouteBindings(activeHostProvider) {
             );
         },
     });
+    const userManagementService = Object.freeze({
+        createUser(...args) {
+            return callRuntimeService('userManagementService', 'createUser', args);
+        },
+        listUsers(...args) {
+            return callRuntimeService('userManagementService', 'listUsers', args);
+        },
+        updateUser(...args) {
+            return callRuntimeService('userManagementService', 'updateUser', args);
+        },
+        disableUser(...args) {
+            return callRuntimeService('userManagementService', 'disableUser', args);
+        },
+    });
 
     return Object.freeze({
         l2tpService,
         stateManagementService,
+        userManagementService,
         loadPanelOverview(...args) {
             const host = activeHostProvider.getActiveHost();
             const method = assertServiceMethod(host, 'loadPanelOverview');

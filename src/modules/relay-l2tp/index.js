@@ -60,6 +60,7 @@ function registerRoutes(context) {
         panelRouter,
         l2tpService,
         stateManagementService,
+        userManagementService,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -75,6 +76,11 @@ function registerRoutes(context) {
     }
     if (!stateManagementService || typeof stateManagementService.configureRelay !== 'function') {
         throw new TypeError('registerRoutes requires stateManagementService');
+    }
+    for (const methodName of ['createUser', 'listUsers', 'updateUser', 'disableUser']) {
+        if (typeof userManagementService?.[methodName] !== 'function') {
+            throw new TypeError(`registerRoutes requires userManagementService.${methodName}`);
+        }
     }
     if (typeof requireAuth !== 'function') {
         throw new TypeError('registerRoutes requires requireAuth');
@@ -100,6 +106,7 @@ function registerRoutes(context) {
     const l2tpRouter = createL2tpRouter({
         l2tpService,
         stateManagementService,
+        userManagementService,
         requireAuth,
         requireOnboarding,
         csrf,

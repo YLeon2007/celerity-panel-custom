@@ -2,9 +2,13 @@
 
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const { L2tpUserExecutionRepository } = require('../repositories/l2tpUserExecutionRepository');
+const {
+    L2tpUserManagementRepository,
+} = require('../repositories/l2tpUserManagementRepository');
 const { L2tpNodeExecutionResolver } = require('../services/l2tpNodeExecutionResolver');
 const { createL2tpNodeTransportResolver } = require('../services/l2tpNodeTransportFactory');
 const { L2tpStateManagementService } = require('../services/l2tpStateManagementService');
+const { L2tpUserManagementService } = require('../services/l2tpUserManagementService');
 const { L2tpUserResolver } = require('../services/l2tpUserResolver');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
@@ -83,6 +87,27 @@ const unavailableStateManagementService = Object.freeze({
         const error = new Error('L2TP state management is unavailable');
         error.code = 'L2TP_STATE_MANAGEMENT_UNAVAILABLE';
         throw error;
+    },
+});
+
+function userManagementUnavailableError() {
+    const error = new Error('L2TP user management is unavailable');
+    error.code = 'L2TP_USER_MANAGEMENT_UNAVAILABLE';
+    return error;
+}
+
+const unavailableUserManagementService = Object.freeze({
+    async createUser() {
+        throw userManagementUnavailableError();
+    },
+    async listUsers() {
+        throw userManagementUnavailableError();
+    },
+    async updateUser() {
+        throw userManagementUnavailableError();
+    },
+    async disableUser() {
+        throw userManagementUnavailableError();
     },
 });
 
@@ -201,6 +226,7 @@ function createL2tpExecutionRuntime({
             secretResolver: unavailableSecretResolver,
             stateReconciler: unavailableStateReconciler,
             stateManagementService: stateManagementService ?? unavailableStateManagementService,
+            userManagementService: unavailableUserManagementService,
         });
         return {
             runtime,
@@ -270,6 +296,16 @@ function createL2tpExecutionRuntime({
         }
         return runtimeStateManagementService.reconcileVerifiedOperation(request);
     };
+    const userManagementRepository = new L2tpUserManagementRepository({
+        HyNode,
+        L2tpUser,
+        RelayL2tpState,
+    });
+    const userManagementService = new L2tpUserManagementService({
+        repository: userManagementRepository,
+        secretBox,
+        secretKey,
+    });
     const userRepository = new L2tpUserExecutionRepository({ model: L2tpUser });
     const userResolver = new L2tpUserResolver({
         repository: userRepository,
@@ -295,6 +331,7 @@ function createL2tpExecutionRuntime({
         secretResolver,
         stateReconciler,
         stateManagementService: runtimeStateManagementService,
+        userManagementService,
         lockService,
     });
     const lifecycle = createWorkerLifecycle({
