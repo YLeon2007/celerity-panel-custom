@@ -43,6 +43,7 @@ function createHost(overrides = {}) {
             operationRepository: { kind: 'operation-repository' },
         }),
         createPanelOverviewLoader: () => async () => ({}),
+        secretResolver: async () => ({ psk: 'fixture-value' }),
         createRuntime(dependencies) {
             runtimeCalls.push(dependencies);
             return runtime;

@@ -73,6 +73,12 @@ async function unavailablePreflightRunner() {
     };
 }
 
+async function unavailableSecretResolver() {
+    const error = new Error('L2TP secret resolver is unavailable');
+    error.code = 'L2TP_SECRET_RESOLVER_UNAVAILABLE';
+    throw error;
+}
+
 function createL2tpPanelHost({
     requireAuth,
     requireOnboarding,
@@ -84,6 +90,7 @@ function createL2tpPanelHost({
     compiler = compileTopology,
     topologyRuntime: injectedTopologyRuntime,
     preflightRunner: injectedPreflightRunner,
+    secretResolver = unavailableSecretResolver,
     artifactMaterializer,
     nodeSSHFactory,
     workerLifecycle,
@@ -138,6 +145,8 @@ function createL2tpPanelHost({
         && models.L2tpOperation
         && models.NodeOperationLock
         && typeof injectedPreflightRunner === 'function'
+        && secretResolver !== unavailableSecretResolver
+        && typeof secretResolver === 'function'
         && typeof artifactMaterializer === 'function'
         && typeof createLifecycle === 'function';
     const preflightRunner = activeRuntimeReady
@@ -168,6 +177,7 @@ function createL2tpPanelHost({
         nodeRepository: adapters.nodeRepository,
         stateRepository: adapters.stateRepository,
         preflightRunner,
+        secretResolver,
         ...(activeRuntimeReady
             ? { transportFactory, artifactMaterializer }
             : { transport }),
