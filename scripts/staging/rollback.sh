@@ -185,6 +185,7 @@ if [[ ${manifest[config_test_present]} == 'true' ]]; then
     )
 fi
 python3 "$SCRIPT_DIR/validate-rollback-backup.py" "${validator_args[@]}"
+install -m 0600 -- "$config_env" "$staged_source/.env"
 
 while IFS= read -r -d '' javascript_file; do
     node --check "$javascript_file" >/dev/null \
