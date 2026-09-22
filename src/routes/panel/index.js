@@ -6,7 +6,11 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 
-const { createL2tpPanelHost } = require('../../modules/createL2tpPanelHost');
+const l2tpModuleEntry = require('../../modules/relay-l2tp');
+const {
+    createL2tpRouteBindings,
+    l2tpActiveHostProvider,
+} = require('../../modules/l2tpActiveHostProvider');
 const { checkIpWhitelist, requireAuth, requireOnboarding, render } = require('./helpers');
 const { issuePanelCsrfToken, requirePanelCsrf } = require('./csrf');
 
@@ -38,7 +42,8 @@ function renderL2tpPage(res, data) {
 }
 
 function createPanelRouter({
-    createL2tpHost = createL2tpPanelHost,
+    activeHostProvider = l2tpActiveHostProvider,
+    l2tpModuleEntry: injectedL2tpModuleEntry = l2tpModuleEntry,
     l2tpRateLimiter: injectedL2tpRateLimiter = l2tpRateLimiter,
     renderL2tpPage: injectedRenderL2tpPage = renderL2tpPage,
 } = {}) {
@@ -64,22 +69,16 @@ function createPanelRouter({
     router.use('/', requireAuth, requireOnboarding, migrationRoutes);
     router.use('/', requireAuth, requireOnboarding, accessLogsRoutes);
 
-    const l2tpHost = createL2tpHost({
-        requireAuth,
-        requireOnboarding,
-        csrf: requirePanelCsrf,
-        rateLimiter: injectedL2tpRateLimiter,
-        renderPage: injectedRenderL2tpPage,
-    });
-    l2tpHost.moduleEntry.registerRoutes({
+    const routeBindings = createL2tpRouteBindings(activeHostProvider);
+    injectedL2tpModuleEntry.registerRoutes({
         panelRouter: router,
-        l2tpService: l2tpHost.runtime.service,
-        stateManagementService: l2tpHost.runtime.stateManagementService,
+        l2tpService: routeBindings.l2tpService,
+        stateManagementService: routeBindings.stateManagementService,
         requireAuth,
         requireOnboarding,
         csrf: requirePanelCsrf,
         rateLimiter: injectedL2tpRateLimiter,
-        loadPanelOverview: l2tpHost.loadPanelOverview,
+        loadPanelOverview: routeBindings.loadPanelOverview,
         renderPage: injectedRenderL2tpPage,
     });
 

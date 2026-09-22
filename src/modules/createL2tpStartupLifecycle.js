@@ -132,6 +132,7 @@ function createL2tpStartupLifecycle({
     config,
     hostDependencies = {},
     createPanelHost,
+    activeHostProvider,
 } = {}) {
     const enabled = readEnabled(config);
     if (enabled) assertEnabledDependencies(hostDependencies);
@@ -157,6 +158,20 @@ function createL2tpStartupLifecycle({
             enabled,
         },
     });
+    if (activeHostProvider !== undefined) {
+        for (const methodName of [
+            'assertActiveHost',
+            'installActiveHost',
+            'clearActiveHost',
+        ]) {
+            if (typeof activeHostProvider?.[methodName] !== 'function') {
+                throw new TypeError(
+                    `L2TP active host provider requires ${methodName}`,
+                );
+            }
+        }
+        activeHostProvider.assertActiveHost(host);
+    }
     let started = false;
     let stopped = false;
     let stopPromise;
@@ -165,6 +180,13 @@ function createL2tpStartupLifecycle({
         start() {
             if (enabled && !started && !stopped) {
                 host.start();
+                try {
+                    activeHostProvider?.installActiveHost(host);
+                } catch (error) {
+                    activeHostProvider?.clearActiveHost(host);
+                    Promise.resolve(host.stop()).catch(() => {});
+                    throw error;
+                }
                 started = true;
             }
             return lifecycleState({ enabled, started, stopped });
@@ -172,6 +194,7 @@ function createL2tpStartupLifecycle({
         stop() {
             if (stopPromise === undefined) {
                 stopped = true;
+                activeHostProvider?.clearActiveHost(host);
                 stopPromise = Promise.resolve(enabled ? host.stop() : undefined)
                     .then(() => lifecycleState({ enabled, started, stopped }));
             }

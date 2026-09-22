@@ -274,3 +274,103 @@ test('enabled lifecycle starts and stops its host once with safe idempotent stat
     assert.deepEqual(calls, ['start', 'stop']);
     assert.doesNotMatch(JSON.stringify(stoppedState), /must-not-escape/);
 });
+
+test('enabled lifecycle publishes its started host atomically and clears that exact host before stop', async () => {
+    const calls = [];
+    let activeHost = null;
+    const host = {
+        start() {
+            assert.equal(activeHost, null);
+            calls.push('host.start');
+        },
+        async stop() {
+            assert.equal(activeHost, null);
+            calls.push('host.stop');
+        },
+    };
+    const activeHostProvider = {
+        assertActiveHost(candidate) {
+            calls.push('provider.assert');
+            assert.strictEqual(candidate, host);
+        },
+        installActiveHost(candidate) {
+            calls.push('provider.install');
+            assert.strictEqual(candidate, host);
+            activeHost = candidate;
+        },
+        clearActiveHost(candidate) {
+            calls.push('provider.clear');
+            assert.strictEqual(candidate, host);
+            if (activeHost !== candidate) return false;
+            activeHost = null;
+            return true;
+        },
+    };
+
+    const lifecycle = createL2tpStartupLifecycle({
+        config: { enabled: true },
+        hostDependencies: createEnabledHostDependencies(),
+        activeHostProvider,
+        createPanelHost() {
+            calls.push('host.create');
+            return host;
+        },
+    });
+
+    assert.deepEqual(calls, ['host.create', 'provider.assert']);
+    lifecycle.start();
+    assert.strictEqual(activeHost, host);
+    assert.deepEqual(calls, [
+        'host.create',
+        'provider.assert',
+        'host.start',
+        'provider.install',
+    ]);
+
+    const firstStop = lifecycle.stop();
+    const secondStop = lifecycle.stop();
+    assert.strictEqual(firstStop, secondStop);
+    await firstStop;
+    assert.equal(activeHost, null);
+    assert.deepEqual(calls, [
+        'host.create',
+        'provider.assert',
+        'host.start',
+        'provider.install',
+        'provider.clear',
+        'host.stop',
+    ]);
+});
+
+test('host start failure leaves the panel provider fail-closed', () => {
+    const calls = [];
+    const startupError = new Error('worker startup failed');
+    const host = {
+        start() {
+            calls.push('host.start');
+            throw startupError;
+        },
+        async stop() {},
+    };
+    const activeHostProvider = {
+        assertActiveHost(candidate) {
+            calls.push('provider.assert');
+            assert.strictEqual(candidate, host);
+        },
+        installActiveHost() {
+            calls.push('provider.install');
+        },
+        clearActiveHost() {
+            calls.push('provider.clear');
+        },
+    };
+    const lifecycle = createL2tpStartupLifecycle({
+        config: { enabled: true },
+        hostDependencies: createEnabledHostDependencies(),
+        activeHostProvider,
+        createPanelHost: () => host,
+    });
+
+    assert.throws(() => lifecycle.start(), error => error === startupError);
+    assert.deepEqual(calls, ['provider.assert', 'host.start']);
+});

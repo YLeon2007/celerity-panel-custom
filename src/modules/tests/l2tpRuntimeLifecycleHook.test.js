@@ -110,9 +110,11 @@ test('enabled mode forwards factory dependencies and starts the lifecycle once',
         },
         async stop() {},
     };
+    const activeHostProvider = { marker: 'root-active-host-provider' };
 
     const result = createL2tpRuntimeLifecycleHook({
         env: { L2TP_EXECUTION_ENABLED: 'true' },
+        activeHostProvider,
         createHostDependencies() {
             calls.push('dependencies');
             return hostDependencies;
@@ -131,6 +133,7 @@ test('enabled mode forwards factory dependencies and starts the lifecycle once',
             options: {
                 config: { enabled: true },
                 hostDependencies,
+                activeHostProvider,
             },
         },
         'start',
@@ -189,9 +192,9 @@ test('root lifecycle propagates invalid enable configuration before creating dep
     assert.equal(dependencyConstructions, 0);
 });
 
-test('root host dependencies provide explicit preflight and candidate factories', async () => {
+test('root host dependencies provide the exact safe candidate composition required by enabled startup', async () => {
     const candidateConstructions = [];
-    const userResolverCalls = [];
+    const nodeQueries = [];
     class FakeCandidateService {
         constructor(dependencies) {
             candidateConstructions.push(dependencies);
@@ -200,15 +203,36 @@ test('root host dependencies provide explicit preflight and candidate factories'
         async buildCandidate() {}
     }
     const createPreflightRunner = () => async () => ({ ok: true, checks: [] });
-    const generateXrayConfig = () => '{}';
-    const node = { _id: 'node-a' };
+    const configGenerator = require('../../services/configGenerator').generateXrayConfig;
+    const fragmentProvider = require('../relay-l2tp/services/l2tpXrayFragmentProvider')
+        .buildL2tpXrayFragment;
+    const node = { _id: 'node-a', groups: [] };
     const users = [{ userId: 'user-a' }];
+    const candidateUserResolver = async resolvedNode => {
+        assert.strictEqual(resolvedNode, node);
+        return users;
+    };
     const timer = { setInterval() {}, clearInterval() {} };
     const lifecycleLogger = { error() {} };
     const middleware = () => {};
+    const HyNode = {
+        findById(nodeId) {
+            nodeQueries.push({ method: 'findById', nodeId });
+            return {
+                select(projection) {
+                    nodeQueries.push({ method: 'select', projection });
+                    return this;
+                },
+                async lean() {
+                    nodeQueries.push({ method: 'lean' });
+                    return node;
+                },
+            };
+        },
+    };
 
     const dependencies = createL2tpRootHostDependencies({
-        HyNode: { findById() {} },
+        HyNode,
         NodeSSH: class FakeNodeSSH {},
         NodeTransport: class FakeNodeTransport {},
         L2tpXrayCandidateService: FakeCandidateService,
@@ -216,13 +240,8 @@ test('root host dependencies provide explicit preflight and candidate factories'
         operationMaterializer: async () => ({}),
         secretBox: { encrypt() {}, decrypt() {} },
         secretKey: 'root-secret-key',
-        syncService: {
-            async _getUsersForNode(resolvedNode) {
-                userResolverCalls.push(resolvedNode);
-                return users;
-            },
-        },
-        generateXrayConfig,
+        syncService: null,
+        candidateUserResolver,
         requireAuth: middleware,
         requireOnboarding: middleware,
         csrf: middleware,
@@ -237,20 +256,84 @@ test('root host dependencies provide explicit preflight and candidate factories'
     });
 
     assert.strictEqual(dependencies.createPreflightRunner, createPreflightRunner);
-    const nodeResolver = async () => node;
-    const candidateService = dependencies.createCandidateService({ nodeResolver });
+    assert.strictEqual(dependencies.candidateUserResolver, candidateUserResolver);
+    assert.strictEqual(dependencies.configGenerator, configGenerator);
+    assert.strictEqual(dependencies.fragmentProvider, fragmentProvider);
+    assert.equal(typeof dependencies.candidateNodeResolver, 'function');
+
+    assert.strictEqual(
+        await dependencies.candidateNodeResolver({ nodeId: 'node-a' }),
+        node,
+    );
+    assert.equal(nodeQueries[0].method, 'findById');
+    assert.equal(nodeQueries[0].nodeId, 'node-a');
+    assert.equal(nodeQueries[1].method, 'select');
+    assert.match(nodeQueries[1].projection, /(?:^|\s)xray\.transport(?:\s|$)/);
+    assert.match(nodeQueries[1].projection, /(?:^|\s)groups(?:\s|$)/);
+    assert.doesNotMatch(nodeQueries[1].projection, /(?:^|\s)ssh(?:\.|\s|$)/);
+    assert.deepEqual(nodeQueries[2], { method: 'lean' });
+
+    const candidateService = dependencies.createCandidateService({
+        nodeResolver: dependencies.candidateNodeResolver,
+        userResolver: dependencies.candidateUserResolver,
+        configGenerator: dependencies.configGenerator,
+        fragmentProvider: dependencies.fragmentProvider,
+    });
     assert.ok(candidateService instanceof FakeCandidateService);
     assert.deepEqual(candidateConstructions, [{
-        configGenerator: generateXrayConfig,
-        userResolver: candidateConstructions[0].userResolver,
-        nodeResolver,
+        configGenerator,
+        userResolver: candidateUserResolver,
+        nodeResolver: dependencies.candidateNodeResolver,
+        fragmentProvider,
     }]);
     assert.deepEqual(await candidateConstructions[0].userResolver(node), users);
-    assert.deepEqual(userResolverCalls, [node]);
     assert.deepEqual(dependencies.workerLifecycle, {
         intervalMs: 15_000,
         timer,
         logger: lifecycleLogger,
     });
     assert.equal(Object.hasOwn(dependencies.workerLifecycle, 'enabled'), false);
+});
+
+test('root default candidate user resolver returns only fields required by Xray generation', async () => {
+    const middleware = () => {};
+    const users = [{
+        _id: 'database-id',
+        userId: 'user-a',
+        xrayUuid: '00000000-0000-4000-8000-000000000001',
+        password: 'must-not-reach-candidate-generation',
+        subscriptionToken: 'must-not-reach-candidate-generation',
+    }];
+    const dependencies = createL2tpRootHostDependencies({
+        HyNode: { findById() {} },
+        NodeSSH: class FakeNodeSSH {},
+        NodeTransport: class FakeNodeTransport {},
+        L2tpXrayCandidateService: class FakeCandidateService {},
+        createPreflightRunner: () => async () => ({ ok: true, checks: [] }),
+        operationMaterializer: async () => ({}),
+        secretBox: { encrypt() {}, decrypt() {} },
+        secretKey: 'root-secret-key',
+        syncService: {
+            async _getUsersForNode() {
+                return users;
+            },
+        },
+        requireAuth: middleware,
+        requireOnboarding: middleware,
+        csrf: middleware,
+        rateLimiter: middleware,
+        renderPage: middleware,
+        timer: { setInterval() {}, clearInterval() {} },
+        logger: { error() {} },
+    });
+
+    const resolved = await dependencies.candidateUserResolver({ _id: 'node-a' });
+    assert.deepEqual(resolved, [{
+        userId: 'user-a',
+        xrayUuid: '00000000-0000-4000-8000-000000000001',
+    }]);
+    assert.doesNotMatch(
+        JSON.stringify(resolved),
+        /database-id|must-not-reach-candidate-generation/,
+    );
 });

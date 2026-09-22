@@ -3,9 +3,48 @@
 const {
     createL2tpStartupLifecycle,
 } = require('./createL2tpStartupLifecycle');
+const {
+    l2tpActiveHostProvider,
+} = require('./l2tpActiveHostProvider');
 
 const ROOT_LEASE_MS = 30_000;
 const ROOT_WORKER_INTERVAL_MS = 30_000;
+const CANDIDATE_NODE_XRAY_PROJECTION = Object.freeze([
+    '_id',
+    'type',
+    'active',
+    'cascadeRole',
+    'ip',
+    'port',
+    'domain',
+    'sni',
+    'groups',
+    'outbounds',
+    'aclRules',
+    'xray.accessLogs.enabled',
+    'xray.apiPort',
+    'xray.inboundTag',
+    'xray.transport',
+    'xray.security',
+    'xray.flow',
+    'xray.alpn',
+    'xray.realityDest',
+    'xray.realitySni',
+    'xray.realityPrivateKey',
+    'xray.realityShortIds',
+    'xray.realitySpiderX',
+    'xray.wsPath',
+    'xray.wsHost',
+    'xray.grpcServiceName',
+    'xray.xhttpPath',
+    'xray.xhttpHost',
+    'xray.xhttpMode',
+    'xray.fallbackDest',
+    'xray.extraInbounds',
+    'xray.tlsSource',
+    'xray.manualCert',
+    '+xray.manualKey',
+]);
 
 function parseL2tpExecutionEnabled(value) {
     if (value === undefined || value === 'false') return false;
@@ -35,6 +74,7 @@ function createL2tpRuntimeLifecycleHook({
     env = process.env,
     createHostDependencies,
     createStartupLifecycle = createL2tpStartupLifecycle,
+    activeHostProvider = l2tpActiveHostProvider,
 } = {}) {
     const enabled = parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
     const hostDependencies = enabled
@@ -43,6 +83,7 @@ function createL2tpRuntimeLifecycleHook({
     const lifecycle = createStartupLifecycle({
         config: { enabled },
         hostDependencies,
+        activeHostProvider,
     });
     lifecycle.start();
     return lifecycle;
@@ -61,7 +102,11 @@ function createL2tpRootHostDependencies({
     secretBox = require('./relay-l2tp/services/secretBoxService'),
     secretKey = require('../../config').ENCRYPTION_KEY,
     syncService = require('../services/syncService'),
-    generateXrayConfig = require('../services/configGenerator').generateXrayConfig,
+    candidateNodeResolver,
+    candidateUserResolver,
+    configGenerator = require('../services/configGenerator').generateXrayConfig,
+    fragmentProvider = require('./relay-l2tp/services/l2tpXrayFragmentProvider')
+        .buildL2tpXrayFragment,
     requireAuth = require('../routes/panel/helpers').requireAuth,
     requireOnboarding = require('../routes/panel/helpers').requireOnboarding,
     csrf = require('../routes/panel/csrf').requirePanelCsrf,
@@ -74,22 +119,49 @@ function createL2tpRootHostDependencies({
     timer = globalThis,
     logger = require('../utils/logger'),
 } = {}) {
-    if (typeof syncService?._getUsersForNode !== 'function') {
+    if (
+        candidateUserResolver === undefined
+        && typeof syncService?._getUsersForNode !== 'function'
+    ) {
         throw new TypeError('L2TP root startup requires syncService._getUsersForNode');
     }
+
+    const resolvedCandidateNodeResolver = candidateNodeResolver ?? (async ({ nodeId } = {}) => (
+        HyNode.findById(nodeId)
+            .select(CANDIDATE_NODE_XRAY_PROJECTION.join(' '))
+            .lean()
+    ));
+    const resolvedCandidateUserResolver = candidateUserResolver ?? (async node => {
+        const users = await syncService._getUsersForNode(node);
+        if (!Array.isArray(users)) return users;
+        return users.map(user => ({
+            userId: user?.userId,
+            xrayUuid: user?.xrayUuid,
+        }));
+    });
 
     return {
         HyNode,
         NodeSSH,
         NodeTransport,
-        createCandidateService({ nodeResolver } = {}) {
+        createCandidateService({
+            nodeResolver = resolvedCandidateNodeResolver,
+            userResolver = resolvedCandidateUserResolver,
+            configGenerator: injectedConfigGenerator = configGenerator,
+            fragmentProvider: injectedFragmentProvider = fragmentProvider,
+        } = {}) {
             return new L2tpXrayCandidateService({
-                configGenerator: generateXrayConfig,
-                userResolver: node => syncService._getUsersForNode(node),
+                configGenerator: injectedConfigGenerator,
+                userResolver,
                 nodeResolver,
+                fragmentProvider: injectedFragmentProvider,
             });
         },
         createPreflightRunner,
+        candidateNodeResolver: resolvedCandidateNodeResolver,
+        candidateUserResolver: resolvedCandidateUserResolver,
+        configGenerator,
+        fragmentProvider,
         operationMaterializer,
         secretBox,
         secretKey,
@@ -113,6 +185,7 @@ function createL2tpRootLifecycle({
     env = process.env,
     createHostDependencies = createL2tpRootHostDependencies,
     createRuntimeLifecycleHook = createL2tpRuntimeLifecycleHook,
+    activeHostProvider = l2tpActiveHostProvider,
 } = {}) {
     let lifecycle;
     let stopPromise;
@@ -123,6 +196,7 @@ function createL2tpRootLifecycle({
                 lifecycle = createRuntimeLifecycleHook({
                     env,
                     createHostDependencies,
+                    activeHostProvider,
                 });
             }
             return lifecycle;
