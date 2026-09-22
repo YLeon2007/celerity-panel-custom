@@ -7,6 +7,9 @@ const {
     L2tpUserManagementRepository,
     SAFE_USER_SELECT,
 } = require('../repositories/l2tpUserManagementRepository');
+const L2tpOperation = require('../models/l2tpOperationModel');
+
+const RELAY_ID = '507f1f77bcf86cd799439011';
 
 function queryResult(result, calls, kind) {
     return {
@@ -62,6 +65,18 @@ function createModels(overrides = {}) {
         HyNode: overrides.HyNode ?? HyNode,
         RelayL2tpState: overrides.RelayL2tpState ?? RelayL2tpState,
         L2tpUser: overrides.L2tpUser ?? L2tpUser,
+    };
+}
+
+function createModelBackedOperationStore(calls, persistedPlans) {
+    return {
+        async create(documents, options) {
+            calls.push({ method: 'L2tpOperation.create', documents, options });
+            const operations = documents.map(document => new L2tpOperation(document));
+            for (const operation of operations) await operation.validate();
+            persistedPlans.push(...operations.map(operation => operation.plan.toObject()));
+            return operations;
+        },
     };
 }
 
@@ -135,6 +150,94 @@ test('reserves one relay credential revision without upserting unconfigured stat
         { method: 'RelayL2tpState.select', fields: 'secretRevision' },
         { method: 'RelayL2tpState.lean' },
     ]);
+});
+
+test('create, update, and disable queues persist the exact model-valid sync plan', async t => {
+    const scenarios = [
+        {
+            name: 'create',
+            operationId: '507f1f77bcf86cd799439012',
+            run(repository) {
+                return repository.createUserAndQueueSync({
+                    relayNode: RELAY_ID,
+                    login: 'alice',
+                    ip: '10.77.0.10',
+                    enabled: true,
+                    passwordEncrypted: 'sealed-create-password',
+                });
+            },
+        },
+        {
+            name: 'update',
+            operationId: '507f1f77bcf86cd799439013',
+            run(repository) {
+                return repository.updateUserAndQueueSync(
+                    RELAY_ID,
+                    'user-1',
+                    6,
+                    { ip: '10.77.0.20', passwordEncrypted: 'sealed-update-password' },
+                );
+            },
+        },
+        {
+            name: 'disable',
+            operationId: '507f1f77bcf86cd799439014',
+            run(repository) {
+                return repository.updateUserAndQueueSync(
+                    RELAY_ID,
+                    'user-1',
+                    6,
+                    { enabled: false },
+                );
+            },
+        },
+    ];
+
+    for (const scenario of scenarios) {
+        await t.test(scenario.name, async () => {
+            const models = createModels();
+            const session = { id: `${scenario.name}-transaction` };
+            const persistedPlans = [];
+            models.L2tpUser.create = async documents => [{ _id: 'user-1', ...documents[0] }];
+            models.L2tpUser.findOneAndUpdate = (filter, update, options) => queryResult({
+                _id: 'user-1',
+                relayNode: RELAY_ID,
+                login: 'alice',
+                ip: update.$set.ip ?? '10.77.0.10',
+                enabled: update.$set.enabled ?? true,
+                desiredRevision: 7,
+                appliedRevision: 6,
+                syncStatus: 'pending',
+            }, models.calls, 'L2tpUser.findOneAndUpdate');
+            const repository = new L2tpUserManagementRepository({
+                ...models,
+                L2tpOperation: createModelBackedOperationStore(models.calls, persistedPlans),
+                operationIdFactory: () => scenario.operationId,
+                transactionRunner: work => work(session),
+            });
+
+            await scenario.run(repository);
+
+            assert.deepEqual(persistedPlans, [{
+                ok: true,
+                operationId: scenario.operationId,
+                relayId: RELAY_ID,
+                desired: { credentialRevision: 7 },
+                steps: [
+                    { type: 'backup' },
+                    {
+                        type: 'sync_users',
+                        artifacts: [{ type: 'desired', path: 'desired.json' }],
+                    },
+                    { type: 'verify_users' },
+                ],
+            }]);
+            assert.doesNotMatch(
+                JSON.stringify(persistedPlans),
+                /sealed|password|ciphertext|plaintext|secret/i,
+            );
+        });
+    }
 });
 
 test('creates only internal allowlisted fields and never returns password ciphertext', async () => {
@@ -296,7 +399,7 @@ test('creates a user and its revision-keyed sync operation in one transaction', 
                     type: 'sync_users',
                     artifacts: [{ type: 'desired', path: 'desired.json' }],
                 },
-                { type: 'verify' },
+                { type: 'verify_users' },
             ],
         },
     }]);

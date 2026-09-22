@@ -64,7 +64,7 @@ function syncPlan({ operationId, relayNode, credentialRevision }) {
                 type: 'sync_users',
                 artifacts: [{ type: 'desired', path: 'desired.json' }],
             },
-            { type: 'verify' },
+            { type: 'verify_users' },
         ],
     };
 }
