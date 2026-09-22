@@ -93,6 +93,76 @@ test('unknown path health blocks rather than assuming the path is healthy', asyn
     });
 });
 
+test('opt-in health provider selects a path whose downstream nodes are currently online', async () => {
+    const now = new Date('2026-09-22T12:00:00.000Z');
+    const HyNode = createReadModel([
+        {
+            _id: 'portal-1',
+            cascadeRole: 'portal',
+            active: true,
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+        {
+            _id: 'relay-1',
+            cascadeRole: 'relay',
+            active: true,
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+        {
+            _id: 'bridge-1',
+            cascadeRole: 'bridge',
+            active: true,
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+    ]);
+    const CascadeLink = createReadModel([
+        {
+            _id: 'entry',
+            active: true,
+            portalNode: 'portal-1',
+            bridgeNode: 'relay-1',
+            mode: 'forward',
+        },
+        {
+            _id: 'exit',
+            active: true,
+            portalNode: 'relay-1',
+            bridgeNode: 'bridge-1',
+            mode: 'forward',
+        },
+    ]);
+    const CascadeRouteGroup = createReadModel([{
+        _id: 'group-a',
+        mode: 'forward',
+        strategy: 'priority-failover',
+        paths: [{ pathKey: 'primary', linkIds: ['entry', 'exit'], priority: 10 }],
+    }]);
+    const runtime = new TopologyRuntimeService({
+        HyNode,
+        CascadeLink,
+        CascadeRouteGroup,
+        compiler: compileTopology,
+        enableHealthProvider: true,
+        clock: { now: () => now },
+        healthMaxStalenessMs: 30_000,
+    });
+
+    const plan = await runtime.getRelayGroupPlan('relay-1', 'group-a');
+
+    assert.deepEqual(plan.decision, {
+        decision: 'select',
+        groupId: 'group-a',
+        pathKey: 'primary',
+        nextHopNodeId: 'bridge-1',
+    });
+});
+
 test('same-named paths in multiple groups remain isolated', async () => {
     const runtime = new TopologyRuntimeService({
         HyNode: createReadModel([

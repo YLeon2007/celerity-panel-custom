@@ -15,7 +15,6 @@ const { NodeOperationLockService } = require('./relay-l2tp/services/nodeOperatio
 const { TopologyRuntimeService } = require('./relay-l2tp/services/topologyRuntimeService');
 
 const DEFAULT_COMPILER_DATA = Object.freeze({ relays: Object.freeze([]) });
-const DEFAULT_HEALTH_BY_PATH_KEY = Object.freeze({});
 const DEFAULT_CLOCK = Object.freeze({ now: () => new Date() });
 const DEFAULT_LEASE_MS = 30_000;
 const DORMANT_LIFECYCLE_STATE = Object.freeze({
@@ -86,7 +85,9 @@ function createL2tpPanelHost({
     rateLimiter,
     renderPage,
     compilerData = DEFAULT_COMPILER_DATA,
-    healthByPathKey = DEFAULT_HEALTH_BY_PATH_KEY,
+    healthByPathKey,
+    enableTopologyHealthProvider = false,
+    topologyHealthMaxStalenessMs,
     compiler = compileTopology,
     topologyRuntime: injectedTopologyRuntime,
     preflightRunner: injectedPreflightRunner,
@@ -112,13 +113,24 @@ function createL2tpPanelHost({
     createRuntime = createL2tpRuntime,
 } = {}) {
     const models = injectedModuleEntry.registerModels();
-    const topologyRuntime = injectedTopologyRuntime ?? new TopologyRuntime({
+    const topologyRuntimeDependencies = {
         HyNode: injectedHyNode,
         CascadeLink: injectedCascadeLink,
         CascadeRouteGroup: models.CascadeRouteGroup,
         compiler,
-        healthByPathKey,
-    });
+        ...(healthByPathKey !== undefined
+            ? { healthByPathKey }
+            : enableTopologyHealthProvider === true
+                ? {
+                    enableHealthProvider: true,
+                    clock,
+                    ...(topologyHealthMaxStalenessMs === undefined
+                        ? {}
+                        : { healthMaxStalenessMs: topologyHealthMaxStalenessMs }),
+                }
+                : {}),
+    };
+    const topologyRuntime = injectedTopologyRuntime ?? new TopologyRuntime(topologyRuntimeDependencies);
     const repository = new Repository({
         HyNode: injectedHyNode,
         RelayL2tpState: models.RelayL2tpState,

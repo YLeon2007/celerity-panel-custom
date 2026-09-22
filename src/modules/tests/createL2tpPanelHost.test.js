@@ -162,6 +162,58 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.equal(workerRuns, 0);
 });
 
+test('explicit opt-in wires the topology health provider with its bounded staleness', () => {
+    const HyNode = { modelName: 'HyNode' };
+    const CascadeLink = { modelName: 'CascadeLink' };
+    const models = {
+        RelayL2tpState: {},
+        CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
+        CascadeTopologyState: {},
+        L2tpOperation: {},
+    };
+    const clock = { now: () => new Date('2026-09-22T12:00:00.000Z') };
+    const compiler = () => ({ relays: [] });
+    let topologyDependencies;
+
+    class FakeTopologyRuntime {
+        constructor(dependencies) {
+            topologyDependencies = dependencies;
+        }
+    }
+
+    class FakeRepository {}
+
+    createL2tpPanelHost({
+        moduleEntry: { registerModels: () => models },
+        HyNode,
+        CascadeLink,
+        TopologyRuntime: FakeTopologyRuntime,
+        Repository: FakeRepository,
+        compiler,
+        enableTopologyHealthProvider: true,
+        topologyHealthMaxStalenessMs: 45_000,
+        clock,
+        createRepositoryAdapters: () => ({
+            nodeRepository: {},
+            stateRepository: {},
+            operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createRuntime: () => ({ worker: {} }),
+    });
+
+    assert.deepEqual(topologyDependencies, {
+        HyNode,
+        CascadeLink,
+        CascadeRouteGroup: models.CascadeRouteGroup,
+        compiler,
+        enableHealthProvider: true,
+        healthMaxStalenessMs: 45_000,
+        clock,
+    });
+    assert.equal(Object.hasOwn(topologyDependencies, 'healthByPathKey'), false);
+});
+
 test('real panel runtime GET operation strips legacy nested secrets and error details', async () => {
     const legacyOperation = {
         _id: 'operation-legacy',

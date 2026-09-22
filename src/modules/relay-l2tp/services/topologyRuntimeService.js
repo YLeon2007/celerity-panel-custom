@@ -1,5 +1,7 @@
 'use strict';
 
+const { TopologyHealthSource } = require('./topologyHealthSource');
+
 const ACTIVE_TOPOLOGY_ROLES = Object.freeze(['portal', 'relay', 'bridge']);
 const NODE_TOPOLOGY_FILTER = Object.freeze({
     type: 'xray',
@@ -98,13 +100,33 @@ class TopologyRuntimeService {
         CascadeLink,
         CascadeRouteGroup,
         compiler,
-        healthByPathKey = {},
+        healthByPathKey,
+        enableHealthProvider = false,
+        clock,
+        healthMaxStalenessMs,
     }) {
         this.HyNode = HyNode;
         this.CascadeLink = CascadeLink;
         this.CascadeRouteGroup = CascadeRouteGroup;
         this.compiler = compiler;
-        this.healthByPathKey = healthByPathKey;
+        this.healthSource = null;
+
+        if (healthByPathKey !== undefined) {
+            this.healthByPathKey = healthByPathKey;
+        } else if (enableHealthProvider === true) {
+            this.healthSource = new TopologyHealthSource({
+                HyNode,
+                CascadeLink,
+                CascadeRouteGroup,
+                ...(clock === undefined ? {} : { clock }),
+                ...(healthMaxStalenessMs === undefined
+                    ? {}
+                    : { maxStalenessMs: healthMaxStalenessMs }),
+            });
+            this.healthByPathKey = () => this.healthSource.getHealthByPathKey();
+        } else {
+            this.healthByPathKey = {};
+        }
     }
 
     async getRelayGroupPlan(relayId, groupId) {
