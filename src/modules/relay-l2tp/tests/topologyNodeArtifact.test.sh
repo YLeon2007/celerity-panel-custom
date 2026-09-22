@@ -60,21 +60,52 @@ mkdir -p \
     "$TEST_ROOT/var/lib"
 printf '%s\n' '{"old":"main"}' >"$TEST_ROOT/usr/local/etc/xray/config.json"
 printf '%s\n' '{"old":"bridge"}' >"$TEST_ROOT/usr/local/etc/xray-bridge/config.json"
+/usr/bin/cp "$TEST_ROOT/usr/local/etc/xray/config.json" "$TMP_DIR/main-config.before"
+/usr/bin/cp "$TEST_ROOT/usr/local/etc/xray-bridge/config.json" "$TMP_DIR/bridge-config.before"
 printf '%s\n' 'outside-rollback-scope' >"$TEST_ROOT/do-not-touch"
 
 printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
     'printf '\''xray %s\n'\'' "$*" >>"${CELERITY_TOPOLOGY_ROOT}/xray.log"' \
-    '[[ "$1" == "run" && "$2" == "-test" && "$3" == "-config" && "$4" == "${CELERITY_TOPOLOGY_ROOT}"/* ]]' \
+    '[[ "$1" == "run" && "$2" == "-test" && "$3" == "-config" && -f "$4" && ! -L "$4" ]]' \
+    '[[ "$4" == "${CELERITY_TOPOLOGY_ROOT}/var/lib/celerity/topology/operations/"*/xray-*/candidate.json \
+        || "$4" == "${CELERITY_TOPOLOGY_ROOT}/usr/local/etc/xray/config.json" \
+        || "$4" == "${CELERITY_TOPOLOGY_ROOT}/usr/local/etc/xray-bridge/config.json" ]]' \
+    '! /usr/bin/grep -Fq '\''"protocol":"unsupported-protocol"'\'' "$4"' \
     >"$TEST_ROOT/usr/local/bin/xray"
 chmod +x "$TEST_ROOT/usr/local/bin/xray"
 printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
     'printf '\''systemctl %s\n'\'' "$*" >>"${CELERITY_TOPOLOGY_ROOT}/systemctl.log"' \
-    'case "$1" in restart|stop) exit 0 ;; is-active) [[ "$2" == "--quiet" ]] && exit 0 ;; esac' \
+    'case "$1" in restart|stop) exit 0 ;; is-active) [[ "$2" == "--quiet" && ! -e "${CELERITY_TOPOLOGY_ROOT}/service.inactive" ]] && exit 0 ;; esac' \
     'exit 64' \
     >"$TEST_ROOT/usr/bin/systemctl"
 chmod +x "$TEST_ROOT/usr/bin/systemctl"
 
-main_candidate='{"secret":"main-candidate-secret-canary","profile":"main"}\n'
+metadata_candidate=$'{"schemaVersion":1,"kind":"xray-topology-node-candidate","mode":"forward","nodeRef":"portal","role":"portal","targetProfile":"xray-main","links":[],"checks":[]}\n'
+metadata_hash="sha256:$(printf '%s' "$metadata_candidate" | sha256sum | cut -d' ' -f1)"
+invoke metadata-prepare prepare metadata-operation metadata-node "$metadata_hash" metadata-backup xray-main "$metadata_candidate"
+[[ "$status" -ne 0 ]] || fail 'metadata-shaped candidate was accepted'
+[[ "$errors" == '{"ok":false,"code":"INVALID_CANDIDATE"}' ]] \
+    || fail 'metadata-shaped candidate returned the wrong error'
+[[ ! -e "$TEST_ROOT/xray.log" ]] || fail 'metadata-shaped candidate reached Xray validation'
+[[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'metadata-shaped candidate reached service activation'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'metadata rejection mutated the active config'
+
+invalid_xray_candidate=$'{"log":{"loglevel":"warning"},"inbounds":[{"tag":"invalid-in","listen":"127.0.0.1","port":1080,"protocol":"unsupported-protocol","settings":{}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}}],"routing":{"rules":[]}}\n'
+invalid_xray_hash="sha256:$(printf '%s' "$invalid_xray_candidate" | sha256sum | cut -d' ' -f1)"
+invoke invalid-xray-prepare prepare invalid-xray-operation invalid-xray-node "$invalid_xray_hash" invalid-xray-backup xray-main "$invalid_xray_candidate"
+[[ "$status" -ne 0 ]] || fail 'Xray-invalid candidate was accepted'
+[[ "$errors" == '{"ok":false,"code":"CANDIDATE_INVALID"}' ]] \
+    || fail 'Xray-invalid candidate returned the wrong error'
+[[ "$(<"$TEST_ROOT/xray.log")" == 'xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/invalid-xray-operation/xray-main/candidate.json' ]] \
+    || fail 'Xray validation did not target the staged candidate'
+[[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'failed Xray validation reached service activation'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'failed Xray validation mutated the active config'
+rm -f "$TEST_ROOT/xray.log"
+
+main_candidate=$'{"log":{"loglevel":"warning"},"inbounds":[{"tag":"main-candidate-secret-canary","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}}],"routing":{"rules":[]}}\n'
+printf '%s' "$main_candidate" >"$TMP_DIR/main-candidate.expected"
 main_hash="sha256:$(printf '%s' "$main_candidate" | sha256sum | cut -d' ' -f1)"
 main_operation='topology-operation-main'
 main_node='main-node-1'
@@ -90,12 +121,14 @@ invoke main-prepare prepare "$main_operation" "$main_node" "$main_hash" "$main_b
     || fail 'prepare mutated the active main config'
 [[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == '{"old":"bridge"}' ]] \
     || fail 'prepare mutated the bridge config'
+[[ "$(<"$TEST_ROOT/xray.log")" == 'xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' ]] \
+    || fail 'prepare did not validate the staged main config'
 
 invoke main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
 [[ "$status" -eq 0 ]] || fail 'xray-main commit failed'
 [[ "$output" == "$(receipt commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
     || fail 'xray-main commit receipt was not strict and bound'
-[[ "$(<"$TEST_ROOT/usr/local/etc/xray/config.json")" == "$main_candidate" ]] \
+/usr/bin/cmp -s "$TMP_DIR/main-candidate.expected" "$TEST_ROOT/usr/local/etc/xray/config.json" \
     || fail 'commit did not activate the prepared main candidate'
 [[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == '{"old":"bridge"}' ]] \
     || fail 'main commit escaped to the bridge target'
@@ -106,14 +139,37 @@ invoke main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_bac
 [[ "$status" -eq 0 ]] || fail 'xray-main verify failed'
 [[ "$output" == "$(receipt verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
     || fail 'xray-main verify receipt was not strict and bound'
+mapfile -t systemctl_calls <"$TEST_ROOT/systemctl.log"
+[[ "${#systemctl_calls[@]}" -eq 2 \
+    && "${systemctl_calls[0]}" == 'systemctl restart xray.service' \
+    && "${systemctl_calls[1]}" == 'systemctl is-active --quiet xray.service' ]] \
+    || fail 'verify did not explicitly require the main service to be active'
+
+touch "$TEST_ROOT/service.inactive"
+invoke inactive-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 ]] || fail 'verify accepted an inactive main service'
+[[ "$errors" == '{"ok":false,"code":"VERIFICATION_FAILED"}' ]] \
+    || fail 'inactive main service returned the wrong verification error'
+rm -f "$TEST_ROOT/service.inactive"
+
+: >"$TEST_ROOT/xray.log"
+: >"$TEST_ROOT/systemctl.log"
+printf '%s\n' '{"inbounds":[],"outbounds":[]}' >"$TEST_ROOT/usr/local/etc/xray/config.json"
+invoke wrong-active-hash verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 ]] || fail 'verify accepted an active config hash mismatch'
+[[ "$errors" == '{"ok":false,"code":"VERIFICATION_FAILED"}' ]] \
+    || fail 'active config hash mismatch returned the wrong verification error'
+[[ ! -s "$TEST_ROOT/xray.log" && ! -s "$TEST_ROOT/systemctl.log" ]] \
+    || fail 'active config hash mismatch reached runtime verification'
+/usr/bin/cp "$TMP_DIR/main-candidate.expected" "$TEST_ROOT/usr/local/etc/xray/config.json"
 
 : >"$TEST_ROOT/systemctl.log"
 invoke main-rollback rollback "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
 [[ "$status" -eq 0 ]] || fail 'xray-main rollback failed'
 [[ "$output" == "$(receipt rollback "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
     || fail 'xray-main rollback receipt was not strict and bound'
-[[ "$(<"$TEST_ROOT/usr/local/etc/xray/config.json")" == '{"old":"main"}' ]] \
-    || fail 'rollback did not restore the fixed main target'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'rollback did not restore the exact main backup'
 [[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == '{"old":"bridge"}' ]] \
     || fail 'main rollback escaped to the bridge target'
 [[ "$(<"$TEST_ROOT/do-not-touch")" == 'outside-rollback-scope' ]] \
@@ -121,7 +177,8 @@ invoke main-rollback rollback "$main_operation" "$main_node" "$main_hash" "$main
 [[ "$(<"$TEST_ROOT/systemctl.log")" == 'systemctl restart xray.service' ]] \
     || fail 'main rollback used a non-fixed service'
 
-bridge_candidate='{"secret":"bridge-candidate-secret-canary","profile":"bridge"}\n'
+bridge_candidate=$'{"log":{"loglevel":"warning"},"inbounds":[{"tag":"bridge-candidate-secret-canary","listen":"127.0.0.1","port":1081,"protocol":"socks","settings":{"auth":"noauth","udp":false}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}}],"routing":{"rules":[]}}\n'
+printf '%s' "$bridge_candidate" >"$TMP_DIR/bridge-candidate.expected"
 bridge_hash="sha256:$(printf '%s' "$bridge_candidate" | sha256sum | cut -d' ' -f1)"
 bridge_operation='topology-operation-bridge'
 bridge_node='bridge-node-1'
@@ -132,7 +189,7 @@ invoke bridge-prepare prepare "$bridge_operation" "$bridge_node" "$bridge_hash" 
 : >"$TEST_ROOT/systemctl.log"
 invoke bridge-commit commit "$bridge_operation" "$bridge_node" "$bridge_hash" "$bridge_backup" xray-bridge ''
 [[ "$status" -eq 0 ]] || fail 'xray-bridge commit failed'
-[[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == "$bridge_candidate" ]] \
+/usr/bin/cmp -s "$TMP_DIR/bridge-candidate.expected" "$TEST_ROOT/usr/local/etc/xray-bridge/config.json" \
     || fail 'commit did not activate the bridge candidate'
 [[ "$(<"$TEST_ROOT/usr/local/etc/xray/config.json")" == '{"old":"main"}' ]] \
     || fail 'bridge commit escaped to the main target'
@@ -140,8 +197,8 @@ invoke bridge-commit commit "$bridge_operation" "$bridge_node" "$bridge_hash" "$
     || fail 'bridge commit used a non-fixed service'
 invoke bridge-rollback rollback "$bridge_operation" "$bridge_node" "$bridge_hash" "$bridge_backup" xray-bridge ''
 [[ "$status" -eq 0 ]] || fail 'xray-bridge rollback failed'
-[[ "$(<"$TEST_ROOT/usr/local/etc/xray-bridge/config.json")" == '{"old":"bridge"}' ]] \
-    || fail 'bridge rollback did not restore its fixed target'
+/usr/bin/cmp -s "$TMP_DIR/bridge-config.before" "$TEST_ROOT/usr/local/etc/xray-bridge/config.json" \
+    || fail 'bridge rollback did not restore its exact backup'
 
 invoke extra-field prepare raw-operation raw-node "$main_hash" raw-backup xray-main "$main_candidate" --path /tmp/foreign
 [[ "$status" -ne 0 ]] || fail 'raw path field was accepted'

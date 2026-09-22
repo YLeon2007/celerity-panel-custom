@@ -8,7 +8,18 @@ const {
     TopologyNodeTransportFactory,
 } = require('../services/topologyNodeTransportFactory');
 
-const artifactContent = '{"kind":"topology-candidate","secret":"candidate-secret"}\n';
+const artifactContent = `${JSON.stringify({
+    log: { loglevel: 'warning' },
+    inbounds: [{
+        tag: 'topology-in',
+        listen: '127.0.0.1',
+        port: 1080,
+        protocol: 'socks',
+        settings: { auth: 'noauth', udp: false },
+    }],
+    outbounds: [{ tag: 'direct', protocol: 'freedom', settings: {} }],
+    routing: { rules: [] },
+})}\n`;
 const candidateHash = `sha256:${createHash('sha256').update(artifactContent).digest('hex')}`;
 
 function receipt(command, plan) {

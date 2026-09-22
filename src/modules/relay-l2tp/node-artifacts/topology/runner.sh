@@ -136,6 +136,32 @@ file_hash_matches() {
     [[ "sha256:$digest" == "$CANDIDATE_HASH" ]]
 }
 
+candidate_structure_valid() {
+    local target="$1"
+    /usr/bin/python3 - "$target" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'rb') as handle:
+    raw = handle.read()
+document = json.loads(raw.decode('utf-8'))
+if not isinstance(document, dict):
+    raise SystemExit(1)
+if not isinstance(document.get('inbounds'), list):
+    raise SystemExit(1)
+if not isinstance(document.get('outbounds'), list):
+    raise SystemExit(1)
+canonical = json.dumps(
+    document,
+    ensure_ascii=False,
+    separators=(',', ':'),
+).encode('utf-8') + b'\n'
+if raw != canonical:
+    raise SystemExit(1)
+PY
+}
+
 ensure_fixed_state_roots() {
     local directory
     for directory in \
@@ -173,8 +199,15 @@ prepare_candidate() {
     digest="${digest_line%% *}"
     [[ "sha256:$digest" == "$CANDIDATE_HASH" ]] \
         || fail 'CANDIDATE_HASH_MISMATCH' 65
+    candidate_structure_valid "$TEMPORARY_FILE" \
+        || fail 'INVALID_CANDIDATE' 65
+    /usr/bin/chmod 0600 -- "$TEMPORARY_FILE" >/dev/null 2>&1 \
+        || fail 'STATE_WRITE_FAILED' 70
+    /usr/bin/mv -fT -- "$TEMPORARY_FILE" "$CANDIDATE_PATH" >/dev/null 2>&1 \
+        || fail 'STATE_WRITE_FAILED' 70
+    TEMPORARY_FILE=''
     [[ -x "$XRAY_PATH" ]] || fail 'XRAY_UNAVAILABLE' 69
-    "$XRAY_PATH" run -test -config "$TEMPORARY_FILE" >/dev/null 2>&1 \
+    "$XRAY_PATH" run -test -config "$CANDIDATE_PATH" >/dev/null 2>&1 \
         || fail 'CANDIDATE_INVALID' 65
 
     config_parent="${CONFIG_PATH%/*}"
@@ -191,11 +224,6 @@ prepare_candidate() {
             || fail 'BACKUP_FAILED' 70
     fi
 
-    /usr/bin/chmod 0600 -- "$TEMPORARY_FILE" >/dev/null 2>&1 \
-        || fail 'STATE_WRITE_FAILED' 70
-    /usr/bin/mv -fT -- "$TEMPORARY_FILE" "$CANDIDATE_PATH" >/dev/null 2>&1 \
-        || fail 'STATE_WRITE_FAILED' 70
-    TEMPORARY_FILE=''
     write_metadata "$OPERATION_METADATA"
     write_metadata "$BACKUP_METADATA"
     emit_receipt

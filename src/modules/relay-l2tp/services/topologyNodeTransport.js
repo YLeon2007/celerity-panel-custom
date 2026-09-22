@@ -55,11 +55,26 @@ function assertBasePlan(plan, extraKeys = []) {
     }
 }
 
+function isCanonicalXrayConfig(content) {
+    let document;
+    try {
+        document = JSON.parse(content);
+    } catch {
+        return false;
+    }
+    return Boolean(document)
+        && typeof document === 'object'
+        && !Array.isArray(document)
+        && Array.isArray(document.inbounds)
+        && Array.isArray(document.outbounds)
+        && content === `${JSON.stringify(document)}\n`;
+}
+
 function assertArtifact(artifact, candidateHash) {
     if (!hasExactKeys(artifact, ['content', 'id'])
         || artifact.id !== TOPOLOGY_NODE_ARTIFACT_ID
         || typeof artifact.content !== 'string'
-        || artifact.content.length === 0) {
+        || !isCanonicalXrayConfig(artifact.content)) {
         throw new TopologyNodeTransportError('INVALID_ARTIFACT', 'Invalid topology node artifact');
     }
     const actualHash = `sha256:${createHash('sha256').update(artifact.content).digest('hex')}`;

@@ -11,7 +11,18 @@ const {
     TopologyNodeTransport,
 } = require('../services/topologyNodeTransport');
 
-const artifactContent = '{"marker":"candidate-secret-canary"}\n';
+const artifactContent = `${JSON.stringify({
+    log: { loglevel: 'warning' },
+    inbounds: [{
+        tag: 'topology-in',
+        listen: '127.0.0.1',
+        port: 1080,
+        protocol: 'socks',
+        settings: { auth: 'noauth', udp: false },
+    }],
+    outbounds: [{ tag: 'direct', protocol: 'freedom', settings: {} }],
+    routing: { rules: [] },
+})}\n`;
 const candidateHash = `sha256:${createHash('sha256').update(artifactContent).digest('hex')}`;
 const basePlan = Object.freeze({
     operationId: 'topology-operation-17',
@@ -198,6 +209,43 @@ test('prepare accepts only the fixed artifact identifier with content matching c
             assert.doesNotMatch(JSON.stringify(error), /candidate-secret-canary|\/tmp/);
             return true;
         });
+        assert.equal(invoked, false);
+    }
+});
+
+test('prepare rejects metadata-shaped and non-canonical candidates before runner invocation', async () => {
+    const metadataCandidate = `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'xray-topology-node-candidate',
+        targetProfile: 'xray-bridge',
+        links: [],
+        checks: [],
+    })}\n`;
+    const nonCanonicalCandidate = `${JSON.stringify(JSON.parse(artifactContent), null, 2)}\n`;
+
+    for (const content of [metadataCandidate, nonCanonicalCandidate]) {
+        const hash = `sha256:${createHash('sha256').update(content).digest('hex')}`;
+        let invoked = false;
+        const transport = new TopologyNodeTransport({
+            async invokeArtifact() {
+                invoked = true;
+                return execResult(receipt('prepare', { candidateHash: hash }));
+            },
+        });
+
+        await assert.rejects(
+            transport.prepare({
+                ...basePlan,
+                candidateHash: hash,
+                artifact: { id: TOPOLOGY_NODE_ARTIFACT_ID, content },
+            }),
+            error => {
+                assert.equal(error.name, 'TopologyNodeTransportError');
+                assert.equal(error.code, 'INVALID_ARTIFACT');
+                assert.doesNotMatch(JSON.stringify(error), /xray-topology-node-candidate/);
+                return true;
+            },
+        );
         assert.equal(invoked, false);
     }
 });
