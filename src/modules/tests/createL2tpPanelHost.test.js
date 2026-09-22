@@ -170,6 +170,11 @@ test('builds the concrete repository adapters and composes a dormant runtime', a
     );
     assert.equal(typeof runtimeCalls[0].transport.uploadRootFile, 'function');
     assert.equal(typeof runtimeCalls[0].lockService.acquire, 'function');
+    assert.equal(typeof runtimeCalls[0].stateReconciler, 'function');
+    await assert.rejects(
+        runtimeCalls[0].stateReconciler({ operation: { kind: 'install' } }),
+        error => error?.code === 'L2TP_STATE_RECONCILER_UNAVAILABLE',
+    );
     assert.equal(typeof runtimeCalls[0].clock.now, 'function');
     assert.equal(typeof runtimeCalls[0].workerId, 'string');
     assert.equal(typeof runtimeCalls[0].leaseMs, 'number');

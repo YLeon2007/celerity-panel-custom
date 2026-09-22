@@ -5,6 +5,9 @@ const test = require('node:test');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
 const { createL2tpRuntime } = require('../relay-l2tp/runtime/createL2tpRuntime');
+const {
+    VERIFIED_STATE_SAFE_SELECT,
+} = require('../relay-l2tp/repositories/l2tpStateManagementRepository');
 const { L2tpNodeTransport } = require('../relay-l2tp/services/l2tpNodeTransport');
 const { materializeInstallOperation } = require('../relay-l2tp/services/l2tpOperationMaterializer');
 const { createL2tpPreflightRunner } = require('../relay-l2tp/services/l2tpPreflightRunner');
@@ -87,6 +90,10 @@ function createActiveHost(overrides = {}) {
     const RelayL2tpState = {
         findOne(filter) {
             calls.push({ kind: 'RelayL2tpState.findOne', filter });
+            return queryResult(executionState, calls, 'RelayL2tpState');
+        },
+        findOneAndUpdate(filter, update, options) {
+            calls.push({ kind: 'RelayL2tpState.findOneAndUpdate', filter, update, options });
             return queryResult(executionState, calls, 'RelayL2tpState');
         },
     };
@@ -261,6 +268,7 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'preflightRunner',
             'candidateService',
             'secretResolver',
+            'stateReconciler',
         ].includes(key)),
         [
             'preflightRunner',
@@ -268,6 +276,7 @@ test('explicit complete activation wires preflight and candidate factories lazil
             'transportResolver',
             'operationMaterializer',
             'secretResolver',
+            'stateReconciler',
         ],
     );
     assert.equal(preflightFactoryCalls.length, 1);
@@ -282,6 +291,7 @@ test('explicit complete activation wires preflight and candidate factories lazil
     assert.ok(host.runtime.worker.lockService instanceof NodeOperationLockService);
     assert.ok(host.runtime.worker.lockService.repository instanceof NodeOperationLockRepository);
     assert.strictEqual(host.runtime.worker.candidateService, runtimeCalls[0].candidateService);
+    assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
     assert.strictEqual(runtimeCalls[0].operationMaterializer, materializeInstallOperation);
     assert.deepEqual(calls, []);
     assert.equal(getScheduledTick(), undefined);
@@ -385,6 +395,58 @@ test('active preflight resolves transport only on demand without operations, sec
     assert.equal(calls.some(call => call.kind === 'candidateUserResolver'), false);
 });
 
+test('active worker reconciler persists verified install state through the management service', async () => {
+    const { calls, host, runtimeCalls } = createActiveHost();
+    const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
+    const operation = {
+        id: 'operation-17',
+        node: 'node-a',
+        kind: 'install',
+        plan: {
+            operationId: 'operation-17',
+            relayId: 'node-a',
+            topologyRevision: 17,
+            selectedPathKey: 'primary',
+            desired: { credentialRevision: 7 },
+        },
+    };
+
+    assert.deepEqual(calls, []);
+    const result = await host.runtime.worker.stateReconciler({ operation, verifiedAt });
+
+    assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
+    assert.deepEqual(calls, [
+        {
+            kind: 'RelayL2tpState.findOneAndUpdate',
+            filter: {
+                node: 'node-a',
+                desiredState: 'installed',
+                secretRevision: 7,
+            },
+            update: {
+                $set: {
+                    status: 'installed',
+                    operationId: 'operation-17',
+                    appliedTopologyRevision: 17,
+                    activePathKey: 'primary',
+                    lastVerifiedAt: verifiedAt,
+                    lastErrorCode: '',
+                    lastError: '',
+                },
+            },
+            options: { new: true, runValidators: true },
+        },
+        { kind: 'RelayL2tpState.select', fields: VERIFIED_STATE_SAFE_SELECT },
+        { kind: 'RelayL2tpState.lean' },
+    ]);
+    assert.deepEqual(result, {
+        node: 'node-a',
+        desiredState: 'installed',
+        secretRevision: 7,
+    });
+    assert.doesNotMatch(JSON.stringify(result), /psk|sealed-psk/);
+});
+
 test('enabled activation rejects missing factories and resolvers before runtime composition', () => {
     for (const [dependencyName, overrides] of [
         ['secretKey', { secretKey: undefined }],
@@ -438,6 +500,11 @@ test('non-boolean activation stays dormant with fail-closed runtime services', a
     await assert.rejects(
         host.runtime.worker.secretResolver({ kind: 'install' }),
         error => error?.code === 'L2TP_SECRET_RESOLVER_UNAVAILABLE',
+    );
+    assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
+    await assert.rejects(
+        host.runtime.worker.stateReconciler({ operation: { kind: 'install' } }),
+        error => error?.code === 'L2TP_STATE_RECONCILER_UNAVAILABLE',
     );
     assert.deepEqual(calls, []);
 });

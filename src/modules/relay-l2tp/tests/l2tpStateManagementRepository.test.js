@@ -7,6 +7,7 @@ const {
     EXECUTION_SECRET_SELECT,
     L2tpStateManagementRepository,
     STATE_MANAGEMENT_SAFE_SELECT,
+    VERIFIED_STATE_SAFE_SELECT,
 } = require('../repositories/l2tpStateManagementRepository');
 
 function createQueryModel(result = null) {
@@ -181,4 +182,102 @@ test('execution lookup selects only matching state identity, revision, and encry
         { method: 'select', paths: EXECUTION_SECRET_SELECT },
         { method: 'lean', options: undefined },
     ]);
+});
+
+test('verified install reconciliation atomically fences current desired state and writes safe fields only', async () => {
+    const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
+    const storedState = {
+        node: 'relay-1',
+        desiredState: 'installed',
+        status: 'installed',
+        secretRevision: 7,
+        operationId: 'operation-17',
+        appliedTopologyRevision: 23,
+        activePathKey: 'primary',
+        lastVerifiedAt: verifiedAt,
+        lastErrorCode: '',
+        lastError: '',
+        pskEncrypted: 'must-not-be-returned',
+        unknown: 'must-not-be-returned',
+    };
+    const RelayL2tpState = createQueryModel(storedState);
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(),
+        RelayL2tpState,
+        CascadeRouteGroup: createQueryModel(),
+    });
+
+    const result = await repository.markInstalledAfterVerification({
+        node: 'relay-1',
+        operationId: 'operation-17',
+        credentialRevision: 7,
+        topologyRevision: 23,
+        activePathKey: 'primary',
+        verifiedAt,
+        status: 'error',
+        pskEncrypted: 'must-not-be-written',
+        lastError: 'must-not-be-written',
+    });
+
+    assert.deepEqual(RelayL2tpState.calls, [
+        {
+            method: 'findOneAndUpdate',
+            filter: {
+                node: 'relay-1',
+                desiredState: 'installed',
+                secretRevision: 7,
+            },
+            update: {
+                $set: {
+                    status: 'installed',
+                    operationId: 'operation-17',
+                    appliedTopologyRevision: 23,
+                    activePathKey: 'primary',
+                    lastVerifiedAt: verifiedAt,
+                    lastErrorCode: '',
+                    lastError: '',
+                },
+            },
+            options: {
+                new: true,
+                runValidators: true,
+            },
+        },
+        { method: 'select', paths: VERIFIED_STATE_SAFE_SELECT },
+        { method: 'lean', options: undefined },
+    ]);
+    assert.deepEqual(result, {
+        node: 'relay-1',
+        desiredState: 'installed',
+        status: 'installed',
+        secretRevision: 7,
+        operationId: 'operation-17',
+        appliedTopologyRevision: 23,
+        activePathKey: 'primary',
+        lastVerifiedAt: verifiedAt,
+        lastErrorCode: '',
+        lastError: '',
+    });
+    assert.ok(VERIFIED_STATE_SAFE_SELECT.split(/\s+/).every(path => !path.startsWith('-')));
+    assert.doesNotMatch(JSON.stringify({ calls: RelayL2tpState.calls, result }), /psk|secret-envelope/i);
+});
+
+test('verified install reconciliation preserves a rejected atomic fence as null', async () => {
+    const RelayL2tpState = createQueryModel(null);
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(),
+        RelayL2tpState,
+        CascadeRouteGroup: createQueryModel(),
+    });
+
+    const result = await repository.markInstalledAfterVerification({
+        node: 'relay-1',
+        operationId: 'operation-17',
+        credentialRevision: 7,
+        topologyRevision: 23,
+        activePathKey: 'primary',
+        verifiedAt: new Date('2026-09-22T10:00:00.000Z'),
+    });
+
+    assert.equal(result, null);
 });

@@ -64,6 +64,12 @@ async function unavailableSecretResolver() {
     throw error;
 }
 
+async function unavailableStateReconciler() {
+    const error = new Error('L2TP state reconciler is unavailable');
+    error.code = 'L2TP_STATE_RECONCILER_UNAVAILABLE';
+    throw error;
+}
+
 const unavailableCandidateService = Object.freeze({
     async buildCandidate() {
         const error = new Error('L2TP Xray candidate service is unavailable');
@@ -193,6 +199,7 @@ function createL2tpExecutionRuntime({
             transport: dormantTransport,
             lockService: dormantLockService,
             secretResolver: unavailableSecretResolver,
+            stateReconciler: unavailableStateReconciler,
             stateManagementService: stateManagementService ?? unavailableStateManagementService,
         });
         return {
@@ -256,6 +263,13 @@ function createL2tpExecutionRuntime({
         secretBox,
         secretKey,
     });
+    const runtimeStateManagementService = stateManagementService ?? managementService;
+    const stateReconciler = async request => {
+        if (typeof runtimeStateManagementService.reconcileVerifiedOperation !== 'function') {
+            return unavailableStateReconciler();
+        }
+        return runtimeStateManagementService.reconcileVerifiedOperation(request);
+    };
     const userRepository = new L2tpUserExecutionRepository({ model: L2tpUser });
     const userResolver = new L2tpUserResolver({
         repository: userRepository,
@@ -279,7 +293,8 @@ function createL2tpExecutionRuntime({
         transportResolver,
         operationMaterializer,
         secretResolver,
-        stateManagementService: stateManagementService ?? managementService,
+        stateReconciler,
+        stateManagementService: runtimeStateManagementService,
         lockService,
     });
     const lifecycle = createWorkerLifecycle({

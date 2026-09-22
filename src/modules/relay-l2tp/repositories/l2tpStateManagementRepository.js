@@ -21,6 +21,19 @@ const STATE_MANAGEMENT_SAFE_FIELDS = Object.freeze([
 ]);
 const STATE_MANAGEMENT_SAFE_SELECT = STATE_MANAGEMENT_SAFE_FIELDS.join(' ');
 const EXECUTION_SECRET_SELECT = 'node desiredState secretRevision +pskEncrypted';
+const VERIFIED_STATE_SAFE_FIELDS = Object.freeze([
+    'node',
+    'desiredState',
+    'status',
+    'secretRevision',
+    'operationId',
+    'appliedTopologyRevision',
+    'activePathKey',
+    'lastVerifiedAt',
+    'lastErrorCode',
+    'lastError',
+]);
+const VERIFIED_STATE_SAFE_SELECT = VERIFIED_STATE_SAFE_FIELDS.join(' ');
 const CONFIGURATION_WRITE_FIELDS = Object.freeze([
     'node',
     'desiredState',
@@ -93,6 +106,41 @@ class L2tpStateManagementRepository {
             .select(EXECUTION_SECRET_SELECT)
             .lean();
     }
+
+    async markInstalledAfterVerification({
+        node,
+        operationId,
+        credentialRevision,
+        topologyRevision,
+        activePathKey,
+        verifiedAt,
+    }) {
+        const state = await this.RelayL2tpState.findOneAndUpdate(
+            {
+                node,
+                desiredState: 'installed',
+                secretRevision: credentialRevision,
+            },
+            {
+                $set: {
+                    status: 'installed',
+                    operationId,
+                    appliedTopologyRevision: topologyRevision,
+                    activePathKey,
+                    lastVerifiedAt: verifiedAt,
+                    lastErrorCode: '',
+                    lastError: '',
+                },
+            },
+            {
+                new: true,
+                runValidators: true,
+            },
+        )
+            .select(VERIFIED_STATE_SAFE_SELECT)
+            .lean();
+        return state ? pickDefined(state, VERIFIED_STATE_SAFE_FIELDS) : null;
+    }
 }
 
 module.exports = {
@@ -101,4 +149,6 @@ module.exports = {
     L2tpStateManagementRepository,
     STATE_MANAGEMENT_SAFE_FIELDS,
     STATE_MANAGEMENT_SAFE_SELECT,
+    VERIFIED_STATE_SAFE_FIELDS,
+    VERIFIED_STATE_SAFE_SELECT,
 };

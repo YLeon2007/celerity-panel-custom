@@ -411,3 +411,165 @@ test('configureRelay wraps secret-envelope failures without leaking the PSK', as
         },
     );
 });
+
+test('reconcileVerifiedOperation persists canonical verified install identity through the fenced repository method', async () => {
+    const calls = [];
+    const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
+    const repository = {
+        async markInstalledAfterVerification(fields) {
+            calls.push(fields);
+            return {
+                node: fields.node,
+                desiredState: 'installed',
+                status: 'installed',
+                secretRevision: fields.credentialRevision,
+                operationId: fields.operationId,
+                appliedTopologyRevision: fields.topologyRevision,
+                activePathKey: fields.activePathKey,
+                lastVerifiedAt: fields.verifiedAt,
+                lastErrorCode: '',
+                lastError: '',
+                pskEncrypted: 'must-not-be-returned',
+            };
+        },
+    };
+    const service = new L2tpStateManagementService({
+        repository,
+        secretBox: {
+            encrypt() { throw new Error('not used'); },
+            decrypt() { throw new Error('not used'); },
+        },
+        secretKey: SECRET_KEY,
+    });
+
+    const result = await service.reconcileVerifiedOperation({
+        operation: {
+            id: 'operation-17',
+            node: 'relay-1',
+            kind: 'install',
+            plan: {
+                operationId: 'operation-17',
+                relayId: 'relay-1',
+                topologyRevision: 23,
+                selectedPathKey: 'primary',
+                desired: { credentialRevision: 7 },
+            },
+        },
+        verifiedAt,
+    });
+
+    assert.deepEqual(calls, [{
+        node: 'relay-1',
+        operationId: 'operation-17',
+        credentialRevision: 7,
+        topologyRevision: 23,
+        activePathKey: 'primary',
+        verifiedAt,
+    }]);
+    assert.deepEqual(result, {
+        node: 'relay-1',
+        operationId: 'operation-17',
+        desiredState: 'installed',
+        status: 'installed',
+        secretRevision: 7,
+        appliedTopologyRevision: 23,
+        activePathKey: 'primary',
+        lastVerifiedAt: verifiedAt,
+        lastErrorCode: '',
+        lastError: '',
+    });
+    assert.doesNotMatch(JSON.stringify(result), /psk|must-not-be-returned/i);
+});
+
+test('reconcileVerifiedOperation rejects stale or revoked state without reporting success', async t => {
+    for (const stateChange of ['stale credential revision', 'revoked desired state']) {
+        await t.test(stateChange, async () => {
+            let writes = 0;
+            const service = new L2tpStateManagementService({
+                repository: {
+                    async markInstalledAfterVerification() {
+                        writes += 1;
+                        return null;
+                    },
+                },
+                secretBox: {
+                    encrypt() { throw new Error('not used'); },
+                    decrypt() { throw new Error('not used'); },
+                },
+                secretKey: SECRET_KEY,
+            });
+
+            await assert.rejects(
+                service.reconcileVerifiedOperation({
+                    operation: {
+                        id: 'operation-17',
+                        node: 'relay-1',
+                        kind: 'install',
+                        plan: {
+                            operationId: 'operation-17',
+                            relayId: 'relay-1',
+                            topologyRevision: 23,
+                            selectedPathKey: 'primary',
+                            desired: { credentialRevision: 7 },
+                        },
+                    },
+                    verifiedAt: new Date('2026-09-22T10:00:00.000Z'),
+                }),
+                error => error?.code === 'L2TP_STATE_RECONCILIATION_REJECTED',
+            );
+            assert.equal(writes, 1);
+        });
+    }
+});
+
+test('reconcileVerifiedOperation rejects mismatched operation or node identity before persistence', async t => {
+    for (const [name, operation] of [
+        ['operation id', {
+            id: 'operation-17',
+            node: 'relay-1',
+            kind: 'install',
+            plan: {
+                operationId: 'operation-stale',
+                relayId: 'relay-1',
+                topologyRevision: 23,
+                selectedPathKey: 'primary',
+                desired: { credentialRevision: 7 },
+            },
+        }],
+        ['node id', {
+            id: 'operation-17',
+            node: 'relay-1',
+            kind: 'install',
+            plan: {
+                operationId: 'operation-17',
+                relayId: 'relay-revoked',
+                topologyRevision: 23,
+                selectedPathKey: 'primary',
+                desired: { credentialRevision: 7 },
+            },
+        }],
+    ]) {
+        await t.test(name, async () => {
+            let writes = 0;
+            const service = new L2tpStateManagementService({
+                repository: {
+                    async markInstalledAfterVerification() { writes += 1; },
+                },
+                secretBox: {
+                    encrypt() { throw new Error('not used'); },
+                    decrypt() { throw new Error('not used'); },
+                },
+                secretKey: SECRET_KEY,
+            });
+
+            await assert.rejects(
+                service.reconcileVerifiedOperation({
+                    operation,
+                    verifiedAt: new Date('2026-09-22T10:00:00.000Z'),
+                }),
+                error => error?.code === 'OPERATION_IDENTITY_MISMATCH',
+            );
+            assert.equal(writes, 0);
+        });
+    }
+});

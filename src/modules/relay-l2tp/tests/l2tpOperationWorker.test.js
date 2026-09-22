@@ -99,6 +99,7 @@ function createWorker(operationRepository, overrides = {}) {
         lockService,
         executor: overrides.executor || {},
         secretResolver: overrides.secretResolver,
+        stateReconciler: overrides.stateReconciler || (async () => ({ status: 'installed' })),
         operationMaterializer: overrides.operationMaterializer,
         candidateService: overrides.candidateService,
         workerId: 'worker-1',
@@ -403,6 +404,7 @@ test('candidate rejection is sanitized and performs no secret resolution or remo
         const operationRepository = createOperationRepository([operation]);
         const transportCalls = [];
         let resolverCalls = 0;
+        let reconciliationCalls = 0;
         const worker = createWorker(operationRepository, {
             operationMaterializer: materializeInstallOperation,
             candidateService: {
@@ -413,6 +415,9 @@ test('candidate rejection is sanitized and performs no secret resolution or remo
             secretResolver: async () => {
                 resolverCalls += 1;
                 return { psk: 'must-not-resolve' };
+            },
+            stateReconciler: async () => {
+                reconciliationCalls += 1;
             },
             executor: new L2tpRemoteExecutor({
                 transport: {
@@ -436,6 +441,7 @@ test('candidate rejection is sanitized and performs no secret resolution or remo
             status: 'failed',
         });
         assert.equal(resolverCalls, 0);
+        assert.equal(reconciliationCalls, 0);
         assert.deepEqual(transportCalls, []);
         assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
         assert.equal(statuses[0].request.errorCode, 'XRAY_CANDIDATE_FAILED');
@@ -1292,6 +1298,141 @@ test('success is persisted only after verify and before releasing the lock', asy
             },
         }],
     );
+});
+
+test('verified install state is reconciled before the operation can become succeeded', async () => {
+    const events = [];
+    const { operation } = createInstallOperation('operation-reconcile-success');
+    const operationRepository = createOperationRepository([operation]);
+    const setStatus = operationRepository.setStatus;
+    operationRepository.setStatus = async request => {
+        events.push({ method: 'setStatus', status: request.status });
+        return setStatus(request);
+    };
+    const worker = createWorker(operationRepository, {
+        operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate({ plan }) {
+                return { operationId: plan.operationId, content: '{}' };
+            },
+        },
+        secretResolver: async () => ({ psk: 'in-memory-only', users: [] }),
+        stateReconciler: async request => {
+            events.push({ method: 'reconcile', request });
+            assert.equal(operationRepository.operations[0].status, 'running');
+            return { status: 'installed' };
+        },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() {
+                events.push({ method: 'release' });
+                return { ok: true };
+            },
+        },
+        executor: {
+            async executeStep({ step }) {
+                events.push({ method: 'executeStep', step: step.type });
+            },
+            async rollback() {
+                events.push({ method: 'rollback' });
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-reconcile-success',
+        status: 'succeeded',
+    });
+    const reconcileIndex = events.findIndex(event => event.method === 'reconcile');
+    const successIndex = events.findIndex(event => (
+        event.method === 'setStatus' && event.status === 'succeeded'
+    ));
+    const releaseIndex = events.findIndex(event => event.method === 'release');
+    assert.ok(reconcileIndex > events.findIndex(event => (
+        event.method === 'executeStep' && event.step === 'verify'
+    )));
+    assert.ok(reconcileIndex < successIndex);
+    assert.ok(successIndex < releaseIndex);
+    assert.deepEqual(events[reconcileIndex].request, {
+        operation: operationRepository.operations[0],
+        verifiedAt: NOW,
+    });
+    assert.equal(events.some(event => event.method === 'rollback'), false);
+});
+
+test('reconciliation failure cannot mark success and rolls back the verified install safely', async () => {
+    const leakedFailure = 'mongo-state-secret-detail';
+    const events = [];
+    const { operation } = createInstallOperation('operation-reconcile-failure');
+    const operationRepository = createOperationRepository([operation]);
+    const setStatus = operationRepository.setStatus;
+    operationRepository.setStatus = async request => {
+        events.push({ method: 'setStatus', request });
+        return setStatus(request);
+    };
+    const worker = createWorker(operationRepository, {
+        operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate({ plan }) {
+                return { operationId: plan.operationId, content: '{}' };
+            },
+        },
+        secretResolver: async () => ({ psk: 'in-memory-only', users: [] }),
+        stateReconciler: async () => {
+            events.push({ method: 'reconcile' });
+            throw Object.assign(new Error(leakedFailure), { code: leakedFailure });
+        },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() {
+                events.push({ method: 'release' });
+                return { ok: true };
+            },
+        },
+        executor: {
+            async executeStep() {},
+            async rollback({ completedSteps, failedStep, error }) {
+                events.push({
+                    method: 'rollback',
+                    completedSteps: completedSteps.map(step => step.type),
+                    failedStep,
+                    error,
+                });
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+    const statuses = events
+        .filter(event => event.method === 'setStatus')
+        .map(event => event.request);
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-reconcile-failure',
+        status: 'rolled_back',
+    });
+    assert.deepEqual(statuses.map(status => status.status), ['rolling_back', 'rolled_back']);
+    assert.ok(statuses.every(status => status.errorCode === 'STATE_RECONCILIATION_FAILED'));
+    assert.ok(statuses.every(status => (
+        status.errorMessage === 'Failed to reconcile verified L2TP state'
+    )));
+    assert.equal(statuses.some(status => status.status === 'succeeded'), false);
+    const rollback = events.find(event => event.method === 'rollback');
+    assert.deepEqual(rollback.completedSteps, INSTALL_STEP_TYPES);
+    assert.deepEqual(rollback.failedStep, { type: 'state_reconciliation' });
+    assert.equal(rollback.error.code, 'STATE_RECONCILIATION_FAILED');
+    assert.equal(rollback.error.message, 'Failed to reconcile verified L2TP state');
+    assert.ok(events.findIndex(event => event.method === 'reconcile')
+        < events.findIndex(event => event.method === 'rollback'));
+    assert.ok(events.findIndex(event => event.method === 'rollback')
+        < events.findIndex(event => event.method === 'release'));
+    assert.doesNotMatch(JSON.stringify({ result, events }), new RegExp(leakedFailure));
 });
 
 test('does not execute an operation twice after it has been claimed and completed', async () => {

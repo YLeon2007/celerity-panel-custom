@@ -24,6 +24,12 @@ const SAFE_RESULT_FIELDS = Object.freeze([
     'routeTable',
     'routingMode',
     'secretRevision',
+    'operationId',
+    'appliedTopologyRevision',
+    'activePathKey',
+    'lastVerifiedAt',
+    'lastErrorCode',
+    'lastError',
     'createdAt',
     'updatedAt',
 ]);
@@ -293,6 +299,72 @@ class L2tpStateManagementService {
             routingMode: 'route-group',
             pskEncrypted,
         });
+        return safeState(state);
+    }
+
+    async reconcileVerifiedOperation({ operation, verifiedAt } = {}) {
+        if (!operation || typeof operation !== 'object' || operation.kind !== 'install') {
+            throw new L2tpStateManagementError(
+                'INVALID_OPERATION_KIND',
+                'Only a verified L2TP install operation can reconcile relay state',
+            );
+        }
+
+        const operationId = entityId(operation);
+        const nodeId = entityId(operation.node);
+        const plan = operation.plan;
+        if (
+            !operationId
+            || !nodeId
+            || entityId(plan?.operationId) !== operationId
+            || entityId(plan?.relayId) !== nodeId
+        ) {
+            throw new L2tpStateManagementError(
+                'OPERATION_IDENTITY_MISMATCH',
+                'The verified L2TP operation identity does not match its install plan',
+            );
+        }
+
+        const credentialRevision = plan.desired?.credentialRevision;
+        if (!Number.isSafeInteger(credentialRevision) || credentialRevision < 1) {
+            throw new L2tpStateManagementError(
+                'CREDENTIAL_REVISION_MISMATCH',
+                'The verified L2TP operation credential revision is invalid',
+            );
+        }
+        if (!Number.isSafeInteger(plan.topologyRevision) || plan.topologyRevision < 0) {
+            throw new L2tpStateManagementError(
+                'INVALID_TOPOLOGY_REVISION',
+                'The verified L2TP operation topology revision is invalid',
+            );
+        }
+        if (typeof plan.selectedPathKey !== 'string' || plan.selectedPathKey.length === 0) {
+            throw new L2tpStateManagementError(
+                'INVALID_ACTIVE_PATH',
+                'The verified L2TP operation active path is invalid',
+            );
+        }
+        if (!(verifiedAt instanceof Date) || Number.isNaN(verifiedAt.getTime())) {
+            throw new L2tpStateManagementError(
+                'INVALID_VERIFICATION_TIME',
+                'The verified L2TP operation timestamp is invalid',
+            );
+        }
+
+        const state = await this.repository.markInstalledAfterVerification({
+            node: nodeId,
+            operationId,
+            credentialRevision,
+            topologyRevision: plan.topologyRevision,
+            activePathKey: plan.selectedPathKey,
+            verifiedAt,
+        });
+        if (!state) {
+            throw new L2tpStateManagementError(
+                'L2TP_STATE_RECONCILIATION_REJECTED',
+                'The relay L2TP desired state changed before reconciliation',
+            );
+        }
         return safeState(state);
     }
 

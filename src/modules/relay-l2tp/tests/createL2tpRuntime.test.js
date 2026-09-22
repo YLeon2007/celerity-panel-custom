@@ -48,6 +48,7 @@ function createDependencies() {
             psk: 'resolved-in-memory-only',
             users: [],
         }),
+        stateReconciler: async () => ({ status: 'installed' }),
         candidateService: { async buildCandidate() {} },
         requireAuth(req, res, next) { next(); },
         requireOnboarding(req, res, next) { next(); },
@@ -92,6 +93,7 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.worker.executor.transport, dependencies.transport);
     assert.strictEqual(runtime.worker.lockService, dependencies.lockService);
     assert.strictEqual(runtime.worker.secretResolver, dependencies.secretResolver);
+    assert.strictEqual(runtime.worker.stateReconciler, dependencies.stateReconciler);
     assert.strictEqual(runtime.worker.candidateService, dependencies.candidateService);
     assert.equal(typeof runtime.worker.operationMaterializer, 'function');
     assert.strictEqual(
@@ -155,6 +157,7 @@ test('does not surface injected model or transport secrets', () => {
         'lockService',
         'executor',
         'secretResolver',
+        'stateReconciler',
         'candidateService',
         'operationMaterializer',
         'clock',
@@ -290,6 +293,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
         'transport',
         'lockService',
         'secretResolver',
+        'stateReconciler',
         'candidateService',
         'requireAuth',
         'requireOnboarding',

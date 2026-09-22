@@ -93,6 +93,7 @@ class L2tpOperationWorker {
         lockService,
         executor,
         secretResolver,
+        stateReconciler,
         candidateService,
         operationMaterializer,
         workerId,
@@ -105,6 +106,7 @@ class L2tpOperationWorker {
         this.lockService = lockService;
         this.executor = executor;
         this.secretResolver = secretResolver;
+        this.stateReconciler = stateReconciler;
         this.candidateService = candidateService;
         this.operationMaterializer = operationMaterializer;
         this.workerId = workerId;
@@ -527,6 +529,82 @@ class L2tpOperationWorker {
             await heartbeat.stop();
             const finishedAt = this.clock.now();
             const finalStep = executionSteps[executionSteps.length - 1].type;
+            if (operation.kind === 'install') {
+                try {
+                    if (typeof this.stateReconciler !== 'function') {
+                        throw new TypeError('L2TP state reconciler is unavailable');
+                    }
+                    await this.stateReconciler({ operation, verifiedAt: finishedAt });
+                } catch {
+                    const errorCode = 'STATE_RECONCILIATION_FAILED';
+                    const errorMessage = 'Failed to reconcile verified L2TP state';
+                    const reconciliationError = Object.assign(new Error(errorMessage), {
+                        code: errorCode,
+                    });
+                    await this.operationRepository.setStatus({
+                        operationId,
+                        status: 'rolling_back',
+                        step: finalStep,
+                        progress: 100,
+                        errorCode,
+                        errorMessage,
+                        journal: {
+                            at: finishedAt,
+                            level: 'error',
+                            code: 'L2TP_STATE_RECONCILIATION_FAILED',
+                            message: errorMessage,
+                        },
+                    });
+
+                    try {
+                        await this.executor.rollback({
+                            operation,
+                            completedSteps: [...completedSteps],
+                            failedStep: { type: 'state_reconciliation' },
+                            error: reconciliationError,
+                        });
+                    } catch (rollbackError) {
+                        const rollbackErrorCode = rollbackError.code || 'ROLLBACK_FAILED';
+                        const rollbackErrorMessage = rollbackError.message
+                            || 'L2TP operation rollback failed';
+                        const rollbackFinishedAt = this.clock.now();
+                        await this.operationRepository.setStatus({
+                            operationId,
+                            status: 'failed',
+                            step: finalStep,
+                            progress: 100,
+                            errorCode: rollbackErrorCode,
+                            errorMessage: rollbackErrorMessage,
+                            finishedAt: rollbackFinishedAt,
+                            journal: {
+                                at: rollbackFinishedAt,
+                                level: 'error',
+                                code: 'L2TP_ROLLBACK_FAILED',
+                                message: 'Failed to roll back L2TP operation',
+                            },
+                        });
+                        return { claimed: true, operationId, status: 'failed' };
+                    }
+
+                    const rollbackFinishedAt = this.clock.now();
+                    await this.operationRepository.setStatus({
+                        operationId,
+                        status: 'rolled_back',
+                        step: finalStep,
+                        progress: 100,
+                        errorCode,
+                        errorMessage,
+                        finishedAt: rollbackFinishedAt,
+                        journal: {
+                            at: rollbackFinishedAt,
+                            level: 'warn',
+                            code: 'L2TP_OPERATION_ROLLED_BACK',
+                            message: 'Rolled back L2TP operation after state reconciliation failure',
+                        },
+                    });
+                    return { claimed: true, operationId, status: 'rolled_back' };
+                }
+            }
             await this.operationRepository.setStatus({
                 operationId,
                 status: 'succeeded',
