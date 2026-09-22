@@ -37,6 +37,7 @@ class L2tpService {
         stateRepository,
         operationRepository,
         planBuilder,
+        operationMaterializer,
         preflightRunner,
         clock,
     }) {
@@ -44,6 +45,7 @@ class L2tpService {
         this.stateRepository = stateRepository;
         this.operationRepository = operationRepository;
         this.planBuilder = planBuilder;
+        this.operationMaterializer = operationMaterializer;
         this.preflightRunner = preflightRunner;
         this.clock = clock;
     }
@@ -120,6 +122,19 @@ class L2tpService {
             );
         }
 
+        const materialized = await this.operationMaterializer({
+            plan,
+            desired: context.desired,
+        });
+        const persistedPlan = materialized?.persistedPlan;
+        if (!persistedPlan || typeof persistedPlan !== 'object') {
+            throw new L2tpServiceError(
+                'INSTALL_PLAN_REJECTED',
+                'L2TP install plan materialization failed',
+                { nodeId: String(nodeId) },
+            );
+        }
+
         await this.operationRepository.create({
             _id: operationId,
             node: entityId(context.node),
@@ -128,7 +143,7 @@ class L2tpService {
             idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}`,
             progress: 0,
             attempts: 0,
-            plan,
+            plan: persistedPlan,
             createdAt: this.clock.now(),
         });
 

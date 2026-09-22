@@ -3,6 +3,7 @@
 const { createConfigFragmentRegistry } = require('../../../services/configFragmentRegistry');
 const { createL2tpRouter } = require('../routes/panel');
 const { L2tpOperationRepository } = require('../services/l2tpOperationRepository');
+const { materializeInstallOperation } = require('../services/l2tpOperationMaterializer');
 const { buildInstallPlan } = require('../services/l2tpProvisionPlanService');
 const { L2tpRemoteExecutor } = require('../services/l2tpRemoteExecutor');
 const { L2tpService } = require('../services/l2tpService');
@@ -18,6 +19,7 @@ const REQUIRED_DEPENDENCIES = Object.freeze([
     'preflightRunner',
     'transport',
     'lockService',
+    'secretResolver',
     'requireAuth',
     'requireOnboarding',
     'csrf',
@@ -62,6 +64,7 @@ function createL2tpRuntime(dependencies) {
         preflightRunner,
         transport,
         lockService,
+        secretResolver,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -78,6 +81,7 @@ function createL2tpRuntime(dependencies) {
         stateRepository,
         operationRepository,
         planBuilder: buildInstallPlan,
+        operationMaterializer: materializeInstallOperation,
         preflightRunner,
         clock,
     });
@@ -86,6 +90,8 @@ function createL2tpRuntime(dependencies) {
         operationRepository: workerOperationRepository,
         lockService,
         executor,
+        secretResolver,
+        operationMaterializer: materializeInstallOperation,
         workerId,
         leaseMs,
         clock,
@@ -95,6 +101,7 @@ function createL2tpRuntime(dependencies) {
         'stateRepository',
         'operationRepository',
         'planBuilder',
+        'operationMaterializer',
         'preflightRunner',
         'clock',
     ]);
@@ -102,7 +109,10 @@ function createL2tpRuntime(dependencies) {
         'operationRepository',
         'lockService',
         'executor',
+        'secretResolver',
+        'operationMaterializer',
         'clock',
+        'timer',
     ]);
     const router = createL2tpRouter({
         l2tpService: service,

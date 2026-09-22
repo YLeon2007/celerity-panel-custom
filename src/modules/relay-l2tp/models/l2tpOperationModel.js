@@ -30,8 +30,29 @@ const operationLogEntrySchema = new mongoose.Schema({
     message: { type: String, required: true, trim: true },
 }, { _id: false, strict: true });
 
+const operationPlanArtifactSchema = new mongoose.Schema({
+    type: { type: String, required: true, trim: true },
+    path: { type: String, required: true, trim: true },
+}, { _id: false, strict: true });
+
 const operationPlanStepSchema = new mongoose.Schema({
     type: { type: String, required: true, trim: true },
+    artifacts: {
+        type: [operationPlanArtifactSchema],
+        default: undefined,
+    },
+}, { _id: false, strict: true });
+
+const operationPlanDesiredSchema = new mongoose.Schema({
+    clientCidr: { type: String, trim: true },
+    localAddress: { type: String, trim: true },
+    poolStart: { type: String, trim: true },
+    poolEnd: { type: String, trim: true },
+    dnsServers: { type: [String], default: undefined },
+    tproxyPort: { type: Number },
+    fwmark: { type: Number },
+    routeTable: { type: Number },
+    credentialRevision: { type: Number, min: 0 },
 }, { _id: false, strict: true });
 
 const operationPlanErrorSchema = new mongoose.Schema({
@@ -46,6 +67,7 @@ const operationPlanSchema = new mongoose.Schema({
     routeGroupId: { type: String, trim: true },
     selectedPathKey: { type: String, trim: true },
     nextHopNodeId: { type: String, trim: true },
+    desired: { type: operationPlanDesiredSchema },
     error: { type: operationPlanErrorSchema },
     steps: {
         type: [operationPlanStepSchema],

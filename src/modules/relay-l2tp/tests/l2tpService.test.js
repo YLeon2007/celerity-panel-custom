@@ -3,6 +3,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const { materializeInstallOperation } = require('../services/l2tpOperationMaterializer');
+const { buildInstallPlan } = require('../services/l2tpProvisionPlanService');
 const { L2tpService } = require('../services/l2tpService');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
@@ -17,6 +19,9 @@ function createService(overrides = {}) {
         },
         operationRepository: overrides.operationRepository || {},
         planBuilder: overrides.planBuilder || (() => ({ ok: true, steps: [] })),
+        operationMaterializer: overrides.operationMaterializer || (({ plan }) => ({
+            persistedPlan: plan,
+        })),
         preflightRunner: overrides.preflightRunner || (async () => ({ ok: true, checks: [] })),
         clock: overrides.clock || { now: () => new Date(NOW) },
     });
@@ -680,4 +685,66 @@ test('install validates context, builds a plan, and persists one queued operatio
             createdAt: NOW,
         },
     });
+});
+
+test('install materializes a secret-safe durable payload after validation and before persistence', async () => {
+    const psk = 'service-psk-must-not-persist';
+    const password = 'service-password-must-not-persist';
+    const base = installContext();
+    const context = installContext({
+        state: {
+            ...base.state,
+            localAddress: '10.77.0.1',
+            poolStart: '10.77.0.10',
+            poolEnd: '10.77.0.200',
+            tproxyPort: 12345,
+            fwmark: 77,
+            routeTable: 177,
+            secretRevision: 9,
+            psk,
+            users: [{ login: 'alice', password }],
+        },
+    });
+    const repositories = createContextRepositories(context);
+    const events = [];
+    let createdOperation;
+    const service = createService({
+        ...repositories,
+        preflightRunner: async () => {
+            events.push('preflight');
+            return { ok: true, checks: [] };
+        },
+        planBuilder: request => {
+            events.push('plan');
+            return buildInstallPlan(request);
+        },
+        operationMaterializer: request => {
+            events.push('materialize');
+            return materializeInstallOperation(request);
+        },
+        operationRepository: {
+            async create(operation) {
+                events.push('persist');
+                createdOperation = operation;
+            },
+        },
+    });
+
+    const result = await service.install(context.node.id, context.input);
+
+    assert.deepEqual(events, ['preflight', 'plan', 'materialize', 'persist']);
+    assert.equal(createdOperation.plan.operationId, result.operationId);
+    assert.deepEqual(
+        createdOperation.plan.steps.find(step => step.type === 'preflight').artifacts,
+        [{ type: 'desired', path: 'desired.json' }],
+    );
+    assert.deepEqual(
+        createdOperation.plan.steps.find(step => step.type === 'stage_managed_files').artifacts,
+        [{ type: 'artifact', path: 'artifacts.json' }],
+    );
+    const persisted = JSON.stringify(createdOperation);
+    assert.doesNotMatch(persisted, new RegExp(psk));
+    assert.doesNotMatch(persisted, new RegExp(password));
+    assert.doesNotMatch(persisted, /"(?:psk|password|content)"\s*:/i);
+    assert.deepEqual(result, { operationId: createdOperation._id });
 });

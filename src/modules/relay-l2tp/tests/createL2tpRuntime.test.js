@@ -37,6 +37,7 @@ function createDependencies() {
             async acquire() {},
             async release() {},
         },
+        secretResolver: async () => ({ psk: 'resolved-in-memory-only' }),
         requireAuth(req, res, next) { next(); },
         requireOnboarding(req, res, next) { next(); },
         csrf(req, res, next) { next(); },
@@ -74,6 +75,12 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.ok(runtime.worker.executor instanceof L2tpRemoteExecutor);
     assert.strictEqual(runtime.worker.executor.transport, dependencies.transport);
     assert.strictEqual(runtime.worker.lockService, dependencies.lockService);
+    assert.strictEqual(runtime.worker.secretResolver, dependencies.secretResolver);
+    assert.equal(typeof runtime.worker.operationMaterializer, 'function');
+    assert.strictEqual(
+        runtime.service.operationMaterializer,
+        runtime.worker.operationMaterializer,
+    );
     assert.strictEqual(runtime.worker.clock, dependencies.clock);
     assert.equal(runtime.worker.workerId, dependencies.workerId);
     assert.equal(runtime.worker.leaseMs, dependencies.leaseMs);
@@ -102,17 +109,34 @@ test('does not surface injected model or transport secrets', () => {
     const dependencies = createDependencies();
     dependencies.operationModel.connectionString = 'mongodb://model-secret';
     dependencies.transport.privateKey = 'transport-private-key';
+    dependencies.secretResolver.privateKey = 'resolver-private-key';
 
     const runtime = createL2tpRuntime(dependencies);
     const serializedRuntime = JSON.stringify(runtime);
 
     assert.doesNotMatch(serializedRuntime, /model-secret/);
     assert.doesNotMatch(serializedRuntime, /transport-private-key/);
+    assert.doesNotMatch(serializedRuntime, /resolver-private-key/);
     assert.equal(Object.hasOwn(runtime, 'operationModel'), false);
     assert.equal(Object.hasOwn(runtime, 'transport'), false);
+    for (const propertyName of [
+        'operationRepository',
+        'lockService',
+        'executor',
+        'secretResolver',
+        'operationMaterializer',
+        'clock',
+        'timer',
+    ]) {
+        assert.equal(
+            Object.prototype.propertyIsEnumerable.call(runtime.worker, propertyName),
+            false,
+            propertyName,
+        );
+    }
 });
 
-test('construction performs no worker, persistence, transport, or root-router work', () => {
+test('construction performs no timer, worker, persistence, transport, or root-router work', () => {
     const calls = [];
     const unexpected = name => () => {
         calls.push(name);
@@ -136,10 +160,18 @@ test('construction performs no worker, persistence, transport, or root-router wo
         acquire: unexpected('lockService.acquire'),
         release: unexpected('lockService.release'),
     };
+    dependencies.secretResolver = unexpected('secretResolver');
     dependencies.clock = { now: unexpected('clock.now') };
     dependencies.panelRouter = { use: unexpected('panelRouter.use') };
 
-    const runtime = createL2tpRuntime(dependencies);
+    const originalSetInterval = global.setInterval;
+    let runtime;
+    global.setInterval = unexpected('global.setInterval');
+    try {
+        runtime = createL2tpRuntime(dependencies);
+    } finally {
+        global.setInterval = originalSetInterval;
+    }
 
     assert.deepEqual(calls, []);
     assert.equal(typeof runtime.worker.runOnce, 'function');
@@ -197,6 +229,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
         'preflightRunner',
         'transport',
         'lockService',
+        'secretResolver',
         'requireAuth',
         'requireOnboarding',
         'csrf',

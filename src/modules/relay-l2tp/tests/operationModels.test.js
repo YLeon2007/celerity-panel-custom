@@ -170,6 +170,60 @@ test('L2TP operation plan retains only the worker allowlist and drops plaintext 
     });
 });
 
+test('L2TP operation plan persists only fixed desired fields and typed artifact references', () => {
+    const operation = l2tpOperation({
+        plan: {
+            ok: true,
+            operationId: 'operation-typed-artifacts',
+            topologyRevision: 17,
+            relayId: 'relay-1',
+            routeGroupId: 'group-a',
+            selectedPathKey: 'primary',
+            nextHopNodeId: 'bridge-1',
+            desired: {
+                clientCidr: '10.77.0.0/24',
+                localAddress: '10.77.0.1',
+                poolStart: '10.77.0.10',
+                poolEnd: '10.77.0.200',
+                dnsServers: ['1.1.1.1'],
+                tproxyPort: 12345,
+                fwmark: 77,
+                routeTable: 177,
+                credentialRevision: 9,
+                psk: 'desired-psk',
+                password: 'desired-password',
+            },
+            steps: [{
+                type: 'preflight',
+                artifacts: [{
+                    type: 'desired',
+                    path: 'desired.json',
+                    content: '{"psk":"artifact-psk"}',
+                    password: 'artifact-password',
+                }],
+            }],
+        },
+    });
+
+    assert.equal(operation.validateSync(), undefined);
+    assert.deepEqual(operation.toObject().plan.desired, {
+        clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        credentialRevision: 9,
+    });
+    assert.deepEqual(operation.toObject().plan.steps, [{
+        type: 'preflight',
+        artifacts: [{ type: 'desired', path: 'desired.json' }],
+    }]);
+    assert.doesNotMatch(JSON.stringify(operation.toObject().plan), /desired-psk|desired-password|artifact-psk|artifact-password/);
+});
+
 test('L2TP operation retains optional topology and route-group plan identity', () => {
     const routeGroupId = objectId();
     const operation = l2tpOperation({ topologyRevision: 17, routeGroupId });

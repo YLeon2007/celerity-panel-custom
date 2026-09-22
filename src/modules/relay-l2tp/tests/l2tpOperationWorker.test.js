@@ -3,6 +3,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const { materializeInstallOperation } = require('../services/l2tpOperationMaterializer');
+const { L2tpRemoteExecutor } = require('../services/l2tpRemoteExecutor');
+const { buildInstallPlan, INSTALL_STEP_TYPES } = require('../services/l2tpProvisionPlanService');
 const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
@@ -95,6 +98,8 @@ function createWorker(operationRepository, overrides = {}) {
         operationRepository,
         lockService,
         executor: overrides.executor || {},
+        secretResolver: overrides.secretResolver,
+        operationMaterializer: overrides.operationMaterializer,
         workerId: 'worker-1',
         leaseMs: overrides.leaseMs || 30_000,
         clock: overrides.clock || createClock(),
@@ -102,6 +107,291 @@ function createWorker(operationRepository, overrides = {}) {
         renewalIntervalMs: overrides.renewalIntervalMs,
     });
 }
+
+function createInstallOperation(id = 'operation-install') {
+    const desired = {
+        desiredState: 'installed',
+        routeGroup: 'group-a',
+        clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1', '9.9.9.9'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        secretRevision: 9,
+    };
+    const plan = buildInstallPlan({
+        operationId: id,
+        topologyRevision: 17,
+        relay: { id: 'relay-1', role: 'relay' },
+        routeGroup: { id: 'group-a' },
+        relayGroupPlan: {
+            groupId: 'group-a',
+            candidates: [{
+                pathKey: 'primary',
+                healthy: true,
+                nextHopNodeId: 'bridge-1',
+            }],
+            decision: {
+                decision: 'select',
+                groupId: 'group-a',
+                pathKey: 'primary',
+                nextHopNodeId: 'bridge-1',
+            },
+        },
+        desired,
+    });
+    const { persistedPlan } = materializeInstallOperation({ plan, desired });
+
+    return {
+        operation: {
+            id,
+            node: 'relay-1',
+            kind: 'install',
+            status: 'queued',
+            plan: persistedPlan,
+        },
+        secrets: { psk: 'worker-jit-psk-secret' },
+    };
+}
+
+test('claims an install once and resolves its PSK once before typed artifact uploads', async () => {
+    const secret = 'worker-jit-psk-secret';
+    const { operation } = createInstallOperation('operation-jit');
+    const operationRepository = createOperationRepository([operation]);
+    const resolverCalls = [];
+    const lockCalls = [];
+    const transportCalls = [];
+    const executor = new L2tpRemoteExecutor({
+        transport: {
+            async uploadRootFile(request) {
+                transportCalls.push({ method: 'uploadRootFile', request });
+            },
+            async runArtifactCommand(request) {
+                transportCalls.push({ method: 'runArtifactCommand', request });
+            },
+        },
+    });
+    const worker = createWorker(operationRepository, {
+        executor,
+        operationMaterializer: materializeInstallOperation,
+        secretResolver: async request => {
+            resolverCalls.push(request);
+            assert.equal(
+                operationRepository.operations[0].status,
+                'running',
+                'operation must be claimed first',
+            );
+            assert.deepEqual(transportCalls, [], 'secrets must resolve before the first upload');
+            return { psk: secret };
+        },
+        lockService: {
+            async acquire(request) {
+                lockCalls.push({ method: 'acquire', request });
+                return { ok: true };
+            },
+            async renew() { return { ok: true }; },
+            async release(request) {
+                lockCalls.push({ method: 'release', request });
+                return { ok: true };
+            },
+        },
+    });
+
+    const first = await worker.runOnce();
+    const second = await worker.runOnce();
+
+    assert.deepEqual(first, {
+        claimed: true,
+        operationId: 'operation-jit',
+        status: 'succeeded',
+    });
+    assert.deepEqual(second, { claimed: false });
+    assert.deepEqual(resolverCalls, [{
+        operationId: 'operation-jit',
+        nodeId: 'relay-1',
+        credentialRevision: 9,
+        secret: 'psk',
+    }]);
+    assert.deepEqual(lockCalls.map(call => call.method), ['acquire', 'release']);
+
+    const uploads = transportCalls.filter(call => call.method === 'uploadRootFile');
+    assert.equal(uploads.length, 2);
+    assert.deepEqual(
+        uploads.map(call => ({
+            type: call.request.type,
+            path: call.request.path,
+        })),
+        [
+            { type: 'desired', path: 'desired.json' },
+            { type: 'artifact', path: 'artifacts.json' },
+        ],
+    );
+    assert.deepEqual(JSON.parse(uploads[0].request.content), {
+        clientCidr: '10.77.0.0/24',
+    });
+    assert.match(uploads[1].request.content, new RegExp(secret));
+    assert.deepEqual(
+        transportCalls
+            .filter(call => call.method === 'runArtifactCommand')
+            .map(call => call.request.command),
+        INSTALL_STEP_TYPES,
+    );
+    assert.ok(
+        transportCalls.indexOf(uploads[0])
+            < transportCalls.findIndex(call => (
+                call.method === 'runArtifactCommand'
+                && call.request.command === 'preflight'
+            )),
+    );
+    assert.ok(
+        transportCalls.indexOf(uploads[1])
+            < transportCalls.findIndex(call => (
+                call.method === 'runArtifactCommand'
+                && call.request.command === 'stage_managed_files'
+            )),
+    );
+    assert.doesNotMatch(JSON.stringify({
+        operation,
+        repositoryCalls: operationRepository.calls,
+        first,
+        second,
+    }), new RegExp(secret));
+    assert.equal(
+        operation.plan.steps.some(step => (
+            step.artifacts?.some(artifact => Object.hasOwn(artifact, 'content'))
+        )),
+        false,
+    );
+});
+
+test('rejects invalid claimed install plans before resolving secrets or remote work', async () => {
+    const { operation: validOperation } = createInstallOperation('operation-invalid-plan');
+    const cases = [
+        {
+            name: 'rejected plan',
+            expectedCode: 'INSTALL_PLAN_REJECTED',
+            plan: { ...validOperation.plan, ok: false },
+        },
+        {
+            name: 'unknown step',
+            expectedCode: 'INVALID_INSTALL_PLAN',
+            plan: {
+                ...validOperation.plan,
+                steps: validOperation.plan.steps.map((step, index) => (
+                    index === 1 ? { type: 'unknown_step' } : step
+                )),
+            },
+        },
+        {
+            name: 'duplicate step',
+            expectedCode: 'INVALID_INSTALL_PLAN',
+            plan: {
+                ...validOperation.plan,
+                steps: [
+                    validOperation.plan.steps[0],
+                    validOperation.plan.steps[0],
+                    ...validOperation.plan.steps.slice(1),
+                ],
+            },
+        },
+    ];
+
+    for (const testCase of cases) {
+        let resolverCalls = 0;
+        let lockCalls = 0;
+        const transportCalls = [];
+        const operationRepository = createOperationRepository([{
+            ...validOperation,
+            id: `operation-${testCase.name.replaceAll(' ', '-')}`,
+            status: 'queued',
+            plan: testCase.plan,
+        }]);
+        const worker = createWorker(operationRepository, {
+            operationMaterializer: materializeInstallOperation,
+            secretResolver: async () => {
+                resolverCalls += 1;
+                return { psk: 'must-not-resolve' };
+            },
+            executor: new L2tpRemoteExecutor({
+                transport: {
+                    async uploadRootFile(request) { transportCalls.push(request); },
+                    async runArtifactCommand(request) { transportCalls.push(request); },
+                },
+            }),
+            lockService: {
+                async acquire() {
+                    lockCalls += 1;
+                    return { ok: true };
+                },
+                async renew() { return { ok: true }; },
+                async release() {},
+            },
+        });
+
+        const result = await worker.runOnce();
+        const [failure] = operationRepository.calls.filter(call => call.method === 'setStatus');
+
+        assert.equal(result.status, 'failed', testCase.name);
+        assert.equal(resolverCalls, 0, testCase.name);
+        assert.equal(lockCalls, 0, testCase.name);
+        assert.deepEqual(transportCalls, [], testCase.name);
+        assert.equal(failure.request.errorCode, testCase.expectedCode, testCase.name);
+    }
+});
+
+test('secret resolution failure is sanitized and performs no remote command or rollback', async () => {
+    const leakedSecret = 'resolver-error-must-not-leak';
+    const { operation } = createInstallOperation('operation-resolver-failure');
+    const operationRepository = createOperationRepository([operation]);
+    const transportCalls = [];
+    const lockCalls = [];
+    const worker = createWorker(operationRepository, {
+        operationMaterializer: materializeInstallOperation,
+        secretResolver: async () => {
+            throw Object.assign(new Error(`vault failure: ${leakedSecret}`), {
+                code: leakedSecret,
+            });
+        },
+        executor: new L2tpRemoteExecutor({
+            transport: {
+                async uploadRootFile(request) { transportCalls.push(request); },
+                async runArtifactCommand(request) { transportCalls.push(request); },
+            },
+        }),
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release(request) {
+                lockCalls.push(request);
+                return { ok: true };
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+    const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-resolver-failure',
+        status: 'failed',
+    });
+    assert.deepEqual(transportCalls, []);
+    assert.equal(lockCalls.length, 1);
+    assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
+    assert.equal(statuses[0].request.errorCode, 'SECRET_RESOLUTION_FAILED');
+    assert.equal(
+        statuses[0].request.errorMessage,
+        'Failed to resolve L2TP operation secrets',
+    );
+    assert.doesNotMatch(
+        JSON.stringify({ result, repositoryCalls: operationRepository.calls }),
+        new RegExp(leakedSecret),
+    );
+});
 
 test('runOnce reports idle when no queued operation can be claimed', async () => {
     const operationRepository = createOperationRepository();

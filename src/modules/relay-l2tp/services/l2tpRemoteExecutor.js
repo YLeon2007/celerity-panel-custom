@@ -43,6 +43,61 @@ function assertNoPathTraversal(path) {
     }
 }
 
+function artifactError(code, message) {
+    return new L2tpRemoteExecutorError(code, message);
+}
+
+function validatedArtifacts(step) {
+    const expectedArtifacts = STEP_ARTIFACT_PATHS[step.type];
+    const artifacts = step.artifacts;
+
+    if (!expectedArtifacts) {
+        if (artifacts === undefined || (Array.isArray(artifacts) && artifacts.length === 0)) {
+            return [];
+        }
+        throw artifactError(
+            'ARTIFACT_NOT_ALLOWED',
+            'Artifact is not allowed for this L2TP operation step',
+        );
+    }
+
+    const expectedEntries = Object.entries(expectedArtifacts);
+    if (!Array.isArray(artifacts) || artifacts.length !== expectedEntries.length) {
+        throw artifactError(
+            'ARTIFACT_REQUIRED',
+            'Exactly one materialized artifact is required for this L2TP operation step',
+        );
+    }
+
+    return artifacts.map((artifact, index) => {
+        const [expectedType, expectedPath] = expectedEntries[index];
+        if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) {
+            throw artifactError(
+                'ARTIFACT_PAYLOAD_INVALID',
+                'The L2TP operation artifact payload is invalid',
+            );
+        }
+        assertNoPathTraversal(artifact.path);
+        if (artifact.type !== expectedType || artifact.path !== expectedPath) {
+            throw artifactError(
+                'ARTIFACT_NOT_ALLOWED',
+                'Artifact is not allowed for this L2TP operation step',
+            );
+        }
+        if (
+            Object.keys(artifact).length !== 3
+            || !Object.hasOwn(artifact, 'content')
+            || typeof artifact.content !== 'string'
+        ) {
+            throw artifactError(
+                'ARTIFACT_PAYLOAD_INVALID',
+                'The L2TP operation artifact payload is invalid',
+            );
+        }
+        return artifact;
+    });
+}
+
 async function uploadRootFile(transport, request) {
     try {
         await transport.uploadRootFile(request);
@@ -86,22 +141,7 @@ class L2tpRemoteExecutor {
         }
 
         const operationId = String(operation._id ?? operation.id);
-        const artifacts = step.artifacts || [];
-
-        for (const artifact of artifacts) {
-            assertNoPathTraversal(artifact.path);
-            const allowedArtifacts = STEP_ARTIFACT_PATHS[step.type];
-            if (
-                !allowedArtifacts
-                || !Object.hasOwn(allowedArtifacts, artifact.type)
-                || allowedArtifacts[artifact.type] !== artifact.path
-            ) {
-                throw new L2tpRemoteExecutorError(
-                    'ARTIFACT_NOT_ALLOWED',
-                    'Artifact is not allowed for this L2TP operation step',
-                );
-            }
-        }
+        const artifacts = validatedArtifacts(step);
 
         for (const artifact of artifacts) {
             await uploadRootFile(this.transport, {

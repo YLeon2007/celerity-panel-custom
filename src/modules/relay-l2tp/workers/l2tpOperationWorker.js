@@ -1,10 +1,88 @@
 'use strict';
 
+const INSTALL_PLAN_ERROR_CODES = new Set([
+    'INSTALL_PLAN_REJECTED',
+    'INVALID_INSTALL_PLAN',
+]);
+
+function entityId(entity) {
+    const value = entity !== null && typeof entity === 'object'
+        ? entity._id ?? entity.id ?? entity.nodeId
+        : entity;
+    return value === null || value === undefined ? null : String(value);
+}
+
+function secretFreeStep(step) {
+    const reference = { type: step.type };
+    if (Array.isArray(step.artifacts)) {
+        reference.artifacts = step.artifacts.map(artifact => ({
+            type: artifact.type,
+            path: artifact.path,
+        }));
+    }
+    return reference;
+}
+
+function attachRemoteArtifacts(plan, remoteArtifacts) {
+    if (!Array.isArray(remoteArtifacts)) {
+        throw new TypeError('L2TP operation materializer must return remote artifacts');
+    }
+
+    const byReference = new Map();
+    for (const artifact of remoteArtifacts) {
+        if (
+            !artifact
+            || typeof artifact !== 'object'
+            || typeof artifact.stepType !== 'string'
+            || typeof artifact.type !== 'string'
+            || typeof artifact.path !== 'string'
+            || typeof artifact.content !== 'string'
+        ) {
+            throw new TypeError('L2TP operation materializer returned an invalid artifact');
+        }
+        const key = `${artifact.stepType}\u0000${artifact.type}\u0000${artifact.path}`;
+        if (byReference.has(key)) {
+            throw new TypeError('L2TP operation materializer returned a duplicate artifact');
+        }
+        byReference.set(key, artifact.content);
+    }
+
+    const consumed = new Set();
+    const steps = plan.steps.map(step => {
+        if (!Array.isArray(step.artifacts) || step.artifacts.length === 0) {
+            return { type: step.type };
+        }
+
+        return {
+            type: step.type,
+            artifacts: step.artifacts.map(reference => {
+                const key = `${step.type}\u0000${reference.type}\u0000${reference.path}`;
+                if (!byReference.has(key)) {
+                    throw new TypeError('L2TP operation materializer omitted a referenced artifact');
+                }
+                consumed.add(key);
+                return {
+                    type: reference.type,
+                    path: reference.path,
+                    content: byReference.get(key),
+                };
+            }),
+        };
+    });
+
+    if (consumed.size !== byReference.size) {
+        throw new TypeError('L2TP operation materializer returned an unreferenced artifact');
+    }
+    return steps;
+}
+
 class L2tpOperationWorker {
     constructor({
         operationRepository,
         lockService,
         executor,
+        secretResolver,
+        operationMaterializer,
         workerId,
         leaseMs,
         clock,
@@ -14,6 +92,8 @@ class L2tpOperationWorker {
         this.operationRepository = operationRepository;
         this.lockService = lockService;
         this.executor = executor;
+        this.secretResolver = secretResolver;
+        this.operationMaterializer = operationMaterializer;
         this.workerId = workerId;
         this.leaseMs = leaseMs;
         this.clock = clock;
@@ -25,6 +105,72 @@ class L2tpOperationWorker {
         });
         this.renewalIntervalMs = renewalIntervalMs
             ?? Math.max(1, Math.floor(leaseMs / 3));
+    }
+
+    async failClaimedOperation({ operationId, errorCode, errorMessage }) {
+        const finishedAt = this.clock.now();
+        await this.operationRepository.setStatus({
+            operationId,
+            status: 'failed',
+            progress: 0,
+            errorCode,
+            errorMessage,
+            finishedAt,
+            journal: {
+                at: finishedAt,
+                level: 'error',
+                code: errorCode,
+                message: errorMessage,
+            },
+        });
+        return { claimed: true, operationId, status: 'failed' };
+    }
+
+    async prepareInstallPlan(operation) {
+        if (typeof this.operationMaterializer !== 'function') {
+            return {
+                errorCode: 'INSTALL_PLAN_REJECTED',
+                errorMessage: 'L2TP install plan materialization is unavailable',
+            };
+        }
+
+        try {
+            const prepared = await this.operationMaterializer({ plan: operation.plan });
+            if (!prepared?.persistedPlan || typeof prepared.persistedPlan !== 'object') {
+                throw new TypeError('L2TP operation materializer returned no durable plan');
+            }
+            return { plan: prepared.persistedPlan };
+        } catch (error) {
+            const errorCode = INSTALL_PLAN_ERROR_CODES.has(error?.code)
+                ? error.code
+                : 'INSTALL_PLAN_REJECTED';
+            return {
+                errorCode,
+                errorMessage: errorCode === 'INVALID_INSTALL_PLAN'
+                    ? 'The claimed L2TP install plan is invalid'
+                    : 'The claimed L2TP install plan was rejected',
+            };
+        }
+    }
+
+    async materializeInstallSteps({ operation, operationId, plan }) {
+        if (typeof this.secretResolver !== 'function') {
+            throw new TypeError('L2TP operation secret resolver is unavailable');
+        }
+        const secrets = await this.secretResolver({
+            operationId,
+            nodeId: entityId(operation.node),
+            credentialRevision: plan.desired?.credentialRevision,
+            secret: 'psk',
+        });
+        const materialized = await this.operationMaterializer({ plan, secrets });
+        if (!materialized?.persistedPlan || typeof materialized.persistedPlan !== 'object') {
+            throw new TypeError('L2TP operation materializer returned no durable plan');
+        }
+        return attachRemoteArtifacts(
+            materialized.persistedPlan,
+            materialized.remoteArtifacts,
+        );
     }
 
     createLeaseHeartbeat({ operationId, node }) {
@@ -106,7 +252,20 @@ class L2tpOperationWorker {
         if (!operation) return { claimed: false };
 
         const operationId = String(operation._id ?? operation.id);
-        const steps = operation.plan?.steps;
+        let preparedInstallPlan = null;
+        if (operation.kind === 'install') {
+            const prepared = await this.prepareInstallPlan(operation);
+            if (prepared.errorCode) {
+                return this.failClaimedOperation({
+                    operationId,
+                    errorCode: prepared.errorCode,
+                    errorMessage: prepared.errorMessage,
+                });
+            }
+            preparedInstallPlan = prepared.plan;
+        }
+
+        const steps = preparedInstallPlan?.steps ?? operation.plan?.steps;
         const hasVerifyStep = Array.isArray(steps)
             && steps.some(step => step?.type === 'verify');
 
@@ -172,16 +331,38 @@ class L2tpOperationWorker {
         });
 
         try {
-            const steps = operation.plan.steps;
+            let executionSteps = preparedInstallPlan?.steps ?? operation.plan.steps;
+            if (preparedInstallPlan) {
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+                try {
+                    executionSteps = await this.materializeInstallSteps({
+                        operation,
+                        operationId,
+                        plan: preparedInstallPlan,
+                    });
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                } catch {
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.stop();
+                    return this.failClaimedOperation({
+                        operationId,
+                        errorCode: 'SECRET_RESOLUTION_FAILED',
+                        errorMessage: 'Failed to resolve L2TP operation secrets',
+                    });
+                }
+            }
             const completedSteps = [];
 
-            for (const [index, step] of steps.entries()) {
+            for (const [index, step] of executionSteps.entries()) {
                 await heartbeat.renewNow();
                 if (heartbeat.getError()) return leaseLostResult();
 
                 const stepType = step.type;
-                const startingProgress = Math.round((index / steps.length) * 100);
-                const completedProgress = Math.round(((index + 1) / steps.length) * 100);
+                const startingProgress = Math.round((index / executionSteps.length) * 100);
+                const completedProgress = Math.round(((index + 1) / executionSteps.length) * 100);
 
                 await this.operationRepository.recordStep({
                     operationId,
@@ -225,7 +406,7 @@ class L2tpOperationWorker {
                         await this.executor.rollback({
                             operation,
                             completedSteps: [...completedSteps],
-                            failedStep: step,
+                            failedStep: secretFreeStep(step),
                             error,
                         });
                     } catch (rollbackError) {
@@ -272,7 +453,7 @@ class L2tpOperationWorker {
                     return { claimed: true, operationId, status: 'rolled_back' };
                 }
 
-                completedSteps.push(step);
+                completedSteps.push(secretFreeStep(step));
                 await this.operationRepository.recordStep({
                     operationId,
                     step: stepType,
@@ -288,7 +469,7 @@ class L2tpOperationWorker {
 
             await heartbeat.stop();
             const finishedAt = this.clock.now();
-            const finalStep = steps[steps.length - 1].type;
+            const finalStep = executionSteps[executionSteps.length - 1].type;
             await this.operationRepository.setStatus({
                 operationId,
                 status: 'succeeded',

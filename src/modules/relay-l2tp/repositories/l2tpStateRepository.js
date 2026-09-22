@@ -38,6 +38,18 @@ const OPERATION_PLAN_FIELDS = Object.freeze([
     'nextHopNodeId',
 ]);
 
+const OPERATION_PLAN_DESIRED_FIELDS = Object.freeze([
+    'clientCidr',
+    'localAddress',
+    'poolStart',
+    'poolEnd',
+    'dnsServers',
+    'tproxyPort',
+    'fwmark',
+    'routeTable',
+    'credentialRevision',
+]);
+
 function pickDefined(source, fields) {
     return fields.reduce((result, field) => {
         if (source[field] !== undefined) result[field] = source[field];
@@ -52,10 +64,25 @@ function sanitizeOperationPlan(plan) {
     if (plan.error && typeof plan.error === 'object' && !Array.isArray(plan.error)) {
         sanitized.error = pickDefined(plan.error, ['code']);
     }
+    if (plan.desired && typeof plan.desired === 'object' && !Array.isArray(plan.desired)) {
+        sanitized.desired = pickDefined(plan.desired, OPERATION_PLAN_DESIRED_FIELDS);
+    }
     if (Array.isArray(plan.steps)) {
         sanitized.steps = plan.steps
             .filter(step => step && typeof step === 'object' && !Array.isArray(step))
-            .map(step => pickDefined(step, ['type']));
+            .map(step => {
+                const sanitizedStep = pickDefined(step, ['type']);
+                if (Array.isArray(step.artifacts)) {
+                    sanitizedStep.artifacts = step.artifacts
+                        .filter(artifact => (
+                            artifact
+                            && typeof artifact === 'object'
+                            && !Array.isArray(artifact)
+                        ))
+                        .map(artifact => pickDefined(artifact, ['type', 'path']));
+                }
+                return sanitizedStep;
+            });
     }
     return sanitized;
 }

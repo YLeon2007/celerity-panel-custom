@@ -22,6 +22,16 @@ function createTransport() {
     };
 }
 
+function materializedArtifactsFor(type) {
+    if (type === 'preflight') {
+        return [{ type: 'desired', path: 'desired.json', content: '{}\n' }];
+    }
+    if (type === 'stage_managed_files') {
+        return [{ type: 'artifact', path: 'artifacts.json', content: '{}\n' }];
+    }
+    return undefined;
+}
+
 test('preflight uploads its root-only desired file before its fixed command', async () => {
     const transport = createTransport();
     const executor = new L2tpRemoteExecutor({ transport });
@@ -76,20 +86,85 @@ test('maps every install-plan step to its same-name allowlisted command', async 
     for (const type of INSTALL_STEP_TYPES) {
         await executor.executeStep({
             operation: { id: 'operation-all-steps' },
-            step: { type },
+            step: {
+                type,
+                ...(materializedArtifactsFor(type) === undefined
+                    ? {}
+                    : { artifacts: materializedArtifactsFor(type) }),
+            },
         });
     }
 
     assert.deepEqual(
-        transport.calls,
-        INSTALL_STEP_TYPES.map(command => ({
-            method: 'runArtifactCommand',
-            request: {
-                operationId: 'operation-all-steps',
-                command,
-            },
-        })),
+        transport.calls
+            .filter(call => call.method === 'runArtifactCommand')
+            .map(call => call.request.command),
+        INSTALL_STEP_TYPES,
     );
+});
+
+test('requires exactly one materialized typed artifact only on its two declared steps', async () => {
+    const invalidCases = [
+        { step: { type: 'preflight' } },
+        { step: { type: 'stage_managed_files', artifacts: [] } },
+        {
+            step: {
+                type: 'preflight',
+                artifacts: [{ type: 'desired', path: 'desired.json' }],
+            },
+        },
+        {
+            step: {
+                type: 'preflight',
+                artifacts: [
+                    { type: 'desired', path: 'desired.json', content: '{}' },
+                    { type: 'desired', path: 'desired.json', content: '{}' },
+                ],
+            },
+        },
+        {
+            step: {
+                type: 'stage_managed_files',
+                artifacts: [{ type: 'artifact', path: 'artifacts.json', content: 17 }],
+            },
+        },
+        {
+            step: {
+                type: 'stage_managed_files',
+                artifacts: [{
+                    type: 'artifact',
+                    path: 'artifacts.json',
+                    content: '{}',
+                    checksum: 'caller-controlled',
+                }],
+            },
+        },
+        {
+            step: {
+                type: 'verify',
+                artifacts: [{ type: 'artifact', path: 'artifacts.json', content: '{}' }],
+            },
+        },
+    ];
+
+    for (const { step } of invalidCases) {
+        const transport = createTransport();
+        const executor = new L2tpRemoteExecutor({ transport });
+
+        await assert.rejects(
+            executor.executeStep({
+                operation: { id: 'operation-exact-artifacts' },
+                step,
+            }),
+            error => {
+                assert.equal(error.name, 'L2tpRemoteExecutorError');
+                assert.match(error.code, /^ARTIFACT_/);
+                assert.doesNotMatch(JSON.stringify(error), /caller-controlled/);
+                return true;
+            },
+        );
+        assert.deepEqual(transport.calls, []);
+    }
 });
 
 test('rejects unknown step types before invoking the transport', async () => {
