@@ -7,12 +7,22 @@ const { compileTopology } = require('./relay-l2tp/domain/topologyCompiler');
 const { L2tpStateRepository, createL2tpServiceRepositoryAdapters } = require('./relay-l2tp/repositories/l2tpStateRepository');
 const { createPanelOverviewLoader } = require('./relay-l2tp/routes/panelOverview');
 const { createL2tpRuntime } = require('./relay-l2tp/runtime/createL2tpRuntime');
+const { createL2tpWorkerLifecycle } = require('./relay-l2tp/runtime/createL2tpWorkerLifecycle');
+const { L2tpNodeTransport } = require('./relay-l2tp/services/l2tpNodeTransport');
+const { createL2tpNodeTransportFactory } = require('./relay-l2tp/services/l2tpNodeTransportFactory');
+const { NodeOperationLockRepository } = require('./relay-l2tp/services/nodeOperationLockRepository');
+const { NodeOperationLockService } = require('./relay-l2tp/services/nodeOperationLockService');
 const { TopologyRuntimeService } = require('./relay-l2tp/services/topologyRuntimeService');
 
 const DEFAULT_COMPILER_DATA = Object.freeze({ relays: Object.freeze([]) });
 const DEFAULT_HEALTH_BY_PATH_KEY = Object.freeze({});
 const DEFAULT_CLOCK = Object.freeze({ now: () => new Date() });
 const DEFAULT_LEASE_MS = 30_000;
+const DORMANT_LIFECYCLE_STATE = Object.freeze({
+    enabled: false,
+    running: false,
+    inFlight: false,
+});
 
 function workerNotStartedError() {
     const error = new Error('The L2TP operation worker is not started by the panel host');
@@ -38,6 +48,23 @@ const dormantLockService = Object.freeze({
     },
 });
 
+const dormantLifecycle = Object.freeze({
+    start() {
+        return { ...DORMANT_LIFECYCLE_STATE };
+    },
+    async stop() {
+        return { ...DORMANT_LIFECYCLE_STATE };
+    },
+});
+
+function lifecycleSummary(state) {
+    return {
+        enabled: state?.enabled === true,
+        running: state?.running === true,
+        inFlight: state?.inFlight === true,
+    };
+}
+
 async function unavailablePreflightRunner() {
     return {
         ok: false,
@@ -56,9 +83,15 @@ function createL2tpPanelHost({
     healthByPathKey = DEFAULT_HEALTH_BY_PATH_KEY,
     compiler = compileTopology,
     topologyRuntime: injectedTopologyRuntime,
-    preflightRunner = unavailablePreflightRunner,
-    transport = dormantTransport,
-    lockService = dormantLockService,
+    preflightRunner: injectedPreflightRunner,
+    artifactMaterializer,
+    nodeSSHFactory,
+    workerLifecycle,
+    NodeTransport: RuntimeNodeTransport = L2tpNodeTransport,
+    createTransportFactory: createNodeTransportFactory = createL2tpNodeTransportFactory,
+    NodeOperationLockService: RuntimeLockService = NodeOperationLockService,
+    NodeOperationLockRepository: RuntimeLockRepository = NodeOperationLockRepository,
+    createWorkerLifecycle: createLifecycle = createL2tpWorkerLifecycle,
     clock = DEFAULT_CLOCK,
     workerId = `panel-${process.pid}`,
     leaseMs = DEFAULT_LEASE_MS,
@@ -96,13 +129,48 @@ function createL2tpPanelHost({
         CascadeRouteGroup: models.CascadeRouteGroup,
         L2tpOperation: models.L2tpOperation,
     });
+    const activeRuntimeReady = workerLifecycle?.enabled === true
+        && typeof nodeSSHFactory === 'function'
+        && typeof RuntimeNodeTransport === 'function'
+        && typeof createNodeTransportFactory === 'function'
+        && typeof RuntimeLockService === 'function'
+        && typeof RuntimeLockRepository === 'function'
+        && models.L2tpOperation
+        && models.NodeOperationLock
+        && typeof injectedPreflightRunner === 'function'
+        && typeof artifactMaterializer === 'function'
+        && typeof createLifecycle === 'function';
+    const preflightRunner = activeRuntimeReady
+        ? injectedPreflightRunner
+        : unavailablePreflightRunner;
+    let transport;
+    let transportFactory;
+    let lockService;
+    if (activeRuntimeReady) {
+        const lockRepository = new RuntimeLockRepository({
+            model: models.NodeOperationLock,
+        });
+        lockService = new RuntimeLockService({
+            repository: lockRepository,
+            clock,
+        });
+        transportFactory = createNodeTransportFactory({
+            nodeSSHFactory,
+            NodeTransport: RuntimeNodeTransport,
+        });
+    } else {
+        transport = dormantTransport;
+        lockService = dormantLockService;
+    }
     const runtime = createRuntime({
         operationModel: models.L2tpOperation,
         operationRepository: adapters.operationRepository,
         nodeRepository: adapters.nodeRepository,
         stateRepository: adapters.stateRepository,
         preflightRunner,
-        transport,
+        ...(activeRuntimeReady
+            ? { transportFactory, artifactMaterializer }
+            : { transport }),
         lockService,
         requireAuth,
         requireOnboarding,
@@ -114,6 +182,12 @@ function createL2tpPanelHost({
         workerId,
         leaseMs,
     });
+    const lifecycle = activeRuntimeReady
+        ? createLifecycle({
+            ...workerLifecycle,
+            worker: runtime.worker,
+        })
+        : dormantLifecycle;
 
     return {
         moduleEntry: injectedModuleEntry,
@@ -121,6 +195,8 @@ function createL2tpPanelHost({
         repository,
         loadPanelOverview,
         runtime,
+        start: () => lifecycleSummary(lifecycle.start()),
+        stop: async () => lifecycleSummary(await lifecycle.stop()),
     };
 }
 

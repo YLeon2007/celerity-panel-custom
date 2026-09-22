@@ -17,7 +17,12 @@ class L2tpOperationWorker {
         this.workerId = workerId;
         this.leaseMs = leaseMs;
         this.clock = clock;
-        this.timer = timer;
+        Object.defineProperty(this, 'timer', {
+            value: timer,
+            writable: true,
+            configurable: true,
+            enumerable: false,
+        });
         this.renewalIntervalMs = renewalIntervalMs
             ?? Math.max(1, Math.floor(leaseMs / 3));
     }
