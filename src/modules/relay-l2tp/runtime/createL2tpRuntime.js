@@ -17,7 +17,6 @@ const REQUIRED_DEPENDENCIES = Object.freeze([
     'nodeRepository',
     'stateRepository',
     'preflightRunner',
-    'transport',
     'lockService',
     'secretResolver',
     'requireAuth',
@@ -39,6 +38,17 @@ function assertDependencies(dependencies) {
         if (dependencies[dependencyName] === undefined || dependencies[dependencyName] === null) {
             throw new TypeError(`createL2tpRuntime requires ${dependencyName}`);
         }
+    }
+    const hasTransport = dependencies.transport !== undefined && dependencies.transport !== null;
+    const hasTransportResolver = typeof dependencies.transportResolver === 'function';
+    if (hasTransport === hasTransportResolver) {
+        throw new TypeError('createL2tpRuntime requires exactly one transport or transportResolver');
+    }
+    if (
+        dependencies.operationMaterializer !== undefined
+        && typeof dependencies.operationMaterializer !== 'function'
+    ) {
+        throw new TypeError('createL2tpRuntime requires operationMaterializer to be a function');
     }
 }
 
@@ -63,8 +73,10 @@ function createL2tpRuntime(dependencies) {
         stateRepository,
         preflightRunner,
         transport,
+        transportResolver,
         lockService,
         secretResolver,
+        operationMaterializer = materializeInstallOperation,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -81,17 +93,19 @@ function createL2tpRuntime(dependencies) {
         stateRepository,
         operationRepository,
         planBuilder: buildInstallPlan,
-        operationMaterializer: materializeInstallOperation,
+        operationMaterializer,
         preflightRunner,
         clock,
     });
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor(
+        transportResolver ? { transportResolver } : { transport },
+    );
     const worker = new L2tpOperationWorker({
         operationRepository: workerOperationRepository,
         lockService,
         executor,
         secretResolver,
-        operationMaterializer: materializeInstallOperation,
+        operationMaterializer,
         workerId,
         leaseMs,
         clock,

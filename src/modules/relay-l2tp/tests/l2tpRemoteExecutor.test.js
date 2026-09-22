@@ -368,3 +368,82 @@ test('sanitizes upload and command transport failures before returning them', as
         );
     }
 });
+
+test('resolves one lazy transport per claimed operation and reuses it for every fixed command', async () => {
+    const resolverCalls = [];
+    const transportCalls = [];
+    const transports = new Map();
+    const transportResolver = async request => {
+        resolverCalls.push(request);
+        const transport = {
+            async uploadRootFile(upload) {
+                transportCalls.push({ operationId: request.operationId, method: 'uploadRootFile', request: upload });
+            },
+            async runArtifactCommand(command) {
+                transportCalls.push({ operationId: request.operationId, method: 'runArtifactCommand', request: command });
+            },
+        };
+        transports.set(request.operationId, transport);
+        return transport;
+    };
+    const executor = new L2tpRemoteExecutor({ transportResolver });
+    const first = { id: 'operation-lazy-a', node: 'relay-a' };
+    const second = { id: 'operation-lazy-b', node: { _id: 'relay-b' } };
+
+    assert.deepEqual(resolverCalls, []);
+    assert.deepEqual(transportCalls, []);
+
+    await executor.executeStep({ operation: first, step: { type: 'verify' } });
+    await executor.executeStep({ operation: first, step: { type: 'commit' } });
+    await executor.rollback({ operation: first });
+    await executor.executeStep({ operation: second, step: { type: 'verify' } });
+
+    assert.deepEqual(resolverCalls, [
+        { operationId: 'operation-lazy-a', nodeId: 'relay-a' },
+        { operationId: 'operation-lazy-b', nodeId: 'relay-b' },
+    ]);
+    assert.equal(transports.size, 2);
+    assert.deepEqual(
+        transportCalls.map(call => [call.operationId, call.method, call.request.command]),
+        [
+            ['operation-lazy-a', 'runArtifactCommand', 'verify'],
+            ['operation-lazy-a', 'runArtifactCommand', 'commit'],
+            ['operation-lazy-a', 'runArtifactCommand', 'rollback'],
+            ['operation-lazy-b', 'runArtifactCommand', 'verify'],
+        ],
+    );
+});
+
+test('sanitizes resolver failures and never attempts a remote call', async () => {
+    const secret = 'resolver-database-password';
+    const resolverCalls = [];
+    const executor = new L2tpRemoteExecutor({
+        async transportResolver(request) {
+            resolverCalls.push(request);
+            throw new Error(`lookup failed with ${secret}`);
+        },
+    });
+    const operation = { id: 'operation-unavailable', node: 'relay-unavailable' };
+
+    for (const action of [
+        () => executor.executeStep({ operation, step: { type: 'verify' } }),
+        () => executor.rollback({ operation }),
+    ]) {
+        await assert.rejects(
+            action(),
+            error => {
+                assert.equal(error.name, 'L2tpRemoteExecutorError');
+                assert.equal(error.code, 'NODE_EXECUTION_UNAVAILABLE');
+                assert.equal(error.message, 'Node execution is unavailable');
+                assert.equal(Object.hasOwn(error, 'cause'), false);
+                assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+                return true;
+            },
+        );
+    }
+
+    assert.deepEqual(resolverCalls, [{
+        operationId: 'operation-unavailable',
+        nodeId: 'relay-unavailable',
+    }]);
+});

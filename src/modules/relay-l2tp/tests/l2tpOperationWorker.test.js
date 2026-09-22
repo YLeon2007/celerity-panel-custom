@@ -1145,3 +1145,32 @@ test('does not execute an operation twice after it has been claimed and complete
     assert.deepEqual(second, { claimed: false });
     assert.equal(executions, 1);
 });
+
+test('releases the per-operation execution transport after a claimed operation finishes', async () => {
+    const releases = [];
+    const operation = {
+        id: 'operation-release-transport',
+        node: 'node-release-transport',
+        status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    };
+    const operationRepository = createOperationRepository([operation]);
+    const worker = createWorker(operationRepository, {
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep() {},
+            releaseOperation(claimedOperation) {
+                releases.push(claimedOperation);
+            },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.status, 'succeeded');
+    assert.equal(releases.length, 1);
+    assert.strictEqual(releases[0], operationRepository.operations[0]);
+});

@@ -215,6 +215,33 @@ test('construction does not access local files or open network clients or server
     assert.deepEqual(calls, []);
 });
 
+test('composes an injected lazy transport resolver and materializer without resolving transport', () => {
+    const dependencies = createDependencies();
+    const resolverCalls = [];
+    const transportResolver = async request => {
+        resolverCalls.push(request);
+        return {
+            async uploadRootFile() {},
+            async runArtifactCommand() {},
+        };
+    };
+    const operationMaterializer = async () => ({
+        persistedPlan: { steps: [] },
+        remoteArtifacts: [],
+    });
+    delete dependencies.transport;
+    dependencies.transportResolver = transportResolver;
+    dependencies.operationMaterializer = operationMaterializer;
+
+    const runtime = createL2tpRuntime(dependencies);
+
+    assert.deepEqual(resolverCalls, []);
+    assert.strictEqual(runtime.worker.executor.transportResolver, transportResolver);
+    assert.strictEqual(runtime.worker.operationMaterializer, operationMaterializer);
+    assert.strictEqual(runtime.service.operationMaterializer, operationMaterializer);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(runtime.worker.executor, 'transportResolver'), false);
+});
+
 test('rejects every missing explicit runtime dependency before composition', () => {
     assert.throws(
         () => createL2tpRuntime(),

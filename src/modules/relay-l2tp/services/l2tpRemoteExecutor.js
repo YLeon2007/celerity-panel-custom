@@ -120,9 +120,71 @@ async function runArtifactCommand(transport, request) {
     }
 }
 
+function entityId(entity) {
+    const value = entity !== null && typeof entity === 'object'
+        ? entity._id ?? entity.id ?? entity.nodeId
+        : entity;
+    return value === null || value === undefined ? null : String(value);
+}
+
+function nodeExecutionUnavailableError() {
+    return new L2tpRemoteExecutorError(
+        'NODE_EXECUTION_UNAVAILABLE',
+        'Node execution is unavailable',
+    );
+}
+
 class L2tpRemoteExecutor {
-    constructor({ transport }) {
-        this.transport = transport;
+    #transportPromises = new Map();
+
+    constructor({ transport, transportResolver } = {}) {
+        const hasTransport = transport !== undefined && transport !== null;
+        const hasTransportResolver = typeof transportResolver === 'function';
+        if (hasTransport === hasTransportResolver) {
+            throw new TypeError('L2tpRemoteExecutor requires exactly one transport or transportResolver');
+        }
+        this.transport = hasTransport ? transport : null;
+        Object.defineProperty(this, 'transportResolver', {
+            value: hasTransportResolver ? transportResolver : null,
+            enumerable: false,
+            writable: false,
+            configurable: false,
+        });
+    }
+
+    async resolveTransport(operation) {
+        if (this.transport) return this.transport;
+
+        const operationId = String(operation._id ?? operation.id);
+        if (!this.#transportPromises.has(operationId)) {
+            const resolution = Promise.resolve()
+                .then(() => this.transportResolver({
+                    operationId,
+                    nodeId: entityId(operation.node),
+                }))
+                .then(transport => {
+                    if (
+                        !transport
+                        || typeof transport.uploadRootFile !== 'function'
+                        || typeof transport.runArtifactCommand !== 'function'
+                    ) {
+                        throw new TypeError('Invalid L2TP node transport');
+                    }
+                    return transport;
+                })
+                .catch(() => {
+                    throw nodeExecutionUnavailableError();
+                });
+            this.#transportPromises.set(operationId, resolution);
+        }
+        return this.#transportPromises.get(operationId);
+    }
+
+    releaseOperation(operation) {
+        if (!this.transport) {
+            const operationId = String(operation._id ?? operation.id);
+            this.#transportPromises.delete(operationId);
+        }
     }
 
     async executeStep({ operation, step }) {
@@ -142,9 +204,10 @@ class L2tpRemoteExecutor {
 
         const operationId = String(operation._id ?? operation.id);
         const artifacts = validatedArtifacts(step);
+        const transport = await this.resolveTransport(operation);
 
         for (const artifact of artifacts) {
-            await uploadRootFile(this.transport, {
+            await uploadRootFile(transport, {
                 operationId,
                 type: artifact.type,
                 path: artifact.path,
@@ -155,7 +218,7 @@ class L2tpRemoteExecutor {
             });
         }
 
-        await runArtifactCommand(this.transport, {
+        await runArtifactCommand(transport, {
             operationId,
             command,
         });
@@ -169,8 +232,9 @@ class L2tpRemoteExecutor {
 
     async rollback({ operation }) {
         const operationId = String(operation._id ?? operation.id);
+        const transport = await this.resolveTransport(operation);
 
-        await runArtifactCommand(this.transport, {
+        await runArtifactCommand(transport, {
             operationId,
             command: 'rollback',
         });

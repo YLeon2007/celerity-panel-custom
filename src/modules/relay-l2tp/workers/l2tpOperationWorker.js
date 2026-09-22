@@ -495,6 +495,7 @@ class L2tpOperationWorker {
                 owner: this.workerId,
                 operationId,
             });
+            this.executor.releaseOperation?.(operation);
         }
     }
 }
