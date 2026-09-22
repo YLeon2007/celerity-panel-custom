@@ -410,12 +410,7 @@ running_services=$("${compose[@]}" ps --status running --services "$CELERITY_APP
     || fail 'backend health validation failed'
 [[ "$running_services" == "$CELERITY_APP_SERVICE" ]] \
     || fail 'backend is not reported running after rollback'
-if ! curl \
-    --fail \
-    --silent \
-    --show-error \
-    --max-time 10 \
-    "https://$CELERITY_TEST_HOST/health" >/dev/null; then
+if ! wait_for_public_https_health; then
     fail 'public HTTPS health validation failed'
 fi
 verify_untouched_service_states

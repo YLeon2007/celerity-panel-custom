@@ -7,10 +7,32 @@ readonly CELERITY_INSTALL_ROOT='/opt/hysteria-panel'
 readonly CELERITY_BACKUP_ROOT='/opt/hysteria-panel-test-backups'
 readonly CELERITY_COMPOSE_FILE='docker-compose.yml'
 readonly CELERITY_APP_SERVICE='backend'
+readonly CELERITY_PUBLIC_HEALTH_MAX_ATTEMPTS=5
+readonly CELERITY_PUBLIC_HEALTH_RETRY_DELAY_SECONDS=2
 
 fail() {
     printf 'staging control refused: %s\n' "$1" >&2
     exit 64
+}
+
+wait_for_public_https_health() {
+    local attempt
+
+    for ((attempt = 1; attempt <= CELERITY_PUBLIC_HEALTH_MAX_ATTEMPTS; attempt++)); do
+        if curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 10 \
+            "https://$CELERITY_TEST_HOST/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        if ((attempt < CELERITY_PUBLIC_HEALTH_MAX_ATTEMPTS)) \
+            && [[ ${CELERITY_STAGING_TEST_MODE-} != '1' ]]; then
+            sleep "$CELERITY_PUBLIC_HEALTH_RETRY_DELAY_SECONDS"
+        fi
+    done
+    return 1
 }
 
 require_test_target() {

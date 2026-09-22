@@ -57,6 +57,7 @@ function createMinimalPrecheckFixture() {
     const mockBin = path.join(root, 'mock-bin');
     const dockerLog = path.join(root, 'docker.log');
     const commandLog = path.join(root, 'commands.log');
+    const curlAttemptFile = path.join(root, 'curl-attempts');
     const dockerState = path.join(root, 'docker-state');
     const untouchedServices = ['mongo', 'redis', 'caddy', 'updater'];
     const untouchedState = Object.fromEntries(untouchedServices.map((service, index) => [service, {
@@ -208,7 +209,23 @@ function createMinimalPrecheckFixture() {
         '[ "$4" = "--max-time" ] || exit 98',
         '[ "$5" = "10" ] || exit 98',
         '[ "$6" = "https://test.infograd.online/health" ] || exit 98',
+        'attempt=0',
+        '[ ! -f "$MOCK_CURL_ATTEMPT_FILE" ] || attempt=$(cat "$MOCK_CURL_ATTEMPT_FILE")',
+        'attempt=$((attempt + 1))',
+        'printf "%s\\n" "$attempt" > "$MOCK_CURL_ATTEMPT_FILE"',
+        '[ -z "${MOCK_CURL_STDOUT:-}" ] || printf "%s\\n" "$MOCK_CURL_STDOUT"',
+        '[ -z "${MOCK_CURL_STDERR:-}" ] || printf "%s\\n" "$MOCK_CURL_STDERR" >&2',
+        'if [ "$attempt" -le "${MOCK_CURL_FAILS_BEFORE_SUCCESS:-0}" ]; then',
+        '  exit 22',
+        'fi',
         'exit "${MOCK_CURL_EXIT:-0}"',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    const sleepMock = path.join(mockBin, 'sleep');
+    fs.writeFileSync(sleepMock, [
+        '#!/bin/sh',
+        'printf "sleep %s\\n" "$*" >> "$MOCK_COMMAND_LOG"',
+        'exit 99',
         '',
     ].join('\n'), { mode: 0o755 });
     const rsyncMock = path.join(mockBin, 'rsync');
@@ -229,6 +246,7 @@ function createMinimalPrecheckFixture() {
         configRef,
         dockerLog,
         commandLog,
+        curlAttemptFile,
         dockerState,
         untouchedServices,
         untouchedState,
@@ -236,6 +254,7 @@ function createMinimalPrecheckFixture() {
             PATH: `${mockBin}:${process.env.PATH}`,
             MOCK_DOCKER_LOG: dockerLog,
             MOCK_COMMAND_LOG: commandLog,
+            MOCK_CURL_ATTEMPT_FILE: curlAttemptFile,
             MOCK_DOCKER_STATE: dockerState,
             MOCK_REAL_RSYNC: realRsync,
             MOCK_REQUIRE_SERVICE_ENV: '1',
@@ -922,6 +941,31 @@ test('deploy checks public HTTPS health with fixed curl semantics after backend 
     }
 });
 
+test('deploy retries a transient public HTTPS 502 without sleeping in test mode', () => {
+    const fixture = createDeployExecuteFixture();
+    const healthOutputCanary = 'transient-health-response-must-not-appear';
+    const expectedCurl = 'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health';
+    try {
+        const result = run(deployScript, fixture.deployArgs, {
+            env: {
+                ...fixture.deployEnv,
+                MOCK_CURL_FAILS_BEFORE_SUCCESS: '1',
+                MOCK_CURL_STDOUT: healthOutputCanary,
+                MOCK_CURL_STDERR: healthOutputCanary,
+            },
+        });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /deploy ok/);
+        assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(healthOutputCanary));
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        assert.deepEqual(calls.filter(call => call.startsWith('curl ')), [expectedCurl, expectedCurl]);
+        assert.equal(calls.some(call => call.startsWith('sleep ')), false, 'test mode must skip retry sleeps');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
 test('deploy snapshots and rechecks untouched container identities and restart counts', () => {
     const fixture = createDeployExecuteFixture();
     try {
@@ -1032,17 +1076,27 @@ test('deploy fails closed unless the running service result is exactly backend',
     }
 });
 
-test('deploy fails closed when the public HTTPS health request fails', () => {
+test('deploy fails closed after the bounded public HTTPS health attempts', () => {
     const fixture = createDeployExecuteFixture();
+    const healthOutputCanary = 'failed-health-response-must-not-appear';
+    const expectedCurl = 'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health';
     try {
         const result = run(deployScript, fixture.deployArgs, {
-            env: { ...fixture.deployEnv, MOCK_CURL_EXIT: '22' },
+            env: {
+                ...fixture.deployEnv,
+                MOCK_CURL_EXIT: '22',
+                MOCK_CURL_STDOUT: healthOutputCanary,
+                MOCK_CURL_STDERR: healthOutputCanary,
+            },
         });
 
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, /public HTTPS health validation failed/);
         assert.doesNotMatch(result.stdout, /deploy ok/);
         const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        assert.deepEqual(calls.filter(call => call.startsWith('curl ')), Array(5).fill(expectedCurl));
+        assert.equal(calls.some(call => call.startsWith('sleep ')), false, 'test mode must skip retry sleeps');
+        assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(healthOutputCanary));
         for (const service of fixture.untouchedServices) {
             const psSuffix = ` ps --status running --quiet ${service}`;
             assert.equal(
@@ -1299,17 +1353,49 @@ test('rollback rejects symlinked retained Git metadata before source restoration
     }
 });
 
+test('rollback retries a transient public HTTPS 502 without sleeping in test mode', () => {
+    const fixture = createRollbackFixture();
+    const healthOutputCanary = 'rollback-health-response-must-not-appear';
+    const expectedCurl = 'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health';
+    try {
+        prepareRollbackInstall(fixture);
+        const result = run(rollbackScript, fixture.args(['--execute', 'true']), {
+            env: {
+                ...fixture.rollbackEnv,
+                MOCK_CURL_FAILS_BEFORE_SUCCESS: '1',
+                MOCK_CURL_STDOUT: healthOutputCanary,
+                MOCK_CURL_STDERR: healthOutputCanary,
+            },
+        });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /rollback ok/);
+        assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(healthOutputCanary));
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        assert.deepEqual(calls.filter(call => call.startsWith('curl ')), [expectedCurl, expectedCurl]);
+        assert.equal(calls.some(call => call.startsWith('sleep ')), false, 'test mode must skip retry sleeps');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
 test('rollback fails closed when public health or an untouched container check fails', () => {
     const cases = [
         {
             name: 'public health',
-            env: { MOCK_CURL_EXIT: '22' },
+            env: {
+                MOCK_CURL_EXIT: '22',
+                MOCK_CURL_STDOUT: 'health-response-must-not-appear',
+                MOCK_CURL_STDERR: 'health-response-must-not-appear',
+            },
             expected: /public HTTPS health validation failed/,
+            expectedCurlAttempts: 5,
         },
         {
             name: 'untouched container identity',
             env: { MOCK_MUTATE_SERVICE: 'mongo', MOCK_AFTER_ID: 'f'.repeat(64) },
             expected: /untouched service mongo container identity changed/,
+            expectedCurlAttempts: 1,
         },
     ];
     for (const testCase of cases) {
@@ -1323,6 +1409,13 @@ test('rollback fails closed when public health or an untouched container check f
             assert.match(result.stderr, testCase.expected);
             assert.doesNotMatch(result.stdout, /rollback ok/);
             assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
+            const calls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+            assert.equal(
+                calls.filter(call => call.startsWith('curl ')).length,
+                testCase.expectedCurlAttempts,
+                `${testCase.name} curl attempts`,
+            );
+            assert.equal(calls.some(call => call.startsWith('sleep ')), false, 'test mode must skip retry sleeps');
         } finally {
             fixture.cleanup();
         }
