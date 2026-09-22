@@ -4,26 +4,108 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
-const { L2tpNodeTransport } = require('../relay-l2tp/services/l2tpNodeTransport');
+const { createL2tpRuntime } = require('../relay-l2tp/runtime/createL2tpRuntime');
+const { materializeInstallOperation } = require('../relay-l2tp/services/l2tpOperationMaterializer');
+const { L2tpRemoteExecutor } = require('../relay-l2tp/services/l2tpRemoteExecutor');
+const { NodeOperationLockRepository } = require('../relay-l2tp/services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../relay-l2tp/services/nodeOperationLockService');
+const { L2tpOperationWorker } = require('../relay-l2tp/workers/l2tpOperationWorker');
 
 function passThrough(req, res, next) {
     next();
 }
 
-function createHost(overrides = {}) {
-    const models = overrides.models || {
-        RelayL2tpState: { modelName: 'RelayL2tpState' },
+function queryResult(result, calls, kind) {
+    return {
+        select(fields) {
+            calls.push({ kind: `${kind}.select`, fields });
+            return this;
+        },
+        lean() {
+            calls.push({ kind: `${kind}.lean` });
+            return Promise.resolve(result);
+        },
+    };
+}
+
+function createActiveHost(overrides = {}) {
+    const calls = [];
+    const runtimeCalls = [];
+    let scheduledTick;
+    const executionNode = {
+        _id: 'node-a',
+        name: 'Relay A',
+        ip: '192.0.2.10',
+        type: 'xray',
+        active: true,
+        cascadeRole: 'relay',
+        ssh: {
+            port: 22,
+            username: 'root',
+            privateKey: 'encrypted-private-key',
+        },
+    };
+    const executionState = {
+        node: 'node-a',
+        desiredState: 'installed',
+        secretRevision: 7,
+        pskEncrypted: 'sealed-psk',
+    };
+    const HyNode = {
+        findById(nodeId) {
+            calls.push({ kind: 'HyNode.findById', nodeId });
+            return queryResult(executionNode, calls, 'HyNode');
+        },
+    };
+    const RelayL2tpState = {
+        findOne(filter) {
+            calls.push({ kind: 'RelayL2tpState.findOne', filter });
+            return queryResult(executionState, calls, 'RelayL2tpState');
+        },
+    };
+    const models = {
+        RelayL2tpState,
         CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
         CascadeTopologyState: { modelName: 'CascadeTopologyState' },
         L2tpOperation: { modelName: 'L2tpOperation' },
         NodeOperationLock: { modelName: 'NodeOperationLock' },
     };
-    const runtimeCalls = [];
-    const runtime = overrides.runtime || {
-        service: { kind: 'service' },
-        worker: { async runOnce() {} },
-        router: { kind: 'router' },
+
+    class FakeNodeSSH {
+        constructor(node) {
+            this.node = node;
+            calls.push({ kind: 'NodeSSH.construct', node });
+        }
+
+        async exec(command, options) {
+            calls.push({ kind: 'NodeSSH.exec', command, options });
+            return { code: 0, stdout: '', stderr: '' };
+        }
+    }
+
+    const timer = {
+        setInterval(callback, intervalMs) {
+            calls.push({ kind: 'timer.setInterval', intervalMs });
+            scheduledTick = callback;
+            return { kind: 'schedule' };
+        },
+        clearInterval(schedule) {
+            calls.push({ kind: 'timer.clearInterval', schedule });
+        },
+    };
+    const secretBox = {
+        encrypt() {
+            throw new Error('not used by execution');
+        },
+        decrypt(envelope, key) {
+            calls.push({ kind: 'secretBox.decrypt', envelope, key });
+            return 'resolved-psk';
+        },
+    };
+    const adapters = {
+        nodeRepository: { kind: 'node-repository' },
+        stateRepository: { kind: 'state-repository' },
+        operationRepository: { kind: 'operation-repository' },
     };
 
     const host = createL2tpPanelHost({
@@ -33,272 +115,135 @@ function createHost(overrides = {}) {
         rateLimiter: passThrough,
         renderPage() {},
         moduleEntry: { registerModels: () => models },
-        HyNode: { modelName: 'HyNode' },
-        CascadeLink: { modelName: 'CascadeLink' },
+        HyNode,
+        CascadeLink: {},
         topologyRuntime: {},
         Repository: class FakeRepository {},
-        createRepositoryAdapters: () => ({
-            nodeRepository: { kind: 'node-repository' },
-            stateRepository: { kind: 'state-repository' },
-            operationRepository: { kind: 'operation-repository' },
-        }),
+        createRepositoryAdapters: () => adapters,
         createPanelOverviewLoader: () => async () => ({}),
-        secretResolver: async () => ({ psk: 'fixture-value' }),
+        workerLifecycle: {
+            enabled: true,
+            intervalMs: 2_500,
+            timer,
+            logger: { error() {} },
+        },
+        NodeSSH: FakeNodeSSH,
+        preflightRunner: async () => ({ ok: true, checks: [] }),
+        operationMaterializer: materializeInstallOperation,
+        secretBox,
+        secretKey: 'execution-secret-key',
         createRuntime(dependencies) {
             runtimeCalls.push(dependencies);
-            return runtime;
+            return createL2tpRuntime(dependencies);
         },
         ...overrides,
-        models: undefined,
-        runtime: undefined,
     });
 
-    return { host, models, runtime, runtimeCalls };
+    return {
+        calls,
+        getScheduledTick: () => scheduledTick,
+        host,
+        runtimeCalls,
+    };
 }
 
-test('uses the dormant path unless activation is the literal boolean true and complete', async () => {
-    for (const workerLifecycle of [
-        undefined,
-        { enabled: false },
-        { enabled: 'true' },
-        { enabled: 1 },
-        { enabled: true },
-    ]) {
-        const constructions = [];
-        const preflightRunner = async () => ({ ok: true });
-        const artifactMaterializer = async () => [];
-        const options = {
-            workerLifecycle,
-            createTransportFactory() {
-                constructions.push({ kind: 'transport-factory' });
-                throw new Error('transport factory must remain dormant');
-            },
-            nodeSSHFactory(node) {
-                constructions.push({ kind: 'ssh', node });
-                return { node };
-            },
-            NodeTransport: class FakeNodeTransport {
-                constructor(dependencies) {
-                    constructions.push({ kind: 'transport', dependencies });
-                }
-            },
-            NodeOperationLockService: class FakeLockService {
-                constructor(dependencies) {
-                    constructions.push({ kind: 'lock-service', dependencies });
-                }
-            },
-            NodeOperationLockRepository: class FakeLockRepository {
-                constructor(dependencies) {
-                    constructions.push({ kind: 'lock-repository', dependencies });
-                }
-            },
-            preflightRunner,
-            ...(workerLifecycle?.enabled === true ? {} : { artifactMaterializer }),
-            createWorkerLifecycle(dependencies) {
-                constructions.push({ kind: 'lifecycle', dependencies });
-                return {
-                    start() { constructions.push({ kind: 'start' }); },
-                    async stop() { constructions.push({ kind: 'stop' }); },
-                };
-            },
-        };
-        const { host, runtimeCalls } = createHost(options);
+test('explicit complete activation wires the real runtime lazily and starts only on request', async () => {
+    const { calls, getScheduledTick, host, runtimeCalls } = createActiveHost();
 
-        assert.equal(runtimeCalls.length, 1);
-        assert.notStrictEqual(runtimeCalls[0].preflightRunner, preflightRunner);
-        assert.equal(runtimeCalls[0].artifactMaterializer, undefined);
-        assert.equal(runtimeCalls[0].transportFactory, undefined);
-        assert.equal(typeof runtimeCalls[0].transport.uploadRootFile, 'function');
-        assert.equal(constructions.length, 0);
-        assert.deepEqual(host.start(), {
-            enabled: false,
-            running: false,
-            inFlight: false,
-        });
-        assert.deepEqual(await host.stop(), {
-            enabled: false,
-            running: false,
-            inFlight: false,
-        });
-        assert.equal(constructions.length, 0);
-    }
-});
-
-test('explicit complete activation composes lock service and a typed transport factory', () => {
-    const constructions = [];
-    const clock = { now: () => new Date('2026-09-22T12:00:00.000Z') };
-    const preflightRunner = async () => ({ ok: true });
-    const artifactMaterializer = async () => [];
-    const workerLifecycle = {
-        enabled: true,
-        intervalMs: 2_500,
-        timer: { setInterval() {}, clearInterval() {} },
-        logger: { error() {} },
-    };
-
-    class FakeLockRepository {
-        constructor(dependencies) {
-            this.kind = 'lock-repository';
-            constructions.push({ kind: 'lock-repository', dependencies, instance: this });
-        }
-    }
-    class FakeLockService {
-        constructor(dependencies) {
-            this.kind = 'lock-service';
-            constructions.push({ kind: 'lock-service', dependencies, instance: this });
-        }
-    }
-    class FakeNodeTransport {
-        constructor(dependencies) {
-            this.kind = 'node-transport';
-            constructions.push({ kind: 'node-transport', dependencies, instance: this });
-        }
-    }
-    function nodeSSHFactory(node) {
-        const nodeSSH = { kind: 'node-ssh', node };
-        constructions.push({ kind: 'node-ssh', node, instance: nodeSSH });
-        return nodeSSH;
-    }
-
-    const { host, models, runtime, runtimeCalls } = createHost({
-        clock,
-        workerLifecycle,
-        preflightRunner,
-        artifactMaterializer,
-        nodeSSHFactory,
-        NodeTransport: FakeNodeTransport,
-        NodeOperationLockService: FakeLockService,
-        NodeOperationLockRepository: FakeLockRepository,
-        createTransportFactory(dependencies) {
-            constructions.push({ kind: 'transport-factory', dependencies });
-            return node => new dependencies.NodeTransport({
-                nodeSSH: dependencies.nodeSSHFactory(node),
-            });
-        },
-        createWorkerLifecycle(dependencies) {
-            constructions.push({ kind: 'lifecycle', dependencies });
-            return {
-                start() {
-                    constructions.push({ kind: 'start' });
-                    return {
-                        enabled: true,
-                        running: true,
-                        inFlight: false,
-                        privateKey: 'lifecycle-start-secret',
-                    };
-                },
-                async stop() {
-                    constructions.push({ kind: 'stop' });
-                    return {
-                        enabled: true,
-                        running: false,
-                        inFlight: false,
-                        privateKey: 'lifecycle-stop-secret',
-                    };
-                },
-            };
-        },
-    });
-
+    assert.equal(runtimeCalls.length, 1);
     assert.deepEqual(
-        constructions.map(construction => construction.kind),
-        ['lock-repository', 'lock-service', 'transport-factory', 'lifecycle'],
+        Object.keys(runtimeCalls[0]).filter(key => [
+            'transport',
+            'transportFactory',
+            'transportResolver',
+            'artifactMaterializer',
+            'operationMaterializer',
+            'secretResolver',
+        ].includes(key)),
+        ['transportResolver', 'operationMaterializer', 'secretResolver'],
     );
-    assert.strictEqual(constructions[0].dependencies.model, models.NodeOperationLock);
-    assert.strictEqual(constructions[1].dependencies.repository, constructions[0].instance);
-    assert.strictEqual(constructions[1].dependencies.clock, clock);
-    assert.strictEqual(constructions[2].dependencies.nodeSSHFactory, nodeSSHFactory);
-    assert.strictEqual(constructions[2].dependencies.NodeTransport, FakeNodeTransport);
-    assert.strictEqual(runtimeCalls[0].operationModel, models.L2tpOperation);
-    assert.strictEqual(runtimeCalls[0].preflightRunner, preflightRunner);
-    assert.strictEqual(runtimeCalls[0].artifactMaterializer, artifactMaterializer);
-    assert.strictEqual(runtimeCalls[0].lockService, constructions[1].instance);
-    assert.equal(runtimeCalls[0].transport, undefined);
-    assert.equal(typeof runtimeCalls[0].transportFactory, 'function');
-    assert.strictEqual(constructions[3].dependencies.worker, runtime.worker);
-    assert.deepEqual(constructions[3].dependencies, {
-        ...workerLifecycle,
-        worker: runtime.worker,
-    });
-
-    const operation = { id: 'operation-a', node: 'node-a' };
-    const firstTransport = runtimeCalls[0].transportFactory(operation.node);
-
-    assert.equal(firstTransport.kind, 'node-transport');
-    assert.deepEqual(
-        constructions.slice(4).map(construction => construction.kind),
-        ['node-ssh', 'node-transport'],
+    assert.ok(host.runtime.worker instanceof L2tpOperationWorker);
+    assert.ok(host.runtime.worker.executor instanceof L2tpRemoteExecutor);
+    assert.ok(host.runtime.worker.lockService instanceof NodeOperationLockService);
+    assert.ok(host.runtime.worker.lockService.repository instanceof NodeOperationLockRepository);
+    assert.strictEqual(runtimeCalls[0].operationMaterializer, materializeInstallOperation);
+    assert.deepEqual(calls, []);
+    assert.equal(getScheduledTick(), undefined);
+    assert.equal(
+        Object.prototype.propertyIsEnumerable.call(host.runtime.worker, 'secretResolver'),
+        false,
     );
-    assert.equal(constructions[4].node, operation.node);
-    assert.strictEqual(constructions[5].dependencies.nodeSSH, constructions[4].instance);
+    assert.doesNotMatch(JSON.stringify(host.runtime), /execution-secret-key|resolved-psk|sealed-psk/);
+
     assert.deepEqual(host.start(), {
         enabled: true,
         running: true,
         inFlight: false,
     });
-    assert.deepEqual(constructions.slice(6), [{ kind: 'start' }]);
+    assert.deepEqual(calls, [{ kind: 'timer.setInterval', intervalMs: 2_500 }]);
+    assert.equal(typeof getScheduledTick(), 'function');
+
+    const secrets = await host.runtime.worker.secretResolver({
+        kind: 'install',
+        node: 'node-a',
+        credentialRevision: 7,
+        secret: 'psk',
+    });
+    assert.deepEqual(secrets, { psk: 'resolved-psk' });
+    assert.deepEqual(
+        calls.map(call => call.kind),
+        [
+            'timer.setInterval',
+            'RelayL2tpState.findOne',
+            'RelayL2tpState.select',
+            'RelayL2tpState.lean',
+            'secretBox.decrypt',
+        ],
+    );
+
+    await host.runtime.worker.executor.executeStep({
+        operation: { _id: 'operation-a', node: 'node-a' },
+        step: { type: 'commit' },
+    });
+
+    assert.deepEqual(
+        calls.map(call => call.kind),
+        [
+            'timer.setInterval',
+            'RelayL2tpState.findOne',
+            'RelayL2tpState.select',
+            'RelayL2tpState.lean',
+            'secretBox.decrypt',
+            'HyNode.findById',
+            'HyNode.select',
+            'HyNode.lean',
+            'NodeSSH.construct',
+            'NodeSSH.exec',
+        ],
+    );
+    assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 1);
+    assert.equal(calls.find(call => call.kind === 'HyNode.findById').nodeId, 'node-a');
 });
 
-test('active stop remains explicit and returns a safe lifecycle summary', async () => {
-    const lifecycleCalls = [];
-    const { host } = createHost({
-        workerLifecycle: { enabled: true },
-        preflightRunner: async () => ({ ok: true }),
-        artifactMaterializer: async () => [],
-        nodeSSHFactory: () => ({}),
-        NodeTransport: class FakeNodeTransport {},
-        NodeOperationLockRepository: class FakeLockRepository {},
-        NodeOperationLockService: class FakeLockService {},
-        createTransportFactory: () => () => ({}),
-        createWorkerLifecycle() {
-            return {
-                start() {
-                    lifecycleCalls.push('start');
-                    return { enabled: true, running: true, inFlight: false };
-                },
-                async stop() {
-                    lifecycleCalls.push('stop');
-                    return {
-                        enabled: true,
-                        running: false,
-                        inFlight: false,
-                        privateKey: 'lifecycle-stop-secret',
-                    };
-                },
-            };
-        },
-    });
+test('incomplete or non-boolean activation remains dormant without execution side effects', async () => {
+    for (const overrides of [
+        { secretKey: undefined },
+        { workerLifecycle: { enabled: 'true' } },
+    ]) {
+        const { calls, getScheduledTick, host } = createActiveHost(overrides);
 
-    assert.deepEqual(lifecycleCalls, []);
-    assert.deepEqual(await host.stop(), {
-        enabled: true,
-        running: false,
-        inFlight: false,
-    });
-    assert.deepEqual(lifecycleCalls, ['stop']);
-});
-
-test('complete activation is production-wirable with the concrete component defaults', () => {
-    const nodeSSH = { async exec() {} };
-    const preflightRunner = async () => ({ ok: true });
-    const artifactMaterializer = async () => [];
-    const { runtimeCalls } = createHost({
-        workerLifecycle: {
-            enabled: true,
-            intervalMs: 1_000,
-            timer: { setInterval() { return {}; }, clearInterval() {} },
-            logger: { error() {} },
-        },
-        nodeSSHFactory: () => nodeSSH,
-        preflightRunner,
-        artifactMaterializer,
-    });
-
-    assert.equal(runtimeCalls.length, 1);
-    assert.strictEqual(runtimeCalls[0].preflightRunner, preflightRunner);
-    assert.strictEqual(runtimeCalls[0].artifactMaterializer, artifactMaterializer);
-    assert.ok(runtimeCalls[0].lockService instanceof NodeOperationLockService);
-    const transport = runtimeCalls[0].transportFactory('node-default');
-    assert.ok(transport instanceof L2tpNodeTransport);
-    assert.strictEqual(transport.nodeSSH, nodeSSH);
+        assert.deepEqual(calls, []);
+        assert.equal(getScheduledTick(), undefined);
+        assert.deepEqual(host.start(), {
+            enabled: false,
+            running: false,
+            inFlight: false,
+        });
+        assert.deepEqual(calls, []);
+        await assert.rejects(
+            host.runtime.worker.secretResolver({ kind: 'install' }),
+            error => error?.code === 'L2TP_SECRET_RESOLVER_UNAVAILABLE',
+        );
+        assert.deepEqual(calls, []);
+    }
 });
