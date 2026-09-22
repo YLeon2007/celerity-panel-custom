@@ -16,7 +16,7 @@ module.exports = {
 2. Добавить ноду через \`POST /nodes\`, затем настроить её через \`POST /nodes/{id}/setup\`.
 3. Получить общую статистику через \`GET /stats\` и статус ноды через \`GET /nodes/{id}/status\`.
 4. Отключить истёкшего пользователя через \`POST /users/{userId}/disable\` и очистить устройства через \`DELETE /users/{userId}/devices\`.
-5. Собрать multi-hop маршрут через \`POST /cascade/links\`, затем развернуть цепочку через \`POST /cascade/chain/deploy\`.
+5. Собрать версионированную multi-hop топологию через \`POST /cascade/links\`. Для развёртывания используется \`POST /cascade/topology/deploy\` с точной ревизией черновика; граница остаётся закрытой, пока не зарегистрированы типизированные исполнители нод.
 6. Объединить несколько реальных нод в один авто-балансировщик через \`POST /nodes\` (\`type=virtual\`); HAPP/Xray-core клиенты получат Xray balancer + observatory профиль, sing-box/Clash — \`urltest\`/\`url-test\` группу.
 7. Автоматизировать действия панели через MCP: \`POST /mcp\` и \`tools/list\`.
 
@@ -279,27 +279,23 @@ JSON-эндпоинты возвращают ошибки в таком форм
             },
             'PUT /cascade/links/{id}': {
                 summary: 'Обновить каскадную связь',
-                description: 'Обновляет параметры каскадного туннеля и при необходимости может запустить redeploy. Требуется скоуп `nodes:write`.',
+                description: 'Обновляет параметры связи в версионированном черновике топологии без скрытого развёртывания. Требуется скоуп `nodes:write`.',
             },
             'DELETE /cascade/links/{id}': {
                 summary: 'Удалить каскадную связь',
-                description: 'Если связь развёрнута, сначала удаляет каскадный конфиг с нод.',
+                description: 'Удаляет связь из версионированного черновика топологии без скрытого развёртывания или снятия конфига.',
             },
             'PATCH /cascade/links/{id}/reconnect': {
                 summary: 'Переподключить каскадную связь',
-                description: 'Меняет входную и/или выходную ноду, при необходимости сначала снимая текущий конфиг.',
-            },
-            'POST /cascade/links/{id}/deploy': {
-                summary: 'Развернуть каскадную связь',
-                description: 'Разворачивает конфиг каскадной связи на обеих нодах. Требуется скоуп `nodes:write`.',
+                description: 'Меняет входную и/или выходную ноду в версионированном черновике без скрытого развёртывания.',
             },
             'POST /cascade/links/{id}/undeploy': {
                 summary: 'Снять каскадную связь',
                 description: 'Удаляет каскадный конфиг с нод для указанной связи. Требуется скоуп `nodes:write`.',
             },
-            'POST /cascade/chain/deploy': {
-                summary: 'Развернуть каскадную цепочку',
-                description: 'Разворачивает всю цепочку, начиная от `nodeId` или от входной стороны `linkId`.',
+            'POST /cascade/topology/deploy': {
+                summary: 'Запросить развёртывание точной ревизии топологии',
+                description: 'Принимает только `expectedTopologyRevision`. Граница возвращает `TOPOLOGY_DEPLOYMENT_UNAVAILABLE`, пока не зарегистрированы типизированные deployer, verifier и restorer нод; fallback на legacy cascade service или сырой SSH отсутствует.',
             },
             'GET /cascade/links/{id}/health': {
                 summary: 'Проверить здоровье каскадной связи',
@@ -445,12 +441,7 @@ JSON-эндпоинты возвращают ошибки в таком форм
             'Invalid link settings': 'Неверные настройки связи',
             'Invalid topology or tunnel settings': 'Неверная топология или настройки туннеля',
             'Invalid reconnect request': 'Неверный запрос переподключения',
-            'Deploy chain after creation': 'Развернуть цепочку после создания',
-            'Deploy failed': 'Развёртывание не удалось',
-            'Deployed': 'Развёрнуто',
             'Undeployed': 'Снято',
-            'Chain deployed': 'Цепочка развёрнута',
-            'Chain deploy failed': 'Развёртывание цепочки не удалось',
             'Health result': 'Результат проверки здоровья',
             'Topology graph': 'Граф топологии',
             'Saved': 'Сохранено',
@@ -485,7 +476,7 @@ JSON-эндпоинты возвращают ошибки в таком форм
             'Xray-specific settings when `type=xray`.': 'Настройки Xray, когда `type=xray`.',
             'Partial node update payload. Any omitted field is left unchanged.': 'Частичное обновление ноды. Пропущенные поля не меняются.',
             'Payload for creating a cascade tunnel between two Xray nodes.': 'Тело запроса для создания каскадного туннеля между двумя Xray нодами.',
-            'Deploy the chain after creating the link.': 'Развернуть цепочку после создания связи.',
+
             'Partial cascade link update payload.': 'Частичное обновление каскадной связи.',
             'Admin session cookie returned by `/api/login`': 'Cookie-сессия администратора, возвращаемая `/api/login`',
             'Authentication error': 'Ошибка аутентификации',

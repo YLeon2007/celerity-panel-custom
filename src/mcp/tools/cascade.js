@@ -160,10 +160,6 @@ async function manageCascade(args, emit) {
             if (!id) throw new Error('id is required for delete');
             const link = await CascadeLink.findById(id);
             if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-            if (link.status === 'active') {
-                emit('progress', { message: 'Undeploying before delete...' });
-                await cascadeService.undeployLink(link).catch(() => {});
-            }
             await CascadeLink.findByIdAndDelete(id);
             await invalidateCascadeCache();
             logger.info(`[MCP] Deleted cascade link ${link.name}`);
@@ -171,20 +167,11 @@ async function manageCascade(args, emit) {
         }
 
         case 'deploy': {
-            if (!id) throw new Error('id is required for deploy');
-            const link = await CascadeLink.findById(id)
-                .populate('portalNode')
-                .populate('bridgeNode');
-            if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-
-            emit('progress', { message: `Deploying cascade link '${link.name}'...` });
-            const result = await cascadeService.deployLink(link);
-
-            if (result.success) {
-                logger.info(`[MCP] Deployed cascade link ${link.name}`);
-                return { success: true, message: `Link '${link.name}' deployed` };
-            }
-            return { success: false, error: result.error };
+            return {
+                success: false,
+                code: 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED',
+                error: 'Use POST /api/cascade/topology/deploy with expectedTopologyRevision',
+            };
         }
 
         case 'undeploy': {
@@ -200,15 +187,11 @@ async function manageCascade(args, emit) {
         }
 
         case 'reconnect': {
-            if (!id) throw new Error('id is required for reconnect');
-            const link = await CascadeLink.findById(id)
-                .populate('portalNode')
-                .populate('bridgeNode');
-            if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-
-            emit('progress', { message: `Reconnecting cascade link '${link.name}'...` });
-            await cascadeService.deployLink(link);
-            return { success: true, message: `Link '${link.name}' reconnection triggered` };
+            return {
+                success: false,
+                code: 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED',
+                error: 'Reconnect the topology draft, then deploy its exact revision',
+            };
         }
 
         default:

@@ -124,6 +124,11 @@ function createTopologyTransferDraftService(dependencies) {
         .createTopologyTransferDraftService(dependencies);
 }
 
+function createTopologyDeploymentService(dependencies) {
+    return require('./services/topologyDeploymentService')
+        .createTopologyDeploymentService(dependencies);
+}
+
 module.exports = {
     manifest,
     validateHost,
@@ -132,4 +137,5 @@ module.exports = {
     registerConfigFragments,
     registerRoutes,
     createTopologyTransferDraftService,
+    createTopologyDeploymentService,
 };

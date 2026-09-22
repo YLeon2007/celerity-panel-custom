@@ -165,7 +165,6 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'], default: 'vless' },
                 tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'], default: 'none' },
                 tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
-                autoDeploy: { type: 'boolean', example: false, description: 'Deploy the chain after creating the link.' },
             },
         },
         CascadeLinkUpdate: {
@@ -181,7 +180,6 @@ the API will clear \`ip\` automatically. When the resulting \`type\` is not virt
                 tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'] },
                 active: { type: 'boolean' },
                 priority: { type: 'integer' },
-                autoRedeploy: { type: 'boolean' },
             },
         },
         McpToolListResponse: {
@@ -478,10 +476,6 @@ function addCommonExamples(target) {
                 devices: [{ hwid: 'abc123', platform: 'Android', lastSeenAt: '2026-05-18T17:00:00.000Z' }],
             },
         },
-        CascadeDeployResponse: {
-            summary: 'Cascade link deployed',
-            value: { success: true, message: 'Cascade link deployed' },
-        },
         CascadeUndeployResponse: {
             summary: 'Cascade link undeployed',
             value: { success: true, message: 'Cascade link undeployed' },
@@ -490,10 +484,7 @@ function addCommonExamples(target) {
             summary: 'Cascade link deleted',
             value: { success: true, message: 'Cascade link deleted' },
         },
-        CascadeChainDeployResponse: {
-            summary: 'Cascade chain deployed',
-            value: { success: true, message: 'Chain deployed: 3 nodes', deployed: 3 },
-        },
+
         NodeStatusResponse: {
             summary: 'Stored node status',
             value: {
@@ -583,9 +574,8 @@ const OPERATION_METADATA = {
     'PUT /cascade/links/{id}': { scopes: ['nodes:write'], requestExample: 'CascadeLinkRequest', responseExample: 'CascadeLinkResponse' },
     'PATCH /cascade/links/{id}/reconnect': { scopes: ['nodes:write'], responseExample: 'CascadeLinkResponse' },
     'DELETE /cascade/links/{id}': { scopes: ['nodes:write'], responseExample: 'CascadeDeleteResponse' },
-    'POST /cascade/links/{id}/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeDeployResponse', skipGenericExamples: true },
+    'POST /cascade/topology/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', skipGenericExamples: true },
     'POST /cascade/links/{id}/undeploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeUndeployResponse', skipGenericExamples: true },
-    'POST /cascade/chain/deploy': { scopes: ['nodes:write'], rateLimit: '10 deploy requests per minute', responseExample: 'CascadeChainDeployResponse', skipGenericExamples: true },
     'GET /cascade/links/{id}/health': { scopes: ['nodes:read'] },
     'GET /cascade/topology': { scopes: ['nodes:read'] },
     'POST /cascade/topology/positions': { scopes: ['nodes:write'], responseExample: 'SuccessResponse' },
@@ -770,7 +760,7 @@ Management API for [C³ CELERITY custom](https://github.com/YLeon2007/celerity-p
 2. Add a node with \`POST /nodes\`, then provision it with \`POST /nodes/{id}/setup\`.
 3. Read panel totals with \`GET /stats\` and node health with \`GET /nodes/{id}/status\`.
 4. Disable an expired user with \`POST /users/{userId}/disable\` and clear devices with \`DELETE /users/{userId}/devices\`.
-5. Build multi-hop routing with \`POST /cascade/links\`, then deploy with \`POST /cascade/chain/deploy\`.
+5. Build a versioned multi-hop topology with \`POST /cascade/links\`. Deployment requests use \`POST /cascade/topology/deploy\` with the exact draft revision; the boundary fails closed until typed node deployment capabilities are registered.
 6. Group several real nodes into a single auto-balancer entry with \`POST /nodes\` (\`type=virtual\`); HAPP/Xray-core clients receive an Xray balancer + observatory profile, sing-box/Clash get a \`urltest\`/\`url-test\` group.
 7. Automate panel actions through MCP using \`POST /mcp\` and \`tools/list\`.
 
@@ -2443,7 +2433,6 @@ See the request body examples panel for both flavours.`,
                                     tunnelProtocol: { type: 'string', enum: ['vless', 'vmess'], default: 'vless' },
                                     tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'], default: 'none' },
                                     tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'], default: 'tcp' },
-                                    autoDeploy: { type: 'boolean', description: 'Deploy chain after creation' },
                                 },
                             },
                         },
@@ -2487,7 +2476,7 @@ See the request body examples panel for both flavours.`,
             delete: {
                 tags: ['Cascade'],
                 summary: 'Delete cascade link',
-                description: 'Undeploys the link first when it is currently deployed/online/offline.',
+                description: 'Deletes the link from the versioned topology draft without a hidden deploy or undeploy side effect.',
                 responses: {
                     200: { description: 'Deleted', content: { 'application/json': { schema: { $ref: '#/components/schemas/Success' } } } },
                     400: { description: 'Invalid link ID' },
@@ -2503,7 +2492,7 @@ See the request body examples panel for both flavours.`,
             patch: {
                 tags: ['Cascade'],
                 summary: 'Reconnect cascade link',
-                description: 'Changes portal and/or bridge node, undeploying first when necessary.',
+                description: 'Changes portal and/or bridge node in the versioned topology draft without a hidden deployment side effect.',
                 requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { portalNodeId: { type: 'string' }, bridgeNodeId: { type: 'string' } } } } } },
                 responses: {
                     200: { description: 'Updated link', content: { 'application/json': { schema: { $ref: '#/components/schemas/CascadeLink' } } } },
@@ -2511,49 +2500,6 @@ See the request body examples panel for both flavours.`,
                     401: { $ref: '#/components/responses/Unauthorized' },
                     403: { $ref: '#/components/responses/Forbidden' },
                     404: { $ref: '#/components/responses/NotFound' },
-                },
-            },
-        },
-
-        '/cascade/links/{id}/deploy': {
-            parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-            post: {
-                tags: ['Cascade'],
-                summary: 'Deploy cascade link',
-                responses: {
-                    200: {
-                        description: 'Deployed',
-                        content: {
-                            'application/json': {
-                                schema: {
-                                    type: 'object',
-                                    properties: {
-                                        success: { type: 'boolean', example: true },
-                                        message: { type: 'string', example: 'Cascade link deployed' },
-                                    },
-                                },
-                            },
-                        },
-                    },
-                    400: { description: 'Invalid link ID' },
-                    401: { $ref: '#/components/responses/Unauthorized' },
-                    403: { $ref: '#/components/responses/Forbidden' },
-                    404: { $ref: '#/components/responses/NotFound' },
-                    429: { $ref: '#/components/responses/RateLimited' },
-                    500: {
-                        description: 'Deploy failed',
-                        content: {
-                            'application/json': {
-                                schema: {
-                                    type: 'object',
-                                    properties: {
-                                        success: { type: 'boolean', example: false },
-                                        error: { type: 'string' },
-                                    },
-                                },
-                            },
-                        },
-                    },
                 },
             },
         },
@@ -2587,29 +2533,106 @@ See the request body examples panel for both flavours.`,
             },
         },
 
-        '/cascade/chain/deploy': {
+        '/cascade/topology/deploy': {
             post: {
                 tags: ['Cascade'],
-                summary: 'Deploy cascade chain',
-                description: 'Deploys the whole chain starting from `nodeId` or from the portal side of `linkId`.',
-                requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { nodeId: { type: 'string' }, linkId: { type: 'string' } } } } } },
+                summary: 'Request a revision-fenced topology deployment',
+                description: 'Accepts exactly `expectedTopologyRevision`. The boundary fails closed with `TOPOLOGY_DEPLOYMENT_UNAVAILABLE` until typed node deployer, verifier, and restorer capabilities are registered; it has no legacy cascade service or raw SSH fallback.',
+                requestBody: {
+                    required: true,
+                    content: {
+                        'application/json': {
+                            schema: {
+                                type: 'object',
+                                additionalProperties: false,
+                                required: ['expectedTopologyRevision'],
+                                properties: {
+                                    expectedTopologyRevision: {
+                                        type: 'integer',
+                                        minimum: 0,
+                                        maximum: Number.MAX_SAFE_INTEGER,
+                                    },
+                                },
+                            },
+                            example: { expectedTopologyRevision: 7 },
+                        },
+                    },
+                },
                 responses: {
-                    200: { description: 'Chain deployed', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, message: { type: 'string' }, deployed: { type: 'integer' } } } } } },
-                    400: { description: '`nodeId` or `linkId` is required' },
-                    401: { $ref: '#/components/responses/Unauthorized' },
-                    403: { $ref: '#/components/responses/Forbidden' },
-                    429: { $ref: '#/components/responses/RateLimited' },
-                    500: {
-                        description: 'Chain deploy failed',
+                    200: {
+                        description: 'Deployment evidence returned only by a registered typed deployment runtime',
                         content: {
                             'application/json': {
                                 schema: {
                                     type: 'object',
+                                    additionalProperties: false,
+                                    required: [
+                                        'operationId',
+                                        'topologyRevision',
+                                        'deployedRevision',
+                                        'nodeEvidence',
+                                    ],
                                     properties: {
-                                        success: { type: 'boolean', example: false },
-                                        deployed: { type: 'integer' },
-                                        errors: { type: 'array', items: { type: 'string' } },
-                                        error: { type: 'string', description: 'Present on unhandled exceptions' },
+                                        operationId: { type: 'string' },
+                                        topologyRevision: { type: 'integer', minimum: 0 },
+                                        deployedRevision: { type: 'integer', minimum: 0 },
+                                        nodeEvidence: {
+                                            type: 'array',
+                                            items: {
+                                                type: 'object',
+                                                additionalProperties: false,
+                                                required: [
+                                                    'nodeId',
+                                                    'deploymentEvidenceId',
+                                                    'verificationEvidenceId',
+                                                ],
+                                                properties: {
+                                                    nodeId: { type: 'string' },
+                                                    deploymentEvidenceId: { type: 'string' },
+                                                    verificationEvidenceId: { type: 'string' },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    400: { description: 'Closed request schema or revision validation failed' },
+                    401: { $ref: '#/components/responses/Unauthorized' },
+                    403: { $ref: '#/components/responses/Forbidden' },
+                    409: { description: 'The requested topology revision is stale' },
+                    422: { description: 'The pinned topology is invalid or cannot be compiled' },
+                    429: { $ref: '#/components/responses/RateLimited' },
+                    500: { description: 'The deployed revision could not be committed' },
+                    502: { description: 'A typed node deployment or verification failed' },
+                    503: {
+                        description: 'Typed topology deployment capabilities are not registered',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    required: ['error'],
+                                    properties: {
+                                        error: {
+                                            type: 'object',
+                                            additionalProperties: false,
+                                            required: ['code', 'message'],
+                                            properties: {
+                                                code: {
+                                                    type: 'string',
+                                                    enum: ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE'],
+                                                },
+                                                message: { type: 'string' },
+                                            },
+                                        },
+                                    },
+                                },
+                                example: {
+                                    error: {
+                                        code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+                                        message: 'Topology deployment capabilities are unavailable',
                                     },
                                 },
                             },

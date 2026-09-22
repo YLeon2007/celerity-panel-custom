@@ -40,34 +40,15 @@ router.use('/links', cascadeLinksRoutes);
 // ==================== DEPLOY / UNDEPLOY ====================
 
 /**
- * POST /cascade/links/:id/deploy — deploy configs to both nodes
+ * POST /cascade/links/:id/deploy — retired unsafe per-link deployment
  */
 router.post('/links/:id/deploy', requireScope('nodes:write'), deployLimiter, async (req, res) => {
-    try {
-        if (!isValidObjectId(req.params.id)) {
-            return res.status(400).json({ error: 'Invalid link ID' });
-        }
-
-        const link = await CascadeLink.findById(req.params.id)
-            .populate('portalNode')
-            .populate('bridgeNode');
-
-        if (!link) return res.status(404).json({ error: 'Cascade link not found' });
-
-        const result = await cascadeService.deployLink(link);
-
-        // Invalidate subscription cache after deploy
-        await invalidateCascadeCache();
-
-        if (result.success) {
-            res.json({ success: true, message: 'Cascade link deployed' });
-        } else {
-            res.status(500).json({ success: false, error: result.error });
-        }
-    } catch (error) {
-        logger.error(`[Cascade API] Deploy error: ${error.message}`);
-        res.status(500).json({ error: error.message });
-    }
+    res.status(410).json({
+        error: {
+            code: 'LEGACY_CASCADE_DEPLOY_DISABLED',
+            message: 'Use POST /api/cascade/topology/deploy with expectedTopologyRevision',
+        },
+    });
 });
 
 /**
@@ -97,52 +78,15 @@ router.post('/links/:id/undeploy', requireScope('nodes:write'), deployLimiter, a
 // ==================== CHAIN DEPLOY ====================
 
 /**
- * POST /cascade/chain/deploy — deploy entire cascade chain in correct order
- * Accepts either nodeId or linkId to identify the chain
+ * POST /cascade/chain/deploy — retired unversioned chain deployment
  */
 router.post('/chain/deploy', requireScope('nodes:write'), deployLimiter, async (req, res) => {
-    try {
-        const { nodeId, linkId } = req.body;
-
-        let startNodeId;
-        if (nodeId) {
-            if (!isValidObjectId(nodeId)) {
-                return res.status(400).json({ error: 'Invalid nodeId' });
-            }
-            startNodeId = nodeId;
-        } else if (linkId) {
-            if (!isValidObjectId(linkId)) {
-                return res.status(400).json({ error: 'Invalid linkId' });
-            }
-            const link = await CascadeLink.findById(linkId);
-            if (!link) return res.status(404).json({ error: 'Link not found' });
-            startNodeId = link.portalNode;
-        } else {
-            return res.status(400).json({ error: 'nodeId or linkId is required' });
-        }
-
-        const result = await cascadeService.deployChain(startNodeId);
-
-        // Invalidate subscription cache after chain deploy
-        await invalidateCascadeCache();
-
-        if (result.success) {
-            res.json({
-                success: true,
-                message: `Chain deployed: ${result.deployed} nodes`,
-                deployed: result.deployed,
-            });
-        } else {
-            res.status(500).json({
-                success: false,
-                deployed: result.deployed,
-                errors: result.errors,
-            });
-        }
-    } catch (error) {
-        logger.error(`[Cascade API] Chain deploy error: ${error.message}`);
-        res.status(500).json({ error: error.message });
-    }
+    res.status(410).json({
+        error: {
+            code: 'LEGACY_CASCADE_DEPLOY_DISABLED',
+            message: 'Use POST /api/cascade/topology/deploy with expectedTopologyRevision',
+        },
+    });
 });
 
 // ==================== HEALTH ====================

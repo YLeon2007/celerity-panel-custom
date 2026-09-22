@@ -14,6 +14,7 @@ const LIFECYCLE_EXPORTS = [
     'registerConfigFragments',
     'registerRoutes',
     'createTopologyTransferDraftService',
+    'createTopologyDeploymentService',
 ];
 
 test('imports the lifecycle entry without loading runtime integrations', () => {
@@ -363,6 +364,35 @@ test('root service factory lazily composes the topology transfer draft service',
     assert.equal(typeof service.exportCurrentTopology, 'function');
     assert.equal(typeof service.importTopologyDraft, 'function');
     assert.deepEqual(calls, [models]);
+});
+
+test('root factories preserve transfer registration and lazily compose deployment', () => {
+    const entry = require('..');
+    assert.equal(typeof entry.createTopologyTransferDraftService, 'function');
+    assert.equal(typeof entry.createTopologyDeploymentService, 'function');
+
+    const dependencies = {
+        SnapshotRepository: class SnapshotRepository {
+            async readDraft() {}
+        },
+        DeploymentRepository: class DeploymentRepository {
+            constructor({ snapshotReader }) {
+                this.snapshotReader = snapshotReader;
+            }
+
+            async pinTopology() {}
+
+            async markDeployed() {}
+        },
+        CascadeTopologyState: {},
+        cascadeNodeDeployer: { async deployNode() {} },
+        cascadeNodeVerifier: { async verifyNode() {} },
+        cascadeNodeRestorer: { async restoreNode() {} },
+        transactionRunner: async work => work(),
+    };
+    const service = entry.createTopologyDeploymentService(dependencies);
+
+    assert.equal(typeof service.deploy, 'function');
 });
 
 test('registerMigrations lazily registers the ordered module migration registry', () => {
