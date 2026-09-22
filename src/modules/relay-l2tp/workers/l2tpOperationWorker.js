@@ -1,13 +1,94 @@
 'use strict';
 
 class L2tpOperationWorker {
-    constructor({ operationRepository, lockService, executor, workerId, leaseMs, clock }) {
+    constructor({
+        operationRepository,
+        lockService,
+        executor,
+        workerId,
+        leaseMs,
+        clock,
+        timer = globalThis,
+        renewalIntervalMs,
+    }) {
         this.operationRepository = operationRepository;
         this.lockService = lockService;
         this.executor = executor;
         this.workerId = workerId;
         this.leaseMs = leaseMs;
         this.clock = clock;
+        this.timer = timer;
+        this.renewalIntervalMs = renewalIntervalMs
+            ?? Math.max(1, Math.floor(leaseMs / 3));
+    }
+
+    createLeaseHeartbeat({ operationId, node }) {
+        let intervalId;
+        let inFlight = null;
+        let renewalError = null;
+        let stopped = false;
+
+        const clear = () => {
+            if (intervalId === undefined) return;
+            this.timer.clearInterval(intervalId);
+            intervalId = undefined;
+        };
+        const renew = async () => {
+            const operationRenewed = await this.operationRepository.renewLease({
+                operationId,
+                owner: this.workerId,
+                leaseMs: this.leaseMs,
+                now: this.clock.now(),
+            });
+            if (!operationRenewed) {
+                const error = new Error('L2TP operation lease is no longer owned by this worker');
+                error.code = 'L2TP_OPERATION_LEASE_LOST';
+                throw error;
+            }
+
+            const lockRenewed = await this.lockService.renew({
+                node,
+                owner: this.workerId,
+                operationId,
+                leaseMs: this.leaseMs,
+            });
+            if (!lockRenewed?.ok) {
+                const error = new Error('L2TP node operation lock is no longer owned by this worker');
+                error.code = lockRenewed?.error?.code || 'NODE_OPERATION_LOCK_LOST';
+                throw error;
+            }
+        };
+        const tick = () => {
+            if (stopped || renewalError) return inFlight || Promise.resolve();
+            if (inFlight) return inFlight;
+
+            inFlight = renew()
+                .catch(error => {
+                    renewalError = error;
+                    clear();
+                })
+                .finally(() => {
+                    inFlight = null;
+                });
+            return inFlight;
+        };
+
+        intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
+
+        return {
+            renewNow: tick,
+            async waitForIdle() {
+                if (inFlight) await inFlight;
+            },
+            getError() {
+                return renewalError;
+            },
+            stop: async () => {
+                stopped = true;
+                clear();
+                if (inFlight) await inFlight;
+            },
+        };
     }
 
     async runOnce() {
@@ -73,11 +154,26 @@ class L2tpOperationWorker {
             return { claimed: true, operationId, status: 'failed' };
         }
 
+        const heartbeat = this.createLeaseHeartbeat({
+            operationId,
+            node: operation.node,
+        });
+        const leaseLostResult = () => ({
+            claimed: true,
+            operationId,
+            status: 'running',
+            stopped: true,
+            errorCode: heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED',
+        });
+
         try {
             const steps = operation.plan.steps;
             const completedSteps = [];
 
             for (const [index, step] of steps.entries()) {
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+
                 const stepType = step.type;
                 const startingProgress = Math.round((index / steps.length) * 100);
                 const completedProgress = Math.round(((index + 1) / steps.length) * 100);
@@ -96,7 +192,13 @@ class L2tpOperationWorker {
 
                 try {
                     await this.executor.executeStep({ operation, step });
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
                 } catch (error) {
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
+                    await heartbeat.stop();
+
                     const errorCode = error.code || 'EXECUTOR_FAILED';
                     const errorMessage = error.message || 'L2TP operation executor failed';
                     await this.operationRepository.setStatus({
@@ -179,6 +281,7 @@ class L2tpOperationWorker {
                 });
             }
 
+            await heartbeat.stop();
             const finishedAt = this.clock.now();
             const finalStep = steps[steps.length - 1].type;
             await this.operationRepository.setStatus({
@@ -199,6 +302,7 @@ class L2tpOperationWorker {
 
             return { claimed: true, operationId, status: 'succeeded' };
         } finally {
+            await heartbeat.stop();
             await this.lockService.release({
                 node: operation.node,
                 owner: this.workerId,

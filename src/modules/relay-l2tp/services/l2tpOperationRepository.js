@@ -30,6 +30,20 @@ class L2tpOperationRepository {
         });
     }
 
+    async renewLease({ operationId, owner, leaseMs, now }) {
+        const leaseUntil = new Date(now.getTime() + leaseMs);
+        const result = await this.model.updateOne({
+            _id: operationId,
+            status: 'running',
+            leaseOwner: owner,
+            leaseUntil: { $gt: now },
+        }, {
+            $set: { leaseUntil },
+        }, { runValidators: true });
+
+        return result.matchedCount === 1;
+    }
+
     async recordStep({ operationId, step, progress, journal }) {
         return this.model.updateOne({ _id: operationId }, {
             $set: { step, progress },

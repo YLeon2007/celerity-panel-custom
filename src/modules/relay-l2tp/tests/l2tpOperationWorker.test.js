@@ -23,6 +23,10 @@ function createOperationRepository(initialOperations = []) {
             operation.leaseOwner = request.owner;
             return operation;
         },
+        async renewLease(request) {
+            calls.push({ method: 'renewLease', request });
+            return true;
+        },
         async recordStep(request) {
             calls.push({ method: 'recordStep', request });
         },
@@ -34,14 +38,68 @@ function createOperationRepository(initialOperations = []) {
     };
 }
 
+function createDeferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
+function createClock(initial = NOW) {
+    let current = new Date(initial);
+    return {
+        now: () => new Date(current),
+        advance(ms) {
+            current = new Date(current.getTime() + ms);
+        },
+    };
+}
+
+function createTimer() {
+    let nextId = 1;
+    const intervals = new Map();
+    const calls = [];
+
+    return {
+        calls,
+        setInterval(callback, intervalMs) {
+            const id = nextId++;
+            calls.push({ method: 'setInterval', id, intervalMs });
+            intervals.set(id, callback);
+            return id;
+        },
+        clearInterval(id) {
+            calls.push({ method: 'clearInterval', id });
+            intervals.delete(id);
+        },
+        async tick() {
+            const callbacks = [...intervals.values()];
+            await Promise.all(callbacks.map(callback => callback()));
+        },
+        activeCount() {
+            return intervals.size;
+        },
+    };
+}
+
 function createWorker(operationRepository, overrides = {}) {
+    const lockService = {
+        async renew() { return { ok: true }; },
+        ...(overrides.lockService || {}),
+    };
+
     return new L2tpOperationWorker({
         operationRepository,
-        lockService: overrides.lockService || {},
+        lockService,
         executor: overrides.executor || {},
         workerId: 'worker-1',
-        leaseMs: 30_000,
-        clock: { now: () => new Date(NOW) },
+        leaseMs: overrides.leaseMs || 30_000,
+        clock: overrides.clock || createClock(),
+        timer: overrides.timer || createTimer(),
+        renewalIntervalMs: overrides.renewalIntervalMs,
     });
 }
 
@@ -228,6 +286,231 @@ test('runOnce journals ordered step progress as the plan executes', async () => 
             },
         ],
     );
+});
+
+test('renews operation and node leases while a step runs longer than the lease', async () => {
+    const clock = createClock();
+    const timer = createTimer();
+    const step = createDeferred();
+    const started = createDeferred();
+    const lockRenewals = [];
+    const operationRepository = createOperationRepository([{
+        id: 'operation-long-step',
+        node: 'node-long-step',
+        status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    const worker = createWorker(operationRepository, {
+        clock,
+        timer,
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew(request) {
+                lockRenewals.push(request);
+                return { ok: true };
+            },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep() {
+                started.resolve();
+                await step.promise;
+            },
+        },
+    });
+
+    const run = worker.runOnce();
+    await started.promise;
+
+    for (const elapsedMs of [10_000, 10_000, 11_000]) {
+        clock.advance(elapsedMs);
+        await timer.tick();
+    }
+    step.resolve();
+
+    const result = await run;
+    const operationRenewals = operationRepository.calls
+        .filter(call => call.method === 'renewLease')
+        .map(call => call.request);
+
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(
+        operationRenewals.map(request => request.now),
+        [
+            NOW,
+            new Date('2026-09-22T10:00:10.000Z'),
+            new Date('2026-09-22T10:00:20.000Z'),
+            new Date('2026-09-22T10:00:31.000Z'),
+        ],
+    );
+    assert.equal(lockRenewals.length, 4);
+    assert.ok(timer.calls[0].intervalMs < 30_000);
+    assert.equal(timer.activeCount(), 0);
+    assert.equal(timer.calls.filter(call => call.method === 'clearInterval').length, 1);
+});
+
+test('stops before a second step when operation lease renewal is rejected', async () => {
+    const timer = createTimer();
+    const step = createDeferred();
+    const started = createDeferred();
+    const executed = [];
+    let renewals = 0;
+    let rollbacks = 0;
+    const operationRepository = createOperationRepository([{
+        id: 'operation-lost-lease',
+        node: 'node-lost-lease',
+        status: 'queued',
+        plan: { steps: [{ type: 'preflight' }, { type: 'verify' }] },
+    }]);
+    operationRepository.renewLease = async request => {
+        operationRepository.calls.push({ method: 'renewLease', request });
+        renewals += 1;
+        return renewals === 1;
+    };
+    const worker = createWorker(operationRepository, {
+        timer,
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep({ step: currentStep }) {
+                executed.push(currentStep.type);
+                if (currentStep.type === 'preflight') {
+                    started.resolve();
+                    await step.promise;
+                }
+            },
+            async rollback() { rollbacks += 1; },
+        },
+    });
+
+    const run = worker.runOnce();
+    await started.promise;
+    await timer.tick();
+    step.resolve();
+
+    const result = await run;
+
+    assert.deepEqual(executed, ['preflight']);
+    assert.equal(rollbacks, 0);
+    assert.equal(result.status, 'running');
+    assert.equal(result.errorCode, 'L2TP_OPERATION_LEASE_LOST');
+    assert.equal(
+        operationRepository.calls.some(call => call.method === 'setStatus'),
+        false,
+    );
+    assert.equal(timer.activeCount(), 0);
+});
+
+test('stops before a second step when node lock renewal rejects', async () => {
+    const timer = createTimer();
+    const step = createDeferred();
+    const started = createDeferred();
+    const executed = [];
+    let lockRenewals = 0;
+    const operationRepository = createOperationRepository([{
+        id: 'operation-lock-renew-rejected',
+        node: 'node-lock-renew-rejected',
+        status: 'queued',
+        plan: { steps: [{ type: 'preflight' }, { type: 'verify' }] },
+    }]);
+    const worker = createWorker(operationRepository, {
+        timer,
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() {
+                lockRenewals += 1;
+                if (lockRenewals > 1) throw new Error('lock store unavailable');
+                return { ok: true };
+            },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep({ step: currentStep }) {
+                executed.push(currentStep.type);
+                if (currentStep.type === 'preflight') {
+                    started.resolve();
+                    await step.promise;
+                }
+            },
+        },
+    });
+
+    const run = worker.runOnce();
+    await started.promise;
+    await timer.tick();
+    step.resolve();
+
+    const result = await run;
+
+    assert.deepEqual(executed, ['preflight']);
+    assert.equal(result.status, 'running');
+    assert.equal(result.errorCode, 'L2TP_LEASE_RENEWAL_FAILED');
+    assert.equal(timer.activeCount(), 0);
+});
+
+test('does not overlap lease renewal calls when a renewal is still pending', async () => {
+    const timer = createTimer();
+    const step = createDeferred();
+    const stepStarted = createDeferred();
+    const renewal = createDeferred();
+    const renewalStarted = createDeferred();
+    let renewals = 0;
+    let activeRenewals = 0;
+    let maxActiveRenewals = 0;
+    const operationRepository = createOperationRepository([{
+        id: 'operation-slow-renewal',
+        node: 'node-slow-renewal',
+        status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    operationRepository.renewLease = async request => {
+        operationRepository.calls.push({ method: 'renewLease', request });
+        renewals += 1;
+        if (renewals === 1) return true;
+
+        activeRenewals += 1;
+        maxActiveRenewals = Math.max(maxActiveRenewals, activeRenewals);
+        renewalStarted.resolve();
+        await renewal.promise;
+        activeRenewals -= 1;
+        return true;
+    };
+    const worker = createWorker(operationRepository, {
+        timer,
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+        executor: {
+            async executeStep() {
+                stepStarted.resolve();
+                await step.promise;
+            },
+        },
+    });
+
+    const run = worker.runOnce();
+    await stepStarted.promise;
+    const firstTick = timer.tick();
+    await renewalStarted.promise;
+    const secondTick = timer.tick();
+
+    assert.equal(renewals, 2);
+    assert.equal(maxActiveRenewals, 1);
+
+    renewal.resolve();
+    await Promise.all([firstTick, secondTick]);
+    step.resolve();
+    const result = await run;
+
+    assert.equal(result.status, 'succeeded');
+    assert.equal(renewals, 2);
+    assert.equal(maxActiveRenewals, 1);
+    assert.equal(timer.activeCount(), 0);
 });
 
 test('executor failure enters rolling back before rollback and finishes rolled back', async () => {

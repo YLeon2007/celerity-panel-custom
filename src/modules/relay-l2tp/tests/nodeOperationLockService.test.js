@@ -25,6 +25,18 @@ function createRepository(initialLocks = []) {
             locks.set(String(lock.node), { ...lock });
             return { ...lock };
         },
+        async renewLease(request) {
+            calls.push({ method: 'renewLease', request: { ...request } });
+            const lock = locks.get(String(request.node));
+            const matches = lock
+                && String(lock.owner) === String(request.owner)
+                && String(lock.operationId) === String(request.operationId)
+                && lock.leaseUntil.getTime() > request.now.getTime();
+            if (!matches) return false;
+
+            lock.leaseUntil = request.leaseUntil;
+            return true;
+        },
         async deleteByNode(node) {
             calls.push({ method: 'deleteByNode', node });
             return locks.delete(String(node));
@@ -146,6 +158,44 @@ test('acquire renews an active lease for the same owner and operation', async ()
             leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
         },
     });
+});
+
+test('renew extends the current unexpired lease with an atomic ownership match', async () => {
+    const repository = createRepository([{
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-21T12:00:05.000Z'),
+    }]);
+    const service = createService(repository);
+
+    const result = await service.renew({
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseMs: 30_000,
+    });
+
+    assert.deepEqual(result, {
+        ok: true,
+        code: RESULT_CODES.RENEWED,
+        lock: {
+            node: 'node-a',
+            owner: 'worker-a',
+            operationId: 'operation-a',
+            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
+        },
+    });
+    assert.deepEqual(repository.calls, [{
+        method: 'renewLease',
+        request: {
+            node: 'node-a',
+            owner: 'worker-a',
+            operationId: 'operation-a',
+            now: NOW,
+            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
+        },
+    }]);
 });
 
 test('release removes a lease for the matching owner and operation', async () => {

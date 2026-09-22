@@ -52,6 +52,39 @@ class NodeOperationLockService {
         };
     }
 
+    async renew({ node, owner, operationId, leaseMs }) {
+        const now = this.clock.now();
+        const leaseUntil = new Date(now.getTime() + leaseMs);
+        const renewed = await this.repository.renewLease({
+            node,
+            owner,
+            operationId,
+            now,
+            leaseUntil,
+        });
+
+        if (!renewed) {
+            return {
+                ok: false,
+                error: {
+                    code: RESULT_CODES.NOT_OWNED,
+                    node,
+                },
+            };
+        }
+
+        return {
+            ok: true,
+            code: RESULT_CODES.RENEWED,
+            lock: {
+                node,
+                owner,
+                operationId,
+                leaseUntil,
+            },
+        };
+    }
+
     async acquireMany({ nodeIds, owner, operationId, leaseMs }) {
         const sortedNodeIds = [...nodeIds].sort((left, right) => {
             const leftKey = String(left);

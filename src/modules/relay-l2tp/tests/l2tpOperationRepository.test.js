@@ -71,6 +71,35 @@ test('claimNext starts a deterministic lease and returns the claimed operation',
     });
 });
 
+test('renewLease extends only the current unexpired lease owned by the running worker', async () => {
+    const model = createModel({ acknowledged: true, matchedCount: 1 });
+    const repository = new L2tpOperationRepository({ model });
+
+    const renewed = await repository.renewLease({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        leaseMs: 30_000,
+        now: NOW,
+    });
+
+    assert.equal(renewed, true);
+    assert.deepEqual(model.calls, [{
+        method: 'updateOne',
+        query: {
+            _id: 'operation-1',
+            status: 'running',
+            leaseOwner: 'worker-1',
+            leaseUntil: { $gt: NOW },
+        },
+        update: {
+            $set: {
+                leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+            },
+        },
+        options: { runValidators: true },
+    }]);
+});
+
 test('recordStep atomically stores progress and appends a bounded journal entry', async () => {
     const updateResult = { acknowledged: true, matchedCount: 1 };
     const model = createModel(updateResult);
