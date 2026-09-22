@@ -118,6 +118,7 @@ class L2tpStateRepository {
         CascadeTopologyState,
         L2tpOperation,
         compilerData,
+        topologyRuntime,
     }) {
         this.HyNode = HyNode;
         this.RelayL2tpState = RelayL2tpState;
@@ -125,6 +126,7 @@ class L2tpStateRepository {
         this.CascadeTopologyState = CascadeTopologyState;
         this.L2tpOperation = L2tpOperation;
         this.compilerData = compilerData;
+        this.topologyRuntime = topologyRuntime;
     }
 
     async findNodeById(nodeId) {
@@ -151,6 +153,9 @@ class L2tpStateRepository {
     }
 
     async getRelayGroupPlan(nodeId, routeGroupId) {
+        if (this.topologyRuntime) {
+            return this.topologyRuntime.getRelayGroupPlan(nodeId, routeGroupId);
+        }
         const relay = this.compilerData.relays.find(
             entry => String(entry.nodeId) === String(nodeId),
         );

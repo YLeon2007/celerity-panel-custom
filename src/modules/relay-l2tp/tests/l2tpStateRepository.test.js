@@ -52,6 +52,7 @@ function createRepository(overrides = {}) {
         CascadeTopologyState: overrides.CascadeTopologyState || createQueryModel(),
         L2tpOperation: overrides.L2tpOperation || createQueryModel(),
         compilerData: overrides.compilerData || { relays: [] },
+        topologyRuntime: overrides.topologyRuntime,
     });
 }
 
@@ -181,6 +182,35 @@ test('getRelayGroupPlan returns the requested route group from injected compiler
         await repository.getRelayGroupPlan('relay-1', 'group-b'),
         expectedPlan,
     );
+});
+
+test('getRelayGroupPlan delegates to an injected topology runtime instead of static data', async () => {
+    const calls = [];
+    const runtimePlan = {
+        groupId: 'group-live',
+        candidates: [],
+        decision: { decision: 'block', error: { code: 'NO_HEALTHY_PATH' } },
+    };
+    const topologyRuntime = {
+        async getRelayGroupPlan(relayId, groupId) {
+            calls.push({ relayId, groupId });
+            return runtimePlan;
+        },
+    };
+    const repository = createRepository({
+        topologyRuntime,
+        compilerData: {
+            relays: [{
+                nodeId: 'relay-1',
+                routeGroups: [{ groupId: 'group-static' }],
+            }],
+        },
+    });
+
+    const result = await repository.getRelayGroupPlan('relay-1', 'group-live');
+
+    assert.strictEqual(result, runtimePlan);
+    assert.deepEqual(calls, [{ relayId: 'relay-1', groupId: 'group-live' }]);
 });
 
 test('findOperation returns a lean operation through an explicit secret-free allowlist', async () => {

@@ -11,6 +11,7 @@ function passThrough(req, res, next) {
 
 test('builds the concrete repository adapters and composes a dormant runtime', () => {
     const HyNode = { modelName: 'HyNode' };
+    const CascadeLink = { modelName: 'CascadeLink' };
     const models = {
         RelayL2tpState: { modelName: 'RelayL2tpState' },
         CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
@@ -19,10 +20,19 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         NodeOperationLock: { modelName: 'NodeOperationLock' },
     };
     const compilerData = { relays: [{ nodeId: 'relay-1', routeGroups: [] }] };
+    const healthByPathKey = { 'group-a:primary': true };
+    const compiler = () => ({ relays: [] });
+    const topologyRuntimeConstructions = [];
     const repositoryConstructions = [];
     const adapterCalls = [];
     const runtimeCalls = [];
     let workerRuns = 0;
+
+    class FakeTopologyRuntime {
+        constructor(dependencies) {
+            topologyRuntimeConstructions.push(dependencies);
+        }
+    }
 
     class FakeRepository {
         constructor(dependencies) {
@@ -54,8 +64,12 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         csrf: passThrough,
         rateLimiter: passThrough,
         compilerData,
+        healthByPathKey,
+        compiler,
         moduleEntry,
         HyNode,
+        CascadeLink,
+        TopologyRuntime: FakeTopologyRuntime,
         Repository: FakeRepository,
         createRepositoryAdapters(repository) {
             adapterCalls.push(repository);
@@ -67,6 +81,14 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         },
     });
 
+    assert.equal(topologyRuntimeConstructions.length, 1);
+    assert.deepEqual(topologyRuntimeConstructions[0], {
+        HyNode,
+        CascadeLink,
+        CascadeRouteGroup: models.CascadeRouteGroup,
+        compiler,
+        healthByPathKey,
+    });
     assert.equal(repositoryConstructions.length, 1);
     assert.deepEqual(repositoryConstructions[0], {
         HyNode,
@@ -75,6 +97,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         CascadeTopologyState: models.CascadeTopologyState,
         L2tpOperation: models.L2tpOperation,
         compilerData,
+        topologyRuntime: host.topologyRuntime,
     });
     assert.deepEqual(adapterCalls, [host.repository]);
     assert.equal(runtimeCalls.length, 1);
@@ -91,6 +114,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.equal(typeof runtimeCalls[0].workerId, 'string');
     assert.equal(typeof runtimeCalls[0].leaseMs, 'number');
     assert.strictEqual(host.moduleEntry, moduleEntry);
+    assert.ok(host.topologyRuntime instanceof FakeTopologyRuntime);
     assert.strictEqual(host.runtime, runtime);
     assert.equal(workerRuns, 0);
 });

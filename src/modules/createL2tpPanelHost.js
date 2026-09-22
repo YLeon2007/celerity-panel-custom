@@ -1,11 +1,15 @@
 'use strict';
 
+const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const moduleEntry = require('./relay-l2tp');
+const { compileTopology } = require('./relay-l2tp/domain/topologyCompiler');
 const { L2tpStateRepository, createL2tpServiceRepositoryAdapters } = require('./relay-l2tp/repositories/l2tpStateRepository');
 const { createL2tpRuntime } = require('./relay-l2tp/runtime/createL2tpRuntime');
+const { TopologyRuntimeService } = require('./relay-l2tp/services/topologyRuntimeService');
 
 const DEFAULT_COMPILER_DATA = Object.freeze({ relays: Object.freeze([]) });
+const DEFAULT_HEALTH_BY_PATH_KEY = Object.freeze({});
 const DEFAULT_CLOCK = Object.freeze({ now: () => new Date() });
 const DEFAULT_LEASE_MS = 30_000;
 
@@ -46,6 +50,9 @@ function createL2tpPanelHost({
     csrf,
     rateLimiter,
     compilerData = DEFAULT_COMPILER_DATA,
+    healthByPathKey = DEFAULT_HEALTH_BY_PATH_KEY,
+    compiler = compileTopology,
+    topologyRuntime: injectedTopologyRuntime,
     preflightRunner = unavailablePreflightRunner,
     transport = dormantTransport,
     lockService = dormantLockService,
@@ -54,11 +61,20 @@ function createL2tpPanelHost({
     leaseMs = DEFAULT_LEASE_MS,
     moduleEntry: injectedModuleEntry = moduleEntry,
     HyNode: injectedHyNode = HyNode,
+    CascadeLink: injectedCascadeLink = CascadeLink,
+    TopologyRuntime = TopologyRuntimeService,
     Repository = L2tpStateRepository,
     createRepositoryAdapters = createL2tpServiceRepositoryAdapters,
     createRuntime = createL2tpRuntime,
 } = {}) {
     const models = injectedModuleEntry.registerModels();
+    const topologyRuntime = injectedTopologyRuntime ?? new TopologyRuntime({
+        HyNode: injectedHyNode,
+        CascadeLink: injectedCascadeLink,
+        CascadeRouteGroup: models.CascadeRouteGroup,
+        compiler,
+        healthByPathKey,
+    });
     const repository = new Repository({
         HyNode: injectedHyNode,
         RelayL2tpState: models.RelayL2tpState,
@@ -66,6 +82,7 @@ function createL2tpPanelHost({
         CascadeTopologyState: models.CascadeTopologyState,
         L2tpOperation: models.L2tpOperation,
         compilerData,
+        topologyRuntime,
     });
     const adapters = createRepositoryAdapters(repository);
     const runtime = createRuntime({
@@ -85,6 +102,7 @@ function createL2tpPanelHost({
 
     return {
         moduleEntry: injectedModuleEntry,
+        topologyRuntime,
         repository,
         runtime,
     };
