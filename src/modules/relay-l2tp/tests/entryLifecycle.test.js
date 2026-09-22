@@ -103,8 +103,11 @@ test('registerRoutes mounts the existing panel router with only injected depende
                 },
                 l2tpService: { kind: 'injected-service' },
                 requireAuth() {},
+                requireOnboarding() {},
                 csrf() {},
                 rateLimiter() {},
+                loadPanelOverview() {},
+                renderPage() {},
             };
 
             entry.registerRoutes(context);
@@ -112,8 +115,11 @@ test('registerRoutes mounts the existing panel router with only injected depende
             assert.deepEqual(factoryCalls, [{
                 l2tpService: context.l2tpService,
                 requireAuth: context.requireAuth,
+                requireOnboarding: context.requireOnboarding,
                 csrf: context.csrf,
                 rateLimiter: context.rateLimiter,
+                loadPanelOverview: context.loadPanelOverview,
+                renderPage: context.renderPage,
             }]);
             assert.deepEqual(mounts, [['/', l2tpRouter]]);
         `],
@@ -157,8 +163,11 @@ test('registerRoutes rejects every missing injected dependency before creating a
                 panelRouter: { use() {} },
                 l2tpService: {},
                 requireAuth() {},
+                requireOnboarding() {},
                 csrf() {},
                 rateLimiter() {},
+                loadPanelOverview() {},
+                renderPage() {},
             };
 
             assert.throws(() => entry.registerRoutes(), /context/i);
@@ -217,8 +226,11 @@ test('registerRoutes rejects a second call without creating or mounting another 
                 },
                 l2tpService: {},
                 requireAuth() {},
+                requireOnboarding() {},
                 csrf() {},
                 rateLimiter() {},
+                loadPanelOverview() {},
+                renderPage() {},
             };
 
             entry.registerRoutes(context);

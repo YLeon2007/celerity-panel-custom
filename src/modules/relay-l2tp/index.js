@@ -43,7 +43,16 @@ function registerRoutes(context) {
         throw new TypeError('registerRoutes context is required');
     }
 
-    const { panelRouter, l2tpService, requireAuth, csrf, rateLimiter } = context;
+    const {
+        panelRouter,
+        l2tpService,
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        loadPanelOverview,
+        renderPage,
+    } = context;
     if (!panelRouter || typeof panelRouter.use !== 'function') {
         throw new TypeError('registerRoutes requires panelRouter');
     }
@@ -53,11 +62,20 @@ function registerRoutes(context) {
     if (typeof requireAuth !== 'function') {
         throw new TypeError('registerRoutes requires requireAuth');
     }
+    if (typeof requireOnboarding !== 'function') {
+        throw new TypeError('registerRoutes requires requireOnboarding');
+    }
     if (typeof csrf !== 'function') {
         throw new TypeError('registerRoutes requires csrf');
     }
     if (typeof rateLimiter !== 'function') {
         throw new TypeError('registerRoutes requires rateLimiter');
+    }
+    if (typeof loadPanelOverview !== 'function') {
+        throw new TypeError('registerRoutes requires loadPanelOverview');
+    }
+    if (typeof renderPage !== 'function') {
+        throw new TypeError('registerRoutes requires renderPage');
     }
 
     routesRegistered = true;
@@ -65,8 +83,11 @@ function registerRoutes(context) {
     const l2tpRouter = createL2tpRouter({
         l2tpService,
         requireAuth,
+        requireOnboarding,
         csrf,
         rateLimiter,
+        loadPanelOverview,
+        renderPage,
     });
 
     panelRouter.use('/', l2tpRouter);

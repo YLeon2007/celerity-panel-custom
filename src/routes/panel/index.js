@@ -7,7 +7,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 
 const { createL2tpPanelHost } = require('../../modules/createL2tpPanelHost');
-const { checkIpWhitelist, requireAuth, requireOnboarding } = require('./helpers');
+const { checkIpWhitelist, requireAuth, requireOnboarding, render } = require('./helpers');
 const { issuePanelCsrfToken, requirePanelCsrf } = require('./csrf');
 
 const authRoutes = require('./auth');
@@ -33,9 +33,14 @@ function exposePanelCsrfToken(req, res, next) {
     next();
 }
 
+function renderL2tpPage(res, data) {
+    return render(res, 'l2tp', data);
+}
+
 function createPanelRouter({
     createL2tpHost = createL2tpPanelHost,
     l2tpRateLimiter: injectedL2tpRateLimiter = l2tpRateLimiter,
+    renderL2tpPage: injectedRenderL2tpPage = renderL2tpPage,
 } = {}) {
     const router = express.Router();
 
@@ -61,15 +66,20 @@ function createPanelRouter({
 
     const l2tpHost = createL2tpHost({
         requireAuth,
+        requireOnboarding,
         csrf: requirePanelCsrf,
         rateLimiter: injectedL2tpRateLimiter,
+        renderPage: injectedRenderL2tpPage,
     });
     l2tpHost.moduleEntry.registerRoutes({
         panelRouter: router,
         l2tpService: l2tpHost.runtime.service,
         requireAuth,
+        requireOnboarding,
         csrf: requirePanelCsrf,
         rateLimiter: injectedL2tpRateLimiter,
+        loadPanelOverview: l2tpHost.loadPanelOverview,
+        renderPage: injectedRenderL2tpPage,
     });
 
     return router;
@@ -79,6 +89,7 @@ const router = createPanelRouter();
 Object.defineProperties(router, {
     createPanelRouter: { value: createPanelRouter },
     exposePanelCsrfToken: { value: exposePanelCsrfToken },
+    renderL2tpPage: { value: renderL2tpPage },
 });
 
 module.exports = router;

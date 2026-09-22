@@ -1,0 +1,117 @@
+<section class="page-header">
+    <div>
+        <h1>L2TP/IPsec Relay</h1>
+        <p class="muted">Topology revision: <strong><%= topologyRevision %></strong></p>
+    </div>
+</section>
+
+<section class="card">
+    <h2>Relay nodes</h2>
+    <% if (!relays || relays.length === 0) { %>
+        <p class="muted">No relay nodes are available.</p>
+    <% } %>
+    <% for (const relay of (relays || [])) { %>
+        <article class="card" data-l2tp-relay data-node-id="<%= relay.id %>">
+            <h3><%= relay.name || relay.id %></h3>
+            <p>
+                Node: <%= relay.nodeStatus || 'unknown' %> ·
+                L2TP: <%= relay.l2tpStatus %> ·
+                Desired: <%= relay.desiredState %>
+            </p>
+            <form data-l2tp-form>
+                <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
+                <label>Client CIDR
+                    <input name="clientCidr" value="<%= relay.clientCidr || '' %>" placeholder="10.77.0.0/24" required>
+                </label>
+                <label>DNS servers
+                    <input name="dnsServers" value="<%= (relay.dnsServers || []).join(', ') %>" placeholder="1.1.1.1, 9.9.9.9" required>
+                </label>
+                <label>Route group
+                    <select name="routeGroupId" required>
+                        <option value="">Select route group</option>
+                        <% for (const group of (routeGroups || [])) { %>
+                            <option value="<%= group.id %>" <%= relay.routeGroupId === group.id ? 'selected' : '' %>>
+                                <%= group.name %> (<%= group.mode %>, <%= group.strategy %>)
+                            </option>
+                        <% } %>
+                    </select>
+                </label>
+                <div class="form-actions">
+                    <button type="button" data-l2tp-action="preflight">Preflight</button>
+                    <button type="button" data-l2tp-action="install">Queue install</button>
+                </div>
+                <output data-l2tp-result aria-live="polite"></output>
+            </form>
+        </article>
+    <% } %>
+</section>
+
+<section class="card">
+    <h2>Recent operations</h2>
+    <% if (!operations || operations.length === 0) { %>
+        <p class="muted">No operations.</p>
+    <% } else { %>
+        <ul>
+            <% for (const operation of operations) { %>
+                <li>
+                    <code><%= operation.id %></code> — <%= operation.kind %> / <%= operation.status %>
+                    (<%= operation.progress %>%)
+                    <%= operation.errorCode ? ` — ${operation.errorCode}` : '' %>
+                </li>
+            <% } %>
+        </ul>
+    <% } %>
+</section>
+
+<script>
+(() => {
+    const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
+    const typedFields = ['clientCidr', 'dnsServers', 'routeGroupId', 'expectedTopologyRevision'];
+
+    function setResult(output, value) {
+        output.textContent = value;
+    }
+
+    document.querySelectorAll('[data-l2tp-relay]').forEach((relay) => {
+        const nodeId = relay.dataset.nodeId;
+        const form = relay.querySelector('[data-l2tp-form]');
+        const output = relay.querySelector('[data-l2tp-result]');
+
+        relay.querySelectorAll('[data-l2tp-action]').forEach((button) => {
+            button.addEventListener('click', async () => {
+                const values = Object.fromEntries(new FormData(form).entries());
+                const payload = {
+                    clientCidr: String(values.clientCidr || '').trim(),
+                    dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
+                    routeGroupId: String(values.routeGroupId || ''),
+                    expectedTopologyRevision: Number(values.expectedTopologyRevision),
+                };
+                if (!typedFields.every((field) => Object.hasOwn(payload, field))) return;
+
+                button.disabled = true;
+                setResult(output, 'Working…');
+                try {
+                    const response = await fetch(`/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/${button.dataset.l2tpAction}`, {
+                        method: 'POST',
+                        headers: {
+                            'content-type': 'application/json',
+                            'x-csrf-token': csrfToken,
+                        },
+                        body: JSON.stringify(payload),
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        setResult(output, result.error?.code || 'REQUEST_FAILED');
+                        return;
+                    }
+                    setResult(output, result.operationId || (result.ok ? 'OK' : 'FAILED'));
+                } catch {
+                    setResult(output, 'REQUEST_FAILED');
+                } finally {
+                    button.disabled = false;
+                }
+            });
+        });
+    });
+})();
+</script>

@@ -18,8 +18,11 @@ const REQUIRED_DEPENDENCIES = Object.freeze([
     'transport',
     'lockService',
     'requireAuth',
+    'requireOnboarding',
     'csrf',
     'rateLimiter',
+    'loadPanelOverview',
+    'renderPage',
     'clock',
     'workerId',
     'leaseMs',
@@ -58,8 +61,11 @@ function createL2tpRuntime(dependencies) {
         transport,
         lockService,
         requireAuth,
+        requireOnboarding,
         csrf,
         rateLimiter,
+        loadPanelOverview,
+        renderPage,
         clock,
         workerId,
         leaseMs,
@@ -99,8 +105,11 @@ function createL2tpRuntime(dependencies) {
     const router = createL2tpRouter({
         l2tpService: service,
         requireAuth,
+        requireOnboarding,
         csrf,
         rateLimiter,
+        loadPanelOverview,
+        renderPage,
     });
     const configFragmentRegistry = createConfigFragmentRegistry([PROVIDER_ID]);
     configFragmentRegistry.register(PROVIDER_ID, buildL2tpXrayFragment);

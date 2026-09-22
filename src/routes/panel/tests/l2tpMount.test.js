@@ -23,6 +23,7 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
 
         const calls = [];
         const l2tpService = { kind: 'l2tp-service' };
+        const loadPanelOverview = async () => ({});
         const l2tpMarker = function l2tpMarker(req, res, next) { next(); };
         const rateLimiter = function rateLimiter(req, res, next) { next(); };
         const moduleEntry = {
@@ -44,7 +45,7 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
             l2tpRateLimiter: rateLimiter,
             createL2tpHost(dependencies) {
                 calls.push({ method: 'createL2tpHost', dependencies });
-                return { moduleEntry, runtime };
+                return { moduleEntry, runtime, loadPanelOverview };
             },
         });
 
@@ -53,16 +54,21 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
             method: 'createL2tpHost',
             dependencies: {
                 requireAuth,
+                requireOnboarding,
                 csrf: requirePanelCsrf,
                 rateLimiter,
+                renderPage: panelRouter.renderL2tpPage,
             },
         });
         assert.equal(calls[1].method, 'registerRoutes');
         assert.strictEqual(calls[1].context.panelRouter, router);
         assert.strictEqual(calls[1].context.l2tpService, l2tpService);
         assert.strictEqual(calls[1].context.requireAuth, requireAuth);
+        assert.strictEqual(calls[1].context.requireOnboarding, requireOnboarding);
         assert.strictEqual(calls[1].context.csrf, requirePanelCsrf);
         assert.strictEqual(calls[1].context.rateLimiter, rateLimiter);
+        assert.strictEqual(calls[1].context.loadPanelOverview, loadPanelOverview);
+        assert.strictEqual(calls[1].context.renderPage, panelRouter.renderL2tpPage);
 
         assert.deepEqual(router.stack.map(layer => layer.handle), [
             checkIpWhitelist,

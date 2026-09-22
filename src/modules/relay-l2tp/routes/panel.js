@@ -65,10 +65,32 @@ function sendServiceError(res, error) {
     });
 }
 
-function createL2tpRouter({ l2tpService, requireAuth, csrf, rateLimiter }) {
+function createL2tpRouter({
+    l2tpService,
+    requireAuth,
+    requireOnboarding,
+    csrf,
+    rateLimiter,
+    loadPanelOverview,
+    renderPage,
+}) {
     const router = express.Router();
 
-    router.get('/nodes/:id/l2tp/status', requireAuth, async (req, res) => {
+    router.get('/l2tp', requireAuth, requireOnboarding, async (req, res) => {
+        try {
+            const overview = await loadPanelOverview();
+            renderPage(res, {
+                title: 'L2TP',
+                page: 'l2tp',
+                csrfToken: res.locals.csrfToken,
+                ...overview,
+            });
+        } catch (error) {
+            res.status(500).send('Internal server error');
+        }
+    });
+
+    router.get('/nodes/:id/l2tp/status', requireAuth, requireOnboarding, async (req, res) => {
         try {
             const status = await l2tpService.getStatus(req.params.id);
             res.json(status);
@@ -80,6 +102,7 @@ function createL2tpRouter({ l2tpService, requireAuth, csrf, rateLimiter }) {
     router.post(
         '/nodes/:id/l2tp/preflight',
         requireAuth,
+        requireOnboarding,
         csrf,
         rateLimiter,
         async (req, res) => {
@@ -98,6 +121,7 @@ function createL2tpRouter({ l2tpService, requireAuth, csrf, rateLimiter }) {
     router.post(
         '/nodes/:id/l2tp/install',
         requireAuth,
+        requireOnboarding,
         csrf,
         rateLimiter,
         async (req, res) => {
@@ -113,7 +137,7 @@ function createL2tpRouter({ l2tpService, requireAuth, csrf, rateLimiter }) {
         },
     );
 
-    router.get('/l2tp/operations/:operationId', requireAuth, async (req, res) => {
+    router.get('/l2tp/operations/:operationId', requireAuth, requireOnboarding, async (req, res) => {
         try {
             const operation = await l2tpService.getOperation(req.params.operationId);
             res.json(operation);

@@ -25,6 +25,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     const topologyRuntimeConstructions = [];
     const repositoryConstructions = [];
     const adapterCalls = [];
+    const overviewLoaderCalls = [];
     const runtimeCalls = [];
     let workerRuns = 0;
 
@@ -58,11 +59,15 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
             },
         },
     };
+    const loadPanelOverview = async () => ({});
+    const renderPage = () => {};
 
     const host = createL2tpPanelHost({
         requireAuth: passThrough,
+        requireOnboarding: passThrough,
         csrf: passThrough,
         rateLimiter: passThrough,
+        renderPage,
         compilerData,
         healthByPathKey,
         compiler,
@@ -74,6 +79,10 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         createRepositoryAdapters(repository) {
             adapterCalls.push(repository);
             return adapters;
+        },
+        createPanelOverviewLoader(dependencies) {
+            overviewLoaderCalls.push(dependencies);
+            return loadPanelOverview;
         },
         createRuntime(dependencies) {
             runtimeCalls.push(dependencies);
@@ -100,13 +109,23 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
         topologyRuntime: host.topologyRuntime,
     });
     assert.deepEqual(adapterCalls, [host.repository]);
+    assert.deepEqual(overviewLoaderCalls, [{
+        HyNode,
+        RelayL2tpState: models.RelayL2tpState,
+        CascadeTopologyState: models.CascadeTopologyState,
+        CascadeRouteGroup: models.CascadeRouteGroup,
+        L2tpOperation: models.L2tpOperation,
+    }]);
     assert.equal(runtimeCalls.length, 1);
     assert.strictEqual(runtimeCalls[0].operationModel, models.L2tpOperation);
     assert.strictEqual(runtimeCalls[0].nodeRepository, adapters.nodeRepository);
     assert.strictEqual(runtimeCalls[0].stateRepository, adapters.stateRepository);
     assert.strictEqual(runtimeCalls[0].requireAuth, passThrough);
+    assert.strictEqual(runtimeCalls[0].requireOnboarding, passThrough);
     assert.strictEqual(runtimeCalls[0].csrf, passThrough);
     assert.strictEqual(runtimeCalls[0].rateLimiter, passThrough);
+    assert.strictEqual(runtimeCalls[0].loadPanelOverview, loadPanelOverview);
+    assert.strictEqual(runtimeCalls[0].renderPage, renderPage);
     assert.equal(typeof runtimeCalls[0].preflightRunner, 'function');
     assert.equal(typeof runtimeCalls[0].transport.uploadRootFile, 'function');
     assert.equal(typeof runtimeCalls[0].lockService.acquire, 'function');
@@ -114,6 +133,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.equal(typeof runtimeCalls[0].workerId, 'string');
     assert.equal(typeof runtimeCalls[0].leaseMs, 'number');
     assert.strictEqual(host.moduleEntry, moduleEntry);
+    assert.strictEqual(host.loadPanelOverview, loadPanelOverview);
     assert.ok(host.topologyRuntime instanceof FakeTopologyRuntime);
     assert.strictEqual(host.runtime, runtime);
     assert.equal(workerRuns, 0);

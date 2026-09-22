@@ -25,9 +25,10 @@ async function request(router, { method = 'GET', path, body, headers = {} }) {
             body: body === undefined ? undefined : JSON.stringify(body),
         });
         const text = await response.text();
+        const contentType = response.headers.get('content-type') || '';
         return {
             status: response.status,
-            body: text ? JSON.parse(text) : null,
+            body: text && contentType.includes('application/json') ? JSON.parse(text) : text,
         };
     } finally {
         await new Promise((resolve, reject) => {
@@ -40,9 +41,99 @@ function passThrough(req, res, next) {
     next();
 }
 
+function createRouter(dependencies) {
+    return createL2tpRouter({
+        requireOnboarding: passThrough,
+        loadPanelOverview: async () => ({}),
+        renderPage(res, data) {
+            res.json(data);
+        },
+        ...dependencies,
+    });
+}
+
+test('GET L2TP page requires authentication before loading panel data', async () => {
+    let overviewCalls = 0;
+    const router = createRouter({
+        l2tpService: {},
+        requireAuth(req, res) {
+            res.status(401).send('authentication required');
+        },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        async loadPanelOverview() {
+            overviewCalls += 1;
+            return {};
+        },
+    });
+
+    const response = await request(router, { path: '/l2tp' });
+
+    assert.equal(response.status, 401);
+    assert.equal(response.body, 'authentication required');
+    assert.equal(overviewCalls, 0);
+});
+
+test('GET L2TP page requires completed onboarding before loading panel data', async () => {
+    let overviewCalls = 0;
+    const router = createRouter({
+        l2tpService: {},
+        requireAuth: passThrough,
+        requireOnboarding(req, res) {
+            res.status(409).send('onboarding required');
+        },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        async loadPanelOverview() {
+            overviewCalls += 1;
+            return {};
+        },
+    });
+
+    const response = await request(router, { path: '/l2tp' });
+
+    assert.equal(response.status, 409);
+    assert.equal(response.body, 'onboarding required');
+    assert.equal(overviewCalls, 0);
+});
+
+test('all L2TP status and operation routes require completed onboarding', async () => {
+    let serviceCalls = 0;
+    const serviceMethod = async () => {
+        serviceCalls += 1;
+        return {};
+    };
+    const router = createRouter({
+        l2tpService: {
+            getStatus: serviceMethod,
+            preflight: serviceMethod,
+            install: serviceMethod,
+            getOperation: serviceMethod,
+        },
+        requireAuth: passThrough,
+        requireOnboarding(req, res) {
+            res.status(409).send('onboarding required');
+        },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+    const requests = [
+        { path: '/nodes/relay-1/l2tp/status' },
+        { method: 'POST', path: '/nodes/relay-1/l2tp/preflight', body: {} },
+        { method: 'POST', path: '/nodes/relay-1/l2tp/install', body: {} },
+        { path: '/l2tp/operations/operation-1' },
+    ];
+
+    for (const requestOptions of requests) {
+        const response = await request(router, requestOptions);
+        assert.equal(response.status, 409, requestOptions.path);
+    }
+    assert.equal(serviceCalls, 0);
+});
+
 test('GET node L2TP status is authenticated and delegates to the injected service', async () => {
     const calls = [];
-    const router = createL2tpRouter({
+    const router = createRouter({
         l2tpService: {
             async getStatus(nodeId) {
                 calls.push({ method: 'getStatus', nodeId });
@@ -71,7 +162,7 @@ test('GET node L2TP status is authenticated and delegates to the injected servic
 
 test('authentication and CSRF middleware can stop protected operations', async () => {
     let serviceCalls = 0;
-    const unauthorizedRouter = createL2tpRouter({
+    const unauthorizedRouter = createRouter({
         l2tpService: {
             async getStatus() {
                 serviceCalls += 1;
@@ -90,7 +181,7 @@ test('authentication and CSRF middleware can stop protected operations', async (
     });
     assert.equal(unauthorized.status, 401);
 
-    const csrfRouter = createL2tpRouter({
+    const csrfRouter = createRouter({
         l2tpService: {
             async install() {
                 serviceCalls += 1;
@@ -125,7 +216,7 @@ test('POST preflight enforces protection and passes only allowed body fields', a
         calls.push({ method });
         next();
     };
-    const router = createL2tpRouter({
+    const router = createRouter({
         l2tpService: {
             async preflight(nodeId, input) {
                 calls.push({ method: 'preflight', nodeId, input });
@@ -170,7 +261,7 @@ test('POST install returns 202 with the queued operation id', async () => {
         calls.push({ method });
         next();
     };
-    const router = createL2tpRouter({
+    const router = createRouter({
         l2tpService: {
             async install(nodeId, input) {
                 calls.push({ method: 'install', nodeId, input });
@@ -204,7 +295,7 @@ test('POST install returns 202 with the queued operation id', async () => {
 
 test('GET L2TP operation is authenticated and delegates by operation id', async () => {
     const calls = [];
-    const router = createL2tpRouter({
+    const router = createRouter({
         l2tpService: {
             async getOperation(operationId) {
                 calls.push({ method: 'getOperation', operationId });
@@ -245,7 +336,7 @@ test('structured service error codes map to the documented HTTP statuses', async
 
     for (const { code, status } of cases) {
         const error = Object.assign(new Error(`service rejected ${code}`), { code });
-        const router = createL2tpRouter({
+        const router = createRouter({
             l2tpService: {
                 async getStatus() {
                     throw error;
@@ -271,7 +362,7 @@ test('structured service error codes map to the documented HTTP statuses', async
 });
 
 test('unexpected service errors return an opaque 500 response', async () => {
-    const router = createL2tpRouter({
+    const router = createRouter({
         l2tpService: {
             async getOperation() {
                 throw new Error('ssh output containing secret-password');
