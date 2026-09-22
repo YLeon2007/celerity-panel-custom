@@ -57,6 +57,33 @@
 
     let cy = null;
     let linkModalMode = 'create';
+    let topologyRevision = null;
+    let deployedRevision = null;
+    let _allLinks = [];
+
+    function applyLinkSnapshot(snapshot) {
+        if (!snapshot || !Number.isSafeInteger(snapshot.topologyRevision)
+            || !Number.isSafeInteger(snapshot.deployedRevision)
+            || !Array.isArray(snapshot.links)) {
+            throw new Error('Invalid cascade-link snapshot');
+        }
+        topologyRevision = snapshot.topologyRevision;
+        deployedRevision = snapshot.deployedRevision;
+        _allLinks = snapshot.links;
+        return snapshot;
+    }
+
+    async function handleDraftMutationResponse(response) {
+        const payload = await response.json().catch(() => ({}));
+        const errorMessage = payload?.error?.message || payload?.error || ('HTTP ' + response.status);
+        if (response.status === 409) {
+            await loadTopology();
+            showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');
+            return null;
+        }
+        if (!response.ok) throw new Error(errorMessage);
+        return applyLinkSnapshot(payload);
+    }
 
     // ==================== INIT ====================
 
@@ -146,14 +173,6 @@
         var swapBtn = document.getElementById('quickSwapBtn');
         if (swapBtn) swapBtn.addEventListener('click', onQuickSwap);
 
-        // Reconnect modal handlers
-        var reconnClose = document.getElementById('reconnectModalClose');
-        if (reconnClose) reconnClose.addEventListener('click', closeReconnectModal);
-        var reconnCancel = document.getElementById('reconnectModalCancel');
-        if (reconnCancel) reconnCancel.addEventListener('click', closeReconnectModal);
-        var reconnSubmit = document.getElementById('reconnectModalSubmit');
-        if (reconnSubmit) reconnSubmit.addEventListener('click', onReconnectSubmit);
-
         setTimeout(function () {
             cy.resize();
             loadTopology();
@@ -177,9 +196,14 @@
         showLoading(true);
         setEmptyState(false);
         try {
-            const res = await fetch('/api/cascade/topology');
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            const data = await res.json();
+            const [topologyRes, linksRes] = await Promise.all([
+                fetch('/api/cascade/topology'),
+                fetch('/api/cascade/links'),
+            ]);
+            if (!topologyRes.ok) throw new Error('HTTP ' + topologyRes.status);
+            if (!linksRes.ok) throw new Error('HTTP ' + linksRes.status);
+            const data = await topologyRes.json();
+            applyLinkSnapshot(await linksRes.json());
             renderGraph(data);
         } catch (err) {
             console.error('[Network] Topology load error:', err);
@@ -847,9 +871,9 @@
                 fetch('/api/nodes'),
                 fetch('/api/cascade/links'),
             ]);
-            if (!nodesRes.ok) throw new Error();
+            if (!nodesRes.ok || !linksRes.ok) throw new Error();
             const nodes = await nodesRes.json();
-            _allLinks = linksRes.ok ? await linksRes.json() : [];
+            applyLinkSnapshot(await linksRes.json());
             const opts  = nodes.map(n =>
                 '<option value="' + n._id + '">' + (n.flag || '') + ' ' + n.name + ' (' + n.ip + ')</option>'
             ).join('');
@@ -1015,6 +1039,7 @@
             return;
         }
 
+        data.expectedTopologyRevision = topologyRevision;
         btn.disabled = true;
         btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>';
 
@@ -1024,11 +1049,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data),
             });
-            if (!res.ok) {
-                const err = await res.json();
-                showToast((i18n.networkError || 'Error') + ': ' + (err.error || ''), 'error');
-                return;
-            }
+            if (!await handleDraftMutationResponse(res)) return;
             closeModal();
             loadTopology();
         } catch (err) {
@@ -1138,7 +1159,12 @@
         setActionLoading(i18n.deleting || 'Deleting...');
 
         try {
-            await fetch('/api/cascade/links/' + linkId, { method: 'DELETE' });
+            const response = await fetch('/api/cascade/links/' + linkId, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
+            });
+            if (!await handleDraftMutationResponse(response)) return;
             showToast(i18n.deleteSuccess || 'Deleted');
             loadTopology();
             closeInfoModal();
@@ -1223,8 +1249,6 @@
             });
         });
     }
-
-    var _allLinks = [];
 
     function updateLinkFormWarnings() {
         var form = document.getElementById('addLinkForm');
@@ -1316,6 +1340,7 @@
             alert(i18n.fillRequired || 'Please fill in all required fields');
             return;
         }
+        data.expectedTopologyRevision = topologyRevision;
         var btn = document.getElementById('quickLinkSubmit');
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>'; }
         try {
@@ -1324,56 +1349,13 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data),
             });
-            if (!res.ok) {
-                var err = await res.json();
-                showToast((i18n.networkError || 'Error') + ': ' + (err.error || ''), 'error');
-                return;
-            }
+            if (!await handleDraftMutationResponse(res)) return;
             closeQuickModal();
             loadTopology();
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
             if (btn) { btn.disabled = false; btn.innerHTML = '<i class="ti ti-plus"></i> ' + (i18n.createLink || 'Create'); }
-        }
-    }
-
-    // ==================== RECONNECT MODAL ====================
-
-    function closeReconnectModal() {
-        var modal = document.getElementById('reconnectModal');
-        if (modal) modal.classList.remove('active');
-    }
-
-    async function onReconnectSubmit() {
-        var linkId = document.getElementById('reconnectLinkId')?.value;
-        var mode = document.getElementById('reconnectMode')?.value;
-        var nodeId = document.getElementById('reconnectNodeSelect')?.value;
-        if (!linkId || !nodeId) return;
-
-        var btn = document.getElementById('reconnectModalSubmit');
-        if (btn) { btn.disabled = true; }
-        try {
-            var body = {};
-            body[mode === 'bridge' ? 'bridgeNodeId' : 'portalNodeId'] = nodeId;
-            var res = await fetch('/api/cascade/links/' + linkId + '/reconnect', {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            if (res.ok) {
-                showToast(i18n.reconnectSuccess || 'Reconnected');
-                closeReconnectModal();
-                closeInfoModal();
-                loadTopology();
-            } else {
-                var data = await res.json();
-                showToast((i18n.reconnectFailed || 'Failed') + ': ' + (data.error || ''), 'error');
-            }
-        } catch (err) {
-            showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
-        } finally {
-            if (btn) { btn.disabled = false; }
         }
     }
 
