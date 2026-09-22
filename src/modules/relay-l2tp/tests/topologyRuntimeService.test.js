@@ -256,6 +256,66 @@ test('selects the lowest-priority candidate whose injected health is explicitly 
     });
 });
 
+test('preserves disabled paths from the runtime query through compiler selection', async () => {
+    const HyNode = createReadModel([
+        { _id: 'portal-1', cascadeRole: 'portal' },
+        { _id: 'relay-1', cascadeRole: 'relay' },
+        { _id: 'bridge-primary', cascadeRole: 'bridge' },
+        { _id: 'bridge-secondary', cascadeRole: 'bridge' },
+    ]);
+    const CascadeLink = createReadModel([
+        { _id: 'entry', portalNode: 'portal-1', bridgeNode: 'relay-1', mode: 'forward' },
+        { _id: 'primary-exit', portalNode: 'relay-1', bridgeNode: 'bridge-primary', mode: 'forward' },
+        { _id: 'secondary-exit', portalNode: 'relay-1', bridgeNode: 'bridge-secondary', mode: 'forward' },
+    ]);
+    const CascadeRouteGroup = createReadModel([{
+        _id: 'group-a',
+        mode: 'forward',
+        strategy: 'priority-failover',
+        paths: [
+            {
+                pathKey: 'primary',
+                linkIds: ['entry', 'primary-exit'],
+                priority: 10,
+                enabled: false,
+            },
+            {
+                pathKey: 'secondary',
+                linkIds: ['entry', 'secondary-exit'],
+                priority: 20,
+                enabled: true,
+            },
+        ],
+    }]);
+    const runtime = new TopologyRuntimeService({
+        HyNode,
+        CascadeLink,
+        CascadeRouteGroup,
+        compiler: compileTopology,
+        healthByPathKey: {
+            'group-a:primary': true,
+            'group-a:secondary': true,
+        },
+    });
+
+    const plan = await runtime.getRelayGroupPlan('relay-1', 'group-a');
+
+    assert.ok(GROUP_TOPOLOGY_SELECT.split(/\s+/).includes('paths.enabled'));
+    assert.deepEqual(
+        plan.candidates.map(({ pathKey, enabled }) => ({ pathKey, enabled })),
+        [
+            { pathKey: 'primary', enabled: false },
+            { pathKey: 'secondary', enabled: true },
+        ],
+    );
+    assert.deepEqual(plan.decision, {
+        decision: 'select',
+        groupId: 'group-a',
+        pathKey: 'secondary',
+        nextHopNodeId: 'bridge-secondary',
+    });
+});
+
 test('queries lean allowlisted fields, performs no writes, and compiles a deterministic secret-free snapshot', async () => {
     const HyNode = createReadModel([
         {
@@ -343,6 +403,7 @@ test('queries lean allowlisted fields, performs no writes, and compiles a determ
                 pathKey: 'primary',
                 linkIds: ['link-a', 'link-b'],
                 priority: 10,
+                enabled: true,
             }],
         }],
         healthByPathKey: { 'group-a:primary': true },

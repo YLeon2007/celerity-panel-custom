@@ -42,6 +42,7 @@ function projectGroups(groups) {
             pathKey: path.pathKey,
             linkIds: (path.linkIds || []).map(entityId),
             priority: path.priority,
+            enabled: path.enabled !== false,
         })),
     }));
 }

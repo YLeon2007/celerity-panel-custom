@@ -27,6 +27,7 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
                     groupId,
                     pathKey: path.pathKey,
                     priority: path.priority,
+                    enabled: path.enabled !== false,
                     nextHopNodeId: pathLinks[index].target,
                     suffixLinks: pathLinks.slice(index).map(link => ({ ...link })),
                 };
@@ -61,7 +62,7 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
                 routeGroup.candidates.map(candidate => ({
                     key: candidate.pathKey,
                     priority: candidate.priority,
-                    enabled: true,
+                    enabled: candidate.enabled,
                     complete: !validation.errors.some(error =>
                         error.groupId === routeGroup.groupId && error.pathKey === candidate.pathKey
                     ),

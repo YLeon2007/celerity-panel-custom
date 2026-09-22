@@ -58,6 +58,7 @@ test('resolves ordered route-group linkIds into relay suffixes and a scoped deci
         groupId: GROUP_ID,
         pathKey: 'primary',
         priority: 10,
+        enabled: true,
         nextHopNodeId: RELAY_2_ID,
         suffixLinks: [
             { id: RELAY_RELAY_LINK_ID, source: RELAY_1_ID, target: RELAY_2_ID, mode: 'forward' },
@@ -129,6 +130,7 @@ test('compiles a relay candidate from only its downstream L2TP suffix', () => {
         groupId: 'group-primary',
         pathKey: 'path-primary',
         priority: 10,
+        enabled: true,
         nextHopNodeId: 'relay-2',
         suffixLinks: [
             { id: 'relay-1-relay-2', source: 'relay-1', target: 'relay-2', mode: 'forward' },
@@ -148,6 +150,30 @@ test('selects the healthy lowest-priority candidate and declares its next hop', 
         groupId: 'group-primary',
         pathKey: 'path-primary',
         nextHopNodeId: 'relay-2',
+    });
+});
+
+test('preserves disabled candidates and excludes them from path selection', () => {
+    const topology = twoPathTopology();
+    topology.groups[0].paths[0].enabled = false;
+    topology.groups[0].paths[1].enabled = true;
+
+    const compiled = compileTopology(topology);
+    const relay = compiled.relays.find(candidate => candidate.nodeId === 'relay-1');
+    const routeGroup = relay.routeGroups.find(entry => entry.groupId === 'group-primary');
+
+    assert.deepEqual(
+        routeGroup.candidates.map(({ pathKey, enabled }) => ({ pathKey, enabled })),
+        [
+            { pathKey: 'path-primary', enabled: false },
+            { pathKey: 'path-secondary', enabled: true },
+        ],
+    );
+    assert.deepEqual(routeGroup.decision, {
+        decision: 'select',
+        groupId: 'group-primary',
+        pathKey: 'path-secondary',
+        nextHopNodeId: 'relay-3',
     });
 });
 
@@ -225,6 +251,7 @@ test('isolates same-named paths by route group with scoped health decisions', ()
                 groupId: 'group-a',
                 pathKey: 'primary',
                 priority: 10,
+                enabled: true,
                 nextHopNodeId: 'relay-a',
                 suffixLinks: [
                     { id: 'relay-1-relay-a', source: 'relay-1', target: 'relay-a', mode: 'forward' },
@@ -244,6 +271,7 @@ test('isolates same-named paths by route group with scoped health decisions', ()
                 groupId: 'group-b',
                 pathKey: 'primary',
                 priority: 20,
+                enabled: true,
                 nextHopNodeId: 'relay-b',
                 suffixLinks: [
                     { id: 'relay-1-relay-b', source: 'relay-1', target: 'relay-b', mode: 'forward' },

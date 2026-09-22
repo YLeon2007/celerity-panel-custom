@@ -145,6 +145,17 @@ test('reads the transactional topology snapshot without parallel session operati
     });
 });
 
+test('projects path enablement into topology draft snapshots', async () => {
+    const trace = [];
+    const session = { id: 'projection-session' };
+    const repository = new TopologyDraftRepository(createModels(trace, session));
+
+    await repository.readDraft(session);
+
+    const groupProjection = trace.find(entry => entry.label === 'groups.select');
+    assert.ok(groupProjection.paths.split(/\s+/).includes('paths.enabled'));
+});
+
 test('persists link and route-group updates and deletes with validators in one session', async () => {
     const trace = [];
     const session = { id: 'mutation-session' };
@@ -234,6 +245,100 @@ test('maps a concurrent initial singleton CAS collision to a stale revision erro
             return true;
         },
     );
+});
+
+test('aborts before entity mutation or revision advance when draft preparation fails', async () => {
+    const trace = [];
+    const session = { id: 'validation-failure-transaction' };
+    const repository = new TopologyDraftRepository(createModels(trace, session));
+    const validationError = new Error('candidate validation failed');
+
+    await assert.rejects(
+        repository.commitDraft({
+            expectedRevision: 7,
+            prepare: async () => { throw validationError; },
+        }),
+        validationError,
+    );
+
+    assert.equal(trace.some(entry => [
+        'links.create',
+        'links.updateOne',
+        'links.deleteOne',
+        'groups.create',
+        'groups.updateOne',
+        'groups.deleteOne',
+        'topology.cas',
+    ].includes(entry.label)), false);
+    assert.equal(trace.some(entry => entry.label === 'transaction.commit'), false);
+});
+
+test('rolls back entity mutation when the topology revision CAS fails', async () => {
+    const trace = [];
+    const session = { id: 'cas-failure-transaction' };
+    const state = {
+        links: [],
+        revision: 7,
+        deployedRevision: 5,
+    };
+    const models = createModels(trace, session);
+    models.CascadeTopologyState.findById = id => {
+        trace.push({ label: 'topology.findById', id });
+        return queryResult({
+            revision: state.revision,
+            deployedRevision: state.deployedRevision,
+        }, trace, 'topology');
+    };
+    models.CascadeLink.create = async (documents, options) => {
+        trace.push({ label: 'links.create', documents, options });
+        state.links.push(...documents);
+        return documents;
+    };
+    models.CascadeTopologyState.findOneAndUpdate = (filter, update, options) => {
+        trace.push({ label: 'topology.cas', filter, update, options });
+        return queryResult(null, trace, 'topology.cas');
+    };
+    models.transactionRunner = async work => {
+        const before = structuredClone(state);
+        trace.push({ label: 'transaction.begin', session });
+        try {
+            const result = await work(session);
+            trace.push({ label: 'transaction.commit', session });
+            return result;
+        } catch (error) {
+            state.links = before.links;
+            state.revision = before.revision;
+            state.deployedRevision = before.deployedRevision;
+            trace.push({ label: 'transaction.abort', session });
+            throw error;
+        }
+    };
+    const repository = new TopologyDraftRepository(models);
+
+    await assert.rejects(
+        repository.commitDraft({
+            expectedRevision: 7,
+            prepare: async () => ({
+                mutation: {
+                    kind: 'link.create',
+                    document: { _id: 'link-1' },
+                },
+            }),
+        }),
+        error => {
+            assert.equal(error.code, 'STALE_TOPOLOGY_REVISION');
+            return true;
+        },
+    );
+
+    assert.equal(trace.filter(entry => entry.label === 'links.create').length, 1);
+    assert.equal(trace.filter(entry => entry.label === 'topology.cas').length, 1);
+    assert.equal(trace.filter(entry => entry.label === 'transaction.abort').length, 1);
+    assert.deepEqual(state, {
+        links: [],
+        revision: 7,
+        deployedRevision: 5,
+    });
 });
 
 test('persists a route-group draft in the same revision transaction', async () => {

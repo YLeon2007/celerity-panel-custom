@@ -12,7 +12,7 @@ const LINK_TOPOLOGY_FILTER = Object.freeze({ active: true });
 const GROUP_TOPOLOGY_FILTER = Object.freeze({});
 const NODE_TOPOLOGY_SELECT = '_id cascadeRole';
 const LINK_TOPOLOGY_SELECT = '_id portalNode bridgeNode mode';
-const GROUP_TOPOLOGY_SELECT = '_id mode strategy paths.pathKey paths.linkIds paths.priority';
+const GROUP_TOPOLOGY_SELECT = '_id mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 
 function stringId(value) {
     if (value === undefined || value === null) return null;
@@ -60,6 +60,7 @@ function projectGroups(rows) {
                     pathKey: path.pathKey,
                     linkIds: (path.linkIds || []).map(stringId),
                     priority: path.priority,
+                    enabled: path.enabled !== false,
                 }))
                 .sort((left, right) => String(left.pathKey).localeCompare(String(right.pathKey))),
         }))
