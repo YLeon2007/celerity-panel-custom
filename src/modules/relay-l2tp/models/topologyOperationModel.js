@@ -21,6 +21,22 @@ const NODE_STATES = [
 const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
+const topologyCheckSchema = new mongoose.Schema({
+    type: {
+        type: String,
+        enum: ['service', 'port'],
+        required: true,
+    },
+    serviceUnit: { type: String },
+    protocol: { type: String, enum: ['tcp'] },
+    port: { type: Number, min: 1, max: 65535 },
+    expectedState: {
+        type: String,
+        enum: ['active', 'listening'],
+        required: true,
+    },
+}, { _id: false, strict: true });
+
 const topologyCandidateSchema = new mongoose.Schema({
     mediaType: {
         type: String,
@@ -44,6 +60,26 @@ const topologyNodeSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'HyNode',
         required: true,
+    },
+    nodeRef: {
+        type: String,
+        match: /^(?:portal|bridge|relay-[1-9][0-9]*)$/,
+        required: true,
+    },
+    role: {
+        type: String,
+        enum: ['portal', 'relay', 'bridge'],
+        required: true,
+    },
+    targetProfile: {
+        type: String,
+        enum: ['xray-main', 'xray-bridge'],
+        required: true,
+    },
+    checks: {
+        type: [topologyCheckSchema],
+        required: true,
+        default: undefined,
     },
     state: {
         type: String,

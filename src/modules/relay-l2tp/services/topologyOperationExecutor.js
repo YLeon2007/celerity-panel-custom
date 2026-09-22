@@ -8,11 +8,12 @@ const {
 const {
     TopologyRunnerBootstrapper,
 } = require('./topologyRunnerBootstrapper');
+const {
+    projectCanonicalXrayCandidate,
+} = require('./topologyXrayCandidate');
 
 const TEST_TARGET = 'test';
-const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 const CONTEXT_KEYS = Object.freeze([
     'node',
     'operationId',
@@ -34,17 +35,6 @@ const NODE_KEYS = Object.freeze([
     'role',
     'serviceUnit',
     'serviceUnitPath',
-    'targetProfile',
-]);
-const CANDIDATE_KEYS = Object.freeze(['bytes', 'mediaType', 'sha256']);
-const CANDIDATE_DOCUMENT_KEYS = Object.freeze([
-    'checks',
-    'kind',
-    'links',
-    'mode',
-    'nodeRef',
-    'role',
-    'schemaVersion',
     'targetProfile',
 ]);
 const RECEIPT_KEYS = Object.freeze([
@@ -117,6 +107,25 @@ function validNodeRef(role, nodeRef) {
     return nodeRef === role;
 }
 
+function validChecks(checks, target) {
+    return Array.isArray(checks) && checks.every(check => {
+        if (check?.type === 'service') {
+            return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
+                && check.serviceUnit === target.serviceUnit
+                && check.expectedState === 'active';
+        }
+        if (check?.type === 'port') {
+            return hasExactKeys(check, ['expectedState', 'port', 'protocol', 'type'])
+                && check.protocol === 'tcp'
+                && Number.isSafeInteger(check.port)
+                && check.port >= 1
+                && check.port <= 65535
+                && check.expectedState === 'listening';
+        }
+        return false;
+    });
+}
+
 function projectFrozenNode(context) {
     if (!hasExactKeys(context, CONTEXT_KEYS)
         || typeof context.operationId !== 'string'
@@ -141,47 +150,18 @@ function projectFrozenNode(context) {
         || node.serviceUnit !== target.serviceUnit
         || node.serviceUnitPath !== target.serviceUnitPath
         || node.configPath !== target.configPath
-        || !Array.isArray(node.checks)
-        || !hasExactKeys(node.candidate, CANDIDATE_KEYS)
-        || node.candidate.mediaType !== CANDIDATE_MEDIA_TYPE
-        || !Array.isArray(node.candidate.bytes)
-        || node.candidate.bytes.length === 0
-        || node.candidate.bytes.length > 4 * 1024 * 1024
-        || node.candidate.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
-        || typeof node.candidate.sha256 !== 'string'
-        || !DIGEST_PATTERN.test(node.candidate.sha256)
-        || node.candidateHash !== node.candidate.sha256) {
+        || !validChecks(node.checks, target)) {
         throw invalidPlan();
     }
 
-    const content = Buffer.from(node.candidate.bytes).toString('utf8');
-    const digest = createHash('sha256').update(content).digest('hex');
-    if (digest !== node.candidate.sha256
-        || !Buffer.from(content, 'utf8').equals(Buffer.from(node.candidate.bytes))) {
-        throw invalidPlan();
-    }
-    let candidateDocument;
+    let projectedCandidate;
     try {
-        candidateDocument = JSON.parse(content);
+        projectedCandidate = projectCanonicalXrayCandidate(node.candidate, node.candidateHash);
     } catch {
         throw invalidPlan();
     }
-    if (!content.endsWith('\n')
-        || content.slice(0, -1).includes('\n')
-        || !hasExactKeys(candidateDocument, CANDIDATE_DOCUMENT_KEYS)
-        || candidateDocument.schemaVersion !== 1
-        || candidateDocument.kind !== 'xray-topology-node-candidate'
-        || !['forward', 'reverse'].includes(candidateDocument.mode)
-        || candidateDocument.nodeRef !== node.nodeRef
-        || candidateDocument.role !== node.role
-        || candidateDocument.targetProfile !== node.targetProfile
-        || !Array.isArray(candidateDocument.links)
-        || !Array.isArray(candidateDocument.checks)
-        || JSON.stringify(candidateDocument.checks) !== JSON.stringify(node.checks)) {
-        throw invalidPlan();
-    }
-
-    const candidateHash = `sha256:${digest}`;
+    const content = projectedCandidate.content;
+    const candidateHash = `sha256:${node.candidateHash}`;
     const backupId = `topology-${createHash('sha256').update([
         context.operationId,
         node.node,

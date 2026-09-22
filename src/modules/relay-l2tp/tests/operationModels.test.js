@@ -411,6 +411,14 @@ test('topology operation retains durable per-node deployment state', () => {
         const operation = topologyOperation({
             nodes: [{
                 node: objectId(),
+                nodeRef: 'portal',
+                role: 'portal',
+                targetProfile: 'xray-main',
+                checks: [{
+                    type: 'service',
+                    serviceUnit: 'xray.service',
+                    expectedState: 'active',
+                }],
                 state,
                 candidateHash: candidate.sha256,
                 candidate,
@@ -420,6 +428,17 @@ test('topology operation retains durable per-node deployment state', () => {
 
         assert.equal(operation.validateSync(), undefined);
         assert.equal(operation.nodes[0].candidateHash, candidate.sha256);
+        assert.equal(operation.nodes[0].nodeRef, 'portal');
+        assert.equal(operation.nodes[0].role, 'portal');
+        assert.equal(operation.nodes[0].targetProfile, 'xray-main');
+        assert.deepEqual(
+            operation.nodes[0].checks.map(check => check.toObject()),
+            [{
+                type: 'service',
+                serviceUnit: 'xray.service',
+                expectedState: 'active',
+            }],
+        );
         assert.deepEqual(operation.nodes[0].candidate.toObject(), {
             mediaType: candidate.mediaType,
             bytes: candidate.bytes,

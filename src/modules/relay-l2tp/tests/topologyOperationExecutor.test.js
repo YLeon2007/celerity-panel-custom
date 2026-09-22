@@ -8,23 +8,32 @@ const {
     TopologyOperationExecutor,
 } = require('../services/topologyOperationExecutor');
 
-function candidateContent({ role, nodeRef, targetProfile, checks = [] }) {
-    return `${JSON.stringify({
-        schemaVersion: 1,
-        kind: 'xray-topology-node-candidate',
-        mode: 'forward',
-        nodeRef,
-        role,
-        targetProfile,
-        links: [],
-        checks,
-    })}\n`;
+function canonicalize(value) {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalize(value[key])]),
+    );
+}
+
+function candidateContent({ nodeRef }) {
+    return `${JSON.stringify(canonicalize({
+        inbounds: [{ tag: `client-${nodeRef}` }],
+        outbounds: [{ tag: 'direct' }],
+        routing: { rules: [] },
+    }))}\n`;
+}
+
+function candidateArtifact(content) {
+    return {
+        mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
+        bytes: [...Buffer.from(content)],
+        sha256: createHash('sha256').update(content).digest('hex'),
+    };
 }
 
 const CANDIDATE_CONTENT = candidateContent({
-    role: 'portal',
     nodeRef: 'portal',
-    targetProfile: 'xray-main',
 });
 const CANDIDATE_DIGEST = createHash('sha256').update(CANDIDATE_CONTENT).digest('hex');
 
@@ -40,8 +49,8 @@ function frozenNode(overrides = {}) {
         || (role === 'portal' ? 'xray-main' : 'xray-bridge');
     const nodeRef = overrides.nodeRef || (role === 'relay' ? 'relay-1' : role);
     const checks = overrides.checks || [];
-    const content = candidateContent({ role, nodeRef, targetProfile, checks });
-    const digest = createHash('sha256').update(content).digest('hex');
+    const content = candidateContent({ nodeRef });
+    const candidate = candidateArtifact(content);
     return deepFreeze({
         nodeRef,
         role,
@@ -53,14 +62,10 @@ function frozenNode(overrides = {}) {
         configPath: targetProfile === 'xray-main'
             ? '/usr/local/etc/xray/config.json'
             : '/usr/local/etc/xray-bridge/config.json',
-        candidate: {
-            mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
-            bytes: [...Buffer.from(content)],
-            sha256: digest,
-        },
+        candidate,
         checks,
         node: overrides.node || `${role}-node`,
-        candidateHash: digest,
+        candidateHash: candidate.sha256,
         ...overrides,
     });
 }
@@ -346,20 +351,32 @@ test('fails closed outside test and rejects non-frozen, role-mismatched, or expa
         error => error?.code === 'INVALID_EXECUTOR_CONFIGURATION',
     );
 
-    const portalCandidate = frozenNode();
+    const legacyContent = `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'xray-topology-node-candidate',
+        mode: 'forward',
+        nodeRef: 'portal',
+        role: 'portal',
+        targetProfile: 'xray-main',
+        links: [],
+        checks: [],
+    })}\n`;
+    const legacyCandidate = candidateArtifact(legacyContent);
+    const nonCanonicalContent = `${JSON.stringify({
+        outbounds: [],
+        inbounds: [],
+    }, null, 2)}\n`;
+    const nonCanonicalCandidate = candidateArtifact(nonCanonicalContent);
     const invalidContexts = [
         prepareContext({ ...frozenNode() }),
         prepareContext(frozenNode({ targetProfile: 'xray-bridge' })),
         prepareContext(frozenNode({
-            role: 'bridge',
-            node: 'bridge-node',
-            nodeRef: 'bridge',
-            targetProfile: 'xray-bridge',
-            serviceUnit: 'xray-bridge.service',
-            serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
-            configPath: '/usr/local/etc/xray-bridge/config.json',
-            candidate: portalCandidate.candidate,
-            candidateHash: portalCandidate.candidateHash,
+            candidate: legacyCandidate,
+            candidateHash: legacyCandidate.sha256,
+        })),
+        prepareContext(frozenNode({
+            candidate: nonCanonicalCandidate,
+            candidateHash: nonCanonicalCandidate.sha256,
         })),
         { ...prepareContext(), users: [{ password: 'user-secret-canary' }] },
         prepareContext(deepFreeze({

@@ -1,5 +1,9 @@
 'use strict';
 
+const {
+    projectCanonicalXrayCandidate,
+} = require('../services/topologyXrayCandidate');
+
 const ACTIVE_STATUSES = Object.freeze([
     'preparing',
     'committing',
@@ -7,6 +11,26 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['prepared', 'committed', 'failed', 'rolled_back']);
+const TARGET_BY_ROLE = Object.freeze({
+    portal: Object.freeze({
+        targetProfile: 'xray-main',
+        serviceUnit: 'xray.service',
+        serviceUnitPath: '/etc/systemd/system/xray.service',
+        configPath: '/usr/local/etc/xray/config.json',
+    }),
+    relay: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+    bridge: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+});
 const CLAIM_PROJECTION = Object.freeze({
     _id: 1,
     topologyRevision: 1,
@@ -16,6 +40,10 @@ const CLAIM_PROJECTION = Object.freeze({
     leaseOwner: 1,
     leaseUntil: 1,
     'nodes.node': 1,
+    'nodes.nodeRef': 1,
+    'nodes.role': 1,
+    'nodes.targetProfile': 1,
+    'nodes.checks': 1,
     'nodes.state': 1,
     'nodes.candidateHash': 1,
     'nodes.candidate.mediaType': 1,
@@ -28,17 +56,67 @@ function operationId(value) {
     return value === null || value === undefined ? '' : String(value);
 }
 
-function durableCandidate(candidate) {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
-        || typeof candidate.mediaType !== 'string'
-        || !Array.isArray(candidate.bytes)
-        || typeof candidate.sha256 !== 'string') {
-        throw new TypeError('Topology operation requires a durable candidate artifact');
+function hasExactKeys(value, keys) {
+    return Boolean(value)
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(keys);
+}
+
+function validNodeRef(role, nodeRef) {
+    if (role === 'relay') return /^relay-[1-9][0-9]*$/.test(nodeRef);
+    return nodeRef === role;
+}
+
+function validChecks(checks, target) {
+    return Array.isArray(checks) && checks.every(check => {
+        if (check?.type === 'service') {
+            return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
+                && check.serviceUnit === target.serviceUnit
+                && check.expectedState === 'active';
+        }
+        if (check?.type === 'port') {
+            return hasExactKeys(check, ['expectedState', 'port', 'protocol', 'type'])
+                && check.protocol === 'tcp'
+                && Number.isSafeInteger(check.port)
+                && check.port >= 1
+                && check.port <= 65535
+                && check.expectedState === 'listening';
+        }
+        return false;
+    });
+}
+
+function durableCandidate(candidate, candidateHash) {
+    const projected = {
+        mediaType: candidate?.mediaType,
+        bytes: Array.isArray(candidate?.bytes) ? [...candidate.bytes] : candidate?.bytes,
+        sha256: candidate?.sha256,
+    };
+    return projectCanonicalXrayCandidate(projected, candidateHash).candidate;
+}
+
+function durableNodeMetadata(node) {
+    const target = TARGET_BY_ROLE[node?.role];
+    if (!target
+        || !validNodeRef(node.role, node.nodeRef)
+        || node.targetProfile !== target.targetProfile
+        || node.serviceUnit !== target.serviceUnit
+        || node.serviceUnitPath !== target.serviceUnitPath
+        || node.configPath !== target.configPath
+        || !validChecks(node.checks, target)) {
+        throw new TypeError('Topology operation requires bound node metadata');
     }
     return {
-        mediaType: candidate.mediaType,
-        bytes: [...candidate.bytes],
-        sha256: candidate.sha256,
+        node: node.node,
+        nodeRef: node.nodeRef,
+        role: node.role,
+        targetProfile: node.targetProfile,
+        checks: node.checks.map(check => ({ ...check })),
+        state: 'pending',
+        candidateHash: node.candidateHash,
+        candidate: durableCandidate(node.candidate, node.candidateHash),
+        backupId: '',
     };
 }
 
@@ -59,13 +137,7 @@ class TopologyOperationRepository {
         nodes,
     }) {
         const metadata = nodes
-            .map(node => ({
-                node: node.node,
-                state: 'pending',
-                candidateHash: node.candidateHash,
-                candidate: durableCandidate(node.candidate),
-                backupId: '',
-            }))
+            .map(durableNodeMetadata)
             .sort((left, right) => operationId(left.node).localeCompare(operationId(right.node)));
         return this.model.create({
             _id: id,

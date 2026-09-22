@@ -35,6 +35,14 @@ function deepFreeze(value) {
     return Object.freeze(value);
 }
 
+function canonicalize(value) {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalize(value[key])]),
+    );
+}
+
 function frozenNode(node, role, nodeRef) {
     const target = TARGET_BY_ROLE[role];
     const checks = [{
@@ -42,16 +50,11 @@ function frozenNode(node, role, nodeRef) {
         serviceUnit: target.serviceUnit,
         expectedState: 'active',
     }];
-    const content = `${JSON.stringify({
-        schemaVersion: 1,
-        kind: 'xray-topology-node-candidate',
-        mode: 'forward',
-        nodeRef,
-        role,
-        targetProfile: target.targetProfile,
-        links: [],
-        checks,
-    })}\n`;
+    const content = `${JSON.stringify(canonicalize({
+        inbounds: [{ tag: `client-${nodeRef}` }],
+        outbounds: [{ tag: 'direct' }],
+        routing: { rules: [] },
+    }))}\n`;
     const sha256 = createHash('sha256').update(content).digest('hex');
     return deepFreeze({
         node,
@@ -71,6 +74,10 @@ function frozenNode(node, role, nodeRef) {
 function durableNode(node, state = 'pending') {
     return {
         node: node.node,
+        nodeRef: node.nodeRef,
+        role: node.role,
+        targetProfile: node.targetProfile,
+        checks: structuredClone(node.checks),
         state,
         candidateHash: node.candidateHash,
         candidate: {
@@ -278,8 +285,53 @@ test('altered durable candidate hash fails the fenced claim without executor use
     assert.equal(repository.calls[1].request.status, 'failed');
 });
 
+test('legacy metadata-only durable candidates fail before executor use', async () => {
+    const operation = durableOperation();
+    for (const node of operation.nodes) {
+        const legacyContent = `${JSON.stringify({
+            schemaVersion: 1,
+            kind: 'xray-topology-node-candidate',
+            mode: 'forward',
+            nodeRef: node.nodeRef,
+            role: node.role,
+            targetProfile: node.targetProfile,
+            links: [],
+            checks: node.checks,
+        })}\n`;
+        const sha256 = createHash('sha256').update(legacyContent).digest('hex');
+        node.candidate = {
+            mediaType: CANDIDATE_MEDIA_TYPE,
+            bytes: [...Buffer.from(legacyContent, 'utf8')],
+            sha256,
+        };
+        node.candidateHash = sha256;
+    }
+    const repository = createRepository(operation);
+    let executorCalls = 0;
+    const forbidden = async () => {
+        executorCalls += 1;
+        throw new Error('executor must not run');
+    };
+    const worker = createWorker({
+        repository,
+        executor: {
+            prepare: forbidden,
+            commit: forbidden,
+            verify: forbidden,
+            cleanupPrepared: forbidden,
+            rollback: forbidden,
+        },
+        deploymentRepository: { markDeployed: forbidden },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'failed');
+    assert.equal(executorCalls, 0);
+    assert.deepEqual(repository.calls.map(call => call.method), ['claim', 'finishClaimed']);
+});
+
 test('prepares every node before deterministic commit and verify then fences deployed revision', async () => {
-    const plan = frozenPlan();
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -314,8 +366,8 @@ test('prepares every node before deterministic commit and verify then fences dep
     };
     const worker = createWorker({ repository, executor, deploymentRepository });
 
-    const first = await worker.run(plan);
-    const second = await worker.run(plan);
+    const first = await worker.run('operation-1');
+    const second = await worker.run('operation-1');
 
     assert.deepEqual(first, {
         claimed: true,
@@ -348,7 +400,6 @@ test('prepares every node before deterministic commit and verify then fences dep
 });
 
 test('prepare failure cleans only prepared nodes and performs no commits', async () => {
-    const plan = frozenPlan();
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -382,7 +433,7 @@ test('prepare failure cleans only prepared nodes and performs no commits', async
         deploymentRepository: { async markDeployed() { throw new Error('must not finalize'); } },
     });
 
-    const result = await worker.run(plan);
+    const result = await worker.run('operation-1');
 
     assert.deepEqual(result, {
         claimed: true,
@@ -432,7 +483,7 @@ test('commit failure rolls back the current and prior committed nodes in reverse
         deploymentRepository: { async markDeployed() { throw new Error('must not finalize'); } },
     });
 
-    const result = await worker.run(frozenThreeNodePlan());
+    const result = await worker.run('operation-1');
 
     assert.equal(result.status, 'rolled_back');
     assert.deepEqual(events.filter(event => event.method === 'rollback'), [
@@ -483,7 +534,7 @@ test('deployed revision finalizer failure rolls back every changed node and cann
         },
     });
 
-    const result = await worker.run(frozenPlan());
+    const result = await worker.run('operation-1');
 
     assert.equal(result.status, 'rolled_back');
     assert.deepEqual(events, [
@@ -535,7 +586,7 @@ test('verify failure continues reverse rollback and fails terminally when one ro
         deploymentRepository: { async markDeployed() { throw new Error('must not finalize'); } },
     });
 
-    const result = await worker.run(frozenThreeNodePlan());
+    const result = await worker.run('operation-1');
 
     assert.equal(result.status, 'failed');
     assert.deepEqual(events.filter(event => event.method === 'rollback'), [
@@ -574,7 +625,7 @@ test('terminal metadata failure is fenced by the current owner and fresh lease',
         deploymentRepository: { markDeployed: forbidden },
     });
 
-    const result = await worker.run(frozenPlan());
+    const result = await worker.run('operation-1');
 
     assert.deepEqual(result, {
         claimed: true,

@@ -1,6 +1,8 @@
 'use strict';
 
-const { createHash } = require('node:crypto');
+const {
+    projectCanonicalXrayCandidate,
+} = require('../services/topologyXrayCandidate');
 
 const EXECUTOR_METHODS = Object.freeze([
     'prepare',
@@ -9,20 +11,7 @@ const EXECUTOR_METHODS = Object.freeze([
     'cleanupPrepared',
     'rollback',
 ]);
-const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
-const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const CANDIDATE_KEYS = Object.freeze(['bytes', 'mediaType', 'sha256']);
-const CANDIDATE_DOCUMENT_KEYS = Object.freeze([
-    'checks',
-    'kind',
-    'links',
-    'mode',
-    'nodeRef',
-    'role',
-    'schemaVersion',
-    'targetProfile',
-]);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -77,18 +66,6 @@ function validNodeRef(role, nodeRef) {
     return nodeRef === role;
 }
 
-function validLinks(links) {
-    return Array.isArray(links) && links.every(link => (
-        hasExactKeys(link, ['direction', 'linkRef', 'peerRef', 'port'])
-        && /^link-[1-9][0-9]*$/.test(link.linkRef)
-        && ['inbound', 'outbound'].includes(link.direction)
-        && /^(?:portal|bridge|relay-[1-9][0-9]*)$/.test(link.peerRef)
-        && Number.isSafeInteger(link.port)
-        && link.port >= 1
-        && link.port <= 65535
-    ));
-}
-
 function validChecks(checks, target) {
     return Array.isArray(checks) && checks.every(check => {
         if (check?.type === 'service') {
@@ -110,60 +87,35 @@ function validChecks(checks, target) {
 
 function durableNodePlan(metadata) {
     const node = entityId(metadata?.node);
-    const candidate = metadata?.candidate;
+    const target = TARGET_BY_ROLE[metadata?.role];
     if (!SAFE_ID_PATTERN.test(node)
         || metadata?.state !== 'pending'
         || metadata?.backupId !== ''
-        || !hasExactKeys(candidate, CANDIDATE_KEYS)
-        || candidate.mediaType !== CANDIDATE_MEDIA_TYPE
-        || !Array.isArray(candidate.bytes)
-        || candidate.bytes.length === 0
-        || candidate.bytes.length > 4 * 1024 * 1024
-        || candidate.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
-        || typeof candidate.sha256 !== 'string'
-        || !DIGEST_PATTERN.test(candidate.sha256)
-        || metadata.candidateHash !== candidate.sha256) {
+        || !target
+        || !validNodeRef(metadata.role, metadata.nodeRef)
+        || metadata.targetProfile !== target.targetProfile
+        || !validChecks(metadata.checks, target)) {
         throw new TypeError('Invalid durable topology candidate');
     }
 
-    const bytes = Buffer.from(candidate.bytes);
-    const content = bytes.toString('utf8');
-    if (!Buffer.from(content, 'utf8').equals(bytes)
-        || createHash('sha256').update(bytes).digest('hex') !== candidate.sha256) {
-        throw new TypeError('Invalid durable topology candidate');
-    }
-    let document;
+    let candidate;
     try {
-        document = JSON.parse(content);
+        candidate = projectCanonicalXrayCandidate(
+            metadata.candidate,
+            metadata.candidateHash,
+        ).candidate;
     } catch {
-        throw new TypeError('Invalid durable topology candidate');
-    }
-    const target = TARGET_BY_ROLE[document?.role];
-    if (content !== `${JSON.stringify(document)}\n`
-        || !hasExactKeys(document, CANDIDATE_DOCUMENT_KEYS)
-        || document.schemaVersion !== 1
-        || document.kind !== 'xray-topology-node-candidate'
-        || !['forward', 'reverse'].includes(document.mode)
-        || !target
-        || !validNodeRef(document.role, document.nodeRef)
-        || document.targetProfile !== target.targetProfile
-        || !validLinks(document.links)
-        || !validChecks(document.checks, target)) {
         throw new TypeError('Invalid durable topology candidate');
     }
 
     return {
         node,
-        nodeRef: document.nodeRef,
-        role: document.role,
+        nodeRef: metadata.nodeRef,
+        role: metadata.role,
         ...target,
-        candidate: {
-            mediaType: candidate.mediaType,
-            bytes: [...candidate.bytes],
-            sha256: candidate.sha256,
-        },
+        candidate,
         candidateHash: metadata.candidateHash,
-        checks: document.checks,
+        checks: metadata.checks.map(check => ({ ...check })),
     };
 }
 

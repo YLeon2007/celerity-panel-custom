@@ -11,21 +11,56 @@ const {
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
 
-function candidate(role, nodeRef, targetProfile) {
-    const content = `${JSON.stringify({
-        schemaVersion: 1,
-        kind: 'xray-topology-node-candidate',
-        mode: 'forward',
-        nodeRef,
-        role,
-        targetProfile,
-        links: [],
-        checks: [],
-    })}\n`;
+const TARGET_BY_ROLE = Object.freeze({
+    portal: Object.freeze({
+        targetProfile: 'xray-main',
+        serviceUnit: 'xray.service',
+        serviceUnitPath: '/etc/systemd/system/xray.service',
+        configPath: '/usr/local/etc/xray/config.json',
+    }),
+    bridge: Object.freeze({
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    }),
+});
+
+function canonicalize(value) {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalize(value[key])]),
+    );
+}
+
+function candidate(nodeRef) {
+    const content = `${JSON.stringify(canonicalize({
+        inbounds: [{ tag: `client-${nodeRef}` }],
+        outbounds: [{ tag: 'direct' }],
+        routing: { rules: [] },
+    }))}\n`;
     return {
         mediaType: CANDIDATE_MEDIA_TYPE,
         bytes: [...Buffer.from(content, 'utf8')],
         sha256: createHash('sha256').update(content).digest('hex'),
+    };
+}
+
+function nodePlan(node, role, nodeRef, artifact = candidate(nodeRef)) {
+    const target = TARGET_BY_ROLE[role];
+    return {
+        node,
+        nodeRef,
+        role,
+        ...target,
+        candidateHash: artifact.sha256,
+        candidate: artifact,
+        checks: [{
+            type: 'service',
+            serviceUnit: target.serviceUnit,
+            expectedState: 'active',
+        }],
     };
 }
 
@@ -51,8 +86,10 @@ function createModel() {
 test('createFrozen persists only sorted allowlisted durable candidate artifacts', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
-    const bridgeCandidate = candidate('bridge', 'bridge', 'xray-bridge');
-    const portalCandidate = candidate('portal', 'portal', 'xray-main');
+    const bridgeCandidate = candidate('bridge');
+    const portalCandidate = candidate('portal');
+    const bridge = nodePlan('node-b', 'bridge', 'bridge', bridgeCandidate);
+    const portal = nodePlan('node-a', 'portal', 'portal', portalCandidate);
 
     const created = await repository.createFrozen({
         operationId: 'operation-1',
@@ -60,8 +97,7 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
         priorDeployedRevision: 5,
         nodes: [
             {
-                node: 'node-b',
-                candidateHash: bridgeCandidate.sha256,
+                ...bridge,
                 candidate: {
                     ...bridgeCandidate,
                     sshPassword: 'ssh-secret-canary',
@@ -69,9 +105,7 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
                 rawShell: 'raw-shell-canary',
             },
             {
-                node: 'node-a',
-                candidateHash: portalCandidate.sha256,
-                candidate: portalCandidate,
+                ...portal,
                 tunnelPsk: 'tunnel-secret-canary',
             },
         ],
@@ -89,6 +123,10 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
         nodes: [
             {
                 node: 'node-a',
+                nodeRef: 'portal',
+                role: 'portal',
+                targetProfile: 'xray-main',
+                checks: portal.checks,
                 state: 'pending',
                 candidateHash: portalCandidate.sha256,
                 candidate: portalCandidate,
@@ -96,6 +134,10 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
             },
             {
                 node: 'node-b',
+                nodeRef: 'bridge',
+                role: 'bridge',
+                targetProfile: 'xray-bridge',
+                checks: bridge.checks,
                 state: 'pending',
                 candidateHash: bridgeCandidate.sha256,
                 candidate: bridgeCandidate,
@@ -109,6 +151,65 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
         JSON.stringify(model.calls),
         /sshPassword|rawShell|tunnelPsk|secret-canary|raw-shell-canary/i,
     );
+});
+
+test('createFrozen rejects legacy, non-canonical, hash-mismatched, or unbound candidates', async () => {
+    const legacyContent = `${JSON.stringify({
+        schemaVersion: 1,
+        kind: 'xray-topology-node-candidate',
+        mode: 'forward',
+        nodeRef: 'portal',
+        role: 'portal',
+        targetProfile: 'xray-main',
+        links: [],
+        checks: [],
+    })}\n`;
+    const legacy = {
+        mediaType: CANDIDATE_MEDIA_TYPE,
+        bytes: [...Buffer.from(legacyContent, 'utf8')],
+        sha256: createHash('sha256').update(legacyContent).digest('hex'),
+    };
+    const nonCanonicalContent = `${JSON.stringify({
+        outbounds: [],
+        inbounds: [],
+    }, null, 2)}\n`;
+    const nonCanonical = {
+        mediaType: CANDIDATE_MEDIA_TYPE,
+        bytes: [...Buffer.from(nonCanonicalContent, 'utf8')],
+        sha256: createHash('sha256').update(nonCanonicalContent).digest('hex'),
+    };
+    const incompleteContent = `${JSON.stringify(canonicalize({
+        inbounds: [],
+        outbounds: [],
+    }))}\n`;
+    const incomplete = {
+        mediaType: CANDIDATE_MEDIA_TYPE,
+        bytes: [...Buffer.from(incompleteContent, 'utf8')],
+        sha256: createHash('sha256').update(incompleteContent).digest('hex'),
+    };
+    const valid = nodePlan('node-a', 'portal', 'portal');
+    const invalidNodes = [
+        nodePlan('node-a', 'portal', 'portal', legacy),
+        nodePlan('node-a', 'portal', 'portal', nonCanonical),
+        nodePlan('node-a', 'portal', 'portal', incomplete),
+        { ...valid, candidateHash: '0'.repeat(64) },
+        { ...valid, targetProfile: 'xray-bridge' },
+    ];
+
+    for (const node of invalidNodes) {
+        const model = createModel();
+        const repository = new TopologyOperationRepository({ model });
+        await assert.rejects(
+            repository.createFrozen({
+                operationId: 'operation-1',
+                topologyRevision: 7,
+                priorDeployedRevision: 5,
+                nodes: [node],
+            }),
+            { name: 'TypeError' },
+        );
+        assert.deepEqual(model.calls, []);
+    }
 });
 
 test('claim reads only durable candidates and never resets later active phases', async () => {
@@ -171,6 +272,10 @@ test('claim reads only durable candidates and never resets later active phases',
                 leaseOwner: 1,
                 leaseUntil: 1,
                 'nodes.node': 1,
+                'nodes.nodeRef': 1,
+                'nodes.role': 1,
+                'nodes.targetProfile': 1,
+                'nodes.checks': 1,
                 'nodes.state': 1,
                 'nodes.candidateHash': 1,
                 'nodes.candidate.mediaType': 1,
