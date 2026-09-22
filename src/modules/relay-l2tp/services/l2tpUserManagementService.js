@@ -4,6 +4,7 @@ const defaultSecretBox = require('./secretBoxService');
 
 const LOGIN_PATTERN = /^[A-Za-z0-9._@-]{1,64}$/;
 const MAX_PASSWORD_LENGTH = 1024;
+const SAFE_SYNC_FAILURE_CODE = 'L2TP_USER_SYNC_FAILED';
 const CREATE_INPUT_FIELDS = Object.freeze(['login', 'ip', 'password', 'enabled']);
 const UPDATE_INPUT_FIELDS = Object.freeze(['login', 'ip', 'password', 'enabled']);
 const SAFE_USER_FIELDS = Object.freeze([
@@ -14,7 +15,6 @@ const SAFE_USER_FIELDS = Object.freeze([
     'appliedRevision',
     'syncStatus',
     'lastSyncedAt',
-    'lastErrorCode',
     'createdAt',
     'updatedAt',
 ]);
@@ -50,6 +50,14 @@ function safeUser(user) {
     if (relayNode !== null) result.relayNode = relayNode;
     for (const field of SAFE_USER_FIELDS) {
         if (user[field] !== undefined) result[field] = user[field];
+    }
+    if (user.syncOperationId !== undefined) {
+        result.syncOperationId = entityId(user.syncOperationId);
+    }
+    if (user.syncStatus === 'error') {
+        result.lastErrorCode = SAFE_SYNC_FAILURE_CODE;
+    } else if (user.lastErrorCode !== undefined) {
+        result.lastErrorCode = '';
     }
     return result;
 }
@@ -301,6 +309,7 @@ module.exports = {
     L2tpUserManagementError,
     L2tpUserManagementService,
     MAX_PASSWORD_LENGTH,
+    SAFE_SYNC_FAILURE_CODE,
     SAFE_USER_FIELDS,
     isCanonicalIpv4,
     safeUser,

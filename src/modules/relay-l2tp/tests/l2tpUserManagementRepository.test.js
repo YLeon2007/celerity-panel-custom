@@ -91,6 +91,7 @@ test('lists users with an explicit safe projection and deterministic order', asy
         { method: 'L2tpUser.find.lean' },
     ]);
     assert.doesNotMatch(SAFE_USER_SELECT, /password|cipher|secret/i);
+    assert.equal(SAFE_USER_SELECT.split(/\s+/).includes('syncOperationId'), true);
 });
 
 test('detects duplicate login or IP within one relay while excluding the updated user', async () => {
@@ -216,6 +217,7 @@ test('updates one relay-owned user, resets sync state, and returns the safe proj
                     passwordEncrypted: 'sealed-replacement',
                     desiredRevision: 8,
                     syncStatus: 'pending',
+                    syncOperationId: null,
                     lastErrorCode: '',
                     lastError: '',
                 },

@@ -44,6 +44,11 @@ const l2tpUserSchema = new mongoose.Schema({
         enum: SYNC_STATUSES,
         default: 'pending',
     },
+    syncOperationId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'L2tpOperation',
+        default: null,
+    },
     lastSyncedAt: { type: Date, default: null },
     lastErrorCode: { type: String, default: '' },
     lastError: { type: String, default: '' },

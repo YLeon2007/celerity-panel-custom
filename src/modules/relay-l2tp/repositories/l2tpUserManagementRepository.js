@@ -9,6 +9,7 @@ const SAFE_USER_FIELDS = Object.freeze([
     'desiredRevision',
     'appliedRevision',
     'syncStatus',
+    'syncOperationId',
     'lastSyncedAt',
     'lastErrorCode',
     'createdAt',
@@ -128,6 +129,7 @@ class L2tpUserManagementRepository {
                 $set: {
                     ...pickDefined(fields, UPDATE_USER_FIELDS),
                     syncStatus: 'pending',
+                    syncOperationId: null,
                     lastErrorCode: '',
                     lastError: '',
                 },

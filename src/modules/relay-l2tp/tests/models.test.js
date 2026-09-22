@@ -118,6 +118,13 @@ function assertValid(document, message) {
 }
 
 {
+    const syncOperationPath = L2tpUser.schema.path('syncOperationId');
+    assert.strictEqual(syncOperationPath.instance, 'ObjectId');
+    assert.strictEqual(syncOperationPath.options.ref, 'L2tpOperation');
+    assert.strictEqual(syncOperationPath.options.default, null);
+}
+
+{
     const ipPath = L2tpUser.schema.path('ip');
     assert.strictEqual(ipPath.options.required, true);
 

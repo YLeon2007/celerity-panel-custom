@@ -45,6 +45,7 @@ const DESIRED_STATE_SAFE_FIELDS = Object.freeze([
     'updatedAt',
 ]);
 const L2TP_USER_INPUT_FIELDS = Object.freeze(['login', 'ip', 'password', 'enabled']);
+const L2TP_USER_SYNC_FAILURE_CODE = 'L2TP_USER_SYNC_FAILED';
 const L2TP_USER_SAFE_FIELDS = Object.freeze([
     'id',
     'relayNode',
@@ -54,6 +55,7 @@ const L2TP_USER_SAFE_FIELDS = Object.freeze([
     'desiredRevision',
     'appliedRevision',
     'syncStatus',
+    'syncOperationId',
     'lastSyncedAt',
     'lastErrorCode',
     'createdAt',
@@ -103,6 +105,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['ACTIVE_OPERATION', 409],
     ['L2TP_OPERATION_ACTIVE', 409],
     ['L2TP_USER_CONFLICT', 409],
+    ['L2TP_USER_STALE_REVISION', 409],
+    ['L2TP_USER_REVISION_CONFLICT', 409],
     ['L2TP_NOT_CONFIGURED', 409],
     ['NODE_OPERATION_LOCK_CONFLICT', 409],
     ['CONFIG_DRIFT', 409],
@@ -115,6 +119,17 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['PREFLIGHT_CHECK_FAILED', 422],
     ['NO_HEALTHY_PATH', 422],
     ['INSTALL_PLAN_REJECTED', 422],
+]);
+
+const SAFE_ERROR_MESSAGE_BY_CODE = new Map([
+    [
+        'L2TP_USER_STALE_REVISION',
+        'The L2TP user changed before this request was applied',
+    ],
+    [
+        'L2TP_USER_REVISION_CONFLICT',
+        'The L2TP user revision conflicts with the current relay revision',
+    ],
 ]);
 
 function pickOperationInput(body = {}) {
@@ -152,7 +167,13 @@ function pickL2tpUserInput(body) {
 }
 
 function safeL2tpUser(user) {
-    return pickDefined(user, L2TP_USER_SAFE_FIELDS);
+    const safe = pickDefined(user, L2TP_USER_SAFE_FIELDS);
+    if (safe.syncStatus === 'error') {
+        safe.lastErrorCode = L2TP_USER_SYNC_FAILURE_CODE;
+    } else if (safe.lastErrorCode !== undefined) {
+        safe.lastErrorCode = '';
+    }
+    return safe;
 }
 
 function sendServiceError(res, error) {
@@ -169,7 +190,7 @@ function sendServiceError(res, error) {
     return res.status(status).json({
         error: {
             code: error.code,
-            message: error.message,
+            message: SAFE_ERROR_MESSAGE_BY_CODE.get(error.code) ?? error.message,
         },
     });
 }

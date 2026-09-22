@@ -726,6 +726,105 @@ test('GET L2TP users returns a safe list including disabled state', async () => 
     assert.doesNotMatch(JSON.stringify(response.body), /sealed-password|password/i);
 });
 
+test('GET L2TP users exposes safe sync progress while fixing failure diagnostics', async () => {
+    const failedAt = new Date('2026-09-22T10:00:00.000Z');
+    const router = createRouter({
+        l2tpService: {},
+        userManagementService: {
+            async listUsers(nodeId) {
+                return [{
+                    id: 'user-canary',
+                    relayNode: nodeId,
+                    login: 'canary',
+                    ip: '10.77.0.99',
+                    enabled: false,
+                    desiredRevision: 9,
+                    appliedRevision: 8,
+                    syncStatus: 'error',
+                    syncOperationId: 'operation-failed',
+                    lastSyncedAt: failedAt,
+                    lastErrorCode: 'SSH_FAILURE_CONTAINING_SECRET_PASSWORD',
+                    lastError: 'password=canary-plaintext ssh stderr',
+                    password: 'canary-plaintext',
+                    passwordEncrypted: 'canary-ciphertext',
+                }];
+            },
+        },
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const response = await request(router, {
+        path: '/nodes/relay-1/l2tp/users',
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, [{
+        id: 'user-canary',
+        relayNode: 'relay-1',
+        login: 'canary',
+        ip: '10.77.0.99',
+        enabled: false,
+        desiredRevision: 9,
+        appliedRevision: 8,
+        syncStatus: 'error',
+        syncOperationId: 'operation-failed',
+        lastSyncedAt: failedAt.toISOString(),
+        lastErrorCode: 'L2TP_USER_SYNC_FAILED',
+    }]);
+    assert.doesNotMatch(
+        JSON.stringify(response.body),
+        /canary-plaintext|canary-ciphertext|SSH_FAILURE|ssh stderr|password/i,
+    );
+});
+
+test('L2TP stale user and revision conflicts map to fixed safe 409 responses', async () => {
+    const cases = [
+        {
+            code: 'L2TP_USER_STALE_REVISION',
+            message: 'The L2TP user changed before this request was applied',
+        },
+        {
+            code: 'L2TP_USER_REVISION_CONFLICT',
+            message: 'The L2TP user revision conflicts with the current relay revision',
+        },
+    ];
+
+    for (const { code, message } of cases) {
+        const router = createRouter({
+            l2tpService: {},
+            userManagementService: {
+                async listUsers() {
+                    throw Object.assign(
+                        new Error('database conflict password=canary-plaintext revision=99'),
+                        {
+                            code,
+                            passwordEncrypted: 'canary-ciphertext',
+                        },
+                    );
+                },
+            },
+            requireAuth: passThrough,
+            csrf: passThrough,
+            rateLimiter: passThrough,
+        });
+
+        const response = await request(router, {
+            path: '/nodes/relay-1/l2tp/users',
+        });
+
+        assert.equal(response.status, 409, code);
+        assert.deepEqual(response.body, {
+            error: { code, message },
+        });
+        assert.doesNotMatch(
+            JSON.stringify(response.body),
+            /canary-plaintext|canary-ciphertext|database conflict|revision=99/i,
+        );
+    }
+});
+
 test('PATCH L2TP user safely disables or updates only allowlisted fields', async () => {
     const calls = [];
     const userManagementService = {

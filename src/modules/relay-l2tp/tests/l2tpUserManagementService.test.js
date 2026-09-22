@@ -272,6 +272,87 @@ test('lists enabled and disabled users without returning credentials or arbitrar
     assert.doesNotMatch(JSON.stringify(users), /sealed-active|raw-disabled|password/i);
 });
 
+test('projects response-only sync operation progress through the service', async () => {
+    const syncedAt = new Date('2026-09-22T10:00:00.000Z');
+    const service = new L2tpUserManagementService({
+        repository: createRepository({
+            async listByRelay() {
+                return [{
+                    _id: 'user-1',
+                    relayNode: 'relay-1',
+                    login: 'alice',
+                    ip: '10.77.0.10',
+                    enabled: true,
+                    desiredRevision: 7,
+                    appliedRevision: 7,
+                    syncStatus: 'synced',
+                    syncOperationId: 'operation-17',
+                    lastSyncedAt: syncedAt,
+                    lastErrorCode: '',
+                }];
+            },
+        }),
+        secretBox: { encrypt: () => 'unused' },
+        secretKey: 'test-secret-key',
+    });
+
+    const [user] = await service.listUsers('relay-1');
+
+    assert.deepEqual(user, {
+        id: 'user-1',
+        relayNode: 'relay-1',
+        login: 'alice',
+        ip: '10.77.0.10',
+        enabled: true,
+        desiredRevision: 7,
+        appliedRevision: 7,
+        syncStatus: 'synced',
+        syncOperationId: 'operation-17',
+        lastSyncedAt: syncedAt,
+        lastErrorCode: '',
+    });
+});
+
+test('projects every failed sync as one fixed safe code without diagnostic or credential leakage', async () => {
+    const service = new L2tpUserManagementService({
+        repository: createRepository({
+            async listByRelay() {
+                return [{
+                    _id: 'user-canary',
+                    relayNode: 'relay-1',
+                    login: 'canary',
+                    ip: '10.77.0.99',
+                    enabled: false,
+                    desiredRevision: 9,
+                    appliedRevision: 8,
+                    syncStatus: 'error',
+                    syncOperationId: 'operation-failed',
+                    lastSyncedAt: null,
+                    lastErrorCode: 'SSH_FAILURE_CONTAINING_SECRET_PASSWORD',
+                    lastError: 'password=canary-plaintext ssh stderr',
+                    password: 'canary-plaintext',
+                    passwordEncrypted: 'canary-ciphertext',
+                }];
+            },
+        }),
+        secretBox: { encrypt: () => 'unused' },
+        secretKey: 'test-secret-key',
+    });
+
+    const [user] = await service.listUsers('relay-1');
+
+    assert.equal(user.lastErrorCode, 'L2TP_USER_SYNC_FAILED');
+    assert.equal(user.syncOperationId, 'operation-failed');
+    assert.equal(user.syncStatus, 'error');
+    assert.equal(user.desiredRevision, 9);
+    assert.equal(user.appliedRevision, 8);
+    assert.equal(user.lastSyncedAt, null);
+    assert.doesNotMatch(
+        JSON.stringify(user),
+        /canary-plaintext|canary-ciphertext|SSH_FAILURE|ssh stderr|password/i,
+    );
+});
+
 test('updates allowlisted fields, encrypts a replacement password, and advances desired revision', async () => {
     const calls = [];
     const existing = {
