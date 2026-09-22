@@ -37,19 +37,18 @@ function validateTopology({ links = [], groups = [] } = {}) {
 
         for (const path of group.paths || []) {
             const pathKey = path.pathKey;
-            const pathLinks = [];
+            const linkIds = (path.linkIds || []).map(String);
+            const pathLinks = linkIds
+                .map(linkId => linksById.get(linkId))
+                .filter(Boolean);
 
-            for (const linkId of path.linkIds || []) {
-                const link = linksById.get(String(linkId));
-                if (link) {
-                    pathLinks.push(link);
-                    continue;
-                }
+            for (const linkId of linkIds) {
+                if (linksById.has(linkId)) continue;
                 errors.push({
                     code: 'UNKNOWN_LINK',
                     groupId,
                     pathKey,
-                    linkId: String(linkId),
+                    linkId,
                 });
             }
 
