@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://test.infograd.online/schemas/l2tp-e2e-evidence-v1.json",
+  "title": "Celerity test-only L2TP E2E evidence",
+  "description": "Non-secret, externally captured probe results. Raw command output and credentials are intentionally outside this closed schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceType",
+    "target",
+    "hostIdentity",
+    "runId",
+    "observedAt",
+    "results"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "evidenceType": {
+      "enum": [
+        "preflight",
+        "install",
+        "health",
+        "traffic"
+      ]
+    },
+    "target": {
+      "const": "test"
+    },
+    "hostIdentity": {
+      "const": "test.infograd.online"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "observedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/result"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "evidenceType": {
+            "const": "preflight"
+          }
+        },
+        "required": [
+          "evidenceType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {
+              "properties": {
+                "gate": {
+                  "const": "preflight"
+                }
+              }
+            },
+            "contains": {
+              "properties": {
+                "gate": {
+                  "const": "preflight"
+                }
+              },
+              "required": [
+                "gate"
+              ]
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "evidenceType": {
+            "const": "install"
+          }
+        },
+        "required": [
+          "evidenceType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "minItems": 1,
+            "maxItems": 1,
+            "items": {
+              "properties": {
+                "gate": {
+                  "const": "install"
+                }
+              }
+            },
+            "contains": {
+              "properties": {
+                "gate": {
+                  "const": "install"
+                }
+              },
+              "required": [
+                "gate"
+              ]
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "evidenceType": {
+            "const": "health"
+          }
+        },
+        "required": [
+          "evidenceType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "properties": {
+                "gate": {
+                  "enum": [
+                    "l2tp_ipsec_established",
+                    "rollback_recovery"
+                  ]
+                }
+              }
+            },
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "l2tp_ipsec_established"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "rollback_recovery"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "evidenceType": {
+            "const": "traffic"
+          }
+        },
+        "required": [
+          "evidenceType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "minItems": 5,
+            "maxItems": 5,
+            "items": {
+              "properties": {
+                "gate": {
+                  "enum": [
+                    "tcp",
+                    "udp",
+                    "dns",
+                    "quic",
+                    "direct_ppp_egress_fail_closed"
+                  ]
+                }
+              }
+            },
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "tcp"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "udp"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "dns"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "quic"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "gate": {
+                      "const": "direct_ppp_egress_fail_closed"
+                    }
+                  },
+                  "required": [
+                    "gate"
+                  ]
+                },
+                "minContains": 1,
+                "maxContains": 1
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate",
+        "status",
+        "exitCode",
+        "commandOutputSha256"
+      ],
+      "properties": {
+        "gate": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ]
+        },
+        "exitCode": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "commandOutputSha256": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "pass"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exitCode": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "fail"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exitCode": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 255
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "exitCode": {
+                "const": null
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
