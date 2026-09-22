@@ -1299,6 +1299,36 @@ test('rollback rejects symlinked retained Git metadata before source restoration
     }
 });
 
+test('rollback fails closed when public health or an untouched container check fails', () => {
+    const cases = [
+        {
+            name: 'public health',
+            env: { MOCK_CURL_EXIT: '22' },
+            expected: /public HTTPS health validation failed/,
+        },
+        {
+            name: 'untouched container identity',
+            env: { MOCK_MUTATE_SERVICE: 'mongo', MOCK_AFTER_ID: 'f'.repeat(64) },
+            expected: /untouched service mongo container identity changed/,
+        },
+    ];
+    for (const testCase of cases) {
+        const fixture = createRollbackFixture();
+        try {
+            prepareRollbackInstall(fixture);
+            const result = run(rollbackScript, fixture.args(['--execute', 'true']), {
+                env: { ...fixture.rollbackEnv, ...testCase.env },
+            });
+            assert.notEqual(result.status, 0, testCase.name);
+            assert.match(result.stderr, testCase.expected);
+            assert.doesNotMatch(result.stdout, /rollback ok/);
+            assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
+        } finally {
+            fixture.cleanup();
+        }
+    }
+});
+
 test('rollback execute restores source config and Mongo before touching only backend', () => {
     const fixture = createRollbackFixture();
     try {
