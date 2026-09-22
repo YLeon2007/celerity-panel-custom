@@ -297,6 +297,39 @@ test('updates a route group through candidate validation and compilation', async
     });
 });
 
+test('preserves disabled route paths through draft validation and compilation', async () => {
+    const snapshot = validSnapshot();
+    snapshot.groups[0].paths[0].enabled = false;
+    let validatorCandidate;
+    let compilerCandidate;
+    const repository = {
+        async commitDraft({ prepare }) {
+            await prepare(snapshot);
+            return { revision: 8, deployedRevision: 5 };
+        },
+    };
+    const service = new TopologyDraftWriteService({
+        repository,
+        validator(candidate) {
+            validatorCandidate = candidate;
+            return { valid: true, errors: [] };
+        },
+        compiler(candidate) {
+            compilerCandidate = candidate;
+            return { valid: true, errors: [], relays: [] };
+        },
+    });
+
+    await service.updateRouteGroup({
+        expectedTopologyRevision: 7,
+        routeGroupId: 'group-1',
+        changes: { name: 'updated primary' },
+    });
+
+    assert.equal(validatorCandidate.groups[0].paths[0].enabled, false);
+    assert.equal(compilerCandidate.groups[0].paths[0].enabled, false);
+});
+
 test('rejects a candidate that the compiler cannot materialize before persistence', async () => {
     const snapshot = validSnapshot();
     snapshot.groups = [];

@@ -79,7 +79,11 @@ test('panel overview queries and returns only allowlisted operational fields', a
         CascadeTopologyState: {
             findById(id) {
                 calls.push({ model: 'CascadeTopologyState', method: 'findById', id });
-                return query({ revision: 17, encryptedValue: secret }, calls, 'CascadeTopologyState');
+                return query({
+                    revision: 17,
+                    deployedRevision: 15,
+                    encryptedValue: secret,
+                }, calls, 'CascadeTopologyState');
             },
         },
         CascadeRouteGroup: {
@@ -123,6 +127,7 @@ test('panel overview queries and returns only allowlisted operational fields', a
 
     assert.deepEqual(overview, {
         topologyRevision: 17,
+        deployedRevision: 15,
         relays: [{
             id: 'relay-1',
             name: 'Relay One',

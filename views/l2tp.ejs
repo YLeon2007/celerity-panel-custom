@@ -1,7 +1,10 @@
 <section class="page-header">
     <div>
         <h1>L2TP/IPsec Relay</h1>
-        <p class="muted">Topology revision: <strong><%= topologyRevision %></strong></p>
+        <p class="muted">
+            Topology revision: <strong data-topology-revision><%= topologyRevision %></strong> ·
+            Deployed revision: <strong data-deployed-revision><%= typeof deployedRevision === 'undefined' ? 0 : deployedRevision %></strong>
+        </p>
     </div>
 </section>
 
@@ -10,6 +13,7 @@
     <p class="muted">Priority failover across explicit, ordered cascade links.</p>
     <form data-route-group-form>
         <input type="hidden" name="routeGroupId" value="">
+        <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
         <label>Name
             <input type="text" name="name" maxlength="128" required>
         </label>
@@ -34,6 +38,10 @@
                 <label>Priority
                     <input type="number" name="priority" step="any" required>
                 </label>
+                <label>
+                    <input type="checkbox" name="enabled" checked>
+                    Enabled
+                </label>
                 <button type="button" data-route-group-action="remove-path">Remove path</button>
             </fieldset>
         </div>
@@ -57,6 +65,10 @@
             </label>
             <label>Priority
                 <input type="number" name="priority" step="any" required>
+            </label>
+            <label>
+                <input type="checkbox" name="enabled" checked>
+                Enabled
             </label>
             <button type="button" data-route-group-action="remove-path">Remove path</button>
         </fieldset>
@@ -197,6 +209,9 @@
     const routeGroupOutput = routeGroupRoot.querySelector('[data-route-group-result]');
     const routeGroupSave = routeGroupRoot.querySelector('[data-route-group-action="save"]');
     const routeGroupCancel = routeGroupRoot.querySelector('[data-route-group-action="cancel"]');
+    const topologyRevisionHeader = document.querySelector('[data-topology-revision]');
+    const deployedRevisionHeader = document.querySelector('[data-deployed-revision]');
+    let routeGroupTopologyRevision = Number(routeGroupForm.elements.expectedTopologyRevision.value);
 
     function setResult(output, value) {
         output.textContent = value;
@@ -271,6 +286,7 @@
                 .map(linkId => linkId.trim())
                 .filter(Boolean);
             const priority = Number(row.querySelector('[name="priority"]').value);
+            const enabled = row.querySelector('[name="enabled"]').checked;
             if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pathKey)) {
                 throw routeGroupError('INVALID_ROUTE_GROUP_PATH_KEY');
             }
@@ -289,6 +305,7 @@
                 pathKey,
                 linkIds,
                 priority,
+                enabled,
             };
         });
         if (new Set(paths.map(path => path.pathKey)).size !== paths.length) {
@@ -349,10 +366,31 @@
                 || !Number.isFinite(priority)
                 || priority <= 0
             ) return null;
-            return { pathKey, linkIds, priority };
+            return {
+                pathKey,
+                linkIds,
+                priority,
+                enabled: path.enabled !== false,
+            };
         });
         if (paths.some(path => path === null)) return null;
         return { id, name, mode, strategy, paths };
+    }
+
+    function normalizeRouteGroupSnapshot(value) {
+        if (!value || typeof value !== 'object' || !Array.isArray(value.routeGroups)) return null;
+        const topologyRevision = value.topologyRevision;
+        const deployedRevision = value.deployedRevision;
+        if (
+            !Number.isSafeInteger(topologyRevision)
+            || topologyRevision < 0
+            || !Number.isSafeInteger(deployedRevision)
+            || deployedRevision < 0
+            || deployedRevision > topologyRevision
+        ) return null;
+        const routeGroups = value.routeGroups.map(normalizeRouteGroup);
+        if (routeGroups.some(group => group === null)) return null;
+        return { topologyRevision, deployedRevision, routeGroups };
     }
 
     function createRouteGroupPathRow(path = {}) {
@@ -362,6 +400,7 @@
             ? path.linkIds.join(', ')
             : '';
         row.querySelector('[name="priority"]').value = path.priority || '';
+        row.querySelector('[name="enabled"]').checked = path.enabled !== false;
         row.querySelector('[data-route-group-action="remove-path"]').addEventListener('click', () => {
             if (routeGroupPaths.querySelectorAll('[data-route-group-path-row]').length === 1) {
                 setResult(routeGroupOutput, 'ROUTE_GROUP_PATH_REQUIRED');
@@ -408,6 +447,27 @@
         });
     }
 
+    function applyRouteGroupSnapshot(snapshot) {
+        routeGroupTopologyRevision = snapshot.topologyRevision;
+        topologyRevisionHeader.textContent = String(snapshot.topologyRevision);
+        deployedRevisionHeader.textContent = String(snapshot.deployedRevision);
+        document.querySelectorAll('input[type="hidden"][name="expectedTopologyRevision"]')
+            .forEach((expectedRevision) => {
+                expectedRevision.value = String(snapshot.topologyRevision);
+                expectedRevision.defaultValue = String(snapshot.topologyRevision);
+            });
+        renderRouteGroups(snapshot.routeGroups);
+        refreshRouteGroupSelectors(snapshot.routeGroups);
+    }
+
+    async function handleRouteGroupMutationError(response, result, fallback) {
+        const errorCode = safeRequestError(response, result, fallback);
+        if (response.status === 409 && errorCode === 'STALE_TOPOLOGY_REVISION') {
+            await loadRouteGroups();
+        }
+        setResult(routeGroupOutput, errorCode);
+    }
+
     async function removeRouteGroup(group, button) {
         if (!window.confirm(`Remove route group “${group.name}”?`)) return;
         button.disabled = true;
@@ -418,17 +478,21 @@
                 credentials: 'same-origin',
                 headers: {
                     'accept': 'application/json',
+                    'content-type': 'application/json',
                     'x-csrf-token': csrfToken,
                 },
+                body: JSON.stringify({ expectedTopologyRevision: routeGroupTopologyRevision }),
             });
             const result = await parseResponse(response);
             if (!response.ok) {
-                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_REMOVE_FAILED'));
+                await handleRouteGroupMutationError(response, result, 'ROUTE_GROUP_REMOVE_FAILED');
                 return;
             }
+            const snapshot = normalizeRouteGroupSnapshot(result);
+            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
             if (routeGroupForm.elements.routeGroupId.value === group.id) resetRouteGroupForm();
+            applyRouteGroupSnapshot(snapshot);
             setResult(routeGroupOutput, 'Route group removed');
-            await loadRouteGroups();
         } catch {
             setResult(routeGroupOutput, 'ROUTE_GROUP_REMOVE_FAILED');
         } finally {
@@ -476,13 +540,9 @@
                 setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_LIST_FAILED'));
                 return;
             }
-            if (!Array.isArray(result)) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
-            const groups = result.map(normalizeRouteGroup);
-            if (groups.some(group => group === null)) {
-                throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
-            }
-            renderRouteGroups(groups);
-            refreshRouteGroupSelectors(groups);
+            const snapshot = normalizeRouteGroupSnapshot(result);
+            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
+            applyRouteGroupSnapshot(snapshot);
         } catch (error) {
             setResult(
                 routeGroupOutput,
@@ -586,16 +646,21 @@
                     'content-type': 'application/json',
                     'x-csrf-token': csrfToken,
                 },
-                body: JSON.stringify(payload),
+                body: JSON.stringify({
+                    ...payload,
+                    expectedTopologyRevision: routeGroupTopologyRevision,
+                }),
             });
             const result = await parseResponse(response);
             if (!response.ok) {
-                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_SAVE_FAILED'));
+                await handleRouteGroupMutationError(response, result, 'ROUTE_GROUP_SAVE_FAILED');
                 return;
             }
+            const snapshot = normalizeRouteGroupSnapshot(result);
+            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
             resetRouteGroupForm();
+            applyRouteGroupSnapshot(snapshot);
             setResult(routeGroupOutput, routeGroupId ? 'Route group updated' : 'Route group created');
-            await loadRouteGroups();
         } catch {
             setResult(routeGroupOutput, 'ROUTE_GROUP_SAVE_FAILED');
         } finally {

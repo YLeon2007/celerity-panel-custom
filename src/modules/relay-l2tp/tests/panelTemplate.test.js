@@ -100,7 +100,7 @@ test('L2TP panel renders a minimal typed route-group editor when no groups exist
     assert.match(html, /name="pathKey"[^>]+maxlength="64"[^>]+required/);
     assert.match(html, /name="linkIds"[^>]+required/);
     assert.match(html, /type="number"[^>]+name="priority"[^>]+step="any"[^>]+required/);
-    assert.doesNotMatch(html, /data-route-group-path-row[\s\S]*?name="enabled"/);
+    assert.match(html, /data-route-group-path-row[\s\S]*?name="enabled"[^>]+checked/);
     assert.match(html, /priority-failover/);
     assert.match(html, /No route groups\./);
     assert.doesNotMatch(html, /data-route-group-action="deploy"/);
@@ -114,11 +114,12 @@ test('route-group editor sends only typed protected CRUD requests and refreshes 
     assert.match(template, /const ROUTE_GROUP_STRATEGY = 'priority-failover';/);
     assert.match(template, /function buildRouteGroupPayload\(form\)/);
     assert.match(template, /return \{\s*name,\s*mode,\s*strategy: ROUTE_GROUP_STRATEGY,\s*paths,\s*\};/s);
-    assert.match(template, /return \{\s*pathKey,\s*linkIds,\s*priority,\s*\};/s);
+    assert.match(template, /return \{\s*pathKey,\s*linkIds,\s*priority,\s*enabled,\s*\};/s);
     assert.match(template, /function routeGroupUrl\(routeGroupId\)/);
     assert.match(template, /`\$\{ROUTE_GROUPS_URL\}\/\$\{encodeURIComponent\(routeGroupId\)\}`/);
     assert.match(template, /method: routeGroupId \? 'PUT' : 'POST'/);
     assert.match(template, /method: 'DELETE'/);
+    assert.match(template, /expectedTopologyRevision: routeGroupTopologyRevision/);
     assert.match(template, /credentials: 'same-origin'/);
     assert.match(template, /'x-csrf-token': csrfToken/);
     assert.match(template, /response\.status === 429/);
@@ -143,11 +144,12 @@ test('route-group payload builder allowlists and validates typed priority-failov
         ${helpers[0]}
         return buildRouteGroupPayload;
     `)();
-    const pathRow = ({ pathKey, linkIds, priority }) => {
+    const pathRow = ({ pathKey, linkIds, priority, enabled }) => {
         const controls = {
             '[name="pathKey"]': { value: pathKey },
             '[name="linkIds"]': { value: linkIds },
             '[name="priority"]': { value: priority },
+            '[name="enabled"]': { checked: enabled },
         };
         return {
             querySelector(selector) { return controls[selector]; },
@@ -158,11 +160,13 @@ test('route-group payload builder allowlists and validates typed priority-failov
             pathKey: 'primary',
             linkIds: '507f1f77bcf86cd799439021, 507f1f77bcf86cd799439022',
             priority: '0.5',
+            enabled: false,
         }),
         pathRow({
             pathKey: 'standby',
             linkIds: '507f1f77bcf86cd799439023',
             priority: '20',
+            enabled: true,
         }),
     ];
     const form = {
@@ -183,11 +187,13 @@ test('route-group payload builder allowlists and validates typed priority-failov
                 pathKey: 'primary',
                 linkIds: ['507f1f77bcf86cd799439021', '507f1f77bcf86cd799439022'],
                 priority: 0.5,
+                enabled: false,
             },
             {
                 pathKey: 'standby',
                 linkIds: ['507f1f77bcf86cd799439023'],
                 priority: 20,
+                enabled: true,
             },
         ],
     });
@@ -211,16 +217,43 @@ test('route-group payload builder allowlists and validates typed priority-failov
     );
 });
 
+test('route-group editor tracks the versioned snapshot and refreshes stale conflicts without replay', () => {
+    const template = fs.readFileSync(templatePath, 'utf8');
+    const html = ejs.render(template, {
+        csrfToken: 'test-csrf-token',
+        deployedRevision: 5,
+        operations: [],
+        relays: [],
+        routeGroups: [],
+        topologyRevision: 7,
+    });
+
+    assert.match(html, /data-topology-revision[^>]*>7<\/strong>/);
+    assert.match(html, /data-deployed-revision[^>]*>5<\/strong>/);
+    assert.match(html, /data-route-group-form[\s\S]*?name="expectedTopologyRevision" value="7"/);
+    assert.match(template, /function normalizeRouteGroupSnapshot\(value\)/);
+    assert.match(template, /function applyRouteGroupSnapshot\(snapshot\)/);
+    assert.match(template, /routeGroupTopologyRevision = snapshot\.topologyRevision/);
+    assert.match(template, /expectedRevision\.value = String\(snapshot\.topologyRevision\)/);
+    assert.match(template, /body: JSON\.stringify\(\{ expectedTopologyRevision: routeGroupTopologyRevision \}\)/);
+    assert.match(template, /expectedTopologyRevision: routeGroupTopologyRevision/);
+    assert.match(
+        template,
+        /response\.status === 409\s*&&\s*errorCode === 'STALE_TOPOLOGY_REVISION'[\s\S]*?await loadRouteGroups\(\)/,
+    );
+    assert.doesNotMatch(template, /STALE_TOPOLOGY_REVISION[\s\S]{0,300}(?:\.click\(|dispatchEvent\(|requestSubmit\()/);
+});
+
 test('route-group response normalization accepts the persisted API shape and drops extras', () => {
     const template = fs.readFileSync(templatePath, 'utf8');
     const helper = template.match(
         /function normalizeRouteGroup\(value\) \{[\s\S]*?(?=^\s*function createRouteGroupPathRow)/m,
     );
     assert.ok(helper, 'route-group response normalizer must be extractable');
-    const normalizeRouteGroup = Function(`
+    const { normalizeRouteGroup, normalizeRouteGroupSnapshot } = Function(`
         const ROUTE_GROUP_STRATEGY = 'priority-failover';
         ${helper[0]}
-        return normalizeRouteGroup;
+        return { normalizeRouteGroup, normalizeRouteGroupSnapshot };
     `)();
 
     assert.deepEqual(normalizeRouteGroup({
@@ -245,6 +278,7 @@ test('route-group response normalization accepts the persisted API shape and dro
             pathKey: 'primary',
             linkIds: ['507f1f77bcf86cd799439021'],
             priority: 0.5,
+            enabled: false,
         }],
     });
 
@@ -258,6 +292,31 @@ test('route-group response normalization accepts the persisted API shape and dro
             linkIds: ['not-an-object-id'],
             priority: 1,
         }],
+    }), null);
+
+    const normalizedSnapshot = normalizeRouteGroupSnapshot({
+        topologyRevision: 8,
+        deployedRevision: 5,
+        routeGroups: [{
+            id: '507f1f77bcf86cd799439011',
+            name: 'Relay exits',
+            mode: 'forward',
+            strategy: 'priority-failover',
+            paths: [{
+                pathKey: 'primary',
+                linkIds: ['507f1f77bcf86cd799439021'],
+                priority: 1,
+                enabled: false,
+            }],
+        }],
+    });
+    assert.equal(normalizedSnapshot.topologyRevision, 8);
+    assert.equal(normalizedSnapshot.deployedRevision, 5);
+    assert.equal(normalizedSnapshot.routeGroups[0].paths[0].enabled, false);
+    assert.equal(normalizeRouteGroupSnapshot({
+        topologyRevision: '8',
+        deployedRevision: 5,
+        routeGroups: [],
     }), null);
 });
 

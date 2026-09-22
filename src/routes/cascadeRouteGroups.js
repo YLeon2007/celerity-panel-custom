@@ -4,20 +4,36 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const CascadeLink = require('../models/cascadeLinkModel');
+const HyNode = require('../models/hyNodeModel');
 const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
-const { validateTopology } = require('../modules/relay-l2tp/domain/topologyValidator');
+const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
+const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+const {
+    createTopologyDraftWriteService,
+} = require('../modules/relay-l2tp/services/topologyDraftWriteService');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 
 const ROUTE_GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
-const LINK_VALIDATION_SELECT = '_id portalNode bridgeNode mode';
+const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const ROUTE_GROUP_MODES = new Set(['reverse', 'forward']);
 const ROUTE_GROUP_STRATEGY = 'priority-failover';
+const ERROR_STATUS_BY_CODE = new Map([
+    ['INVALID_TOPOLOGY_REVISION', 400],
+    ['INVALID_REQUEST', 400],
+    ['INVALID_ROUTE_GROUP_ID', 400],
+    ['CASCADE_ROUTE_GROUP_NOT_FOUND', 404],
+    ['STALE_TOPOLOGY_REVISION', 409],
+    ['CASCADE_ROUTE_GROUP_CONFLICT', 409],
+    ['CASCADE_ROUTE_GROUP_IN_USE', 409],
+    ['INVALID_TOPOLOGY_DRAFT', 422],
+]);
 
 class RequestValidationError extends Error {
-    constructor(message, details) {
+    constructor(message, details, code = 'INVALID_REQUEST') {
         super(message);
         this.name = 'RequestValidationError';
+        this.code = code;
         this.details = details;
     }
 }
@@ -56,6 +72,18 @@ function normalizeObjectId(value, field) {
         throw new RequestValidationError(`${field} must be a valid link ID`);
     }
     return value;
+}
+
+function normalizeExpectedTopologyRevision(input) {
+    const revision = input?.expectedTopologyRevision;
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+        throw new RequestValidationError(
+            'expectedTopologyRevision must be a non-negative safe integer',
+            undefined,
+            'INVALID_TOPOLOGY_REVISION',
+        );
+    }
+    return revision;
 }
 
 function normalizeRouteGroupInput(input) {
@@ -126,57 +154,95 @@ function normalizeRouteGroupInput(input) {
     return { name, mode: input.mode, strategy, paths };
 }
 
-function referencedLinkIds(group) {
-    const seen = new Set();
-    const orderedIds = [];
-    for (const path of group.paths) {
-        for (const linkId of path.linkIds) {
-            if (seen.has(linkId)) continue;
-            seen.add(linkId);
-            orderedIds.push(linkId);
-        }
-    }
-    return orderedIds;
+async function listRouteGroups(RouteGroup) {
+    const rows = await RouteGroup.find({})
+        .select(ROUTE_GROUP_SELECT)
+        .sort({ name: 1, _id: 1 })
+        .lean();
+    return (rows || []).map(projectRouteGroup).sort(compareRouteGroups);
 }
 
-async function validateRouteGroupLinks(Link, group, groupId = 'new') {
-    const linkIds = referencedLinkIds(group);
-    const rows = await Link.find({ _id: { $in: linkIds } })
-        .select(LINK_VALIDATION_SELECT)
-        .lean();
-    const links = (rows || []).map(rawLink => {
-        const link = plainObject(rawLink);
-        return {
-            id: String(link._id ?? link.id),
-            source: String(link.portalNode),
-            target: String(link.bridgeNode),
-            mode: link.mode,
-        };
-    });
-    const validation = validateTopology({
-        links,
-        groups: [{ _id: groupId, ...group }],
-    });
-    if (!validation.valid) {
-        throw new RequestValidationError('Invalid route group topology', validation.errors);
+async function readRouteGroupSnapshot({ RouteGroup, TopologyState, revisions }) {
+    const routeGroupsPromise = listRouteGroups(RouteGroup);
+    let topologyRevision;
+    let deployedRevision;
+
+    if (revisions) {
+        topologyRevision = revisions.revision;
+        deployedRevision = revisions.deployedRevision;
+    } else {
+        const state = await TopologyState.findById('singleton')
+            .select(TOPOLOGY_STATE_SELECT)
+            .lean();
+        topologyRevision = state?.revision ?? 0;
+        deployedRevision = state?.deployedRevision ?? 0;
     }
+
+    return {
+        topologyRevision,
+        deployedRevision,
+        routeGroups: await routeGroupsPromise,
+    };
 }
 
 function sendError(res, error, operation) {
+    let code = error?.code;
+    let status;
+
     if (error instanceof RequestValidationError || error?.name === 'ValidationError') {
-        const body = { error: error.message };
-        if (error.details) body.details = error.details;
-        return res.status(400).json(body);
+        code = code || 'INVALID_REQUEST';
+        status = 400;
+    } else if (error?.code === 11000 || error?.code === 11001) {
+        code = 'CASCADE_ROUTE_GROUP_CONFLICT';
+        status = 409;
+    } else {
+        status = ERROR_STATUS_BY_CODE.get(code);
     }
-    logger.error(`[Cascade Route Groups API] ${operation} error: ${error.message}`);
-    return res.status(500).json({ error: `Failed to ${operation.toLowerCase()} cascade route group` });
+
+    if (!status) {
+        logger.error(`[Cascade Route Groups API] ${operation} error: ${error.message}`);
+        return res.status(500).json({
+            error: {
+                code: 'INTERNAL_ERROR',
+                message: 'Internal server error',
+            },
+        });
+    }
+
+    const body = {
+        error: {
+            code,
+            message: error.message,
+        },
+    };
+    if (Array.isArray(error?.errors)) body.error.details = error.errors;
+    else if (error?.details !== undefined) body.error.details = error.details;
+    return res.status(status).json(body);
 }
 
 function createCascadeRouteGroupsRouter({
     RouteGroup = CascadeRouteGroup,
     Link = CascadeLink,
+    Node = HyNode,
+    TopologyState = CascadeTopologyState,
+    RelayState = RelayL2tpState,
+    topologyDraftWriteService,
+    createDraftWriteService = createTopologyDraftWriteService,
 } = {}) {
     const router = express.Router();
+    let writeService = topologyDraftWriteService;
+    const getWriteService = () => {
+        if (!writeService) {
+            writeService = createDraftWriteService({
+                HyNode: Node,
+                CascadeLink: Link,
+                CascadeRouteGroup: RouteGroup,
+                CascadeTopologyState: TopologyState,
+                RelayL2tpState: RelayState,
+            });
+        }
+        return writeService;
+    };
     const mutationLimiter = rateLimit({
         windowMs: 60 * 1000,
         max: 30,
@@ -189,11 +255,7 @@ function createCascadeRouteGroupsRouter({
 
     router.get('/', requireScope('nodes:read'), async (req, res) => {
         try {
-            const rows = await RouteGroup.find({})
-                .select(ROUTE_GROUP_SELECT)
-                .sort({ name: 1, _id: 1 })
-                .lean();
-            res.json((rows || []).map(projectRouteGroup).sort(compareRouteGroups));
+            res.json(await readRouteGroupSnapshot({ RouteGroup, TopologyState }));
         } catch (error) {
             sendError(res, error, 'List');
         }
@@ -201,10 +263,17 @@ function createCascadeRouteGroupsRouter({
 
     router.post('/', requireScope('nodes:write'), mutationLimiter, async (req, res) => {
         try {
+            const expectedTopologyRevision = normalizeExpectedTopologyRevision(req.body);
             const group = normalizeRouteGroupInput(req.body);
-            await validateRouteGroupLinks(Link, group);
-            const created = await RouteGroup.create(group);
-            res.status(201).json(projectRouteGroup(created));
+            const revisions = await getWriteService().createRouteGroup({
+                expectedTopologyRevision,
+                routeGroup: { _id: new mongoose.Types.ObjectId(), ...group },
+            });
+            res.status(201).json(await readRouteGroupSnapshot({
+                RouteGroup,
+                TopologyState,
+                revisions,
+            }));
         } catch (error) {
             sendError(res, error, 'Create');
         }
@@ -213,19 +282,24 @@ function createCascadeRouteGroupsRouter({
     router.put('/:id', requireScope('nodes:write'), mutationLimiter, async (req, res) => {
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-                throw new RequestValidationError('Invalid route group ID');
+                throw new RequestValidationError(
+                    'Invalid route group ID',
+                    undefined,
+                    'INVALID_ROUTE_GROUP_ID',
+                );
             }
+            const expectedTopologyRevision = normalizeExpectedTopologyRevision(req.body);
             const group = normalizeRouteGroupInput(req.body);
-            await validateRouteGroupLinks(Link, group, req.params.id);
-            const updated = await RouteGroup.findByIdAndUpdate(
-                req.params.id,
-                { $set: group },
-                { new: true, runValidators: true },
-            );
-            if (!updated) {
-                return res.status(404).json({ error: 'Cascade route group not found' });
-            }
-            return res.json(projectRouteGroup(updated));
+            const revisions = await getWriteService().updateRouteGroup({
+                expectedTopologyRevision,
+                routeGroupId: req.params.id,
+                changes: group,
+            });
+            return res.json(await readRouteGroupSnapshot({
+                RouteGroup,
+                TopologyState,
+                revisions,
+            }));
         } catch (error) {
             return sendError(res, error, 'Update');
         }
@@ -234,13 +308,22 @@ function createCascadeRouteGroupsRouter({
     router.delete('/:id', requireScope('nodes:write'), mutationLimiter, async (req, res) => {
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-                throw new RequestValidationError('Invalid route group ID');
+                throw new RequestValidationError(
+                    'Invalid route group ID',
+                    undefined,
+                    'INVALID_ROUTE_GROUP_ID',
+                );
             }
-            const deleted = await RouteGroup.findByIdAndDelete(req.params.id);
-            if (!deleted) {
-                return res.status(404).json({ error: 'Cascade route group not found' });
-            }
-            return res.json({ success: true, id: req.params.id });
+            const expectedTopologyRevision = normalizeExpectedTopologyRevision(req.body);
+            const revisions = await getWriteService().deleteRouteGroup({
+                expectedTopologyRevision,
+                routeGroupId: req.params.id,
+            });
+            return res.json(await readRouteGroupSnapshot({
+                RouteGroup,
+                TopologyState,
+                revisions,
+            }));
         } catch (error) {
             return sendError(res, error, 'Delete');
         }
@@ -252,9 +335,12 @@ function createCascadeRouteGroupsRouter({
 const router = createCascadeRouteGroupsRouter();
 
 module.exports = router;
-module.exports.LINK_VALIDATION_SELECT = LINK_VALIDATION_SELECT;
+module.exports.ERROR_STATUS_BY_CODE = ERROR_STATUS_BY_CODE;
 module.exports.ROUTE_GROUP_SELECT = ROUTE_GROUP_SELECT;
+module.exports.TOPOLOGY_STATE_SELECT = TOPOLOGY_STATE_SELECT;
 module.exports.createCascadeRouteGroupsRouter = createCascadeRouteGroupsRouter;
+module.exports.listRouteGroups = listRouteGroups;
+module.exports.normalizeExpectedTopologyRevision = normalizeExpectedTopologyRevision;
 module.exports.normalizeRouteGroupInput = normalizeRouteGroupInput;
 module.exports.projectRouteGroup = projectRouteGroup;
-module.exports.validateRouteGroupLinks = validateRouteGroupLinks;
+module.exports.readRouteGroupSnapshot = readRouteGroupSnapshot;

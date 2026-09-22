@@ -18,7 +18,7 @@ const STATE_PANEL_SELECT = [
     'activePathKey',
     'lastVerifiedAt',
 ].join(' ');
-const TOPOLOGY_PANEL_SELECT = 'revision';
+const TOPOLOGY_PANEL_SELECT = 'revision deployedRevision';
 const ROUTE_GROUP_PANEL_SELECT = '_id name mode strategy paths.pathKey paths.priority';
 const OPERATION_PANEL_SELECT = [
     '_id',
@@ -72,6 +72,7 @@ function createPanelOverviewLoader({
 
         return {
             topologyRevision: topology?.revision ?? 0,
+            deployedRevision: topology?.deployedRevision ?? 0,
             relays: (nodes || []).map(node => {
                 const state = statesByNodeId.get(id(node._id)) || {};
                 return {

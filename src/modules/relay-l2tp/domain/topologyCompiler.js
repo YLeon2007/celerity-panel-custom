@@ -9,12 +9,14 @@ function compileTopology({ nodes = [], links = [], groups = [], healthByPathKey 
     const validation = validateTopology({ nodes, links: orderedLinks, groups });
     const nodesById = new Map(nodes.map(node => [String(node.id), node]));
     const linksById = new Map(orderedLinks.map(link => [String(link.id), link]));
+    const pathEnabledByKey = new Map();
     const relaysByNodeId = new Map();
 
     for (const group of groups) {
         const groupId = String(group._id ?? group.id);
 
         for (const path of group.paths || []) {
+            pathEnabledByKey.set(`${groupId}:${path.pathKey}`, path.enabled !== false);
             const pathLinks = (path.linkIds || [])
                 .map(linkId => linksById.get(String(linkId)))
                 .filter(Boolean);
