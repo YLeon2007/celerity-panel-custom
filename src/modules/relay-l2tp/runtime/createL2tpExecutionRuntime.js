@@ -65,6 +65,14 @@ async function unavailableSecretResolver() {
     throw error;
 }
 
+const unavailableStateManagementService = Object.freeze({
+    async configureRelay() {
+        const error = new Error('L2TP state management is unavailable');
+        error.code = 'L2TP_STATE_MANAGEMENT_UNAVAILABLE';
+        throw error;
+    },
+});
+
 function lifecycleSummary(state) {
     return {
         enabled: state?.enabled === true,
@@ -129,6 +137,7 @@ function createL2tpExecutionRuntime({
     operationMaterializer = materializeInstallOperation,
     secretBox = defaultSecretBox,
     secretKey,
+    stateManagementService,
     clock,
     runtimeDependencies,
     createRuntime = createL2tpRuntime,
@@ -159,6 +168,7 @@ function createL2tpExecutionRuntime({
             transport: dormantTransport,
             lockService: dormantLockService,
             secretResolver: unavailableSecretResolver,
+            stateManagementService: stateManagementService ?? unavailableStateManagementService,
         });
         return {
             runtime,
@@ -194,6 +204,7 @@ function createL2tpExecutionRuntime({
         transportResolver,
         operationMaterializer,
         secretResolver,
+        stateManagementService: stateManagementService ?? managementService,
         lockService,
     });
     const lifecycle = createWorkerLifecycle({
