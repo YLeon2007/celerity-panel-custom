@@ -97,3 +97,50 @@ resolve_control_path() {
         || fail 'test filesystem path escaped its isolated root'
     printf '%s\n' "$mapped_path"
 }
+
+require_safe_git_head_metadata() {
+    local repository_root=$1
+    local label=$2
+    local git_metadata="$repository_root/.git"
+    local git_head="$git_metadata/HEAD"
+    local head_value
+    local head_reference
+    local head_reference_path
+    local head_reference_parent
+    local packed_references="$git_metadata/packed-refs"
+    local reference_index
+    local -a head_reference_parts=()
+
+    [[ -d "$git_metadata" && ! -L "$git_metadata" ]] \
+        || fail "$label Git metadata must be a real directory"
+    [[ -f "$git_head" && ! -L "$git_head" ]] \
+        || fail "$label Git HEAD must be a regular file"
+    head_value=$(<"$git_head")
+    if [[ "$head_value" == 'ref: '* ]]; then
+        head_reference=${head_value#'ref: '}
+        if [[ "$head_reference" != refs/* \
+            || "$head_reference" == *$'\n'* ]] \
+            || ! git check-ref-format "$head_reference" >/dev/null 2>&1; then
+            fail "$label Git HEAD reference is unsafe"
+        fi
+        IFS='/' read -r -a head_reference_parts <<< "$head_reference"
+        head_reference_parent=$git_metadata
+        for ((reference_index = 0; reference_index < ${#head_reference_parts[@]} - 1; reference_index++)); do
+            head_reference_parent+="/${head_reference_parts[$reference_index]}"
+            if [[ -L "$head_reference_parent" \
+                || ( -e "$head_reference_parent" && ! -d "$head_reference_parent" ) ]]; then
+                fail "$label Git HEAD reference path must use real directories"
+            fi
+        done
+        head_reference_path="$git_metadata/$head_reference"
+        if [[ -L "$head_reference_path" \
+            || ( -e "$head_reference_path" && ! -f "$head_reference_path" ) ]]; then
+            fail "$label Git HEAD reference must be a regular file"
+        fi
+        if [[ ! -e "$head_reference_path" \
+            && ( -L "$packed_references" \
+                || ( -e "$packed_references" && ! -f "$packed_references" ) ) ]]; then
+            fail "$label Git packed references must be a regular file"
+        fi
+    fi
+}

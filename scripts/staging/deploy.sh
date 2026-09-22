@@ -79,8 +79,6 @@ for config_ref in "${config_file_refs[@]}"; do
 done
 "$SCRIPT_DIR/precheck.sh" "${precheck_args[@]}" >/dev/null
 
-backup_id="$operation_id-${expected_source_commit:0:12}"
-backup_dir="$backup_root/$backup_id"
 declare -a config_destinations=()
 for config_ref in "${config_file_refs[@]}"; do
     config_destinations+=("${config_ref%%=*}")
@@ -96,9 +94,10 @@ print_plan() {
         "target=$target" \
         "host_identity=$host_identity" \
         "install_root=$install_root" \
-        "backup_dir=$backup_dir" \
-        "source_commit=$expected_source_commit" \
-        "source_tree=$expected_source_tree" \
+        "backup_dir=$backup_root/$operation_id-<predeploy-commit-prefix>" \
+        'backup_id_source=predeploy-git-head' \
+        "candidate_source_commit=$expected_source_commit" \
+        "candidate_source_tree=$expected_source_tree" \
         "source_bundle_sha256=$source_bundle_sha256" \
         "module_artifact_sha256=$module_artifact_sha256" \
         'backup_steps=source,config,mongo' \
@@ -133,6 +132,7 @@ expected_install_parent=$(cd -- "$(dirname -- "$expected_install_root_path")" &&
     || fail 'installed .env must be a regular file'
 backup_root_path=$(resolve_control_path "$backup_root")
 command -v rsync >/dev/null 2>&1 || fail 'rsync is required for exact source replacement'
+command -v git >/dev/null 2>&1 || fail 'Git is required to identify the predeploy source'
 
 runtime_root=$(mktemp -d)
 lock_dir=''
@@ -199,6 +199,67 @@ verify_untouched_service_states() {
     done
 }
 
+capture_predeploy_source_identity() {
+    local git_root
+
+    require_safe_git_head_metadata "$install_root_path" 'installed source'
+    if ! git_root=$(git -C "$install_root_path" rev-parse --show-toplevel 2>/dev/null); then
+        fail 'installed source must be a Git worktree'
+    fi
+    [[ -d "$git_root" && ! -L "$git_root" ]] \
+        || fail 'installed source Git root must be a real directory'
+    git_root=$(cd -- "$git_root" && pwd -P)
+    [[ "$git_root" == "$install_root_path" ]] \
+        || fail 'installed source Git root must match the install root'
+    if ! deployed_source_commit=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
+        || ! deployed_source_tree=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{tree}' 2>/dev/null); then
+        fail 'installed source Git identity is unavailable'
+    fi
+    require_git_oid 'installed source commit' "$deployed_source_commit"
+    require_git_oid 'installed source tree' "$deployed_source_tree"
+    require_clean_predeploy_source 'installed source must be clean before backup'
+}
+
+require_clean_predeploy_source() {
+    local refusal_message=$1
+    local status_file="$runtime_root/predeploy-git-status"
+    local status_entry
+    local status_code
+    local status_path
+
+    if ! git -C "$install_root_path" status \
+        --porcelain=v1 \
+        -z \
+        --untracked-files=all > "$status_file" 2>/dev/null; then
+        fail 'installed source Git status is unavailable'
+    fi
+    while IFS= read -r -d '' status_entry; do
+        status_code=${status_entry:0:2}
+        status_path=${status_entry:3}
+        if [[ "$status_code" == '??' \
+            && ( "$status_path" == '.celerity-staging-source.env' \
+                || "$status_path" == config/test/* ) ]]; then
+            continue
+        fi
+        fail "$refusal_message"
+    done < "$status_file"
+    rm -f -- "$status_file"
+}
+
+verify_predeploy_source_identity() {
+    local current_commit
+    local current_tree
+
+    if ! current_commit=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
+        || ! current_tree=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{tree}' 2>/dev/null); then
+        fail 'installed source Git identity changed during backup'
+    fi
+    [[ "$current_commit" == "$deployed_source_commit" \
+        && "$current_tree" == "$deployed_source_tree" ]] \
+        || fail 'installed source Git identity changed during backup'
+    require_clean_predeploy_source 'installed source changed during backup'
+}
+
 python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --source-bundle "$source_bundle" \
     --module-artifact "$module_artifact" \
@@ -225,9 +286,12 @@ staged_compose=(
 mkdir -p -m 0700 -- "$backup_root_path"
 [[ -d "$backup_root_path" && ! -L "$backup_root_path" ]] || fail 'backup root must not be a symlink'
 backup_root_path=$(cd -- "$backup_root_path" && pwd -P)
-backup_dir_path="$backup_root_path/$backup_id"
 lock_dir="$backup_root_path/.deploy-lock"
 mkdir -- "$lock_dir" 2>/dev/null || fail 'another staging control operation is active'
+capture_predeploy_source_identity
+backup_id="$operation_id-${deployed_source_commit:0:12}"
+backup_dir="$backup_root/$backup_id"
+backup_dir_path="$backup_root_path/$backup_id"
 [[ ! -e "$backup_dir_path" ]] || fail 'timestamped backup destination already exists'
 mkdir -m 0700 -- "$backup_dir_path"
 printf 'incomplete\n' > "$backup_dir_path/STATE"
@@ -281,6 +345,7 @@ fi
 [[ -s "$mongo_dump_output" && -f "$mongo_dump_output" && ! -L "$mongo_dump_output" ]] \
     || fail 'Mongo dump hook did not create a non-empty regular archive'
 chmod 0600 "$mongo_dump_output"
+verify_predeploy_source_identity
 
 cat > "$backup_dir_path/backup-manifest.env" <<EOF
 schema_version=1
@@ -292,8 +357,8 @@ backup_id=$backup_id
 operation_id=$operation_id
 compose_file=$CELERITY_COMPOSE_FILE
 app_service=$CELERITY_APP_SERVICE
-deployed_source_commit=$expected_source_commit
-deployed_source_tree=$expected_source_tree
+deployed_source_commit=$deployed_source_commit
+deployed_source_tree=$deployed_source_tree
 config_test_present=$config_test_present
 EOF
 (
@@ -337,10 +402,10 @@ for config_ref in "${config_file_refs[@]}"; do
     install -m 0600 -- "$local_file" "$destination_path"
 done
 cat > "$install_root_path/.celerity-staging-source.env" <<EOF
-source_commit=$expected_source_commit
-source_tree=$expected_source_tree
-source_bundle_sha256=$source_bundle_sha256
-module_artifact_sha256=$module_artifact_sha256
+candidate_source_commit=$expected_source_commit
+candidate_source_tree=$expected_source_tree
+candidate_source_bundle_sha256=$source_bundle_sha256
+candidate_module_artifact_sha256=$module_artifact_sha256
 target=test
 host_identity=$CELERITY_TEST_HOST
 EOF

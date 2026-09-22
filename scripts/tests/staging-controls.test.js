@@ -40,6 +40,11 @@ function sha256(filePath) {
     return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
 
+function readEnvFile(filePath) {
+    return Object.fromEntries(fs.readFileSync(filePath, 'utf8').trimEnd().split('\n')
+        .map(line => line.split(/=(.*)/s, 2)));
+}
+
 function createMinimalPrecheckFixture() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'celerity-staging-controls-'));
     const bundleStage = path.join(root, 'bundle-stage');
@@ -320,6 +325,19 @@ function createDeployExecuteFixture() {
     fs.copyFileSync(fixture.configEnv, path.join(installDir, '.env'));
     fs.writeFileSync(path.join(installDir, 'old.js'), "'use strict';\n");
     fs.writeFileSync(path.join(installDir, 'config', 'test', 'old.conf'), 'old-test-config\n');
+    runChecked('git', ['init', '--quiet'], { cwd: installDir });
+    runChecked('git', ['config', 'user.name', 'Staging Test'], { cwd: installDir });
+    runChecked('git', ['config', 'user.email', 'staging-test@example.invalid'], { cwd: installDir });
+    fs.writeFileSync(path.join(installDir, '.git', 'info', 'exclude'), [
+        '.env',
+        '.celerity-staging-source.env',
+        'config/test/',
+        '',
+    ].join('\n'));
+    runChecked('git', ['add', 'docker-compose.yml', 'old.js'], { cwd: installDir });
+    runChecked('git', ['commit', '--quiet', '-m', 'predeploy baseline'], { cwd: installDir });
+    const baselineCommit = runChecked('git', ['rev-parse', 'HEAD^{commit}'], { cwd: installDir });
+    const baselineTree = runChecked('git', ['rev-parse', 'HEAD^{tree}'], { cwd: installDir });
     fs.writeFileSync(mongoDumpHook, [
         '#!/bin/sh',
         'printf "called\\n" >> "$HOOK_LOG"',
@@ -332,6 +350,8 @@ function createDeployExecuteFixture() {
         testFsRoot,
         installDir,
         backupRootDir,
+        baselineCommit,
+        baselineTree,
         hookLog,
         mongoDumpHook,
         deployArgs: [
@@ -352,12 +372,29 @@ function createDeployExecuteFixture() {
 function createRollbackFixture() {
     const fixture = createMinimalPrecheckFixture();
     const testFsRoot = path.join(fixture.root, 'fs-root');
-    const backupId = '20260922T120000Z-aaaaaaaaaaaa';
-    const logicalBackupDir = `/opt/hysteria-panel-test-backups/${backupId}`;
-    const backupDir = path.join(testFsRoot, logicalBackupDir);
     const sourceStage = path.join(fixture.root, 'rollback-source');
     const hookLog = path.join(fixture.root, 'mongo-restore-hook.log');
     const mongoRestoreHook = path.join(fixture.root, 'mongo-restore-hook.sh');
+
+    fs.mkdirSync(sourceStage, { recursive: true });
+    fs.copyFileSync(path.join(fixture.root, 'bundle-stage', 'source', 'docker-compose.yml'), path.join(sourceStage, 'docker-compose.yml'));
+    fs.writeFileSync(path.join(sourceStage, 'index.js'), "'use strict';\n");
+    fs.writeFileSync(path.join(sourceStage, '.gitignore'), [
+        '.env',
+        '.celerity-staging-source.env',
+        'config/test/',
+        '',
+    ].join('\n'));
+    runChecked('git', ['init', '--quiet'], { cwd: sourceStage });
+    runChecked('git', ['config', 'user.name', 'Staging Test'], { cwd: sourceStage });
+    runChecked('git', ['config', 'user.email', 'staging-test@example.invalid'], { cwd: sourceStage });
+    runChecked('git', ['add', '.'], { cwd: sourceStage });
+    runChecked('git', ['commit', '--quiet', '-m', 'recorded rollback baseline'], { cwd: sourceStage });
+    const deployedSourceCommit = runChecked('git', ['rev-parse', 'HEAD^{commit}'], { cwd: sourceStage });
+    const deployedSourceTree = runChecked('git', ['rev-parse', 'HEAD^{tree}'], { cwd: sourceStage });
+    const backupId = `20260922T120000Z-${deployedSourceCommit.slice(0, 12)}`;
+    const logicalBackupDir = `/opt/hysteria-panel-test-backups/${backupId}`;
+    const backupDir = path.join(testFsRoot, logicalBackupDir);
     const manifestPath = path.join(backupDir, 'backup-manifest.env');
     const checksumsPath = path.join(backupDir, 'SHA256SUMS');
     const manifest = {
@@ -370,17 +407,19 @@ function createRollbackFixture() {
         operation_id: '20260922T120000Z',
         compose_file: 'docker-compose.yml',
         app_service: 'backend',
-        deployed_source_commit: sourceCommit,
-        deployed_source_tree: sourceTree,
+        deployed_source_commit: deployedSourceCommit,
+        deployed_source_tree: deployedSourceTree,
         config_test_present: 'false',
     };
     const checksumFiles = ['backup-manifest.env', 'config.env', 'mongo.archive.gz', 'source.tar.gz'];
 
     fs.mkdirSync(backupDir, { recursive: true });
-    fs.mkdirSync(sourceStage, { recursive: true });
-    fs.copyFileSync(path.join(fixture.root, 'bundle-stage', 'source', 'docker-compose.yml'), path.join(sourceStage, 'docker-compose.yml'));
-    fs.writeFileSync(path.join(sourceStage, 'index.js'), "'use strict';\n");
-    const packed = spawnSync('tar', ['-czf', path.join(backupDir, 'source.tar.gz'), '-C', sourceStage, '.'], { encoding: 'utf8' });
+    const packed = spawnSync('tar', [
+        '--exclude=./.git',
+        '-czf', path.join(backupDir, 'source.tar.gz'),
+        '-C', sourceStage,
+        '.',
+    ], { encoding: 'utf8' });
     assert.equal(packed.status, 0, packed.stderr);
     fs.copyFileSync(fixture.configEnv, path.join(backupDir, 'config.env'));
     fs.writeFileSync(path.join(backupDir, 'mongo.archive.gz'), 'mongo-backup-fixture\n', { mode: 0o600 });
@@ -426,6 +465,9 @@ function createRollbackFixture() {
         backupId,
         logicalBackupDir,
         backupDir,
+        sourceStage,
+        deployedSourceCommit,
+        deployedSourceTree,
         hookLog,
         mongoRestoreHook,
         manifestPath,
@@ -696,6 +738,161 @@ test('deploy execute honors the guarded isolated test filesystem', () => {
     }
 });
 
+test('deploy backup provenance uses the clean predeploy Git baseline instead of the candidate', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        assert.notEqual(fixture.baselineCommit, sourceCommit);
+        assert.notEqual(fixture.baselineTree, sourceTree);
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+
+        const backupId = `20260922T120000Z-${fixture.baselineCommit.slice(0, 12)}`;
+        const backupDir = path.join(fixture.backupRootDir, backupId);
+        assert.match(result.stdout, new RegExp(`backup_dir=/opt/hysteria-panel-test-backups/${backupId}`));
+        const manifest = readEnvFile(path.join(backupDir, 'backup-manifest.env'));
+        assert.equal(manifest.backup_id, backupId);
+        assert.equal(manifest.deployed_source_commit, fixture.baselineCommit);
+        assert.equal(manifest.deployed_source_tree, fixture.baselineTree);
+
+        const archivedBaseline = runChecked('tar', ['-xOf', path.join(backupDir, 'source.tar.gz'), './old.js']);
+        assert.equal(archivedBaseline, "'use strict';");
+        const marker = readEnvFile(path.join(fixture.installDir, '.celerity-staging-source.env'));
+        assert.equal(marker.candidate_source_commit, sourceCommit);
+        assert.equal(marker.candidate_source_tree, sourceTree);
+        assert.equal(marker.candidate_source_bundle_sha256, sha256(fixture.bundle));
+        assert.equal(marker.candidate_module_artifact_sha256, sha256(fixture.artifact));
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects an untracked source file before creating the baseline backup', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        fs.writeFileSync(path.join(fixture.installDir, 'rogue-source.js'), "'use strict';\n");
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source must be clean before backup/);
+        assert.equal(fs.existsSync(fixture.hookLog), false, 'dirty baseline must be rejected before Mongo backup');
+        const backupEntries = fs.readdirSync(fixture.backupRootDir);
+        assert.deepEqual(backupEntries, []);
+        const calls = fs.readFileSync(fixture.commandLog, 'utf8');
+        assert.doesNotMatch(calls, /^rsync /m, 'dirty baseline must be rejected before replacement');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects Git metadata symlinks before trusting the predeploy identity', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const gitMetadata = path.join(fixture.installDir, '.git');
+        const externalGitMetadata = path.join(fixture.root, 'external-git-metadata');
+        fs.renameSync(gitMetadata, externalGitMetadata);
+        fs.symlinkSync(externalGitMetadata, gitMetadata, 'dir');
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git metadata must be a real directory/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects a symlinked Git HEAD before trusting the predeploy identity', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const gitHead = path.join(fixture.installDir, '.git', 'HEAD');
+        const externalHead = path.join(fixture.root, 'external-git-head');
+        fs.renameSync(gitHead, externalHead);
+        fs.symlinkSync(externalHead, gitHead);
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git HEAD must be a regular file/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects a symlinked Git HEAD reference before trusting the predeploy identity', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const headReference = runChecked('git', ['symbolic-ref', 'HEAD'], { cwd: fixture.installDir });
+        const referencePath = path.join(fixture.installDir, '.git', ...headReference.split('/'));
+        const externalReference = path.join(fixture.root, 'external-git-reference');
+        fs.renameSync(referencePath, externalReference);
+        fs.symlinkSync(externalReference, referencePath);
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git HEAD reference must be a regular file/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects path traversal in the Git HEAD reference', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        fs.writeFileSync(path.join(fixture.installDir, '.git', 'HEAD'), 'ref: refs/heads/../../external-ref\n');
+        fs.writeFileSync(path.join(fixture.installDir, '.git', 'external-ref'), `${fixture.baselineCommit}\n`);
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git HEAD reference is unsafe/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects symlinks in the Git HEAD reference path', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        const refsPath = path.join(fixture.installDir, '.git', 'refs');
+        const externalRefs = path.join(fixture.root, 'external-git-refs');
+        fs.renameSync(refsPath, externalRefs);
+        fs.symlinkSync(externalRefs, refsPath, 'dir');
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git HEAD reference path must use real directories/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('deploy rejects symlinked packed refs used by Git HEAD', () => {
+    const fixture = createDeployExecuteFixture();
+    try {
+        runChecked('git', ['pack-refs', '--all', '--prune'], { cwd: fixture.installDir });
+        const packedRefs = path.join(fixture.installDir, '.git', 'packed-refs');
+        const externalPackedRefs = path.join(fixture.root, 'external-packed-refs');
+        fs.renameSync(packedRefs, externalPackedRefs);
+        fs.symlinkSync(externalPackedRefs, packedRefs);
+
+        const result = run(deployScript, fixture.deployArgs, { env: fixture.deployEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /installed source Git packed references must be a regular file/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        assert.deepEqual(fs.readdirSync(fixture.backupRootDir), []);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
 test('deploy checks public HTTPS health with fixed curl semantics after backend update', () => {
     const fixture = createDeployExecuteFixture();
     try {
@@ -874,7 +1071,11 @@ test('deploy plan is deterministic, backs up source config and Mongo, and scopes
         assert.equal(first.status, 0, first.stderr || first.stdout);
         assert.equal(second.status, 0, second.stderr || second.stdout);
         assert.equal(first.stdout, second.stdout);
-        assert.match(first.stdout, /backup_dir=\/opt\/hysteria-panel-test-backups\/20260922T120000Z-aaaaaaaaaaaa/);
+        assert.match(first.stdout, /backup_dir=\/opt\/hysteria-panel-test-backups\/20260922T120000Z-<predeploy-commit-prefix>/);
+        assert.match(first.stdout, /backup_id_source=predeploy-git-head/);
+        assert.match(first.stdout, new RegExp(`candidate_source_commit=${sourceCommit}`));
+        assert.match(first.stdout, new RegExp(`candidate_source_tree=${sourceTree}`));
+        assert.doesNotMatch(first.stdout, /backup_dir=.*aaaaaaaaaaaa/);
         assert.match(first.stdout, /backup_steps=source,config,mongo/);
         assert.match(first.stdout, /container_build=backend/);
         assert.match(first.stdout, /container_restart=backend --no-deps/);
@@ -1040,6 +1241,50 @@ test('rollback rejects missing, mismatched, and traversal checksum references be
     }
 });
 
+test('rollback refuses to restore when the retained install Git identity differs from the recorded baseline', () => {
+    const fixture = createRollbackFixture();
+    try {
+        const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
+        fs.mkdirSync(installDir, { recursive: true });
+        fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), 'candidate source\n');
+        runChecked('git', ['init', '--quiet'], { cwd: installDir });
+        runChecked('git', ['config', 'user.name', 'Staging Test'], { cwd: installDir });
+        runChecked('git', ['config', 'user.email', 'staging-test@example.invalid'], { cwd: installDir });
+        runChecked('git', ['add', 'docker-compose.yml'], { cwd: installDir });
+        runChecked('git', ['commit', '--quiet', '-m', 'different baseline'], { cwd: installDir });
+
+        const result = run(rollbackScript, fixture.args(['--execute', 'true']), { env: fixture.rollbackEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /install Git identity does not match the recorded baseline/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        const calls = fs.existsSync(fixture.commandLog) ? fs.readFileSync(fixture.commandLog, 'utf8') : '';
+        assert.doesNotMatch(calls, /^rsync /m, 'mismatched Git identity must be rejected before replacement');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('rollback rejects symlinked retained Git metadata before source restoration', () => {
+    const fixture = createRollbackFixture();
+    try {
+        const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
+        runChecked('git', ['clone', '--quiet', '--no-local', fixture.sourceStage, installDir]);
+        const gitMetadata = path.join(installDir, '.git');
+        const externalGitMetadata = path.join(fixture.root, 'external-retained-git-metadata');
+        fs.renameSync(gitMetadata, externalGitMetadata);
+        fs.symlinkSync(externalGitMetadata, gitMetadata, 'dir');
+
+        const result = run(rollbackScript, fixture.args(['--execute', 'true']), { env: fixture.rollbackEnv });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /install Git metadata must be a real directory/);
+        assert.equal(fs.existsSync(fixture.hookLog), false);
+        const calls = fs.existsSync(fixture.commandLog) ? fs.readFileSync(fixture.commandLog, 'utf8') : '';
+        assert.doesNotMatch(calls, /^rsync /m, 'unsafe Git metadata must be rejected before replacement');
+    } finally {
+        fixture.cleanup();
+    }
+});
+
 test('rollback execute restores source config and Mongo before touching only backend', () => {
     const fixture = createRollbackFixture();
     try {
@@ -1056,9 +1301,11 @@ test('rollback execute restores source config and Mongo before touching only bac
         fixture.writeChecksums([...fixture.checksumFiles, 'config-test.tar.gz']);
 
         const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
+        runChecked('git', ['clone', '--quiet', '--no-local', fixture.sourceStage, installDir]);
         fs.mkdirSync(path.join(installDir, 'config', 'test'), { recursive: true });
-        fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), 'old source\n');
+        fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), 'candidate source\n');
         fs.writeFileSync(path.join(installDir, '.env'), 'OLD_SECRET=must-not-appear\n', { mode: 0o600 });
+        fs.writeFileSync(path.join(installDir, '.celerity-staging-source.env'), 'candidate_source_commit=cccccccccccccccccccccccccccccccccccccccc\n');
         fs.writeFileSync(path.join(installDir, 'config', 'test', 'obsolete.conf'), 'obsolete\n');
         fs.writeFileSync(path.join(installDir, 'obsolete.js'), "'use strict';\n");
 
@@ -1068,7 +1315,15 @@ test('rollback execute restores source config and Mongo before touching only bac
         assert.doesNotMatch(`${result.stdout}${result.stderr}`, /must-not-appear/);
         assert.equal(fs.readFileSync(fixture.hookLog, 'utf8'), 'called\n');
         assert.equal(fs.existsSync(path.join(installDir, 'obsolete.js')), false);
+        assert.equal(fs.existsSync(path.join(installDir, '.celerity-staging-source.env')), false);
         assert.equal(fs.existsSync(path.join(installDir, 'config', 'test', 'obsolete.conf')), false);
+        assert.equal(runChecked('git', ['rev-parse', 'HEAD^{commit}'], { cwd: installDir }), fixture.deployedSourceCommit);
+        assert.equal(runChecked('git', ['rev-parse', 'HEAD^{tree}'], { cwd: installDir }), fixture.deployedSourceTree);
+        assert.equal(runChecked('git', ['status', '--porcelain=v1', '--untracked-files=no'], { cwd: installDir }), '');
+        assert.equal(
+            fs.readFileSync(path.join(installDir, 'index.js'), 'utf8'),
+            fs.readFileSync(path.join(fixture.sourceStage, 'index.js'), 'utf8'),
+        );
         assert.equal(
             fs.readFileSync(path.join(installDir, 'config', 'test', 'worker.conf'), 'utf8'),
             'restored-test-config\n',

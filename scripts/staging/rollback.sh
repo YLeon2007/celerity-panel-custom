@@ -224,6 +224,71 @@ expected_install_parent=$(cd -- "$(dirname -- "$expected_install_root_path")" &&
 [[ "$install_root_path" == "$expected_install_parent/$(basename -- "$install_root")" ]] \
     || fail 'install root resolved outside the guarded test path'
 command -v rsync >/dev/null 2>&1 || fail 'rsync is required for exact source replacement'
+command -v git >/dev/null 2>&1 || fail 'Git is required to validate rollback provenance'
+
+validate_retained_baseline_identity() {
+    local git_root
+    local current_commit
+    local current_tree
+
+    require_safe_git_head_metadata "$install_root_path" 'install'
+    if ! git_root=$(git -C "$install_root_path" rev-parse --show-toplevel 2>/dev/null); then
+        fail 'install root must retain the recorded baseline Git worktree'
+    fi
+    [[ -d "$git_root" && ! -L "$git_root" ]] \
+        || fail 'install Git root must be a real directory'
+    git_root=$(cd -- "$git_root" && pwd -P)
+    [[ "$git_root" == "$install_root_path" ]] \
+        || fail 'install Git root must match the install root'
+    if ! current_commit=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
+        || ! current_tree=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{tree}' 2>/dev/null); then
+        fail 'install Git identity is unavailable'
+    fi
+    [[ "$current_commit" == "${manifest[deployed_source_commit]}" \
+        && "$current_tree" == "${manifest[deployed_source_tree]}" ]] \
+        || fail 'install Git identity does not match the recorded baseline'
+}
+
+verify_restored_baseline_provenance() {
+    local current_commit
+    local current_tree
+    local status_file="$runtime_root/restored-git-status"
+    local status_entry
+    local status_code
+    local status_path
+
+    if ! current_commit=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) \
+        || ! current_tree=$(git -C "$install_root_path" rev-parse --verify 'HEAD^{tree}' 2>/dev/null); then
+        fail 'restored Git identity is unavailable'
+    fi
+    [[ "$current_commit" == "${manifest[deployed_source_commit]}" \
+        && "$current_tree" == "${manifest[deployed_source_tree]}" ]] \
+        || fail 'restored Git identity does not match the recorded baseline'
+    if ! git -C "$install_root_path" status \
+        --porcelain=v1 \
+        -z \
+        --untracked-files=all > "$status_file" 2>/dev/null; then
+        fail 'restored Git status is unavailable'
+    fi
+    while IFS= read -r -d '' status_entry; do
+        status_code=${status_entry:0:2}
+        status_path=${status_entry:3}
+        if [[ "$status_code" == '??' \
+            && ( "$status_path" == '.env' \
+                || "$status_path" == config/test/* \
+                || "$status_path" == node_modules/* \
+                || "$status_path" == data/* \
+                || "$status_path" == logs/* \
+                || "$status_path" == backups/* \
+                || "$status_path" == greenlock.d/* ) ]]; then
+            continue
+        fi
+        fail 'restored source does not exactly match the recorded baseline'
+    done < "$status_file"
+    rm -f -- "$status_file"
+}
+
+validate_retained_baseline_identity
 
 staged_compose=(
     docker compose
@@ -255,6 +320,7 @@ if [[ ${manifest[config_test_present]} == 'true' ]]; then
     mkdir -p -m 0700 -- "$install_root_path/config/test"
     rsync --archive --delete "$staged_config/test/" "$install_root_path/config/test/"
 fi
+verify_restored_baseline_provenance
 
 if ! BACKUP_DIR="$backup_dir_path" \
     MONGO_RESTORE_INPUT="$mongo_archive" \
