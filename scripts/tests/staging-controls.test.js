@@ -362,6 +362,7 @@ test('staging validator accepts real source and module artifacts from the same e
         fs.writeFileSync(configEnv, [
             'PANEL_DOMAIN=test.infograd.online',
             'L2TP_EXECUTION_ENABLED=true',
+            'L2TP_MIGRATIONS_ENABLED=true',
             '',
         ].join('\n'));
 
