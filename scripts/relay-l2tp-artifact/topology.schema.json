@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://celerity.local/schemas/relay-l2tp-topology-v1.json",
+  "title": "CELERITY relay-l2tp portable topology",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "module",
+    "kind",
+    "topology"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "module": {
+      "const": "relay-l2tp"
+    },
+    "kind": {
+      "enum": [
+        "relay-l2tp-topology-transfer",
+        "relay-l2tp-topology-import-draft"
+      ]
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodes",
+        "links",
+        "routeGroups",
+        "relayStates"
+      ],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/link"
+          }
+        },
+        "routeGroups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/routeGroup"
+          }
+        },
+        "relayStates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/relayState"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "portableKey": {
+      "type": "string",
+      "pattern": "^[a-z]+-[0-9]{3,}$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "name",
+        "role"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^node-[0-9]{3,}$"
+        },
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "role": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "name",
+        "source",
+        "target",
+        "mode",
+        "active"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^link-[0-9]{3,}$"
+        },
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^node-[0-9]{3,}$"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^node-[0-9]{3,}$"
+        },
+        "mode": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "active": {
+          "type": "boolean"
+        }
+      }
+    },
+    "routePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pathKey",
+        "links",
+        "priority"
+      ],
+      "properties": {
+        "pathKey": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^link-[0-9]{3,}$"
+          }
+        },
+        "priority": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "routeGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "name",
+        "mode",
+        "strategy",
+        "paths"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^group-[0-9]{3,}$"
+        },
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "mode": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "strategy": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/routePath"
+          }
+        }
+      }
+    },
+    "relayState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node",
+        "desiredState"
+      ],
+      "properties": {
+        "node": {
+          "type": "string",
+          "pattern": "^node-[0-9]{3,}$"
+        },
+        "desiredState": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "clientCidr": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "localAddress": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "poolStart": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "poolEnd": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "dnsServers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "mtu": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "mru": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "routingMode": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "routeGroup": {
+          "type": "string",
+          "pattern": "^group-[0-9]{3,}$"
+        }
+      }
+    }
+  }
+}
