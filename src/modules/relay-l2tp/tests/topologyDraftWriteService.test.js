@@ -152,7 +152,7 @@ test('rejects a candidate with a missing route link before compiling or committi
             assert.equal(error.name, 'TopologyDraftWriteError');
             assert.equal(error.code, 'INVALID_TOPOLOGY_DRAFT');
             assert.deepEqual(error.errors, [{
-                code: 'MISSING_LINK',
+                code: 'UNKNOWN_LINK',
                 groupId: 'group-1',
                 pathKey: 'primary',
                 linkId: 'missing-link',
