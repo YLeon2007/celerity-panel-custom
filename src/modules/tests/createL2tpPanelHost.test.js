@@ -10,15 +10,23 @@ function passThrough(req, res, next) {
     next();
 }
 
-async function request(router, path) {
+async function request(router, pathOrOptions) {
+    const options = typeof pathOrOptions === 'string'
+        ? { path: pathOrOptions }
+        : pathOrOptions;
     const app = express();
+    app.use(express.json());
     app.use(router);
     const server = await new Promise(resolve => {
         const listeningServer = app.listen(0, '127.0.0.1', () => resolve(listeningServer));
     });
 
     try {
-        const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`);
+        const response = await fetch(`http://127.0.0.1:${server.address().port}${options.path}`, {
+            method: options.method || 'GET',
+            headers: options.body === undefined ? {} : { 'content-type': 'application/json' },
+            body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        });
         return {
             status: response.status,
             body: await response.json(),
@@ -30,7 +38,7 @@ async function request(router, path) {
     }
 }
 
-test('builds the concrete repository adapters and composes a dormant runtime', () => {
+test('builds the concrete repository adapters and composes a dormant runtime', async () => {
     const HyNode = { modelName: 'HyNode' };
     const CascadeLink = { modelName: 'CascadeLink' };
     const models = {
@@ -143,6 +151,11 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.strictEqual(runtimeCalls[0].operationRepository, adapters.operationRepository);
     assert.strictEqual(runtimeCalls[0].nodeRepository, adapters.nodeRepository);
     assert.strictEqual(runtimeCalls[0].stateRepository, adapters.stateRepository);
+    assert.equal(typeof runtimeCalls[0].stateManagementService.configureRelay, 'function');
+    await assert.rejects(
+        runtimeCalls[0].stateManagementService.configureRelay('relay-1', {}),
+        error => error?.code === 'L2TP_STATE_MANAGEMENT_UNAVAILABLE',
+    );
     assert.strictEqual(runtimeCalls[0].requireAuth, passThrough);
     assert.strictEqual(runtimeCalls[0].requireOnboarding, passThrough);
     assert.strictEqual(runtimeCalls[0].csrf, passThrough);
@@ -160,6 +173,95 @@ test('builds the concrete repository adapters and composes a dormant runtime', (
     assert.ok(host.topologyRuntime instanceof FakeTopologyRuntime);
     assert.strictEqual(host.runtime, runtime);
     assert.equal(workerRuns, 0);
+});
+
+test('actual mounted configure route uses the state management service injected through the host runtime', async () => {
+    const calls = [];
+    const models = {
+        RelayL2tpState: {},
+        CascadeRouteGroup: {},
+        CascadeTopologyState: {},
+        L2tpOperation: {},
+        NodeOperationLock: {},
+    };
+    const stateManagementService = {
+        async configureRelay(nodeId, input) {
+            calls.push({ nodeId, input });
+            return {
+                node: nodeId,
+                desiredState: 'installed',
+                status: 'not_installed',
+                routeGroup: input.routeGroupId,
+                clientCidr: input.clientCidr,
+                pskEncrypted: 'must-not-be-returned',
+            };
+        },
+    };
+    const realModuleEntry = require('../relay-l2tp');
+    const moduleEntry = {
+        registerModels: () => models,
+        registerRoutes: realModuleEntry.registerRoutes,
+    };
+    const host = createL2tpPanelHost({
+        requireAuth: passThrough,
+        requireOnboarding: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        renderPage() {},
+        moduleEntry,
+        HyNode: {},
+        topologyRuntime: {},
+        Repository: class FakeRepository {},
+        createRepositoryAdapters: () => ({
+            nodeRepository: {},
+            stateRepository: {},
+            operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        stateManagementService,
+    });
+    const mountedRouter = express.Router();
+
+    host.moduleEntry.registerRoutes({
+        panelRouter: mountedRouter,
+        l2tpService: host.runtime.service,
+        stateManagementService: host.runtime.stateManagementService,
+        requireAuth: passThrough,
+        requireOnboarding: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+        loadPanelOverview: host.loadPanelOverview,
+        renderPage() {},
+    });
+
+    const response = await request(mountedRouter, {
+        method: 'POST',
+        path: '/nodes/relay-17/l2tp/configure',
+        body: {
+            clientCidr: '10.77.0.0/24',
+            routeGroupId: 'route-group-a',
+            generatePsk: true,
+            password: 'must-not-reach-service',
+        },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [{
+        nodeId: 'relay-17',
+        input: {
+            clientCidr: '10.77.0.0/24',
+            routeGroupId: 'route-group-a',
+            generatePsk: true,
+        },
+    }]);
+    assert.deepEqual(response.body, {
+        node: 'relay-17',
+        desiredState: 'installed',
+        status: 'not_installed',
+        routeGroup: 'route-group-a',
+        clientCidr: '10.77.0.0/24',
+    });
+    assert.doesNotMatch(JSON.stringify(response.body), /must-not-be-returned/);
 });
 
 test('explicit opt-in wires the topology health provider with its bounded staleness', () => {

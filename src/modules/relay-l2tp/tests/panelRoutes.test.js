@@ -137,7 +137,14 @@ test('GET node L2TP status is authenticated and delegates to the injected servic
         l2tpService: {
             async getStatus(nodeId) {
                 calls.push({ method: 'getStatus', nodeId });
-                return { status: 'installed', nodeId };
+                return {
+                    status: 'installed',
+                    nodeId,
+                    psk: 'must-not-be-returned',
+                    pskEncrypted: 'must-not-be-returned',
+                    ssh: { password: 'must-not-be-returned' },
+                    rawCommand: 'must-not-be-returned',
+                };
             },
         },
         requireAuth(req, res, next) {
@@ -249,6 +256,102 @@ test('POST preflight enforces protection and passes only allowed body fields', a
     ]);
 });
 
+test('POST configure enforces every mutation guard and returns only safe desired state', async () => {
+    const calls = [];
+    const expectedInput = {
+        clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1', '9.9.9.9'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        routeGroupId: 'route-group-1',
+        psk: 'operator-supplied-secret',
+    };
+    const middleware = method => (req, res, next) => {
+        calls.push({ method });
+        next();
+    };
+    const router = createRouter({
+        l2tpService: {},
+        stateManagementService: {
+            async configureRelay(nodeId, input) {
+                calls.push({ method: 'configureRelay', nodeId, input });
+                return {
+                    node: nodeId,
+                    desiredState: 'installed',
+                    status: 'not_installed',
+                    routeGroup: input.routeGroupId,
+                    clientCidr: input.clientCidr,
+                    localAddress: input.localAddress,
+                    poolStart: input.poolStart,
+                    poolEnd: input.poolEnd,
+                    dnsServers: input.dnsServers,
+                    tproxyPort: input.tproxyPort,
+                    fwmark: input.fwmark,
+                    routeTable: input.routeTable,
+                    routingMode: 'route-group',
+                    secretRevision: 1,
+                    psk: input.psk,
+                    pskEncrypted: 'encrypted-secret',
+                    password: 'must-not-be-returned',
+                    rawCommand: 'must-not-be-returned',
+                };
+            },
+        },
+        requireAuth: middleware('requireAuth'),
+        requireOnboarding: middleware('requireOnboarding'),
+        csrf: middleware('csrf'),
+        rateLimiter: middleware('rateLimiter'),
+    });
+
+    const response = await request(router, {
+        method: 'POST',
+        path: '/nodes/node-19/l2tp/configure',
+        body: {
+            ...expectedInput,
+            node: 'different-node',
+            desiredState: 'absent',
+            routingMode: 'attacker-controlled',
+            password: 'must-not-reach-service',
+            encryptedValue: 'must-not-reach-service',
+            ssh: { command: 'must-not-reach-service' },
+            argv: ['must-not-reach-service'],
+        },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+        node: 'node-19',
+        desiredState: 'installed',
+        status: 'not_installed',
+        routeGroup: 'route-group-1',
+        clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1', '9.9.9.9'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        routingMode: 'route-group',
+        secretRevision: 1,
+    });
+    assert.deepEqual(calls, [
+        { method: 'requireAuth' },
+        { method: 'requireOnboarding' },
+        { method: 'csrf' },
+        { method: 'rateLimiter' },
+        { method: 'configureRelay', nodeId: 'node-19', input: expectedInput },
+    ]);
+    assert.doesNotMatch(
+        JSON.stringify(response.body),
+        /operator-supplied-secret|encrypted-secret|must-not-be-returned/i,
+    );
+});
+
 test('POST install returns 202 with the queued operation id', async () => {
     const calls = [];
     const expectedInput = {
@@ -324,6 +427,49 @@ test('GET L2TP operation is authenticated and delegates by operation id', async 
         { method: 'requireAuth' },
         { method: 'getOperation', operationId: 'operation-31' },
     ]);
+});
+
+test('configure errors expose only allowlisted codes at stable HTTP statuses', async () => {
+    const cases = [
+        { code: 'INVALID_CLIENT_POOL', status: 400 },
+        { code: 'ROUTE_GROUP_NOT_FOUND', status: 404 },
+        { code: 'NODE_NOT_RELAY', status: 409 },
+        { code: 'PSK_ENCRYPTION_FAILED', status: 422 },
+    ];
+
+    for (const { code, status } of cases) {
+        const error = Object.assign(new Error(`safe ${code} rejection`), {
+            code,
+            details: { psk: 'must-not-be-returned' },
+            rawCommand: 'must-not-be-returned',
+        });
+        const router = createRouter({
+            l2tpService: {},
+            stateManagementService: {
+                async configureRelay() {
+                    throw error;
+                },
+            },
+            requireAuth: passThrough,
+            csrf: passThrough,
+            rateLimiter: passThrough,
+        });
+
+        const response = await request(router, {
+            method: 'POST',
+            path: `/nodes/node-${status}/l2tp/configure`,
+            body: { generatePsk: true },
+        });
+
+        assert.equal(response.status, status, code);
+        assert.deepEqual(response.body, {
+            error: {
+                code,
+                message: `safe ${code} rejection`,
+            },
+        });
+        assert.doesNotMatch(JSON.stringify(response.body), /must-not-be-returned/);
+    }
 });
 
 test('structured service error codes map to the documented HTTP statuses', async () => {

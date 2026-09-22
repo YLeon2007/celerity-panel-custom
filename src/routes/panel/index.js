@@ -74,6 +74,7 @@ function createPanelRouter({
     l2tpHost.moduleEntry.registerRoutes({
         panelRouter: router,
         l2tpService: l2tpHost.runtime.service,
+        stateManagementService: l2tpHost.runtime.stateManagementService,
         requireAuth,
         requireOnboarding,
         csrf: requirePanelCsrf,

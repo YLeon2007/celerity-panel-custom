@@ -28,6 +28,13 @@ function createDependencies() {
         },
         nodeRepository: { async findById() {} },
         stateRepository: { async findByNodeId() {} },
+        stateManagementService: {
+            repository: { connectionString: 'mongodb://state-management-secret' },
+            secretBox: { privateKey: 'secret-box-private-key' },
+            secretKey: 'state-management-secret-key',
+            randomBytes() {},
+            async configureRelay() {},
+        },
         preflightRunner: async () => ({ ok: true }),
         transport: {
             async uploadRootFile() {},
@@ -68,6 +75,11 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.service.planBuilder, buildInstallPlan);
     assert.strictEqual(runtime.service.preflightRunner, dependencies.preflightRunner);
     assert.strictEqual(runtime.service.clock, dependencies.clock);
+    assert.strictEqual(runtime.stateManagementService, dependencies.stateManagementService);
+    assert.equal(
+        Object.prototype.propertyIsEnumerable.call(runtime, 'stateManagementService'),
+        false,
+    );
 
     assert.ok(runtime.worker instanceof L2tpOperationWorker);
     assert.ok(runtime.worker.operationRepository instanceof L2tpOperationRepository);
@@ -117,8 +129,20 @@ test('does not surface injected model or transport secrets', () => {
     assert.doesNotMatch(serializedRuntime, /model-secret/);
     assert.doesNotMatch(serializedRuntime, /transport-private-key/);
     assert.doesNotMatch(serializedRuntime, /resolver-private-key/);
+    assert.doesNotMatch(serializedRuntime, /state-management-secret/);
+    assert.doesNotMatch(serializedRuntime, /secret-box-private-key/);
     assert.equal(Object.hasOwn(runtime, 'operationModel'), false);
     assert.equal(Object.hasOwn(runtime, 'transport'), false);
+    for (const propertyName of ['repository', 'secretBox', 'secretKey', 'randomBytes']) {
+        assert.equal(
+            Object.prototype.propertyIsEnumerable.call(
+                runtime.stateManagementService,
+                propertyName,
+            ),
+            false,
+            propertyName,
+        );
+    }
     for (const propertyName of [
         'operationRepository',
         'lockService',
@@ -253,6 +277,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
         'operationRepository',
         'nodeRepository',
         'stateRepository',
+        'stateManagementService',
         'preflightRunner',
         'transport',
         'lockService',

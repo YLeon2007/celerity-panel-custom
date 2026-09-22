@@ -2,6 +2,49 @@
 
 const express = require('express');
 
+const CONFIGURE_INPUT_FIELDS = Object.freeze([
+    'clientCidr',
+    'localAddress',
+    'poolStart',
+    'poolEnd',
+    'dnsServers',
+    'tproxyPort',
+    'fwmark',
+    'routeTable',
+    'routeGroupId',
+    'psk',
+    'generatePsk',
+]);
+const NODE_STATUS_SAFE_FIELDS = Object.freeze([
+    'nodeId',
+    'role',
+    'desiredState',
+    'status',
+    'routeGroupId',
+    'operationId',
+    'appliedTopologyRevision',
+    'lastErrorCode',
+]);
+const DESIRED_STATE_SAFE_FIELDS = Object.freeze([
+    '_id',
+    'node',
+    'desiredState',
+    'status',
+    'routeGroup',
+    'clientCidr',
+    'localAddress',
+    'poolStart',
+    'poolEnd',
+    'dnsServers',
+    'tproxyPort',
+    'fwmark',
+    'routeTable',
+    'routingMode',
+    'secretRevision',
+    'createdAt',
+    'updatedAt',
+]);
+
 const ERROR_STATUS_BY_CODE = new Map([
     ['BAD_REQUEST', 400],
     ['INVALID_INPUT', 400],
@@ -9,7 +52,15 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_NODE_ID', 400],
     ['INVALID_OPERATION_ID', 400],
     ['INVALID_CLIENT_CIDR', 400],
+    ['INVALID_DESIRED_STATE', 400],
+    ['INVALID_LOCAL_ADDRESS', 400],
+    ['INVALID_CLIENT_POOL', 400],
     ['INVALID_DNS_SERVERS', 400],
+    ['INVALID_TPROXY_PORT', 400],
+    ['INVALID_FWMARK', 400],
+    ['INVALID_ROUTE_TABLE', 400],
+    ['NODE_REQUIRED', 400],
+    ['PSK_SOURCE_REQUIRED', 400],
     ['INVALID_ROUTE_GROUP_ID', 400],
     ['INVALID_TOPOLOGY_REVISION', 400],
     ['UNSUPPORTED_OS', 400],
@@ -33,6 +84,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CONFIG_DRIFT', 409],
     ['CONFIG_DRIFT_CONFLICT', 409],
     ['UNPROCESSABLE_ENTITY', 422],
+    ['INVALID_PSK', 422],
+    ['PSK_ENCRYPTION_FAILED', 422],
     ['PREFLIGHT_FAILED', 422],
     ['PREFLIGHT_CHECK_FAILED', 422],
     ['NO_HEALTHY_PATH', 422],
@@ -46,6 +99,27 @@ function pickOperationInput(body = {}) {
         routeGroupId: body.routeGroupId,
         expectedTopologyRevision: body.expectedTopologyRevision,
     };
+}
+
+function pickDefined(source, fields) {
+    return fields.reduce((result, field) => {
+        if (source?.[field] !== undefined) {
+            result[field] = Array.isArray(source[field]) ? [...source[field]] : source[field];
+        }
+        return result;
+    }, {});
+}
+
+function pickConfigureInput(body) {
+    return pickDefined(body, CONFIGURE_INPUT_FIELDS);
+}
+
+function safeNodeStatus(status) {
+    return pickDefined(status, NODE_STATUS_SAFE_FIELDS);
+}
+
+function safeDesiredState(state) {
+    return pickDefined(state, DESIRED_STATE_SAFE_FIELDS);
 }
 
 function sendServiceError(res, error) {
@@ -69,6 +143,7 @@ function sendServiceError(res, error) {
 
 function createL2tpRouter({
     l2tpService,
+    stateManagementService,
     requireAuth,
     requireOnboarding,
     csrf,
@@ -95,11 +170,30 @@ function createL2tpRouter({
     router.get('/nodes/:id/l2tp/status', requireAuth, requireOnboarding, async (req, res) => {
         try {
             const status = await l2tpService.getStatus(req.params.id);
-            res.json(status);
+            res.json(safeNodeStatus(status));
         } catch (error) {
             sendServiceError(res, error);
         }
     });
+
+    router.post(
+        '/nodes/:id/l2tp/configure',
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        async (req, res) => {
+            try {
+                const state = await stateManagementService.configureRelay(
+                    req.params.id,
+                    pickConfigureInput(req.body),
+                );
+                res.json(safeDesiredState(state));
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
 
     router.post(
         '/nodes/:id/l2tp/preflight',

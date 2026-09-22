@@ -23,6 +23,7 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
 
         const calls = [];
         const l2tpService = { kind: 'l2tp-service' };
+        const stateManagementService = { kind: 'state-management-service' };
         const loadPanelOverview = async () => ({});
         const l2tpMarker = function l2tpMarker(req, res, next) { next(); };
         const rateLimiter = function rateLimiter(req, res, next) { next(); };
@@ -34,6 +35,7 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
         };
         const runtime = Object.create(null, {
             service: { value: l2tpService, enumerable: true },
+            stateManagementService: { value: stateManagementService },
             worker: {
                 get() {
                     throw new Error('panel mount must not access or start the worker');
@@ -63,6 +65,7 @@ test('panel aggregator preserves existing routes and registers the L2TP runtime 
         assert.equal(calls[1].method, 'registerRoutes');
         assert.strictEqual(calls[1].context.panelRouter, router);
         assert.strictEqual(calls[1].context.l2tpService, l2tpService);
+        assert.strictEqual(calls[1].context.stateManagementService, stateManagementService);
         assert.strictEqual(calls[1].context.requireAuth, requireAuth);
         assert.strictEqual(calls[1].context.requireOnboarding, requireOnboarding);
         assert.strictEqual(calls[1].context.csrf, requirePanelCsrf);

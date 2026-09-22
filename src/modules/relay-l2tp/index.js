@@ -46,6 +46,7 @@ function registerRoutes(context) {
     const {
         panelRouter,
         l2tpService,
+        stateManagementService,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -58,6 +59,9 @@ function registerRoutes(context) {
     }
     if (!l2tpService) {
         throw new TypeError('registerRoutes requires l2tpService');
+    }
+    if (!stateManagementService || typeof stateManagementService.configureRelay !== 'function') {
+        throw new TypeError('registerRoutes requires stateManagementService');
     }
     if (typeof requireAuth !== 'function') {
         throw new TypeError('registerRoutes requires requireAuth');
@@ -82,6 +86,7 @@ function registerRoutes(context) {
     const { createL2tpRouter } = require('./routes/panel');
     const l2tpRouter = createL2tpRouter({
         l2tpService,
+        stateManagementService,
         requireAuth,
         requireOnboarding,
         csrf,

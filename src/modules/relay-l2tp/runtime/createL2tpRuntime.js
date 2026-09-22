@@ -16,6 +16,7 @@ const REQUIRED_DEPENDENCIES = Object.freeze([
     'operationRepository',
     'nodeRepository',
     'stateRepository',
+    'stateManagementService',
     'preflightRunner',
     'lockService',
     'secretResolver',
@@ -71,6 +72,7 @@ function createL2tpRuntime(dependencies) {
         operationRepository,
         nodeRepository,
         stateRepository,
+        stateManagementService,
         preflightRunner,
         transport,
         transportResolver,
@@ -110,6 +112,12 @@ function createL2tpRuntime(dependencies) {
         leaseMs,
         clock,
     });
+    hideInjectedDependencies(stateManagementService, [
+        'repository',
+        'secretBox',
+        'secretKey',
+        'randomBytes',
+    ]);
     hideInjectedDependencies(service, [
         'nodeRepository',
         'stateRepository',
@@ -130,6 +138,7 @@ function createL2tpRuntime(dependencies) {
     ]);
     const router = createL2tpRouter({
         l2tpService: service,
+        stateManagementService,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -140,12 +149,19 @@ function createL2tpRuntime(dependencies) {
     const configFragmentRegistry = createConfigFragmentRegistry([PROVIDER_ID]);
     configFragmentRegistry.register(PROVIDER_ID, buildL2tpXrayFragment);
 
-    return {
+    const runtime = {
         service,
         worker,
         router,
         configFragmentRegistry,
     };
+    Object.defineProperty(runtime, 'stateManagementService', {
+        value: stateManagementService,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+    });
+    return runtime;
 }
 
 module.exports = { createL2tpRuntime };

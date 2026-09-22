@@ -21,10 +21,28 @@
             <form data-l2tp-form>
                 <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
                 <label>Client CIDR
-                    <input name="clientCidr" value="<%= relay.clientCidr || '' %>" placeholder="10.77.0.0/24" required>
+                    <input type="text" name="clientCidr" value="<%= relay.clientCidr || '' %>" placeholder="10.77.0.0/24" required>
+                </label>
+                <label>Local IP
+                    <input type="text" name="localAddress" value="<%= relay.localAddress || '' %>" placeholder="10.77.0.1" required>
+                </label>
+                <label>Pool start
+                    <input type="text" name="poolStart" value="<%= relay.poolStart || '' %>" placeholder="10.77.0.10" required>
+                </label>
+                <label>Pool end
+                    <input type="text" name="poolEnd" value="<%= relay.poolEnd || '' %>" placeholder="10.77.0.200" required>
                 </label>
                 <label>DNS servers
-                    <input name="dnsServers" value="<%= (relay.dnsServers || []).join(', ') %>" placeholder="1.1.1.1, 9.9.9.9" required>
+                    <input type="text" name="dnsServers" value="<%= (relay.dnsServers || []).join(', ') %>" placeholder="1.1.1.1, 9.9.9.9" required>
+                </label>
+                <label>TPROXY port
+                    <input type="number" name="tproxyPort" value="<%= relay.tproxyPort ?? '' %>" min="1" max="65535" step="1" placeholder="12345" required>
+                </label>
+                <label>Firewall mark
+                    <input type="number" name="fwmark" value="<%= relay.fwmark ?? '' %>" min="1" max="4294967295" step="1" placeholder="77" required>
+                </label>
+                <label>Route table
+                    <input type="number" name="routeTable" value="<%= relay.routeTable ?? '' %>" min="1" max="4294967295" step="1" placeholder="177" required>
                 </label>
                 <label>Route group
                     <select name="routeGroupId" required>
@@ -37,6 +55,7 @@
                     </select>
                 </label>
                 <div class="form-actions">
+                    <button type="button" data-l2tp-action="configure">Save desired state</button>
                     <button type="button" data-l2tp-action="preflight">Preflight</button>
                     <button type="button" data-l2tp-action="install">Queue install</button>
                 </div>
@@ -66,10 +85,33 @@
 <script>
 (() => {
     const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
-    const typedFields = ['clientCidr', 'dnsServers', 'routeGroupId', 'expectedTopologyRevision'];
 
     function setResult(output, value) {
         output.textContent = value;
+    }
+
+    function buildOperationPayload(values) {
+        return {
+            clientCidr: String(values.clientCidr || '').trim(),
+            dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
+            routeGroupId: String(values.routeGroupId || ''),
+            expectedTopologyRevision: Number(values.expectedTopologyRevision),
+        };
+    }
+
+    function buildConfigurePayload(values) {
+        return {
+            clientCidr: String(values.clientCidr || '').trim(),
+            localAddress: String(values.localAddress || '').trim(),
+            poolStart: String(values.poolStart || '').trim(),
+            poolEnd: String(values.poolEnd || '').trim(),
+            dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
+            tproxyPort: Number(values.tproxyPort),
+            fwmark: Number(values.fwmark),
+            routeTable: Number(values.routeTable),
+            routeGroupId: String(values.routeGroupId || ''),
+            generatePsk: true,
+        };
     }
 
     document.querySelectorAll('[data-l2tp-relay]').forEach((relay) => {
@@ -80,18 +122,15 @@
         relay.querySelectorAll('[data-l2tp-action]').forEach((button) => {
             button.addEventListener('click', async () => {
                 const values = Object.fromEntries(new FormData(form).entries());
-                const payload = {
-                    clientCidr: String(values.clientCidr || '').trim(),
-                    dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
-                    routeGroupId: String(values.routeGroupId || ''),
-                    expectedTopologyRevision: Number(values.expectedTopologyRevision),
-                };
-                if (!typedFields.every((field) => Object.hasOwn(payload, field))) return;
+                const action = button.dataset.l2tpAction;
+                const payload = action === 'configure'
+                    ? buildConfigurePayload(values)
+                    : buildOperationPayload(values);
 
                 button.disabled = true;
                 setResult(output, 'Working…');
                 try {
-                    const response = await fetch(`/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/${button.dataset.l2tpAction}`, {
+                    const response = await fetch(`/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/${action}`, {
                         method: 'POST',
                         headers: {
                             'content-type': 'application/json',
@@ -104,7 +143,11 @@
                         setResult(output, result.error?.code || 'REQUEST_FAILED');
                         return;
                     }
-                    setResult(output, result.operationId || (result.ok ? 'OK' : 'FAILED'));
+                    setResult(
+                        output,
+                        result.operationId
+                            || (result.ok ? 'OK' : action === 'configure' ? result.status || 'CONFIGURED' : 'FAILED'),
+                    );
                 } catch {
                     setResult(output, 'REQUEST_FAILED');
                 } finally {

@@ -102,6 +102,10 @@ test('registerRoutes mounts the existing panel router with only injected depende
                     },
                 },
                 l2tpService: { kind: 'injected-service' },
+                stateManagementService: {
+                    kind: 'injected-state-management-service',
+                    configureRelay() {},
+                },
                 requireAuth() {},
                 requireOnboarding() {},
                 csrf() {},
@@ -114,6 +118,7 @@ test('registerRoutes mounts the existing panel router with only injected depende
 
             assert.deepEqual(factoryCalls, [{
                 l2tpService: context.l2tpService,
+                stateManagementService: context.stateManagementService,
                 requireAuth: context.requireAuth,
                 requireOnboarding: context.requireOnboarding,
                 csrf: context.csrf,
@@ -162,6 +167,7 @@ test('registerRoutes rejects every missing injected dependency before creating a
             const baseContext = {
                 panelRouter: { use() {} },
                 l2tpService: {},
+                stateManagementService: { configureRelay() {} },
                 requireAuth() {},
                 requireOnboarding() {},
                 csrf() {},
@@ -225,6 +231,7 @@ test('registerRoutes rejects a second call without creating or mounting another 
                     },
                 },
                 l2tpService: {},
+                stateManagementService: { configureRelay() {} },
                 requireAuth() {},
                 requireOnboarding() {},
                 csrf() {},
