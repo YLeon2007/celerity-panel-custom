@@ -172,6 +172,63 @@ cleanup() {
 trap cleanup EXIT
 staged_source="$runtime_root/source"
 staged_config="$runtime_root/config"
+
+untouched_services=(mongo redis caddy updater)
+declare -A untouched_container_ids=()
+declare -A untouched_restart_counts=()
+current_untouched_container_id=''
+current_untouched_restart_count=''
+
+read_untouched_service_state() {
+    local service=$1
+    local container_ref
+    local inspected_state
+    local inspected_id
+    local restart_count
+    local unexpected
+
+    if ! container_ref=$("${compose[@]}" ps --status running --quiet "$service" 2>/dev/null); then
+        fail "untouched service $service is not running"
+    fi
+    [[ "$container_ref" =~ ^[0-9a-f]{12,64}$ ]] \
+        || fail "untouched service $service must have exactly one running container"
+    if ! inspected_state=$(docker inspect \
+        --format '{{.Id}} {{.RestartCount}}' \
+        "$container_ref" 2>/dev/null); then
+        fail "untouched service $service container state is unavailable"
+    fi
+    [[ "$inspected_state" != *$'\n'* ]] \
+        || fail "untouched service $service container state is invalid"
+    read -r inspected_id restart_count unexpected <<< "$inspected_state"
+    [[ "$inspected_id" =~ ^[0-9a-f]{64}$ \
+        && "$restart_count" =~ ^[0-9]+$ \
+        && -z "$unexpected" \
+        && "$inspected_id" == "$container_ref"* ]] \
+        || fail "untouched service $service container state is invalid"
+    current_untouched_container_id=$inspected_id
+    current_untouched_restart_count=$restart_count
+}
+
+capture_untouched_service_states() {
+    local service
+    for service in "${untouched_services[@]}"; do
+        read_untouched_service_state "$service"
+        untouched_container_ids[$service]=$current_untouched_container_id
+        untouched_restart_counts[$service]=$current_untouched_restart_count
+    done
+}
+
+verify_untouched_service_states() {
+    local service
+    for service in "${untouched_services[@]}"; do
+        read_untouched_service_state "$service"
+        [[ "$current_untouched_container_id" == "${untouched_container_ids[$service]}" ]] \
+            || fail "untouched service $service container identity changed"
+        [[ "$current_untouched_restart_count" == "${untouched_restart_counts[$service]}" ]] \
+            || fail "untouched service $service restart count changed"
+    done
+}
+
 validator_args=(
     --source-archive "$source_archive"
     --config-env-file "$config_env"
@@ -205,6 +262,8 @@ print_plan() {
         'restore_steps=source,config,mongo' \
         "container_build=$CELERITY_APP_SERVICE" \
         "container_restart=$CELERITY_APP_SERVICE --no-deps" \
+        'untouched_services=mongo,redis,caddy,updater' \
+        'untouched_verification=container-id,restart-count' \
         'node_mutation=none' \
         "health_template=docker compose --project-directory $install_root --env-file $install_root/.env -f $install_root/$CELERITY_COMPOSE_FILE ps $CELERITY_APP_SERVICE" \
         "health_template=curl --fail --silent --show-error --max-time 10 https://$CELERITY_TEST_HOST/health"
@@ -223,6 +282,10 @@ expected_install_root_path=$(resolve_control_path "$install_root")
 expected_install_parent=$(cd -- "$(dirname -- "$expected_install_root_path")" && pwd -P)
 [[ "$install_root_path" == "$expected_install_parent/$(basename -- "$install_root")" ]] \
     || fail 'install root resolved outside the guarded test path'
+[[ -f "$install_root_path/$CELERITY_COMPOSE_FILE" && ! -L "$install_root_path/$CELERITY_COMPOSE_FILE" ]] \
+    || fail 'installed Compose file must be a regular file'
+[[ -f "$install_root_path/.env" && ! -L "$install_root_path/.env" ]] \
+    || fail 'installed .env must be a regular file'
 command -v rsync >/dev/null 2>&1 || fail 'rsync is required for exact source replacement'
 command -v git >/dev/null 2>&1 || fail 'Git is required to validate rollback provenance'
 
@@ -290,6 +353,13 @@ verify_restored_baseline_provenance() {
 
 validate_retained_baseline_identity
 
+compose=(
+    docker compose
+    --project-directory "$install_root_path"
+    --env-file "$install_root_path/.env"
+    -f "$install_root_path/$CELERITY_COMPOSE_FILE"
+)
+
 staged_compose=(
     docker compose
     --project-directory "$staged_source"
@@ -301,6 +371,7 @@ staged_compose=(
 
 lock_dir="$backup_root_path/.deploy-lock"
 mkdir -- "$lock_dir" 2>/dev/null || fail 'another staging control operation is active'
+capture_untouched_service_states
 
 rsync \
     --archive \
@@ -331,12 +402,6 @@ if ! BACKUP_DIR="$backup_dir_path" \
     fail 'Mongo restore hook failed after source and config restore'
 fi
 
-compose=(
-    docker compose
-    --project-directory "$install_root_path"
-    --env-file "$install_root_path/.env"
-    -f "$install_root_path/$CELERITY_COMPOSE_FILE"
-)
 "${compose[@]}" config --quiet >/dev/null 2>&1 \
     || fail 'restored Compose validation failed'
 "${compose[@]}" build "$CELERITY_APP_SERVICE"
@@ -345,6 +410,15 @@ running_services=$("${compose[@]}" ps --status running --services "$CELERITY_APP
     || fail 'backend health validation failed'
 [[ "$running_services" == "$CELERITY_APP_SERVICE" ]] \
     || fail 'backend is not reported running after rollback'
+if ! curl \
+    --fail \
+    --silent \
+    --show-error \
+    --max-time 10 \
+    "https://$CELERITY_TEST_HOST/health" >/dev/null; then
+    fail 'public HTTPS health validation failed'
+fi
+verify_untouched_service_states
 
 printf '%s\n' \
     'rollback ok' \

@@ -486,6 +486,15 @@ function createRollbackFixture() {
     };
 }
 
+function prepareRollbackInstall(fixture) {
+    const installDir = path.join(fixture.testFsRoot, '/opt/hysteria-panel');
+    runChecked('git', ['clone', '--quiet', '--no-local', fixture.sourceStage, installDir]);
+    fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), 'candidate source\n');
+    fs.writeFileSync(path.join(installDir, '.env'), 'OLD_SECRET=must-not-appear\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(installDir, 'obsolete.js'), "'use strict';\n");
+    return installDir;
+}
+
 test('source bundle builder produces deterministic archives from an exact clean commit and tree', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'celerity-bundle-builder-'));
     try {
@@ -1335,6 +1344,24 @@ test('rollback execute restores source config and Mongo before touching only bac
         assert.match(dockerCalls, /up -d --no-deps backend/);
         assert.match(dockerCalls, /ps --status running --services backend/);
         assert.doesNotMatch(dockerCalls, /(?:build|up -d|restart) (?:caddy|mongo|redis|updater)/);
+        const commandCalls = fs.readFileSync(fixture.commandLog, 'utf8').trim().split('\n');
+        const backendUpdate = commandCalls.findIndex(call => call.endsWith(' up -d --no-deps backend'));
+        const backendRunning = commandCalls.findIndex(call => call.endsWith(' ps --status running --services backend'));
+        const publicHealth = commandCalls.indexOf(
+            'curl --fail --silent --show-error --max-time 10 https://test.infograd.online/health',
+        );
+        assert.ok(backendUpdate >= 0);
+        assert.ok(backendRunning > backendUpdate);
+        assert.ok(publicHealth > backendRunning);
+        for (const service of fixture.untouchedServices) {
+            const expected = fixture.untouchedState[service];
+            const psSuffix = ` ps --status running --quiet ${service}`;
+            const psCalls = commandCalls.filter(call => call.endsWith(psSuffix));
+            const inspectCall = `docker inspect --format {{.Id}} {{.RestartCount}} ${expected.id}`;
+            const inspectCalls = commandCalls.filter(call => call === inspectCall);
+            assert.equal(psCalls.length, 2, `${service} identity must be checked before and after`);
+            assert.equal(inspectCalls.length, 2, `${service} restart count must be checked before and after`);
+        }
     } finally {
         fixture.cleanup();
     }
