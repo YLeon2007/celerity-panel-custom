@@ -383,3 +383,39 @@ test('real panel runtime GET operation strips legacy nested secrets and error de
         /top-level-secret|plan-secret|private failure detail|nested-error-secret|nested-step-secret/,
     );
 });
+
+test('passes an explicitly injected node transport into execution runtime composition', () => {
+    const models = {
+        RelayL2tpState: {},
+        CascadeRouteGroup: {},
+        CascadeTopologyState: {},
+        L2tpOperation: {},
+        NodeOperationLock: {},
+    };
+    class FakeNodeTransport {}
+    let executionDependencies;
+
+    createL2tpPanelHost({
+        moduleEntry: { registerModels: () => models },
+        HyNode: {},
+        NodeTransport: FakeNodeTransport,
+        topologyRuntime: {},
+        Repository: class FakeRepository {},
+        createRepositoryAdapters: () => ({
+            nodeRepository: {},
+            stateRepository: {},
+            operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime(dependencies) {
+            executionDependencies = dependencies;
+            return {
+                runtime: { stateManagementService: {} },
+                start() {},
+                async stop() {},
+            };
+        },
+    });
+
+    assert.strictEqual(executionDependencies.NodeTransport, FakeNodeTransport);
+});
