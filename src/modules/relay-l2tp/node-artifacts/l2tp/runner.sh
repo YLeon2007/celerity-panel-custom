@@ -37,14 +37,41 @@ case "$COMMAND" in
     preflight)
         exec_artifact "$ARTIFACT_DIR/preflight.sh" "$OPERATION_DIR/desired.json"
         ;;
+    install_runtime)
+        exec_artifact "$ARTIFACT_DIR/install-runtime.sh"
+        ;;
+    backup)
+        exec_artifact "$ARTIFACT_DIR/backup.sh" "$OPERATION_DIR" '/'
+        ;;
     stage_managed_files)
         exec_artifact "$ARTIFACT_DIR/apply.sh" "$OPERATION_DIR/artifacts.json" '/'
+        ;;
+    compose_xray_fragment)
+        exec_artifact "$ARTIFACT_DIR/compose-xray-fragment.sh" "$OPERATION_DIR"
         ;;
     validate_xray)
         exec_artifact "$ARTIFACT_DIR/validate-xray.sh" "$OPERATION_DIR"
         ;;
     validate_nft)
         exec_artifact "$ARTIFACT_DIR/validate-nft.sh" "$OPERATION_DIR"
+        ;;
+    activate_xray)
+        exec_artifact "$ARTIFACT_DIR/activate-xray.sh" "$OPERATION_DIR" '/'
+        ;;
+    apply_firewall_policy)
+        exec_artifact "$ARTIFACT_DIR/apply-firewall-policy.sh" "$OPERATION_DIR"
+        ;;
+    start_l2tp)
+        exec_artifact "$ARTIFACT_DIR/start-l2tp.sh" "$OPERATION_DIR"
+        ;;
+    sync_users)
+        exec_artifact "$ARTIFACT_DIR/sync-users.sh" "$OPERATION_DIR"
+        ;;
+    verify)
+        exec_artifact "$ARTIFACT_DIR/verify.sh" "$OPERATION_DIR"
+        ;;
+    commit)
+        exec_artifact "$ARTIFACT_DIR/commit.sh" "$OPERATION_DIR"
         ;;
     rollback)
         exec_artifact "$ARTIFACT_DIR/rollback.sh" "$OPERATION_DIR"

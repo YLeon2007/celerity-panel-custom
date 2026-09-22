@@ -52,6 +52,7 @@ test('builds the deterministic ordered install operation plan', () => {
         nextHopNodeId: 'relay-2',
         steps: [
             { type: 'preflight' },
+            { type: 'install_runtime' },
             { type: 'backup' },
             { type: 'stage_managed_files' },
             { type: 'compose_xray_fragment' },

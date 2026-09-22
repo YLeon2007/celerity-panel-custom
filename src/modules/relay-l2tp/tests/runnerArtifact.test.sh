@@ -64,11 +64,20 @@ cp "$RUNNER_SOURCE" "$TMP_DIR/lib/runner.sh"
 chmod +x "$TMP_DIR/lib/runner.sh"
 ln -s "$TMP_DIR/lib/runner.sh" "$TMP_DIR/bin/celerity-l2tp-artifact-runner"
 make_sibling_artifact preflight.sh
+make_sibling_artifact install-runtime.sh
+make_sibling_artifact backup.sh
 make_sibling_artifact apply.sh
+make_sibling_artifact compose-xray-fragment.sh
 make_sibling_artifact validate-xray.sh
 make_sibling_artifact validate-nft.sh
+make_sibling_artifact activate-xray.sh
+make_sibling_artifact apply-firewall-policy.sh
+make_sibling_artifact start-l2tp.sh
+make_sibling_artifact sync-users.sh
+make_sibling_artifact verify.sh
+make_sibling_artifact commit.sh
 make_sibling_artifact rollback.sh
-for forbidden in preflight.sh apply.sh validate-xray.sh validate-nft.sh rollback.sh apt apt-get systemctl nft; do
+for forbidden in preflight.sh install-runtime.sh backup.sh apply.sh compose-xray-fragment.sh validate-xray.sh validate-nft.sh activate-xray.sh apply-firewall-policy.sh start-l2tp.sh sync-users.sh verify.sh commit.sh rollback.sh apt apt-get systemctl nft; do
     make_forbidden_command "$forbidden"
 done
 
@@ -94,6 +103,27 @@ mapfile -t call <"$TMP_DIR/call.log"
     || fail 'stage_managed_files received the wrong manifest path'
 [[ "${call[2]}" == '/' ]] || fail 'stage_managed_files received a non-root apply target'
 
+rm -f "$TMP_DIR/call.log"
+invoke_runner backup --operation-id operation-19 --command backup
+[[ "$status" -eq 0 ]] || fail 'backup dispatch failed'
+[[ "$(<"$output")" == '{"status":"ok","artifact":"backup.sh"}' ]] \
+    || fail 'backup did not execute the fixed sibling artifact'
+mapfile -t call <"$TMP_DIR/call.log"
+[[ "${#call[@]}" -eq 3 ]] || fail 'backup received an unexpected argument count'
+[[ "${call[0]}" == 'backup.sh' ]] || fail 'backup invoked the wrong artifact'
+[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-19' ]] \
+    || fail 'backup received the wrong operation directory'
+[[ "${call[2]}" == '/' ]] || fail 'backup received a non-root backup target'
+
+rm -f "$TMP_DIR/call.log"
+invoke_runner install-runtime --operation-id operation-19 --command install_runtime
+[[ "$status" -eq 0 ]] || fail 'install_runtime dispatch failed'
+[[ "$(<"$output")" == '{"status":"ok","artifact":"install-runtime.sh"}' ]] \
+    || fail 'install_runtime did not execute the fixed sibling artifact'
+mapfile -t call <"$TMP_DIR/call.log"
+[[ "${#call[@]}" -eq 1 ]] || fail 'install_runtime received arguments'
+[[ "${call[0]}" == 'install-runtime.sh' ]] || fail 'install_runtime invoked the wrong artifact'
+
 max_operation_id="$(printf 'a%.0s' {1..128})"
 rm -f "$TMP_DIR/call.log"
 invoke_runner max-id --operation-id "$max_operation_id" --command preflight
@@ -103,11 +133,17 @@ mapfile -t call <"$TMP_DIR/call.log"
     || fail 'maximum-length operation id was not passed as data'
 
 declare -A command_artifacts=(
+    [compose_xray_fragment]='compose-xray-fragment.sh'
     [validate_xray]='validate-xray.sh'
     [validate_nft]='validate-nft.sh'
+    [apply_firewall_policy]='apply-firewall-policy.sh'
+    [start_l2tp]='start-l2tp.sh'
+    [sync_users]='sync-users.sh'
+    [verify]='verify.sh'
+    [commit]='commit.sh'
     [rollback]='rollback.sh'
 )
-for command in validate_xray validate_nft rollback; do
+for command in compose_xray_fragment validate_xray validate_nft apply_firewall_policy start_l2tp sync_users verify commit rollback; do
     rm -f "$TMP_DIR/call.log"
     invoke_runner "$command" --operation-id operation-20 --command "$command"
     [[ "$status" -eq 0 ]] || fail "$command dispatch failed"
@@ -121,8 +157,20 @@ for command in validate_xray validate_nft rollback; do
         || fail "$command received the wrong operation directory"
 done
 
+rm -f "$TMP_DIR/call.log"
+invoke_runner activate_xray --operation-id operation-20 --command activate_xray
+[[ "$status" -eq 0 ]] || fail 'activate_xray dispatch failed'
+[[ "$(<"$output")" == '{"status":"ok","artifact":"activate-xray.sh"}' ]] \
+    || fail 'activate_xray did not execute the fixed sibling artifact'
+mapfile -t call <"$TMP_DIR/call.log"
+[[ "${#call[@]}" -eq 3 ]] || fail 'activate_xray received an unexpected argument count'
+[[ "${call[0]}" == 'activate-xray.sh' ]] || fail 'activate_xray invoked the wrong artifact'
+[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    || fail 'activate_xray received the wrong operation directory'
+[[ "${call[2]}" == '/' ]] || fail 'activate_xray received a non-root activation target'
+
 expect_error unknown-command UNKNOWN_COMMAND \
-    --operation-id operation-21 --command backup
+    --operation-id operation-21 --command install_runtime_raw
 expect_error missing-arguments INVALID_ARGUMENTS \
     --operation-id operation-21
 expect_error extra-arguments INVALID_ARGUMENTS \

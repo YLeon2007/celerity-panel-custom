@@ -2,6 +2,7 @@
 
 const INSTALL_STEP_TYPES = Object.freeze([
     'preflight',
+    'install_runtime',
     'backup',
     'stage_managed_files',
     'compose_xray_fragment',

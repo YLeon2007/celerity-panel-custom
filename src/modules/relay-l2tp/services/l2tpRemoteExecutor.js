@@ -2,6 +2,7 @@
 
 const STEP_COMMANDS = Object.freeze({
     preflight: 'preflight',
+    install_runtime: 'install_runtime',
     backup: 'backup',
     stage_managed_files: 'stage_managed_files',
     compose_xray_fragment: 'compose_xray_fragment',

@@ -81,11 +81,8 @@ fi
 exit 1
 '
 make_stub nft '
-if [[ "${1:-}" == "--version" ]]; then
-    printf "%s\\n" "nftables v1.0.9"
-    exit 0
-fi
-exit 1
+printf "%s\\n" nft >>"$MUTATION_LOG"
+exit 99
 '
 printf '%s\n' '{}' >"$TMP_DIR/xray-config.json"
 output="$TMP_DIR/supported.out"
@@ -98,7 +95,6 @@ assert_line '{"check":"os","status":"ok","id":"debian","version":"13"}' "$output
 assert_line '{"check":"xray","status":"ok","version":"Xray 26.3.27"}' "$output"
 assert_line "{\"check\":\"xray_config\",\"status\":\"ok\",\"path\":\"$TMP_DIR/xray-config.json\"}" "$output"
 assert_line '{"check":"xray_unit","status":"ok","unit":"xray.service"}' "$output"
-assert_line '{"check":"nft","status":"ok","version":"nftables v1.0.9"}' "$output"
 assert_line '{"check":"client_cidr","status":"ok","cidr":"10.77.0.0/24"}' "$output"
 [[ ! -s "$TMP_DIR/mutations.log" ]] || fail 'supported path attempted a mutation'
 ! grep -Fq -- 'must-not-leak' "$output" || fail 'supported path leaked desired-state secret'

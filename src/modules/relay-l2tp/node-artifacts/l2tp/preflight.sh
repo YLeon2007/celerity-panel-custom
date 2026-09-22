@@ -105,15 +105,3 @@ if [[ "$unit_state" != 'loaded' ]]; then
     exit 72
 fi
 printf '{"check":"xray_unit","status":"ok","unit":"%s"}\n' "$XRAY_UNIT_NAME"
-
-nft_path="$(command -v nft || true)"
-if [[ -z "$nft_path" ]]; then
-    emit_error 'nft' 'NFT_BINARY_MISSING'
-    exit 73
-fi
-nft_version="$($nft_path --version 2>/dev/null | sed -n '1p' || true)"
-if [[ -z "$nft_version" ]]; then
-    emit_error 'nft' 'NFT_VERSION_UNAVAILABLE'
-    exit 73
-fi
-printf '{"check":"nft","status":"ok","version":"%s"}\n' "$(json_escape "$nft_version")"

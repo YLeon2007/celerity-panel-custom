@@ -113,6 +113,7 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
     const transport = new L2tpNodeTransport({ nodeSSH });
     const commands = [
         'preflight',
+        'install_runtime',
         'backup',
         'stage_managed_files',
         'compose_xray_fragment',

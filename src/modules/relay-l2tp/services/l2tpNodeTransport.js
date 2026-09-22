@@ -5,6 +5,7 @@ const ARTIFACT_RUNNER_PATH = '/usr/local/bin/celerity-l2tp-artifact-runner';
 const ARTIFACT_RECEIVER_PATH = '/usr/local/bin/celerity-l2tp-artifact-receiver';
 const ARTIFACT_COMMANDS = Object.freeze([
     'preflight',
+    'install_runtime',
     'backup',
     'stage_managed_files',
     'compose_xray_fragment',
