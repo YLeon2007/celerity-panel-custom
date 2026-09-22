@@ -54,6 +54,13 @@ function l2tpOperation(overrides = {}) {
         kind: 'install',
         status: 'queued',
         idempotencyKey: 'install:node:revision-1',
+        plan: {
+            ok: true,
+            topologyRevision: 1,
+            relayId: 'relay-1',
+            routeGroupId: 'group-a',
+            steps: [{ type: 'verify' }],
+        },
         ...overrides,
     });
 }
@@ -112,6 +119,69 @@ test('L2TP operation requires an idempotency key with a unique index', () => {
     const index = L2tpOperation.schema.indexes().find(([fields]) => fields.idempotencyKey === 1);
     assert.ok(index, 'idempotency key index exists');
     assert.equal(index[1].unique, true);
+});
+
+test('L2TP operation requires an immutable durable plan', () => {
+    const planPath = L2tpOperation.schema.path('plan');
+
+    assert.ok(planPath, 'plan schema path exists');
+    assert.equal(planPath.options.required, true);
+    assert.equal(planPath.options.immutable, true);
+    assert.equal(l2tpOperation().validateSync(), undefined);
+    assertValidationKind(l2tpOperation({ plan: undefined }), 'plan', 'required');
+});
+
+test('L2TP operation plan retains only the worker allowlist and drops plaintext secrets', () => {
+    const operation = l2tpOperation({
+        plan: {
+            ok: false,
+            operationId: 'operation-17',
+            topologyRevision: 17,
+            relayId: 'relay-1',
+            routeGroupId: 'group-a',
+            selectedPathKey: 'primary',
+            nextHopNodeId: 'bridge-1',
+            error: {
+                code: 'NO_HEALTHY_PATH',
+                password: 'error-password',
+            },
+            steps: [{
+                type: 'verify',
+                psk: 'step-psk',
+                password: 'step-password',
+            }],
+            psk: 'plan-psk',
+            password: 'plan-password',
+            unknown: 'not-allowed',
+        },
+    });
+
+    assert.equal(operation.validateSync(), undefined);
+    assert.deepEqual(operation.toObject().plan, {
+        ok: false,
+        operationId: 'operation-17',
+        topologyRevision: 17,
+        relayId: 'relay-1',
+        routeGroupId: 'group-a',
+        selectedPathKey: 'primary',
+        nextHopNodeId: 'bridge-1',
+        error: { code: 'NO_HEALTHY_PATH' },
+        steps: [{ type: 'verify' }],
+    });
+});
+
+test('L2TP operation retains optional topology and route-group plan identity', () => {
+    const routeGroupId = objectId();
+    const operation = l2tpOperation({ topologyRevision: 17, routeGroupId });
+
+    assert.equal(operation.validateSync(), undefined);
+    assert.equal(operation.topologyRevision, 17);
+    assert.equal(String(operation.routeGroupId), String(routeGroupId));
+    assert.equal(
+        L2tpOperation.schema.path('routeGroupId').options.ref,
+        'CascadeRouteGroup',
+    );
+    assertValidationKind(l2tpOperation({ topologyRevision: -1 }), 'topologyRevision', 'min');
 });
 
 test('L2TP operation progress is numeric and bounded from 0 through 100', () => {

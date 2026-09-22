@@ -30,6 +30,30 @@ const operationLogEntrySchema = new mongoose.Schema({
     message: { type: String, required: true, trim: true },
 }, { _id: false, strict: true });
 
+const operationPlanStepSchema = new mongoose.Schema({
+    type: { type: String, required: true, trim: true },
+}, { _id: false, strict: true });
+
+const operationPlanErrorSchema = new mongoose.Schema({
+    code: { type: String, required: true, trim: true },
+}, { _id: false, strict: true });
+
+const operationPlanSchema = new mongoose.Schema({
+    ok: { type: Boolean },
+    operationId: { type: String, trim: true },
+    topologyRevision: { type: Number, min: 0 },
+    relayId: { type: String, trim: true },
+    routeGroupId: { type: String, trim: true },
+    selectedPathKey: { type: String, trim: true },
+    nextHopNodeId: { type: String, trim: true },
+    error: { type: operationPlanErrorSchema },
+    steps: {
+        type: [operationPlanStepSchema],
+        required: true,
+        default: undefined,
+    },
+}, { _id: false, strict: true });
+
 const l2tpOperationSchema = new mongoose.Schema({
     node: {
         type: mongoose.Schema.Types.ObjectId,
@@ -57,6 +81,17 @@ const l2tpOperationSchema = new mongoose.Schema({
         trim: true,
         unique: true,
         index: true,
+    },
+    plan: {
+        type: operationPlanSchema,
+        required: true,
+        immutable: true,
+    },
+    topologyRevision: { type: Number, min: 0, default: null },
+    routeGroupId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'CascadeRouteGroup',
+        default: null,
     },
     step: { type: String, default: '', trim: true },
     progress: {
