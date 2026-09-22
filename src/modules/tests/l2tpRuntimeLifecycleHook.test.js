@@ -5,6 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
+const { createL2tpPanelHost } = require('../createL2tpPanelHost');
+const {
+    DEFAULT_MAX_STALENESS_MS,
+} = require('../relay-l2tp/services/topologyHealthSource');
 const {
     createL2tpRootHostDependencies,
     createL2tpRootLifecycle,
@@ -347,6 +351,8 @@ test('root host dependencies provide the exact safe candidate composition requir
     assert.strictEqual(dependencies.candidateUserResolver, candidateUserResolver);
     assert.strictEqual(dependencies.configGenerator, configGenerator);
     assert.strictEqual(dependencies.fragmentProvider, fragmentProvider);
+    assert.equal(dependencies.enableTopologyHealthProvider, true);
+    assert.equal(dependencies.topologyHealthMaxStalenessMs, DEFAULT_MAX_STALENESS_MS);
     assert.equal(typeof dependencies.candidateNodeResolver, 'function');
 
     assert.strictEqual(
@@ -381,6 +387,162 @@ test('root host dependencies provide the exact safe candidate composition requir
         logger: lifecycleLogger,
     });
     assert.equal(Object.hasOwn(dependencies.workerLifecycle, 'enabled'), false);
+});
+
+test('enabled root composition selects only a current healthy downstream path', async () => {
+    const now = new Date('2026-09-22T12:00:00.000Z');
+    const maxStalenessMs = 30_000;
+    const nodes = [
+        {
+            _id: 'portal-1',
+            type: 'xray',
+            active: true,
+            cascadeRole: 'portal',
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+        {
+            _id: 'relay-1',
+            type: 'xray',
+            active: true,
+            cascadeRole: 'relay',
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+        {
+            _id: 'bridge-1',
+            type: 'xray',
+            active: true,
+            cascadeRole: 'bridge',
+            status: 'online',
+            agentStatus: 'online',
+            agentLastSeen: now,
+        },
+    ];
+    const links = [
+        {
+            _id: 'entry',
+            active: true,
+            portalNode: 'portal-1',
+            bridgeNode: 'relay-1',
+            mode: 'forward',
+        },
+        {
+            _id: 'exit',
+            active: true,
+            portalNode: 'relay-1',
+            bridgeNode: 'bridge-1',
+            mode: 'forward',
+        },
+    ];
+    const groups = [{
+        _id: 'group-a',
+        mode: 'forward',
+        strategy: 'priority-failover',
+        paths: [{ pathKey: 'primary', linkIds: ['entry', 'exit'], priority: 10 }],
+    }];
+    const createReadModel = rows => ({
+        find() {
+            return {
+                select() { return this; },
+                lean() { return Promise.resolve(rows); },
+            };
+        },
+    });
+    const HyNode = {
+        ...createReadModel(nodes),
+        findById() {
+            throw new Error('candidate lookup must not run during topology health evaluation');
+        },
+    };
+    const CascadeLink = createReadModel(links);
+    const CascadeRouteGroup = createReadModel(groups);
+    const middleware = () => {};
+    const rootDependencies = createL2tpRootHostDependencies({
+        HyNode,
+        NodeSSH: class ForbiddenNodeSSH {
+            constructor() {
+                throw new Error('topology health must not open SSH connections');
+            }
+        },
+        NodeTransport: class ForbiddenNodeTransport {
+            constructor() {
+                throw new Error('topology health must not construct remote transports');
+            }
+        },
+        L2tpXrayCandidateService: class FakeCandidateService {},
+        createPreflightRunner: () => async () => ({ ok: true, checks: [] }),
+        operationMaterializer: async () => ({}),
+        secretBox: { encrypt() {}, decrypt() {} },
+        secretKey: 'root-secret-key',
+        syncService: null,
+        candidateUserResolver: async () => [],
+        requireAuth: middleware,
+        requireOnboarding: middleware,
+        csrf: middleware,
+        rateLimiter: middleware,
+        renderPage: middleware,
+        clock: { now: () => now },
+        topologyHealthMaxStalenessMs: maxStalenessMs,
+        timer: { setInterval() {}, clearInterval() {} },
+        logger: { error() {} },
+    });
+
+    assert.equal(rootDependencies.enableTopologyHealthProvider, true);
+    assert.equal(rootDependencies.topologyHealthMaxStalenessMs, maxStalenessMs);
+
+    const host = createL2tpPanelHost({
+        ...rootDependencies,
+        CascadeLink,
+        moduleEntry: {
+            registerModels: () => ({
+                RelayL2tpState: {},
+                CascadeRouteGroup,
+                CascadeTopologyState: {},
+                L2tpOperation: {},
+                L2tpUser: {},
+                NodeOperationLock: {},
+            }),
+        },
+        Repository: class FakeRepository {},
+        createRepositoryAdapters: () => ({
+            nodeRepository: {},
+            stateRepository: {},
+            operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({
+            runtime: { stateManagementService: {} },
+            start() {},
+            async stop() {},
+        }),
+    });
+
+    assert.equal(host.topologyRuntime.healthSource.maxStalenessMs, maxStalenessMs);
+    assert.deepEqual(
+        (await host.topologyRuntime.getRelayGroupPlan('relay-1', 'group-a')).decision,
+        {
+            decision: 'select',
+            groupId: 'group-a',
+            pathKey: 'primary',
+            nextHopNodeId: 'bridge-1',
+        },
+    );
+
+    nodes[2].agentLastSeen = new Date(now.getTime() - maxStalenessMs - 1);
+    assert.deepEqual(
+        (await host.topologyRuntime.getRelayGroupPlan('relay-1', 'group-a')).decision,
+        { decision: 'block', error: { code: 'NO_HEALTHY_PATH' } },
+    );
+
+    nodes[2].agentLastSeen = now;
+    nodes[2].agentStatus = 'unknown';
+    assert.deepEqual(
+        (await host.topologyRuntime.getRelayGroupPlan('relay-1', 'group-a')).decision,
+        { decision: 'block', error: { code: 'NO_HEALTHY_PATH' } },
+    );
 });
 
 test('root default candidate user resolver returns only fields required by Xray generation', async () => {

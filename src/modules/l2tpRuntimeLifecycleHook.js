@@ -9,6 +9,9 @@ const {
 const {
     l2tpActiveHostProvider,
 } = require('./l2tpActiveHostProvider');
+const {
+    DEFAULT_MAX_STALENESS_MS,
+} = require('./relay-l2tp/services/topologyHealthSource');
 
 const ROOT_LEASE_MS = 30_000;
 const ROOT_WORKER_INTERVAL_MS = 30_000;
@@ -116,6 +119,7 @@ function createL2tpRootHostDependencies({
     rateLimiter = require('../routes/panel').l2tpRateLimiter,
     renderPage = require('../routes/panel').renderL2tpPage,
     clock = { now: () => new Date() },
+    topologyHealthMaxStalenessMs = DEFAULT_MAX_STALENESS_MS,
     workerId = `panel-${process.pid}`,
     leaseMs = ROOT_LEASE_MS,
     intervalMs = ROOT_WORKER_INTERVAL_MS,
@@ -174,6 +178,8 @@ function createL2tpRootHostDependencies({
         rateLimiter,
         renderPage,
         clock,
+        enableTopologyHealthProvider: true,
+        topologyHealthMaxStalenessMs,
         workerId,
         leaseMs,
         workerLifecycle: {
