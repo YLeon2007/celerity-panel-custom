@@ -80,6 +80,7 @@ test('panel mounts one late-bound L2TP router and delegates configure and prefli
             assert.strictEqual(calls[0].context.requireAuth, requireAuth);
             assert.strictEqual(calls[0].context.requireOnboarding, requireOnboarding);
             assert.strictEqual(calls[0].context.rateLimiter, rateLimiter);
+            assert.equal(typeof calls[0].context.userManagementService.createUser, 'function');
 
             assert.deepEqual(router.stack.map(layer => layer.handle), [
                 checkIpWhitelist,
@@ -152,6 +153,23 @@ test('panel mounts one late-bound L2TP router and delegates configure and prefli
                                 };
                             },
                         },
+                        userManagementService: {
+                            async createUser(nodeId, input) {
+                                calls.push({ method: 'createUser', nodeId, input });
+                                return {
+                                    id: 'user-a',
+                                    relayNode: nodeId,
+                                    login: input.login,
+                                    ip: input.ip,
+                                    enabled: input.enabled,
+                                    password: input.password,
+                                    passwordEncrypted: 'sealed-password',
+                                };
+                            },
+                            async listUsers() { return []; },
+                            async updateUser() {},
+                            async disableUser() {},
+                        },
                     },
                     async loadPanelOverview() {
                         return { source: 'active-host' };
@@ -176,9 +194,27 @@ test('panel mounts one late-bound L2TP router and delegates configure and prefli
                 });
                 assert.equal(preflight.status, 200);
                 assert.deepEqual(preflight.body, { ok: true, source: 'active-host' });
+
+                const createdUser = await request('/nodes/relay-a/l2tp/users', {
+                    login: 'alice',
+                    ip: '10.77.0.10',
+                    password: 'input-only-password',
+                    enabled: true,
+                    passwordEncrypted: 'attacker-ciphertext',
+                });
+                assert.equal(createdUser.status, 201);
+                assert.deepEqual(createdUser.body, {
+                    id: 'user-a',
+                    relayNode: 'relay-a',
+                    login: 'alice',
+                    ip: '10.77.0.10',
+                    enabled: true,
+                });
+                assert.doesNotMatch(JSON.stringify(createdUser.body), /password|sealed|ciphertext/i);
                 assert.deepEqual(calls.slice(1).map(call => call.method), [
                     'configureRelay',
                     'preflight',
+                    'createUser',
                 ]);
                 assert.deepEqual(calls[1], {
                     method: 'configureRelay',
@@ -193,6 +229,16 @@ test('panel mounts one late-bound L2TP router and delegates configure and prefli
                         dnsServers: undefined,
                         routeGroupId: 'group-a',
                         expectedTopologyRevision: undefined,
+                    },
+                });
+                assert.deepEqual(calls[3], {
+                    method: 'createUser',
+                    nodeId: 'relay-a',
+                    input: {
+                        login: 'alice',
+                        ip: '10.77.0.10',
+                        password: 'input-only-password',
+                        enabled: true,
                     },
                 });
             } finally {

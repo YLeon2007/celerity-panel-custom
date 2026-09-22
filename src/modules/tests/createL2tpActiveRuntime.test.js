@@ -4,6 +4,10 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
+const {
+    L2tpUserManagementRepository,
+    SAFE_USER_SELECT,
+} = require('../relay-l2tp/repositories/l2tpUserManagementRepository');
 const { createL2tpRuntime } = require('../relay-l2tp/runtime/createL2tpRuntime');
 const {
     VERIFIED_STATE_SAFE_SELECT,
@@ -12,6 +16,9 @@ const { L2tpNodeTransport } = require('../relay-l2tp/services/l2tpNodeTransport'
 const { materializeInstallOperation } = require('../relay-l2tp/services/l2tpOperationMaterializer');
 const { createL2tpPreflightRunner } = require('../relay-l2tp/services/l2tpPreflightRunner');
 const { L2tpRemoteExecutor } = require('../relay-l2tp/services/l2tpRemoteExecutor');
+const {
+    L2tpUserManagementService,
+} = require('../relay-l2tp/services/l2tpUserManagementService');
 const { buildL2tpXrayFragment } = require('../relay-l2tp/services/l2tpXrayFragmentProvider');
 const { L2tpXrayCandidateService } = require('../relay-l2tp/services/l2tpXrayCandidateService');
 const { NodeOperationLockRepository } = require('../relay-l2tp/services/nodeOperationLockRepository');
@@ -101,6 +108,15 @@ function createActiveHost(overrides = {}) {
         find(filter) {
             calls.push({ kind: 'L2tpUser.find', filter });
             return queryResult(executionUsers, calls, 'L2tpUser');
+        },
+        findOne() {
+            throw new Error('not used while listing users');
+        },
+        findOneAndUpdate() {
+            throw new Error('not used while listing users');
+        },
+        create() {
+            throw new Error('not used while listing users');
         },
     };
     const models = {
@@ -243,6 +259,12 @@ function createActiveHost(overrides = {}) {
         host,
         preflightFactoryCalls,
         runtimeCalls,
+        userManagementDependencies: {
+            HyNode,
+            L2tpUser,
+            RelayL2tpState,
+            secretBox,
+        },
     };
 }
 
@@ -447,6 +469,47 @@ test('active worker reconciler persists verified install state through the manag
     assert.doesNotMatch(JSON.stringify(result), /psk|sealed-psk/);
 });
 
+test('active runtime composes model-backed user management without enumerating credentials', async () => {
+    const {
+        calls,
+        host,
+        runtimeCalls,
+        userManagementDependencies,
+    } = createActiveHost();
+    const service = host.runtime.userManagementService;
+
+    assert.ok(service instanceof L2tpUserManagementService);
+    assert.strictEqual(runtimeCalls[0].userManagementService, service);
+    assert.ok(service.repository instanceof L2tpUserManagementRepository);
+    assert.strictEqual(service.repository.HyNode, userManagementDependencies.HyNode);
+    assert.strictEqual(service.repository.L2tpUser, userManagementDependencies.L2tpUser);
+    assert.strictEqual(service.repository.RelayL2tpState, userManagementDependencies.RelayL2tpState);
+    assert.strictEqual(service.secretBox, userManagementDependencies.secretBox);
+    assert.deepEqual(calls, []);
+
+    const users = await service.listUsers('node-a');
+
+    assert.deepEqual(users, [{
+        relayNode: 'node-a',
+        login: 'alice',
+        ip: '10.77.0.10',
+        enabled: true,
+        desiredRevision: 4,
+    }]);
+    assert.deepEqual(calls.map(call => call.kind), [
+        'HyNode.findById',
+        'HyNode.select',
+        'HyNode.lean',
+        'L2tpUser.find',
+        'L2tpUser.select',
+        'L2tpUser.sort',
+        'L2tpUser.lean',
+    ]);
+    assert.equal(calls.find(call => call.kind === 'L2tpUser.select').fields, SAFE_USER_SELECT);
+    assert.equal(calls.some(call => call.kind === 'secretBox.decrypt'), false);
+    assert.doesNotMatch(JSON.stringify(users), /sealed-alice-password|password/i);
+});
+
 test('enabled activation rejects missing factories and resolvers before runtime composition', () => {
     for (const [dependencyName, overrides] of [
         ['secretKey', { secretKey: undefined }],
@@ -497,6 +560,18 @@ test('non-boolean activation stays dormant with fail-closed runtime services', a
         runtimeCalls[0].stateManagementService.configureRelay('node-a', {}),
         error => error?.code === 'L2TP_STATE_MANAGEMENT_UNAVAILABLE',
     );
+    for (const [methodName, args] of [
+        ['createUser', ['node-a', {}]],
+        ['listUsers', ['node-a']],
+        ['updateUser', ['node-a', 'user-a', {}]],
+        ['disableUser', ['node-a', 'user-a']],
+    ]) {
+        await assert.rejects(
+            host.runtime.userManagementService[methodName](...args),
+            error => error?.code === 'L2TP_USER_MANAGEMENT_UNAVAILABLE',
+            methodName,
+        );
+    }
     await assert.rejects(
         host.runtime.worker.secretResolver({ kind: 'install' }),
         error => error?.code === 'L2TP_SECRET_RESOLVER_UNAVAILABLE',

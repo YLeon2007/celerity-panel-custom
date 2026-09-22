@@ -17,6 +17,7 @@ const REQUIRED_DEPENDENCIES = Object.freeze([
     'nodeRepository',
     'stateRepository',
     'stateManagementService',
+    'userManagementService',
     'preflightRunner',
     'lockService',
     'secretResolver',
@@ -75,6 +76,7 @@ function createL2tpRuntime(dependencies) {
         nodeRepository,
         stateRepository,
         stateManagementService,
+        userManagementService,
         preflightRunner,
         transport,
         transportResolver,
@@ -124,6 +126,11 @@ function createL2tpRuntime(dependencies) {
         'secretKey',
         'randomBytes',
     ]);
+    hideInjectedDependencies(userManagementService, [
+        'repository',
+        'secretBox',
+        'secretKey',
+    ]);
     hideInjectedDependencies(service, [
         'nodeRepository',
         'stateRepository',
@@ -147,6 +154,7 @@ function createL2tpRuntime(dependencies) {
     const router = createL2tpRouter({
         l2tpService: service,
         stateManagementService,
+        userManagementService,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -165,6 +173,12 @@ function createL2tpRuntime(dependencies) {
     };
     Object.defineProperty(runtime, 'stateManagementService', {
         value: stateManagementService,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+    });
+    Object.defineProperty(runtime, 'userManagementService', {
+        value: userManagementService,
         enumerable: false,
         writable: false,
         configurable: false,

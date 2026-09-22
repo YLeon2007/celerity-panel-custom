@@ -35,6 +35,15 @@ function createDependencies() {
             randomBytes() {},
             async configureRelay() {},
         },
+        userManagementService: {
+            repository: { connectionString: 'mongodb://user-management-secret' },
+            secretBox: { privateKey: 'user-secret-box-private-key' },
+            secretKey: 'user-management-secret-key',
+            async createUser() {},
+            async listUsers() { return []; },
+            async updateUser() {},
+            async disableUser() {},
+        },
         preflightRunner: async () => ({ ok: true }),
         transport: {
             async uploadRootFile() {},
@@ -81,8 +90,13 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.service.preflightRunner, dependencies.preflightRunner);
     assert.strictEqual(runtime.service.clock, dependencies.clock);
     assert.strictEqual(runtime.stateManagementService, dependencies.stateManagementService);
+    assert.strictEqual(runtime.userManagementService, dependencies.userManagementService);
     assert.equal(
         Object.prototype.propertyIsEnumerable.call(runtime, 'stateManagementService'),
+        false,
+    );
+    assert.equal(
+        Object.prototype.propertyIsEnumerable.call(runtime, 'userManagementService'),
         false,
     );
 
@@ -139,6 +153,8 @@ test('does not surface injected model or transport secrets', () => {
     assert.doesNotMatch(serializedRuntime, /resolver-private-key/);
     assert.doesNotMatch(serializedRuntime, /state-management-secret/);
     assert.doesNotMatch(serializedRuntime, /secret-box-private-key/);
+    assert.doesNotMatch(serializedRuntime, /user-management-secret/);
+    assert.doesNotMatch(serializedRuntime, /user-secret-box-private-key/);
     assert.doesNotMatch(serializedRuntime, /candidate-private-key/);
     assert.equal(Object.hasOwn(runtime, 'operationModel'), false);
     assert.equal(Object.hasOwn(runtime, 'transport'), false);
@@ -146,6 +162,16 @@ test('does not surface injected model or transport secrets', () => {
         assert.equal(
             Object.prototype.propertyIsEnumerable.call(
                 runtime.stateManagementService,
+                propertyName,
+            ),
+            false,
+            propertyName,
+        );
+    }
+    for (const propertyName of ['repository', 'secretBox', 'secretKey']) {
+        assert.equal(
+            Object.prototype.propertyIsEnumerable.call(
+                runtime.userManagementService,
                 propertyName,
             ),
             false,
@@ -289,6 +315,7 @@ test('rejects every missing explicit runtime dependency before composition', () 
         'nodeRepository',
         'stateRepository',
         'stateManagementService',
+        'userManagementService',
         'preflightRunner',
         'transport',
         'lockService',

@@ -104,6 +104,12 @@ function assertValid(document, message) {
     ));
     assert.ok(identityIndex, 'relayNode/login index exists');
     assert.strictEqual(identityIndex[1].unique, true, 'relayNode/login index is unique');
+
+    const addressIndex = L2tpUser.schema.indexes().find(([fields]) => (
+        fields.relayNode === 1 && fields.ip === 1
+    ));
+    assert.ok(addressIndex, 'relayNode/ip index exists');
+    assert.strictEqual(addressIndex[1].unique, true, 'relayNode/ip index is unique');
 }
 
 {

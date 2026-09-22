@@ -44,6 +44,12 @@ function passThrough(req, res, next) {
 function createRouter(dependencies) {
     return createL2tpRouter({
         requireOnboarding: passThrough,
+        userManagementService: {
+            async createUser() {},
+            async listUsers() { return []; },
+            async updateUser() {},
+            async disableUser() {},
+        },
         loadPanelOverview: async () => ({}),
         renderPage(res, data) {
             res.json(data);
@@ -533,4 +539,267 @@ test('unexpected service errors return an opaque 500 response', async () => {
         },
     });
     assert.doesNotMatch(JSON.stringify(response.body), /secret-password|ssh output/);
+});
+
+test('L2TP user routes enforce auth, onboarding, CSRF, and rate limiting before service access', async () => {
+    let serviceCalls = 0;
+    const userManagementService = {
+        async listUsers() { serviceCalls += 1; return []; },
+        async createUser() { serviceCalls += 1; return {}; },
+        async updateUser() { serviceCalls += 1; return {}; },
+        async disableUser() { serviceCalls += 1; return {}; },
+    };
+    const unauthorized = createRouter({
+        l2tpService: {},
+        userManagementService,
+        requireAuth(req, res) { res.status(401).send('authentication required'); },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+    const unauthorizedResponse = await request(unauthorized, {
+        path: '/nodes/relay-1/l2tp/users',
+    });
+    assert.equal(unauthorizedResponse.status, 401);
+
+    const notOnboarded = createRouter({
+        l2tpService: {},
+        userManagementService,
+        requireAuth: passThrough,
+        requireOnboarding(req, res) { res.status(409).send('onboarding required'); },
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+    const onboardingResponse = await request(notOnboarded, {
+        method: 'POST',
+        path: '/nodes/relay-1/l2tp/users',
+        body: {},
+    });
+    assert.equal(onboardingResponse.status, 409);
+
+    const csrfRejected = createRouter({
+        l2tpService: {},
+        userManagementService,
+        requireAuth: passThrough,
+        csrf(req, res) { res.status(403).send('invalid csrf token'); },
+        rateLimiter: passThrough,
+    });
+    const csrfResponse = await request(csrfRejected, {
+        method: 'PATCH',
+        path: '/nodes/relay-1/l2tp/users/user-1',
+        body: { enabled: false },
+    });
+    assert.equal(csrfResponse.status, 403);
+
+    const rateLimited = createRouter({
+        l2tpService: {},
+        userManagementService,
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter(req, res) { res.status(429).send('rate limited'); },
+    });
+    const limitedResponse = await request(rateLimited, {
+        path: '/nodes/relay-1/l2tp/users',
+    });
+    assert.equal(limitedResponse.status, 429);
+    assert.equal(serviceCalls, 0);
+});
+
+test('POST L2TP user accepts only allowlisted fields and returns no password material', async () => {
+    const calls = [];
+    const middleware = method => (req, res, next) => {
+        calls.push({ method });
+        next();
+    };
+    const router = createRouter({
+        l2tpService: {},
+        userManagementService: {
+            async createUser(nodeId, input) {
+                calls.push({ method: 'createUser', nodeId, input });
+                return {
+                    id: 'user-1',
+                    relayNode: nodeId,
+                    login: input.login,
+                    ip: input.ip,
+                    enabled: input.enabled,
+                    desiredRevision: 7,
+                    appliedRevision: 0,
+                    syncStatus: 'pending',
+                    password: input.password,
+                    passwordEncrypted: 'sealed-password',
+                    rawCommand: 'must-not-be-returned',
+                };
+            },
+        },
+        requireAuth: middleware('requireAuth'),
+        requireOnboarding: middleware('requireOnboarding'),
+        csrf: middleware('csrf'),
+        rateLimiter: middleware('rateLimiter'),
+    });
+
+    const response = await request(router, {
+        method: 'POST',
+        path: '/nodes/relay-1/l2tp/users',
+        body: {
+            login: 'alice',
+            ip: '10.77.0.10',
+            password: 'test-account-password',
+            enabled: true,
+            relayNode: 'attacker-selected-relay',
+            desiredRevision: 999,
+            passwordEncrypted: 'attacker-ciphertext',
+            command: 'must-not-reach-service',
+            argv: ['must-not-reach-service'],
+        },
+    });
+
+    assert.equal(response.status, 201);
+    assert.deepEqual(calls, [
+        { method: 'requireAuth' },
+        { method: 'requireOnboarding' },
+        { method: 'csrf' },
+        { method: 'rateLimiter' },
+        {
+            method: 'createUser',
+            nodeId: 'relay-1',
+            input: {
+                login: 'alice',
+                ip: '10.77.0.10',
+                password: 'test-account-password',
+                enabled: true,
+            },
+        },
+    ]);
+    assert.deepEqual(response.body, {
+        id: 'user-1',
+        relayNode: 'relay-1',
+        login: 'alice',
+        ip: '10.77.0.10',
+        enabled: true,
+        desiredRevision: 7,
+        appliedRevision: 0,
+        syncStatus: 'pending',
+    });
+    assert.doesNotMatch(
+        JSON.stringify(response.body),
+        /test-account-password|sealed-password|attacker-ciphertext|rawCommand|command|argv/,
+    );
+});
+
+test('GET L2TP users returns a safe list including disabled state', async () => {
+    const router = createRouter({
+        l2tpService: {},
+        userManagementService: {
+            async listUsers(nodeId) {
+                return [{
+                    id: 'user-2',
+                    relayNode: nodeId,
+                    login: 'disabled',
+                    ip: '10.77.0.11',
+                    enabled: false,
+                    desiredRevision: 4,
+                    appliedRevision: 3,
+                    syncStatus: 'pending',
+                    passwordEncrypted: 'sealed-password',
+                }];
+            },
+        },
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const response = await request(router, {
+        path: '/nodes/relay-1/l2tp/users',
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, [{
+        id: 'user-2',
+        relayNode: 'relay-1',
+        login: 'disabled',
+        ip: '10.77.0.11',
+        enabled: false,
+        desiredRevision: 4,
+        appliedRevision: 3,
+        syncStatus: 'pending',
+    }]);
+    assert.doesNotMatch(JSON.stringify(response.body), /sealed-password|password/i);
+});
+
+test('PATCH L2TP user safely disables or updates only allowlisted fields', async () => {
+    const calls = [];
+    const userManagementService = {
+        async disableUser(nodeId, userId) {
+            calls.push({ method: 'disableUser', nodeId, userId });
+            return {
+                id: userId,
+                relayNode: nodeId,
+                login: 'alice',
+                ip: '10.77.0.10',
+                enabled: false,
+                desiredRevision: 8,
+                passwordEncrypted: 'sealed-password',
+            };
+        },
+        async updateUser(nodeId, userId, input) {
+            calls.push({ method: 'updateUser', nodeId, userId, input });
+            return {
+                id: userId,
+                relayNode: nodeId,
+                login: input.login,
+                ip: input.ip,
+                enabled: input.enabled,
+                desiredRevision: 9,
+                password: input.password,
+            };
+        },
+    };
+    const router = createRouter({
+        l2tpService: {},
+        userManagementService,
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const disabled = await request(router, {
+        method: 'PATCH',
+        path: '/nodes/relay-1/l2tp/users/user-1',
+        body: { enabled: false, command: 'must-not-reach-service' },
+    });
+    const updated = await request(router, {
+        method: 'PATCH',
+        path: '/nodes/relay-1/l2tp/users/user-1',
+        body: {
+            login: 'alice-2',
+            ip: '10.77.0.20',
+            password: 'replacement-password',
+            enabled: true,
+            passwordEncrypted: 'attacker-ciphertext',
+            rawCommand: 'must-not-reach-service',
+        },
+    });
+
+    assert.deepEqual(calls, [
+        { method: 'disableUser', nodeId: 'relay-1', userId: 'user-1' },
+        {
+            method: 'updateUser',
+            nodeId: 'relay-1',
+            userId: 'user-1',
+            input: {
+                login: 'alice-2',
+                ip: '10.77.0.20',
+                password: 'replacement-password',
+                enabled: true,
+            },
+        },
+    ]);
+    assert.equal(disabled.status, 200);
+    assert.equal(updated.status, 200);
+    assert.equal(disabled.body.enabled, false);
+    assert.equal(updated.body.enabled, true);
+    assert.doesNotMatch(
+        JSON.stringify([disabled.body, updated.body]),
+        /sealed-password|replacement-password|attacker-ciphertext|rawCommand/,
+    );
 });

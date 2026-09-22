@@ -53,6 +53,7 @@ const l2tpUserSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 l2tpUserSchema.index({ relayNode: 1, login: 1 }, { unique: true });
+l2tpUserSchema.index({ relayNode: 1, ip: 1 }, { unique: true });
 l2tpUserSchema.index({ relayNode: 1, enabled: 1 });
 l2tpUserSchema.index({ syncStatus: 1 });
 

@@ -74,6 +74,7 @@ function createPanelRouter({
         panelRouter: router,
         l2tpService: routeBindings.l2tpService,
         stateManagementService: routeBindings.stateManagementService,
+        userManagementService: routeBindings.userManagementService,
         requireAuth,
         requireOnboarding,
         csrf: requirePanelCsrf,

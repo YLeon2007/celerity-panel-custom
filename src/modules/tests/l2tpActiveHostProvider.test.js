@@ -20,6 +20,12 @@ function createHost(marker = 'active') {
             stateManagementService: {
                 async configureRelay() { return marker; },
             },
+            userManagementService: {
+                async createUser() { return marker; },
+                async listUsers() { return marker; },
+                async updateUser() { return marker; },
+                async disableUser() { return marker; },
+            },
         },
         async loadPanelOverview() { return marker; },
     };
@@ -58,6 +64,10 @@ test('route bindings resolve the current host per call and fail closed while dor
         () => bindings.l2tpService.preflight('relay-a', {}),
         error => error.code === 'L2TP_RUNTIME_UNAVAILABLE',
     );
+    assert.throws(
+        () => bindings.userManagementService.listUsers('relay-a'),
+        error => error.code === 'L2TP_RUNTIME_UNAVAILABLE',
+    );
 
     const host = createHost('active-host');
     provider.installActiveHost(host);
@@ -69,11 +79,19 @@ test('route bindings resolve the current host per call and fail closed while dor
         await bindings.l2tpService.preflight('relay-a', {}),
         'active-host',
     );
+    assert.equal(
+        await bindings.userManagementService.listUsers('relay-a'),
+        'active-host',
+    );
     assert.equal(await bindings.loadPanelOverview(), 'active-host');
 
     provider.clearActiveHost(host);
     assert.throws(
         () => bindings.stateManagementService.configureRelay('relay-a', {}),
+        error => error.code === 'L2TP_RUNTIME_UNAVAILABLE',
+    );
+    assert.throws(
+        () => bindings.userManagementService.createUser('relay-a', {}),
         error => error.code === 'L2TP_RUNTIME_UNAVAILABLE',
     );
 });

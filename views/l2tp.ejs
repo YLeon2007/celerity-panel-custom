@@ -61,6 +61,37 @@
                 </div>
                 <output data-l2tp-result aria-live="polite"></output>
             </form>
+            <section data-l2tp-users>
+                <h4>L2TP users</h4>
+                <form data-l2tp-user-form autocomplete="off">
+                    <label>Login
+                        <input type="text" name="login" maxlength="64" required>
+                    </label>
+                    <label>Client IP
+                        <input type="text" name="ip" placeholder="10.77.0.10" required>
+                    </label>
+                    <label>Password
+                        <input type="password" name="password" autocomplete="new-password" maxlength="1024" required>
+                    </label>
+                    <label>
+                        <input type="checkbox" name="enabled" checked>
+                        Enabled
+                    </label>
+                    <button type="submit" data-l2tp-user-action="create">Add user</button>
+                </form>
+                <p class="muted" data-l2tp-user-empty>Loading users…</p>
+                <div data-l2tp-user-list></div>
+                <template data-l2tp-user-row>
+                    <div class="card">
+                        <code data-l2tp-user-login></code>
+                        <span data-l2tp-user-ip></span>
+                        <span data-l2tp-user-status></span>
+                        <span data-l2tp-user-sync></span>
+                        <button type="button" data-l2tp-user-action="toggle"></button>
+                    </div>
+                </template>
+                <output data-l2tp-user-result aria-live="polite"></output>
+            </section>
         </article>
     <% } %>
 </section>
@@ -114,10 +145,91 @@
         };
     }
 
+    function buildL2tpUserPayload(values) {
+        return {
+            login: String(values.login || '').trim(),
+            ip: String(values.ip || '').trim(),
+            password: String(values.password || ''),
+            enabled: values.enabled === 'on',
+        };
+    }
+
+    function l2tpUsersUrl(nodeId, userId) {
+        const base = `/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/users`;
+        return userId === undefined ? base : `${base}/${encodeURIComponent(userId)}`;
+    }
+
+    async function parseResponse(response) {
+        try {
+            return await response.json();
+        } catch {
+            return {};
+        }
+    }
+
+    async function loadL2tpUsers(relay, nodeId, output) {
+        const list = relay.querySelector('[data-l2tp-user-list]');
+        const empty = relay.querySelector('[data-l2tp-user-empty]');
+        const rowTemplate = relay.querySelector('[data-l2tp-user-row]');
+        try {
+            const response = await fetch(l2tpUsersUrl(nodeId), {
+                headers: { 'x-csrf-token': csrfToken },
+            });
+            const users = await parseResponse(response);
+            if (!response.ok || !Array.isArray(users)) {
+                setResult(output, users.error?.code || 'USER_LIST_FAILED');
+                return;
+            }
+
+            list.replaceChildren();
+            empty.hidden = users.length !== 0;
+            empty.textContent = users.length === 0 ? 'No L2TP users.' : '';
+            for (const user of users) {
+                const row = rowTemplate.content.firstElementChild.cloneNode(true);
+                row.querySelector('[data-l2tp-user-login]').textContent = String(user.login || '');
+                row.querySelector('[data-l2tp-user-ip]').textContent = String(user.ip || '');
+                row.querySelector('[data-l2tp-user-status]').textContent = user.enabled ? 'Enabled' : 'Disabled';
+                row.querySelector('[data-l2tp-user-sync]').textContent = String(user.syncStatus || 'pending');
+                const toggle = row.querySelector('[data-l2tp-user-action="toggle"]');
+                toggle.textContent = user.enabled ? 'Disable' : 'Enable';
+                toggle.addEventListener('click', async () => {
+                    toggle.disabled = true;
+                    setResult(output, 'Working…');
+                    try {
+                        const response = await fetch(l2tpUsersUrl(nodeId, user.id), {
+                            method: 'PATCH',
+                            headers: {
+                                'content-type': 'application/json',
+                                'x-csrf-token': csrfToken,
+                            },
+                            body: JSON.stringify({ enabled: !user.enabled }),
+                        });
+                        const result = await parseResponse(response);
+                        if (!response.ok) {
+                            setResult(output, result.error?.code || 'USER_UPDATE_FAILED');
+                            return;
+                        }
+                        setResult(output, 'User updated');
+                        await loadL2tpUsers(relay, nodeId, output);
+                    } catch {
+                        setResult(output, 'USER_UPDATE_FAILED');
+                    } finally {
+                        toggle.disabled = false;
+                    }
+                });
+                list.append(row);
+            }
+        } catch {
+            setResult(output, 'USER_LIST_FAILED');
+        }
+    }
+
     document.querySelectorAll('[data-l2tp-relay]').forEach((relay) => {
         const nodeId = relay.dataset.nodeId;
         const form = relay.querySelector('[data-l2tp-form]');
         const output = relay.querySelector('[data-l2tp-result]');
+        const userForm = relay.querySelector('[data-l2tp-user-form]');
+        const userOutput = relay.querySelector('[data-l2tp-user-result]');
 
         relay.querySelectorAll('[data-l2tp-action]').forEach((button) => {
             button.addEventListener('click', async () => {
@@ -155,6 +267,39 @@
                 }
             });
         });
+
+        userForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const button = userForm.querySelector('[data-l2tp-user-action="create"]');
+            const values = Object.fromEntries(new FormData(userForm).entries());
+            button.disabled = true;
+            setResult(userOutput, 'Working…');
+            try {
+                const response = await fetch(l2tpUsersUrl(nodeId), {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-csrf-token': csrfToken,
+                    },
+                    body: JSON.stringify(buildL2tpUserPayload(values)),
+                });
+                const result = await parseResponse(response);
+                if (!response.ok) {
+                    setResult(userOutput, result.error?.code || 'USER_CREATE_FAILED');
+                    return;
+                }
+                userForm.reset();
+                userForm.querySelector('[name="password"]').value = '';
+                setResult(userOutput, 'User added');
+                await loadL2tpUsers(relay, nodeId, userOutput);
+            } catch {
+                setResult(userOutput, 'USER_CREATE_FAILED');
+            } finally {
+                button.disabled = false;
+            }
+        });
+
+        void loadL2tpUsers(relay, nodeId, userOutput);
     });
 })();
 </script>

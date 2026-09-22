@@ -156,6 +156,11 @@ test('builds the concrete repository adapters and composes a dormant runtime', a
         runtimeCalls[0].stateManagementService.configureRelay('relay-1', {}),
         error => error?.code === 'L2TP_STATE_MANAGEMENT_UNAVAILABLE',
     );
+    assert.equal(typeof runtimeCalls[0].userManagementService.listUsers, 'function');
+    await assert.rejects(
+        runtimeCalls[0].userManagementService.listUsers('relay-1'),
+        error => error?.code === 'L2TP_USER_MANAGEMENT_UNAVAILABLE',
+    );
     assert.strictEqual(runtimeCalls[0].requireAuth, passThrough);
     assert.strictEqual(runtimeCalls[0].requireOnboarding, passThrough);
     assert.strictEqual(runtimeCalls[0].csrf, passThrough);
@@ -236,6 +241,7 @@ test('actual mounted configure route uses the state management service injected 
         panelRouter: mountedRouter,
         l2tpService: host.runtime.service,
         stateManagementService: host.runtime.stateManagementService,
+        userManagementService: host.runtime.userManagementService,
         requireAuth: passThrough,
         requireOnboarding: passThrough,
         csrf: passThrough,
