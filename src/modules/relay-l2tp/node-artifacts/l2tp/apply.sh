@@ -52,7 +52,7 @@ def read_manifest(path):
 
 
 ALLOWLIST = {
-    'etc/ipsec.conf': 0o644,
+    'etc/ipsec.d/celerity-l2tp.conf': 0o644,
     'etc/ipsec.secrets': 0o600,
     'etc/xl2tpd/xl2tpd.conf': 0o644,
     'etc/ppp/options.xl2tpd': 0o600,

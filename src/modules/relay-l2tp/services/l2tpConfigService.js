@@ -65,6 +65,14 @@ function poolOutsideClientCidr(desired) {
     return error;
 }
 
+function invalidPsk() {
+    const error = new Error('psk cannot be represented safely in ipsec.secrets');
+    error.name = 'L2tpConfigError';
+    error.code = 'INVALID_PSK';
+    error.field = 'psk';
+    return error;
+}
+
 function buildL2tpArtifacts(desired) {
     const clientRange = parseClientCidr(desired.clientCidr);
     if (!clientRange) {
@@ -83,12 +91,16 @@ function buildL2tpArtifacts(desired) {
         throw poolOutsideClientCidr(desired);
     }
 
+    if (typeof desired.psk !== 'string' || /["\r\n]/.test(desired.psk)) {
+        throw invalidPsk();
+    }
+
     const dnsOptions = desired.dnsServers.map(server => `ms-dns ${server}\n`).join('');
 
     return {
         files: [
             {
-                path: '/etc/ipsec.conf',
+                path: 'etc/ipsec.d/celerity-l2tp.conf',
                 mode: 0o644,
                 content: `# Managed by Celerity. Do not edit.
 config setup
@@ -108,12 +120,12 @@ conn celerity-l2tp
 `,
             },
             {
-                path: '/etc/ipsec.secrets',
+                path: 'etc/ipsec.secrets',
                 mode: 0o600,
                 content: `%any %any : PSK "${desired.psk}"\n`,
             },
             {
-                path: '/etc/xl2tpd/xl2tpd.conf',
+                path: 'etc/xl2tpd/xl2tpd.conf',
                 mode: 0o644,
                 content: `[global]
 port = 1701
@@ -127,7 +139,7 @@ length bit = yes
 `,
             },
             {
-                path: '/etc/ppp/options.xl2tpd',
+                path: 'etc/ppp/options.xl2tpd',
                 mode: 0o600,
                 content: `auth
 refuse-pap
@@ -143,7 +155,7 @@ lock
 ${dnsOptions}`,
             },
             {
-                path: '/etc/nftables.d/celerity-l2tp.nft',
+                path: 'etc/nftables.d/celerity-l2tp.nft',
                 mode: 0o644,
                 content: `table inet celerity_l2tp {
     chain prerouting {
