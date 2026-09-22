@@ -22,18 +22,25 @@ function runBuild(outputDir) {
     ], { encoding: 'utf8' });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
-    return JSON.parse(result.stdout);
+    const built = JSON.parse(result.stdout);
+    if (built.artifactPath && !built.archivePath) built.archivePath = built.artifactPath;
+    if (!built.checksumPath && built.archivePath) built.checksumPath = `${built.archivePath}.sha256`;
+    return built;
 }
 
 function runVerify(archivePath, checksumPath) {
-    const result = spawnSync(process.execPath, [
+    const result = runVerifyResult(archivePath, checksumPath);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout);
+}
+
+function runVerifyResult(archivePath, checksumPath) {
+    return spawnSync(process.execPath, [
         verifyScript,
         '--archive', archivePath,
         '--checksum', checksumPath,
     ], { encoding: 'utf8' });
-
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    return JSON.parse(result.stdout);
 }
 
 function sha256(filePath) {
@@ -50,6 +57,22 @@ function extractArchive(archivePath, outputDir) {
     fs.mkdirSync(outputDir, { recursive: true });
     const result = spawnSync('tar', ['-xzf', archivePath, '-C', outputDir], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
+}
+
+function createDeterministicArchive(sourceDir, rootName, archivePath) {
+    const result = spawnSync('tar', [
+        '--sort=name',
+        '--format=ustar',
+        '--mtime=@0',
+        '--owner=0',
+        '--group=0',
+        '--numeric-owner',
+        '--mode=u+rwX,go+rX,go-w',
+        '-C', sourceDir,
+        '-czf', archivePath,
+        rootName,
+    ], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
 function trackedModuleFiles() {
@@ -70,6 +93,50 @@ function writeJson(filePath, value) {
 
 function runCli(scriptPath, args) {
     return spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8' });
+}
+
+function runGit(repoPath, args) {
+    const result = spawnSync('git', ['-C', repoPath, ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return result.stdout.trim();
+}
+
+function createBuildTargetFixture(prefix) {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    const fixtureRepo = path.join(tempRoot, 'repo');
+    for (const relativePath of [
+        'src/modules/relay-l2tp',
+        'scripts/relay-l2tp-artifact',
+        'views/l2tp.ejs',
+    ]) {
+        fs.cpSync(
+            path.join(repoRoot, ...relativePath.split('/')),
+            path.join(fixtureRepo, ...relativePath.split('/')),
+            { recursive: true },
+        );
+    }
+    runGit(fixtureRepo, ['init', '--quiet']);
+    runGit(fixtureRepo, ['add', '.']);
+    runGit(fixtureRepo, [
+        '-c', 'user.name=Release Test',
+        '-c', 'user.email=release-test@example.invalid',
+        'commit', '--quiet', '-m', 'target',
+    ]);
+    const targetCommit = runGit(fixtureRepo, ['rev-parse', 'HEAD^{commit}']);
+    const targetTree = runGit(fixtureRepo, ['rev-parse', 'HEAD^{tree}']);
+
+    const manifestPath = path.join(fixtureRepo, 'src/modules/relay-l2tp/manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.version = '9.9.9';
+    writeJson(manifestPath, manifest);
+    runGit(fixtureRepo, ['add', manifestPath]);
+    runGit(fixtureRepo, [
+        '-c', 'user.name=Release Test',
+        '-c', 'user.email=release-test@example.invalid',
+        'commit', '--quiet', '-m', 'newer-head',
+    ]);
+
+    return { tempRoot, fixtureRepo, targetCommit, targetTree };
 }
 
 function createArtifactFixture(prefix) {
@@ -123,6 +190,46 @@ test('builds byte-identical archives and checksum manifests in separate temporar
     }
 });
 
+test('builds the exact requested source ref instead of a newer checked-out branch', () => {
+    const fixture = createBuildTargetFixture('relay-l2tp-source-ref-');
+    try {
+        const result = runCli(buildScript, [
+            '--repo-root', fixture.fixtureRepo,
+            '--output-dir', path.join(fixture.tempRoot, 'dist'),
+            '--source-ref', fixture.targetCommit,
+        ]);
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const built = JSON.parse(result.stdout);
+        assert.equal(path.basename(built.artifactPath), 'relay-l2tp-0.1.0.tar.gz');
+        assert.deepEqual(built.source, {
+            commit: fixture.targetCommit,
+            tree: fixture.targetTree,
+        });
+    } finally {
+        fs.rmSync(fixture.tempRoot, { recursive: true, force: true });
+    }
+});
+
+test('builder CLI prints only artifact identity fields', () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-l2tp-build-output-'));
+    try {
+        const result = runCli(buildScript, [
+            '--repo-root', repoRoot,
+            '--output-dir', path.join(tempRoot, 'dist'),
+        ]);
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = JSON.parse(result.stdout);
+        assert.deepEqual(Object.keys(output).sort(), ['artifactPath', 'sha256', 'size', 'source']);
+        assert.match(output.artifactPath, /relay-l2tp-0\.1\.0\.tar\.gz$/);
+        assert.match(output.sha256, /^[a-f0-9]{64}$/);
+        assert.equal(output.size, fs.statSync(output.artifactPath).size);
+        assert.match(output.source.commit, /^[a-f0-9]{40}$/);
+        assert.match(output.source.tree, /^[a-f0-9]{40}$/);
+    } finally {
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+});
+
 test('archive contains exactly module source and explicit release metadata in sorted paths', () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-l2tp-members-'));
     try {
@@ -132,6 +239,7 @@ test('archive contains exactly module source and explicit release metadata in so
         const expected = [
             ...trackedModuleFiles().map(file => `${root}${file}`),
             `${root}install.js`,
+            `${root}module/views/l2tp.ejs`,
             `${root}release-manifest.json`,
             `${root}topology.schema.json`,
             `${root}topology-transfer.js`,
@@ -139,13 +247,13 @@ test('archive contains exactly module source and explicit release metadata in so
 
         assert.deepEqual(actual, [...actual].sort(), 'archive member paths must be sorted');
         assert.deepEqual(actual, expected);
-        assert.equal(actual.some(member => /(^|\/)(?:node_modules|\.git|tests?|cache|tmp)(?:\/|$)/i.test(member)), false);
+        assert.equal(actual.some(member => /(^|\/)(?:node_modules|\.git|tests?|cache|tmp|credentials?)(?:\/|$)/i.test(member)), false);
     } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });
     }
 });
 
-test('release manifest declares compatibility, lifecycle, topology transfer, commit, and every payload hash', () => {
+test('release manifest binds source commit/tree, package contents, node executables, and every payload hash', () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-l2tp-manifest-'));
     try {
         const built = runBuild(path.join(tempRoot, 'out'));
@@ -153,20 +261,36 @@ test('release manifest declares compatibility, lifecycle, topology transfer, com
         extractArchive(built.archivePath, extracted);
         const releaseRoot = path.join(extracted, 'relay-l2tp-0.1.0');
         const manifest = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'release-manifest.json'), 'utf8'));
-        const commit = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+        const commit = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD^{commit}'], { encoding: 'utf8' }).stdout.trim();
+        const tree = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).stdout.trim();
 
+        assert.equal(manifest.schemaVersion, 2);
         assert.deepEqual(manifest.module, {
             id: 'relay-l2tp',
             version: '0.1.0',
             moduleApiVersion: 1,
             requiredCapabilities: ['ssh'],
         });
-        assert.equal(manifest.sourceCommit, commit);
+        assert.deepEqual(manifest.source, { commit, tree });
         assert.deepEqual(Object.keys(manifest.installer.commands).sort(), ['install', 'remove', 'rollback', 'upgrade']);
         assert.equal(manifest.installer.stateDirectory, 'data/modules/relay-l2tp');
         assert.match(manifest.installer.hostFilePolicy, /never patches host index or configuration files/i);
         assert.deepEqual(Object.keys(manifest.topologyTransfer.commands).sort(), ['export', 'import', 'validate']);
         assert.equal(manifest.topologyTransfer.schema, 'topology.schema.json');
+        assert.deepEqual(manifest.contents, {
+            migrationRegistry: 'module/migrations/index.js',
+            panel: {
+                views: ['module/views/l2tp.ejs'],
+                routes: ['module/routes/panel.js', 'module/routes/panelOverview.js'],
+            },
+            tools: {
+                installer: 'install.js',
+                nodeInstaller: 'module/node-artifacts/l2tp/install.sh',
+                rollback: 'module/node-artifacts/l2tp/rollback.sh',
+                topologySchema: 'topology.schema.json',
+                topologyTransfer: 'topology-transfer.js',
+            },
+        });
 
         const payloadFiles = archiveFiles(built.archivePath)
             .map(member => member.replace('relay-l2tp-0.1.0/', ''))
@@ -176,6 +300,16 @@ test('release manifest declares compatibility, lifecycle, topology transfer, com
         for (const file of manifest.files) {
             assert.equal(file.sha256, sha256(path.join(releaseRoot, ...file.path.split('/'))));
         }
+
+        const executableNodeArtifacts = manifest.files
+            .filter(file => file.path.startsWith('module/node-artifacts/l2tp/'))
+            .filter(file => (fs.statSync(path.join(releaseRoot, ...file.path.split('/'))).mode & 0o111) !== 0);
+        assert.deepEqual(manifest.nodeArtifacts, {
+            root: 'module/node-artifacts/l2tp',
+            executables: executableNodeArtifacts,
+        });
+        assert.equal(manifest.nodeArtifacts.executables.length, 17);
+        assert.equal(new Set(manifest.nodeArtifacts.executables.map(file => file.path)).size, 17);
     } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });
     }
@@ -187,10 +321,46 @@ test('verifier authenticates the checksum, member set, manifest, and file hashes
         const built = runBuild(tempRoot);
         const verified = runVerify(built.archivePath, built.checksumPath);
 
-        assert.equal(verified.valid, true);
-        assert.equal(verified.module.id, 'relay-l2tp');
-        assert.equal(verified.module.version, '0.1.0');
+        assert.deepEqual(Object.keys(verified).sort(), ['artifactPath', 'sha256', 'size', 'source']);
+        assert.equal(verified.artifactPath, path.resolve(built.archivePath));
         assert.equal(verified.sha256, sha256(built.archivePath));
+        assert.equal(verified.size, fs.statSync(built.archivePath).size);
+        assert.match(verified.source.commit, /^[a-f0-9]{40}$/);
+        assert.match(verified.source.tree, /^[a-f0-9]{40}$/);
+    } finally {
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+});
+
+test('changing a node payload invalidates verification even when its generic file hash and archive checksum are refreshed', () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-l2tp-node-tamper-'));
+    try {
+        const built = runBuild(path.join(tempRoot, 'original'));
+        const extracted = path.join(tempRoot, 'extracted');
+        const rootName = 'relay-l2tp-0.1.0';
+        const releaseRoot = path.join(extracted, rootName);
+        const payloadPath = 'module/node-artifacts/l2tp/runner.sh';
+        extractArchive(built.archivePath, extracted);
+
+        const absolutePayloadPath = path.join(releaseRoot, ...payloadPath.split('/'));
+        fs.appendFileSync(absolutePayloadPath, '\n# release-verifier-tamper-probe\n');
+        const manifestPath = path.join(releaseRoot, 'release-manifest.json');
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        manifest.files.find(file => file.path === payloadPath).sha256 = sha256(absolutePayloadPath);
+        writeJson(manifestPath, manifest);
+
+        const tamperedArchive = path.join(tempRoot, `${rootName}-tampered.tar.gz`);
+        const tamperedChecksum = `${tamperedArchive}.sha256`;
+        createDeterministicArchive(extracted, rootName, tamperedArchive);
+        fs.writeFileSync(
+            tamperedChecksum,
+            `${sha256(tamperedArchive)}  ${path.basename(tamperedArchive)}\n`,
+        );
+
+        const result = runVerifyResult(tamperedArchive, tamperedChecksum);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /node artifact digest pin mismatch: module\/node-artifacts\/l2tp\/runner\.sh/i);
+        assert.equal(result.stderr.includes('release-verifier-tamper-probe'), false);
     } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });
     }

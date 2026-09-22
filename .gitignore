@@ -28,6 +28,10 @@ backups/
 data/homepage/custom.html
 data/homepage/custom.html.tmp
 
+# Generated build/release outputs
+dist/
+generated/
+
 # OS files
 .DS_Store
 Thumbs.db

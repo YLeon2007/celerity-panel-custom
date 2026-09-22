@@ -44,7 +44,7 @@ function validateModuleManifest(manifest, label = 'module manifest') {
 
 function validateArtifact(artifactRoot) {
     const releaseManifest = readJson(path.join(artifactRoot, 'release-manifest.json'), 'release manifest');
-    if (releaseManifest.schemaVersion !== 1) fail('Unsupported release manifest schemaVersion');
+    if (releaseManifest.schemaVersion !== 2) fail('Unsupported release manifest schemaVersion');
     const releaseModule = validateModuleManifest(releaseManifest.module, 'release manifest module');
     const moduleManifest = validateModuleManifest(
         readJson(path.join(artifactRoot, 'module', 'manifest.json'), 'module manifest'),
