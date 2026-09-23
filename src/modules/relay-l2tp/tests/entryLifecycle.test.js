@@ -468,6 +468,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
         CascadeTopologyState: { updateOne() {} },
         RelayL2tpState: {},
         TopologyOperation: { updateOne() {} },
+        NodeOperationLock: {},
     };
 
     const service = entry.createTopologyDeploymentService({

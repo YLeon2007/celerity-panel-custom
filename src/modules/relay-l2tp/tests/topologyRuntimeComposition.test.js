@@ -38,6 +38,12 @@ const {
 const {
     TopologyOperationFinalizer,
 } = require('../services/topologyOperationFinalizer');
+const {
+    NodeOperationLockRepository,
+} = require('../services/nodeOperationLockRepository');
+const {
+    NodeOperationLockService,
+} = require('../services/nodeOperationLockService');
 
 const ENABLED_ENV = Object.freeze({
     L2TP_EXECUTION_ENABLED: 'true',
@@ -72,12 +78,8 @@ function compositionDependencies(calls = []) {
         CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate', 'updateOne'], calls),
         RelayL2tpState: modelWith(['find'], calls),
         TopologyOperation: modelWith(['create', 'findOneAndUpdate', 'updateOne'], calls),
+        NodeOperationLock: modelWith(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'], calls),
         transactionRunner: async work => work({ id: 'test-session' }),
-        lockService: {
-            acquire: async () => ({ ok: true }),
-            renew: async () => ({ ok: true }),
-            release: async () => ({ ok: true }),
-        },
         clock: {
             now() {
                 calls.push('clock.now');
@@ -136,6 +138,22 @@ test('test topology runtime requires all three exact opt-in flags', async () => 
         });
         await assertUnavailable(defaultService);
         assert.equal(resolverCapabilityReads, 0, JSON.stringify(env));
+
+        let lockModelReads = 0;
+        const guardedDependencies = {
+            env,
+            createTopologyOperationExecutor() {
+                throw new Error('default executor factory must remain disabled');
+            },
+        };
+        Object.defineProperty(guardedDependencies, 'NodeOperationLock', {
+            get() {
+                lockModelReads += 1;
+                throw new Error('disabled runtime must not read the lock model');
+            },
+        });
+        await assertUnavailable(createTopologyOperationRuntime(guardedDependencies));
+        assert.equal(lockModelReads, 0, JSON.stringify(env));
 
         let executorFactoryCalls = 0;
         let workerConstructions = 0;
@@ -267,7 +285,13 @@ test('enabled composition wires the queued topology runtime without starting its
         service.operationWorker.finalizer.repository.transactionRunner,
         dependencies.transactionRunner,
     );
-    assert.strictEqual(service.operationWorker.lockService, dependencies.lockService);
+    assert.ok(service.operationWorker.lockService instanceof NodeOperationLockService);
+    assert.ok(service.operationWorker.lockService.repository instanceof NodeOperationLockRepository);
+    assert.strictEqual(
+        service.operationWorker.lockService.repository.model,
+        dependencies.NodeOperationLock,
+    );
+    assert.strictEqual(service.operationWorker.lockService.clock, dependencies.clock);
     assert.equal(service.operationWorker.workerId, dependencies.workerId);
     assert.equal(service.operationWorker.leaseMs, dependencies.leaseMs);
     assert.deepEqual(executorFactoryDependencies, {

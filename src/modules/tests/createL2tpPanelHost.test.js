@@ -6,6 +6,12 @@ const express = require('express');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
 
+const TOPOLOGY_ENABLED_ENV = Object.freeze({
+    L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true',
+    TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+});
+
 function passThrough(req, res, next) {
     next();
 }
@@ -188,6 +194,61 @@ test('builds the concrete repository adapters and composes a dormant runtime', a
     assert.ok(host.topologyRuntime instanceof FakeTopologyRuntime);
     assert.strictEqual(host.runtime, runtime);
     assert.equal(workerRuns, 0);
+});
+
+test('opted-in panel host passes the lock model to topology recovery and starts', () => {
+    const models = {
+        RelayL2tpState: {},
+        CascadeRouteGroup: {},
+        CascadeTopologyState: {},
+        L2tpOperation: {},
+        TopologyOperation: {},
+        NodeOperationLock: {},
+    };
+    const topologyDependencies = [];
+    let topologyWorker;
+    let recoveryStarts = 0;
+    const moduleEntry = {
+        registerModels: () => models,
+        createTopologyDeploymentService(dependencies) {
+            topologyDependencies.push(dependencies);
+            topologyWorker = { run: async () => {} };
+            return { operationWorker: topologyWorker };
+        },
+    };
+
+    const host = createL2tpPanelHost({
+        env: TOPOLOGY_ENABLED_ENV,
+        moduleEntry,
+        topologyRuntime: {},
+        Repository: class FakeRepository {},
+        createRepositoryAdapters: () => ({
+            nodeRepository: {},
+            stateRepository: {},
+            operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({
+            runtime: { stateManagementService: {} },
+            start: () => ({}),
+            async stop() {},
+        }),
+        createTopologyRecoveryLifecycle(dependencies) {
+            assert.strictEqual(dependencies.worker, topologyWorker);
+            return {
+                start() {
+                    recoveryStarts += 1;
+                },
+                async stop() {},
+            };
+        },
+    });
+
+    host.start();
+
+    assert.equal(topologyDependencies.length, 1);
+    assert.strictEqual(topologyDependencies[0].NodeOperationLock, models.NodeOperationLock);
+    assert.equal(recoveryStarts, 1);
 });
 
 test('actual mounted configure route uses the state management service injected through the host runtime', async () => {

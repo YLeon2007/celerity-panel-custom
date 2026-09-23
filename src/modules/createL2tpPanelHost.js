@@ -156,6 +156,7 @@ function createL2tpPanelHost({
             CascadeTopologyState: models.CascadeTopologyState,
             RelayL2tpState: models.RelayL2tpState,
             TopologyOperation: models.TopologyOperation,
+            NodeOperationLock: models.NodeOperationLock,
             NodeSSH,
             clock,
             workerId: `${workerId}-topology`,

@@ -41,6 +41,12 @@ const {
 const {
     TopologyOperationWorker,
 } = require('../workers/topologyOperationWorker');
+const {
+    NodeOperationLockRepository,
+} = require('../services/nodeOperationLockRepository');
+const {
+    NodeOperationLockService,
+} = require('../services/nodeOperationLockService');
 
 const REQUIRED_TEST_RUNTIME_FLAGS = Object.freeze([
     'L2TP_EXECUTION_ENABLED',
@@ -128,7 +134,6 @@ function createTopologyOperationRuntime(dependencies = {}) {
         Finalizer = TopologyOperationFinalizer,
         OperationWorker = TopologyOperationWorker,
         Coordinator = TopologyOperationCoordinator,
-        lockService,
         validator,
         compiler,
         idFactory,
@@ -147,6 +152,13 @@ function createTopologyOperationRuntime(dependencies = {}) {
     }
 
     try {
+        const lockRepository = new NodeOperationLockRepository({
+            model: dependencies.NodeOperationLock,
+        });
+        const lockService = new NodeOperationLockService({
+            repository: lockRepository,
+            clock,
+        });
         const snapshotReader = new SnapshotRepository({
             HyNode,
             CascadeLink,
