@@ -267,6 +267,12 @@ function assertSuccessfulExec(result) {
     }
 }
 
+const COMMAND_EXEC_TIMEOUT_MS = Object.freeze({
+    // apt/dpkg runs legitimately take minutes on first install.
+    install_runtime: 600000,
+    default: 120000,
+});
+
 class L2tpNodeTransport {
     constructor({ nodeSSH }) {
         this.nodeSSH = nodeSSH;
@@ -324,15 +330,17 @@ class L2tpNodeTransport {
 
         let result;
         try {
+            const timeout = COMMAND_EXEC_TIMEOUT_MS[command] ?? COMMAND_EXEC_TIMEOUT_MS.default;
             result = await this.nodeSSH.exec(
                 `${ARTIFACT_RUNNER_PATH} --operation-id ${operationId} --command ${command}`,
+                { timeout },
             );
             if (command !== 'preflight' && command !== 'verify-users') assertSuccessfulExec(result);
-        } catch (error) {
+        } catch {
+            // Note: no `cause` — stderr may carry sensitive material.
             throw new L2tpNodeTransportError(
                 extractRunnerErrorCode(result) || 'REMOTE_COMMAND_FAILED',
                 'Failed to run an L2TP artifact command',
-                { cause: error },
             );
         }
 

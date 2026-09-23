@@ -278,9 +278,15 @@ async function uploadRootFile(transport, request) {
 async function runArtifactCommand(transport, request) {
     try {
         return await transport.runArtifactCommand(request);
-    } catch {
+    } catch (error) {
+        // Preserve precise runner artifact codes (e.g. NFT_VERIFY_FAILED)
+        // instead of flattening everything into REMOTE_COMMAND_FAILED.
+        const code = typeof error?.code === 'string'
+            && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code)
+            ? error.code
+            : 'REMOTE_COMMAND_FAILED';
         throw new L2tpRemoteExecutorError(
-            'REMOTE_COMMAND_FAILED',
+            code,
             'Failed to run an L2TP artifact command',
         );
     }

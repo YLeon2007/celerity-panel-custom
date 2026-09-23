@@ -229,6 +229,7 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
         commands.map(command => ({
             method: 'exec',
             command: `/usr/local/bin/celerity-l2tp-artifact-runner --operation-id operation-18 --command ${command}`,
+            options: { timeout: command === 'install_runtime' ? 600000 : 120000 },
         })),
     );
 });
