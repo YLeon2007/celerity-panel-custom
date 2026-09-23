@@ -162,6 +162,14 @@ test('materializes fixed preflight JSON and generated artifacts only after secre
             path: 'desired.json',
             content: `${JSON.stringify({
                 clientCidr: '10.77.0.0/24',
+                localAddress: '10.77.0.1',
+                poolStart: '10.77.0.10',
+                poolEnd: '10.77.0.200',
+                dnsServers: ['1.1.1.1', '9.9.9.9'],
+                tproxyPort: 12345,
+                fwmark: 77,
+                routeTable: 177,
+                credentialRevision: 9,
                 users: [{
                     login: 'alice',
                     password: SECRET_PASSWORD,
@@ -215,6 +223,14 @@ test('materializes an empty desired users array only when the resolver returns n
 
     assert.deepEqual(JSON.parse(remoteDesired.content), {
         clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1', '9.9.9.9'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        credentialRevision: 9,
         users: [],
     });
 });

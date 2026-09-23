@@ -294,6 +294,14 @@ test('claims an install once and resolves its PSK once before typed artifact upl
     );
     assert.deepEqual(JSON.parse(uploads[0].request.content), {
         clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1', '9.9.9.9'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+        credentialRevision: 9,
         users: [{
             login: 'alice',
             password: 'alice-current-password',

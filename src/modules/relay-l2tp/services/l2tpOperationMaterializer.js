@@ -293,8 +293,12 @@ function materializeInstallOperation(
                 stepType: 'preflight',
                 type: 'desired',
                 path: 'desired.json',
+                // This staged desired.json is the only desired document on the
+                // node during install (sync_users carries no artifact for
+                // install operations), so later steps — apply_firewall_policy
+                // and verify — read fwmark/routeTable from it as well.
                 content: `${JSON.stringify({
-                    clientCidr: persistedPlan.desired.clientCidr,
+                    ...persistedPlan.desired,
                     users: desiredUsers,
                 })}\n`,
             },
