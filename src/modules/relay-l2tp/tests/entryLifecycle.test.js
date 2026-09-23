@@ -465,9 +465,9 @@ test('root deployment factory exposes only the exact opted-in queued composition
         HyNode: {},
         CascadeLink: {},
         CascadeRouteGroup: {},
-        CascadeTopologyState: {},
+        CascadeTopologyState: { updateOne() {} },
         RelayL2tpState: {},
-        TopologyOperation: {},
+        TopologyOperation: { updateOne() {} },
     };
 
     const service = entry.createTopologyDeploymentService({

@@ -203,7 +203,6 @@ function createRepository(operation = durableOperation(), overrides = {}) {
 function createWorker({
     repository,
     executor,
-    deploymentRepository,
     finalizer,
     clock,
     lockService,
@@ -216,27 +215,13 @@ function createWorker({
         async release() { return { ok: true }; },
     };
     const effectiveFinalizer = finalizer || {
-        async succeed(request) {
-            const deployed = await deploymentRepository.markDeployed({
-                expectedRevision: request.expectedRevision,
-                expectedDeployedRevision: request.expectedDeployedRevision,
-            });
-            if (deployed?.revision !== request.expectedRevision
-                || deployed?.deployedRevision !== request.expectedRevision) {
-                throw new Error('Topology deployedRevision CAS was rejected');
-            }
-            const succeeded = await repository.finishClaimed({
+        async finalizeSucceeded(request) {
+            return {
                 operationId: request.operationId,
-                owner: request.owner,
-                now: request.now,
-                status: 'succeeded',
-            });
-            if (succeeded !== true) {
-                const error = new Error('Topology terminal success fence was lost');
-                error.code = 'TOPOLOGY_OPERATION_LEASE_LOST';
-                throw error;
-            }
-            return deployed;
+                topologyRevision: request.topologyRevision,
+                deployedRevision: request.topologyRevision,
+                finishedAt: new Date(NOW),
+            };
         },
     };
     return new TopologyOperationWorker({
@@ -621,7 +606,7 @@ test('owned-lock renewal loss in every slow executor phase fences progress and s
                 timer,
                 renewalIntervalMs: 10_000,
                 finalizer: {
-                    async succeed() {
+                    async finalizeSucceeded() {
                         finalized = true;
                         return { revision: 7, deployedRevision: 7 };
                     },
@@ -699,7 +684,7 @@ test('lease loss during commit fences durable progress after that executor call'
         lockService,
         renewalIntervalMs: 10_000,
         finalizer: {
-            async succeed() {
+            async finalizeSucceeded() {
                 finalized = true;
                 throw new Error('must not finalize after lease loss');
             },
@@ -829,7 +814,7 @@ test('partial node-lock acquisition unwinds only acquired locks in reverse order
             cleanupPrepared: forbidden,
             rollback: forbidden,
         },
-        finalizer: { succeed: forbidden },
+        finalizer: { finalizeSucceeded: forbidden },
     });
 
     const result = await worker.run('operation-1');
@@ -979,7 +964,99 @@ test('rolls back forward and reverse topology changes in exact reverse deploymen
     );
 });
 
-test('prepares every node before deterministic commit and verify then fences deployed revision', async () => {
+test('delegates terminal success to the atomic finalizer with only operation lease and revisions', async () => {
+    const repository = createRepository();
+    const finalizerCalls = [];
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: { opaque: request.node.node },
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        finalizer: {
+            async finalizeSucceeded(request) {
+                finalizerCalls.push(request);
+                return {
+                    operationId: request.operationId,
+                    topologyRevision: request.topologyRevision,
+                    deployedRevision: request.topologyRevision,
+                    finishedAt: new Date(NOW),
+                };
+            },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(finalizerCalls, [{
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        leaseUntil: repository.operation.leaseUntil,
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+    }]);
+    assert.deepEqual(
+        repository.calls.filter(call => (
+            call.method === 'finishClaimed' && call.request.status === 'succeeded'
+        )),
+        [],
+    );
+});
+
+test('atomic finalizer failure rolls back committed nodes and cannot report success', async () => {
+    const repository = createRepository();
+    const rollbackNodes = [];
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: { opaque: request.node.node },
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() {
+            throw new Error('no prepared-only nodes expected');
+        },
+        async rollback(request) {
+            rollbackNodes.push(request.node.node);
+            return { ok: true };
+        },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        finalizer: {
+            async finalizeSucceeded() {
+                throw new Error('atomic finalization failed');
+            },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'rolled_back');
+    assert.deepEqual(rollbackNodes, ['node-b', 'node-a']);
+    assert.equal(repository.operation.status, 'rolled_back');
+    assert.equal(
+        repository.calls.some(call => (
+            call.method === 'finishClaimed' && call.request.status === 'succeeded'
+        )),
+        false,
+    );
+});
+
+test('prepares every node before deterministic commit and verify then returns atomic success', async () => {
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -1006,13 +1083,7 @@ test('prepares every node before deterministic commit and verify then fences dep
             return { ok: true };
         },
     };
-    const deploymentRepository = {
-        async markDeployed(request) {
-            events.push({ method: 'markDeployed', request });
-            return { revision: 7, deployedRevision: 7 };
-        },
-    };
-    const worker = createWorker({ repository, executor, deploymentRepository });
+    const worker = createWorker({ repository, executor });
 
     const first = await worker.run('operation-1');
     const second = await worker.run('operation-1');
@@ -1030,18 +1101,12 @@ test('prepares every node before deterministic commit and verify then fences dep
         { method: 'verify', node: 'node-a' },
         { method: 'commit', node: 'node-b' },
         { method: 'verify', node: 'node-b' },
-        {
-            method: 'markDeployed',
-            request: { expectedRevision: 7, expectedDeployedRevision: 5 },
-        },
     ]);
-    const finishIndex = repository.calls.findLastIndex(call => call.method === 'finishClaimed');
-    const finalCall = repository.calls[finishIndex];
-    assert.equal(finalCall.request.status, 'succeeded');
     assert.equal(
-        repository.calls[finishIndex - 1].method,
-        'renewLease',
-        'lease must be renewed after deployedRevision finalization',
+        repository.calls.some(call => (
+            call.method === 'finishClaimed' && call.request.status === 'succeeded'
+        )),
+        false,
     );
     const persistedCalls = repository.calls.filter(call => call.method === 'recordNode');
     assert.doesNotMatch(JSON.stringify(persistedCalls), /candidate-[ab]-secret/);
@@ -1147,7 +1212,7 @@ test('commit failure rolls back the current and prior committed nodes in reverse
     ]);
 });
 
-test('deployed revision finalizer failure rolls back every changed node and cannot succeed', async () => {
+test('atomic finalizer failure rolls back every changed node and cannot succeed', async () => {
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -1174,9 +1239,8 @@ test('deployed revision finalizer failure rolls back every changed node and cann
     const worker = createWorker({
         repository,
         executor,
-        deploymentRepository: {
-            async markDeployed() {
-                events.push({ method: 'markDeployed' });
+        finalizer: {
+            async finalizeSucceeded() {
                 throw new Error('CAS failed');
             },
         },
@@ -1186,7 +1250,6 @@ test('deployed revision finalizer failure rolls back every changed node and cann
 
     assert.equal(result.status, 'rolled_back');
     assert.deepEqual(events, [
-        { method: 'markDeployed' },
         { method: 'rollback', node: 'node-b' },
         { method: 'rollback', node: 'node-a' },
     ]);

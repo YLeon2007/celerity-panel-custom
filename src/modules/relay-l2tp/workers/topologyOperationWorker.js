@@ -213,7 +213,7 @@ class TopologyOperationWorker {
         if (!executor || EXECUTOR_METHODS.some(method => typeof executor[method] !== 'function')) {
             throw new TypeError('Topology operation worker requires a typed executor');
         }
-        if (!finalizer || typeof finalizer.succeed !== 'function') {
+        if (!finalizer || typeof finalizer.finalizeSucceeded !== 'function') {
             throw new TypeError('Topology operation worker requires atomic terminal finalization');
         }
         if (!lockService
@@ -250,13 +250,16 @@ class TopologyOperationWorker {
     }
 
     async renew(operationId) {
+        const now = this.clock.now();
+        const leaseUntil = new Date(now.getTime() + this.leaseMs);
         const renewed = await this.operationRepository.renewLease({
             operationId,
             owner: this.workerId,
             leaseMs: this.leaseMs,
-            now: this.clock.now(),
+            now,
         });
         if (renewed !== true) throw new LeaseLostError();
+        return leaseUntil;
     }
 
     async renewLocks(operationId, lockedNodeIds) {
@@ -286,7 +289,8 @@ class TopologyOperationWorker {
             if (stopped || renewalError) return inFlight || Promise.resolve();
             if (inFlight) return inFlight;
             inFlight = this.renew(operationId)
-                .then(() => this.renewLocks(operationId, lockedNodeIds))
+                .then(leaseUntil => this.renewLocks(operationId, lockedNodeIds)
+                    .then(() => leaseUntil))
                 .catch(error => {
                     renewalError = error instanceof LeaseLostError
                         ? error
@@ -302,8 +306,9 @@ class TopologyOperationWorker {
             if (renewalError) throw renewalError;
         };
         const renewOwned = async () => {
-            await tick();
+            const leaseUntil = await tick();
             assertOwned();
+            return leaseUntil;
         };
 
         intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
@@ -638,20 +643,16 @@ class TopologyOperationWorker {
                 }
             }
 
-            await heartbeat.renew();
-            let deployed;
+            const leaseUntil = await heartbeat.renew();
             try {
-                deployed = await this.finalizer.succeed({
+                const finalized = await this.finalizer.finalizeSucceeded({
                     operationId,
                     owner: this.workerId,
-                    now: this.clock.now(),
-                    expectedRevision: plan.topologyRevision,
-                    expectedDeployedRevision: plan.priorDeployedRevision,
+                    leaseUntil,
+                    topologyRevision: plan.topologyRevision,
+                    priorDeployedRevision: plan.priorDeployedRevision,
                 });
-                if (deployed?.revision !== plan.topologyRevision
-                    || deployed?.deployedRevision !== plan.topologyRevision) {
-                    throw new Error('Topology deployedRevision CAS was rejected');
-                }
+                if (!finalized) throw new Error('Topology operation finalization was rejected');
             } catch (error) {
                 if (error instanceof LeaseLostError
                     || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') {

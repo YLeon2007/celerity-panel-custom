@@ -32,6 +32,12 @@ const {
 const {
     TopologyOperationWorker,
 } = require('../workers/topologyOperationWorker');
+const {
+    TopologyOperationFinalizationRepository,
+} = require('../repositories/topologyOperationFinalizationRepository');
+const {
+    TopologyOperationFinalizer,
+} = require('../services/topologyOperationFinalizer');
 
 const ENABLED_ENV = Object.freeze({
     L2TP_EXECUTION_ENABLED: 'true',
@@ -63,10 +69,15 @@ function compositionDependencies(calls = []) {
         HyNode: modelWith(['find', 'findById'], calls),
         CascadeLink: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeRouteGroup: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
-        CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate'], calls),
+        CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate', 'updateOne'], calls),
         RelayL2tpState: modelWith(['find'], calls),
         TopologyOperation: modelWith(['create', 'findOneAndUpdate', 'updateOne'], calls),
         transactionRunner: async work => work({ id: 'test-session' }),
+        lockService: {
+            acquire: async () => ({ ok: true }),
+            renew: async () => ({ ok: true }),
+            release: async () => ({ ok: true }),
+        },
         clock: {
             now() {
                 calls.push('clock.now');
@@ -241,8 +252,22 @@ test('enabled composition wires the queued topology runtime without starting its
     assert.strictEqual(service.operationRepository.model, dependencies.TopologyOperation);
     assert.ok(service.operationWorker instanceof TopologyOperationWorker);
     assert.strictEqual(service.operationWorker.operationRepository, service.operationRepository);
-    assert.strictEqual(service.operationWorker.deploymentRepository, service.topologyRepository);
     assert.strictEqual(service.operationWorker.executor, executor);
+    assert.ok(service.operationWorker.finalizer instanceof TopologyOperationFinalizer);
+    assert.ok(service.operationWorker.finalizer.repository instanceof TopologyOperationFinalizationRepository);
+    assert.strictEqual(
+        service.operationWorker.finalizer.repository.TopologyOperation,
+        dependencies.TopologyOperation,
+    );
+    assert.strictEqual(
+        service.operationWorker.finalizer.repository.CascadeTopologyState,
+        dependencies.CascadeTopologyState,
+    );
+    assert.strictEqual(
+        service.operationWorker.finalizer.repository.transactionRunner,
+        dependencies.transactionRunner,
+    );
+    assert.strictEqual(service.operationWorker.lockService, dependencies.lockService);
     assert.equal(service.operationWorker.workerId, dependencies.workerId);
     assert.equal(service.operationWorker.leaseMs, dependencies.leaseMs);
     assert.deepEqual(executorFactoryDependencies, {

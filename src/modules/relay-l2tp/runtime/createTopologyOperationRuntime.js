@@ -10,6 +10,9 @@ const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
 const {
+    TopologyOperationFinalizationRepository,
+} = require('../repositories/topologyOperationFinalizationRepository');
+const {
     TopologyNodeExecutionResolver,
 } = require('../services/topologyNodeExecutionResolver');
 const {
@@ -26,6 +29,9 @@ const {
 const {
     TopologyOperationCoordinator,
 } = require('../services/topologyOperationCoordinator');
+const {
+    TopologyOperationFinalizer,
+} = require('../services/topologyOperationFinalizer');
 const {
     unavailableTopologyDeploymentService,
 } = require('../services/topologyDeploymentService');
@@ -118,8 +124,11 @@ function createTopologyOperationRuntime(dependencies = {}) {
         DeploymentRepository = TopologyDeploymentRepository,
         PlanMaterializer = TopologyOperationPlanMaterializer,
         OperationRepository = TopologyOperationRepository,
+        FinalizationRepository = TopologyOperationFinalizationRepository,
+        Finalizer = TopologyOperationFinalizer,
         OperationWorker = TopologyOperationWorker,
         Coordinator = TopologyOperationCoordinator,
+        lockService,
         validator,
         compiler,
         idFactory,
@@ -153,6 +162,15 @@ function createTopologyOperationRuntime(dependencies = {}) {
         });
         const planMaterializer = new PlanMaterializer({ HyNode, CascadeLink });
         const operationRepository = new OperationRepository({ model: TopologyOperation });
+        const finalizationRepository = new FinalizationRepository({
+            TopologyOperation,
+            CascadeTopologyState,
+            ...optional(transactionRunner, 'transactionRunner'),
+        });
+        const finalizer = new Finalizer({
+            repository: finalizationRepository,
+            clock,
+        });
         const executor = executorFactory(Object.freeze({
             HyNode,
             hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
@@ -163,7 +181,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const operationWorker = new OperationWorker({
             operationRepository,
             executor,
-            deploymentRepository: topologyRepository,
+            finalizer,
+            lockService,
             workerId,
             leaseMs,
             clock,
