@@ -16,6 +16,12 @@ const {
     parseL2tpExecutionEnabled,
 } = require('../l2tpRuntimeLifecycleHook');
 
+const ENABLED_ENV = Object.freeze({
+    L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true',
+    TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+});
+
 test('parses L2TP_EXECUTION_ENABLED as an exact disabled-by-default boolean', () => {
     assert.equal(parseL2tpExecutionEnabled(undefined), false);
     assert.equal(parseL2tpExecutionEnabled('false'), false);
@@ -148,6 +154,30 @@ test('enabled mode forwards factory dependencies and starts the lifecycle once',
         },
         'start',
     ]);
+});
+
+test('enabled runtime lifecycle passes the exact opt-in environment to lazy host creation', () => {
+    let receivedOptions;
+    const env = { ...ENABLED_ENV };
+    const lifecycle = { start() {}, async stop() {} };
+
+    createL2tpRuntimeLifecycleHook({
+        env,
+        createHostDependencies(options) {
+            receivedOptions = options;
+            return {
+                createCandidateService() {},
+                createPreflightRunner() {},
+                createUserSnapshotResolver() {},
+                createUserSyncReconciler() {},
+            };
+        },
+        createStartupLifecycle() {
+            return lifecycle;
+        },
+    });
+
+    assert.deepEqual(receivedOptions, { env });
 });
 
 test('root lifecycle awaits migrations once after the database boundary before runtime startup', async () => {
@@ -289,6 +319,7 @@ test('root lifecycle propagates invalid enable configuration before creating dep
 });
 
 test('root host dependencies provide the exact safe candidate composition required by enabled startup', async () => {
+    const env = { ...ENABLED_ENV };
     const candidateConstructions = [];
     const nodeQueries = [];
     class FakeCandidateService {
@@ -328,6 +359,7 @@ test('root host dependencies provide the exact safe candidate composition requir
     };
 
     const dependencies = createL2tpRootHostDependencies({
+        env,
         HyNode,
         NodeSSH: class FakeNodeSSH {},
         NodeTransport: class FakeNodeTransport {},
@@ -351,6 +383,7 @@ test('root host dependencies provide the exact safe candidate composition requir
         logger: lifecycleLogger,
     });
 
+    assert.strictEqual(dependencies.env, env);
     assert.strictEqual(dependencies.createPreflightRunner, createPreflightRunner);
     assert.strictEqual(dependencies.candidateUserResolver, candidateUserResolver);
     assert.strictEqual(dependencies.configGenerator, configGenerator);

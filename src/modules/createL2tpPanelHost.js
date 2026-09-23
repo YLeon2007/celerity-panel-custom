@@ -16,6 +16,7 @@ const DEFAULT_CLOCK = Object.freeze({ now: () => new Date() });
 const DEFAULT_LEASE_MS = 30_000;
 
 function createL2tpPanelHost({
+    env = process.env,
     requireAuth,
     requireOnboarding,
     csrf,
@@ -42,7 +43,9 @@ function createL2tpPanelHost({
     NodeSSH,
     NodeTransport,
     workerLifecycle,
+    topologyRecoveryScanLimit,
     createWorkerLifecycle: createLifecycle = createL2tpWorkerLifecycle,
+    createTopologyRecoveryLifecycle,
     clock = DEFAULT_CLOCK,
     workerId = `panel-${process.pid}`,
     leaseMs = DEFAULT_LEASE_MS,
@@ -134,6 +137,50 @@ function createL2tpPanelHost({
         },
     });
 
+    let topologyDeploymentService;
+    let topologyRecoveryLifecycle;
+    const { isTopologyTestExecutionEnabled } = require(
+        './relay-l2tp/runtime/createTopologyOperationRuntime'
+    );
+    if (isTopologyTestExecutionEnabled(env)) {
+        if (typeof injectedModuleEntry.createTopologyDeploymentService !== 'function') {
+            throw new TypeError(
+                'Opted-in topology recovery requires createTopologyDeploymentService',
+            );
+        }
+        topologyDeploymentService = injectedModuleEntry.createTopologyDeploymentService({
+            env,
+            HyNode: injectedHyNode,
+            CascadeLink: injectedCascadeLink,
+            CascadeRouteGroup: models.CascadeRouteGroup,
+            CascadeTopologyState: models.CascadeTopologyState,
+            RelayL2tpState: models.RelayL2tpState,
+            TopologyOperation: models.TopologyOperation,
+            NodeSSH,
+            clock,
+            workerId: `${workerId}-topology`,
+            leaseMs,
+        });
+        if (typeof topologyDeploymentService?.operationWorker?.run !== 'function') {
+            throw new TypeError('Opted-in topology recovery requires an operation worker');
+        }
+        const recoveryFactory = createTopologyRecoveryLifecycle
+            ?? require('./relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle')
+                .createTopologyOperationRecoveryLifecycle;
+        topologyRecoveryLifecycle = recoveryFactory({
+            env,
+            operationModel: models.TopologyOperation,
+            worker: topologyDeploymentService.operationWorker,
+            clock,
+            intervalMs: workerLifecycle?.intervalMs,
+            timer: workerLifecycle?.timer,
+            logger: workerLifecycle?.logger,
+            ...(topologyRecoveryScanLimit === undefined
+                ? {}
+                : { scanLimit: topologyRecoveryScanLimit }),
+        });
+    }
+
     return {
         moduleEntry: injectedModuleEntry,
         topologyRuntime,
@@ -141,8 +188,22 @@ function createL2tpPanelHost({
         loadPanelOverview,
         stateManagementService: executionRuntime.runtime.stateManagementService,
         runtime: executionRuntime.runtime,
-        start: executionRuntime.start,
-        stop: executionRuntime.stop,
+        start() {
+            const executionState = executionRuntime.start();
+            topologyRecoveryLifecycle?.start();
+            return executionState;
+        },
+        async stop() {
+            let recoveryError;
+            try {
+                await topologyRecoveryLifecycle?.stop();
+            } catch (error) {
+                recoveryError = error;
+            }
+            const executionState = await executionRuntime.stop();
+            if (recoveryError) throw recoveryError;
+            return executionState;
+        },
     };
 }
 

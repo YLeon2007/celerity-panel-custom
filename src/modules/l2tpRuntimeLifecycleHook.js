@@ -60,11 +60,11 @@ function parseL2tpExecutionEnabled(value) {
     );
 }
 
-function createEnabledHostDependencies(factory) {
+function createEnabledHostDependencies(factory, env) {
     if (typeof factory !== 'function') {
         throw new TypeError('L2TP enabled startup requires createHostDependencies');
     }
-    const dependencies = factory();
+    const dependencies = factory({ env });
     if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
         throw new TypeError('L2TP createHostDependencies must return an object');
     }
@@ -89,7 +89,7 @@ function createL2tpRuntimeLifecycleHook({
 } = {}) {
     const enabled = parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
     const hostDependencies = enabled
-        ? createEnabledHostDependencies(createHostDependencies)
+        ? createEnabledHostDependencies(createHostDependencies, env)
         : {};
     const lifecycle = createStartupLifecycle({
         config: { enabled },
@@ -101,6 +101,7 @@ function createL2tpRuntimeLifecycleHook({
 }
 
 function createL2tpRootHostDependencies({
+    env = process.env,
     HyNode = require('../models/hyNodeModel'),
     NodeSSH = require('../services/nodeSSH'),
     NodeTransport = require('./relay-l2tp/services/l2tpNodeTransport').L2tpNodeTransport,
@@ -167,6 +168,7 @@ function createL2tpRootHostDependencies({
     });
 
     return {
+        env,
         HyNode,
         NodeSSH,
         NodeTransport,
