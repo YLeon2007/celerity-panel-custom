@@ -1,6 +1,6 @@
 'use strict';
 
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { compileTopology } = require('../domain/topologyCompiler');
 const {
     projectGroups,
@@ -268,7 +268,10 @@ class TopologyOperationCoordinator {
     }
 
     async queueOnce({ expectedTopologyRevision, idempotencyKey }) {
-        const operationId = entityId(this.idFactory(idempotencyKey));
+        // Unique run suffix: node-side runner state is keyed by operation id,
+        // so a re-queued revision must never reuse a previous operation id.
+        const runIdempotencyKey = `${idempotencyKey}:${randomUUID()}`;
+        const operationId = entityId(this.idFactory(runIdempotencyKey));
         if (!operationId) {
             throw new TopologyOperationCoordinatorError(
                 'TOPOLOGY_OPERATION_QUEUE_FAILED',
@@ -322,7 +325,7 @@ class TopologyOperationCoordinator {
         try {
             await this.operationRepository.createFrozen({
                 operationId,
-                idempotencyKey,
+                idempotencyKey: runIdempotencyKey,
                 topologyRevision: pinned.revision,
                 priorDeployedRevision: pinned.deployedRevision,
                 nodes: plan.nodes,

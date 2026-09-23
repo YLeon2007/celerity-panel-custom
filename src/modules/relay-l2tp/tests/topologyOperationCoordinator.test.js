@@ -127,13 +127,16 @@ test('queues one frozen fixed-test operation and starts only the injected worker
         }],
         groups: [],
     });
-    assert.deepEqual(calls.find(call => call.method === 'createFrozen').input, {
-        operationId: 'operation-public',
-        idempotencyKey: 'topology:test:revision-7',
-        topologyRevision: 7,
-        priorDeployedRevision: 5,
-        nodes: calls.find(call => call.method === 'createFrozen').input.nodes,
-    });
+    const frozenInput = calls.find(call => call.method === 'createFrozen').input;
+    assert.equal(frozenInput.operationId, 'operation-public');
+    assert.match(
+        frozenInput.idempotencyKey,
+        /^topology:test:revision-7:[0-9a-f-]{36}$/,
+        'each queue run must use a unique idempotency key suffix so node-side runner state never collides',
+    );
+    assert.equal(frozenInput.topologyRevision, 7);
+    assert.equal(frozenInput.priorDeployedRevision, 5);
+    assert.ok(Array.isArray(frozenInput.nodes));
     const durableNodes = calls.find(call => call.method === 'createFrozen').input.nodes;
     assert.equal(Object.isFrozen(durableNodes), true);
     assert.deepEqual(durableNodes.map(node => ({
@@ -320,7 +323,7 @@ test('a cached idempotent result whose operation was purged (undeploy) is re-que
         },
         operationRepository: {
             async createFrozen(input) {
-                calls.push({ method: 'createFrozen', operationId: input.operationId });
+                calls.push({ method: 'createFrozen', operationId: input.operationId, idempotencyKey: input.idempotencyKey });
                 persisted = { status: 'queued', topologyRevision: 7 };
             },
             async findPublicById(operationId) {
@@ -352,6 +355,12 @@ test('a cached idempotent result whose operation was purged (undeploy) is re-que
     });
     assert.equal(calls.filter(call => call.method === 'createFrozen').length, 2);
     assert.equal(calls.filter(call => call.method === 'worker.run').length, 2);
+    const keys = calls
+        .filter(call => call.method === 'createFrozen')
+        .map(call => call.idempotencyKey);
+    assert.ok(keys.every(key => /^topology:test:revision-7:[0-9a-f-]{36}$/.test(key)));
+    assert.notEqual(keys[0], keys[1],
+        'a re-queued operation must get a fresh idempotency key so node-side runner state does not collide');
 });
 
 test('projects a deterministic status without candidates, leases, backups, or invalid states', () => {
