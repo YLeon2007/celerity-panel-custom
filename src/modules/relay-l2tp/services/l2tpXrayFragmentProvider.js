@@ -32,6 +32,36 @@ function buildL2tpXrayFragment(snapshot) {
         });
     }
 
+function isIpMatcher(entry) {
+    return entry.startsWith('geoip:') || /^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(entry);
+}
+
+function buildControlPlaneRule(entries, tags) {
+    // Xray rejects domains inside `ip` rules ("unsupported address for router"),
+    // while panel node addresses may legitimately be hostnames.
+    const ipMatchers = [];
+    const domainMatchers = [];
+    for (const entry of [...entries].sort()) {
+        if (isIpMatcher(entry)) {
+            ipMatchers.push(entry);
+        } else {
+            domainMatchers.push(entry);
+        }
+    }
+    const rule = {
+        type: 'field',
+        inboundTag: [tags.inbound],
+        outboundTag: tags.blockOutbound,
+    };
+    if (ipMatchers.length > 0) {
+        rule.ip = ipMatchers;
+    }
+    if (domainMatchers.length > 0) {
+        rule.domain = domainMatchers;
+    }
+    return rule;
+}
+
     return {
         id: 'relay-l2tp',
         inbounds: [{
@@ -55,12 +85,7 @@ function buildL2tpXrayFragment(snapshot) {
                 ip: ['geoip:private'],
                 outboundTag: tags.blockOutbound,
             },
-            {
-                type: 'field',
-                inboundTag: [tags.inbound],
-                ip: [...plan.relay.controlPlaneIps].sort(),
-                outboundTag: tags.blockOutbound,
-            },
+            buildControlPlaneRule(plan.relay.controlPlaneIps, tags),
             {
                 type: 'field',
                 inboundTag: [tags.inbound],

@@ -177,3 +177,22 @@ test('is deterministic across plan ordering and excludes secret fields', () => {
     assert.doesNotMatch(serialized, /relay-private-key|path-password|l2tp-preshared-secret|deployment-token/);
     assert.doesNotMatch(serialized, /"(?:psk|password|privateKey|secret|token)"/i);
 });
+
+test('domain control-plane addresses go to the domain matcher, IPs stay in ip', () => {
+    const fragment = buildL2tpXrayFragment(snapshot({
+        plan: {
+            ...snapshot().plan,
+            relay: {
+                id: 'relay-1',
+                controlPlaneIps: ['relay.example.com', '198.51.100.10', '2001:db8::/32'],
+            },
+        },
+    }));
+    const rule = fragment.routingRules.find(
+        candidate => candidate.inboundTag?.includes('relay-l2tp-route-group-a')
+            && candidate.outboundTag === 'block'
+            && (candidate.domain || (candidate.ip && !candidate.ip.includes('geoip:private'))),
+    );
+    assert.deepEqual(rule.domain, ['relay.example.com']);
+    assert.deepEqual(rule.ip, ['198.51.100.10', '2001:db8::/32']);
+});
