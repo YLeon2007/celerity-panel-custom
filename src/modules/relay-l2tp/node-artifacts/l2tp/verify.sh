@@ -132,7 +132,8 @@ then
     exit 70
 fi
 route_state="$($ip_path -4 route show table "$route_table" type local 2>/dev/null || true)"
-if [[ -z "$route_state" || "$route_state" != *'local 0.0.0.0/0'* ]]; then
+# iproute2 prints the 0.0.0.0/0 local route as "local default" on newer builds.
+if [[ -z "$route_state" || "$route_state" != *'local 0.0.0.0/0'* && "$route_state" != *'local default'* ]]; then
     emit_error 'IP_ROUTE_VERIFY_FAILED'
     exit 70
 fi
