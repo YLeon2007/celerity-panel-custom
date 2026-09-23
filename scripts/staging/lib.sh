@@ -9,6 +9,7 @@ readonly CELERITY_COMPOSE_FILE='docker-compose.yml'
 readonly CELERITY_APP_SERVICE='backend'
 readonly CELERITY_PUBLIC_HEALTH_MAX_ATTEMPTS=5
 readonly CELERITY_PUBLIC_HEALTH_RETRY_DELAY_SECONDS=2
+readonly CELERITY_STAGING_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 fail() {
     printf 'staging control refused: %s\n' "$1" >&2
@@ -71,8 +72,47 @@ require_git_oid() {
 require_local_regular_file() {
     local label=$1
     local file_path=${2-}
-    [[ -n "$file_path" && -f "$file_path" && ! -L "$file_path" ]] \
+    [[ -n "$file_path" ]] \
         || fail "$label must reference a local regular file"
+    [[ ! -L "$file_path" ]] || fail "$label must not be a symlink"
+    [[ -f "$file_path" ]] || fail "$label must reference a local regular file"
+}
+
+secure_remove_file() {
+    local file_path=${1-}
+    [[ -n "$file_path" ]] || return 0
+    if [[ -L "$file_path" || ! -e "$file_path" ]]; then
+        rm -f -- "$file_path"
+    elif command -v shred >/dev/null 2>&1; then
+        shred --remove=wipesync -- "$file_path" 2>/dev/null || rm -f -- "$file_path"
+    else
+        rm -f -- "$file_path"
+    fi
+}
+
+create_compose_env() {
+    local base_env_file=$1
+    local overlay_env_file=${2-}
+    local output_file=$3
+    require_local_regular_file 'target env file' "$base_env_file"
+    if [[ -n "$overlay_env_file" ]]; then
+        require_local_regular_file 'config env file' "$overlay_env_file"
+    fi
+    [[ ! -e "$output_file" && ! -L "$output_file" ]] \
+        || fail 'temporary Compose env destination already exists'
+    if [[ -n "$overlay_env_file" ]]; then
+        python3 "$CELERITY_STAGING_SCRIPT_DIR/merge-compose-env.py" \
+            --base-env-file "$base_env_file" \
+            --overlay-env-file "$overlay_env_file" \
+            --output "$output_file"
+    else
+        python3 "$CELERITY_STAGING_SCRIPT_DIR/merge-compose-env.py" \
+            --base-env-file "$base_env_file" \
+            --output "$output_file"
+    fi
+    [[ -f "$output_file" && ! -L "$output_file" ]] \
+        || fail 'temporary Compose env was not created'
+    chmod 0600 -- "$output_file"
 }
 
 sha256_file() {

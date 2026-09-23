@@ -165,7 +165,9 @@ fi
 
 runtime_root=$(mktemp -d)
 lock_dir=''
+compose_env=''
 cleanup() {
+    secure_remove_file "$compose_env"
     rm -rf -- "$runtime_root"
     [[ -z "$lock_dir" ]] || rmdir -- "$lock_dir" 2>/dev/null || true
 }
@@ -242,7 +244,8 @@ if [[ ${manifest[config_test_present]} == 'true' ]]; then
     )
 fi
 python3 "$SCRIPT_DIR/validate-rollback-backup.py" "${validator_args[@]}"
-install -m 0600 -- "$config_env" "$staged_source/.env"
+compose_env="$staged_source/.env"
+create_compose_env "$config_env" '' "$compose_env"
 
 while IFS= read -r -d '' javascript_file; do
     node --check "$javascript_file" >/dev/null \
@@ -356,14 +359,14 @@ validate_retained_baseline_identity
 compose=(
     docker compose
     --project-directory "$install_root_path"
-    --env-file "$install_root_path/.env"
+    --env-file "$compose_env"
     -f "$install_root_path/$CELERITY_COMPOSE_FILE"
 )
 
 staged_compose=(
     docker compose
     --project-directory "$staged_source"
-    --env-file "$config_env"
+    --env-file "$compose_env"
     -f "$staged_source/$CELERITY_COMPOSE_FILE"
 )
 "${staged_compose[@]}" config --quiet >/dev/null 2>&1 \

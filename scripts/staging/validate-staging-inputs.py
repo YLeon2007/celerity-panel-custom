@@ -178,27 +178,42 @@ def validate_module_artifact(args: argparse.Namespace) -> None:
 
 
 def validate_config_env(args: argparse.Namespace) -> None:
+    config_path = Path(args.config_env_file)
+    if config_path.is_symlink() or not config_path.is_file():
+        refuse("test config env file must be a local regular file")
     try:
-        lines = Path(args.config_env_file).read_text(encoding="utf-8").splitlines()
+        lines = config_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as error:
         refuse(f"test config cannot be validated ({type(error).__name__})")
-    required: dict[str, str] = {}
+    allowed = {
+        "PANEL_DOMAIN",
+        "ACME_EMAIL",
+        "L2TP_EXECUTION_ENABLED",
+        "L2TP_MIGRATIONS_ENABLED",
+        "TOPOLOGY_TEST_EXECUTION_ENABLED",
+    }
+    values: dict[str, str] = {}
     for raw_line in lines:
+        if "\x00" in raw_line:
+            refuse("test config must use strict KEY=value syntax")
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export ") or "=" not in line:
             refuse("test config must use strict KEY=value syntax")
         key, value = line.split("=", 1)
-        if key in {"PANEL_DOMAIN", "L2TP_EXECUTION_ENABLED", "L2TP_MIGRATIONS_ENABLED"}:
-            if key in required:
-                refuse("test config contains duplicate required keys")
-            required[key] = value
-    if required.get("PANEL_DOMAIN") != "test.infograd.online":
+        if not key or not key.replace("_", "a").isalnum() or not (key[0].isalpha() or key[0] == "_"):
+            refuse("test config must use strict KEY=value syntax")
+        if key not in allowed:
+            refuse("unexpected test config key")
+        if key in values:
+            refuse("duplicate test config key")
+        values[key] = value
+    if values.get("PANEL_DOMAIN") != "test.infograd.online":
         refuse("test config PANEL_DOMAIN must match the test host")
-    if required.get("L2TP_EXECUTION_ENABLED") != "true":
+    if values.get("L2TP_EXECUTION_ENABLED") != "true":
         refuse("test config requires L2TP_EXECUTION_ENABLED=true exactly")
-    if required.get("L2TP_MIGRATIONS_ENABLED") != "true":
+    if values.get("L2TP_MIGRATIONS_ENABLED") != "true":
         refuse(
             "test config with L2TP_EXECUTION_ENABLED=true requires "
             "L2TP_MIGRATIONS_ENABLED=true exactly"

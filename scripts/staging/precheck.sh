@@ -64,8 +64,17 @@ for config_ref in "${config_file_refs[@]}"; do
     require_local_regular_file 'config file ref' "$local_file"
 done
 
+install_root_path=$(resolve_control_path "$install_root")
+[[ -d "$install_root_path" && ! -L "$install_root_path" ]] \
+    || fail "install root must already be the real $CELERITY_INSTALL_ROOT directory"
+install_root_path=$(cd -- "$install_root_path" && pwd -P)
+[[ -f "$install_root_path/.env" && ! -L "$install_root_path/.env" ]] \
+    || fail 'installed .env must be a regular file'
+
 validation_root=$(mktemp -d)
+compose_env=''
 cleanup() {
+    secure_remove_file "$compose_env"
     rm -rf -- "$validation_root"
 }
 trap cleanup EXIT
@@ -77,13 +86,14 @@ python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --expected-source-commit "$expected_source_commit" \
     --expected-source-tree "$expected_source_tree" \
     --extract-source "$extracted_source"
-install -m 0600 -- "$config_env_file" "$extracted_source/.env"
+compose_env="$extracted_source/.env"
+create_compose_env "$install_root_path/.env" "$config_env_file" "$compose_env"
 
 compose_path="$extracted_source/$CELERITY_COMPOSE_FILE"
 compose_base=(
     docker compose
     --project-directory "$extracted_source"
-    --env-file "$config_env_file"
+    --env-file "$compose_env"
     -f "$compose_path"
 )
 if ! "${compose_base[@]}" config --quiet >/dev/null 2>&1; then

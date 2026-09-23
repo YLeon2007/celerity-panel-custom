@@ -136,7 +136,9 @@ command -v git >/dev/null 2>&1 || fail 'Git is required to identify the predeplo
 
 runtime_root=$(mktemp -d)
 lock_dir=''
+compose_env=''
 cleanup() {
+    secure_remove_file "$compose_env"
     rm -rf -- "$runtime_root"
     [[ -z "$lock_dir" ]] || rmdir -- "$lock_dir" 2>/dev/null || true
 }
@@ -267,7 +269,8 @@ python3 "$SCRIPT_DIR/validate-staging-inputs.py" \
     --expected-source-commit "$expected_source_commit" \
     --expected-source-tree "$expected_source_tree" \
     --extract-source "$staged_source"
-install -m 0600 -- "$config_env_file" "$staged_source/.env"
+compose_env="$staged_source/.env"
+create_compose_env "$install_root_path/.env" "$config_env_file" "$compose_env"
 
 while IFS= read -r -d '' javascript_file; do
     node --check "$javascript_file" >/dev/null \
@@ -277,7 +280,7 @@ done < <(find "$staged_source" -type f -name '*.js' -print0 | sort -z)
 staged_compose=(
     docker compose
     --project-directory "$staged_source"
-    --env-file "$config_env_file"
+    --env-file "$compose_env"
     -f "$staged_source/$CELERITY_COMPOSE_FILE"
 )
 "${staged_compose[@]}" config --quiet >/dev/null 2>&1 \
@@ -372,7 +375,7 @@ printf 'complete\n' > "$backup_dir_path/STATE"
 compose=(
     docker compose
     --project-directory "$install_root_path"
-    --env-file "$install_root_path/.env"
+    --env-file "$compose_env"
     -f "$install_root_path/$CELERITY_COMPOSE_FILE"
 )
 capture_untouched_service_states
@@ -389,7 +392,7 @@ rsync \
     --exclude='backups/' \
     --exclude='greenlock.d/' \
     "$staged_source/" "$install_root_path/"
-install -m 0600 -- "$config_env_file" "$install_root_path/.env"
+install -m 0600 -- "$compose_env" "$install_root_path/.env"
 rm -rf -- "$install_root_path/config/test"
 if ((${#config_file_refs[@]})); then
     mkdir -p -m 0700 -- "$install_root_path/config/test"

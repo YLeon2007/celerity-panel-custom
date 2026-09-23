@@ -53,6 +53,8 @@ function createMinimalPrecheckFixture() {
     const bundle = path.join(root, 'source.tar.gz');
     const artifact = path.join(root, 'relay-l2tp.tar.gz');
     const configEnv = path.join(root, 'test.env');
+    const testFsRoot = path.join(root, 'fs-root');
+    const installDir = path.join(testFsRoot, 'opt', 'hysteria-panel');
     const configRef = path.join(root, 'worker.conf');
     const mockBin = path.join(root, 'mock-bin');
     const dockerLog = path.join(root, 'docker.log');
@@ -69,6 +71,7 @@ function createMinimalPrecheckFixture() {
     fs.mkdirSync(artifactStage, { recursive: true });
     fs.mkdirSync(mockBin, { recursive: true });
     fs.mkdirSync(dockerState, { recursive: true });
+    fs.mkdirSync(installDir, { recursive: true });
     for (const [service, state] of Object.entries(untouchedState)) {
         fs.writeFileSync(path.join(dockerState, `${service}.id`), `${state.id}\n`);
         fs.writeFileSync(path.join(dockerState, `${service}.restart`), `${state.restartCount}\n`);
@@ -113,9 +116,21 @@ function createMinimalPrecheckFixture() {
 
     fs.writeFileSync(configEnv, [
         'PANEL_DOMAIN=test.infograd.online',
+        'ACME_EMAIL=staging-admin@test.infograd.online',
         'L2TP_EXECUTION_ENABLED=true',
         'L2TP_MIGRATIONS_ENABLED=true',
-        'FIXTURE_SECRET=must-not-appear',
+        'TOPOLOGY_TEST_EXECUTION_ENABLED=true',
+        '',
+    ].join('\n'), { mode: 0o600 });
+    fs.writeFileSync(path.join(installDir, '.env'), [
+        'PANEL_DOMAIN=target.infograd.online',
+        'ACME_EMAIL=target-admin@infograd.online',
+        'L2TP_EXECUTION_ENABLED=false',
+        'L2TP_MIGRATIONS_ENABLED=false',
+        'TOPOLOGY_TEST_EXECUTION_ENABLED=false',
+        'ENCRYPTION_KEY=target-secret-encryption-key',
+        'SESSION_SECRET=target-secret-session-key',
+        'MONGO_PASSWORD=target-secret-mongo-password',
         '',
     ].join('\n'), { mode: 0o600 });
     fs.writeFileSync(configRef, 'token=must-not-appear\n', { mode: 0o600 });
@@ -147,6 +162,7 @@ function createMinimalPrecheckFixture() {
         '      service_env_mode=$(stat -c %a "$service_env_file") || exit 96',
         '      [ "$service_env_mode" = 600 ] || exit 97',
         '      cmp -s "$config_env_file" "$service_env_file" || exit 98',
+        '      [ -z "${MOCK_CAPTURE_ENV:-}" ] || cp -- "$service_env_file" "$MOCK_CAPTURE_ENV"',
         '      printf "service-env=%s mode=%s\\n" "$service_env_file" "$service_env_mode" >> "$MOCK_DOCKER_LOG"',
         '      ;;',
         '  esac',
@@ -239,6 +255,8 @@ function createMinimalPrecheckFixture() {
 
     return {
         root,
+        testFsRoot,
+        installDir,
         bundle,
         artifact,
         artifactStage,
@@ -258,6 +276,9 @@ function createMinimalPrecheckFixture() {
             MOCK_DOCKER_STATE: dockerState,
             MOCK_REAL_RSYNC: realRsync,
             MOCK_REQUIRE_SERVICE_ENV: '1',
+            MOCK_CAPTURE_ENV: path.join(root, 'captured-compose.env'),
+            CELERITY_STAGING_TEST_MODE: '1',
+            CELERITY_STAGING_TEST_FS_ROOT: testFsRoot,
         },
         args: [
             '--target', 'test',
@@ -329,8 +350,7 @@ function runDeployPlan(fixture) {
 
 function createDeployExecuteFixture() {
     const fixture = createMinimalPrecheckFixture();
-    const testFsRoot = path.join(fixture.root, 'fs-root');
-    const installDir = path.join(testFsRoot, '/opt/hysteria-panel');
+    const { testFsRoot, installDir } = fixture;
     const backupRootDir = path.join(testFsRoot, '/opt/hysteria-panel-test-backups');
     const hookLog = path.join(fixture.root, 'mongo-dump-hook.log');
     const mongoDumpHook = path.join(fixture.root, 'mongo-dump-hook.sh');
@@ -341,9 +361,8 @@ function createDeployExecuteFixture() {
         path.join(fixture.root, 'bundle-stage', 'source', 'docker-compose.yml'),
         path.join(installDir, 'docker-compose.yml'),
     );
-    fs.copyFileSync(fixture.configEnv, path.join(installDir, '.env'));
+    fs.chmodSync(path.join(installDir, '.env'), 0o600);
     fs.writeFileSync(path.join(installDir, 'old.js'), "'use strict';\n");
-    fs.writeFileSync(path.join(installDir, 'config', 'test', 'old.conf'), 'old-test-config\n');
     runChecked('git', ['init', '--quiet'], { cwd: installDir });
     runChecked('git', ['config', 'user.name', 'Staging Test'], { cwd: installDir });
     runChecked('git', ['config', 'user.email', 'staging-test@example.invalid'], { cwd: installDir });
@@ -390,6 +409,7 @@ function createDeployExecuteFixture() {
 
 function createRollbackFixture() {
     const fixture = createMinimalPrecheckFixture();
+    fs.rmSync(fixture.installDir, { recursive: true, force: true });
     const testFsRoot = path.join(fixture.root, 'fs-root');
     const sourceStage = path.join(fixture.root, 'rollback-source');
     const hookLog = path.join(fixture.root, 'mongo-restore-hook.log');
@@ -748,6 +768,77 @@ test('precheck validates the pinned clean bundle, module artifact, compose layou
         assert.equal(archiveEntries.includes('source/.env'), false, 'temporary Compose env must not enter source bundle');
     } finally {
         fixture.cleanup();
+    }
+});
+
+test('precheck merges test overrides over the target Compose environment without dropping secrets', () => {
+    const fixture = createMinimalPrecheckFixture();
+    try {
+        const result = run(precheckScript, fixture.args, { env: fixture.env });
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const merged = readEnvFile(path.join(fixture.root, 'captured-compose.env'));
+        assert.equal(merged.PANEL_DOMAIN, 'test.infograd.online');
+        assert.equal(merged.ACME_EMAIL, 'staging-admin@test.infograd.online');
+        assert.equal(merged.L2TP_EXECUTION_ENABLED, 'true');
+        assert.equal(merged.L2TP_MIGRATIONS_ENABLED, 'true');
+        assert.equal(merged.TOPOLOGY_TEST_EXECUTION_ENABLED, 'true');
+        assert.equal(merged.ENCRYPTION_KEY, 'target-secret-encryption-key');
+        assert.equal(merged.SESSION_SECRET, 'target-secret-session-key');
+        assert.equal(merged.MONGO_PASSWORD, 'target-secret-mongo-password');
+        assert.doesNotMatch(`${result.stdout}${result.stderr}`, /target-secret/);
+    } finally {
+        fixture.cleanup();
+    }
+});
+
+test('staging config rejects extra, duplicate, malformed, and symlinked dotenv records', () => {
+    const cases = [
+        {
+            name: 'extra secret',
+            mutate(fixture) {
+                fs.appendFileSync(fixture.configEnv, 'SESSION_SECRET=must-not-appear\n');
+            },
+            expected: /unexpected test config key/,
+        },
+        {
+            name: 'duplicate permitted key',
+            mutate(fixture) {
+                fs.appendFileSync(fixture.configEnv, 'PANEL_DOMAIN=test.infograd.online\n');
+            },
+            expected: /duplicate test config key/,
+        },
+        {
+            name: 'malformed record',
+            mutate(fixture) {
+                fs.appendFileSync(fixture.configEnv, 'not-a-dotenv-record\n');
+            },
+            expected: /strict KEY=value syntax/,
+        },
+        {
+            name: 'symlink',
+            mutate(fixture) {
+                const replacement = path.join(fixture.root, 'symlinked-test.env');
+                fs.renameSync(fixture.configEnv, replacement);
+                fs.symlinkSync(replacement, fixture.configEnv);
+            },
+            expected: /config env file must not be a symlink/,
+        },
+    ];
+
+    for (const testCase of cases) {
+        const fixture = createMinimalPrecheckFixture();
+        try {
+            testCase.mutate(fixture);
+            const result = run(precheckScript, fixture.args, { env: fixture.env });
+
+            assert.notEqual(result.status, 0, testCase.name);
+            assert.match(result.stderr, testCase.expected, testCase.name);
+            assert.doesNotMatch(`${result.stdout}${result.stderr}`, /target-secret/);
+            assert.equal(fs.existsSync(fixture.dockerLog), false, `${testCase.name} must fail before Compose`);
+        } finally {
+            fixture.cleanup();
+        }
     }
 });
 
