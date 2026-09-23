@@ -232,7 +232,6 @@ function createL2tpRouter({
         '/l2tp/simple/overview',
         requireAuth,
         requireOnboarding,
-        rateLimiter,
         async (req, res) => {
             if (!requireSimpleService(res)) return;
             try {

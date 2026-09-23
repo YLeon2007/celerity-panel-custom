@@ -1787,6 +1787,7 @@
     "requestFailed": "Request failed",
     "queued": "Operation queued",
     "done": "Done",
-    "failed": "Failed"
+    "failed": "Failed",
+    "rateLimited": "Too many requests — wait a minute"
   }
 }

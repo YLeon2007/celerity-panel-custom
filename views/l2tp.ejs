@@ -60,6 +60,7 @@
         confirmDeleteAccount: t('l2tp.confirmDeleteAccount'),
         pendingSync: t('l2tp.pendingSync'),
         requestFailed: t('l2tp.requestFailed'),
+        rateLimited: t('l2tp.rateLimited'),
         queued: t('l2tp.queued'),
         done: t('l2tp.done'),
         failed: t('l2tp.failed'),
@@ -90,11 +91,20 @@
         let payload = null;
         try { payload = await response.json(); } catch { /* empty body */ }
         if (!response.ok) {
-            const error = new Error(payload?.error?.code || 'REQUEST_FAILED');
-            error.code = payload?.error?.code || 'REQUEST_FAILED';
+            const code = payload?.error?.code
+                || payload?.code
+                || (response.status === 429 ? 'RATE_LIMITED' : 'REQUEST_FAILED');
+            const error = new Error(code);
+            error.code = code;
             throw error;
         }
         return payload;
+    }
+
+    function fmtError(error) {
+        return error?.code === 'RATE_LIMITED'
+            ? L.rateLimited
+            : `${L.requestFailed}: ${error?.code || 'REQUEST_FAILED'}`;
     }
 
     function relayBadge(relay) {
@@ -160,7 +170,7 @@
             renderRelays(data.relays || []);
             renderAccounts(data.accounts || []);
         } catch (error) {
-            relayStatus.textContent = error.code || L.requestFailed;
+            relayStatus.textContent = fmtError(error);
         }
     }
 
@@ -221,7 +231,7 @@
             }
             await refresh();
         } catch (error) {
-            relayStatus.textContent = `${L.requestFailed}: ${error.code}`;
+            relayStatus.textContent = fmtError(error);
             button.disabled = false;
         }
     });
@@ -240,7 +250,7 @@
             accountStatus.textContent = L.done;
             refresh();
         } catch (error) {
-            accountStatus.textContent = `${L.requestFailed}: ${error.code}`;
+            accountStatus.textContent = fmtError(error);
         }
     });
 
@@ -256,7 +266,7 @@
             accountStatus.textContent = L.done;
             refresh();
         } catch (error) {
-            accountStatus.textContent = `${L.requestFailed}: ${error.code}`;
+            accountStatus.textContent = fmtError(error);
             button.disabled = false;
         }
     });

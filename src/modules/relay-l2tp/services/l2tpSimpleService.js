@@ -274,7 +274,10 @@ class L2tpSimpleService {
             const nodeId = entityId(node._id);
             const state = stateByNode.get(nodeId);
             let psk = null;
-            if (state?.pskEncrypted) {
+            // pskEncrypted is schema-hidden (select: false), so its presence
+            // cannot be checked here — attempt to reveal for every configured
+            // relay and treat decryption/absence failures as "no PSK yet".
+            if (state?.desiredState === 'installed') {
                 try {
                     psk = (await this.stateManagementService.revealPsk(nodeId)).psk;
                 } catch {
