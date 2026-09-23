@@ -42,6 +42,9 @@ const {
     TopologyOperationWorker,
 } = require('../workers/topologyOperationWorker');
 const {
+    TopologyUserResync,
+} = require('../services/topologyUserResync');
+const {
     NodeOperationLockRepository,
 } = require('../services/nodeOperationLockRepository');
 const {
@@ -191,6 +194,12 @@ function createTopologyOperationRuntime(dependencies = {}) {
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
+        let userResync;
+        try {
+            userResync = new TopologyUserResync({ HyNode });
+        } catch {
+            userResync = undefined;
+        }
         const operationWorker = new OperationWorker({
             operationRepository,
             executor,
@@ -199,6 +208,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             workerId,
             leaseMs,
             clock,
+            ...optional(userResync, 'userResync'),
         });
         return new Coordinator({
             topologyRepository,

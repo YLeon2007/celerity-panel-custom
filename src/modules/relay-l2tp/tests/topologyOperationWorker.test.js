@@ -208,6 +208,7 @@ function createWorker({
     lockService,
     timer,
     renewalIntervalMs,
+    userResync,
 } = {}) {
     const effectiveLockService = lockService || {
         async acquire() { return { ok: true }; },
@@ -234,6 +235,7 @@ function createWorker({
         clock: clock || { now: () => new Date(NOW) },
         timer,
         renewalIntervalMs,
+        userResync,
     });
 }
 
@@ -444,6 +446,72 @@ test('fresh worker resumes an expired preparing claim from durable candidates on
     assert.equal(repository.calls[0].method, 'claim');
     assert.equal(repository.calls[0].request.operationId, 'operation-1');
     assert.equal(operation.attempts, 1);
+});
+
+test('successful deploy triggers best-effort subscription user resync', async () => {
+    const operation = durableOperation();
+    operation.status = 'preparing';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    const repository = createRepository(operation);
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const resynced = [];
+    const worker = createWorker({
+        repository,
+        executor,
+        userResync: {
+            async resyncPlan(plan) {
+                resynced.push(plan.operationId ?? plan.kind);
+            },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'succeeded');
+    assert.equal(resynced.length, 1);
+});
+
+test('user resync failure does not fail a committed deployment', async () => {
+    const operation = durableOperation();
+    operation.status = 'preparing';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    const repository = createRepository(operation);
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        userResync: {
+            async resyncPlan() { throw new Error('agent down'); },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'succeeded');
 });
 
 test('lease heartbeat renews while a typed executor call is still running', async () => {

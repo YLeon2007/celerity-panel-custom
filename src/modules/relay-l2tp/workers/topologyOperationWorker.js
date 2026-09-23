@@ -203,6 +203,7 @@ class TopologyOperationWorker {
         clock,
         timer = globalThis,
         renewalIntervalMs,
+        userResync,
     } = {}) {
         const repositoryMethods = [
             'claim',
@@ -251,6 +252,11 @@ class TopologyOperationWorker {
         });
         this.renewalIntervalMs = renewalIntervalMs
             ?? Math.max(1, Math.floor(leaseMs / 3));
+        if (userResync !== undefined
+            && (!userResync || typeof userResync.resyncPlan !== 'function')) {
+            throw new TypeError('Topology operation worker user resync requires resyncPlan');
+        }
+        this.userResync = userResync;
         this.running = new Set();
     }
 
@@ -830,6 +836,17 @@ class TopologyOperationWorker {
                     changing,
                     heartbeat,
                 );
+            }
+            // Subscription users live in the xray runtime only (agent API),
+            // so the deploy's config restart wiped them; re-push before
+            // declaring the chain usable. Resync failure must not fail the
+            // already-committed deployment.
+            if (this.userResync) {
+                try {
+                    await this.userResync.resyncPlan(plan);
+                } catch {
+                    // best-effort: users are re-added on the next user change
+                }
             }
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {
