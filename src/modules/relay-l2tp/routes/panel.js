@@ -119,6 +119,14 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['PREFLIGHT_CHECK_FAILED', 422],
     ['NO_HEALTHY_PATH', 422],
     ['INSTALL_PLAN_REJECTED', 422],
+    ['INVALID_INPUT', 400],
+    ['RELAY_L2TP_STATE_NOT_FOUND', 404],
+    ['PSK_NOT_CONFIGURED', 404],
+    ['PSK_DECRYPTION_FAILED', 422],
+    ['NO_INSTALLED_RELAYS', 409],
+    ['POOL_EXHAUSTED', 409],
+    ['ADDRESS_SPACE_EXHAUSTED', 409],
+    ['UNINSTALL_FAILED', 502],
 ]);
 
 const SAFE_ERROR_MESSAGE_BY_CODE = new Map([
@@ -199,6 +207,7 @@ function createL2tpRouter({
     l2tpService,
     stateManagementService,
     userManagementService,
+    simpleService,
     requireAuth,
     requireOnboarding,
     csrf,
@@ -207,6 +216,101 @@ function createL2tpRouter({
     renderPage,
 }) {
     const router = express.Router();
+
+    function requireSimpleService(res) {
+        if (simpleService) return true;
+        res.status(503).json({
+            error: {
+                code: 'L2TP_RUNTIME_UNAVAILABLE',
+                message: 'The L2TP runtime is unavailable',
+            },
+        });
+        return false;
+    }
+
+    router.get(
+        '/l2tp/simple/overview',
+        requireAuth,
+        requireOnboarding,
+        rateLimiter,
+        async (req, res) => {
+            if (!requireSimpleService(res)) return;
+            try {
+                res.json(await simpleService.overview());
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
+
+    router.post(
+        '/l2tp/simple/relays/:id/install',
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        async (req, res) => {
+            if (!requireSimpleService(res)) return;
+            try {
+                const result = await simpleService.installRelay(req.params.id);
+                res.status(202).json(result);
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
+
+    router.post(
+        '/l2tp/simple/relays/:id/uninstall',
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        async (req, res) => {
+            if (!requireSimpleService(res)) return;
+            try {
+                res.json(await simpleService.uninstallRelay(req.params.id));
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
+
+    router.post(
+        '/l2tp/simple/accounts',
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        async (req, res) => {
+            if (!requireSimpleService(res)) return;
+            try {
+                const result = await simpleService.createAccount({
+                    login: req.body?.login,
+                    password: req.body?.password,
+                });
+                res.status(201).json(result);
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
+
+    router.post(
+        '/l2tp/simple/accounts/:login/delete',
+        requireAuth,
+        requireOnboarding,
+        csrf,
+        rateLimiter,
+        async (req, res) => {
+            if (!requireSimpleService(res)) return;
+            try {
+                res.json(await simpleService.deleteAccount(req.params.login));
+            } catch (error) {
+                sendServiceError(res, error);
+            }
+        },
+    );
 
     router.get('/l2tp', requireAuth, requireOnboarding, async (req, res) => {
         try {

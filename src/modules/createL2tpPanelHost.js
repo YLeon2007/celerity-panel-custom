@@ -101,6 +101,7 @@ function createL2tpPanelHost({
         RelayL2tpState: models.RelayL2tpState,
         L2tpUser: models.L2tpUser,
         CascadeRouteGroup: models.CascadeRouteGroup,
+        CascadeLink: injectedCascadeLink,
         operationModel: models.L2tpOperation,
         lockModel: models.NodeOperationLock,
         NodeSSH,

@@ -117,11 +117,29 @@ function createL2tpRouteBindings(activeHostProvider) {
             return callRuntimeService('userManagementService', 'disableUser', args);
         },
     });
+    const simpleService = Object.freeze({
+        overview(...args) {
+            return callRuntimeService('simpleService', 'overview', args);
+        },
+        installRelay(...args) {
+            return callRuntimeService('simpleService', 'installRelay', args);
+        },
+        uninstallRelay(...args) {
+            return callRuntimeService('simpleService', 'uninstallRelay', args);
+        },
+        createAccount(...args) {
+            return callRuntimeService('simpleService', 'createAccount', args);
+        },
+        deleteAccount(...args) {
+            return callRuntimeService('simpleService', 'deleteAccount', args);
+        },
+    });
 
     return Object.freeze({
         l2tpService,
         stateManagementService,
         userManagementService,
+        simpleService,
         loadPanelOverview(...args) {
             const host = activeHostProvider.getActiveHost();
             const method = assertServiceMethod(host, 'loadPanelOverview');

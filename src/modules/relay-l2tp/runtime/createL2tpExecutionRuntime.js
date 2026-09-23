@@ -12,6 +12,7 @@ const { L2tpUserManagementService } = require('../services/l2tpUserManagementSer
 const { L2tpUserSyncReconciler } = require('../services/l2tpUserSyncReconciler');
 const { L2tpUserSyncRepository } = require('../repositories/l2tpUserSyncRepository');
 const { L2tpUserResolver } = require('../services/l2tpUserResolver');
+const { L2tpSimpleService } = require('../services/l2tpSimpleService');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 const { createL2tpRuntime } = require('./createL2tpRuntime');
@@ -217,6 +218,7 @@ function createL2tpExecutionRuntime({
     RelayL2tpState,
     L2tpUser,
     CascadeRouteGroup,
+    CascadeLink,
     operationModel,
     lockModel,
     NodeSSH,
@@ -377,6 +379,24 @@ function createL2tpExecutionRuntime({
         stateManagementService: runtimeStateManagementService,
         userManagementService,
         lockService,
+    });
+    const simpleService = new L2tpSimpleService({
+        HyNode,
+        RelayL2tpState,
+        L2tpUser,
+        CascadeRouteGroup,
+        CascadeLink,
+        l2tpService: runtime.service,
+        stateManagementService: runtimeStateManagementService,
+        userManagementService,
+        stateRepository: runtimeDependencies.stateRepository,
+        nodeSSHFactory: node => new NodeSSH(node),
+    });
+    Object.defineProperty(runtime, 'simpleService', {
+        value: simpleService,
+        enumerable: false,
+        writable: false,
+        configurable: false,
     });
     const lifecycle = createWorkerLifecycle({
         ...workerLifecycle,

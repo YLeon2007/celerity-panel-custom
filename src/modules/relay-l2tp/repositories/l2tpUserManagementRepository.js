@@ -291,6 +291,52 @@ class L2tpUserManagementRepository {
             .select(SAFE_USER_SELECT)
             .lean();
     }
+
+    async deleteUserAndQueueSync(relayNode, userId, expectedRevision) {
+        if (
+            !this.L2tpOperation
+            || typeof this.L2tpOperation.create !== 'function'
+            || typeof this.transactionRunner !== 'function'
+        ) {
+            throw repositoryError(
+                'L2TP_USER_SYNC_QUEUE_UNAVAILABLE',
+                'Transactional L2TP user sync queuing is unavailable',
+            );
+        }
+        const operationId = this.operationIdFactory();
+
+        return this.transactionRunner(async session => {
+            const desiredRevision = await this.reserveCredentialRevision(relayNode, session);
+            if (!Number.isSafeInteger(desiredRevision) || desiredRevision < 1) {
+                throw repositoryError(
+                    'L2TP_NOT_CONFIGURED',
+                    'The relay L2TP desired state is not configured',
+                );
+            }
+            const deleted = await this.L2tpUser.findOneAndDelete(
+                { relayNode, _id: userId, desiredRevision: expectedRevision },
+                { session },
+            );
+            if (!deleted) {
+                throw repositoryError(
+                    'L2TP_USER_CHANGED',
+                    'The L2TP user changed before the deletion could be queued',
+                );
+            }
+            const operationDocuments = [{
+                _id: operationId,
+                node: relayNode,
+                kind: 'sync_users',
+                status: 'queued',
+                idempotencyKey: `sync-users:${relayNode}:revision-${desiredRevision}`,
+                progress: 0,
+                attempts: 0,
+                plan: syncPlan({ operationId, relayNode, credentialRevision: desiredRevision }),
+            }];
+            await this.L2tpOperation.create(operationDocuments, { session });
+            return { operationId };
+        });
+    }
 }
 
 module.exports = {

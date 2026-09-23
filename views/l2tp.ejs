@@ -1,773 +1,257 @@
-<section class="page-header">
-    <div>
-        <h1><%= t('l2tp.title') %></h1>
-        <p class="muted">
-            <%= t('l2tp.topologyRevision') %>: <strong data-topology-revision><%= topologyRevision %></strong> ·
-            <%= t('l2tp.deployedRevision') %>: <strong data-deployed-revision><%= typeof deployedRevision === 'undefined' ? 0 : deployedRevision %></strong>
-        </p>
+<style>
+.l2tp-simple { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+.l2tp-simple .card { background: var(--card-bg, #1e1e2e); border: 1px solid var(--border-color, #2e2e3e); border-radius: 10px; padding: 18px 20px; }
+.l2tp-simple h2 { margin: 0 0 14px; font-size: 17px; display: flex; align-items: center; gap: 8px; }
+.l2tp-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border-color, #2e2e3e); flex-wrap: wrap; }
+.l2tp-row:first-of-type { border-top: none; }
+.l2tp-row .grow { flex: 1; min-width: 140px; }
+.l2tp-name { font-weight: 600; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; }
+.badge-ok { background: rgba(46, 204, 113, .15); color: #2ecc71; }
+.badge-off { background: rgba(255, 255, 255, .08); color: #999; }
+.badge-warn { background: rgba(241, 196, 15, .15); color: #f1c40f; }
+.badge-err { background: rgba(231, 76, 60, .15); color: #e74c3c; }
+.psk-chip { font-family: monospace; font-size: 12px; background: rgba(255,255,255,.06); border: 1px dashed var(--border-color, #2e2e3e); border-radius: 6px; padding: 4px 10px; cursor: pointer; user-select: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.psk-chip:hover { border-color: #4a9eff; }
+.relay-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.relay-chip { font-size: 12px; background: rgba(74, 158, 255, .12); color: #4a9eff; border-radius: 6px; padding: 2px 8px; }
+.l2tp-form { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.l2tp-form input { background: rgba(255,255,255,.05); border: 1px solid var(--border-color, #2e2e3e); color: inherit; border-radius: 6px; padding: 8px 12px; min-width: 180px; }
+.l2tp-status-line { min-height: 20px; font-size: 13px; margin-top: 8px; opacity: .85; }
+.l2tp-empty { opacity: .55; font-size: 14px; padding: 8px 0; }
+</style>
+
+<div class="l2tp-simple">
+    <div class="card">
+        <h2><i class="ti ti-server-2"></i> <%= t('l2tp.relays') %></h2>
+        <div id="relayList"><div class="l2tp-empty"><%= t('l2tp.loading') %></div></div>
+        <div class="l2tp-status-line" id="relayStatus"></div>
     </div>
-</section>
 
-<section class="card" data-l2tp-route-groups>
-    <h2><%= t('l2tp.routeGroups') %></h2>
-    <p class="muted"><%= t('l2tp.routeGroupsHint') %></p>
-    <form data-route-group-form>
-        <input type="hidden" name="routeGroupId" value="">
-        <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
-        <label><%= t('l2tp.rgName') %>
-            <input type="text" name="name" maxlength="128" required>
-        </label>
-        <label><%= t('l2tp.rgMode') %>
-            <select name="mode" required>
-                <option value="reverse"><%= t('l2tp.modeReverse') %></option>
-                <option value="forward"><%= t('l2tp.modeForward') %></option>
-            </select>
-        </label>
-        <label><%= t('l2tp.rgStrategy') %>
-            <input type="text" value="priority-failover" readonly aria-readonly="true">
-        </label>
-        <div data-route-group-paths>
-            <fieldset class="card" data-route-group-path-row>
-                <legend><%= t('l2tp.rgPath') %></legend>
-                <label><%= t('l2tp.rgPathKey') %>
-                    <input type="text" name="pathKey" maxlength="64" required>
-                </label>
-                <label><%= t('l2tp.rgLinkIds') %>
-                    <input type="text" name="linkIds" required placeholder="link id, link id">
-                </label>
-                <label><%= t('l2tp.rgPriority') %>
-                    <input type="number" name="priority" step="any" required>
-                </label>
-                <label>
-                    <input type="checkbox" name="enabled" checked>
-                    <%= t('l2tp.rgEnabled') %>
-                </label>
-                <button type="button" data-route-group-action="remove-path"><%= t('l2tp.rgRemovePath') %></button>
-            </fieldset>
-        </div>
-        <div class="form-actions">
-            <button type="button" data-route-group-action="add-path"><%= t('l2tp.rgAddPath') %></button>
-            <button type="submit" data-route-group-action="save"><%= t('l2tp.rgCreate') %></button>
-            <button type="button" data-route-group-action="cancel" hidden><%= t('l2tp.rgCancelEdit') %></button>
-        </div>
-        <output data-route-group-result aria-live="polite"></output>
-    </form>
-    <p class="muted" data-route-group-empty><%= routeGroups && routeGroups.length ? t('l2tp.rgLoading') : t('l2tp.rgEmpty') %></p>
-    <div data-route-group-list></div>
-    <template data-route-group-path-template>
-        <fieldset class="card" data-route-group-path-row>
-            <legend><%= t('l2tp.rgPath') %></legend>
-            <label><%= t('l2tp.rgPathKey') %>
-                <input type="text" name="pathKey" maxlength="64" required>
-            </label>
-            <label><%= t('l2tp.rgLinkIds') %>
-                <input type="text" name="linkIds" required placeholder="link id, link id">
-            </label>
-            <label><%= t('l2tp.rgPriority') %>
-                <input type="number" name="priority" step="any" required>
-            </label>
-            <label>
-                <input type="checkbox" name="enabled" checked>
-                <%= t('l2tp.rgEnabled') %>
-            </label>
-            <button type="button" data-route-group-action="remove-path"><%= t('l2tp.rgRemovePath') %></button>
-        </fieldset>
-    </template>
-    <template data-route-group-item-template>
-        <article class="card" data-route-group-item>
-            <h3 data-route-group-name></h3>
-            <p data-route-group-summary></p>
-            <ul data-route-group-path-list></ul>
-            <div class="form-actions">
-                <button type="button" data-route-group-action="edit"><%= t('l2tp.rgEdit') %></button>
-                <button type="button" data-route-group-action="remove"><%= t('l2tp.rgRemove') %></button>
-            </div>
-        </article>
-    </template>
-</section>
-
-<section class="card">
-    <h2><%= t('l2tp.relayNodes') %></h2>
-    <% if (!relays || relays.length === 0) { %>
-        <p class="muted"><%= t('l2tp.noRelays') %></p>
-    <% } %>
-    <% for (const relay of (relays || [])) { %>
-        <article class="card" data-l2tp-relay data-node-id="<%= relay.id %>">
-            <h3><%= relay.name || relay.id %></h3>
-            <p>
-                <%= t('l2tp.nodeLabel') %>: <%= relay.nodeStatus || 'unknown' %> ·
-                <%= t('l2tp.l2tpLabel') %>: <%= relay.l2tpStatus %> ·
-                <%= t('l2tp.desiredLabel') %>: <%= relay.desiredState %>
-            </p>
-            <form data-l2tp-form>
-                <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
-                <label><%= t('l2tp.clientCidr') %>
-                    <input type="text" name="clientCidr" value="<%= relay.clientCidr || '' %>" placeholder="10.77.0.0/24" required>
-                </label>
-                <label><%= t('l2tp.localIp') %>
-                    <input type="text" name="localAddress" value="<%= relay.localAddress || '' %>" placeholder="10.77.0.1" required>
-                </label>
-                <label><%= t('l2tp.poolStart') %>
-                    <input type="text" name="poolStart" value="<%= relay.poolStart || '' %>" placeholder="10.77.0.10" required>
-                </label>
-                <label><%= t('l2tp.poolEnd') %>
-                    <input type="text" name="poolEnd" value="<%= relay.poolEnd || '' %>" placeholder="10.77.0.200" required>
-                </label>
-                <label><%= t('l2tp.dnsServers') %>
-                    <input type="text" name="dnsServers" value="<%= (relay.dnsServers || []).join(', ') %>" placeholder="1.1.1.1, 9.9.9.9" required>
-                </label>
-                <label><%= t('l2tp.tproxyPort') %>
-                    <input type="number" name="tproxyPort" value="<%= relay.tproxyPort ?? '' %>" min="1" max="65535" step="1" placeholder="12345" required>
-                </label>
-                <label><%= t('l2tp.fwmark') %>
-                    <input type="number" name="fwmark" value="<%= relay.fwmark ?? '' %>" min="1" max="4294967295" step="1" placeholder="77" required>
-                </label>
-                <label><%= t('l2tp.routeTable') %>
-                    <input type="number" name="routeTable" value="<%= relay.routeTable ?? '' %>" min="1" max="4294967295" step="1" placeholder="177" required>
-                </label>
-                <label><%= t('l2tp.routeGroup') %>
-                    <select name="routeGroupId" required>
-                        <option value=""><%= t('l2tp.selectRouteGroup') %></option>
-                        <% for (const group of (routeGroups || [])) { %>
-                            <option value="<%= group.id %>" <%= relay.routeGroupId === group.id ? 'selected' : '' %>>
-                                <%= group.name %> (<%= group.mode === 'reverse' ? t('l2tp.modeReverse') : t('l2tp.modeForward') %>, <%= group.strategy %>)
-                            </option>
-                        <% } %>
-                    </select>
-                </label>
-                <div class="form-actions">
-                    <button type="button" data-l2tp-action="configure"><%= t('l2tp.saveDesired') %></button>
-                    <button type="button" data-l2tp-action="preflight"><%= t('l2tp.preflight') %></button>
-                    <button type="button" data-l2tp-action="install"><%= t('l2tp.queueInstall') %></button>
-                </div>
-                <output data-l2tp-result aria-live="polite"></output>
-            </form>
-            <section data-l2tp-users>
-                <h4><%= t('l2tp.usersTitle') %></h4>
-                <form data-l2tp-user-form autocomplete="off">
-                    <label><%= t('l2tp.login') %>
-                        <input type="text" name="login" maxlength="64" required>
-                    </label>
-                    <label><%= t('l2tp.clientIp') %>
-                        <input type="text" name="ip" placeholder="10.77.0.10" required>
-                    </label>
-                    <label><%= t('l2tp.secret') %>
-                        <input type="password" name="password" autocomplete="new-password" maxlength="1024" required>
-                    </label>
-                    <label>
-                        <input type="checkbox" name="enabled" checked>
-                        <%= t('l2tp.userEnabled') %>
-                    </label>
-                    <button type="submit" data-l2tp-user-action="create"><%= t('l2tp.addUser') %></button>
-                </form>
-                <p class="muted" data-l2tp-user-empty><%= t('l2tp.loadingUsers') %></p>
-                <div data-l2tp-user-list></div>
-                <template data-l2tp-user-row>
-                    <div class="card">
-                        <code data-l2tp-user-login></code>
-                        <span data-l2tp-user-ip></span>
-                        <span data-l2tp-user-status></span>
-                        <span data-l2tp-user-sync></span>
-                        <button type="button" data-l2tp-user-action="toggle"></button>
-                    </div>
-                </template>
-                <output data-l2tp-user-result aria-live="polite"></output>
-            </section>
-        </article>
-    <% } %>
-</section>
-
-<section class="card">
-    <h2><%= t('l2tp.recentOps') %></h2>
-    <% if (!operations || operations.length === 0) { %>
-        <p class="muted"><%= t('l2tp.noOps') %></p>
-    <% } else { %>
-        <ul>
-            <% for (const operation of operations) { %>
-                <li>
-                    <code><%= operation.id %></code> — <%= operation.kind %> / <%= operation.status %>
-                    (<%= operation.progress %>%)
-                    <%= operation.errorCode ? ` — ${operation.errorCode}` : '' %>
-                </li>
-            <% } %>
-        </ul>
-    <% } %>
-</section>
+    <div class="card">
+        <h2><i class="ti ti-users"></i> <%= t('l2tp.accounts') %></h2>
+        <form class="l2tp-form" id="accountForm">
+            <input type="text" id="accountLogin" placeholder="<%= t('l2tp.login') %>" autocomplete="off" required>
+            <input type="password" id="accountPassword" placeholder="<%= t('l2tp.secret') %>" autocomplete="new-password" required>
+            <button type="submit" class="btn btn-primary"><i class="ti ti-plus"></i> <%= t('l2tp.createAccount') %></button>
+        </form>
+        <div id="accountList"></div>
+        <div class="l2tp-status-line" id="accountStatus"></div>
+    </div>
+</div>
 
 <script>
 (() => {
+    'use strict';
     const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
-    const I18N = <%- JSON.stringify({
-        rgCreate: t('l2tp.rgCreate'),
-        rgUpdate: t('l2tp.rgUpdate'),
-        rgEmpty: t('l2tp.rgEmpty'),
-        rgRemoved: t('l2tp.rgRemoved'),
-        rgCreated: t('l2tp.rgCreated'),
-        rgUpdated: t('l2tp.rgUpdated'),
-        rgRemoveConfirm: t('l2tp.rgRemoveConfirm'),
-        selectRouteGroup: t('l2tp.selectRouteGroup'),
-        modeReverse: t('l2tp.modeReverse'),
-        modeForward: t('l2tp.modeForward'),
-        priorityWord: t('l2tp.priorityWord'),
-        working: t('l2tp.working'),
-        noUsers: t('l2tp.noUsers'),
-        stateEnabled: t('l2tp.stateEnabled'),
-        stateDisabled: t('l2tp.stateDisabled'),
-        actionDisable: t('l2tp.actionDisable'),
-        actionEnable: t('l2tp.actionEnable'),
-        userUpdated: t('l2tp.userUpdated'),
-        userAdded: t('l2tp.userAdded'),
+    const L = <%- JSON.stringify({
+        install: t('l2tp.install'),
+        uninstall: t('l2tp.uninstall'),
+        confirmUninstall: t('l2tp.confirmUninstall'),
+        installed: t('l2tp.installed'),
+        notInstalled: t('l2tp.notInstalled'),
+        installing: t('l2tp.installing'),
+        online: t('l2tp.online'),
+        offline: t('l2tp.offline'),
+        copyPsk: t('l2tp.copyPsk'),
+        copied: t('l2tp.copied'),
+        noAccounts: t('l2tp.noAccounts'),
+        deleteAccount: t('l2tp.deleteAccount'),
+        confirmDeleteAccount: t('l2tp.confirmDeleteAccount'),
+        pendingSync: t('l2tp.pendingSync'),
+        requestFailed: t('l2tp.requestFailed'),
+        queued: t('l2tp.queued'),
+        done: t('l2tp.done'),
+        failed: t('l2tp.failed'),
     }) %>;
-    const modeLabel = (mode) => (mode === 'reverse' ? I18N.modeReverse : I18N.modeForward);
-    const ROUTE_GROUPS_URL = '/api/cascade/route-groups';
-    const ROUTE_GROUP_STRATEGY = 'priority-failover';
-    const routeGroupRoot = document.querySelector('[data-l2tp-route-groups]');
-    const routeGroupForm = routeGroupRoot.querySelector('[data-route-group-form]');
-    const routeGroupPaths = routeGroupRoot.querySelector('[data-route-group-paths]');
-    const routeGroupPathTemplate = routeGroupRoot.querySelector('[data-route-group-path-template]');
-    const routeGroupItemTemplate = routeGroupRoot.querySelector('[data-route-group-item-template]');
-    const routeGroupList = routeGroupRoot.querySelector('[data-route-group-list]');
-    const routeGroupEmpty = routeGroupRoot.querySelector('[data-route-group-empty]');
-    const routeGroupOutput = routeGroupRoot.querySelector('[data-route-group-result]');
-    const routeGroupSave = routeGroupRoot.querySelector('[data-route-group-action="save"]');
-    const routeGroupCancel = routeGroupRoot.querySelector('[data-route-group-action="cancel"]');
-    const topologyRevisionHeader = document.querySelector('[data-topology-revision]');
-    const deployedRevisionHeader = document.querySelector('[data-deployed-revision]');
-    let routeGroupTopologyRevision = Number(routeGroupForm.elements.expectedTopologyRevision.value);
 
-    function setResult(output, value) {
-        output.textContent = value;
+    const relayList = document.getElementById('relayList');
+    const relayStatus = document.getElementById('relayStatus');
+    const accountList = document.getElementById('accountList');
+    const accountStatus = document.getElementById('accountStatus');
+    const accountForm = document.getElementById('accountForm');
+    const pollers = new Map();
+
+    function esc(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        }[ch]));
     }
 
-    function buildOperationPayload(values) {
-        return {
-            clientCidr: String(values.clientCidr || '').trim(),
-            dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
-            routeGroupId: String(values.routeGroupId || ''),
-            expectedTopologyRevision: Number(values.expectedTopologyRevision),
-        };
+    async function api(path, options = {}) {
+        const response = await fetch(path, {
+            ...options,
+            headers: {
+                'x-csrf-token': csrfToken,
+                ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+                ...(options.headers || {}),
+            },
+        });
+        let payload = null;
+        try { payload = await response.json(); } catch { /* empty body */ }
+        if (!response.ok) {
+            const error = new Error(payload?.error?.code || 'REQUEST_FAILED');
+            error.code = payload?.error?.code || 'REQUEST_FAILED';
+            throw error;
+        }
+        return payload;
     }
 
-    function buildConfigurePayload(values) {
-        return {
-            clientCidr: String(values.clientCidr || '').trim(),
-            localAddress: String(values.localAddress || '').trim(),
-            poolStart: String(values.poolStart || '').trim(),
-            poolEnd: String(values.poolEnd || '').trim(),
-            dnsServers: String(values.dnsServers || '').split(',').map((item) => item.trim()).filter(Boolean),
-            tproxyPort: Number(values.tproxyPort),
-            fwmark: Number(values.fwmark),
-            routeTable: Number(values.routeTable),
-            routeGroupId: String(values.routeGroupId || ''),
-            generatePsk: true,
-        };
+    function relayBadge(relay) {
+        if (relay.installed) {
+            return relay.status === 'installed'
+                ? `<span class="badge badge-ok">${esc(L.installed)}</span>`
+                : `<span class="badge badge-warn">${esc(L.installing)}</span>`;
+        }
+        return `<span class="badge badge-off">${esc(L.notInstalled)}</span>`;
     }
 
-    function buildL2tpUserPayload(values) {
-        return {
-            login: String(values.login || '').trim(),
-            ip: String(values.ip || '').trim(),
-            password: String(values.password || ''),
-            enabled: values.enabled === 'on',
-        };
+    function renderRelays(relays) {
+        if (!relays.length) {
+            relayList.innerHTML = `<div class="l2tp-empty">${esc(L.noAccounts)}</div>`;
+            return;
+        }
+        relayList.innerHTML = relays.map(relay => `
+            <div class="l2tp-row" data-node="${esc(relay.id)}">
+                <span class="l2tp-name grow">${esc(relay.name)}
+                    <span class="badge ${relay.online ? 'badge-ok' : 'badge-err'}">${esc(relay.online ? L.online : L.offline)}</span>
+                </span>
+                ${relayBadge(relay)}
+                ${relay.psk
+                    ? `<span class="psk-chip" data-psk="${esc(relay.psk)}" title="${esc(L.copyPsk)}">${esc(relay.psk)}</span>`
+                    : ''}
+                ${relay.installed
+                    ? `<button class="btn btn-sm btn-outline" data-action="uninstall">${esc(L.uninstall)}</button>`
+                    : `<button class="btn btn-sm btn-primary" data-action="install">${esc(L.install)}</button>`}
+            </div>
+        `).join('');
     }
 
-    function l2tpUsersUrl(nodeId, userId) {
-        const base = `/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/users`;
-        return userId === undefined ? base : `${base}/${encodeURIComponent(userId)}`;
+    function renderAccounts(accounts) {
+        if (!accounts.length) {
+            accountList.innerHTML = `<div class="l2tp-empty">${esc(L.noAccounts)}</div>`;
+            return;
+        }
+        accountList.innerHTML = accounts.map(account => `
+            <div class="l2tp-row" data-login="${esc(account.login)}">
+                <span class="l2tp-name grow">${esc(account.login)}
+                    ${account.pending ? `<span class="badge badge-warn">${esc(L.pendingSync)}</span>` : ''}
+                </span>
+                <span class="relay-chips">${account.relays.map(relay =>
+                    `<span class="relay-chip">${esc(relay.name)} · ${esc(relay.ip)}</span>`).join('')}
+                </span>
+                <button class="btn btn-sm btn-outline" data-action="delete-account">${esc(L.deleteAccount)}</button>
+            </div>
+        `).join('');
     }
 
-    async function parseResponse(response) {
+    async function refresh() {
         try {
-            return await response.json();
-        } catch {
-            return {};
+            const data = await api('/panel/l2tp/simple/overview');
+            renderRelays(data.relays || []);
+            renderAccounts(data.accounts || []);
+        } catch (error) {
+            relayStatus.textContent = error.code || L.requestFailed;
         }
     }
 
-    function routeGroupError(code) {
-        const error = new Error(code);
-        error.code = code;
-        return error;
-    }
-
-    function buildRouteGroupPayload(form) {
-        const name = String(form.elements.name.value || '').trim();
-        const mode = String(form.elements.mode.value || '');
-        if (!name || name.length > 128) throw routeGroupError('INVALID_ROUTE_GROUP_NAME');
-        if (!['reverse', 'forward'].includes(mode)) throw routeGroupError('INVALID_ROUTE_GROUP_MODE');
-
-        const rows = [...form.querySelectorAll('[data-route-group-path-row]')];
-        if (rows.length === 0 || rows.length > 32) {
-            throw routeGroupError('INVALID_ROUTE_GROUP_PATHS');
+    async function pollOperation(operationId, nodeId) {
+        if (pollers.has(operationId)) return;
+        pollers.set(operationId, nodeId);
+        try {
+            for (let attempt = 0; attempt < 240; attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                const operation = await api(`/panel/l2tp/operations/${operationId}`);
+                if (operation.status === 'succeeded') {
+                    relayStatus.textContent = L.done;
+                    break;
+                }
+                if (operation.status === 'failed' || operation.status === 'rolled_back') {
+                    relayStatus.textContent = `${L.failed}: ${operation.errorCode || ''}`;
+                    break;
+                }
+                relayStatus.textContent = `${L.queued} (${operation.progress || 0}%)`;
+            }
+        } catch { /* keep last status */ } finally {
+            pollers.delete(operationId);
+            refresh();
         }
-        const paths = rows.map((row) => {
-            const pathKey = String(row.querySelector('[name="pathKey"]').value || '').trim();
-            const linkIds = String(row.querySelector('[name="linkIds"]').value || '')
-                .split(',')
-                .map(linkId => linkId.trim())
-                .filter(Boolean);
-            const priority = Number(row.querySelector('[name="priority"]').value);
-            const enabled = row.querySelector('[name="enabled"]').checked;
-            if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pathKey)) {
-                throw routeGroupError('INVALID_ROUTE_GROUP_PATH_KEY');
+    }
+
+    relayList.addEventListener('click', async event => {
+        const pskChip = event.target.closest('.psk-chip');
+        if (pskChip) {
+            try {
+                await navigator.clipboard.writeText(pskChip.dataset.psk);
+                relayStatus.textContent = L.copied;
+            } catch {
+                const range = document.createRange();
+                range.selectNodeContents(pskChip);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
             }
-            if (
-                linkIds.length === 0
-                || linkIds.length > 32
-                || linkIds.some(linkId => !/^[a-fA-F0-9]{24}$/.test(linkId))
-                || new Set(linkIds).size !== linkIds.length
-            ) {
-                throw routeGroupError('INVALID_ROUTE_GROUP_LINK_IDS');
-            }
-            if (!Number.isFinite(priority) || priority <= 0) {
-                throw routeGroupError('INVALID_ROUTE_GROUP_PRIORITY');
-            }
-            return {
-                pathKey,
-                linkIds,
-                priority,
-                enabled,
-            };
-        });
-        if (new Set(paths.map(path => path.pathKey)).size !== paths.length) {
-            throw routeGroupError('DUPLICATE_ROUTE_GROUP_PATH_KEY');
+            return;
         }
-        if (new Set(paths.map(path => path.priority)).size !== paths.length) {
-            throw routeGroupError('DUPLICATE_ROUTE_GROUP_PRIORITY');
-        }
-        return {
-            name,
-            mode,
-            strategy: ROUTE_GROUP_STRATEGY,
-            paths,
-        };
-    }
-
-    function routeGroupUrl(routeGroupId) {
-        return routeGroupId
-            ? `${ROUTE_GROUPS_URL}/${encodeURIComponent(routeGroupId)}`
-            : ROUTE_GROUPS_URL;
-    }
-
-    function safeRequestError(response, result, fallback) {
-        if (response.status === 401) return 'SESSION_REQUIRED';
-        if (response.status === 403) return 'REQUEST_FORBIDDEN';
-        if (response.status === 429) return 'RATE_LIMITED';
-        const code = result?.error?.code || result?.code;
-        return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)
-            ? code
-            : fallback;
-    }
-
-    function normalizeRouteGroup(value) {
-        if (!value || typeof value !== 'object') return null;
-        const id = String(value.id || value._id || '');
-        const name = typeof value.name === 'string' ? value.name.trim() : '';
-        const mode = value.mode;
-        const strategy = value.strategy;
-        if (
-            !/^[a-fA-F0-9]{24}$/.test(id)
-            || !name
-            || name.length > 128
-            || !['reverse', 'forward'].includes(mode)
-            || strategy !== ROUTE_GROUP_STRATEGY
-            || !Array.isArray(value.paths)
-        ) return null;
-
-        const paths = value.paths.map((path) => {
-            const pathKey = typeof path?.pathKey === 'string' ? path.pathKey.trim() : '';
-            const linkIds = Array.isArray(path?.linkIds)
-                ? path.linkIds.map(linkId => String(linkId))
-                : [];
-            const priority = Number(path?.priority);
-            if (
-                !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(pathKey)
-                || linkIds.length === 0
-                || linkIds.some(linkId => !/^[a-fA-F0-9]{24}$/.test(linkId))
-                || !Number.isFinite(priority)
-                || priority <= 0
-            ) return null;
-            return {
-                pathKey,
-                linkIds,
-                priority,
-                enabled: path.enabled !== false,
-            };
-        });
-        if (paths.some(path => path === null)) return null;
-        return { id, name, mode, strategy, paths };
-    }
-
-    function normalizeRouteGroupSnapshot(value) {
-        if (!value || typeof value !== 'object' || !Array.isArray(value.routeGroups)) return null;
-        const topologyRevision = value.topologyRevision;
-        const deployedRevision = value.deployedRevision;
-        if (
-            !Number.isSafeInteger(topologyRevision)
-            || topologyRevision < 0
-            || !Number.isSafeInteger(deployedRevision)
-            || deployedRevision < 0
-            || deployedRevision > topologyRevision
-        ) return null;
-        const routeGroups = value.routeGroups.map(normalizeRouteGroup);
-        if (routeGroups.some(group => group === null)) return null;
-        return { topologyRevision, deployedRevision, routeGroups };
-    }
-
-    function createRouteGroupPathRow(path = {}) {
-        const row = routeGroupPathTemplate.content.firstElementChild.cloneNode(true);
-        row.querySelector('[name="pathKey"]').value = path.pathKey || '';
-        row.querySelector('[name="linkIds"]').value = Array.isArray(path.linkIds)
-            ? path.linkIds.join(', ')
-            : '';
-        row.querySelector('[name="priority"]').value = path.priority || '';
-        row.querySelector('[name="enabled"]').checked = path.enabled !== false;
-        row.querySelector('[data-route-group-action="remove-path"]').addEventListener('click', () => {
-            if (routeGroupPaths.querySelectorAll('[data-route-group-path-row]').length === 1) {
-                setResult(routeGroupOutput, 'ROUTE_GROUP_PATH_REQUIRED');
-                return;
-            }
-            row.remove();
-        });
-        return row;
-    }
-
-    function resetRouteGroupForm() {
-        routeGroupForm.reset();
-        routeGroupForm.elements.routeGroupId.value = '';
-        routeGroupPaths.replaceChildren(createRouteGroupPathRow());
-        routeGroupSave.textContent = I18N.rgCreate;
-        routeGroupCancel.hidden = true;
-    }
-
-    function editRouteGroup(group) {
-        routeGroupForm.elements.routeGroupId.value = group.id;
-        routeGroupForm.elements.name.value = group.name;
-        routeGroupForm.elements.mode.value = group.mode;
-        routeGroupPaths.replaceChildren(...group.paths.map(createRouteGroupPathRow));
-        routeGroupSave.textContent = I18N.rgUpdate;
-        routeGroupCancel.hidden = false;
-        setResult(routeGroupOutput, '');
-        routeGroupForm.elements.name.focus();
-    }
-
-    function refreshRouteGroupSelectors(groups) {
-        document.querySelectorAll('[data-l2tp-form] select[name="routeGroupId"]').forEach((selector) => {
-            const selectedId = selector.value;
-            const placeholder = document.createElement('option');
-            placeholder.value = '';
-            placeholder.textContent = I18N.selectRouteGroup;
-            selector.replaceChildren(placeholder);
-            for (const group of groups) {
-                const option = document.createElement('option');
-                option.value = group.id;
-                option.textContent = `${group.name} (${modeLabel(group.mode)}, ${group.strategy})`;
-                selector.append(option);
-            }
-            if (groups.some(group => group.id === selectedId)) selector.value = selectedId;
-        });
-    }
-
-    function applyRouteGroupSnapshot(snapshot) {
-        routeGroupTopologyRevision = snapshot.topologyRevision;
-        topologyRevisionHeader.textContent = String(snapshot.topologyRevision);
-        deployedRevisionHeader.textContent = String(snapshot.deployedRevision);
-        document.querySelectorAll('input[type="hidden"][name="expectedTopologyRevision"]')
-            .forEach((expectedRevision) => {
-                expectedRevision.value = String(snapshot.topologyRevision);
-                expectedRevision.defaultValue = String(snapshot.topologyRevision);
-            });
-        renderRouteGroups(snapshot.routeGroups);
-        refreshRouteGroupSelectors(snapshot.routeGroups);
-    }
-
-    async function handleRouteGroupMutationError(response, result, fallback) {
-        const errorCode = safeRequestError(response, result, fallback);
-        if (response.status === 409 && errorCode === 'STALE_TOPOLOGY_REVISION') {
-            await loadRouteGroups();
-        }
-        setResult(routeGroupOutput, errorCode);
-    }
-
-    async function removeRouteGroup(group, button) {
-        if (!window.confirm(I18N.rgRemoveConfirm.replace('{name}', group.name))) return;
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const row = button.closest('.l2tp-row');
+        const nodeId = row?.dataset.node;
+        if (!nodeId) return;
+        if (button.dataset.action === 'uninstall' && !window.confirm(L.confirmUninstall)) return;
         button.disabled = true;
-        setResult(routeGroupOutput, I18N.working);
+        relayStatus.textContent = '';
         try {
-            const response = await fetch(routeGroupUrl(group.id), {
-                method: 'DELETE',
-                credentials: 'same-origin',
-                headers: {
-                    'accept': 'application/json',
-                    'content-type': 'application/json',
-                    'x-csrf-token': csrfToken,
-                },
-                body: JSON.stringify({ expectedTopologyRevision: routeGroupTopologyRevision }),
-            });
-            const result = await parseResponse(response);
-            if (!response.ok) {
-                await handleRouteGroupMutationError(response, result, 'ROUTE_GROUP_REMOVE_FAILED');
-                return;
+            if (button.dataset.action === 'install') {
+                const result = await api(`/panel/l2tp/simple/relays/${nodeId}/install`, { method: 'POST', body: '{}' });
+                relayStatus.textContent = L.queued;
+                if (result?.operationId) pollOperation(result.operationId, nodeId);
+            } else {
+                await api(`/panel/l2tp/simple/relays/${nodeId}/uninstall`, { method: 'POST', body: '{}' });
+                relayStatus.textContent = L.done;
             }
-            const snapshot = normalizeRouteGroupSnapshot(result);
-            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
-            if (routeGroupForm.elements.routeGroupId.value === group.id) resetRouteGroupForm();
-            applyRouteGroupSnapshot(snapshot);
-            setResult(routeGroupOutput, I18N.rgRemoved);
-        } catch {
-            setResult(routeGroupOutput, 'ROUTE_GROUP_REMOVE_FAILED');
-        } finally {
+            await refresh();
+        } catch (error) {
+            relayStatus.textContent = `${L.requestFailed}: ${error.code}`;
             button.disabled = false;
         }
-    }
-
-    function renderRouteGroups(groups) {
-        routeGroupList.replaceChildren();
-        routeGroupEmpty.hidden = groups.length !== 0;
-        routeGroupEmpty.textContent = groups.length === 0 ? I18N.rgEmpty : '';
-        for (const group of groups) {
-            const item = routeGroupItemTemplate.content.firstElementChild.cloneNode(true);
-            item.querySelector('[data-route-group-name]').textContent = group.name;
-            item.querySelector('[data-route-group-summary]').textContent =
-                `${modeLabel(group.mode)} · ${group.strategy}`;
-            const pathList = item.querySelector('[data-route-group-path-list]');
-            for (const path of group.paths) {
-                const pathItem = document.createElement('li');
-                pathItem.textContent =
-                    `${path.pathKey}: ${path.linkIds.join(' → ')} (${I18N.priorityWord} ${path.priority})`;
-                pathList.append(pathItem);
-            }
-            item.querySelector('[data-route-group-action="edit"]').addEventListener(
-                'click',
-                () => editRouteGroup(group),
-            );
-            const removeButton = item.querySelector('[data-route-group-action="remove"]');
-            removeButton.addEventListener('click', () => removeRouteGroup(group, removeButton));
-            routeGroupList.append(item);
-        }
-    }
-
-    async function loadRouteGroups() {
-        try {
-            const response = await fetch(ROUTE_GROUPS_URL, {
-                credentials: 'same-origin',
-                headers: {
-                    'accept': 'application/json',
-                    'x-csrf-token': csrfToken,
-                },
-            });
-            const result = await parseResponse(response);
-            if (!response.ok) {
-                setResult(routeGroupOutput, safeRequestError(response, result, 'ROUTE_GROUP_LIST_FAILED'));
-                return;
-            }
-            const snapshot = normalizeRouteGroupSnapshot(result);
-            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
-            applyRouteGroupSnapshot(snapshot);
-        } catch (error) {
-            setResult(
-                routeGroupOutput,
-                error?.code === 'ROUTE_GROUP_LIST_INVALID'
-                    ? error.code
-                    : 'ROUTE_GROUP_LIST_FAILED',
-            );
-        }
-    }
-
-    async function loadL2tpUsers(relay, nodeId, output) {
-        const list = relay.querySelector('[data-l2tp-user-list]');
-        const empty = relay.querySelector('[data-l2tp-user-empty]');
-        const rowTemplate = relay.querySelector('[data-l2tp-user-row]');
-        try {
-            const response = await fetch(l2tpUsersUrl(nodeId), {
-                headers: { 'x-csrf-token': csrfToken },
-            });
-            const users = await parseResponse(response);
-            if (!response.ok || !Array.isArray(users)) {
-                setResult(output, users.error?.code || 'USER_LIST_FAILED');
-                return;
-            }
-
-            list.replaceChildren();
-            empty.hidden = users.length !== 0;
-            empty.textContent = users.length === 0 ? I18N.noUsers : '';
-            for (const user of users) {
-                const row = rowTemplate.content.firstElementChild.cloneNode(true);
-                row.querySelector('[data-l2tp-user-login]').textContent = String(user.login || '');
-                row.querySelector('[data-l2tp-user-ip]').textContent = String(user.ip || '');
-                row.querySelector('[data-l2tp-user-status]').textContent = user.enabled ? I18N.stateEnabled : I18N.stateDisabled;
-                row.querySelector('[data-l2tp-user-sync]').textContent = String(user.syncStatus || 'pending');
-                const toggle = row.querySelector('[data-l2tp-user-action="toggle"]');
-                toggle.textContent = user.enabled ? I18N.actionDisable : I18N.actionEnable;
-                toggle.addEventListener('click', async () => {
-                    toggle.disabled = true;
-                    setResult(output, I18N.working);
-                    try {
-                        const response = await fetch(l2tpUsersUrl(nodeId, user.id), {
-                            method: 'PATCH',
-                            headers: {
-                                'content-type': 'application/json',
-                                'x-csrf-token': csrfToken,
-                            },
-                            body: JSON.stringify({ enabled: !user.enabled }),
-                        });
-                        const result = await parseResponse(response);
-                        if (!response.ok) {
-                            setResult(output, result.error?.code || 'USER_UPDATE_FAILED');
-                            return;
-                        }
-                        setResult(output, I18N.userUpdated);
-                        await loadL2tpUsers(relay, nodeId, output);
-                    } catch {
-                        setResult(output, 'USER_UPDATE_FAILED');
-                    } finally {
-                        toggle.disabled = false;
-                    }
-                });
-                list.append(row);
-            }
-        } catch {
-            setResult(output, 'USER_LIST_FAILED');
-        }
-    }
-
-    routeGroupRoot.querySelector('[data-route-group-action="add-path"]').addEventListener('click', () => {
-        routeGroupPaths.append(createRouteGroupPathRow());
     });
-    routeGroupCancel.addEventListener('click', () => {
-        resetRouteGroupForm();
-        setResult(routeGroupOutput, '');
-    });
-    routeGroupForm.addEventListener('submit', async (event) => {
+
+    accountForm.addEventListener('submit', async event => {
         event.preventDefault();
-        if (!routeGroupForm.reportValidity()) return;
-
-        const routeGroupId = String(routeGroupForm.elements.routeGroupId.value || '');
-        if (routeGroupId && !/^[a-fA-F0-9]{24}$/.test(routeGroupId)) {
-            setResult(routeGroupOutput, 'INVALID_ROUTE_GROUP_ID');
-            return;
-        }
-
-        let payload;
+        const login = document.getElementById('accountLogin').value.trim();
+        const password = document.getElementById('accountPassword').value;
+        accountStatus.textContent = '';
         try {
-            payload = buildRouteGroupPayload(routeGroupForm);
+            await api('/panel/l2tp/simple/accounts', {
+                method: 'POST',
+                body: JSON.stringify({ login, password }),
+            });
+            accountForm.reset();
+            accountStatus.textContent = L.done;
+            refresh();
         } catch (error) {
-            setResult(routeGroupOutput, error?.code || 'INVALID_ROUTE_GROUP');
-            return;
+            accountStatus.textContent = `${L.requestFailed}: ${error.code}`;
         }
+    });
 
-        routeGroupSave.disabled = true;
-        setResult(routeGroupOutput, I18N.working);
+    accountList.addEventListener('click', async event => {
+        const button = event.target.closest('button[data-action="delete-account"]');
+        if (!button) return;
+        const login = button.closest('.l2tp-row')?.dataset.login;
+        if (!login || !window.confirm(`${L.confirmDeleteAccount} "${login}"?`)) return;
+        button.disabled = true;
+        accountStatus.textContent = '';
         try {
-            const response = await fetch(routeGroupUrl(routeGroupId), {
-                method: routeGroupId ? 'PUT' : 'POST',
-                credentials: 'same-origin',
-                headers: {
-                    'accept': 'application/json',
-                    'content-type': 'application/json',
-                    'x-csrf-token': csrfToken,
-                },
-                body: JSON.stringify({
-                    ...payload,
-                    expectedTopologyRevision: routeGroupTopologyRevision,
-                }),
-            });
-            const result = await parseResponse(response);
-            if (!response.ok) {
-                await handleRouteGroupMutationError(response, result, 'ROUTE_GROUP_SAVE_FAILED');
-                return;
-            }
-            const snapshot = normalizeRouteGroupSnapshot(result);
-            if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
-            resetRouteGroupForm();
-            applyRouteGroupSnapshot(snapshot);
-            setResult(routeGroupOutput, routeGroupId ? I18N.rgUpdated : I18N.rgCreated);
-        } catch {
-            setResult(routeGroupOutput, 'ROUTE_GROUP_SAVE_FAILED');
-        } finally {
-            routeGroupSave.disabled = false;
+            await api(`/panel/l2tp/simple/accounts/${encodeURIComponent(login)}/delete`, { method: 'POST', body: '{}' });
+            accountStatus.textContent = L.done;
+            refresh();
+        } catch (error) {
+            accountStatus.textContent = `${L.requestFailed}: ${error.code}`;
+            button.disabled = false;
         }
     });
-    resetRouteGroupForm();
-    void loadRouteGroups();
 
-    document.querySelectorAll('[data-l2tp-relay]').forEach((relay) => {
-        const nodeId = relay.dataset.nodeId;
-        const form = relay.querySelector('[data-l2tp-form]');
-        const output = relay.querySelector('[data-l2tp-result]');
-        const userForm = relay.querySelector('[data-l2tp-user-form]');
-        const userOutput = relay.querySelector('[data-l2tp-user-result]');
-
-        relay.querySelectorAll('[data-l2tp-action]').forEach((button) => {
-            button.addEventListener('click', async () => {
-                const values = Object.fromEntries(new FormData(form).entries());
-                const action = button.dataset.l2tpAction;
-                const payload = action === 'configure'
-                    ? buildConfigurePayload(values)
-                    : buildOperationPayload(values);
-
-                button.disabled = true;
-                setResult(output, I18N.working);
-                try {
-                    const response = await fetch(`/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/${action}`, {
-                        method: 'POST',
-                        headers: {
-                            'content-type': 'application/json',
-                            'x-csrf-token': csrfToken,
-                        },
-                        body: JSON.stringify(payload),
-                    });
-                    const result = await response.json();
-                    if (!response.ok) {
-                        setResult(output, result.error?.code || 'REQUEST_FAILED');
-                        return;
-                    }
-                    setResult(
-                        output,
-                        result.operationId
-                            || (result.ok ? 'OK' : action === 'configure' ? result.status || 'CONFIGURED' : 'FAILED'),
-                    );
-                } catch {
-                    setResult(output, 'REQUEST_FAILED');
-                } finally {
-                    button.disabled = false;
-                }
-            });
-        });
-
-        userForm.addEventListener('submit', async (event) => {
-            event.preventDefault();
-            const button = userForm.querySelector('[data-l2tp-user-action="create"]');
-            const values = Object.fromEntries(new FormData(userForm).entries());
-            button.disabled = true;
-            setResult(userOutput, I18N.working);
-            try {
-                const response = await fetch(l2tpUsersUrl(nodeId), {
-                    method: 'POST',
-                    headers: {
-                        'content-type': 'application/json',
-                        'x-csrf-token': csrfToken,
-                    },
-                    body: JSON.stringify(buildL2tpUserPayload(values)),
-                });
-                const result = await parseResponse(response);
-                if (!response.ok) {
-                    setResult(userOutput, result.error?.code || 'USER_CREATE_FAILED');
-                    return;
-                }
-                userForm.reset();
-                userForm.querySelector('[name="password"]').value = '';
-                setResult(userOutput, I18N.userAdded);
-                await loadL2tpUsers(relay, nodeId, userOutput);
-            } catch {
-                setResult(userOutput, 'USER_CREATE_FAILED');
-            } finally {
-                button.disabled = false;
-            }
-        });
-
-        void loadL2tpUsers(relay, nodeId, userOutput);
-    });
+    refresh();
 })();
 </script>

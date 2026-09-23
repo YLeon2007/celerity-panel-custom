@@ -131,6 +131,7 @@ test('registerRoutes mounts the existing panel router with only injected depende
                 l2tpService: context.l2tpService,
                 stateManagementService: context.stateManagementService,
                 userManagementService: context.userManagementService,
+                simpleService: undefined,
                 requireAuth: context.requireAuth,
                 requireOnboarding: context.requireOnboarding,
                 csrf: context.csrf,

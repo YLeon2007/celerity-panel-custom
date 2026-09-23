@@ -95,6 +95,9 @@ function createActiveHost(overrides = {}) {
             calls.push({ kind: 'HyNode.findById', nodeId });
             return queryResult(executionNode, calls, 'HyNode');
         },
+        find() {
+            throw new Error('not used outside the simple facade');
+        },
     };
     const RelayL2tpState = {
         findOne(filter) {
@@ -104,6 +107,9 @@ function createActiveHost(overrides = {}) {
         findOneAndUpdate(filter, update, options) {
             calls.push({ kind: 'RelayL2tpState.findOneAndUpdate', filter, update, options });
             return queryResult(executionState, calls, 'RelayL2tpState');
+        },
+        find() {
+            throw new Error('not used outside the simple facade');
         },
     };
     const L2tpUser = {
@@ -124,7 +130,12 @@ function createActiveHost(overrides = {}) {
     const models = {
         RelayL2tpState,
         L2tpUser,
-        CascadeRouteGroup: { modelName: 'CascadeRouteGroup' },
+        CascadeRouteGroup: {
+            modelName: 'CascadeRouteGroup',
+            find() {
+                throw new Error('not used outside the simple facade');
+            },
+        },
         CascadeTopologyState: { modelName: 'CascadeTopologyState' },
         L2tpOperation: { modelName: 'L2tpOperation' },
         NodeOperationLock: { modelName: 'NodeOperationLock' },

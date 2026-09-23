@@ -319,6 +319,78 @@ class L2tpUserManagementService {
     disableUser(nodeId, userId) {
         return this.updateUser(nodeId, userId, { enabled: false });
     }
+
+    async deleteUser(nodeId, userId) {
+        const relayNode = await this.assertRelay(nodeId);
+        const selectedUserId = validateUserId(userId);
+        const existing = await this.repository.findByRelayAndId(relayNode, selectedUserId);
+        if (!existing) throw notFoundError();
+
+        let result;
+        try {
+            result = await this.repository.deleteUserAndQueueSync(
+                relayNode,
+                selectedUserId,
+                existing.desiredRevision,
+            );
+        } catch (error) {
+            if (error?.code === 'L2TP_USER_CHANGED') {
+                throw new L2tpUserManagementError(
+                    'L2TP_USER_STALE_REVISION',
+                    'The L2TP user changed before the deletion could be queued',
+                );
+            }
+            throw error;
+        }
+        const syncOperationId = entityId(result?.operationId);
+        if (!syncOperationId) {
+            throw new L2tpUserManagementError(
+                'L2TP_USER_SYNC_QUEUE_FAILED',
+                'The L2TP user sync operation could not be queued',
+            );
+        }
+        return { deleted: true, syncOperationId };
+    }
+
+    // Imports an already-encrypted credential onto another relay without
+    // queueing a sync operation (used to fan accounts out before install,
+    // where the install operation itself carries the user snapshot).
+    async importUser(nodeId, input) {
+        const relayNode = await this.assertRelay(nodeId);
+        validateLogin(input?.login);
+        validateIp(input?.ip);
+        if (typeof input.passwordEncrypted !== 'string' || input.passwordEncrypted.length === 0) {
+            throw new L2tpUserManagementError(
+                'L2TP_USER_ENCRYPTION_FAILED',
+                'An encrypted L2TP user password is required',
+            );
+        }
+        const enabled = input.enabled === undefined ? true : input.enabled;
+        validateEnabled(enabled);
+        const desiredRevision = configuredRevision(input.desiredRevision);
+
+        const conflict = await this.repository.findConflict(relayNode, {
+            login: input.login,
+            ip: input.ip,
+        });
+        if (conflict) throw conflictError();
+
+        let created;
+        try {
+            created = await this.repository.createUser({
+                relayNode,
+                login: input.login,
+                ip: input.ip,
+                enabled,
+                passwordEncrypted: input.passwordEncrypted,
+                desiredRevision,
+            });
+        } catch (error) {
+            if (isDuplicateKeyError(error)) throw conflictError();
+            throw error;
+        }
+        return safeUser(created);
+    }
 }
 
 module.exports = {

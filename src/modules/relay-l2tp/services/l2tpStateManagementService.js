@@ -368,6 +368,36 @@ class L2tpStateManagementService {
         return safeState(state);
     }
 
+    async revealPsk(nodeId) {
+        const selectedNodeId = entityId(nodeId);
+        if (!selectedNodeId) {
+            throw new L2tpStateManagementError('NODE_REQUIRED', 'A relay node is required');
+        }
+        const state = await this.repository.findExecutionStateByNodeId(selectedNodeId);
+        if (!state) {
+            throw new L2tpStateManagementError(
+                'RELAY_L2TP_STATE_NOT_FOUND',
+                'The relay L2TP desired state was not found',
+            );
+        }
+        if (typeof state.pskEncrypted !== 'string' || state.pskEncrypted.length === 0) {
+            throw new L2tpStateManagementError(
+                'PSK_NOT_CONFIGURED',
+                'The relay L2TP PSK is not configured',
+            );
+        }
+        try {
+            const psk = this.secretBox.decrypt(state.pskEncrypted, this.secretKey);
+            if (typeof psk !== 'string' || psk.length === 0) throw new Error('empty PSK');
+            return { psk };
+        } catch {
+            throw new L2tpStateManagementError(
+                'PSK_DECRYPTION_FAILED',
+                'The relay L2TP PSK could not be decrypted',
+            );
+        }
+    }
+
     async resolveOperationSecrets(operation) {
         if (!operation || typeof operation !== 'object' || operation.kind !== 'install') {
             throw new L2tpStateManagementError(
