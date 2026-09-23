@@ -690,6 +690,68 @@ test('install validates context, builds a plan, and persists one queued operatio
     });
 });
 
+test('install replaces a terminal operation holding the same idempotency key', async () => {
+    const context = installContext();
+    const repositories = createContextRepositories(context);
+    const events = [];
+    const service = createService({
+        ...repositories,
+        planBuilder: request => buildInstallPlan(request),
+        operationMaterializer: request => materializeInstallOperation(request),
+        operationRepository: {
+            async create() {
+                events.push('create');
+                if (events.filter(event => event === 'create').length === 1) {
+                    const error = new Error('E11000 duplicate key');
+                    error.code = 11000;
+                    throw error;
+                }
+            },
+            async findByIdempotencyKey() {
+                return { _id: 'stale-op', status: 'failed' };
+            },
+            async deleteById(operationId) {
+                events.push(`delete:${operationId}`);
+            },
+        },
+    });
+
+    const result = await service.install(context.node.id, context.input);
+
+    assert.deepEqual(events, ['create', 'delete:stale-op', 'create']);
+    assert.notEqual(result.operationId, 'stale-op');
+});
+
+test('install returns the active operation for a duplicate idempotency key', async () => {
+    const context = installContext();
+    const repositories = createContextRepositories(context);
+    let creates = 0;
+    const service = createService({
+        ...repositories,
+        planBuilder: request => buildInstallPlan(request),
+        operationMaterializer: request => materializeInstallOperation(request),
+        operationRepository: {
+            async create() {
+                creates += 1;
+                const error = new Error('E11000 duplicate key');
+                error.code = 11000;
+                throw error;
+            },
+            async findByIdempotencyKey() {
+                return { _id: 'active-op', status: 'running' };
+            },
+            async deleteById() {
+                throw new Error('active operations must not be deleted');
+            },
+        },
+    });
+
+    const result = await service.install(context.node.id, context.input);
+
+    assert.equal(creates, 1);
+    assert.deepEqual(result, { operationId: 'active-op' });
+});
+
 test('install materializes a secret-safe durable payload after validation and before persistence', async () => {
     const psk = 'service-psk-must-not-persist';
     const password = 'service-password-must-not-persist';

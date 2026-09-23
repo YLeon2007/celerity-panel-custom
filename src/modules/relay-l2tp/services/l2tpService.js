@@ -136,7 +136,7 @@ class L2tpService {
             );
         }
 
-        await this.operationRepository.create({
+        const operationDocument = {
             _id: operationId,
             node: entityId(context.node),
             kind: 'install',
@@ -146,7 +146,25 @@ class L2tpService {
             attempts: 0,
             plan: persistedPlan,
             createdAt: this.clock.now(),
-        });
+        };
+        try {
+            await this.operationRepository.create(operationDocument);
+        } catch (error) {
+            // A terminal operation keeps the unique idempotency key forever,
+            // which used to block every retry at the same topology revision.
+            // Active duplicates stay idempotent; terminal ones are replaced.
+            if (error?.code !== 11000) throw error;
+            const existing = await this.operationRepository.findByIdempotencyKey(
+                operationDocument.idempotencyKey,
+            );
+            if (!existing) throw error;
+            const existingId = entityId(existing._id ?? existing.id);
+            if (['queued', 'claimed', 'running'].includes(existing.status)) {
+                return { operationId: existingId };
+            }
+            await this.operationRepository.deleteById(existingId);
+            await this.operationRepository.create(operationDocument);
+        }
 
         return { operationId };
     }

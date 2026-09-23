@@ -133,6 +133,8 @@ function createL2tpServiceRepositoryAdapters(repository) {
         operationRepository: {
             findById: operationId => repository.findOperation(operationId),
             create: operation => repository.createQueuedOperation(operation),
+            findByIdempotencyKey: key => repository.findOperationByIdempotencyKey(key),
+            deleteById: operationId => repository.deleteOperationById(operationId),
         },
     };
 }
@@ -196,6 +198,17 @@ class L2tpStateRepository {
             .select(OPERATION_SAFE_SELECT)
             .lean();
         return sanitizeOperation(operation);
+    }
+
+    async findOperationByIdempotencyKey(idempotencyKey) {
+        const operation = await this.L2tpOperation.findOne({ idempotencyKey })
+            .select(OPERATION_SAFE_SELECT)
+            .lean();
+        return sanitizeOperation(operation);
+    }
+
+    async deleteOperationById(operationId) {
+        return this.L2tpOperation.deleteOne({ _id: operationId });
     }
 
     async createQueuedOperation({
