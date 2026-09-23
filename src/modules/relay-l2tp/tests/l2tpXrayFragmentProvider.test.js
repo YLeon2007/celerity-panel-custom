@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+const { cascadePathIngressPort } = require('../domain/cascadePathIngress');
 const { composeXrayConfig } = require('../services/xrayConfigComposer');
 const { buildL2tpXrayFragment } = require('../services/l2tpXrayFragmentProvider');
 
@@ -55,7 +56,16 @@ test('builds a canonical group-scoped TPROXY fragment for the selected healthy p
                 sockopt: { tproxy: 'tproxy' },
             },
         }],
-        outbounds: [],
+        outbounds: [{
+            tag: 'cascade-primary',
+            protocol: 'socks',
+            settings: {
+                servers: [{
+                    address: '127.0.0.1',
+                    port: cascadePathIngressPort('route-group-a', 'primary'),
+                }],
+            },
+        }],
         routingRules: [
             {
                 type: 'field',
@@ -77,17 +87,42 @@ test('builds a canonical group-scoped TPROXY fragment for the selected healthy p
         ],
     });
 
-    assert.doesNotThrow(() => composeXrayConfig(
+    assert.equal(fragment.outbounds[0].settings.servers[0].port, 19535);
+
+    const composed = composeXrayConfig(
         {
             inbounds: [],
             outbounds: [
                 { tag: 'block', protocol: 'blackhole' },
-                { tag: 'cascade-primary', protocol: 'vless' },
             ],
             routing: { rules: [] },
         },
         [fragment],
-    ));
+    );
+    assert(composed.outbounds.some(outbound => outbound.tag === 'cascade-primary'));
+});
+
+test('points the cascade outbound at the deterministic per-path ingress port', () => {
+    const secondarySnapshot = snapshot();
+    secondarySnapshot.plan.selectedPathKey = 'secondary';
+
+    const fragment = buildL2tpXrayFragment(secondarySnapshot);
+
+    assert.deepEqual(fragment.outbounds, [{
+        tag: 'cascade-secondary',
+        protocol: 'socks',
+        settings: {
+            servers: [{
+                address: '127.0.0.1',
+                port: cascadePathIngressPort('route-group-a', 'secondary'),
+            }],
+        },
+    }]);
+    assert.equal(fragment.outbounds[0].settings.servers[0].port, 19556);
+    assert.equal(
+        fragment.routingRules.at(-1).outboundTag,
+        'cascade-secondary',
+    );
 });
 
 test('routes only to block when the plan has no healthy selected path', () => {
@@ -109,6 +144,17 @@ test('routes only to block when the plan has no healthy selected path', () => {
         false,
     );
     assert.deepEqual(fragment.outbounds, []);
+});
+
+test('fails closed when the selected path exists but the group identity is missing', () => {
+    const grouplessSnapshot = snapshot();
+    delete grouplessSnapshot.plan.group;
+
+    assert.throws(() => buildL2tpXrayFragment(grouplessSnapshot), { name: 'TypeError' });
+
+    const emptyGroupSnapshot = snapshot();
+    emptyGroupSnapshot.plan.group = { id: '' };
+    assert.throws(() => buildL2tpXrayFragment(emptyGroupSnapshot), { name: 'TypeError' });
 });
 
 test('is deterministic across plan ordering and excludes secret fields', () => {

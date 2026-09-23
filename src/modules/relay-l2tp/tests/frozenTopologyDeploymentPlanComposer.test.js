@@ -5,7 +5,11 @@ const { createHash } = require('node:crypto');
 const Module = require('node:module');
 const test = require('node:test');
 
-const { generateXrayConfig } = require('../../../services/configGenerator');
+const { generateXrayConfigWithApi } = require('../../../services/configGenerator');
+const {
+    cascadePathIngressPort,
+    cascadePathIngressTag,
+} = require('../domain/cascadePathIngress');
 
 const {
     composeFrozenTopologyDeploymentPlan,
@@ -81,7 +85,31 @@ function reverseChainInput() {
                     mode: 'reverse',
                 },
             ],
-            groups: [],
+            groups: [{
+                _id: 'group-reverse',
+                mode: 'reverse',
+                strategy: 'priority-failover',
+                paths: [
+                    {
+                        pathKey: 'backup',
+                        linkIds: ['link-portal-relay-object-id', 'link-relay-bridge-object-id'],
+                        priority: 2,
+                        enabled: true,
+                    },
+                    {
+                        pathKey: 'main',
+                        linkIds: ['link-portal-relay-object-id', 'link-relay-bridge-object-id'],
+                        priority: 1,
+                        enabled: true,
+                    },
+                    {
+                        pathKey: 'off',
+                        linkIds: ['link-portal-relay-object-id', 'link-relay-bridge-object-id'],
+                        priority: 3,
+                        enabled: false,
+                    },
+                ],
+            }],
         },
         nodeMetadata: [
             {
@@ -174,10 +202,71 @@ test('composes frozen secret-free reverse candidates in Portal to Relay to Bridg
     }
 
     const configs = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, candidateConfig(node)]));
-    for (const [nodeRef, config] of Object.entries(configs)) {
-        assert(config.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), nodeRef);
-        assert(config.inbounds.some(inbound => inbound.tag === `client-${nodeRef.replace('-1', '')}`), nodeRef);
+    // The portal keeps the panel management API surface on its xray-main profile.
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), 'portal');
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'client-portal'), 'portal');
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'client-portal-extra'), 'portal');
+    // Relay reverse candidates are pure cascade configs: no baseline composition,
+    // no API_INBOUND (avoids the double bind against the relay xray-main API).
+    assert.equal(configs['relay-1'].api, undefined, 'relay-1');
+    assert.equal(configs['relay-1'].stats, undefined, 'relay-1');
+    assert.equal(configs['relay-1'].policy, undefined, 'relay-1');
+    assert.equal(
+        configs['relay-1'].inbounds.some(inbound => inbound.tag === 'API_INBOUND'),
+        false,
+        'relay-1',
+    );
+    assert.equal(
+        configs['relay-1'].inbounds.some(inbound => inbound.tag === 'client-relay'),
+        false,
+        'relay-1',
+    );
+    // Bridge keeps its client-facing baseline but must not bind the API either.
+    assert.equal(
+        configs.bridge.inbounds.some(inbound => inbound.tag === 'API_INBOUND'),
+        false,
+        'bridge',
+    );
+    assert.equal(configs.bridge.api, undefined, 'bridge');
+    assert(configs.bridge.inbounds.some(inbound => inbound.tag === 'client-bridge'), 'bridge');
+    // Per-path socks ingress covers every enabled path routed through the relay.
+    assert.deepEqual(configs['relay-1'].inbounds.filter(inbound => inbound.protocol === 'socks'), [
+        {
+            tag: 'cascade-backup',
+            listen: '127.0.0.1',
+            port: cascadePathIngressPort('group-reverse', 'backup'),
+            protocol: 'socks',
+            settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' },
+        },
+        {
+            tag: 'cascade-main',
+            listen: '127.0.0.1',
+            port: cascadePathIngressPort('group-reverse', 'main'),
+            protocol: 'socks',
+            settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' },
+        },
+    ]);
+    assert.equal(cascadePathIngressPort('group-reverse', 'backup'), 19330);
+    assert.equal(cascadePathIngressPort('group-reverse', 'main'), 19592);
+    for (const tag of ['cascade-backup', 'cascade-main']) {
+        assert(configs['relay-1'].routing.rules.some(rule => (
+            rule.inboundTag?.includes(tag) && rule.outboundTag === 'portal-down-link-2'
+        )), tag);
     }
+    // Disabled paths and non-relay roles get no ingress listeners.
+    assert.equal(
+        configs['relay-1'].inbounds.some(inbound => inbound.tag === 'cascade-off'),
+        false,
+    );
+    assert.equal(configs.portal.inbounds.some(inbound => inbound.protocol === 'socks'), false);
+    assert.equal(configs.bridge.inbounds.some(inbound => inbound.protocol === 'socks'), false);
+    // The new socks listeners are covered by deployment checks.
+    assert.deepEqual(plan.nodes.find(node => node.nodeRef === 'relay-1').checks, [
+        { type: 'service', serviceUnit: 'xray-bridge.service', expectedState: 'active' },
+        { type: 'port', protocol: 'tcp', port: 12002, expectedState: 'listening' },
+        { type: 'port', protocol: 'tcp', port: 19330, expectedState: 'listening' },
+        { type: 'port', protocol: 'tcp', port: 19592, expectedState: 'listening' },
+    ]);
     assert.deepEqual(configs.portal.reverse.portals, [{
         tag: 'portal-link-1',
         domain: 'link-1.reverse.example.test',
@@ -277,6 +366,9 @@ test('composes forward plans in Bridge to Relay to Portal order with exact check
     const permuted = forwardChainInput();
     permuted.snapshot.nodes.reverse();
     permuted.snapshot.links.reverse();
+    permuted.snapshot.groups = permuted.snapshot.groups
+        .map(group => ({ ...group, paths: [...group.paths].reverse() }))
+        .reverse();
     permuted.nodeMetadata.reverse();
     permuted.linkMetadata.reverse();
     permuted.compiledTopology.relays.reverse();
@@ -312,6 +404,18 @@ test('composes forward plans in Bridge to Relay to Portal order with exact check
                 port: 12001,
                 expectedState: 'listening',
             },
+            {
+                type: 'port',
+                protocol: 'tcp',
+                port: 19330,
+                expectedState: 'listening',
+            },
+            {
+                type: 'port',
+                protocol: 'tcp',
+                port: 19592,
+                expectedState: 'listening',
+            },
         ],
         [
             {
@@ -337,6 +441,23 @@ test('composes forward plans in Bridge to Relay to Portal order with exact check
         rule.inboundTag?.includes('fwd-hop-link-1') && rule.outboundTag === 'direct'
     )));
     assert(configs.bridge.inbounds.some(inbound => inbound.tag === 'fwd-hop-link-2'));
+    // Forward relay exposes the same per-path socks ingress, chained to the exit.
+    assert.deepEqual(
+        configs['relay-1'].inbounds
+            .filter(inbound => inbound.protocol === 'socks')
+            .map(inbound => inbound.tag),
+        ['cascade-backup', 'cascade-main'],
+    );
+    assert(configs['relay-1'].outbounds.some(outbound => outbound.tag === 'fwd-link-2'));
+    assert(configs['relay-1'].routing.rules.some(rule => (
+        rule.inboundTag?.includes('cascade-backup')
+        && rule.inboundTag?.includes('cascade-main')
+        && rule.outboundTag === 'fwd-link-2'
+    )));
+    // Relay/bridge forward candidates must not bind the panel API either.
+    assert.equal(configs['relay-1'].inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
+    assert.equal(configs.bridge.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
+    assert(configs.portal.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
 });
 
 test('composes every relay in a longer reverse v1 chain', () => {
@@ -366,6 +487,10 @@ test('composes every relay in a longer reverse v1 chain', () => {
         nodeId: 'node-relay-two-object-id',
         routeGroups: [],
     });
+    // Only the 'main' path extends over the new relay-2 subchain link.
+    input.snapshot.groups[0].paths
+        .find(path => path.pathKey === 'main')
+        .linkIds.push('link-relay-two-bridge-object-id');
 
     const plan = composeFrozenTopologyDeploymentPlan(input);
     assert.deepEqual(
@@ -377,6 +502,21 @@ test('composes every relay in a longer reverse v1 chain', () => {
         assert.equal(config.reverse.bridges.length, 1);
         assert.equal(config.reverse.portals.length, 1);
     }
+    // Per-path ingress follows the path subchain: relay-1 serves both enabled
+    // paths, relay-2 only the path that actually crosses its downstream link.
+    const relayOne = candidateConfig(plan.nodes.find(node => node.nodeRef === 'relay-1'));
+    const relayTwo = candidateConfig(plan.nodes.find(node => node.nodeRef === 'relay-2'));
+    assert(relayOne.inbounds.some(inbound => inbound.tag === 'cascade-main'));
+    assert(relayOne.inbounds.some(inbound => inbound.tag === 'cascade-backup'));
+    assert(relayOne.routing.rules.some(rule => (
+        rule.inboundTag?.includes('cascade-main') && rule.outboundTag === 'portal-down-link-2'
+    )));
+    assert(relayTwo.inbounds.some(inbound => inbound.tag === 'cascade-main'));
+    assert.equal(relayTwo.inbounds.some(inbound => inbound.tag === 'cascade-backup'), false);
+    assert(relayTwo.routing.rules.some(rule => (
+        rule.inboundTag?.includes('cascade-main') && rule.outboundTag === 'portal-down-link-3'
+    )));
+    assert.equal(relayTwo.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
 });
 
 test('composes a direct Portal to Bridge forward v1 chain without relays', () => {
@@ -410,7 +550,7 @@ test('composes a direct Portal to Bridge forward v1 chain without relays', () =>
 test('preserves the official Xray generator baseline before adding cascade pieces', () => {
     const input = reverseChainInput();
     const portalMetadata = input.nodeMetadata.find(node => node.role === 'portal');
-    const baseline = JSON.parse(generateXrayConfig(portalMetadata, []));
+    const baseline = JSON.parse(generateXrayConfigWithApi(portalMetadata, []));
     const plan = composeFrozenTopologyDeploymentPlan(input);
     const portal = candidateConfig(plan.nodes.find(node => node.role === 'portal'));
 
@@ -421,6 +561,7 @@ test('preserves the official Xray generator baseline before adding cascade piece
     for (const inbound of baseline.inbounds) {
         assert.deepEqual(portal.inbounds.find(candidate => candidate.tag === inbound.tag), inbound);
     }
+    assert.equal(baseline.inbounds[0].tag, 'API_INBOUND');
 });
 
 test('rejects a cascade listener that collides with a preserved server inbound', () => {

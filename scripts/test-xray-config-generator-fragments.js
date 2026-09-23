@@ -86,7 +86,7 @@ test('omitting fragments preserves legacy generator semantics byte for byte', ()
 test('fragment collisions surface the structured composer error before serialization', () => {
     const collidingFragment = canonicalFragment({
         inbounds: [{
-            tag: 'API_INBOUND',
+            tag: 'vless-in',
             listen: '127.0.0.1',
             port: 62000,
             protocol: 'dokodemo-door',
@@ -99,7 +99,7 @@ test('fragment collisions surface the structured composer error before serializa
         {
             name: 'XrayConfigComposerError',
             code: 'DUPLICATE_INBOUND_TAG',
-            tag: 'API_INBOUND',
+            tag: 'vless-in',
         },
     );
 });

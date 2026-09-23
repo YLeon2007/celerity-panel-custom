@@ -13,6 +13,9 @@ const {
     TEST_TOPOLOGY_TARGET,
     TopologyOperationPlanMaterializer,
 } = require('../services/topologyOperationPlanMaterializer');
+const {
+    cascadePathIngressPort,
+} = require('../domain/cascadePathIngress');
 
 const SECRET_CANARIES = Object.freeze([
     'node-ssh-password-canary',
@@ -78,7 +81,20 @@ function pinnedSnapshot() {
                     rawCommand: SECRET_CANARIES[5],
                 },
             ],
-            groups: [{ secret: SECRET_CANARIES[2], shell: SECRET_CANARIES[5] }],
+            groups: [{
+                _id: 'group-1',
+                mode: 'reverse',
+                strategy: 'priority-failover',
+                secret: SECRET_CANARIES[2],
+                shell: SECRET_CANARIES[5],
+                paths: [{
+                    pathKey: 'main',
+                    linkIds: ['portal-relay', 'relay-bridge'],
+                    priority: 1,
+                    enabled: true,
+                    password: SECRET_CANARIES[0],
+                }],
+            }],
         },
         compiled: {
             valid: true,
@@ -223,9 +239,28 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
         assert.ok(Array.isArray(config.inbounds));
         assert.ok(Array.isArray(config.outbounds));
         assert.ok(config.routing && Array.isArray(config.routing.rules));
-        assert(config.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
     }
     const portal = JSON.parse(Buffer.from(plan.nodes[0].candidate.bytes).toString('utf8'));
+    const relay = JSON.parse(Buffer.from(plan.nodes[1].candidate.bytes).toString('utf8'));
+    const bridge = JSON.parse(Buffer.from(plan.nodes[2].candidate.bytes).toString('utf8'));
+    assert(portal.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
+    assert.equal(relay.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
+    assert.equal(bridge.inbounds.some(inbound => inbound.tag === 'API_INBOUND'), false);
+    // Route groups survive projection: the relay candidate carries a per-path
+    // socks ingress for the enabled path routed through its downstream link.
+    const socksIngress = relay.inbounds.find(inbound => inbound.tag === 'cascade-main');
+    assert.deepEqual(socksIngress, {
+        tag: 'cascade-main',
+        listen: '127.0.0.1',
+        port: cascadePathIngressPort('group-1', 'main'),
+        protocol: 'socks',
+        settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' },
+    });
+    assert(relay.routing.rules.some(rule => (
+        rule.inboundTag?.includes('cascade-main') && rule.outboundTag === 'portal-down-link-2'
+    )));
+    assert.equal(portal.inbounds.some(inbound => inbound.protocol === 'socks'), false);
+    assert.equal(bridge.inbounds.some(inbound => inbound.protocol === 'socks'), false);
     assert(portal.inbounds.some(inbound => (
         inbound.tag === 'client-portal' && inbound.port === 20443
     )));
@@ -391,6 +426,38 @@ test('rejects missing, unsafe, non-test, and invalid role identities before meta
                 snapshot.topology.nodes.find(node => node.role === 'relay').role = 'portal';
             },
             code: 'INVALID_TOPOLOGY_ROLES',
+        },
+        {
+            name: 'unsafe route group identity',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                snapshot.topology.groups[0]._id = 'group with spaces';
+            },
+            code: 'UNSAFE_TOPOLOGY_GROUP_IDENTITY',
+        },
+        {
+            name: 'missing route group identity',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                delete snapshot.topology.groups[0]._id;
+            },
+            code: 'UNSAFE_TOPOLOGY_GROUP_IDENTITY',
+        },
+        {
+            name: 'unsafe route group path key',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                snapshot.topology.groups[0].paths[0].pathKey = 'main; rm -rf /';
+            },
+            code: 'UNSAFE_TOPOLOGY_GROUP_IDENTITY',
+        },
+        {
+            name: 'unsafe route group path link id',
+            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
+            mutate(snapshot) {
+                snapshot.topology.groups[0].paths[0].linkIds = ['relay-bridge', ''];
+            },
+            code: 'UNSAFE_TOPOLOGY_GROUP_IDENTITY',
         },
     ];
 

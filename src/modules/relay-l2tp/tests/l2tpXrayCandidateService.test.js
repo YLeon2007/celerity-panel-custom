@@ -10,6 +10,9 @@ const test = require('node:test');
 
 const { generateXrayConfig } = require('../../../services/configGenerator');
 const {
+    cascadePathIngressPort,
+} = require('../domain/cascadePathIngress');
+const {
     L2tpXrayCandidateService,
 } = require('../services/l2tpXrayCandidateService');
 
@@ -40,11 +43,7 @@ function xrayNode(overrides = {}) {
             transport: 'tcp',
             security: 'none',
         },
-        outbounds: [{
-            type: 'socks5',
-            name: 'cascade-primary',
-            addr: '127.0.0.1:1080',
-        }],
+        outbounds: [],
         aclRules: [],
         ...overrides,
     };
@@ -110,7 +109,16 @@ test('passes one canonical L2TP fragment through the injected generator hook', a
             },
             streamSettings: { sockopt: { tproxy: 'tproxy' } },
         }],
-        outbounds: [],
+        outbounds: [{
+            tag: 'cascade-primary',
+            protocol: 'socks',
+            settings: {
+                servers: [{
+                    address: '127.0.0.1',
+                    port: cascadePathIngressPort('route-group-a', 'primary'),
+                }],
+            },
+        }],
         routingRules: [
             {
                 type: 'field',
@@ -163,8 +171,63 @@ test('uses the official generator output without post-generation JSON mutation',
         config.inbounds.filter(inbound => inbound.tag === 'relay-l2tp-route-group-a').length,
         1,
     );
-    assert(config.outbounds.some(outbound => outbound.tag === 'cascade-primary'));
+    const cascadeOutbound = config.outbounds.find(outbound => outbound.tag === 'cascade-primary');
+    assert(cascadeOutbound, 'candidate carries the cascade-<pathKey> outbound without node.outbounds');
+    assert.equal(cascadeOutbound.protocol, 'socks');
+    assert.deepEqual(cascadeOutbound.settings.servers, [{
+        address: '127.0.0.1',
+        port: cascadePathIngressPort('route-group-a', 'primary'),
+    }]);
     assert(config.routing.rules.some(rule => rule.outboundTag === 'cascade-primary'));
+});
+
+test('keeps building candidates when the node has unrelated operator outbounds', async () => {
+    const node = xrayNode({
+        outbounds: [{
+            type: 'socks5',
+            name: 'legacy-operator-outbound',
+            addr: '127.0.0.1:1080',
+        }],
+    });
+    const service = new L2tpXrayCandidateService({
+        nodeResolver: async () => node,
+        userResolver: async () => users,
+        configGenerator: (resolvedNode, resolvedUsers, options) => (
+            generateXrayConfig(resolvedNode, resolvedUsers, options)
+        ),
+    });
+
+    const candidate = await service.buildCandidate({ plan: safePlan() });
+    const config = JSON.parse(candidate.content);
+
+    assert(config.outbounds.some(outbound => outbound.tag === 'legacy-operator-outbound'));
+    assert(config.outbounds.some(outbound => outbound.tag === 'cascade-primary'));
+});
+
+test('fails closed when an operator outbound collides with the cascade path tag', async () => {
+    const node = xrayNode({
+        outbounds: [{
+            type: 'socks5',
+            name: 'cascade-primary',
+            addr: '127.0.0.1:1080',
+        }],
+    });
+    const service = new L2tpXrayCandidateService({
+        nodeResolver: async () => node,
+        userResolver: async () => users,
+        configGenerator: (resolvedNode, resolvedUsers, options) => (
+            generateXrayConfig(resolvedNode, resolvedUsers, options)
+        ),
+    });
+
+    await assert.rejects(
+        service.buildCandidate({ plan: safePlan() }),
+        error => {
+            assert.equal(error.name, 'L2tpXrayCandidateError');
+            assert.equal(error.code, 'XRAY_CONFIG_GENERATION_FAILED');
+            return true;
+        },
+    );
 });
 
 test('rejects missing or blocked selections before any resolver or generator', async () => {

@@ -532,6 +532,7 @@ test('registerConfigFragments registers only relay-l2tp with the existing fragme
     const entry = require('..');
     const { createConfigFragmentRegistry } = require('../../../services/configFragmentRegistry');
     const { buildL2tpXrayFragment } = require('../services/l2tpXrayFragmentProvider');
+    const { cascadePathIngressPort } = require('../domain/cascadePathIngress');
     const registry = createConfigFragmentRegistry(['relay-l2tp']);
     const registrations = [];
     const configFragmentRegistry = {
@@ -549,6 +550,7 @@ test('registerConfigFragments registers only relay-l2tp with the existing fragme
     const [fragment] = registry.compose({
         plan: {
             relay: { controlPlaneIps: ['198.51.100.10'] },
+            group: { id: 'route-group-a' },
             paths: [{
                 pathKey: 'primary',
                 healthy: true,
@@ -566,4 +568,14 @@ test('registerConfigFragments registers only relay-l2tp with the existing fragme
     assert.equal(fragment.id, 'relay-l2tp');
     assert.equal(fragment.inbounds[0].tag, 'relay-l2tp-route-group-a');
     assert.equal(fragment.routingRules.at(-1).outboundTag, 'cascade-primary');
+    assert.deepEqual(fragment.outbounds, [{
+        tag: 'cascade-primary',
+        protocol: 'socks',
+        settings: {
+            servers: [{
+                address: '127.0.0.1',
+                port: cascadePathIngressPort('route-group-a', 'primary'),
+            }],
+        },
+    }]);
 });
