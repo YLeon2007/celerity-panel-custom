@@ -123,3 +123,11 @@ test('network UI deploy never stringifies a bare error object', () => {
 test('nodes view exposes the CSRF token for network module requests', () => {
     assert.match(NODES_VIEW_SOURCE, /window\._networkCsrfToken = <%- JSON\.stringify\(csrfToken \|\| ''\) %>;/);
 });
+
+test('network UI deploy maps coordinator statuses to distinct user messages', () => {
+    const helper = extractDeployPath('_cascadeDeploy');
+    assert.match(helper, /result\.status === 'succeeded'[\s\S]*?deployAlreadyDeployed/);
+    assert.match(helper, /deploymentEndedWithStatus/);
+    assert.match(NODES_VIEW_SOURCE, /deployAlreadyDeployed: <%- JSON\.stringify\(t\('network\.deployAlreadyDeployed'\)\) %>/);
+    assert.match(NODES_VIEW_SOURCE, /deploymentEndedWithStatus: <%- JSON\.stringify\(t\('network\.deploymentEndedWithStatus'\)\) %>/);
+});

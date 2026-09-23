@@ -149,6 +149,12 @@ class TopologyOperationRepository {
         });
     }
 
+    async findPublicById(operationId) {
+        return this.model.findById(operationId)
+            .select('status topologyRevision')
+            .lean();
+    }
+
     async claim({ operationId: id, owner, leaseMs, now }) {
         const lease = new Date(now.getTime() + leaseMs);
         const options = {

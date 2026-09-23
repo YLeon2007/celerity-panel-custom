@@ -1456,6 +1456,8 @@
     "swapNodes": "Поменять",
     "deployFailed": "Ошибка деплоя",
     "deployQueued": "Деплой топологии поставлен в очередь",
+    "deployAlreadyDeployed": "Эта ревизия топологии уже задеплоена",
+    "deploymentEndedWithStatus": "Деплой этой ревизии завершился со статусом",
     "networkError": "Ошибка сети",
     "rolePortal": "PORTAL",
     "roleBridge": "BRIDGE",

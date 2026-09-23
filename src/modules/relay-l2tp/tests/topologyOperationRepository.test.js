@@ -8,6 +8,30 @@ const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
 
+test('findPublicById returns only the public status projection', async () => {
+    let captured;
+    const model = {
+        async create() {},
+        async findOneAndUpdate() {},
+        async updateOne() {},
+        findById(id) {
+            const query = {
+                select(projection) {
+                    captured = { id, projection };
+                    return {
+                        lean: async () => ({ status: 'succeeded', topologyRevision: 7 }),
+                    };
+                },
+            };
+            return query;
+        },
+    };
+    const repository = new TopologyOperationRepository({ model });
+    const result = await repository.findPublicById('operation-dup');
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision' });
+    assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7 });
+});
+
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
 

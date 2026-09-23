@@ -1103,7 +1103,16 @@
                 : (errorValue?.message || errorValue?.code || ('HTTP ' + res.status));
             throw new Error(message);
         }
+        if (!['queued', 'succeeded'].includes(data.status)) {
+            throw new Error((i18n.deploymentEndedWithStatus || 'Deployment ended with status') + ': ' + (data.status || 'unknown'));
+        }
         return data;
+    }
+
+    function deployResultMessage(result) {
+        return result.status === 'succeeded'
+            ? (i18n.deployAlreadyDeployed || 'Topology already deployed')
+            : (i18n.deployQueued || 'Deployment queued');
     }
 
     window._cascadeDeploy = async function (linkId) {
@@ -1115,8 +1124,8 @@
         if (edge.length) edge.data('status', 'syncing');
 
         try {
-            await deployTopology();
-            showToast(i18n.deployQueued || i18n.deploySuccess || 'Deployment queued');
+            const result = await deployTopology();
+            showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();
         } catch (err) {
@@ -1132,8 +1141,8 @@
         cy.edges().forEach(function (e) { e.data('status', 'syncing'); });
 
         try {
-            await deployTopology();
-            showToast(i18n.deployQueued || i18n.chainDeploySuccess || 'Deployment queued');
+            const result = await deployTopology();
+            showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();
         } catch (err) {

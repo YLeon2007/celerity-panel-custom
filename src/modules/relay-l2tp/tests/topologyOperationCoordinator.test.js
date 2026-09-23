@@ -245,6 +245,62 @@ test('invalid pinned topology is sanitized before any plan or worker call', asyn
     assert.deepEqual(calls.map(call => call.method), ['pinTopology']);
 });
 
+test('re-deploy of an already-recorded revision returns the existing operation without re-running work', async () => {
+    for (const existingStatus of ['succeeded', 'failed', 'rolled_back']) {
+        const calls = [];
+        const duplicate = new Error('E11000 duplicate key error');
+        duplicate.code = 11000;
+        const coordinator = new TopologyOperationCoordinator({
+            topologyRepository: {
+                async pinTopology({ expectedRevision, prepare }) {
+                    calls.push({ method: 'pinTopology', expectedRevision });
+                    const prepared = await prepare(snapshot());
+                    return { revision: 7, deployedRevision: 7, ...prepared };
+                },
+            },
+            planMaterializer: {
+                async materialize() {
+                    calls.push({ method: 'materialize' });
+                    return materializedPlan();
+                },
+            },
+            operationRepository: {
+                async createFrozen() {
+                    calls.push({ method: 'createFrozen' });
+                    throw duplicate;
+                },
+                async findPublicById(operationId) {
+                    calls.push({ method: 'findPublicById', operationId });
+                    return { status: existingStatus, topologyRevision: 7 };
+                },
+            },
+            operationWorker: {
+                async run(operationId) {
+                    calls.push({ method: 'worker.run', operationId });
+                },
+            },
+            validator: () => ({ valid: true, errors: [] }),
+            compiler: () => ({ valid: true, errors: [], relays: [] }),
+            idFactory: () => 'operation-dup',
+        });
+
+        const result = await coordinator.deploy({ expectedTopologyRevision: 7 });
+        await Promise.resolve();
+
+        assert.deepEqual(result, {
+            operationId: 'operation-dup',
+            topologyRevision: 7,
+            status: existingStatus,
+        });
+        assert.deepEqual(calls.find(call => call.method === 'findPublicById'), {
+            method: 'findPublicById',
+            operationId: 'operation-dup',
+        });
+        assert.equal(calls.some(call => call.method === 'worker.run'), false,
+            `worker must not re-run for an existing ${existingStatus} operation`);
+    }
+});
+
 test('projects a deterministic status without candidates, leases, backups, or invalid states', () => {
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: { async pinTopology() {} },

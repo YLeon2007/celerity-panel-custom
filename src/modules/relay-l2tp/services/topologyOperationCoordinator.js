@@ -307,13 +307,28 @@ class TopologyOperationCoordinator {
             topology: pinned.topology,
             plan: pinned.frozenPlan,
         });
-        await this.operationRepository.createFrozen({
-            operationId,
-            idempotencyKey,
-            topologyRevision: pinned.revision,
-            priorDeployedRevision: pinned.deployedRevision,
-            nodes: plan.nodes,
-        });
+        try {
+            await this.operationRepository.createFrozen({
+                operationId,
+                idempotencyKey,
+                topologyRevision: pinned.revision,
+                priorDeployedRevision: pinned.deployedRevision,
+                nodes: plan.nodes,
+            });
+        } catch (error) {
+            if ((error?.code === 11000 || error?.code === 11001)
+                && typeof this.operationRepository.findPublicById === 'function') {
+                const existing = await this.operationRepository.findPublicById(operationId);
+                if (existing) {
+                    return Object.freeze({
+                        operationId,
+                        topologyRevision: pinned.revision,
+                        status: existing.status ?? 'queued',
+                    });
+                }
+            }
+            throw safeQueueError(error, operationId, expectedTopologyRevision);
+        }
         if (this.operationWorker) {
             Promise.resolve(this.operationWorker.run(operationId)).catch(() => {
                 this.onWorkerError({ operationId });
