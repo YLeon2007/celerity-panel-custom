@@ -157,6 +157,7 @@ function installContext(overrides = {}) {
             routeGroup: 'group-a',
             clientCidr: '10.66.0.0/24',
             dnsServers: ['9.9.9.9'],
+            secretRevision: 9,
         },
         routeGroup: { id: 'group-a', name: 'primary' },
         topologyRevision: 17,
@@ -227,6 +228,7 @@ test('preflight validates injected state and delegates to the injected runner', 
         state: context.state,
         desired: {
             ...context.state,
+            credentialRevision: context.state.secretRevision,
             clientCidr: context.input.clientCidr,
             dnsServers: context.input.dnsServers,
             routeGroup: 'group-a',
@@ -665,6 +667,7 @@ test('install validates context, builds a plan, and persists one queued operatio
             relayGroupPlan: context.relayGroupPlan,
             desired: {
                 ...context.state,
+                credentialRevision: context.state.secretRevision,
                 clientCidr: context.input.clientCidr,
                 dnsServers: context.input.dnsServers,
                 routeGroup: 'group-a',
@@ -734,6 +737,11 @@ test('install materializes a secret-safe durable payload after validation and be
 
     assert.deepEqual(events, ['preflight', 'plan', 'materialize', 'persist']);
     assert.equal(createdOperation.plan.operationId, result.operationId);
+    assert.equal(
+        createdOperation.plan.desired.credentialRevision,
+        context.state.secretRevision,
+        'install plan must pin the current relay credential (secret) revision',
+    );
     assert.deepEqual(
         createdOperation.plan.steps.find(step => step.type === 'preflight').artifacts,
         [{ type: 'desired', path: 'desired.json' }],

@@ -25,6 +25,7 @@ function nodeRole(node) {
 function installDesired(state, input) {
     return {
         ...state,
+        credentialRevision: state?.secretRevision,
         ...(input.clientCidr === undefined ? {} : { clientCidr: input.clientCidr }),
         ...(input.dnsServers === undefined ? {} : { dnsServers: input.dnsServers }),
         routeGroup: input.routeGroupId,
