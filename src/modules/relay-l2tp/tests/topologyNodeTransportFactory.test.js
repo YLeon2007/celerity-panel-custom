@@ -21,6 +21,19 @@ const artifactContent = `${JSON.stringify({
     routing: { rules: [] },
 })}\n`;
 const candidateHash = `sha256:${createHash('sha256').update(artifactContent).digest('hex')}`;
+const checks = Object.freeze([
+    Object.freeze({
+        type: 'service',
+        serviceUnit: 'xray-bridge.service',
+        expectedState: 'active',
+    }),
+    Object.freeze({
+        type: 'port',
+        protocol: 'tcp',
+        port: 12001,
+        expectedState: 'listening',
+    }),
+]);
 
 function receipt(command, plan) {
     return {
@@ -132,7 +145,10 @@ test('binds node identity and role profile across every lifecycle command', asyn
         artifact: { id: 'xray-config', content: artifactContent },
     });
     for (const command of ['commit', 'verify', 'rollback']) {
-        assert.deepEqual(await transport[command]({ ...plan }), receipt(command, plan));
+        assert.deepEqual(await transport[command]({
+            ...plan,
+            ...(command === 'verify' ? { checks } : {}),
+        }), receipt(command, plan));
     }
 
     assert.deepEqual(
@@ -140,13 +156,20 @@ test('binds node identity and role profile across every lifecycle command', asyn
             command: call.command.match(/--command ([a-z]+)/)?.[1],
             nodeId: call.command.match(/--node-id ([A-Za-z0-9._-]+)/)?.[1],
             targetProfile: call.command.match(/--target-profile ([A-Za-z0-9._-]+)/)?.[1],
+            checks: call.command.match(/--checks ([A-Za-z0-9_-]+)/)?.[1],
             options: call.options,
         })),
         [
-            { command: 'prepare', nodeId: 'relay-node', targetProfile: 'xray-bridge', options: { stdin: artifactContent } },
-            { command: 'commit', nodeId: 'relay-node', targetProfile: 'xray-bridge', options: undefined },
-            { command: 'verify', nodeId: 'relay-node', targetProfile: 'xray-bridge', options: undefined },
-            { command: 'rollback', nodeId: 'relay-node', targetProfile: 'xray-bridge', options: undefined },
+            { command: 'prepare', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: { stdin: artifactContent } },
+            { command: 'commit', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: undefined },
+            {
+                command: 'verify',
+                nodeId: 'relay-node',
+                targetProfile: 'xray-bridge',
+                checks: Buffer.from(JSON.stringify(checks), 'utf8').toString('base64url'),
+                options: undefined,
+            },
+            { command: 'rollback', nodeId: 'relay-node', targetProfile: 'xray-bridge', checks: undefined, options: undefined },
         ],
     );
 

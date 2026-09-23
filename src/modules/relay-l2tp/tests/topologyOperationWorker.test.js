@@ -140,6 +140,18 @@ function durableThreeNodeOperation() {
     };
 }
 
+function durableTopologyOperation(order) {
+    const nodesByRole = {
+        portal: frozenNode('node-z', 'portal', 'portal'),
+        relay: frozenNode('node-a', 'relay', 'relay-1'),
+        bridge: frozenNode('node-m', 'bridge', 'bridge'),
+    };
+    return {
+        ...durableOperation(),
+        nodes: order.map(role => durableNode(nodesByRole[role])),
+    };
+}
+
 function createRepository(operation = durableOperation(), overrides = {}) {
     const calls = [];
     return {
@@ -197,6 +209,74 @@ function createWorker({ repository, executor, deploymentRepository, clock } = {}
         leaseMs: 30_000,
         clock: clock || { now: () => new Date(NOW) },
     });
+}
+
+async function successfulLifecycleEvents(order) {
+    const repository = createRepository(durableTopologyOperation(order));
+    const events = [];
+    const executor = {
+        async prepare(request) {
+            events.push({ method: 'prepare', role: request.node.role });
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: { opaque: request.node.node },
+            };
+        },
+        async commit(request) {
+            events.push({ method: 'commit', role: request.node.role });
+            return { ok: true };
+        },
+        async verify(request) {
+            events.push({ method: 'verify', role: request.node.role });
+            return { ok: true };
+        },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        deploymentRepository: {
+            async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'succeeded');
+    return events;
+}
+
+async function rollbackRolesAfterFinalVerifyFailure(order) {
+    const repository = createRepository(durableTopologyOperation(order));
+    const rollbackRoles = [];
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: { opaque: request.node.node },
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify(request) {
+            return { ok: request.node.role !== order.at(-1) };
+        },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback(request) {
+            rollbackRoles.push(request.node.role);
+            return { ok: true };
+        },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        deploymentRepository: {
+            async markDeployed() { throw new Error('failed verification must not finalize'); },
+        },
+    });
+
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'rolled_back');
+    return rollbackRoles;
 }
 
 test('fresh worker resumes an expired preparing claim from durable candidates only', async () => {
@@ -329,6 +409,51 @@ test('legacy metadata-only durable candidates fail before executor use', async (
     assert.equal(result.status, 'failed');
     assert.equal(executorCalls, 0);
     assert.deepEqual(repository.calls.map(call => call.method), ['claim', 'finishClaimed']);
+});
+
+test('executes forward topology Bridge to Relay to Portal through prepare commit and verify', async () => {
+    assert.deepEqual(
+        await successfulLifecycleEvents(['bridge', 'relay', 'portal']),
+        [
+            { method: 'prepare', role: 'bridge' },
+            { method: 'prepare', role: 'relay' },
+            { method: 'prepare', role: 'portal' },
+            { method: 'commit', role: 'bridge' },
+            { method: 'verify', role: 'bridge' },
+            { method: 'commit', role: 'relay' },
+            { method: 'verify', role: 'relay' },
+            { method: 'commit', role: 'portal' },
+            { method: 'verify', role: 'portal' },
+        ],
+    );
+});
+
+test('executes reverse topology Portal to Relay to Bridge through prepare commit and verify', async () => {
+    assert.deepEqual(
+        await successfulLifecycleEvents(['portal', 'relay', 'bridge']),
+        [
+            { method: 'prepare', role: 'portal' },
+            { method: 'prepare', role: 'relay' },
+            { method: 'prepare', role: 'bridge' },
+            { method: 'commit', role: 'portal' },
+            { method: 'verify', role: 'portal' },
+            { method: 'commit', role: 'relay' },
+            { method: 'verify', role: 'relay' },
+            { method: 'commit', role: 'bridge' },
+            { method: 'verify', role: 'bridge' },
+        ],
+    );
+});
+
+test('rolls back forward and reverse topology changes in exact reverse deployment order', async () => {
+    assert.deepEqual(
+        await rollbackRolesAfterFinalVerifyFailure(['bridge', 'relay', 'portal']),
+        ['portal', 'relay', 'bridge'],
+    );
+    assert.deepEqual(
+        await rollbackRolesAfterFinalVerifyFailure(['portal', 'relay', 'bridge']),
+        ['bridge', 'relay', 'portal'],
+    );
 });
 
 test('prepares every node before deterministic commit and verify then fences deployed revision', async () => {

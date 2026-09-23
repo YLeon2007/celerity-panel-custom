@@ -136,9 +136,7 @@ class TopologyOperationRepository {
         priorDeployedRevision,
         nodes,
     }) {
-        const metadata = nodes
-            .map(durableNodeMetadata)
-            .sort((left, right) => operationId(left.node).localeCompare(operationId(right.node)));
+        const metadata = nodes.map(durableNodeMetadata);
         return this.model.create({
             _id: id,
             topologyRevision,

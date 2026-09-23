@@ -25,7 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "$#" -ne 12 \
+if [[ ( "$#" -ne 12 && "$#" -ne 14 ) \
     || "$1" != '--command' \
     || "$3" != '--operation-id' \
     || "$5" != '--node-id' \
@@ -41,11 +41,18 @@ readonly NODE_ID="$6"
 readonly CANDIDATE_HASH="$8"
 readonly BACKUP_ID="${10}"
 readonly TARGET_PROFILE="${12}"
+readonly CHECKS_TOKEN="${14-}"
 readonly SAFE_ID_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 readonly HASH_PATTERN='^sha256:[a-f0-9]{64}$'
 
 [[ "$COMMAND" =~ ^(prepare|commit|verify|rollback)$ ]] \
     || fail 'UNKNOWN_COMMAND' 64
+if [[ "$COMMAND" == 'verify' ]]; then
+    [[ "$#" -eq 14 && "${13}" == '--checks' ]] \
+        || fail 'INVALID_ARGUMENTS' 64
+else
+    [[ "$#" -eq 12 ]] || fail 'INVALID_ARGUMENTS' 64
+fi
 [[ "$OPERATION_ID" =~ $SAFE_ID_PATTERN \
     && "$NODE_ID" =~ $SAFE_ID_PATTERN \
     && "$BACKUP_ID" =~ $SAFE_ID_PATTERN ]] \
@@ -91,6 +98,7 @@ readonly BACKUP_ABSENT="$BACKUP_DIR/config.absent"
 readonly XRAY_PATH="$ROOT_PREFIX/usr/local/bin/xray"
 readonly XRAY_ASSET_DIR="$ROOT_PREFIX/usr/local/share/xray"
 readonly SYSTEMCTL_PATH="$ROOT_PREFIX/usr/bin/systemctl"
+readonly SS_PATH="$ROOT_PREFIX/usr/bin/ss"
 
 emit_receipt() {
     printf '{"ok":true,"command":"%s","operationId":"%s","nodeId":"%s","candidateHash":"%s","backupId":"%s","targetProfile":"%s"}\n' \
@@ -162,6 +170,80 @@ if raw != canonical:
     raise SystemExit(1)
 PY
 }
+
+parse_checks() {
+    /usr/bin/python3 - "$CHECKS_TOKEN" "$SERVICE_NAME" <<'PY'
+import base64
+import json
+import re
+import sys
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError('duplicate key')
+        value[key] = item
+    return value
+
+
+def reject_constant(_value):
+    raise ValueError('invalid number')
+
+
+token, service_name = sys.argv[1:]
+if re.fullmatch(r'[A-Za-z0-9_-]+', token) is None:
+    raise SystemExit(1)
+try:
+    raw = base64.b64decode(
+        token + ('=' * (-len(token) % 4)),
+        altchars=b'-_',
+        validate=True,
+    )
+    if base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=') != token:
+        raise ValueError('non-canonical base64url')
+    checks = json.loads(
+        raw.decode('utf-8'),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+if type(checks) is not list:
+    raise SystemExit(1)
+for check in checks:
+    if type(check) is not dict or type(check.get('type')) is not str:
+        raise SystemExit(1)
+    if check['type'] == 'service':
+        if (set(check) != {'type', 'serviceUnit', 'expectedState'}
+                or check.get('serviceUnit') != service_name
+                or check.get('expectedState') != 'active'):
+            raise SystemExit(1)
+        continue
+    if check['type'] == 'port':
+        port = check.get('port')
+        if (set(check) != {'type', 'protocol', 'port', 'expectedState'}
+                or check.get('protocol') != 'tcp'
+                or type(port) is not int
+                or not 1 <= port <= 65535
+                or check.get('expectedState') != 'listening'):
+            raise SystemExit(1)
+        print(port)
+        continue
+    raise SystemExit(1)
+PY
+}
+
+REQUIRED_TCP_PORTS=()
+if [[ "$COMMAND" == 'verify' ]]; then
+    checks_ports=''
+    checks_ports="$(parse_checks)" || fail 'INVALID_CHECKS' 65
+    if [[ -n "$checks_ports" ]]; then
+        mapfile -t REQUIRED_TCP_PORTS <<<"$checks_ports"
+    fi
+fi
+readonly -a REQUIRED_TCP_PORTS
 
 ensure_fixed_state_roots() {
     local directory
@@ -264,6 +346,7 @@ commit_candidate() {
 }
 
 verify_candidate() {
+    local port listeners
     assert_bound_state
     file_hash_matches "$CONFIG_PATH" || fail 'VERIFICATION_FAILED' 65
     [[ -x "$XRAY_PATH" && -x "$SYSTEMCTL_PATH" ]] \
@@ -276,6 +359,14 @@ verify_candidate() {
         || fail 'VERIFICATION_FAILED' 65
     "$SYSTEMCTL_PATH" is-active --quiet "$SERVICE_NAME" >/dev/null 2>&1 \
         || fail 'VERIFICATION_FAILED' 65
+    if [[ "${#REQUIRED_TCP_PORTS[@]}" -gt 0 ]]; then
+        [[ -x "$SS_PATH" ]] || fail 'VERIFICATION_UNAVAILABLE' 69
+        for port in "${REQUIRED_TCP_PORTS[@]}"; do
+            listeners="$("$SS_PATH" -H -ltn "sport = :$port" 2>/dev/null)" \
+                || fail 'VERIFICATION_UNAVAILABLE' 69
+            [[ -n "$listeners" ]] || fail 'VERIFICATION_FAILED' 65
+        done
+    fi
     emit_receipt
 }
 

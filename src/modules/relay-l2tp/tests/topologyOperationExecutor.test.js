@@ -88,13 +88,18 @@ function runnerRequest(command) {
         ['targetProfile', '--target-profile'],
     ].map(([field, flag]) => [field, command.match(new RegExp(`${flag} ([A-Za-z0-9._:-]+)`))?.[1]]));
     fields.command = command.match(/--command ([a-z]+)/)?.[1];
+    const checksToken = command.match(/--checks ([A-Za-z0-9_-]+)/)?.[1];
+    if (checksToken) {
+        fields.checks = JSON.parse(Buffer.from(checksToken, 'base64url').toString('utf8'));
+    }
     return fields;
 }
 
 function execResult(request, overrides = {}) {
+    const { checks: _checks, ...receiptRequest } = request;
     return {
         code: 0,
-        stdout: `${JSON.stringify({ ok: true, ...request, ...overrides })}\n`,
+        stdout: `${JSON.stringify({ ok: true, ...receiptRequest, ...overrides })}\n`,
         stderr: '',
     };
 }
@@ -238,6 +243,19 @@ test('reuses the prepared binding for closed commit, verify, and rollback receip
         serviceUnit: 'xray-bridge.service',
         serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
         configPath: '/usr/local/etc/xray-bridge/config.json',
+        checks: [
+            {
+                type: 'service',
+                serviceUnit: 'xray-bridge.service',
+                expectedState: 'active',
+            },
+            {
+                type: 'port',
+                protocol: 'tcp',
+                port: 12001,
+                expectedState: 'listening',
+            },
+        ],
     });
     const nodeContent = Buffer.from(node.candidate.bytes).toString('utf8');
     const nodeCandidateHash = `sha256:${node.candidateHash}`;
@@ -260,6 +278,7 @@ test('reuses the prepared binding for closed commit, verify, and rollback receip
             candidateHash: event.request.candidateHash,
             backupId: event.request.backupId,
             targetProfile: event.request.targetProfile,
+            checks: event.request.checks,
             options: event.options,
         })),
         ['prepare', 'commit', 'verify', 'rollback'].map((command, index) => ({
@@ -269,6 +288,7 @@ test('reuses the prepared binding for closed commit, verify, and rollback receip
             candidateHash: nodeCandidateHash,
             backupId: prepared.backupId,
             targetProfile: 'xray-bridge',
+            checks: index === 2 ? node.checks : undefined,
             options: index === 0 ? { stdin: nodeContent } : undefined,
         })),
     );

@@ -131,8 +131,7 @@ function durablePlan(operation, operationId) {
         || operation.nodes.length === 0) {
         throw new TypeError('Invalid durable topology operation');
     }
-    const nodes = operation.nodes.map(durableNodePlan)
-        .sort((left, right) => left.node.localeCompare(right.node));
+    const nodes = operation.nodes.map(durableNodePlan);
     if (new Set(nodes.map(node => node.node)).size !== nodes.length) {
         throw new TypeError('Invalid durable topology operation');
     }
@@ -164,9 +163,7 @@ function orderedPlanNodes(plan) {
         || plan.nodes.length === 0) {
         throw new TypeError('Topology operation worker received an invalid frozen plan');
     }
-    const nodes = [...plan.nodes].sort((left, right) => (
-        entityId(left?.node).localeCompare(entityId(right?.node))
-    ));
+    const nodes = [...plan.nodes];
     const ids = nodes.map(node => entityId(node?.node));
     if (ids.some(id => id === '') || new Set(ids).size !== ids.length
         || nodes.some(node => typeof node.candidateHash !== 'string'

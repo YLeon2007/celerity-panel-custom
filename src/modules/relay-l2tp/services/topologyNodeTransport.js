@@ -11,6 +11,10 @@ const TOPOLOGY_NODE_COMMANDS = Object.freeze({
     ROLLBACK: 'rollback',
 });
 const TARGET_PROFILES = new Set(['xray-main', 'xray-bridge']);
+const SERVICE_BY_TARGET_PROFILE = Object.freeze({
+    'xray-main': 'xray.service',
+    'xray-bridge': 'xray-bridge.service',
+});
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CANDIDATE_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const BASE_KEYS = Object.freeze([
@@ -53,6 +57,26 @@ function assertBasePlan(plan, extraKeys = []) {
         || !TARGET_PROFILES.has(plan.targetProfile)) {
         throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid topology node plan');
     }
+}
+
+function validChecks(checks, targetProfile) {
+    const serviceUnit = SERVICE_BY_TARGET_PROFILE[targetProfile];
+    return Array.isArray(checks) && checks.every(check => {
+        if (check?.type === 'service') {
+            return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
+                && check.serviceUnit === serviceUnit
+                && check.expectedState === 'active';
+        }
+        if (check?.type === 'port') {
+            return hasExactKeys(check, ['expectedState', 'port', 'protocol', 'type'])
+                && check.protocol === 'tcp'
+                && Number.isSafeInteger(check.port)
+                && check.port >= 1
+                && check.port <= 65535
+                && check.expectedState === 'listening';
+        }
+        return false;
+    });
 }
 
 function isCanonicalXrayConfig(content) {
@@ -132,8 +156,14 @@ class TopologyNodeTransport {
     }
 
     async #invoke(command, request, artifactRequired = false) {
-        assertBasePlan(request, artifactRequired ? ['artifact'] : []);
+        const checksRequired = command === TOPOLOGY_NODE_COMMANDS.VERIFY;
+        assertBasePlan(request, artifactRequired
+            ? ['artifact']
+            : (checksRequired ? ['checks'] : []));
         if (artifactRequired) assertArtifact(request.artifact, request.candidateHash);
+        if (checksRequired && !validChecks(request.checks, request.targetProfile)) {
+            throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid topology node plan');
+        }
 
         let result;
         try {
@@ -144,6 +174,7 @@ class TopologyNodeTransport {
                 candidateHash: request.candidateHash,
                 backupId: request.backupId,
                 targetProfile: request.targetProfile,
+                ...(checksRequired ? { checks: request.checks.map(check => ({ ...check })) } : {}),
                 ...(artifactRequired ? { artifact: { ...request.artifact } } : {}),
             });
         } catch {

@@ -23,6 +23,12 @@ receipt() {
         "$command" "$operation_id" "$node_id" "$candidate_hash" "$backup_id" "$profile"
 }
 
+encode_checks() {
+    /usr/bin/python3 -c \
+        'import base64, sys; print(base64.urlsafe_b64encode(sys.argv[1].encode()).decode().rstrip("="))' \
+        "$1"
+}
+
 invoke() {
     local label="$1"
     local command="$2"
@@ -80,7 +86,15 @@ printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
     'case "$1" in restart|stop) exit 0 ;; is-active) [[ "$2" == "--quiet" && ! -e "${CELERITY_TOPOLOGY_ROOT}/service.inactive" ]] && exit 0 ;; esac' \
     'exit 64' \
     >"$TEST_ROOT/usr/bin/systemctl"
-chmod +x "$TEST_ROOT/usr/bin/systemctl"
+printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' \
+    'printf '\''ss %s\n'\'' "$*" >>"${CELERITY_TOPOLOGY_ROOT}/ss.log"' \
+    '[[ "$1" == "-H" && "$2" == "-ltn" && "$3" =~ ^sport\ =\ :([1-9][0-9]{0,4})$ ]]' \
+    'port="${BASH_REMATCH[1]}"' \
+    '[[ -f "${CELERITY_TOPOLOGY_ROOT}/listening-ports" ]] || exit 0' \
+    '/usr/bin/grep -Fx -- "$port" "${CELERITY_TOPOLOGY_ROOT}/listening-ports" >/dev/null || exit 0' \
+    'printf '\''LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:*\n'\'' "$port"' \
+    >"$TEST_ROOT/usr/bin/ss"
+chmod +x "$TEST_ROOT/usr/bin/systemctl" "$TEST_ROOT/usr/bin/ss"
 
 asset_candidate=$'{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[]}\n'
 asset_hash="sha256:$(printf '%s' "$asset_candidate" | sha256sum | cut -d' ' -f1)"
@@ -124,6 +138,7 @@ main_hash="sha256:$(printf '%s' "$main_candidate" | sha256sum | cut -d' ' -f1)"
 main_operation='topology-operation-main'
 main_node='main-node-1'
 main_backup='topology-backup-main'
+main_checks="$(encode_checks '[{"type":"service","serviceUnit":"xray.service","expectedState":"active"},{"type":"port","protocol":"tcp","port":1080,"expectedState":"listening"}]')"
 
 invoke main-prepare prepare "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main "$main_candidate"
 [[ "$status" -eq 0 ]] || fail 'xray-main prepare failed'
@@ -152,7 +167,7 @@ invoke main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_bac
 xray_calls_before_missing_assets="$(<"$TEST_ROOT/xray.log")"
 systemctl_calls_before_missing_assets="$(<"$TEST_ROOT/systemctl.log")"
 rmdir "$TEST_ROOT/usr/local/share/xray"
-invoke missing-assets-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+invoke missing-assets-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$main_checks"
 [[ "$status" -ne 0 ]] || fail 'verify accepted a missing fixed Xray asset directory'
 [[ "$errors" == '{"ok":false,"code":"XRAY_ASSETS_UNAVAILABLE"}' ]] \
     || fail 'active verification with missing Xray assets returned the wrong error'
@@ -162,23 +177,54 @@ invoke missing-assets-main-verify verify "$main_operation" "$main_node" "$main_h
     || fail 'active verification reached systemctl with missing fixed assets'
 mkdir -p "$TEST_ROOT/usr/local/share/xray"
 
-invoke main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+: >"$TEST_ROOT/xray.log"
+: >"$TEST_ROOT/systemctl.log"
+rm -f "$TEST_ROOT/listening-ports" "$TEST_ROOT/ss.log"
+invoke missing-listener-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$main_checks"
+[[ "$status" -ne 0 ]] || fail 'verify accepted an active service with a missing required TCP listener'
+[[ "$errors" == '{"ok":false,"code":"VERIFICATION_FAILED"}' ]] \
+    || fail 'missing required TCP listener returned the wrong verification error'
+[[ "$(<"$TEST_ROOT/systemctl.log")" == 'systemctl is-active --quiet xray.service' ]] \
+    || fail 'missing-listener verification did not first require an active fixed service'
+[[ "$(<"$TEST_ROOT/ss.log")" == 'ss -H -ltn sport = :1080' ]] \
+    || fail 'missing-listener verification did not query the required TCP port'
+
+: >"$TEST_ROOT/xray.log"
+: >"$TEST_ROOT/systemctl.log"
+: >"$TEST_ROOT/ss.log"
+printf '%s\n' '1080' >"$TEST_ROOT/listening-ports"
+invoke main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$main_checks"
 [[ "$status" -eq 0 ]] || fail 'xray-main verify failed'
 [[ "$output" == "$(receipt verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
     || fail 'xray-main verify receipt was not strict and bound'
 mapfile -t xray_calls <"$TEST_ROOT/xray.log"
-[[ "${#xray_calls[@]}" -eq 2 \
-    && "${xray_calls[0]}" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' \
-    && "${xray_calls[1]}" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/usr/local/etc/xray/config.json' ]] \
+[[ "${#xray_calls[@]}" -eq 1 \
+    && "${xray_calls[0]}" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/usr/local/etc/xray/config.json' ]] \
     || fail 'active verification was not bound to the fixed Xray assets and config'
 mapfile -t systemctl_calls <"$TEST_ROOT/systemctl.log"
-[[ "${#systemctl_calls[@]}" -eq 2 \
-    && "${systemctl_calls[0]}" == 'systemctl restart xray.service' \
-    && "${systemctl_calls[1]}" == 'systemctl is-active --quiet xray.service' ]] \
+[[ "${#systemctl_calls[@]}" -eq 1 \
+    && "${systemctl_calls[0]}" == 'systemctl is-active --quiet xray.service' ]] \
     || fail 'verify did not explicitly require the main service to be active'
+[[ "$(<"$TEST_ROOT/ss.log")" == 'ss -H -ltn sport = :1080' ]] \
+    || fail 'verify did not explicitly require the declared TCP listener'
+
+: >"$TEST_ROOT/xray.log"
+: >"$TEST_ROOT/systemctl.log"
+: >"$TEST_ROOT/ss.log"
+invoke missing-checks-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 ]] || fail 'verify accepted a request without closed checks'
+[[ "$errors" == '{"ok":false,"code":"INVALID_ARGUMENTS"}' ]] \
+    || fail 'missing verify checks returned the wrong argument error'
+foreign_service_checks="$(encode_checks '[{"type":"service","serviceUnit":"xray-bridge.service","expectedState":"active"}]')"
+invoke foreign-service-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$foreign_service_checks"
+[[ "$status" -ne 0 ]] || fail 'verify accepted checks for a foreign service profile'
+[[ "$errors" == '{"ok":false,"code":"INVALID_CHECKS"}' ]] \
+    || fail 'foreign service checks returned the wrong validation error'
+[[ ! -s "$TEST_ROOT/xray.log" && ! -s "$TEST_ROOT/systemctl.log" && ! -s "$TEST_ROOT/ss.log" ]] \
+    || fail 'rejected checks reached runtime verification'
 
 touch "$TEST_ROOT/service.inactive"
-invoke inactive-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+invoke inactive-main-verify verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$main_checks"
 [[ "$status" -ne 0 ]] || fail 'verify accepted an inactive main service'
 [[ "$errors" == '{"ok":false,"code":"VERIFICATION_FAILED"}' ]] \
     || fail 'inactive main service returned the wrong verification error'
@@ -187,7 +233,7 @@ rm -f "$TEST_ROOT/service.inactive"
 : >"$TEST_ROOT/xray.log"
 : >"$TEST_ROOT/systemctl.log"
 printf '%s\n' '{"inbounds":[],"outbounds":[]}' >"$TEST_ROOT/usr/local/etc/xray/config.json"
-invoke wrong-active-hash verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+invoke wrong-active-hash verify "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main '' --checks "$main_checks"
 [[ "$status" -ne 0 ]] || fail 'verify accepted an active config hash mismatch'
 [[ "$errors" == '{"ok":false,"code":"VERIFICATION_FAILED"}' ]] \
     || fail 'active config hash mismatch returned the wrong verification error'

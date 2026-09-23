@@ -83,7 +83,7 @@ function createModel() {
     };
 }
 
-test('createFrozen persists only sorted allowlisted durable candidate artifacts', async () => {
+test('createFrozen durably preserves composer deployment order without sorting by node id', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
     const bridgeCandidate = candidate('bridge');
@@ -122,17 +122,6 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
         leaseUntil: null,
         nodes: [
             {
-                node: 'node-a',
-                nodeRef: 'portal',
-                role: 'portal',
-                targetProfile: 'xray-main',
-                checks: portal.checks,
-                state: 'pending',
-                candidateHash: portalCandidate.sha256,
-                candidate: portalCandidate,
-                backupId: '',
-            },
-            {
                 node: 'node-b',
                 nodeRef: 'bridge',
                 role: 'bridge',
@@ -141,6 +130,17 @@ test('createFrozen persists only sorted allowlisted durable candidate artifacts'
                 state: 'pending',
                 candidateHash: bridgeCandidate.sha256,
                 candidate: bridgeCandidate,
+                backupId: '',
+            },
+            {
+                node: 'node-a',
+                nodeRef: 'portal',
+                role: 'portal',
+                targetProfile: 'xray-main',
+                checks: portal.checks,
+                state: 'pending',
+                candidateHash: portalCandidate.sha256,
+                candidate: portalCandidate,
                 backupId: '',
             },
         ],

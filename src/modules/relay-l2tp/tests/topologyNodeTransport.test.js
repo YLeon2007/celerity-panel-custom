@@ -31,6 +31,19 @@ const basePlan = Object.freeze({
     backupId: 'topology-backup-17-bridge-2',
     targetProfile: 'xray-bridge',
 });
+const checks = Object.freeze([
+    Object.freeze({
+        type: 'service',
+        serviceUnit: 'xray-bridge.service',
+        expectedState: 'active',
+    }),
+    Object.freeze({
+        type: 'port',
+        protocol: 'tcp',
+        port: 12001,
+        expectedState: 'listening',
+    }),
+]);
 
 function receipt(command, overrides = {}) {
     return {
@@ -126,10 +139,18 @@ test('commit, verify, and rollback send only the closed bound plan', async () =>
             },
         });
 
-        assert.deepEqual(await transport[command]({ ...basePlan }), receipt(command));
+        const request = {
+            ...basePlan,
+            ...(command === 'verify' ? { checks } : {}),
+        };
+        assert.deepEqual(await transport[command](request), receipt(command));
         assert.deepEqual(calls, [{
             runnerPath: TOPOLOGY_NODE_RUNNER_PATH,
-            request: { command, ...basePlan },
+            request: {
+                command,
+                ...basePlan,
+                ...(command === 'verify' ? { checks: structuredClone(checks) } : {}),
+            },
         }]);
     }
 });
@@ -269,7 +290,7 @@ test('receipts are strict and bound to command, operation, node, hash, backup, a
                 return execResult(invalidReceipt);
             },
         });
-        await assert.rejects(transport.verify({ ...basePlan }), error => {
+        await assert.rejects(transport.verify({ ...basePlan, checks }), error => {
             assert.equal(error.name, 'TopologyNodeTransportError');
             assert.equal(error.code, 'INVALID_RECEIPT');
             assert.equal(error.message, 'Invalid topology node receipt');

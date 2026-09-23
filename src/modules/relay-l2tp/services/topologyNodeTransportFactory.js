@@ -17,6 +17,10 @@ const TARGET_PROFILE_BY_ROLE = Object.freeze({
 const COMMANDS = new Set(Object.values(TOPOLOGY_NODE_COMMANDS));
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CANDIDATE_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const SERVICE_BY_TARGET_PROFILE = Object.freeze({
+    'xray-main': 'xray.service',
+    'xray-bridge': 'xray-bridge.service',
+});
 const BASE_RUNNER_REQUEST_KEYS = Object.freeze([
     'backupId',
     'candidateHash',
@@ -49,11 +53,34 @@ function isExactResolutionRequest(request) {
         && Object.hasOwn(TARGET_PROFILE_BY_ROLE, request.role);
 }
 
+function validChecks(checks, targetProfile) {
+    const serviceUnit = SERVICE_BY_TARGET_PROFILE[targetProfile];
+    return Array.isArray(checks) && checks.every(check => {
+        if (check?.type === 'service') {
+            return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
+                && check.serviceUnit === serviceUnit
+                && check.expectedState === 'active';
+        }
+        if (check?.type === 'port') {
+            return hasExactKeys(check, ['expectedState', 'port', 'protocol', 'type'])
+                && check.protocol === 'tcp'
+                && Number.isSafeInteger(check.port)
+                && check.port >= 1
+                && check.port <= 65535
+                && check.expectedState === 'listening';
+        }
+        return false;
+    });
+}
+
 function assertRunnerRequest(runnerPath, request, binding) {
     const artifactRequired = request?.command === TOPOLOGY_NODE_COMMANDS.PREPARE;
+    const checksRequired = request?.command === TOPOLOGY_NODE_COMMANDS.VERIFY;
     const expectedKeys = artifactRequired
         ? [...BASE_RUNNER_REQUEST_KEYS, 'artifact'].sort()
-        : BASE_RUNNER_REQUEST_KEYS;
+        : (checksRequired
+            ? [...BASE_RUNNER_REQUEST_KEYS, 'checks'].sort()
+            : BASE_RUNNER_REQUEST_KEYS);
     if (
         runnerPath !== TOPOLOGY_NODE_RUNNER_PATH
         || !hasExactKeys(request, expectedKeys)
@@ -64,6 +91,7 @@ function assertRunnerRequest(runnerPath, request, binding) {
         || !SAFE_ID_PATTERN.test(request.nodeId)
         || !SAFE_ID_PATTERN.test(request.backupId)
         || !CANDIDATE_HASH_PATTERN.test(request.candidateHash)
+        || (checksRequired && !validChecks(request.checks, request.targetProfile))
         || (
             artifactRequired
             && (
@@ -81,7 +109,7 @@ function assertRunnerRequest(runnerPath, request, binding) {
 }
 
 function runnerCommand(request) {
-    return [
+    const args = [
         TOPOLOGY_NODE_RUNNER_PATH,
         `--command ${request.command}`,
         `--operation-id ${request.operationId}`,
@@ -89,7 +117,13 @@ function runnerCommand(request) {
         `--candidate-hash ${request.candidateHash}`,
         `--backup-id ${request.backupId}`,
         `--target-profile ${request.targetProfile}`,
-    ].join(' ');
+    ];
+    if (request.command === TOPOLOGY_NODE_COMMANDS.VERIFY) {
+        const encodedChecks = Buffer.from(JSON.stringify(request.checks), 'utf8')
+            .toString('base64url');
+        args.push(`--checks ${encodedChecks}`);
+    }
+    return args.join(' ');
 }
 
 function createArtifactInvoker(nodeSSH, binding) {

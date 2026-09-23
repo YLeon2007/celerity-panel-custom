@@ -175,17 +175,19 @@ function projectFrozenNode(context) {
         candidateHash,
         backupId,
         targetProfile: node.targetProfile,
+        checks: node.checks,
         content,
     });
 }
 
-function transportRequest(binding) {
+function transportRequest(binding, includeChecks = false) {
     return {
         operationId: binding.operationId,
         nodeId: binding.nodeId,
         candidateHash: binding.candidateHash,
         backupId: binding.backupId,
         targetProfile: binding.targetProfile,
+        ...(includeChecks ? { checks: binding.checks } : {}),
     };
 }
 
@@ -341,7 +343,10 @@ class TopologyOperationExecutor {
         const state = this.#preparedBinding(context);
         try {
             return assertReceipt(
-                await state.transport[command](transportRequest(state.binding)),
+                await state.transport[command](transportRequest(
+                    state.binding,
+                    command === 'verify',
+                )),
                 command,
                 state.binding,
             );
