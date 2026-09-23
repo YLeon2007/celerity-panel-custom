@@ -62,9 +62,9 @@ class TopologyUserResync {
     }
 
     async resyncPlan(plan) {
-        if (plan?.kind !== 'deploy') {
-            return { nodeCount: 0, userCount: 0 };
-        }
+        // Topology operations are deploy-only: undeploy goes through the
+        // legacy cascadeService path and never creates a topology operation,
+        // so every plan reaching the worker is a deploy.
         const syncService = this.syncService;
         if (typeof syncService?._getUsersForNode !== 'function'
             || typeof syncService?.addXrayUser !== 'function') {

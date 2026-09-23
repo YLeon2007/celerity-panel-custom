@@ -31,18 +31,17 @@ test('TopologyUserResync: requires HyNode.findById', () => {
     assert.throws(() => new TopologyUserResync({}), TypeError);
 });
 
-test('TopologyUserResync: skips non-deploy plans', async () => {
-    let called = 0;
+test('TopologyUserResync: no users means a zero-count no-op', async () => {
     const resync = new TopologyUserResync({
-        HyNode: hyNodeFixture({}),
+        HyNode: hyNodeFixture({ 'node-portal': { _id: 'p', name: 'P', type: 'xray' } }),
         syncService: {
-            async _getUsersForNode() { called += 1; return []; },
+            async _getUsersForNode() { return []; },
             async addXrayUser() { return true; },
         },
+        logger: { info() {}, warn() {}, error() {} },
     });
-    const result = await resync.resyncPlan(planFixture('undeploy'));
-    assert.deepEqual(result, { nodeCount: 0, userCount: 0 });
-    assert.equal(called, 0);
+    const result = await resync.resyncPlan(planFixture());
+    assert.deepEqual(result, { nodeCount: 1, userCount: 0 });
 });
 
 test('TopologyUserResync: pushes users to deduped xray nodes only', async () => {
