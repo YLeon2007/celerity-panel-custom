@@ -11,7 +11,7 @@ if [[ "$#" -ne 0 ]]; then
     exit 64
 fi
 
-readonly -a REQUIRED_PACKAGES=(strongswan xl2tpd ppp nftables)
+readonly -a REQUIRED_PACKAGES=(strongswan strongswan-starter xl2tpd ppp nftables)
 dpkg_query_path="$(command -v dpkg-query || true)"
 apt_get_path="$(command -v apt-get || true)"
 if [[ -z "$dpkg_query_path" || -z "$apt_get_path" ]]; then
