@@ -39,8 +39,10 @@ if (( changed > 0 )); then
         --yes \
         --no-install-recommends \
         --no-remove \
+        -o 'Dpkg::Options::=--force-confdef' \
+        -o 'Dpkg::Options::=--force-confold' \
         install \
-        "${missing_packages[@]}" >/dev/null 2>&1; then
+        "${missing_packages[@]}" >/dev/null 2>&1 </dev/null; then
         emit_error 'RUNTIME_INSTALL_FAILED'
         exit 70
     fi
