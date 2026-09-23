@@ -1085,6 +1085,23 @@
         if (el) el.remove();
     }
 
+    async function deployTopology() {
+        const res = await fetch('/api/cascade/topology/deploy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 409) {
+            await loadTopology();
+        }
+        if (!res.ok) {
+            const message = data?.error?.message || data?.error || ('HTTP ' + res.status);
+            throw new Error(message);
+        }
+        return data;
+    }
+
     window._cascadeDeploy = async function (linkId) {
         if (!confirm(i18n.confirmDeploy || 'Deploy this cascade link?')) return;
         setActionLoading(i18n.deploying || 'Deploying...');
@@ -1094,19 +1111,13 @@
         if (edge.length) edge.data('status', 'syncing');
 
         try {
-            const res  = await fetch('/api/cascade/links/' + linkId + '/deploy', { method: 'POST' });
-            const data = await res.json();
-            if (data.success) {
-                showToast(i18n.deploySuccess || 'Deployed');
-                loadTopology();
-                closeInfoModal();
-            } else {
-                if (edge.length && prev) edge.data('status', prev);
-                showToast((i18n.deployFailed || 'Failed') + ': ' + (data.error || ''), 'error');
-            }
+            await deployTopology();
+            showToast(i18n.deployQueued || i18n.deploySuccess || 'Deployment queued');
+            loadTopology();
+            closeInfoModal();
         } catch (err) {
             if (edge.length && prev) edge.data('status', prev);
-            showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
+            showToast((i18n.deployFailed || 'Failed') + ': ' + err.message, 'error');
         } finally { resetActionLoading(); }
     };
 
@@ -1117,22 +1128,12 @@
         cy.edges().forEach(function (e) { e.data('status', 'syncing'); });
 
         try {
-            const res  = await fetch('/api/cascade/chain/deploy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ linkId: linkId }),
-            });
-            const data = await res.json();
-            if (data.success) {
-                showToast((i18n.chainDeploySuccess || 'Chain synced') + ': ' + data.deployed + ' ' + (i18n.nodes || 'nodes'));
-                loadTopology();
-                closeInfoModal();
-            } else {
-                showToast((i18n.chainDeployFailed || 'Chain sync failed') + ': ' + (data.errors || []).join(', '), 'error');
-                loadTopology();
-            }
+            await deployTopology();
+            showToast(i18n.deployQueued || i18n.chainDeploySuccess || 'Deployment queued');
+            loadTopology();
+            closeInfoModal();
         } catch (err) {
-            showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
+            showToast((i18n.chainDeployFailed || 'Chain sync failed') + ': ' + err.message, 'error');
             loadTopology();
         } finally { resetActionLoading(); }
     };

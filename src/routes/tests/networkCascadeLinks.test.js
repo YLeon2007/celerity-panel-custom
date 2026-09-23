@@ -41,3 +41,62 @@ test('network UI refreshes a stale snapshot on 409 without replaying the mutatio
     assert.doesNotMatch(handlerSource, /method: (?:'POST'|'PUT'|'DELETE')/);
     assert.doesNotMatch(NETWORK_SOURCE, /\/api\/cascade\/links\/[^'\n]+\/reconnect/);
 });
+
+function extractHandler(name) {
+    const start = NETWORK_SOURCE.indexOf(`window.${name} = async function`);
+    assert.notStrictEqual(start, -1, `${name} handler must exist`);
+    const end = NETWORK_SOURCE.indexOf('\n    window.', start + 1);
+    return NETWORK_SOURCE.slice(start, end === -1 ? undefined : end);
+}
+
+function extractDeployPath(name) {
+    // Deploy handlers delegate the network call to the shared deployTopology helper.
+    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology()');
+    assert.notStrictEqual(helperStart, -1, 'deployTopology helper must exist');
+    const helperEnd = NETWORK_SOURCE.indexOf('\n    window.', helperStart);
+    assert.notStrictEqual(helperEnd, -1, 'deployTopology helper must precede the handlers');
+    return NETWORK_SOURCE.slice(helperStart, helperEnd) + extractHandler(name);
+}
+
+test('network UI deploy and chain sync use the revision-safe topology deploy endpoint', () => {
+    for (const name of ['_cascadeDeploy', '_cascadeDeployChain']) {
+        const handler = extractDeployPath(name);
+        assert.match(
+            handler,
+            /fetch\('\/api\/cascade\/topology\/deploy', \{[\s\S]*?method: 'POST',[\s\S]*?body: JSON\.stringify\(\{ expectedTopologyRevision: topologyRevision \}\)/,
+            `${name} must POST to the revision-safe topology deploy endpoint`,
+        );
+        assert.doesNotMatch(
+            handler,
+            /\/api\/cascade\/links\/' \+ linkId \+ '\/deploy|\/api\/cascade\/chain\/deploy/,
+            `${name} must not call retired unversioned deploy endpoints`,
+        );
+    }
+});
+
+test('network UI deploy surfaces typed error messages instead of stringified objects', () => {
+    for (const name of ['_cascadeDeploy', '_cascadeDeployChain']) {
+        const handler = extractDeployPath(name);
+        assert.match(
+            handler,
+            /error\?\.message \|\|/,
+            `${name} must render error.message from typed error payloads`,
+        );
+        assert.doesNotMatch(
+            handler,
+            /\+ \(data\.error \|\| ''\)|\+ \(data\.errors \|\| \[\]\)\.join/,
+            `${name} must not stringify error objects`,
+        );
+    }
+});
+
+test('network UI deploy refreshes the topology snapshot on revision conflict', () => {
+    for (const name of ['_cascadeDeploy', '_cascadeDeployChain']) {
+        const handler = extractDeployPath(name);
+        assert.match(
+            handler,
+            /409[\s\S]*?loadTopology\(\)/,
+            `${name} must reload the snapshot on a 409 stale-revision conflict`,
+        );
+    }
+});

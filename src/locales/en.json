@@ -1455,6 +1455,7 @@
     "quickLinkBridge": "Bridge",
     "swapNodes": "Swap",
     "deployFailed": "Deploy failed",
+    "deployQueued": "Topology deployment queued",
     "networkError": "Network error",
     "rolePortal": "PORTAL",
     "roleBridge": "BRIDGE",
