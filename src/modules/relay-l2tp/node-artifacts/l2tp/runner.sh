@@ -33,6 +33,18 @@ if [[ ! "$OPERATION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ ]]; then
 fi
 
 readonly OPERATION_DIR="$OPERATIONS_ROOT/$OPERATION_ID"
+# Operations whose first step carries no artifacts (e.g. sync_users backup)
+# have no upload to create the directory — create it on demand.
+if [[ -L "$OPERATION_DIR" ]]; then
+    emit_error 'INVALID_OPERATION_DIRECTORY'
+    exit 66
+fi
+if [[ ! -d "$OPERATION_DIR" ]]; then
+    if ! /usr/bin/install -d -m 0700 -o root -g root -- "$OPERATION_DIR"; then
+        emit_error 'INVALID_OPERATION_DIRECTORY'
+        exit 66
+    fi
+fi
 case "$COMMAND" in
     preflight)
         exec_artifact "$ARTIFACT_DIR/preflight.sh" "$OPERATION_DIR/desired.json"
