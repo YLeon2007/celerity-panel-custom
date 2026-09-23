@@ -109,6 +109,21 @@ function getPanelCertificates(domain) {
     }
 }
 
+// Reusable shell snippet: enable and persist BBR congestion control + fq
+// qdisc. Long-RTT inter-node links (cascade reverse tunnels) collapse under
+// cubic on packet loss; BBR keeps the tunnel window open. Idempotent and
+// safe on kernels without BBR: falls back to the current algorithm.
+const TCP_BBR_SNIPPET = `
+echo "=== TCP tuning (BBR) ==="
+if modprobe tcp_bbr 2>/dev/null && sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+    printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/99-celerity-bbr.conf
+    echo tcp_bbr > /etc/modules-load.d/celerity-bbr.conf
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    echo "Done: BBR + fq enabled and persisted (/etc/sysctl.d/99-celerity-bbr.conf)"
+else
+    echo "SKIP: BBR unavailable on this kernel, keeping $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo current)"
+fi`;
+
 // Reusable shell snippet: persist iptables rules across reboots
 const IPTABLES_SAVE_SNIPPET = `
 if command -v netfilter-persistent &> /dev/null; then
@@ -876,6 +891,8 @@ fi
 
 mkdir -p /usr/local/etc/xray
 echo "Done: Directory /usr/local/etc/xray ready"
+
+${TCP_BBR_SNIPPET}
 `;
 
 // ACME (acme.sh) setup for tlsSource='acme': issue LE cert for `domain` via
