@@ -13,6 +13,7 @@
     }
 
     const i18n = window._networkI18n || {};
+    const csrfToken = window._networkCsrfToken || '';
 
     const STATUS_COLORS = {
         online:   '#22c55e',
@@ -1088,7 +1089,7 @@
     async function deployTopology() {
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
             body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
         });
         const data = await res.json().catch(() => ({}));
@@ -1096,7 +1097,10 @@
             await loadTopology();
         }
         if (!res.ok) {
-            const message = data?.error?.message || data?.error || ('HTTP ' + res.status);
+            const errorValue = data?.error;
+            const message = typeof errorValue === 'string'
+                ? errorValue
+                : (errorValue?.message || errorValue?.code || ('HTTP ' + res.status));
             throw new Error(message);
         }
         return data;

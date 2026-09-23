@@ -1152,6 +1152,7 @@ function switchNodesView(view) {
     }
 }
 
+window._networkCsrfToken = <%- JSON.stringify(csrfToken || '') %>;
 window._networkI18n = {
     selectPortal: <%- JSON.stringify(t('network.selectPortal')) %>,
     selectBridge: <%- JSON.stringify(t('network.selectBridge')) %>,

@@ -9,7 +9,10 @@ const NETWORK_SOURCE = fs.readFileSync(
     path.resolve(__dirname, '../../../public/js/network.js'),
     'utf8',
 );
-
+const NODES_VIEW_SOURCE = fs.readFileSync(
+    path.resolve(__dirname, '../../../views/nodes.ejs'),
+    'utf8',
+);
 test('network UI consumes and tracks the versioned cascade-link snapshot', () => {
     assert.match(NETWORK_SOURCE, /let topologyRevision = null;/);
     assert.match(NETWORK_SOURCE, /let deployedRevision = null;/);
@@ -79,13 +82,13 @@ test('network UI deploy surfaces typed error messages instead of stringified obj
         const handler = extractDeployPath(name);
         assert.match(
             handler,
-            /error\?\.message \|\|/,
-            `${name} must render error.message from typed error payloads`,
+            /typeof errorValue === 'string'[\s\S]*?errorValue\?\.message/,
+            `${name} must surface typed error.message payloads`,
         );
         assert.doesNotMatch(
             handler,
-            /\+ \(data\.error \|\| ''\)|\+ \(data\.errors \|\| \[\]\)\.join/,
-            `${name} must not stringify error objects`,
+            /throw new Error\(data\?\.error\)/,
+            `${name} must not stringify a bare error object`,
         );
     }
 });
@@ -95,8 +98,28 @@ test('network UI deploy refreshes the topology snapshot on revision conflict', (
         const handler = extractDeployPath(name);
         assert.match(
             handler,
-            /409[\s\S]*?loadTopology\(\)/,
-            `${name} must reload the snapshot on a 409 stale-revision conflict`,
+            /res\.status === 409[\s\S]*?loadTopology\(\)/,
+            `${name} must reload the topology snapshot on 409`,
         );
     }
+});
+
+test('network UI deploy sends the panel CSRF token on session requests', () => {
+    // POST /api/cascade/topology/deploy enforces requirePanelCsrf for session auth.
+    const helper = extractDeployPath('_cascadeDeploy');
+    assert.match(helper, /['"]x-csrf-token['"]: csrfToken/, 'deployTopology must send the x-csrf-token header');
+    assert.match(NETWORK_SOURCE, /window\._networkCsrfToken/, 'network.js must read the page-exposed CSRF token');
+});
+
+test('network UI deploy never stringifies a bare error object', () => {
+    const helper = extractDeployPath('_cascadeDeploy');
+    assert.match(
+        helper,
+        /typeof errorValue === 'string'[\s\S]*?errorValue\?\.message \|\| errorValue\?\.code/,
+        'deployTopology must fall back to error.code for object errors without message',
+    );
+});
+
+test('nodes view exposes the CSRF token for network module requests', () => {
+    assert.match(NODES_VIEW_SOURCE, /window\._networkCsrfToken = <%- JSON\.stringify\(csrfToken \|\| ''\) %>;/);
 });
