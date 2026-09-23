@@ -476,7 +476,7 @@ class SyncService {
         // config would silently crash Xray on the node.
         let configContent;
         try {
-            configContent = configGenerator.generateXrayConfig(node, users);
+            configContent = configGenerator.generateXrayConfigWithApi(node, users);
         } catch (genErr) {
             if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
                 logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);

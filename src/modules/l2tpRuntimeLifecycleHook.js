@@ -130,7 +130,7 @@ function createL2tpRootHostDependencies({
     syncService = require('../services/syncService'),
     candidateNodeResolver,
     candidateUserResolver,
-    configGenerator = require('../services/configGenerator').generateXrayConfig,
+    configGenerator = require('../services/configGenerator').generateXrayConfigWithApi,
     fragmentProvider = require('./relay-l2tp/services/l2tpXrayFragmentProvider')
         .buildL2tpXrayFragment,
     requireAuth = require('../routes/panel/helpers').requireAuth,

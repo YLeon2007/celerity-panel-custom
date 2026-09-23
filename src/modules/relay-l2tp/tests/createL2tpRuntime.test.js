@@ -126,6 +126,7 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     const [fragment] = runtime.configFragmentRegistry.compose({
         plan: {
             relay: { controlPlaneIps: ['198.51.100.10'] },
+            group: { id: 'route-group-a' },
             paths: [{
                 pathKey: 'primary',
                 healthy: true,
@@ -140,6 +141,8 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
         tproxyPort: 12345,
     });
     assert.equal(fragment.id, 'relay-l2tp');
+    assert.equal(fragment.outbounds[0].tag, 'cascade-primary');
+    assert.equal(fragment.outbounds[0].protocol, 'socks');
 });
 
 test('does not surface injected model or transport secrets', () => {

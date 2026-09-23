@@ -1,5 +1,10 @@
 'use strict';
 
+const {
+    cascadePathIngressPort,
+    cascadePathIngressTag,
+} = require('./cascadePathIngress');
+
 class TopologyDraftError extends Error {
     constructor(code, message, details = {}) {
         super(message);
@@ -34,17 +39,29 @@ function projectLinks(links) {
 }
 
 function projectGroups(groups) {
-    return (groups || []).map(group => ({
-        _id: entityId(group),
-        mode: group.mode,
-        strategy: group.strategy,
-        paths: (group.paths || []).map(path => ({
-            pathKey: path.pathKey,
-            linkIds: (path.linkIds || []).map(entityId),
-            priority: path.priority,
-            enabled: path.enabled !== false,
-        })),
-    }));
+    return (groups || []).map(group => {
+        const groupId = entityId(group);
+        return {
+            _id: groupId,
+            mode: group.mode,
+            strategy: group.strategy,
+            paths: (group.paths || []).map(path => {
+                const projected = {
+                    pathKey: path.pathKey,
+                    linkIds: (path.linkIds || []).map(entityId),
+                    priority: path.priority,
+                    enabled: path.enabled !== false,
+                };
+                if (groupId !== null && typeof path.pathKey === 'string' && path.pathKey.length > 0) {
+                    projected.cascadePathIngress = {
+                        tag: cascadePathIngressTag(path.pathKey),
+                        port: cascadePathIngressPort(groupId, path.pathKey),
+                    };
+                }
+                return projected;
+            }),
+        };
+    });
 }
 
 function buildCandidate(snapshot, mutation) {

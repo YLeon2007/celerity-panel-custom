@@ -751,7 +751,6 @@ function buildVlessInbound(inbound, users, node) {
 function generateXrayConfig(node, users, options = {}) {
     const { fragments = [] } = options;
     const xray = node.xray || {};
-    const apiPort = xray.apiPort || 61000;
     const mainInboundTag = xray.inboundTag || 'vless-in';
 
     // Main inbound is described by the flat xray.* fields plus node.port.
@@ -780,34 +779,7 @@ function generateXrayConfig(node, users, options = {}) {
 
     const config = {
         log: buildXrayLogSection(node),
-        api: {
-            services: ['HandlerService', 'StatsService'],
-            tag: 'API',
-        },
-        stats: {},
-        policy: {
-            levels: {
-                '0': {
-                    statsUserUplink: true,
-                    statsUserDownlink: true,
-                },
-            },
-            system: {
-                statsInboundUplink: true,
-                statsInboundDownlink: true,
-                statsOutboundUplink: true,
-                statsOutboundDownlink: true,
-            },
-        },
         inbounds: [
-            // gRPC API inbound (local only, for user management)
-            {
-                listen: '127.0.0.1',
-                port: apiPort,
-                protocol: 'dokodemo-door',
-                settings: { address: '127.0.0.1' },
-                tag: 'API_INBOUND',
-            },
             buildVlessInbound(mainInbound, users, node),
             ...extraInbounds.map(extra => buildVlessInbound(extra, users, node)),
         ],
@@ -818,11 +790,6 @@ function generateXrayConfig(node, users, options = {}) {
         routing: {
             domainStrategy: 'IPIfNonMatch',
             rules: [
-                {
-                    inboundTag: ['API_INBOUND'],
-                    outboundTag: 'API',
-                    type: 'field',
-                },
                 // geoip:private is added last via ensurePrivateIpBlock() after
                 // all cascade rules are applied, so cascade tunnels to LAN IPs work
             ],
@@ -933,6 +900,75 @@ function generateXrayConfig(node, users, options = {}) {
         ? config
         : composeXrayConfig(config, fragments);
     return JSON.stringify(finalConfig, null, 2);
+}
+
+/**
+ * Attach the panel management API surface (gRPC HandlerService/StatsService)
+ * to a parsed Xray config. `generateXrayConfig` deliberately ships without it
+ * so bridge-profile instances (relay/bridge cascade candidates) never bind the
+ * loopback API port twice on hosts that also run xray-main. Callers that
+ * produce the node's main config must opt in explicitly.
+ *
+ * @param {Object} config - Parsed Xray config object (mutated in place)
+ * @param {number} apiPort - Loopback port for the gRPC API inbound
+ * @returns {Object} the same config object
+ */
+function applyXrayApi(config, apiPort) {
+    if (!Number.isSafeInteger(apiPort) || apiPort < 1 || apiPort > 65535) {
+        throw new TypeError('applyXrayApi requires a valid loopback API port');
+    }
+    config.api = {
+        services: ['HandlerService', 'StatsService'],
+        tag: 'API',
+    };
+    config.stats = {};
+    config.policy = {
+        levels: {
+            '0': {
+                statsUserUplink: true,
+                statsUserDownlink: true,
+            },
+        },
+        system: {
+            statsInboundUplink: true,
+            statsInboundDownlink: true,
+            statsOutboundUplink: true,
+            statsOutboundDownlink: true,
+        },
+    };
+    config.inbounds = config.inbounds || [];
+    config.inbounds.unshift({
+        // gRPC API inbound (local only, for user management)
+        listen: '127.0.0.1',
+        port: apiPort,
+        protocol: 'dokodemo-door',
+        settings: { address: '127.0.0.1' },
+        tag: 'API_INBOUND',
+    });
+    config.routing = config.routing || { rules: [] };
+    config.routing.rules = config.routing.rules || [];
+    config.routing.rules.unshift({
+        inboundTag: ['API_INBOUND'],
+        outboundTag: 'API',
+        type: 'field',
+    });
+    return config;
+}
+
+/**
+ * Generate the node main Xray config including the panel management API.
+ * This matches the pre-split `generateXrayConfig` behaviour and is the right
+ * entry point for xray-main deployments (sync, node setup, portal candidates).
+ *
+ * @param {Object} node - Node document (with xray sub-object)
+ * @param {Array} users - Array of user documents (with xrayUuid)
+ * @param {Object} [options] - Additional generation options
+ * @returns {string} JSON string
+ */
+function generateXrayConfigWithApi(node, users, options = {}) {
+    const config = JSON.parse(generateXrayConfig(node, users, options));
+    applyXrayApi(config, (node.xray || {}).apiPort || 61000);
+    return JSON.stringify(config, null, 2);
 }
 
 /**
@@ -1276,6 +1312,47 @@ function generateCombinedBridgeConfig(links, options = {}) {
 }
 
 /**
+ * Attach per-path cascade ingress listeners to a parsed Xray config.
+ * Each entry installs a loopback-only socks inbound tagged `cascade-<pathKey>`
+ * so the local L2TP tproxy fragment can inject traffic into that path, plus
+ * (when egressTag is given) a routing rule forwarding it into the path egress.
+ *
+ * @param {Object} config - Parsed Xray config object (mutated in place)
+ * @param {Array<{pathKey: string, port: number, egressTag?: string}>} entries
+ */
+function applyCascadePathIngress(config, entries = []) {
+    if (!entries || entries.length === 0) return;
+
+    config.inbounds = config.inbounds || [];
+    config.routing = config.routing || { rules: [] };
+    config.routing.rules = config.routing.rules || [];
+
+    for (const entry of entries) {
+        if (!entry || typeof entry.pathKey !== 'string' || entry.pathKey.length === 0) {
+            throw new TypeError('Cascade path ingress entries require a pathKey');
+        }
+        if (!Number.isSafeInteger(entry.port) || entry.port < 1 || entry.port > 65535) {
+            throw new TypeError('Cascade path ingress entries require a valid port');
+        }
+        const tag = `cascade-${entry.pathKey}`;
+        config.inbounds.push({
+            tag,
+            listen: '127.0.0.1',
+            port: entry.port,
+            protocol: 'socks',
+            settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' },
+        });
+        if (entry.egressTag !== undefined) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: [tag],
+                outboundTag: entry.egressTag,
+            });
+        }
+    }
+}
+
+/**
  * Generate Xray JSON config for a Relay (intermediate hop) node.
  * The Relay connects upstream to a Portal AND accepts downstream connections from Bridges,
  * forwarding traffic through the chain instead of releasing to internet.
@@ -1283,9 +1360,10 @@ function generateCombinedBridgeConfig(links, options = {}) {
  * @param {Object} upstreamLink - CascadeLink where this node is bridgeNode (connects TO portal)
  * @param {Object} upstreamPortal - HyNode of the upstream portal
  * @param {Array} downstreamLinks - CascadeLinks where this node is portalNode (accepts FROM bridges)
+ * @param {Array} [cascadePathIngress] - Per-path ingress entries ({pathKey, port, egressTag})
  * @returns {string} JSON string ready to write to config.json
  */
-function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
+function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, cascadePathIngress = []) {
     const upDomain = getCascadeTunnelDomain(upstreamLink);
     const upProtocol = upstreamLink.tunnelProtocol || 'vless';
     const upLinkId = String(upstreamLink._id).slice(-8);
@@ -1393,6 +1471,10 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
         });
     }
 
+    // Per-path cascade ingress: loopback socks listeners that let the local
+    // L2TP tproxy fragment inject traffic into the selected path's egress.
+    applyCascadePathIngress(config, cascadePathIngress);
+
     // LAST: Blackhole for private IPs
     config.routing.rules.push({
         type: 'field',
@@ -1406,6 +1488,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks) {
 /**
  * Build streamSettings for the cascade tunnel connection between Portal and Bridge.
  * Supports tcp/ws/grpc/xhttp transports and none/tls/reality security.
+ *
  * Note: Xray-core 25.x+ renamed splithttp to xhttp; old DB rows storing
  * 'splithttp' are normalized to 'xhttp' here for forward compatibility.
  *
@@ -1536,10 +1619,34 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
  *                               Must have bridgeNode populated.
  * @param {string|string[]} clientInboundTags - Tag(s) of the client-facing inbound(s).
  *        See applyReversePortal for the same multi-tag semantics.
+ * @param {Array} [cascadePathIngress] - Per-path ingress entries ({pathKey, port});
+ *        each installs a loopback socks inbound whose tag joins the rule set
+ *        pointing at the chain exit outbound.
  */
-function applyForwardChain(config, forwardLinks, clientInboundTags) {
+function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathIngress = []) {
     if (!forwardLinks || forwardLinks.length === 0) return;
-    const tags = normalizeInboundTags(clientInboundTags);
+    const ingressTags = [];
+    if (cascadePathIngress && cascadePathIngress.length > 0) {
+        config.inbounds = config.inbounds || [];
+        for (const entry of cascadePathIngress) {
+            if (!entry || typeof entry.pathKey !== 'string' || entry.pathKey.length === 0) {
+                throw new TypeError('Cascade path ingress entries require a pathKey');
+            }
+            if (!Number.isSafeInteger(entry.port) || entry.port < 1 || entry.port > 65535) {
+                throw new TypeError('Cascade path ingress entries require a valid port');
+            }
+            const tag = `cascade-${entry.pathKey}`;
+            config.inbounds.push({
+                tag,
+                listen: '127.0.0.1',
+                port: entry.port,
+                protocol: 'socks',
+                settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' },
+            });
+            ingressTags.push(tag);
+        }
+    }
+    const tags = [...normalizeInboundTags(clientInboundTags), ...ingressTags];
 
     config.outbounds = config.outbounds || [];
     config.routing = config.routing || { rules: [] };
@@ -1799,6 +1906,8 @@ module.exports = {
     generateSystemdService,
     applyOutboundsAndAcl,
     generateXrayConfig,
+    applyXrayApi,
+    generateXrayConfigWithApi,
     buildXrayLogSection,
     XRAY_ACCESS_LOG_PATH,
     buildXrayStreamSettings,
@@ -1807,6 +1916,8 @@ module.exports = {
     generateBridgeConfig,
     generateCombinedBridgeConfig,
     generateRelayConfig,
+    generateRelayConfigWithIngress: generateRelayConfig,
+    applyCascadePathIngress,
     buildCascadeTunnelStreamSettings,
     generateBridgeSystemdService,
     applyForwardChain,

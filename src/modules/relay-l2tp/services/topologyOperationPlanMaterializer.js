@@ -3,6 +3,7 @@
 const {
     composeFrozenTopologyDeploymentPlan,
 } = require('./frozenTopologyDeploymentPlanComposer');
+const { projectGroups } = require('../domain/topologyDraft');
 
 const TEST_TOPOLOGY_TARGET = 'test';
 const TEST_TOPOLOGY_HOST_IDENTITY = 'test.infograd.online';
@@ -136,6 +137,23 @@ function snapshotLink(link) {
     return { id, source, target, mode: link.mode };
 }
 
+function projectPinnedGroups(groups) {
+    return projectGroups(groups).map(group => {
+        const id = assertSafeId(group._id, 'UNSAFE_TOPOLOGY_GROUP_IDENTITY');
+        return {
+            ...group,
+            _id: id,
+            paths: group.paths.map(path => ({
+                ...path,
+                pathKey: assertSafeId(path.pathKey, 'UNSAFE_TOPOLOGY_GROUP_IDENTITY'),
+                linkIds: path.linkIds.map(linkId => (
+                    assertSafeId(linkId, 'UNSAFE_TOPOLOGY_GROUP_IDENTITY')
+                )),
+            })),
+        };
+    }).sort((left, right) => left._id.localeCompare(right._id, 'en'));
+}
+
 function projectPinnedSnapshot(pinnedSnapshot) {
     const topology = pinnedSnapshot?.topology;
     const compiled = pinnedSnapshot?.compiled;
@@ -158,12 +176,13 @@ function projectPinnedSnapshot(pinnedSnapshot) {
     }
     const links = topology.links.map(snapshotLink)
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+    const groups = projectPinnedGroups(topology.groups);
     const relays = compiled.relays.map(relay => ({
         nodeId: assertSafeId(relay?.nodeId, 'UNSAFE_COMPILED_RELAY_IDENTITY'),
     })).sort((left, right) => left.nodeId.localeCompare(right.nodeId, 'en'));
 
     return {
-        snapshot: { nodes, links },
+        snapshot: { nodes, links, groups },
         compiledTopology: { valid: true, relays },
     };
 }

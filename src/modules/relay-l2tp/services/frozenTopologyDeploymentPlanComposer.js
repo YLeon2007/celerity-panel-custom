@@ -3,6 +3,9 @@
 const { createHash } = require('node:crypto');
 const configGenerator = require('../../../services/configGenerator');
 const { composeXrayConfig } = require('./xrayConfigComposer');
+const {
+    cascadePathIngressPort,
+} = require('../domain/cascadePathIngress');
 
 const XRAY_CONFIG_FIELDS = Object.freeze([
     'apiPort',
@@ -395,7 +398,34 @@ function composeBaselineWithCascade(baseline, cascade) {
     return config;
 }
 
-function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById }) {
+// Every enabled path of every route group whose subchain crosses this relay's
+// downstream link gets a deterministic loopback socks ingress on the relay.
+// Disabled paths stay without ingress; ordering is normalized so frozen
+// candidates are permutation-stable.
+function relayPathIngress(groups, downstreamLinkId, egressTag) {
+    const entries = [];
+    for (const group of groups || []) {
+        const groupId = entityId(group);
+        if (!groupId || !Array.isArray(group.paths)) continue;
+        for (const path of group.paths) {
+            if (path?.enabled === false) continue;
+            if (typeof path?.pathKey !== 'string' || path.pathKey.length === 0) continue;
+            const linkIds = (Array.isArray(path.linkIds) ? path.linkIds : []).map(entityId);
+            if (!linkIds.includes(downstreamLinkId)) continue;
+            entries.push({
+                pathKey: path.pathKey,
+                port: cascadePathIngressPort(groupId, path.pathKey),
+                ...(egressTag === undefined ? {} : { egressTag }),
+            });
+        }
+    }
+    entries.sort((left, right) => (
+        left.pathKey.localeCompare(right.pathKey, 'en') || left.port - right.port
+    ));
+    return entries;
+}
+
+function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [] }) {
     const nodeConfigsById = new Map(chain.orderedNodes.map(({ id, node }) => [
         id,
         projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
@@ -407,27 +437,50 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
         nodeConfigsById,
     ));
     const configs = new Map();
+    const ingressByNodeId = new Map();
 
     for (let index = 0; index < chain.orderedNodes.length; index += 1) {
         const { id, node } = chain.orderedNodes[index];
         const nodeConfig = nodeConfigsById.get(id);
         let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
 
+        if (node.role === 'portal') {
+            // The portal keeps the panel management API on its xray-main profile.
+            configGenerator.applyXrayApi(config, nodeConfig.xray.apiPort || 61000);
+        }
+
         if (chain.mode === 'forward') {
             if (node.role === 'portal') {
                 configGenerator.applyForwardChain(config, links, clientInboundTags(nodeConfig));
             } else {
                 configGenerator.applyForwardHopInbound(config, [links[index - 1]]);
+                if (node.role === 'relay') {
+                    const ingress = relayPathIngress(groups, chain.orderedLinks[index].id);
+                    if (ingress.length > 0) {
+                        // Chain the per-path socks ingress to the suffix exit.
+                        configGenerator.applyForwardChain(config, links.slice(index), [], ingress);
+                        ingressByNodeId.set(id, ingress);
+                    }
+                }
             }
         } else if (node.role === 'portal') {
             configGenerator.applyReversePortal(config, [links[index]], clientInboundTags(nodeConfig));
         } else if (node.role === 'relay') {
-            const cascade = parseGeneratedConfig(configGenerator.generateRelayConfig(
+            // Relay reverse candidates are pure cascade configs: the baseline
+            // is intentionally not composed in, so the bridge profile never
+            // binds the panel API port alongside the relay xray-main instance.
+            const ingress = relayPathIngress(
+                groups,
+                chain.orderedLinks[index].id,
+                `portal-down-${String(links[index]._id).slice(-8)}`,
+            );
+            if (ingress.length > 0) ingressByNodeId.set(id, ingress);
+            config = parseGeneratedConfig(configGenerator.generateRelayConfigWithIngress(
                 links[index - 1],
                 links[index - 1].portalNode,
                 [links[index]],
+                ingress,
             ));
-            config = composeBaselineWithCascade(config, cascade);
         } else {
             const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig([links[index - 1]]));
             cascade.inbounds = cascade.inbounds || [];
@@ -437,7 +490,7 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
         config = composeXrayConfig(config, []);
         configs.set(id, config);
     }
-    return configs;
+    return { configs, ingressByNodeId };
 }
 
 function canonicalize(value) {
@@ -448,12 +501,14 @@ function canonicalize(value) {
     );
 }
 
-function candidateForNode({ mode, nodeId, node, nodeRef, orderedLinks, linkMetadataById, config }) {
+function candidateForNode({ mode, nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [] }) {
     const target = TARGETS_BY_ROLE[node.role];
-    const listeningPorts = orderedLinks
-        .filter(entry => (mode === 'reverse' ? entry.source : entry.target) === nodeId)
-        .map(entry => assertPort(linkMetadataById.get(entry.id).tunnelPort))
-        .sort((left, right) => left - right);
+    const listeningPorts = [...new Set([
+        ...orderedLinks
+            .filter(entry => (mode === 'reverse' ? entry.source : entry.target) === nodeId)
+            .map(entry => assertPort(linkMetadataById.get(entry.id).tunnelPort)),
+        ...ingressPorts,
+    ])].sort((left, right) => left - right);
     const checks = [
         { type: 'service', serviceUnit: target.serviceUnit, expectedState: 'active' },
         ...listeningPorts.map(port => ({
@@ -554,13 +609,15 @@ function composeFrozenTopologyDeploymentPlan({
 
     const refs = topologyRefs(chain.orderedNodes);
     let candidateConfigsById;
+    let ingressByNodeId;
     try {
-        candidateConfigsById = buildCandidateConfigs({
+        ({ configs: candidateConfigsById, ingressByNodeId } = buildCandidateConfigs({
             chain,
             refs,
             nodeMetadataById,
             linkMetadataById,
-        });
+            groups: snapshot.groups,
+        }));
     } catch (error) {
         if (error instanceof FrozenTopologyDeploymentPlanError) throw error;
         throw new FrozenTopologyDeploymentPlanError(
@@ -579,6 +636,7 @@ function composeFrozenTopologyDeploymentPlan({
         orderedLinks: chain.orderedLinks,
         linkMetadataById,
         config: candidateConfigsById.get(id),
+        ingressPorts: (ingressByNodeId.get(id) || []).map(entry => entry.port),
     }));
 
     return deepFreeze({

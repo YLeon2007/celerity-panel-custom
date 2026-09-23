@@ -63,8 +63,11 @@ test('rejects non-string identities instead of deriving ambiguous ports', () => 
         ['', 'primary'],
         ['route-group-a', ''],
         [42, 'primary'],
+        ['route-group-a', 42],
     ]) {
         assert.throws(() => cascadePathIngressPort(groupId, pathKey), { name: 'TypeError' });
+    }
+    for (const pathKey of [undefined, null, '', 42]) {
         assert.throws(() => cascadePathIngressTag(pathKey), { name: 'TypeError' });
     }
 });

@@ -330,7 +330,7 @@ test('root host dependencies provide the exact safe candidate composition requir
         async buildCandidate() {}
     }
     const createPreflightRunner = () => async () => ({ ok: true, checks: [] });
-    const configGenerator = require('../../services/configGenerator').generateXrayConfig;
+    const configGenerator = require('../../services/configGenerator').generateXrayConfigWithApi;
     const fragmentProvider = require('../relay-l2tp/services/l2tpXrayFragmentProvider')
         .buildL2tpXrayFragment;
     const node = { _id: 'node-a', groups: [] };

@@ -1093,7 +1093,7 @@ async function setupXrayNode(node, options = {}) {
         const users = await syncService._getUsersForNode(node);
         let configContent;
         try {
-            configContent = configGenerator.generateXrayConfig(node, users);
+            configContent = configGenerator.generateXrayConfigWithApi(node, users);
         } catch (genErr) {
             if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
                 const human = genErr.code === 'PANEL_CERT_UNAVAILABLE'
