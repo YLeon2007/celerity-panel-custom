@@ -8,6 +8,22 @@ const test = require('node:test');
 
 const templatePath = path.resolve(__dirname, '../../../../views/l2tp.ejs');
 
+// The template is fully localized through t(); tests render it with the
+// English locale so structural assertions stay human-readable.
+const enMessages = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, '../../../locales/en.json'),
+    'utf8',
+));
+function testT(key) {
+    const value = String(key).split('.').reduce(
+        (node, part) => (node === null || node === undefined ? undefined : node[part]),
+        enMessages,
+    );
+    if (typeof value !== 'string') throw new Error(`missing en locale key: ${key}`);
+    return value;
+}
+const TEST_RENDER_CONTEXT = Object.freeze({ t: testT, lang: 'en' });
+
 test('L2TP panel template exposes typed controls while keeping passwords input-only', () => {
     const template = fs.readFileSync(templatePath, 'utf8');
     const configureFields = [
@@ -77,6 +93,7 @@ test('L2TP panel template exposes typed controls while keeping passwords input-o
 test('L2TP panel renders a minimal typed route-group editor when no groups exist', () => {
     const template = fs.readFileSync(templatePath, 'utf8');
     const html = ejs.render(template, {
+        ...TEST_RENDER_CONTEXT,
         csrfToken: 'test-csrf-token',
         operations: [],
         relays: [],
@@ -220,6 +237,7 @@ test('route-group payload builder allowlists and validates typed priority-failov
 test('route-group editor tracks the versioned snapshot and refreshes stale conflicts without replay', () => {
     const template = fs.readFileSync(templatePath, 'utf8');
     const html = ejs.render(template, {
+        ...TEST_RENDER_CONTEXT,
         csrfToken: 'test-csrf-token',
         deployedRevision: 5,
         operations: [],
@@ -323,6 +341,7 @@ test('route-group response normalization accepts the persisted API shape and dro
 test('rendered L2TP inline script has valid JavaScript syntax', () => {
     const template = fs.readFileSync(templatePath, 'utf8');
     const html = ejs.render(template, {
+        ...TEST_RENDER_CONTEXT,
         csrfToken: 'test-csrf-token',
         operations: [],
         relays: [],

@@ -1,76 +1,76 @@
 <section class="page-header">
     <div>
-        <h1>L2TP/IPsec Relay</h1>
+        <h1><%= t('l2tp.title') %></h1>
         <p class="muted">
-            Topology revision: <strong data-topology-revision><%= topologyRevision %></strong> ·
-            Deployed revision: <strong data-deployed-revision><%= typeof deployedRevision === 'undefined' ? 0 : deployedRevision %></strong>
+            <%= t('l2tp.topologyRevision') %>: <strong data-topology-revision><%= topologyRevision %></strong> ·
+            <%= t('l2tp.deployedRevision') %>: <strong data-deployed-revision><%= typeof deployedRevision === 'undefined' ? 0 : deployedRevision %></strong>
         </p>
     </div>
 </section>
 
 <section class="card" data-l2tp-route-groups>
-    <h2>Route groups</h2>
-    <p class="muted">Priority failover across explicit, ordered cascade links.</p>
+    <h2><%= t('l2tp.routeGroups') %></h2>
+    <p class="muted"><%= t('l2tp.routeGroupsHint') %></p>
     <form data-route-group-form>
         <input type="hidden" name="routeGroupId" value="">
         <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
-        <label>Name
+        <label><%= t('l2tp.rgName') %>
             <input type="text" name="name" maxlength="128" required>
         </label>
-        <label>Mode
+        <label><%= t('l2tp.rgMode') %>
             <select name="mode" required>
-                <option value="reverse">Reverse</option>
-                <option value="forward">Forward</option>
+                <option value="reverse"><%= t('l2tp.modeReverse') %></option>
+                <option value="forward"><%= t('l2tp.modeForward') %></option>
             </select>
         </label>
-        <label>Strategy
+        <label><%= t('l2tp.rgStrategy') %>
             <input type="text" value="priority-failover" readonly aria-readonly="true">
         </label>
         <div data-route-group-paths>
             <fieldset class="card" data-route-group-path-row>
-                <legend>Path</legend>
-                <label>Path key
+                <legend><%= t('l2tp.rgPath') %></legend>
+                <label><%= t('l2tp.rgPathKey') %>
                     <input type="text" name="pathKey" maxlength="64" required>
                 </label>
-                <label>Ordered link IDs
+                <label><%= t('l2tp.rgLinkIds') %>
                     <input type="text" name="linkIds" required placeholder="link id, link id">
                 </label>
-                <label>Priority
+                <label><%= t('l2tp.rgPriority') %>
                     <input type="number" name="priority" step="any" required>
                 </label>
                 <label>
                     <input type="checkbox" name="enabled" checked>
-                    Enabled
+                    <%= t('l2tp.rgEnabled') %>
                 </label>
-                <button type="button" data-route-group-action="remove-path">Remove path</button>
+                <button type="button" data-route-group-action="remove-path"><%= t('l2tp.rgRemovePath') %></button>
             </fieldset>
         </div>
         <div class="form-actions">
-            <button type="button" data-route-group-action="add-path">Add path</button>
-            <button type="submit" data-route-group-action="save">Create group</button>
-            <button type="button" data-route-group-action="cancel" hidden>Cancel edit</button>
+            <button type="button" data-route-group-action="add-path"><%= t('l2tp.rgAddPath') %></button>
+            <button type="submit" data-route-group-action="save"><%= t('l2tp.rgCreate') %></button>
+            <button type="button" data-route-group-action="cancel" hidden><%= t('l2tp.rgCancelEdit') %></button>
         </div>
         <output data-route-group-result aria-live="polite"></output>
     </form>
-    <p class="muted" data-route-group-empty><%= routeGroups && routeGroups.length ? 'Loading route groups…' : 'No route groups.' %></p>
+    <p class="muted" data-route-group-empty><%= routeGroups && routeGroups.length ? t('l2tp.rgLoading') : t('l2tp.rgEmpty') %></p>
     <div data-route-group-list></div>
     <template data-route-group-path-template>
         <fieldset class="card" data-route-group-path-row>
-            <legend>Path</legend>
-            <label>Path key
+            <legend><%= t('l2tp.rgPath') %></legend>
+            <label><%= t('l2tp.rgPathKey') %>
                 <input type="text" name="pathKey" maxlength="64" required>
             </label>
-            <label>Ordered link IDs
+            <label><%= t('l2tp.rgLinkIds') %>
                 <input type="text" name="linkIds" required placeholder="link id, link id">
             </label>
-            <label>Priority
+            <label><%= t('l2tp.rgPriority') %>
                 <input type="number" name="priority" step="any" required>
             </label>
             <label>
                 <input type="checkbox" name="enabled" checked>
-                Enabled
+                <%= t('l2tp.rgEnabled') %>
             </label>
-            <button type="button" data-route-group-action="remove-path">Remove path</button>
+            <button type="button" data-route-group-action="remove-path"><%= t('l2tp.rgRemovePath') %></button>
         </fieldset>
     </template>
     <template data-route-group-item-template>
@@ -79,88 +79,88 @@
             <p data-route-group-summary></p>
             <ul data-route-group-path-list></ul>
             <div class="form-actions">
-                <button type="button" data-route-group-action="edit">Edit</button>
-                <button type="button" data-route-group-action="remove">Remove</button>
+                <button type="button" data-route-group-action="edit"><%= t('l2tp.rgEdit') %></button>
+                <button type="button" data-route-group-action="remove"><%= t('l2tp.rgRemove') %></button>
             </div>
         </article>
     </template>
 </section>
 
 <section class="card">
-    <h2>Relay nodes</h2>
+    <h2><%= t('l2tp.relayNodes') %></h2>
     <% if (!relays || relays.length === 0) { %>
-        <p class="muted">No relay nodes are available.</p>
+        <p class="muted"><%= t('l2tp.noRelays') %></p>
     <% } %>
     <% for (const relay of (relays || [])) { %>
         <article class="card" data-l2tp-relay data-node-id="<%= relay.id %>">
             <h3><%= relay.name || relay.id %></h3>
             <p>
-                Node: <%= relay.nodeStatus || 'unknown' %> ·
-                L2TP: <%= relay.l2tpStatus %> ·
-                Desired: <%= relay.desiredState %>
+                <%= t('l2tp.nodeLabel') %>: <%= relay.nodeStatus || 'unknown' %> ·
+                <%= t('l2tp.l2tpLabel') %>: <%= relay.l2tpStatus %> ·
+                <%= t('l2tp.desiredLabel') %>: <%= relay.desiredState %>
             </p>
             <form data-l2tp-form>
                 <input type="hidden" name="expectedTopologyRevision" value="<%= topologyRevision %>">
-                <label>Client CIDR
+                <label><%= t('l2tp.clientCidr') %>
                     <input type="text" name="clientCidr" value="<%= relay.clientCidr || '' %>" placeholder="10.77.0.0/24" required>
                 </label>
-                <label>Local IP
+                <label><%= t('l2tp.localIp') %>
                     <input type="text" name="localAddress" value="<%= relay.localAddress || '' %>" placeholder="10.77.0.1" required>
                 </label>
-                <label>Pool start
+                <label><%= t('l2tp.poolStart') %>
                     <input type="text" name="poolStart" value="<%= relay.poolStart || '' %>" placeholder="10.77.0.10" required>
                 </label>
-                <label>Pool end
+                <label><%= t('l2tp.poolEnd') %>
                     <input type="text" name="poolEnd" value="<%= relay.poolEnd || '' %>" placeholder="10.77.0.200" required>
                 </label>
-                <label>DNS servers
+                <label><%= t('l2tp.dnsServers') %>
                     <input type="text" name="dnsServers" value="<%= (relay.dnsServers || []).join(', ') %>" placeholder="1.1.1.1, 9.9.9.9" required>
                 </label>
-                <label>TPROXY port
+                <label><%= t('l2tp.tproxyPort') %>
                     <input type="number" name="tproxyPort" value="<%= relay.tproxyPort ?? '' %>" min="1" max="65535" step="1" placeholder="12345" required>
                 </label>
-                <label>Firewall mark
+                <label><%= t('l2tp.fwmark') %>
                     <input type="number" name="fwmark" value="<%= relay.fwmark ?? '' %>" min="1" max="4294967295" step="1" placeholder="77" required>
                 </label>
-                <label>Route table
+                <label><%= t('l2tp.routeTable') %>
                     <input type="number" name="routeTable" value="<%= relay.routeTable ?? '' %>" min="1" max="4294967295" step="1" placeholder="177" required>
                 </label>
-                <label>Route group
+                <label><%= t('l2tp.routeGroup') %>
                     <select name="routeGroupId" required>
-                        <option value="">Select route group</option>
+                        <option value=""><%= t('l2tp.selectRouteGroup') %></option>
                         <% for (const group of (routeGroups || [])) { %>
                             <option value="<%= group.id %>" <%= relay.routeGroupId === group.id ? 'selected' : '' %>>
-                                <%= group.name %> (<%= group.mode %>, <%= group.strategy %>)
+                                <%= group.name %> (<%= group.mode === 'reverse' ? t('l2tp.modeReverse') : t('l2tp.modeForward') %>, <%= group.strategy %>)
                             </option>
                         <% } %>
                     </select>
                 </label>
                 <div class="form-actions">
-                    <button type="button" data-l2tp-action="configure">Save desired state</button>
-                    <button type="button" data-l2tp-action="preflight">Preflight</button>
-                    <button type="button" data-l2tp-action="install">Queue install</button>
+                    <button type="button" data-l2tp-action="configure"><%= t('l2tp.saveDesired') %></button>
+                    <button type="button" data-l2tp-action="preflight"><%= t('l2tp.preflight') %></button>
+                    <button type="button" data-l2tp-action="install"><%= t('l2tp.queueInstall') %></button>
                 </div>
                 <output data-l2tp-result aria-live="polite"></output>
             </form>
             <section data-l2tp-users>
-                <h4>L2TP users</h4>
+                <h4><%= t('l2tp.usersTitle') %></h4>
                 <form data-l2tp-user-form autocomplete="off">
-                    <label>Login
+                    <label><%= t('l2tp.login') %>
                         <input type="text" name="login" maxlength="64" required>
                     </label>
-                    <label>Client IP
+                    <label><%= t('l2tp.clientIp') %>
                         <input type="text" name="ip" placeholder="10.77.0.10" required>
                     </label>
-                    <label>Password
+                    <label><%= t('l2tp.secret') %>
                         <input type="password" name="password" autocomplete="new-password" maxlength="1024" required>
                     </label>
                     <label>
                         <input type="checkbox" name="enabled" checked>
-                        Enabled
+                        <%= t('l2tp.userEnabled') %>
                     </label>
-                    <button type="submit" data-l2tp-user-action="create">Add user</button>
+                    <button type="submit" data-l2tp-user-action="create"><%= t('l2tp.addUser') %></button>
                 </form>
-                <p class="muted" data-l2tp-user-empty>Loading users…</p>
+                <p class="muted" data-l2tp-user-empty><%= t('l2tp.loadingUsers') %></p>
                 <div data-l2tp-user-list></div>
                 <template data-l2tp-user-row>
                     <div class="card">
@@ -178,9 +178,9 @@
 </section>
 
 <section class="card">
-    <h2>Recent operations</h2>
+    <h2><%= t('l2tp.recentOps') %></h2>
     <% if (!operations || operations.length === 0) { %>
-        <p class="muted">No operations.</p>
+        <p class="muted"><%= t('l2tp.noOps') %></p>
     <% } else { %>
         <ul>
             <% for (const operation of operations) { %>
@@ -197,6 +197,28 @@
 <script>
 (() => {
     const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
+    const I18N = <%- JSON.stringify({
+        rgCreate: t('l2tp.rgCreate'),
+        rgUpdate: t('l2tp.rgUpdate'),
+        rgEmpty: t('l2tp.rgEmpty'),
+        rgRemoved: t('l2tp.rgRemoved'),
+        rgCreated: t('l2tp.rgCreated'),
+        rgUpdated: t('l2tp.rgUpdated'),
+        rgRemoveConfirm: t('l2tp.rgRemoveConfirm'),
+        selectRouteGroup: t('l2tp.selectRouteGroup'),
+        modeReverse: t('l2tp.modeReverse'),
+        modeForward: t('l2tp.modeForward'),
+        priorityWord: t('l2tp.priorityWord'),
+        working: t('l2tp.working'),
+        noUsers: t('l2tp.noUsers'),
+        stateEnabled: t('l2tp.stateEnabled'),
+        stateDisabled: t('l2tp.stateDisabled'),
+        actionDisable: t('l2tp.actionDisable'),
+        actionEnable: t('l2tp.actionEnable'),
+        userUpdated: t('l2tp.userUpdated'),
+        userAdded: t('l2tp.userAdded'),
+    }) %>;
+    const modeLabel = (mode) => (mode === 'reverse' ? I18N.modeReverse : I18N.modeForward);
     const ROUTE_GROUPS_URL = '/api/cascade/route-groups';
     const ROUTE_GROUP_STRATEGY = 'priority-failover';
     const routeGroupRoot = document.querySelector('[data-l2tp-route-groups]');
@@ -415,7 +437,7 @@
         routeGroupForm.reset();
         routeGroupForm.elements.routeGroupId.value = '';
         routeGroupPaths.replaceChildren(createRouteGroupPathRow());
-        routeGroupSave.textContent = 'Create group';
+        routeGroupSave.textContent = I18N.rgCreate;
         routeGroupCancel.hidden = true;
     }
 
@@ -424,7 +446,7 @@
         routeGroupForm.elements.name.value = group.name;
         routeGroupForm.elements.mode.value = group.mode;
         routeGroupPaths.replaceChildren(...group.paths.map(createRouteGroupPathRow));
-        routeGroupSave.textContent = 'Update group';
+        routeGroupSave.textContent = I18N.rgUpdate;
         routeGroupCancel.hidden = false;
         setResult(routeGroupOutput, '');
         routeGroupForm.elements.name.focus();
@@ -435,12 +457,12 @@
             const selectedId = selector.value;
             const placeholder = document.createElement('option');
             placeholder.value = '';
-            placeholder.textContent = 'Select route group';
+            placeholder.textContent = I18N.selectRouteGroup;
             selector.replaceChildren(placeholder);
             for (const group of groups) {
                 const option = document.createElement('option');
                 option.value = group.id;
-                option.textContent = `${group.name} (${group.mode}, ${group.strategy})`;
+                option.textContent = `${group.name} (${modeLabel(group.mode)}, ${group.strategy})`;
                 selector.append(option);
             }
             if (groups.some(group => group.id === selectedId)) selector.value = selectedId;
@@ -469,9 +491,9 @@
     }
 
     async function removeRouteGroup(group, button) {
-        if (!window.confirm(`Remove route group “${group.name}”?`)) return;
+        if (!window.confirm(I18N.rgRemoveConfirm.replace('{name}', group.name))) return;
         button.disabled = true;
-        setResult(routeGroupOutput, 'Working…');
+        setResult(routeGroupOutput, I18N.working);
         try {
             const response = await fetch(routeGroupUrl(group.id), {
                 method: 'DELETE',
@@ -492,7 +514,7 @@
             if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
             if (routeGroupForm.elements.routeGroupId.value === group.id) resetRouteGroupForm();
             applyRouteGroupSnapshot(snapshot);
-            setResult(routeGroupOutput, 'Route group removed');
+            setResult(routeGroupOutput, I18N.rgRemoved);
         } catch {
             setResult(routeGroupOutput, 'ROUTE_GROUP_REMOVE_FAILED');
         } finally {
@@ -503,17 +525,17 @@
     function renderRouteGroups(groups) {
         routeGroupList.replaceChildren();
         routeGroupEmpty.hidden = groups.length !== 0;
-        routeGroupEmpty.textContent = groups.length === 0 ? 'No route groups.' : '';
+        routeGroupEmpty.textContent = groups.length === 0 ? I18N.rgEmpty : '';
         for (const group of groups) {
             const item = routeGroupItemTemplate.content.firstElementChild.cloneNode(true);
             item.querySelector('[data-route-group-name]').textContent = group.name;
             item.querySelector('[data-route-group-summary]').textContent =
-                `${group.mode} · ${group.strategy}`;
+                `${modeLabel(group.mode)} · ${group.strategy}`;
             const pathList = item.querySelector('[data-route-group-path-list]');
             for (const path of group.paths) {
                 const pathItem = document.createElement('li');
                 pathItem.textContent =
-                    `${path.pathKey}: ${path.linkIds.join(' → ')} (priority ${path.priority})`;
+                    `${path.pathKey}: ${path.linkIds.join(' → ')} (${I18N.priorityWord} ${path.priority})`;
                 pathList.append(pathItem);
             }
             item.querySelector('[data-route-group-action="edit"]').addEventListener(
@@ -569,18 +591,18 @@
 
             list.replaceChildren();
             empty.hidden = users.length !== 0;
-            empty.textContent = users.length === 0 ? 'No L2TP users.' : '';
+            empty.textContent = users.length === 0 ? I18N.noUsers : '';
             for (const user of users) {
                 const row = rowTemplate.content.firstElementChild.cloneNode(true);
                 row.querySelector('[data-l2tp-user-login]').textContent = String(user.login || '');
                 row.querySelector('[data-l2tp-user-ip]').textContent = String(user.ip || '');
-                row.querySelector('[data-l2tp-user-status]').textContent = user.enabled ? 'Enabled' : 'Disabled';
+                row.querySelector('[data-l2tp-user-status]').textContent = user.enabled ? I18N.stateEnabled : I18N.stateDisabled;
                 row.querySelector('[data-l2tp-user-sync]').textContent = String(user.syncStatus || 'pending');
                 const toggle = row.querySelector('[data-l2tp-user-action="toggle"]');
-                toggle.textContent = user.enabled ? 'Disable' : 'Enable';
+                toggle.textContent = user.enabled ? I18N.actionDisable : I18N.actionEnable;
                 toggle.addEventListener('click', async () => {
                     toggle.disabled = true;
-                    setResult(output, 'Working…');
+                    setResult(output, I18N.working);
                     try {
                         const response = await fetch(l2tpUsersUrl(nodeId, user.id), {
                             method: 'PATCH',
@@ -595,7 +617,7 @@
                             setResult(output, result.error?.code || 'USER_UPDATE_FAILED');
                             return;
                         }
-                        setResult(output, 'User updated');
+                        setResult(output, I18N.userUpdated);
                         await loadL2tpUsers(relay, nodeId, output);
                     } catch {
                         setResult(output, 'USER_UPDATE_FAILED');
@@ -636,7 +658,7 @@
         }
 
         routeGroupSave.disabled = true;
-        setResult(routeGroupOutput, 'Working…');
+        setResult(routeGroupOutput, I18N.working);
         try {
             const response = await fetch(routeGroupUrl(routeGroupId), {
                 method: routeGroupId ? 'PUT' : 'POST',
@@ -660,7 +682,7 @@
             if (!snapshot) throw routeGroupError('ROUTE_GROUP_LIST_INVALID');
             resetRouteGroupForm();
             applyRouteGroupSnapshot(snapshot);
-            setResult(routeGroupOutput, routeGroupId ? 'Route group updated' : 'Route group created');
+            setResult(routeGroupOutput, routeGroupId ? I18N.rgUpdated : I18N.rgCreated);
         } catch {
             setResult(routeGroupOutput, 'ROUTE_GROUP_SAVE_FAILED');
         } finally {
@@ -686,7 +708,7 @@
                     : buildOperationPayload(values);
 
                 button.disabled = true;
-                setResult(output, 'Working…');
+                setResult(output, I18N.working);
                 try {
                     const response = await fetch(`/panel/nodes/${encodeURIComponent(nodeId)}/l2tp/${action}`, {
                         method: 'POST',
@@ -719,7 +741,7 @@
             const button = userForm.querySelector('[data-l2tp-user-action="create"]');
             const values = Object.fromEntries(new FormData(userForm).entries());
             button.disabled = true;
-            setResult(userOutput, 'Working…');
+            setResult(userOutput, I18N.working);
             try {
                 const response = await fetch(l2tpUsersUrl(nodeId), {
                     method: 'POST',
@@ -736,7 +758,7 @@
                 }
                 userForm.reset();
                 userForm.querySelector('[name="password"]').value = '';
-                setResult(userOutput, 'User added');
+                setResult(userOutput, I18N.userAdded);
                 await loadL2tpUsers(relay, nodeId, userOutput);
             } catch {
                 setResult(userOutput, 'USER_CREATE_FAILED');
