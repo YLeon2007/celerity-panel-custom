@@ -298,6 +298,24 @@ test('deployment API maps stale revisions safely without leaking deployment inte
     assert.doesNotMatch(JSON.stringify(response.body), /rollbackToken|password|diagnostic/);
 });
 
+test('default models satisfy the topology runtime wiring contract', () => {
+    const relayL2tpModule = require('../../modules/relay-l2tp');
+    const {
+        unavailableTopologyDeploymentService,
+    } = require('../../modules/relay-l2tp/services/topologyDeploymentService');
+    const { DEFAULT_MODELS } = require('../cascadeTopologyDeploy');
+    const service = relayL2tpModule.createTopologyDeploymentService({
+        ...DEFAULT_MODELS,
+        env: {
+            L2TP_EXECUTION_ENABLED: 'true',
+            L2TP_MIGRATIONS_ENABLED: 'true',
+            TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+        },
+    });
+    assert.notStrictEqual(service, unavailableTopologyDeploymentService);
+    assert.strictEqual(typeof service.deploy, 'function');
+});
+
 test('deployment API uses the module factory and returns a safe unavailable response', async () => {
     const calls = [];
     const models = { marker: 'default-topology-models' };
