@@ -32,8 +32,11 @@ function entityId(entity) {
     if (!entity) return '';
     if (typeof entity === 'string') return entity;
     if (typeof entity === 'object') {
-        if (entity._id !== undefined) return entityId(entity._id);
-        if (entity.id !== undefined) return entityId(entity.id);
+        // bson ObjectId exposes a self-referencing `_id` getter — stringify
+        // it before the generic `_id`/`id` branches to avoid recursion.
+        if (typeof entity.toHexString === 'function') return entity.toHexString();
+        if (entity._id !== undefined && entity._id !== entity) return entityId(entity._id);
+        if (entity.id !== undefined && entity.id !== entity) return entityId(entity.id);
     }
     return String(entity);
 }

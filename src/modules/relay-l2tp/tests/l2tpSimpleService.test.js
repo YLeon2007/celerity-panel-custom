@@ -134,6 +134,14 @@ const STATE = {
     pskEncrypted: 'v1:enc',
 };
 
+test('entityId handles bson ObjectId self-referencing getters', async () => {
+    const objectIdLike = { toHexString: () => '64b0f0f0f0f0f0f0f0f0f0f0' };
+    const models = createModels({ nodes: [{ ...RELAY, _id: objectIdLike }], states: [] });
+    const service = createService({}, models);
+    const overview = await service.overview();
+    assert.equal(overview.relays[0].id, '64b0f0f0f0f0f0f0f0f0f0f0');
+});
+
 test('autoDesiredInput generates a deterministic collision-free subnet', () => {
     const first = autoDesiredInput('relay-a', [], 'group-a');
     const repeat = autoDesiredInput('relay-a', [], 'group-a');
