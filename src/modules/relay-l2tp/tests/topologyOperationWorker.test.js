@@ -1347,3 +1347,172 @@ test('terminal metadata failure is fenced by the current owner and fresh lease',
     });
     assert.equal(operation.status, 'preparing');
 });
+
+test('expired partial preparation is rehydrated, cleaned, and retried from fresh prepare state', async () => {
+    const operation = durableOperation();
+    operation.status = 'preparing';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    const preparedNode = operation.nodes.find(node => node.node === 'node-a');
+    preparedNode.state = 'prepared';
+    preparedNode.backupId = 'topology-backup-node-a';
+    const repository = createRepository(operation);
+    const events = [];
+    const executor = {
+        async rehydrate(request) {
+            events.push({ method: 'rehydrate', node: request.node.node, backupId: request.backupId });
+            return {
+                ok: true,
+                backupId: request.backupId,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async cleanupPrepared(request) {
+            events.push({ method: 'cleanupPrepared', node: request.node.node });
+            return { ok: true };
+        },
+        async prepare(request) {
+            events.push({ method: 'prepare', node: request.node.node });
+            return {
+                backupId: `topology-backup-${request.node.node}-fresh`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit(request) {
+            events.push({ method: 'commit', node: request.node.node });
+            return { ok: true };
+        },
+        async verify(request) {
+            events.push({ method: 'verify', node: request.node.node });
+            return { ok: true };
+        },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({ repository, executor });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(events, [
+        { method: 'rehydrate', node: 'node-a', backupId: 'topology-backup-node-a' },
+        { method: 'cleanupPrepared', node: 'node-a' },
+        { method: 'prepare', node: 'node-a' },
+        { method: 'prepare', node: 'node-b' },
+        { method: 'commit', node: 'node-a' },
+        { method: 'verify', node: 'node-a' },
+        { method: 'commit', node: 'node-b' },
+        { method: 'verify', node: 'node-b' },
+    ]);
+    assert.equal(preparedNode.state, 'committed');
+    assert.equal(preparedNode.backupId, 'topology-backup-node-a-fresh');
+});
+
+test('expired committing operation rolls back only durable committed and prepared bindings', async () => {
+    const operation = durableOperation();
+    operation.status = 'committing';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    operation.nodes.find(node => node.node === 'node-a').state = 'committed';
+    operation.nodes.find(node => node.node === 'node-a').backupId = 'topology-backup-node-a';
+    operation.nodes.find(node => node.node === 'node-b').state = 'prepared';
+    operation.nodes.find(node => node.node === 'node-b').backupId = 'topology-backup-node-b';
+    const repository = createRepository(operation, {
+        async claim(request) {
+            repository.calls.push({ method: 'claim', request });
+            operation.leaseOwner = request.owner;
+            operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+            operation.attempts += 1;
+            return operation;
+        },
+    });
+    const events = [];
+    const executor = {
+        async rehydrate(request) {
+            events.push({ method: 'rehydrate', node: request.node.node, backupId: request.backupId });
+            return {
+                ok: true,
+                backupId: request.backupId,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async cleanupPrepared(request) {
+            events.push({ method: 'cleanupPrepared', node: request.node.node });
+            return { ok: true };
+        },
+        async rollback(request) {
+            events.push({ method: 'rollback', node: request.node.node });
+            return { ok: true };
+        },
+        async prepare() { throw new Error('must not prepare during rollback recovery'); },
+        async commit() { throw new Error('must not commit during rollback recovery'); },
+        async verify() { throw new Error('must not verify during rollback recovery'); },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        finalizer: { async finalizeSucceeded() { throw new Error('must not finalize'); } },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'rolled_back');
+    assert.deepEqual(events, [
+        { method: 'rehydrate', node: 'node-b', backupId: 'topology-backup-node-b' },
+        { method: 'cleanupPrepared', node: 'node-b' },
+        { method: 'rehydrate', node: 'node-a', backupId: 'topology-backup-node-a' },
+        { method: 'rollback', node: 'node-a' },
+    ]);
+    assert.equal(operation.status, 'rolled_back');
+    assert.deepEqual(operation.nodes.map(node => node.state), ['rolled_back', 'rolled_back']);
+});
+
+test('expired rollback resumes after a crash point and preserves failed rollback status', async () => {
+    const operation = durableOperation();
+    operation.status = 'rolling_back';
+    operation.leaseOwner = 'stopped-process';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    operation.nodes.find(node => node.node === 'node-a').state = 'committed';
+    operation.nodes.find(node => node.node === 'node-a').backupId = 'topology-backup-node-a';
+    operation.nodes.find(node => node.node === 'node-b').state = 'rolled_back';
+    operation.nodes.find(node => node.node === 'node-b').backupId = 'topology-backup-node-b';
+    const repository = createRepository(operation, {
+        async claim(request) {
+            repository.calls.push({ method: 'claim', request });
+            operation.leaseOwner = request.owner;
+            operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+            operation.attempts += 1;
+            return operation;
+        },
+    });
+    const events = [];
+    const executor = {
+        async rehydrate(request) {
+            events.push({ method: 'rehydrate', node: request.node.node });
+            return {
+                ok: true,
+                backupId: request.backupId,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async rollback(request) {
+            events.push({ method: 'rollback', node: request.node.node });
+            throw new Error('rollback still unavailable');
+        },
+        async cleanupPrepared() { throw new Error('must not clean rolled-back nodes'); },
+        async prepare() { throw new Error('must not prepare during rollback recovery'); },
+        async commit() { throw new Error('must not commit during rollback recovery'); },
+        async verify() { throw new Error('must not verify during rollback recovery'); },
+    };
+    const worker = createWorker({ repository, executor });
+
+    const result = await worker.run('operation-1');
+
+    assert.equal(result.status, 'failed');
+    assert.deepEqual(events, [
+        { method: 'rehydrate', node: 'node-a' },
+        { method: 'rollback', node: 'node-a' },
+    ]);
+    assert.equal(operation.status, 'failed');
+    assert.equal(operation.nodes.find(node => node.node === 'node-a').state, 'failed');
+    assert.equal(operation.nodes.find(node => node.node === 'node-b').state, 'rolled_back');
+});

@@ -25,6 +25,10 @@ const LIFECYCLE_CONTEXT_KEYS = Object.freeze([
     ...CONTEXT_KEYS,
     'prepared',
 ].sort());
+const REHYDRATE_CONTEXT_KEYS = Object.freeze([
+    'backupId',
+    ...CONTEXT_KEYS,
+].sort());
 const NODE_KEYS = Object.freeze([
     'candidate',
     'candidateHash',
@@ -126,7 +130,7 @@ function validChecks(checks, target) {
     });
 }
 
-function projectFrozenNode(context) {
+function projectFrozenNode(context, durableBackupId) {
     if (!hasExactKeys(context, CONTEXT_KEYS)
         || typeof context.operationId !== 'string'
         || !SAFE_ID_PATTERN.test(context.operationId)
@@ -162,12 +166,14 @@ function projectFrozenNode(context) {
     }
     const content = projectedCandidate.content;
     const candidateHash = `sha256:${node.candidateHash}`;
-    const backupId = `topology-${createHash('sha256').update([
+    const generatedBackupId = `topology-${createHash('sha256').update([
         context.operationId,
         node.node,
         candidateHash,
         node.targetProfile,
     ].join('\0')).digest('hex')}`;
+    const backupId = durableBackupId === undefined ? generatedBackupId : durableBackupId;
+    if (typeof backupId !== 'string' || !SAFE_ID_PATTERN.test(backupId)) throw invalidPlan();
     return Object.freeze({
         operationId: context.operationId,
         nodeId: node.node,
@@ -205,6 +211,18 @@ function assertReceipt(receipt, command, binding) {
     return Object.freeze({
         ok: true,
         command,
+        operationId: binding.operationId,
+        nodeId: binding.nodeId,
+        candidateHash: binding.candidateHash,
+        backupId: binding.backupId,
+        targetProfile: binding.targetProfile,
+    });
+}
+
+function preparedReceipt(binding) {
+    return Object.freeze({
+        ok: true,
+        command: 'prepare',
         operationId: binding.operationId,
         nodeId: binding.nodeId,
         candidateHash: binding.candidateHash,
@@ -258,29 +276,32 @@ class TopologyOperationExecutor {
         this.#NodeTransportFactory = NodeTransportFactory;
     }
 
+    async #createTransport(binding) {
+        const nodeSSH = await this.#nodeExecutionResolver.resolve({
+            nodeId: binding.nodeId,
+            role: binding.role,
+        });
+        const bootstrapper = new this.#RunnerBootstrapper({
+            nodeSSH,
+            target: this.#target,
+        });
+        await bootstrapper.ensureRunner();
+        const factory = new this.#NodeTransportFactory({
+            nodeExecutionResolver: {
+                resolve: async () => nodeSSH,
+            },
+        });
+        return factory.create({
+            nodeId: binding.nodeId,
+            role: binding.role,
+        });
+    }
+
     async prepare(context) {
         const binding = projectFrozenNode(context);
-        let nodeSSH;
         let transport;
         try {
-            nodeSSH = await this.#nodeExecutionResolver.resolve({
-                nodeId: binding.nodeId,
-                role: binding.role,
-            });
-            const bootstrapper = new this.#RunnerBootstrapper({
-                nodeSSH,
-                target: this.#target,
-            });
-            await bootstrapper.ensureRunner();
-            const factory = new this.#NodeTransportFactory({
-                nodeExecutionResolver: {
-                    resolve: async () => nodeSSH,
-                },
-            });
-            transport = await factory.create({
-                nodeId: binding.nodeId,
-                role: binding.role,
-            });
+            transport = await this.#createTransport(binding);
             const receipt = assertReceipt(await transport.prepare({
                 ...transportRequest(binding),
                 artifact: {
@@ -310,6 +331,36 @@ class TopologyOperationExecutor {
         }
     }
 
+    async rehydrate(context) {
+        if (!hasExactKeys(context, REHYDRATE_CONTEXT_KEYS)
+            || typeof context.backupId !== 'string'
+            || !SAFE_ID_PATTERN.test(context.backupId)) {
+            throw invalidPlan();
+        }
+        try {
+            const binding = projectFrozenNode({
+                operationId: context.operationId,
+                topologyRevision: context.topologyRevision,
+                priorDeployedRevision: context.priorDeployedRevision,
+                node: context.node,
+            }, context.backupId);
+            const transport = await this.#createTransport(binding);
+            const prepared = preparedReceipt(binding);
+            this.#preparedBindings.set(prepared, { binding, transport });
+            return Object.freeze({
+                ok: true,
+                backupId: binding.backupId,
+                prepared,
+            });
+        } catch (error) {
+            if (error instanceof TopologyOperationExecutorError
+                && error.code === 'INVALID_FROZEN_NODE_PLAN') {
+                throw error;
+            }
+            throw executionFailed();
+        }
+    }
+
     #preparedBinding(context) {
         if (!hasExactKeys(context, LIFECYCLE_CONTEXT_KEYS)
             || typeof context.backupId !== 'string'
@@ -324,7 +375,7 @@ class TopologyOperationExecutor {
             topologyRevision: context.topologyRevision,
             priorDeployedRevision: context.priorDeployedRevision,
             node: context.node,
-        });
+        }, context.backupId);
         const state = this.#preparedBindings.get(context.prepared);
         if (!state
             || context.backupId !== state.binding.backupId

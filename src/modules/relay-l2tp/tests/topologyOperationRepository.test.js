@@ -287,6 +287,71 @@ test('claim reads only durable candidates and never resets later active phases',
     }]);
 });
 
+test('claim reacquires expired committing and rolling-back phases without resetting their status', async () => {
+    const model = createModel();
+    let claimCall = 0;
+    const recovered = {
+        _id: 'operation-1',
+        status: 'committing',
+        nodes: [{ state: 'committed', backupId: 'backup-a' }],
+    };
+    model.findOneAndUpdate = async (query, update, options) => {
+        model.calls.push({ method: 'findOneAndUpdate', query, update, options });
+        claimCall += 1;
+        return claimCall === 1 ? null : recovered;
+    };
+    const repository = new TopologyOperationRepository({ model });
+
+    const result = await repository.claim({
+        operationId: 'operation-1',
+        owner: 'worker-1',
+        leaseMs: 30_000,
+        now: NOW,
+    });
+
+    assert.strictEqual(result, recovered);
+    assert.deepEqual(model.calls[1], {
+        method: 'findOneAndUpdate',
+        query: {
+            _id: 'operation-1',
+            status: { $in: ['preparing', 'committing', 'rolling_back'] },
+            leaseUntil: { $lte: NOW },
+        },
+        update: {
+            $set: {
+                leaseOwner: 'worker-1',
+                leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+            },
+            $inc: { attempts: 1 },
+        },
+        options: {
+            new: true,
+            runValidators: true,
+            lean: true,
+            projection: {
+                _id: 1,
+                topologyRevision: 1,
+                priorDeployedRevision: 1,
+                status: 1,
+                attempts: 1,
+                leaseOwner: 1,
+                leaseUntil: 1,
+                'nodes.node': 1,
+                'nodes.nodeRef': 1,
+                'nodes.role': 1,
+                'nodes.targetProfile': 1,
+                'nodes.checks': 1,
+                'nodes.state': 1,
+                'nodes.candidateHash': 1,
+                'nodes.candidate.mediaType': 1,
+                'nodes.candidate.bytes': 1,
+                'nodes.candidate.sha256': 1,
+                'nodes.backupId': 1,
+            },
+        },
+    });
+});
+
 test('renewLease extends only an active unexpired lease owned by the worker', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });

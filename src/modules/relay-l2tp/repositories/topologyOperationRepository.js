@@ -10,7 +10,7 @@ const ACTIVE_STATUSES = Object.freeze([
     'rolling_back',
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
-const NODE_STATES = new Set(['prepared', 'committed', 'failed', 'rolled_back']);
+const NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -150,7 +150,14 @@ class TopologyOperationRepository {
     }
 
     async claim({ operationId: id, owner, leaseMs, now }) {
-        return this.model.findOneAndUpdate({
+        const lease = new Date(now.getTime() + leaseMs);
+        const options = {
+            new: true,
+            runValidators: true,
+            lean: true,
+            projection: CLAIM_PROJECTION,
+        };
+        const claimed = await this.model.findOneAndUpdate({
             _id: id,
             $or: [
                 { status: 'queued' },
@@ -173,15 +180,23 @@ class TopologyOperationRepository {
             $set: {
                 status: 'preparing',
                 leaseOwner: owner,
-                leaseUntil: new Date(now.getTime() + leaseMs),
+                leaseUntil: lease,
             },
             $inc: { attempts: 1 },
+        }, options);
+        if (claimed) return claimed;
+
+        return this.model.findOneAndUpdate({
+            _id: id,
+            status: { $in: [...ACTIVE_STATUSES] },
+            leaseUntil: { $lte: now },
         }, {
-            new: true,
-            runValidators: true,
-            lean: true,
-            projection: CLAIM_PROJECTION,
-        });
+            $set: {
+                leaseOwner: owner,
+                leaseUntil: lease,
+            },
+            $inc: { attempts: 1 },
+        }, options);
     }
 
     async renewLease({ operationId: id, owner, leaseMs, now }) {

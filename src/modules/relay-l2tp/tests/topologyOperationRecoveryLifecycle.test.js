@@ -193,6 +193,46 @@ test('scan never invokes the worker for an active unexpired foreign lease', asyn
     assert.deepEqual(workerCalls, ['queued-operation', 'expired-operation']);
 });
 
+test('startup scan recovers expired committing and rolling-back operations', async () => {
+    const now = new Date('2026-09-23T12:00:00.000Z');
+    const workerCalls = [];
+    const lifecycle = createTopologyOperationRecoveryLifecycle({
+        env: ENABLED_ENV,
+        operationModel: createScanModel([
+            {
+                _id: 'expired-committing-operation',
+                status: 'committing',
+                leaseOwner: 'stopped-worker',
+                leaseUntil: new Date(now.getTime() - 1),
+                nodes: [{ state: 'committed', backupId: 'backup-a' }],
+            },
+            {
+                _id: 'expired-rolling-back-operation',
+                status: 'rolling_back',
+                leaseOwner: 'stopped-worker',
+                leaseUntil: new Date(now.getTime() - 1),
+                nodes: [{ state: 'failed', backupId: 'backup-b' }],
+            },
+        ]),
+        worker: {
+            async run(operationId) {
+                workerCalls.push(operationId);
+            },
+        },
+        clock: { now: () => now },
+        timer: createFakeTimer(),
+        logger: { error() {} },
+    });
+
+    lifecycle.start();
+    await lifecycle.stop();
+
+    assert.deepEqual(workerCalls, [
+        'expired-committing-operation',
+        'expired-rolling-back-operation',
+    ]);
+});
+
 test('duplicate lifecycle registration is blocked before and after stop', async () => {
     const modelCalls = [];
     const timer = createFakeTimer();

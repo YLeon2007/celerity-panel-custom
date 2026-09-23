@@ -26,23 +26,19 @@ function createDormantLifecycle() {
     });
 }
 
+const RECOVERABLE_STATUSES = Object.freeze([
+    'preparing',
+    'committing',
+    'rolling_back',
+]);
+
 function recoveryFilter(now) {
     return {
         $or: [
             { status: 'queued' },
             {
-                status: 'preparing',
+                status: { $in: [...RECOVERABLE_STATUSES] },
                 leaseUntil: { $lte: now },
-                nodes: {
-                    $not: {
-                        $elemMatch: {
-                            $or: [
-                                { state: { $ne: 'pending' } },
-                                { backupId: { $ne: '' } },
-                            ],
-                        },
-                    },
-                },
             },
         ],
     };
@@ -50,11 +46,9 @@ function recoveryFilter(now) {
 
 function isRecoveryCandidate(operation, now) {
     if (operation?.status === 'queued') return true;
-    return operation?.status === 'preparing'
+    return RECOVERABLE_STATUSES.includes(operation?.status)
         && operation.leaseUntil instanceof Date
-        && operation.leaseUntil <= now
-        && Array.isArray(operation.nodes)
-        && operation.nodes.every(node => node?.state === 'pending' && node?.backupId === '');
+        && operation.leaseUntil <= now;
 }
 
 function createTopologyOperationRecoveryLifecycle(options = {}) {

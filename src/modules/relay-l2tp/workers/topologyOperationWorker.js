@@ -11,6 +11,8 @@ const EXECUTOR_METHODS = Object.freeze([
     'cleanupPrepared',
     'rollback',
 ]);
+const ACTIVE_OPERATION_STATUSES = new Set(['preparing', 'committing', 'rolling_back']);
+const DURABLE_NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
@@ -88,9 +90,12 @@ function validChecks(checks, target) {
 function durableNodePlan(metadata) {
     const node = entityId(metadata?.node);
     const target = TARGET_BY_ROLE[metadata?.role];
+    const state = metadata?.state;
+    const backupId = metadata?.backupId;
     if (!SAFE_ID_PATTERN.test(node)
-        || metadata?.state !== 'pending'
-        || metadata?.backupId !== ''
+        || !DURABLE_NODE_STATES.has(state)
+        || typeof backupId !== 'string'
+        || (state === 'pending' ? backupId !== '' : !SAFE_ID_PATTERN.test(backupId))
         || !target
         || !validNodeRef(metadata.role, metadata.nodeRef)
         || metadata.targetProfile !== target.targetProfile
@@ -122,7 +127,7 @@ function durableNodePlan(metadata) {
 function durablePlan(operation, operationId) {
     if (!operation
         || entityId(operation) !== operationId
-        || operation.status !== 'preparing'
+        || !ACTIVE_OPERATION_STATUSES.has(operation.status)
         || !Number.isSafeInteger(operation.topologyRevision)
         || operation.topologyRevision < 0
         || !Number.isSafeInteger(operation.priorDeployedRevision)
@@ -384,6 +389,143 @@ class TopologyOperationWorker {
         };
     }
 
+    durableEntries(operation, nodes) {
+        const metadataByNode = new Map(
+            operation.nodes.map(metadata => [entityId(metadata.node), metadata]),
+        );
+        return nodes.map(node => {
+            const metadata = metadataByNode.get(entityId(node.node));
+            if (!metadata || metadata.candidateHash !== node.candidateHash) {
+                throw new TypeError('Durable topology metadata does not match the frozen plan');
+            }
+            return {
+                node,
+                state: metadata.state,
+                backupId: metadata.backupId,
+            };
+        });
+    }
+
+    async invokeDurableNode(plan, entry, command, heartbeat) {
+        if (typeof this.executor.rehydrate !== 'function') {
+            throw new Error('Topology executor cannot rehydrate a durable binding');
+        }
+        const rehydrated = await this.executor.rehydrate(
+            this.context(plan, entry.node, undefined, entry.backupId),
+        );
+        if (rehydrated?.ok !== true
+            || rehydrated.backupId !== entry.backupId
+            || !rehydrated.prepared
+            || typeof rehydrated.prepared !== 'object'
+            || !Object.isFrozen(rehydrated.prepared)) {
+            throw new Error('Topology executor rejected durable binding rehydration');
+        }
+        const result = await this.executor[command](this.context(
+            plan,
+            entry.node,
+            rehydrated.prepared,
+            entry.backupId,
+        ));
+        if (result?.ok !== true) throw new Error('Topology durable node operation was rejected');
+        return result;
+    }
+
+    async cleanupExpiredPreparation(plan, operationId, entries, heartbeat) {
+        let cleanupFailed = false;
+        for (const entry of [...entries].reverse()) {
+            if (!['prepared', 'committed', 'failed'].includes(entry.state)) continue;
+            await this.renew(operationId);
+            const command = entry.state === 'prepared' ? 'cleanupPrepared' : 'rollback';
+            let state = 'pending';
+            try {
+                await heartbeat.run(() => this.invokeDurableNode(
+                    plan,
+                    entry,
+                    command,
+                    heartbeat,
+                ));
+            } catch (error) {
+                if (error instanceof LeaseLostError) throw error;
+                cleanupFailed = true;
+                state = 'failed';
+            }
+            const recorded = await this.operationRepository.recordNode({
+                operationId,
+                owner: this.workerId,
+                now: this.clock.now(),
+                node: entry.node.node,
+                state,
+                ...(state === 'pending' ? { backupId: '' } : {}),
+            });
+            if (recorded !== true) throw new LeaseLostError();
+            entry.state = state;
+            if (state === 'pending') entry.backupId = '';
+        }
+        if (cleanupFailed) {
+            const finished = await this.operationRepository.finishClaimed({
+                operationId,
+                owner: this.workerId,
+                now: this.clock.now(),
+                status: 'failed',
+            });
+            if (finished !== true) throw new LeaseLostError();
+            return false;
+        }
+        return true;
+    }
+
+    async rollbackDurableOperation(plan, operation, operationId, entries, heartbeat) {
+        if (operation.status === 'committing') {
+            const rollingBack = await this.operationRepository.setPhase({
+                operationId,
+                owner: this.workerId,
+                now: this.clock.now(),
+                from: 'committing',
+                to: 'rolling_back',
+            });
+            if (rollingBack !== true) throw new LeaseLostError();
+        }
+
+        let rollbackFailed = false;
+        for (const entry of [...entries].reverse()) {
+            if (!['prepared', 'committed', 'failed'].includes(entry.state)) continue;
+            await this.renew(operationId);
+            let state = 'rolled_back';
+            try {
+                const command = entry.state === 'prepared' ? 'cleanupPrepared' : 'rollback';
+                await heartbeat.run(() => this.invokeDurableNode(
+                    plan,
+                    entry,
+                    command,
+                    heartbeat,
+                ));
+            } catch (error) {
+                if (error instanceof LeaseLostError) throw error;
+                rollbackFailed = true;
+                state = 'failed';
+            }
+            const recorded = await this.operationRepository.recordNode({
+                operationId,
+                owner: this.workerId,
+                now: this.clock.now(),
+                node: entry.node.node,
+                state,
+            });
+            if (recorded !== true) throw new LeaseLostError();
+            entry.state = state;
+        }
+
+        const status = rollbackFailed ? 'failed' : 'rolled_back';
+        const finished = await this.operationRepository.finishClaimed({
+            operationId,
+            owner: this.workerId,
+            now: this.clock.now(),
+            status,
+        });
+        if (finished !== true) throw new LeaseLostError();
+        return { claimed: true, operationId, status };
+    }
+
     async cleanupAfterPrepareFailure(plan, operationId, prepared, heartbeat) {
         const rollingBack = await this.operationRepository.setPhase({
             operationId,
@@ -527,9 +669,11 @@ class TopologyOperationWorker {
             if (!operation) return { claimed: false, operationId };
             let plan;
             let nodes;
+            let entries;
             try {
                 plan = durablePlan(operation, operationId);
                 nodes = orderedPlanNodes(plan);
+                entries = this.durableEntries(operation, nodes);
             } catch {
                 const failed = await this.operationRepository.finishClaimed({
                     operationId,
@@ -547,11 +691,32 @@ class TopologyOperationWorker {
                 return {
                     claimed: true,
                     operationId,
-                    status: 'preparing',
+                    status: operation.status,
                     stopped: true,
                     errorCode: lockErrorCode,
                 };
             }
+
+            if (operation.status === 'committing' || operation.status === 'rolling_back') {
+                return await this.rollbackDurableOperation(
+                    plan,
+                    operation,
+                    operationId,
+                    entries,
+                    heartbeat,
+                );
+            }
+
+            if (entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
+                const cleaned = await this.cleanupExpiredPreparation(
+                    plan,
+                    operationId,
+                    entries,
+                    heartbeat,
+                );
+                if (!cleaned) return { claimed: true, operationId, status: 'failed' };
+            }
+
             const prepared = [];
             try {
                 for (const node of nodes) {

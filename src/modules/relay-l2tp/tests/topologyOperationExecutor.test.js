@@ -485,3 +485,59 @@ test('a malformed prepare receipt triggers only fixed rollback and exposes no pr
     );
     assert.doesNotMatch(JSON.stringify(executor), new RegExp(remoteSecret));
 });
+
+test('rehydrates a durable prepared binding without preparing or reading current topology', async () => {
+    const { events, executor } = executorFixture();
+    const node = frozenNode({
+        role: 'bridge',
+        node: 'bridge-node',
+        nodeRef: 'bridge',
+        targetProfile: 'xray-bridge',
+        serviceUnit: 'xray-bridge.service',
+        serviceUnitPath: '/etc/systemd/system/xray-bridge.service',
+        configPath: '/usr/local/etc/xray-bridge/config.json',
+    });
+    const backupId = 'topology-durable-backup-bridge';
+
+    const rehydrated = await executor.rehydrate({
+        ...prepareContext(node),
+        backupId,
+    });
+
+    assert.deepEqual(events.filter(event => event.method), [
+        { method: 'resolve', request: { nodeId: 'bridge-node', role: 'bridge' } },
+        { method: 'bootstrapper', target: 'test' },
+        { method: 'ensureRunner' },
+    ]);
+    assert.equal(events.filter(event => event.method === 'transport').length, 0);
+    assert.deepEqual(rehydrated, {
+        ok: true,
+        backupId,
+        prepared: {
+            ok: true,
+            command: 'prepare',
+            operationId: 'topology-operation-17',
+            nodeId: 'bridge-node',
+            candidateHash: `sha256:${node.candidateHash}`,
+            backupId,
+            targetProfile: 'xray-bridge',
+        },
+    });
+
+    const rolledBack = await executor.rollback({
+        ...prepareContext(node),
+        backupId,
+        prepared: rehydrated.prepared,
+    });
+    assert.equal(rolledBack.ok, true);
+    assert.deepEqual(events.filter(event => event.method === 'transport')
+        .map(event => event.request), [{
+        operationId: 'topology-operation-17',
+        nodeId: 'bridge-node',
+        candidateHash: `sha256:${node.candidateHash}`,
+        backupId,
+        targetProfile: 'xray-bridge',
+        command: 'rollback',
+    }]);
+    assert.doesNotMatch(JSON.stringify({ executor, rehydrated }), /secret|privateKey|topology-lookup/);
+});
