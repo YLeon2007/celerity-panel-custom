@@ -285,7 +285,8 @@ class L2tpSimpleService {
                 id: nodeId,
                 name: typeof node.name === 'string' && node.name.length > 0 ? node.name : nodeId,
                 online: node.status === 'online',
-                installed: state?.desiredState === 'installed',
+                installed: state?.status === 'installed',
+                configured: state?.desiredState === 'installed',
                 status: state?.status ?? 'not_installed',
                 psk,
             });
@@ -476,7 +477,7 @@ class L2tpSimpleService {
             throw simpleError('NODE_NOT_RELAY', 'L2TP can only be managed on relay nodes');
         }
         const state = await this.RelayL2tpState.findOne({ node: selectedNodeId }).lean();
-        if (!state || state.desiredState !== 'installed') {
+        if (!state || state.status !== 'installed') {
             throw simpleError('L2TP_NOT_CONFIGURED', 'L2TP is not installed on this relay');
         }
 
@@ -516,7 +517,7 @@ class L2tpSimpleService {
         }
 
         const states = (await this.listStates())
-            .filter(state => state.desiredState === 'installed');
+            .filter(state => state.status === 'installed');
         if (states.length === 0) {
             throw simpleError(
                 'NO_INSTALLED_RELAYS',
@@ -571,7 +572,7 @@ class L2tpSimpleService {
             throw simpleError('L2TP_USER_NOT_FOUND', 'The L2TP account was not found');
         }
         const states = (await this.listStates())
-            .filter(state => state.desiredState === 'installed');
+            .filter(state => state.status === 'installed');
         const installedNodes = new Set(states.map(state => entityId(state.node)));
         const results = [];
         for (const user of users) {

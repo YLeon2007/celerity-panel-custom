@@ -99,11 +99,22 @@
 
     function relayBadge(relay) {
         if (relay.installed) {
-            return relay.status === 'installed'
-                ? `<span class="badge badge-ok">${esc(L.installed)}</span>`
-                : `<span class="badge badge-warn">${esc(L.installing)}</span>`;
+            return `<span class="badge badge-ok">${esc(L.installed)}</span>`;
+        }
+        if (relay.configured && relay.status !== 'not_installed') {
+            return `<span class="badge badge-warn">${esc(L.installing)}</span>`;
         }
         return `<span class="badge badge-off">${esc(L.notInstalled)}</span>`;
+    }
+
+    function relayButton(relay) {
+        if (relay.installed) {
+            return `<button class="btn btn-sm btn-outline" data-action="uninstall">${esc(L.uninstall)}</button>`;
+        }
+        if (relay.configured && relay.status !== 'not_installed') {
+            return `<button class="btn btn-sm btn-primary" disabled>${esc(L.installing)}</button>`;
+        }
+        return `<button class="btn btn-sm btn-primary" data-action="install">${esc(L.install)}</button>`;
     }
 
     function renderRelays(relays) {
@@ -120,9 +131,7 @@
                 ${relay.psk
                     ? `<span class="psk-chip" data-psk="${esc(relay.psk)}" title="${esc(L.copyPsk)}">${esc(relay.psk)}</span>`
                     : ''}
-                ${relay.installed
-                    ? `<button class="btn btn-sm btn-outline" data-action="uninstall">${esc(L.uninstall)}</button>`
-                    : `<button class="btn btn-sm btn-primary" data-action="install">${esc(L.install)}</button>`}
+                ${relayButton(relay)}
             </div>
         `).join('');
     }
