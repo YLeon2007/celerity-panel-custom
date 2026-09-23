@@ -41,7 +41,7 @@ function rejectFinalization() {
 }
 
 class TopologyOperationFinalizationRepository {
-    constructor({ TopologyOperation, CascadeTopologyState, transactionRunner } = {}) {
+    constructor({ TopologyOperation, CascadeTopologyState, CascadeLink, transactionRunner } = {}) {
         if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
         }
@@ -55,6 +55,7 @@ class TopologyOperationFinalizationRepository {
         }
         this.TopologyOperation = TopologyOperation;
         this.CascadeTopologyState = CascadeTopologyState;
+        this.CascadeLink = CascadeLink || null;
         this.transactionRunner = runTransaction;
     }
 
@@ -98,6 +99,14 @@ class TopologyOperationFinalizationRepository {
                     timestamps: false,
                 });
                 if (topology?.matchedCount !== 1) rejectFinalization();
+
+                if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
+                    await this.CascadeLink.updateMany(
+                        { active: true },
+                        { $set: { status: 'deployed' } },
+                        { runValidators: true, session },
+                    );
+                }
 
                 return {
                     operationId,

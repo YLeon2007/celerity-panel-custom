@@ -458,6 +458,8 @@ const i18n = {
     xrayGenerateKeysConfirm: <%- JSON.stringify(t("nodes.xrayGenerateKeysConfirm")) %>,
     xrayKeysSuccess: <%- JSON.stringify(t("nodes.xrayKeysSuccess")) %>
 };
+
+const csrfToken = <%- JSON.stringify(csrfToken || '') %>;
 const i18nConfig = {
     copied: <%- JSON.stringify(t("common.copied")) %>,
     loadConfigConfirm: <%- JSON.stringify(t("nodes.loadConfigConfirm")) %>,
@@ -1568,12 +1570,30 @@ async function cascadeAction(linkId, action, btn) {
     if (!confirm(confirmMsg)) return;
     if (btn) { btn.disabled = true; btn.innerHTML = '<i class="ti ti-loader-2" style="animation:spin 0.7s linear infinite;display:inline-block"></i>'; }
     try {
-        const res = await fetch('/api/cascade/links/' + linkId + '/' + action, { method: 'POST' });
+        let res;
+        if (action === 'deploy') {
+            const linksRes = await fetch('/api/cascade/links');
+            const linksData = await linksRes.json().catch(() => ({}));
+            if (!linksRes.ok || typeof linksData.topologyRevision !== 'number') {
+                throw new Error('HTTP ' + linksRes.status);
+            }
+            res = await fetch('/api/cascade/topology/deploy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+                body: JSON.stringify({ expectedTopologyRevision: linksData.topologyRevision }),
+            });
+        } else {
+            res = await fetch('/api/cascade/links/' + linkId + '/' + action, { method: 'POST' });
+        }
         if (res.ok) {
             location.reload();
         } else {
             const data = await res.json().catch(() => ({}));
-            alert(i18n.error + ': ' + (data.error || 'Unknown error'));
+            const errorValue = data?.error;
+            const message = typeof errorValue === 'string'
+                ? errorValue
+                : (errorValue?.message || errorValue?.code || ('HTTP ' + res.status));
+            alert(i18n.error + ': ' + message);
             if (btn) { btn.disabled = false; btn.innerHTML = action === 'deploy' ? '<i class="ti ti-upload"></i>' : '<i class="ti ti-upload-off"></i>'; }
         }
     } catch (err) {

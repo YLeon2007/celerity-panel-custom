@@ -239,7 +239,19 @@ class TopologyOperationCoordinator {
         const { expectedTopologyRevision } = input;
         const idempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
         const existing = this.operationsByIdempotencyKey.get(idempotencyKey);
-        if (existing) return existing;
+        if (existing) {
+            const settled = await existing.then(operation => operation, () => null);
+            if (!settled) {
+                this.operationsByIdempotencyKey.delete(idempotencyKey);
+            } else if (typeof this.operationRepository.findPublicById === 'function') {
+                const persisted = await this.operationRepository.findPublicById(settled.operationId);
+                if (persisted) return existing;
+                // The operation record was purged (undeploy): re-queue from scratch.
+                this.operationsByIdempotencyKey.delete(idempotencyKey);
+            } else {
+                return existing;
+            }
+        }
 
         const queued = this.queueOnce({ expectedTopologyRevision, idempotencyKey });
         this.operationsByIdempotencyKey.set(idempotencyKey, queued);

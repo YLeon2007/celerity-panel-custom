@@ -439,6 +439,21 @@ test('legacy deploy entry points are fail-closed while explicit undeploy remains
     assert.equal((CASCADE_ROUTE_SOURCE.match(/cascadeService\.undeployLink\s*\(/g) || []).length, 1);
 });
 
+test('undeploy resets the deployed topology state and purges revision operations for redeploy', () => {
+    const start = CASCADE_ROUTE_SOURCE.indexOf("router.post('/links/:id/undeploy'");
+    assert.notStrictEqual(start, -1, 'undeploy route must exist');
+    const end = CASCADE_ROUTE_SOURCE.indexOf('router.', start + 1);
+    const undeploy = CASCADE_ROUTE_SOURCE.slice(start, end === -1 ? undefined : end);
+    assert.match(undeploy, /CascadeTopologyState\.findOneAndUpdate\(/,
+        'undeploy must touch the deployed topology state');
+    assert.match(undeploy, /deployedRevision: 0/,
+        'undeploy must reset deployedRevision so the map shows pending');
+    assert.match(undeploy, /TopologyOperation\.deleteMany\(/,
+        'undeploy must purge recorded operations of the current revision to allow redeploy');
+    assert.match(undeploy, /topologyRevision: state\?\.revision/,
+        'operation purge must be scoped to the current topology revision');
+});
+
 test('legacy chain deployment is absent from docs and rejected by the live REST router', () => {
     const response = runIsolatedProbe(`
         const express = require('express');

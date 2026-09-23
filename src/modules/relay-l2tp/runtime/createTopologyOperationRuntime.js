@@ -177,6 +177,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const finalizationRepository = new FinalizationRepository({
             TopologyOperation,
             CascadeTopologyState,
+            CascadeLink,
             ...optional(transactionRunner, 'transactionRunner'),
         });
         const finalizer = new Finalizer({

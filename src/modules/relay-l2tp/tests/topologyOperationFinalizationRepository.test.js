@@ -110,6 +110,32 @@ function request(overrides = {}) {
     };
 }
 
+test('finalizeSucceeded marks active cascade links deployed in the same transaction', async () => {
+    const harness = createHarness();
+    const linkCalls = [];
+    const CascadeLink = {
+        updateMany(filter, update, options) {
+            linkCalls.push({ filter, update, options });
+            return Promise.resolve({ matchedCount: 2, modifiedCount: 2 });
+        },
+    };
+    const repository = new TopologyOperationFinalizationRepository({
+        TopologyOperation: harness.repository.TopologyOperation,
+        CascadeTopologyState: harness.repository.CascadeTopologyState,
+        CascadeLink,
+        transactionRunner: async work => work(SESSION),
+    });
+
+    const finalized = await repository.finalizeSucceeded(request());
+
+    assert.equal(finalized?.deployedRevision, 7);
+    assert.deepEqual(linkCalls, [{
+        filter: { active: true },
+        update: { $set: { status: 'deployed' } },
+        options: { runValidators: true, session: SESSION },
+    }]);
+});
+
 test('atomically marks the leased committing operation succeeded and advances deployedRevision', async () => {
     const harness = createHarness();
 

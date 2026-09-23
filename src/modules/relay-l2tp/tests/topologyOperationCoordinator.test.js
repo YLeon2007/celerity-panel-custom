@@ -301,6 +301,59 @@ test('re-deploy of an already-recorded revision returns the existing operation w
     }
 });
 
+test('a cached idempotent result whose operation was purged (undeploy) is re-queued from scratch', async () => {
+    const calls = [];
+    let persisted = { status: 'succeeded', topologyRevision: 7 };
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: {
+            async pinTopology({ expectedRevision, prepare }) {
+                calls.push({ method: 'pinTopology', expectedRevision });
+                const prepared = await prepare(snapshot());
+                return { revision: 7, deployedRevision: 5, ...prepared };
+            },
+        },
+        planMaterializer: {
+            async materialize() {
+                calls.push({ method: 'materialize' });
+                return materializedPlan();
+            },
+        },
+        operationRepository: {
+            async createFrozen(input) {
+                calls.push({ method: 'createFrozen', operationId: input.operationId });
+                persisted = { status: 'queued', topologyRevision: 7 };
+            },
+            async findPublicById(operationId) {
+                calls.push({ method: 'findPublicById', operationId });
+                return persisted;
+            },
+        },
+        operationWorker: {
+            async run(operationId) {
+                calls.push({ method: 'worker.run', operationId });
+            },
+        },
+        validator: () => ({ valid: true, errors: [] }),
+        compiler: () => ({ valid: true, errors: [], relays: [] }),
+        idFactory: () => 'operation-purged',
+    });
+
+    const first = await coordinator.queue({ expectedTopologyRevision: 7 });
+    assert.equal(first.status, 'queued');
+
+    // Undeploy purges the operation record; the cached promise must not short-circuit.
+    persisted = null;
+    const second = await coordinator.queue({ expectedTopologyRevision: 7 });
+
+    assert.deepEqual(second, {
+        operationId: 'operation-purged',
+        topologyRevision: 7,
+        status: 'queued',
+    });
+    assert.equal(calls.filter(call => call.method === 'createFrozen').length, 2);
+    assert.equal(calls.filter(call => call.method === 'worker.run').length, 2);
+});
+
 test('projects a deterministic status without candidates, leases, backups, or invalid states', () => {
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: { async pinTopology() {} },
