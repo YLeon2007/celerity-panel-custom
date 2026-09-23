@@ -67,8 +67,8 @@ const VERIFY_USER_FAILURE_STATUSES = Object.freeze({
 const VERIFY_USER_FAILURE_CODES = new Set(Object.keys(VERIFY_USER_FAILURE_STATUSES));
 
 class L2tpNodeTransportError extends Error {
-    constructor(code, message) {
-        super(message);
+    constructor(code, message, options = {}) {
+        super(message, options);
         this.name = 'L2tpNodeTransportError';
         this.code = code;
     }
@@ -241,6 +241,26 @@ function parseVerifyUsersExecResult(result, expectedCredentialRevision, expected
     };
 }
 
+function extractRunnerErrorCode(result) {
+    // runner.sh artifacts report failures as {"status":"error","code":"X"}
+    // on stderr — surface that code instead of the generic transport error.
+    const stderr = typeof result?.stderr === 'string' ? result.stderr : '';
+    for (const line of stderr.split('\n').reverse()) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) continue;
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed && parsed.status === 'error' && typeof parsed.code === 'string'
+                && /^[A-Z][A-Z0-9_]{2,63}$/.test(parsed.code)) {
+                return parsed.code;
+            }
+        } catch {
+            // not a JSON line — keep scanning
+        }
+    }
+    return null;
+}
+
 function assertSuccessfulExec(result) {
     if (result && Object.hasOwn(result, 'code') && result.code !== 0) {
         throw new Error('Remote command returned nonzero');
@@ -308,10 +328,11 @@ class L2tpNodeTransport {
                 `${ARTIFACT_RUNNER_PATH} --operation-id ${operationId} --command ${command}`,
             );
             if (command !== 'preflight' && command !== 'verify-users') assertSuccessfulExec(result);
-        } catch {
+        } catch (error) {
             throw new L2tpNodeTransportError(
-                'REMOTE_COMMAND_FAILED',
+                extractRunnerErrorCode(result) || 'REMOTE_COMMAND_FAILED',
                 'Failed to run an L2TP artifact command',
+                { cause: error },
             );
         }
 
