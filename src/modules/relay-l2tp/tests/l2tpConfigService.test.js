@@ -238,8 +238,8 @@ test('builds namespaced TCP and UDP TPROXY nft rules with fail-closed PPP egress
     assert.equal(fileByPath(result, 'etc/nftables.d/celerity-l2tp.nft').content, `table inet celerity_l2tp {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-        iifname "ppp*" ip saddr 10.77.0.0/24 meta l4proto tcp tproxy to :12345 meta mark set 77 accept
-        iifname "ppp*" ip saddr 10.77.0.0/24 meta l4proto udp tproxy to :12345 meta mark set 77 accept
+        iifname "ppp*" ip saddr 10.77.0.0/24 meta l4proto tcp tproxy ip to :12345 meta mark set 77 accept
+        iifname "ppp*" ip saddr 10.77.0.0/24 meta l4proto udp tproxy ip to :12345 meta mark set 77 accept
     }
 
     chain forward {

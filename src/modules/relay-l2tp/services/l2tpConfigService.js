@@ -199,8 +199,8 @@ ${dnsOptions}`,
                 content: `table inet celerity_l2tp {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-        iifname "ppp*" ip saddr ${desired.clientCidr} meta l4proto tcp tproxy to :${desired.tproxyPort} meta mark set ${desired.fwmark} accept
-        iifname "ppp*" ip saddr ${desired.clientCidr} meta l4proto udp tproxy to :${desired.tproxyPort} meta mark set ${desired.fwmark} accept
+        iifname "ppp*" ip saddr ${desired.clientCidr} meta l4proto tcp tproxy ip to :${desired.tproxyPort} meta mark set ${desired.fwmark} accept
+        iifname "ppp*" ip saddr ${desired.clientCidr} meta l4proto udp tproxy ip to :${desired.tproxyPort} meta mark set ${desired.fwmark} accept
     }
 
     chain forward {
