@@ -200,14 +200,55 @@ function createRepository(operation = durableOperation(), overrides = {}) {
     };
 }
 
-function createWorker({ repository, executor, deploymentRepository, clock } = {}) {
+function createWorker({
+    repository,
+    executor,
+    deploymentRepository,
+    finalizer,
+    clock,
+    lockService,
+    timer,
+    renewalIntervalMs,
+} = {}) {
+    const effectiveLockService = lockService || {
+        async acquire() { return { ok: true }; },
+        async renew() { return { ok: true }; },
+        async release() { return { ok: true }; },
+    };
+    const effectiveFinalizer = finalizer || {
+        async succeed(request) {
+            const deployed = await deploymentRepository.markDeployed({
+                expectedRevision: request.expectedRevision,
+                expectedDeployedRevision: request.expectedDeployedRevision,
+            });
+            if (deployed?.revision !== request.expectedRevision
+                || deployed?.deployedRevision !== request.expectedRevision) {
+                throw new Error('Topology deployedRevision CAS was rejected');
+            }
+            const succeeded = await repository.finishClaimed({
+                operationId: request.operationId,
+                owner: request.owner,
+                now: request.now,
+                status: 'succeeded',
+            });
+            if (succeeded !== true) {
+                const error = new Error('Topology terminal success fence was lost');
+                error.code = 'TOPOLOGY_OPERATION_LEASE_LOST';
+                throw error;
+            }
+            return deployed;
+        },
+    };
     return new TopologyOperationWorker({
         operationRepository: repository,
         executor,
-        deploymentRepository,
+        finalizer: effectiveFinalizer,
+        lockService: effectiveLockService,
         workerId: 'worker-1',
         leaseMs: 30_000,
         clock: clock || { now: () => new Date(NOW) },
+        timer,
+        renewalIntervalMs,
     });
 }
 
@@ -279,6 +320,96 @@ async function rollbackRolesAfterFinalVerifyFailure(order) {
     return rollbackRoles;
 }
 
+function createManualTimer() {
+    let callback;
+    return {
+        setInterval(next) {
+            callback = next;
+            return 1;
+        },
+        clearInterval() {
+            callback = undefined;
+        },
+        async tick() {
+            assert.equal(typeof callback, 'function', 'lease heartbeat must be active');
+            await callback();
+        },
+        isActive() {
+            return typeof callback === 'function';
+        },
+    };
+}
+
+function deferred() {
+    let resolve;
+    const promise = new Promise(next => { resolve = next; });
+    return { promise, resolve };
+}
+
+function createSlowPhaseHarness(phase) {
+    const started = deferred();
+    const release = deferred();
+    let entered = false;
+    let prepareCalls = 0;
+    let commitCalls = 0;
+    const pause = async currentPhase => {
+        if (currentPhase !== phase) return;
+        if (!entered) {
+            entered = true;
+            started.resolve();
+        }
+        await release.promise;
+    };
+    return {
+        started: started.promise,
+        release: release.resolve,
+        expectedStatus: ['cleanupPrepared', 'rollback'].includes(phase)
+            ? 'rolled_back'
+            : 'succeeded',
+        executor: {
+            async prepare(request) {
+                prepareCalls += 1;
+                if (phase === 'cleanupPrepared' && prepareCalls === 2) {
+                    throw new Error('start prepared-node cleanup');
+                }
+                await pause('prepare');
+                return {
+                    backupId: `backup-${request.node.node}`,
+                    prepared: Object.freeze({ node: request.node.node }),
+                };
+            },
+            async commit() {
+                commitCalls += 1;
+                if (phase === 'rollback' && commitCalls === 2) {
+                    return { ok: false };
+                }
+                await pause('commit');
+                return { ok: true };
+            },
+            async verify() {
+                await pause('verify');
+                return { ok: true };
+            },
+            async cleanupPrepared() {
+                await pause('cleanupPrepared');
+                return { ok: true };
+            },
+            async rollback() {
+                await pause('rollback');
+                return { ok: true };
+            },
+        },
+    };
+}
+
+const SLOW_EXECUTOR_PHASES = Object.freeze([
+    'prepare',
+    'commit',
+    'verify',
+    'cleanupPrepared',
+    'rollback',
+]);
+
 test('fresh worker resumes an expired preparing claim from durable candidates only', async () => {
     const operation = durableOperation();
     operation.status = 'preparing';
@@ -329,6 +460,398 @@ test('fresh worker resumes an expired preparing claim from durable candidates on
     assert.equal(repository.calls[0].request.operationId, 'operation-1');
     assert.equal(operation.attempts, 1);
 });
+
+test('lease heartbeat renews while a typed executor call is still running', async () => {
+    const repository = createRepository();
+    const timer = createManualTimer();
+    let enterPrepare;
+    const prepareStarted = new Promise(resolve => { enterPrepare = resolve; });
+    let finishPrepare;
+    const prepareResult = new Promise(resolve => { finishPrepare = resolve; });
+    let prepareCalls = 0;
+    const executor = {
+        async prepare(request) {
+            prepareCalls += 1;
+            if (prepareCalls === 1) {
+                enterPrepare();
+                await prepareResult;
+            }
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        timer,
+        renewalIntervalMs: 10_000,
+        deploymentRepository: {
+            async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+        },
+    });
+
+    const running = worker.run('operation-1');
+    await prepareStarted;
+    const renewalsBeforeTick = repository.calls.filter(call => (
+        call.method === 'renewLease'
+    )).length;
+
+    await timer.tick();
+
+    const renewalsDuringPrepare = repository.calls.filter(call => (
+        call.method === 'renewLease'
+    )).length;
+    assert.ok(renewalsDuringPrepare > renewalsBeforeTick);
+    finishPrepare();
+    assert.equal((await running).status, 'succeeded');
+    assert.equal(timer.isActive(), false, 'lease heartbeat must stop after the run');
+});
+
+test('lease heartbeat interval must be shorter than the lease', () => {
+    const repository = createRepository();
+    const executor = Object.fromEntries([
+        'prepare',
+        'commit',
+        'verify',
+        'cleanupPrepared',
+        'rollback',
+    ].map(method => [method, async () => ({ ok: true })]));
+
+    assert.throws(() => createWorker({
+        repository,
+        executor,
+        renewalIntervalMs: 30_000,
+        deploymentRepository: {
+            async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+        },
+    }), /lease identity and clock/);
+});
+
+test('operation and owned-lock heartbeat stays active during every slow executor phase', async t => {
+    for (const phase of SLOW_EXECUTOR_PHASES) {
+        await t.test(phase, async () => {
+            const repository = createRepository();
+            const timer = createManualTimer();
+            const events = [];
+            const lockService = {
+                async acquire(request) {
+                    events.push({ method: 'acquire', node: request.node });
+                    return { ok: true };
+                },
+                async renew(request) {
+                    events.push({ method: 'renew', node: request.node });
+                    return { ok: true };
+                },
+                async release(request) {
+                    events.push({ method: 'release', node: request.node });
+                    return { ok: true };
+                },
+            };
+            const harness = createSlowPhaseHarness(phase);
+            const worker = createWorker({
+                repository,
+                executor: harness.executor,
+                lockService,
+                timer,
+                renewalIntervalMs: 10_000,
+                deploymentRepository: {
+                    async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+                },
+            });
+
+            const running = worker.run('operation-1');
+            await harness.started;
+            const operationRenewals = repository.calls.filter(call => (
+                call.method === 'renewLease'
+            )).length;
+            const lockRenewals = events.filter(event => event.method === 'renew').length;
+
+            await timer.tick();
+
+            assert.ok(repository.calls.filter(call => (
+                call.method === 'renewLease'
+            )).length > operationRenewals);
+            assert.ok(events.filter(event => event.method === 'renew').length > lockRenewals);
+            harness.release();
+            assert.equal((await running).status, harness.expectedStatus);
+            assert.equal(timer.isActive(), false, 'heartbeat timer must be stopped');
+            assert.deepEqual(events.filter(event => event.method === 'release'), [
+                { method: 'release', node: 'node-b' },
+                { method: 'release', node: 'node-a' },
+            ]);
+        });
+    }
+});
+
+test('owned-lock renewal loss in every slow executor phase fences progress and success', async t => {
+    for (const phase of SLOW_EXECUTOR_PHASES) {
+        await t.test(phase, async () => {
+            const repository = createRepository();
+            const timer = createManualTimer();
+            const events = [];
+            let renewalOwned = true;
+            let finalized = false;
+            const lockService = {
+                async acquire(request) {
+                    events.push({ method: 'acquire', node: request.node });
+                    return { ok: true };
+                },
+                async renew(request) {
+                    events.push({ method: 'renew', node: request.node });
+                    return renewalOwned
+                        ? { ok: true }
+                        : { ok: false, error: { code: 'NODE_OPERATION_LOCK_NOT_OWNED' } };
+                },
+                async release(request) {
+                    events.push({ method: 'release', node: request.node });
+                    return { ok: true };
+                },
+            };
+            const harness = createSlowPhaseHarness(phase);
+            const worker = createWorker({
+                repository,
+                executor: harness.executor,
+                lockService,
+                timer,
+                renewalIntervalMs: 10_000,
+                finalizer: {
+                    async succeed() {
+                        finalized = true;
+                        return { revision: 7, deployedRevision: 7 };
+                    },
+                },
+            });
+
+            const running = worker.run('operation-1');
+            await harness.started;
+            renewalOwned = false;
+            await timer.tick();
+            const durableMutations = repository.calls.filter(call => (
+                ['recordNode', 'setPhase', 'finishClaimed'].includes(call.method)
+            )).length;
+            harness.release();
+            const result = await running;
+
+            assert.equal(result.errorCode, 'TOPOLOGY_OPERATION_LEASE_LOST');
+            assert.equal(finalized, false);
+            assert.equal(timer.isActive(), false, 'failed heartbeat timer must be stopped');
+            assert.equal(repository.calls.filter(call => (
+                ['recordNode', 'setPhase', 'finishClaimed'].includes(call.method)
+            )).length, durableMutations, 'stale worker must not persist further progress');
+            assert.deepEqual(events.filter(event => event.method === 'release'), [
+                { method: 'release', node: 'node-b' },
+                { method: 'release', node: 'node-a' },
+            ]);
+        });
+    }
+});
+
+test('lease loss during commit fences durable progress after that executor call', async () => {
+    let leaseOwned = true;
+    const operation = durableOperation();
+    const repository = createRepository(operation, {
+        async renewLease(request) {
+            repository.calls.push({ method: 'renewLease', request });
+            return leaseOwned;
+        },
+    });
+    const timer = createManualTimer();
+    const lockEvents = [];
+    const lockService = {
+        async acquire() { return { ok: true }; },
+        async renew() { return { ok: true }; },
+        async release(request) {
+            lockEvents.push({ method: 'release', node: request.node });
+            return { ok: true };
+        },
+    };
+    let enterCommit;
+    const commitStarted = new Promise(resolve => { enterCommit = resolve; });
+    let finishCommit;
+    const commitResult = new Promise(resolve => { finishCommit = resolve; });
+    const executor = {
+        async prepare(request) {
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() {
+            enterCommit();
+            await commitResult;
+            return { ok: true };
+        },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    let finalized = false;
+    const worker = createWorker({
+        repository,
+        executor,
+        timer,
+        lockService,
+        renewalIntervalMs: 10_000,
+        finalizer: {
+            async succeed() {
+                finalized = true;
+                throw new Error('must not finalize after lease loss');
+            },
+        },
+    });
+
+    const running = worker.run('operation-1');
+    await commitStarted;
+    leaseOwned = false;
+    await timer.tick();
+    finishCommit();
+    const result = await running;
+
+    assert.equal(result.errorCode, 'TOPOLOGY_OPERATION_LEASE_LOST');
+    assert.equal(finalized, false);
+    assert.equal(timer.isActive(), false);
+    assert.deepEqual(lockEvents, [
+        { method: 'release', node: 'node-b' },
+        { method: 'release', node: 'node-a' },
+    ]);
+    assert.equal(repository.calls.some(call => (
+        call.method === 'recordNode'
+        && call.request.node === 'node-a'
+        && call.request.state === 'committed'
+    )), false, 'the stale worker must not persist progress after commit returns');
+});
+
+test('node locks are acquired by deterministic node id and released in reverse order', async () => {
+    const repository = createRepository(durableTopologyOperation([
+        'bridge',
+        'relay',
+        'portal',
+    ]));
+    const events = [];
+    const lockService = {
+        async acquire(request) {
+            events.push({ method: 'lock.acquire', node: request.node });
+            return { ok: true };
+        },
+        async renew() { return { ok: true }; },
+        async release(request) {
+            events.push({ method: 'lock.release', node: request.node });
+            return { ok: true };
+        },
+    };
+    const executor = {
+        async prepare(request) {
+            events.push({ method: 'prepare', node: request.node.node });
+            return {
+                backupId: `backup-${request.node.node}`,
+                prepared: Object.freeze({ node: request.node.node }),
+            };
+        },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    const worker = createWorker({
+        repository,
+        executor,
+        lockService,
+        deploymentRepository: {
+            async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
+        },
+    });
+
+    assert.equal((await worker.run('operation-1')).status, 'succeeded');
+    assert.deepEqual(events.filter(event => event.method.startsWith('lock.')), [
+        { method: 'lock.acquire', node: 'node-a' },
+        { method: 'lock.acquire', node: 'node-m' },
+        { method: 'lock.acquire', node: 'node-z' },
+        { method: 'lock.release', node: 'node-z' },
+        { method: 'lock.release', node: 'node-m' },
+        { method: 'lock.release', node: 'node-a' },
+    ]);
+    assert.deepEqual(events.filter(event => event.method === 'prepare'), [
+        { method: 'prepare', node: 'node-m' },
+        { method: 'prepare', node: 'node-a' },
+        { method: 'prepare', node: 'node-z' },
+    ]);
+    assert.ok(
+        events.findIndex(event => event.method === 'lock.acquire' && event.node === 'node-z')
+            < events.findIndex(event => event.method === 'prepare'),
+        'all locks must be held before preparation starts',
+    );
+});
+
+test('partial node-lock acquisition unwinds only acquired locks in reverse order', async () => {
+    const repository = createRepository(durableTopologyOperation([
+        'bridge',
+        'relay',
+        'portal',
+    ]));
+    const events = [];
+    const timer = createManualTimer();
+    const lockService = {
+        async acquire(request) {
+            events.push({ method: 'acquire', node: request.node });
+            if (request.node === 'node-z') {
+                return {
+                    ok: false,
+                    error: { code: 'NODE_OPERATION_LOCK_CONFLICT' },
+                };
+            }
+            return { ok: true };
+        },
+        async renew() { return { ok: true }; },
+        async release(request) {
+            events.push({ method: 'release', node: request.node });
+            return { ok: true };
+        },
+    };
+    let executorCalls = 0;
+    const forbidden = async () => {
+        executorCalls += 1;
+        throw new Error('executor must not run without every node lock');
+    };
+    const worker = createWorker({
+        repository,
+        lockService,
+        timer,
+        executor: {
+            prepare: forbidden,
+            commit: forbidden,
+            verify: forbidden,
+            cleanupPrepared: forbidden,
+            rollback: forbidden,
+        },
+        finalizer: { succeed: forbidden },
+    });
+
+    const result = await worker.run('operation-1');
+
+    assert.deepEqual(result, {
+        claimed: true,
+        operationId: 'operation-1',
+        status: 'preparing',
+        stopped: true,
+        errorCode: 'NODE_OPERATION_LOCK_CONFLICT',
+    });
+    assert.equal(executorCalls, 0);
+    assert.equal(timer.isActive(), false, 'heartbeat timer must stop after lock conflict');
+    assert.deepEqual(events, [
+        { method: 'acquire', node: 'node-a' },
+        { method: 'acquire', node: 'node-m' },
+        { method: 'acquire', node: 'node-z' },
+        { method: 'release', node: 'node-m' },
+        { method: 'release', node: 'node-a' },
+    ]);
+});
+
 
 test('altered durable candidate hash fails the fenced claim without executor use', async () => {
     const operation = durableOperation();

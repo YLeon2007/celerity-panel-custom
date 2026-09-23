@@ -191,10 +191,13 @@ class TopologyOperationWorker {
     constructor({
         operationRepository,
         executor,
-        deploymentRepository,
+        finalizer,
+        lockService,
         workerId,
         leaseMs,
         clock,
+        timer = globalThis,
+        renewalIntervalMs,
     } = {}) {
         const repositoryMethods = [
             'claim',
@@ -210,21 +213,39 @@ class TopologyOperationWorker {
         if (!executor || EXECUTOR_METHODS.some(method => typeof executor[method] !== 'function')) {
             throw new TypeError('Topology operation worker requires a typed executor');
         }
-        if (!deploymentRepository
-            || typeof deploymentRepository.markDeployed !== 'function') {
-            throw new TypeError('Topology operation worker requires deployedRevision CAS finalization');
+        if (!finalizer || typeof finalizer.succeed !== 'function') {
+            throw new TypeError('Topology operation worker requires atomic terminal finalization');
+        }
+        if (!lockService
+            || ['acquire', 'renew', 'release'].some(method => (
+                typeof lockService[method] !== 'function'
+            ))) {
+            throw new TypeError('Topology operation worker requires node operation locks');
         }
         if (typeof workerId !== 'string' || workerId.length === 0
-            || !Number.isSafeInteger(leaseMs) || leaseMs < 1
-            || typeof clock?.now !== 'function') {
+            || !Number.isSafeInteger(leaseMs) || leaseMs < 2
+            || typeof clock?.now !== 'function'
+            || typeof timer?.setInterval !== 'function'
+            || typeof timer?.clearInterval !== 'function'
+            || (renewalIntervalMs !== undefined
+                && (!Number.isSafeInteger(renewalIntervalMs)
+                    || renewalIntervalMs < 1
+                    || renewalIntervalMs >= leaseMs))) {
             throw new TypeError('Topology operation worker requires lease identity and clock');
         }
         this.operationRepository = operationRepository;
         this.executor = executor;
-        this.deploymentRepository = deploymentRepository;
+        this.finalizer = finalizer;
+        this.lockService = lockService;
         this.workerId = workerId;
         this.leaseMs = leaseMs;
         this.clock = clock;
+        Object.defineProperty(this, 'timer', {
+            value: timer,
+            enumerable: false,
+        });
+        this.renewalIntervalMs = renewalIntervalMs
+            ?? Math.max(1, Math.floor(leaseMs / 3));
         this.running = new Set();
     }
 
@@ -238,6 +259,115 @@ class TopologyOperationWorker {
         if (renewed !== true) throw new LeaseLostError();
     }
 
+    async renewLocks(operationId, lockedNodeIds) {
+        for (const node of lockedNodeIds) {
+            const renewed = await this.lockService.renew({
+                node,
+                owner: this.workerId,
+                operationId,
+                leaseMs: this.leaseMs,
+            });
+            if (renewed?.ok !== true) throw new LeaseLostError();
+        }
+    }
+
+    createLeaseHeartbeat(operationId, lockedNodeIds) {
+        let intervalId;
+        let inFlight = null;
+        let renewalError = null;
+        let stopped = false;
+
+        const clear = () => {
+            if (intervalId === undefined) return;
+            this.timer.clearInterval(intervalId);
+            intervalId = undefined;
+        };
+        const tick = () => {
+            if (stopped || renewalError) return inFlight || Promise.resolve();
+            if (inFlight) return inFlight;
+            inFlight = this.renew(operationId)
+                .then(() => this.renewLocks(operationId, lockedNodeIds))
+                .catch(error => {
+                    renewalError = error instanceof LeaseLostError
+                        ? error
+                        : new LeaseLostError();
+                    clear();
+                })
+                .finally(() => {
+                    inFlight = null;
+                });
+            return inFlight;
+        };
+        const assertOwned = () => {
+            if (renewalError) throw renewalError;
+        };
+        const renewOwned = async () => {
+            await tick();
+            assertOwned();
+        };
+
+        intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
+        return {
+            run: async work => {
+                await renewOwned();
+                let result;
+                let workError;
+                try {
+                    result = await work();
+                } catch (error) {
+                    workError = error;
+                }
+                await renewOwned();
+                if (workError) throw workError;
+                return result;
+            },
+            renew: renewOwned,
+            stop: async () => {
+                stopped = true;
+                clear();
+                if (inFlight) await inFlight;
+            },
+        };
+    }
+
+    async acquireLocks(operationId, nodes, acquiredNodeIds) {
+        const nodeIds = nodes
+            .map(node => entityId(node.node))
+            .sort((left, right) => left.localeCompare(right));
+        for (const nodeId of nodeIds) {
+            let acquired;
+            try {
+                acquired = await this.lockService.acquire({
+                    node: nodeId,
+                    owner: this.workerId,
+                    operationId,
+                    leaseMs: this.leaseMs,
+                });
+            } catch {
+                return 'NODE_LOCK_UNAVAILABLE';
+            }
+            if (acquired?.ok !== true) {
+                return acquired?.error?.code || 'NODE_LOCK_UNAVAILABLE';
+            }
+            acquiredNodeIds.push(nodeId);
+        }
+        return null;
+    }
+
+    async releaseLocks(operationId, acquiredNodeIds) {
+        for (const node of [...acquiredNodeIds].reverse()) {
+            try {
+                await this.lockService.release({
+                    node,
+                    owner: this.workerId,
+                    operationId,
+                });
+            } catch {
+                // Owned locks are leased; continue unwinding the remaining nodes.
+            }
+        }
+    }
+
     context(plan, node, prepared, backupId) {
         return {
             operationId: entityId(plan.operationId),
@@ -249,7 +379,7 @@ class TopologyOperationWorker {
         };
     }
 
-    async cleanupAfterPrepareFailure(plan, operationId, prepared) {
+    async cleanupAfterPrepareFailure(plan, operationId, prepared, heartbeat) {
         const rollingBack = await this.operationRepository.setPhase({
             operationId,
             owner: this.workerId,
@@ -264,13 +394,14 @@ class TopologyOperationWorker {
             await this.renew(operationId);
             let state = 'rolled_back';
             try {
-                const cleaned = await this.executor.cleanupPrepared(
+                const cleaned = await heartbeat.run(() => this.executor.cleanupPrepared(
                     this.context(plan, entry.node, entry.prepared, entry.backupId),
-                );
+                ));
                 if (cleaned?.ok !== true) {
                     throw new Error('Topology prepared-node cleanup was rejected');
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof LeaseLostError) throw error;
                 cleanupFailed = true;
                 state = 'failed';
             }
@@ -295,7 +426,8 @@ class TopologyOperationWorker {
         return { claimed: true, operationId, status };
     }
 
-    async rollbackAfterCommitFailure(plan, operationId, prepared, changing) {
+
+    async rollbackAfterCommitFailure(plan, operationId, prepared, changing, heartbeat) {
         const rollingBack = await this.operationRepository.setPhase({
             operationId,
             owner: this.workerId,
@@ -310,13 +442,14 @@ class TopologyOperationWorker {
             await this.renew(operationId);
             let state = 'rolled_back';
             try {
-                const rolledBack = await this.executor.rollback(
+                const rolledBack = await heartbeat.run(() => this.executor.rollback(
                     this.context(plan, entry.node, entry.prepared, entry.backupId),
-                );
+                ));
                 if (rolledBack?.ok !== true) {
                     throw new Error('Topology node rollback was rejected');
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof LeaseLostError) throw error;
                 rollbackFailed = true;
                 state = 'failed';
             }
@@ -336,13 +469,14 @@ class TopologyOperationWorker {
             await this.renew(operationId);
             let state = 'rolled_back';
             try {
-                const cleaned = await this.executor.cleanupPrepared(
+                const cleaned = await heartbeat.run(() => this.executor.cleanupPrepared(
                     this.context(plan, entry.node, entry.prepared, entry.backupId),
-                );
+                ));
                 if (cleaned?.ok !== true) {
                     throw new Error('Topology prepared-node cleanup was rejected');
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof LeaseLostError) throw error;
                 rollbackFailed = true;
                 state = 'failed';
             }
@@ -376,6 +510,8 @@ class TopologyOperationWorker {
             return { claimed: false, operationId };
         }
         this.running.add(operationId);
+        let heartbeat;
+        const acquiredNodeIds = [];
         try {
             const operation = await this.operationRepository.claim({
                 operationId,
@@ -400,11 +536,24 @@ class TopologyOperationWorker {
                 return { claimed: true, operationId, status: 'failed' };
             }
 
+            heartbeat = this.createLeaseHeartbeat(operationId, acquiredNodeIds);
+            const lockErrorCode = await this.acquireLocks(operationId, nodes, acquiredNodeIds);
+            if (lockErrorCode) {
+                return {
+                    claimed: true,
+                    operationId,
+                    status: 'preparing',
+                    stopped: true,
+                    errorCode: lockErrorCode,
+                };
+            }
             const prepared = [];
             try {
                 for (const node of nodes) {
                     await this.renew(operationId);
-                    const result = await this.executor.prepare(this.context(plan, node));
+                    const result = await heartbeat.run(
+                        () => this.executor.prepare(this.context(plan, node)),
+                    );
                     if (!result || typeof result.backupId !== 'string' || result.backupId.length === 0) {
                         throw new TypeError('Topology executor prepare must return a backup identifier');
                     }
@@ -422,7 +571,12 @@ class TopologyOperationWorker {
                 }
             } catch (error) {
                 if (error instanceof LeaseLostError) throw error;
-                return this.cleanupAfterPrepareFailure(plan, operationId, prepared);
+                return await this.cleanupAfterPrepareFailure(
+                    plan,
+                    operationId,
+                    prepared,
+                    heartbeat,
+                );
             }
 
             const committing = await this.operationRepository.setPhase({
@@ -440,19 +594,20 @@ class TopologyOperationWorker {
                 changing.push(entry);
                 let committed;
                 try {
-                    committed = await this.executor.commit(
+                    committed = await heartbeat.run(() => this.executor.commit(
                         this.context(plan, entry.node, entry.prepared, entry.backupId),
-                    );
+                    ));
                     if (committed?.ok !== true) {
                         throw new Error('Topology node commit was rejected');
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
-                    return this.rollbackAfterCommitFailure(
+                    return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
                         prepared,
                         changing,
+                        heartbeat,
                     );
                 }
                 const recorded = await this.operationRepository.recordNode({
@@ -465,27 +620,31 @@ class TopologyOperationWorker {
                 if (recorded !== true) throw new LeaseLostError();
                 await this.renew(operationId);
                 try {
-                    const verified = await this.executor.verify(
+                    const verified = await heartbeat.run(() => this.executor.verify(
                         this.context(plan, entry.node, entry.prepared, entry.backupId),
-                    );
+                    ));
                     if (verified?.ok !== true) {
                         throw new Error('Topology node verification was rejected');
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
-                    return this.rollbackAfterCommitFailure(
+                    return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
                         prepared,
                         changing,
+                        heartbeat,
                     );
                 }
             }
 
-            await this.renew(operationId);
+            await heartbeat.renew();
             let deployed;
             try {
-                deployed = await this.deploymentRepository.markDeployed({
+                deployed = await this.finalizer.succeed({
+                    operationId,
+                    owner: this.workerId,
+                    now: this.clock.now(),
                     expectedRevision: plan.topologyRevision,
                     expectedDeployedRevision: plan.priorDeployedRevision,
                 });
@@ -494,35 +653,34 @@ class TopologyOperationWorker {
                     throw new Error('Topology deployedRevision CAS was rejected');
                 }
             } catch (error) {
-                if (error instanceof LeaseLostError) throw error;
-                return this.rollbackAfterCommitFailure(
+                if (error instanceof LeaseLostError
+                    || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') {
+                    throw new LeaseLostError();
+                }
+                return await this.rollbackAfterCommitFailure(
                     plan,
                     operationId,
                     prepared,
                     changing,
+                    heartbeat,
                 );
             }
-            await this.renew(operationId);
-            const succeeded = await this.operationRepository.finishClaimed({
-                operationId,
-                owner: this.workerId,
-                now: this.clock.now(),
-                status: 'succeeded',
-            });
-            if (succeeded !== true) throw new LeaseLostError();
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {
-            if (error instanceof LeaseLostError) {
+            if (error instanceof LeaseLostError
+                || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') {
                 return {
                     claimed: true,
                     operationId,
                     status: 'running',
                     stopped: true,
-                    errorCode: error.code,
+                    errorCode: 'TOPOLOGY_OPERATION_LEASE_LOST',
                 };
             }
             throw error;
         } finally {
+            if (heartbeat) await heartbeat.stop();
+            await this.releaseLocks(operationId, acquiredNodeIds);
             this.running.delete(operationId);
         }
     }
