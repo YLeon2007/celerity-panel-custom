@@ -922,6 +922,7 @@ const render = (res, template, data = {}) => {
         languageOptions: res.locals.languageOptions,
         dateLocale: res.locals.dateLocale,
         locales: res.locals.locales,
+        csrfToken: res.locals.csrfToken || '',
     };
 
     const content = compiledTemplate({

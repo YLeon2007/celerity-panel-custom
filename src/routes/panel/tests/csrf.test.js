@@ -8,6 +8,18 @@ const {
     requirePanelCsrf,
 } = require('../csrf');
 
+const HELPERS_SOURCE = require('node:fs').readFileSync(
+    require('node:path').resolve(__dirname, '../helpers.js'),
+    'utf8',
+);
+
+test('panel render exposes the session CSRF token to every template', () => {
+    // Templates like nodes.ejs need the token for session-authenticated API calls
+    // (e.g. POST /api/cascade/topology/deploy); render() must pass it explicitly
+    // because it compiles templates with a curated data object, not res.locals.
+    assert.match(HELPERS_SOURCE, /csrfToken: res\.locals\.csrfToken \|\| ''/);
+});
+
 function createResponse() {
     return {
         statusCode: null,
