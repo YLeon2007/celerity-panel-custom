@@ -17,38 +17,41 @@ class NodeOperationLockService {
 
     async acquire({ node, owner, operationId, leaseMs }) {
         const now = this.clock.now();
-        const currentLock = await this.repository.findByNode(node);
-        const isActive = currentLock && currentLock.leaseUntil.getTime() > now.getTime();
-        const isRenewal = isActive
-            && String(currentLock.owner) === String(owner)
-            && String(currentLock.operationId) === String(operationId);
-
-        if (isActive && !isRenewal) {
-            return {
-                ok: false,
-                error: {
-                    code: RESULT_CODES.CONFLICT,
-                    node,
-                    owner: currentLock.owner,
-                    operationId: currentLock.operationId,
-                    leaseUntil: currentLock.leaseUntil,
-                },
-            };
-        }
-
-        const lock = {
+        const lease = {
             node,
             owner,
             operationId,
             leaseUntil: new Date(now.getTime() + leaseMs),
         };
+        const claim = await this.repository.acquireLease({
+            ...lease,
+            now,
+        });
 
-        await this.repository.save(lock);
+        if (!claim?.acquired) {
+            const currentLock = claim?.currentLock;
+            return {
+                ok: false,
+                error: {
+                    code: RESULT_CODES.CONFLICT,
+                    node,
+                    owner: currentLock?.owner,
+                    operationId: currentLock?.operationId,
+                    leaseUntil: currentLock?.leaseUntil,
+                },
+            };
+        }
+
+        const previousLock = claim.previousLock;
+        const isRenewal = Boolean(previousLock)
+            && previousLock.leaseUntil.getTime() > now.getTime()
+            && String(previousLock.owner) === String(owner)
+            && String(previousLock.operationId) === String(operationId);
 
         return {
             ok: true,
             code: isRenewal ? RESULT_CODES.RENEWED : RESULT_CODES.ACQUIRED,
-            lock,
+            lock: lease,
         };
     }
 

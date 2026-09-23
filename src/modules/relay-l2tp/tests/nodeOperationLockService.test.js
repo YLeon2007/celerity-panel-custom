@@ -20,6 +20,27 @@ function createRepository(initialLocks = []) {
             calls.push({ method: 'findByNode', node });
             return locks.get(String(node)) || null;
         },
+        async acquireLease(request) {
+            calls.push({ method: 'acquireLease', request: { ...request } });
+            const currentLock = locks.get(String(request.node));
+            const previousLock = currentLock ? { ...currentLock } : null;
+            const eligible = !previousLock
+                || previousLock.leaseUntil.getTime() <= request.now.getTime()
+                || (String(previousLock.owner) === String(request.owner)
+                    && String(previousLock.operationId) === String(request.operationId));
+            if (!eligible) {
+                return { acquired: false, currentLock: previousLock };
+            }
+
+            const lock = {
+                node: request.node,
+                owner: request.owner,
+                operationId: request.operationId,
+                leaseUntil: request.leaseUntil,
+            };
+            locks.set(String(request.node), { ...lock });
+            return { acquired: true, previousLock };
+        },
         async save(lock) {
             calls.push({ method: 'save', lock: { ...lock } });
             locks.set(String(lock.node), { ...lock });
@@ -57,6 +78,117 @@ function createService(repository) {
         clock: { now: () => new Date(NOW) },
     });
 }
+
+function createConcurrentRepository(initialLock = null) {
+    let currentLock = initialLock ? { ...initialLock } : null;
+    const calls = [];
+    const pendingReads = [];
+
+    function releaseReads() {
+        while (pendingReads.length > 0) {
+            pendingReads.shift()(currentLock ? { ...currentLock } : null);
+        }
+    }
+
+    return {
+        calls,
+        async findByNode(node) {
+            calls.push({ method: 'findByNode', node });
+            return new Promise(resolve => {
+                pendingReads.push(lock => resolve(lock));
+                if (pendingReads.length === 2) releaseReads();
+            });
+        },
+        async save(lock) {
+            calls.push({ method: 'save', lock: { ...lock } });
+            currentLock = { ...lock };
+            return { ...lock };
+        },
+        async acquireLease(request) {
+            calls.push({ method: 'acquireLease', request: { ...request } });
+            const previousLock = currentLock ? { ...currentLock } : null;
+            const eligible = !previousLock
+                || previousLock.leaseUntil.getTime() <= request.now.getTime()
+                || (String(previousLock.owner) === String(request.owner)
+                    && String(previousLock.operationId) === String(request.operationId));
+            if (!eligible) {
+                return { acquired: false, currentLock: previousLock };
+            }
+
+            currentLock = {
+                node: request.node,
+                owner: request.owner,
+                operationId: request.operationId,
+                leaseUntil: request.leaseUntil,
+            };
+            return { acquired: true, previousLock };
+        },
+        getCurrentLock() {
+            return currentLock;
+        },
+    };
+}
+
+test('concurrent absent competitors allow only one acquire', async () => {
+    const repository = createConcurrentRepository();
+    const service = createService(repository);
+
+    const results = await Promise.all([
+        service.acquire({
+            node: 'node-a',
+            owner: 'worker-a',
+            operationId: 'operation-a',
+            leaseMs: 30_000,
+        }),
+        service.acquire({
+            node: 'node-a',
+            owner: 'worker-b',
+            operationId: 'operation-b',
+            leaseMs: 30_000,
+        }),
+    ]);
+
+    assert.deepEqual(results.map(result => result.ok).sort(), [false, true]);
+    assert.deepEqual(repository.getCurrentLock(), {
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
+    });
+});
+
+test('concurrent expired competitors allow only one replacement', async () => {
+    const repository = createConcurrentRepository({
+        node: 'node-a',
+        owner: 'worker-expired',
+        operationId: 'operation-expired',
+        leaseUntil: new Date('2026-09-21T11:59:59.999Z'),
+    });
+    const service = createService(repository);
+
+    const results = await Promise.all([
+        service.acquire({
+            node: 'node-a',
+            owner: 'worker-a',
+            operationId: 'operation-a',
+            leaseMs: 30_000,
+        }),
+        service.acquire({
+            node: 'node-a',
+            owner: 'worker-b',
+            operationId: 'operation-b',
+            leaseMs: 30_000,
+        }),
+    ]);
+
+    assert.deepEqual(results.map(result => result.ok).sort(), [false, true]);
+    assert.deepEqual(repository.getCurrentLock(), {
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
+    });
+});
 
 test('acquire creates a lease when the node has no lock', async () => {
     const repository = createRepository();
@@ -109,6 +241,7 @@ test('acquire rejects an active lease owned by another operation', async () => {
         },
     });
     assert.equal(repository.calls.filter(call => call.method === 'save').length, 0);
+    assert.equal(repository.calls.filter(call => call.method === 'findByNode').length, 0);
 });
 
 test('acquire replaces an expired lease', async () => {
@@ -366,8 +499,8 @@ test('acquireMany sorts node ids before making repository calls', async () => {
     );
     assert.deepEqual(
         repository.calls
-            .filter(call => call.method === 'findByNode')
-            .map(call => call.node),
+            .filter(call => call.method === 'acquireLease')
+            .map(call => call.request.node),
         ['node-a', 'node-b', 'node-c'],
     );
 });

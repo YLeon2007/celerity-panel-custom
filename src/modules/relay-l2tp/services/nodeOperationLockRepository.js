@@ -19,6 +19,45 @@ class NodeOperationLockRepository {
         return lean(this.model.findOne({ node }));
     }
 
+    async acquireLease({ node, owner, operationId, now, leaseUntil }) {
+        try {
+            const previousLock = await lean(this.model.findOneAndUpdate(
+                {
+                    node,
+                    $or: [
+                        { leaseUntil: { $lte: now } },
+                        { owner, operationId },
+                    ],
+                },
+                {
+                    $set: {
+                        owner,
+                        operationId,
+                        leaseUntil,
+                    },
+                },
+                {
+                    upsert: true,
+                    new: false,
+                    runValidators: true,
+                    setDefaultsOnInsert: true,
+                },
+            ));
+
+            return {
+                acquired: true,
+                previousLock,
+            };
+        } catch (error) {
+            if (error?.code !== 11000) throw error;
+
+            return {
+                acquired: false,
+                currentLock: await this.findByNode(node),
+            };
+        }
+    }
+
     save({ node, owner, operationId, leaseUntil }) {
         return lean(this.model.findOneAndUpdate(
             { node },

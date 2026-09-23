@@ -102,6 +102,96 @@ test('adapts the lock model to the concrete lock-service repository contract', a
     ]);
 });
 
+test('acquireLease atomically claims only absent, expired, or same-owner locks', async () => {
+    const calls = [];
+    const previousLock = {
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-22T12:01:00.000Z'),
+    };
+    const model = {
+        findOneAndUpdate(filter, update, options) {
+            calls.push({ method: 'findOneAndUpdate', filter, update, options });
+            return queryResult(previousLock);
+        },
+    };
+    const repository = new NodeOperationLockRepository({ model });
+    const now = new Date('2026-09-22T12:00:00.000Z');
+    const leaseUntil = new Date('2026-09-22T12:02:00.000Z');
+
+    assert.deepEqual(await repository.acquireLease({
+        node: 'node-a',
+        owner: 'worker-b',
+        operationId: 'operation-b',
+        now,
+        leaseUntil,
+    }), {
+        acquired: true,
+        previousLock,
+    });
+    assert.deepEqual(calls, [{
+        method: 'findOneAndUpdate',
+        filter: {
+            node: 'node-a',
+            $or: [
+                { leaseUntil: { $lte: now } },
+                { owner: 'worker-b', operationId: 'operation-b' },
+            ],
+        },
+        update: {
+            $set: {
+                owner: 'worker-b',
+                operationId: 'operation-b',
+                leaseUntil,
+            },
+        },
+        options: {
+            upsert: true,
+            new: false,
+            runValidators: true,
+            setDefaultsOnInsert: true,
+        },
+    }]);
+});
+
+test('acquireLease turns a unique-key race into a rejected claim', async () => {
+    const currentLock = {
+        node: 'node-a',
+        owner: 'worker-a',
+        operationId: 'operation-a',
+        leaseUntil: new Date('2026-09-22T12:01:00.000Z'),
+    };
+    const calls = [];
+    const duplicateKey = Object.assign(new Error('duplicate key'), { code: 11000 });
+    const model = {
+        findOneAndUpdate() {
+            calls.push('findOneAndUpdate');
+            throw duplicateKey;
+        },
+        findOne(filter) {
+            calls.push({ method: 'findOne', filter });
+            return queryResult(currentLock);
+        },
+    };
+    const repository = new NodeOperationLockRepository({ model });
+
+    assert.deepEqual(await repository.acquireLease({
+        node: 'node-a',
+        owner: 'worker-b',
+        operationId: 'operation-b',
+        now: new Date('2026-09-22T12:00:00.000Z'),
+        leaseUntil: new Date('2026-09-22T12:02:00.000Z'),
+    }), {
+        acquired: false,
+        currentLock,
+    });
+    assert.deepEqual(calls, [
+        'findOneAndUpdate',
+        { method: 'findOne', filter: { node: 'node-a' } },
+    ]);
+});
+
 test('reports unmatched renewals and owned deletions without model objects in results', async () => {
     const model = {
         async updateOne() { return { matchedCount: 0 }; },
