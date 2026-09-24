@@ -1457,6 +1457,7 @@
     "swapNodes": "Swap",
     "deployFailed": "Deploy failed",
     "deployQueued": "Topology deployment queued",
+    "deployDeferredIncompleteChain": "Auto-deploy deferred: the chain is not complete yet",
     "deployAlreadyDeployed": "This topology revision is already deployed",
     "deploymentEndedWithStatus": "Deployment of this revision ended with status",
     "networkError": "Network error",

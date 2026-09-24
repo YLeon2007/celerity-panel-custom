@@ -248,6 +248,50 @@ test('invalid pinned topology is sanitized before any plan or worker call', asyn
     assert.deepEqual(calls.map(call => call.method), ['pinTopology']);
 });
 
+test('plan validation failures surface as 422 INVALID_TOPOLOGY_DEPLOYMENT with the reason', async () => {
+    const { FrozenTopologyDeploymentPlanError } = require('../services/frozenTopologyDeploymentPlanComposer');
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: {
+            async pinTopology({ prepare }) {
+                return prepare(snapshot());
+            },
+        },
+        planMaterializer: {
+            async materialize() {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'MISSING_TOPOLOGY_LINK',
+                    'Topology v1 requires one link between every adjacent node',
+                );
+            },
+        },
+        operationRepository: {
+            async createFrozen() {
+                throw new Error('must not create an operation for an invalid plan');
+            },
+        },
+        operationWorker: {
+            async run() {
+                throw new Error('must not start work for an invalid plan');
+            },
+        },
+        validator: () => ({ valid: true, errors: [] }),
+        idFactory: () => 'operation-incomplete-chain',
+    });
+
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 7 }),
+        error => {
+            assert.equal(error.code, 'INVALID_TOPOLOGY_DEPLOYMENT');
+            assert.equal(
+                error.message,
+                'Topology v1 requires one link between every adjacent node',
+            );
+            assert.equal(error.causeCode, 'MISSING_TOPOLOGY_LINK');
+            return true;
+        },
+    );
+});
+
 test('re-deploy of an already-recorded revision returns the existing operation without re-running work', async () => {
     for (const existingStatus of ['succeeded', 'failed', 'rolled_back']) {
         const calls = [];

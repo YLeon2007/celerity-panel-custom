@@ -110,6 +110,19 @@ function safeQueueError(error, operationId, expectedTopologyRevision) {
             },
         );
     }
+    // Plan validation failures (incomplete chain, bad roles, unsupported
+    // metadata) are client-visible 422s, not opaque 500 queue failures.
+    if (error?.name === 'FrozenTopologyDeploymentPlanError') {
+        return new TopologyOperationCoordinatorError(
+            'INVALID_TOPOLOGY_DEPLOYMENT',
+            error.message || 'The pinned topology is invalid',
+            {
+                operationId,
+                expectedTopologyRevision,
+                causeCode: error?.code,
+            },
+        );
+    }
     return new TopologyOperationCoordinatorError(
         'TOPOLOGY_OPERATION_QUEUE_FAILED',
         `The topology operation could not be queued: ${error?.message || 'unknown error'}`,
