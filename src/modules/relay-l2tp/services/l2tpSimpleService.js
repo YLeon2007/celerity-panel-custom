@@ -403,7 +403,9 @@ class L2tpSimpleService {
             ? entityId(state.routeGroup)
             : await this.ensureRouteGroup(selectedNodeId);
 
-        if (!state) {
+        if (!state || state.desiredState !== 'installed') {
+            // Fresh relay or one whose state was reset by uninstall —
+            // (re)generate the PSK and mark install as desired.
             await this.stateManagementService.configureRelay(
                 selectedNodeId,
                 autoDesiredInput(selectedNodeId, states, routeGroupId),

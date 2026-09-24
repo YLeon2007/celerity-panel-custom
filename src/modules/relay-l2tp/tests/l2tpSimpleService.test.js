@@ -278,6 +278,41 @@ test('installRelay auto-configures defaults, inherits accounts and queues instal
     assert.equal(calls.install[0].input.expectedTopologyRevision, 7);
 });
 
+test('installRelay reconfigures a state reset by uninstall before installing', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        states: [{ ...STATE, desiredState: 'not_installed', status: 'not_installed' }],
+        groups: [{ _id: 'group-a', name: 'g' }],
+    });
+    const calls = { configure: [], install: [] };
+    const service = createService({
+        stateManagementService: {
+            configureRelay: async (nodeId, input) => {
+                calls.configure.push({ nodeId, input });
+            },
+        },
+        userManagementService: {
+            createUser: async () => ({}),
+            deleteUser: async () => ({}),
+            importUser: async () => ({}),
+        },
+        l2tpService: {
+            install: async (nodeId, input) => {
+                calls.install.push({ nodeId, input });
+                return { operationId: 'op-reinstall' };
+            },
+            getOperation: async () => ({}),
+        },
+    }, models);
+
+    const result = await service.installRelay('relay-1');
+
+    assert.deepEqual(result, { operationId: 'op-reinstall' });
+    assert.equal(calls.configure.length, 1);
+    assert.equal(calls.configure[0].input.generatePsk, true);
+    assert.equal(calls.install.length, 1);
+});
+
 test('installRelay auto-creates a route group from a linear cascade chain', async () => {
     const models = createModels({
         nodes: [RELAY],
