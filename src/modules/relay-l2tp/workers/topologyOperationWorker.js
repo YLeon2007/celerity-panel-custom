@@ -758,7 +758,7 @@ class TopologyOperationWorker {
                 }
             } catch (error) {
                 if (error instanceof LeaseLostError) throw error;
-                logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
+                logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause}${error.cause?.detail ? ` ${JSON.stringify(error.cause.detail)}` : ''})` : ''}`);
                 return await this.cleanupAfterPrepareFailure(
                     plan,
                     operationId,

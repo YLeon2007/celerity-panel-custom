@@ -113,10 +113,17 @@ function parseReceipt(result, command, expected) {
         || result.stderr !== ''
         || typeof result.stdout !== 'string'
         || !result.stdout.endsWith('\n')) {
-        throw new TopologyNodeTransportError(
+        const error = new TopologyNodeTransportError(
             'INVALID_RECEIPT',
             'Invalid topology node receipt',
         );
+        // Diagnostic detail for operators; the message stays stable for tests.
+        error.detail = {
+            exitCode: result && typeof result === 'object' ? result.code : undefined,
+            stderr: typeof result?.stderr === 'string' ? result.stderr.slice(0, 300) : undefined,
+            stdout: typeof result?.stdout === 'string' ? result.stdout.slice(0, 300) : undefined,
+        };
+        throw error;
     }
     const serialized = result.stdout.slice(0, -1);
     if (!serialized || /[\r\n]/.test(serialized)) {
