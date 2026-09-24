@@ -22,8 +22,13 @@ services:
     image: mongo:7
     container_name: hysteria-mongo
     restart: always
+    # Single-node replica set: the topology deploy pipeline uses Mongo
+    # transactions, which require a replica set member. Authorization with a
+    # replica set requires a shared keyFile.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/etc/mongo/keyfile"]
     volumes:
       - mongo_data:/data/db
+      - ./mongo-keyfile:/etc/mongo/keyfile:ro
     environment:
       MONGO_INITDB_DATABASE: hysteria
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hysteria}
