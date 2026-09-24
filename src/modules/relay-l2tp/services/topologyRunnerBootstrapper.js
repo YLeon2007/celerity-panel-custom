@@ -44,7 +44,7 @@ const CLEANUP_COMMAND = Object.freeze(
 const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze([
     '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge',
     '&& if /usr/bin/test ! -f /etc/systemd/system/xray-bridge.service; then',
-    `/usr/bin/printf '%s\\n' '${[
+    `/usr/bin/printf '%b\\n' '${[
         '[Unit]',
         'Description=Xray Bridge (Cascade Tunnel)',
         'After=network.target nss-lookup.target',
