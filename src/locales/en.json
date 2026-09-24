@@ -1788,6 +1788,8 @@
     "queued": "Operation queued",
     "done": "Done",
     "failed": "Failed",
-    "rateLimited": "Too many requests — wait a minute"
+    "rateLimited": "Too many requests — wait a minute",
+    "copyPassword": "Click to copy the password",
+    "passwordPlaceholder": "Password (empty — auto-generate)"
   }
 }

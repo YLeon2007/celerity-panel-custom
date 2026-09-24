@@ -113,6 +113,8 @@ function createService(overrides = {}, models = createModels()) {
             exec: async () => ({ code: 0, stdout: 'TEARDOWN_OK' }),
             disconnect: () => {},
         })),
+        secretBox: overrides.secretBox ?? null,
+        secretKey: overrides.secretKey ?? null,
     });
 }
 
@@ -400,7 +402,51 @@ test('createAccount fans out to every installed relay with per-relay addresses',
     assert.equal(created[0].input.ip, '10.255.30.10');
     assert.equal(created[1].input.ip, '10.255.31.10');
     assert.equal(created[0].input.password, 'secret-pw');
+    assert.equal(result.password, 'secret-pw');
     assert.equal(result.results.every(entry => entry.created), true);
+});
+
+test('createAccount generates a password when none is provided', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    const created = [];
+    const service = createService({
+        userManagementService: {
+            createUser: async (nodeId, input) => { created.push({ nodeId, input }); },
+            deleteUser: async () => ({}),
+            importUser: async () => ({}),
+        },
+    }, models);
+
+    const result = await service.createAccount({ login: 'bob' });
+
+    assert.equal(created.length, 1);
+    assert.match(created[0].input.password, /^[A-Za-z0-9_-]{16}$/);
+    assert.equal(result.password, created[0].input.password);
+});
+
+test('overview reveals account passwords through the secret box', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        states: [STATE],
+        users: [{
+            _id: 'u1',
+            relayNode: 'relay-1',
+            login: 'alice',
+            ip: '10.255.30.10',
+            enabled: true,
+            syncStatus: 'synced',
+            passwordEncrypted: 'v1:sealed',
+        }],
+    });
+    const service = createService({
+        secretBox: { decrypt: envelope => (envelope === 'v1:sealed' ? 'plain-pw' : null) },
+        secretKey: 'key',
+    }, models);
+
+    const overview = await service.overview();
+
+    assert.equal(overview.accounts.length, 1);
+    assert.equal(overview.accounts[0].password, 'plain-pw');
 });
 
 test('createAccount requires at least one installed relay', async () => {

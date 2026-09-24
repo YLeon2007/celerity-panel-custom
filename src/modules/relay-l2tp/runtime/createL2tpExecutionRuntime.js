@@ -391,6 +391,8 @@ function createL2tpExecutionRuntime({
         userManagementService,
         stateRepository: runtimeDependencies.stateRepository,
         nodeSSHFactory: node => new NodeSSH(node),
+        secretBox,
+        secretKey,
     });
     Object.defineProperty(runtime, 'simpleService', {
         value: simpleService,

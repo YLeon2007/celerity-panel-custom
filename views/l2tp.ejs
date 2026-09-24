@@ -32,7 +32,7 @@
         <h2><i class="ti ti-users"></i> <%= t('l2tp.accounts') %></h2>
         <form class="l2tp-form" id="accountForm">
             <input type="text" id="accountLogin" placeholder="<%= t('l2tp.login') %>" autocomplete="off" required>
-            <input type="password" id="accountPassword" placeholder="<%= t('l2tp.secret') %>" autocomplete="new-password" required>
+            <input type="text" id="accountPassword" placeholder="<%= t('l2tp.passwordPlaceholder') %>" autocomplete="new-password">
             <button type="submit" class="btn btn-primary"><i class="ti ti-plus"></i> <%= t('l2tp.createAccount') %></button>
         </form>
         <div id="accountList"></div>
@@ -54,6 +54,7 @@
         online: t('l2tp.online'),
         offline: t('l2tp.offline'),
         copyPsk: t('l2tp.copyPsk'),
+        copyPassword: t('l2tp.copyPassword'),
         copied: t('l2tp.copied'),
         noAccounts: t('l2tp.noAccounts'),
         deleteAccount: t('l2tp.deleteAccount'),
@@ -156,6 +157,10 @@
                 <span class="l2tp-name grow">${esc(account.login)}
                     ${account.pending ? `<span class="badge badge-warn">${esc(L.pendingSync)}</span>` : ''}
                 </span>
+                ${account.password
+                    ? `<button class="psk-chip" data-psk="${esc(account.password)}"
+                        title="${esc(L.copyPassword)}">${esc(account.password)}</button>`
+                    : '<span class="l2tp-empty">—</span>'}
                 <span class="relay-chips">${account.relays.map(relay =>
                     `<span class="relay-chip">${esc(relay.name)} · ${esc(relay.ip)}</span>`).join('')}
                 </span>
@@ -255,6 +260,20 @@
     });
 
     accountList.addEventListener('click', async event => {
+        const pskChip = event.target.closest('.psk-chip');
+        if (pskChip) {
+            try {
+                await navigator.clipboard.writeText(pskChip.dataset.psk);
+                accountStatus.textContent = L.copied;
+            } catch {
+                const range = document.createRange();
+                range.selectNodeContents(pskChip);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+            return;
+        }
         const button = event.target.closest('button[data-action="delete-account"]');
         if (!button) return;
         const login = button.closest('.l2tp-row')?.dataset.login;

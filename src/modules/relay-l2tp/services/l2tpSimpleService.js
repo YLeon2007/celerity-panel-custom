@@ -1,6 +1,6 @@
 'use strict';
 
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
 
 // Simplified, opinionated facade over the L2TP relay machinery: the panel
 // page only exposes install/uninstall per relay, a revealed per-relay PSK
@@ -142,7 +142,13 @@ function safeAccountUsers(users) {
         enabled: user.enabled !== false,
         syncStatus: typeof user.syncStatus === 'string' ? user.syncStatus : '',
         desiredRevision: user.desiredRevision,
+        passwordEncrypted: typeof user.passwordEncrypted === 'string' ? user.passwordEncrypted : '',
     }));
+}
+
+function generateAccountPassword() {
+    // base64url keeps chap-secrets quoting safe (no whitespace/quotes).
+    return randomBytes(12).toString('base64url');
 }
 
 function buildTeardownScript(state) {
@@ -204,6 +210,8 @@ class L2tpSimpleService {
         userManagementService,
         stateRepository,
         nodeSSHFactory,
+        secretBox = null,
+        secretKey = null,
     } = {}) {
         if (!HyNode || typeof HyNode.find !== 'function' || typeof HyNode.findById !== 'function') {
             throw new TypeError('L2TP simple service requires the HyNode model');
@@ -244,6 +252,17 @@ class L2tpSimpleService {
         this.userManagementService = userManagementService;
         this.stateRepository = stateRepository;
         this.nodeSSHFactory = nodeSSHFactory;
+        this.secretBox = secretBox;
+        this.secretKey = secretKey;
+    }
+
+    revealAccountPassword(passwordEncrypted) {
+        if (!passwordEncrypted || !this.secretBox || !this.secretKey) return null;
+        try {
+            return this.secretBox.decrypt(passwordEncrypted, this.secretKey);
+        } catch {
+            return null;
+        }
     }
 
     async listStates() {
@@ -257,7 +276,7 @@ class L2tpSimpleService {
 
     async listAccounts() {
         const users = await this.L2tpUser.find({})
-            .select('relayNode login ip enabled syncStatus desiredRevision')
+            .select('relayNode login ip enabled syncStatus desiredRevision +passwordEncrypted')
             .lean();
         return safeAccountUsers(users || []);
     }
@@ -295,10 +314,18 @@ class L2tpSimpleService {
             });
         }
         const nodeNames = new Map(relays.map(relay => [relay.id, relay.name]));
+        const passwords = new Map();
         const grouped = new Map();
         for (const account of accounts) {
+            if (!passwords.has(account.login)) {
+                passwords.set(
+                    account.login,
+                    this.revealAccountPassword(account.passwordEncrypted),
+                );
+            }
             const entry = grouped.get(account.login) ?? {
                 login: account.login,
+                password: passwords.get(account.login),
                 relays: [],
                 pending: false,
             };
@@ -516,9 +543,11 @@ class L2tpSimpleService {
 
     async createAccount(input) {
         const login = typeof input?.login === 'string' ? input.login.trim() : '';
-        const password = typeof input?.password === 'string' ? input.password : '';
-        if (!login || !password) {
-            throw simpleError('INVALID_INPUT', 'Both login and password are required');
+        const password = typeof input?.password === 'string' && input.password.length > 0
+            ? input.password
+            : generateAccountPassword();
+        if (!login) {
+            throw simpleError('INVALID_INPUT', 'An account login is required');
         }
 
         const states = (await this.listStates())
@@ -564,7 +593,7 @@ class L2tpSimpleService {
                 syncStatus: 'pending',
             });
         }
-        return { login, results };
+        return { login, password, results };
     }
 
     async deleteAccount(login) {
