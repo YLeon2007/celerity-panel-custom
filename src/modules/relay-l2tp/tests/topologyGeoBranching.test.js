@@ -141,6 +141,14 @@ test('reverse chain with a geo-routing branch bridge composes end-to-end', () =>
     assert.ok(geoRuleIndex < defaultRuleIndex, 'geo rules precede the default rule');
     assert.ok(privateIndex > defaultRuleIndex, 'geoip:private stays last');
 
+    // Every plan node carries its durable node id so the coordinator never
+    // re-derives refs by walking a branching link graph.
+    const byRef = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, node]));
+    assert.equal(byRef.portal.node, 'node-portal');
+    assert.equal(byRef['relay-1'].node, 'node-relay');
+    assert.equal(byRef.bridge.node, 'node-bridge');
+    assert.equal(byRef['bridge-2'].node, 'node-bridge-geo');
+
     // The geo bridge is configured like a regular bridge for its own link:
     // in reverse mode it dials out through its tunnel outbound.
     const geoBridge = configs['bridge-2'];

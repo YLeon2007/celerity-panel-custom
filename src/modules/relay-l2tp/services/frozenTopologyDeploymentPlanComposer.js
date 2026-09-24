@@ -668,6 +668,7 @@ function candidateForNode({ mode, nodeId, node, nodeRef, orderedLinks, linkMetad
     const bytes = Buffer.from(`${JSON.stringify(canonicalize(config))}\n`, 'utf8');
 
     return {
+        node: nodeId,
         nodeRef,
         role: node.role,
         ...target,
