@@ -431,11 +431,19 @@ class L2tpSimpleService {
 
         const states = await this.listStates();
         let state = states.find(entry => entityId(entry.node) === selectedNodeId);
-        const routeGroupId = state?.routeGroup
-            ? entityId(state.routeGroup)
-            : await this.ensureRouteGroup(selectedNodeId);
+        let routeGroupId = state?.routeGroup ? entityId(state.routeGroup) : null;
         if (routeGroupId) {
-            await this.refreshEmptyRouteGroup(selectedNodeId, routeGroupId);
+            // The pinned group may have been deleted together with cascade
+            // links — fall back to (re)creating a group instead of failing
+            // with ROUTE_GROUP_NOT_FOUND deep inside the install pipeline.
+            const existing = await this.CascadeRouteGroup.findById(routeGroupId).lean();
+            if (!existing) routeGroupId = null;
+        }
+        if (!routeGroupId) {
+            routeGroupId = await this.ensureRouteGroup(selectedNodeId);
+        }
+        if (routeGroupId) {
+            await this.ensureRelayGroupPath(selectedNodeId, routeGroupId);
         }
 
         if (!state || state.desiredState !== 'installed') {
@@ -494,6 +502,43 @@ class L2tpSimpleService {
             routeGroupId,
             expectedTopologyRevision: topologyRevision,
         });
+    }
+
+    // Every relay gets its own path inside the shared group: the compiler
+    // derives each relay's egress plan from the path whose first link starts
+    // at that relay. A group auto-created for one relay therefore does not
+    // serve another relay mid-chain until its suffix path is appended.
+    async ensureRelayGroupPath(nodeId, routeGroupId) {
+        const group = await this.CascadeRouteGroup.findById(routeGroupId).lean();
+        if (!group) return;
+        let paths;
+        try {
+            paths = await this.buildAutoGroupPaths(nodeId);
+        } catch (error) {
+            // No cascade chain currently leaves this relay — keep the group
+            // untouched instead of failing the install.
+            if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
+                return;
+            }
+            throw error;
+        }
+        if (!paths.length || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
+            return;
+        }
+        const wanted = paths[0];
+        const wantedLinks = JSON.stringify((wanted.linkIds || []).map(String));
+        const exists = (group.paths || []).some(path => (
+            JSON.stringify((path?.linkIds || []).map(String)) === wantedLinks
+        ));
+        if (exists) return;
+        const usedKeys = new Set((group.paths || []).map(path => path?.pathKey));
+        const pathKey = usedKeys.has(wanted.pathKey)
+            ? `${wanted.pathKey}-${String(nodeId).slice(-6)}`
+            : wanted.pathKey;
+        await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, {
+            $push: { paths: { ...wanted, pathKey } },
+        });
+        await this.stateRepository.advanceTopologyRevision?.();
     }
 
     // Rebuilds the relay route group paths when a topology change (e.g. a

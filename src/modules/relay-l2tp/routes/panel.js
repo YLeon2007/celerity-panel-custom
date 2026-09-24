@@ -202,6 +202,11 @@ function sendServiceError(res, error) {
         error: {
             code: error.code,
             message: SAFE_ERROR_MESSAGE_BY_CODE.get(error.code) ?? error.message,
+            // Diagnostic detail (failureCode / nodeId / routeGroupId) is safe:
+            // it contains no secrets, only machine-readable failure context.
+            ...(error.details && typeof error.details === 'object'
+                ? { details: error.details }
+                : {}),
         },
     });
 }
