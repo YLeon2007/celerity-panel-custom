@@ -156,6 +156,16 @@ PY
     fi
 fi
 
+# `ipsec start` outside systemd (or an interrupted uninstall) can leave an
+# orphaned starter/charon pair plus stale pid files. A fresh `ipsec start`
+# then exits 0 with "no fork done", the unit ends inactive and verify fails.
+# Always tear down any existing IPsec runtime before the service restart.
+ipsec_path="$(command -v ipsec || true)"
+if [[ -n "$ipsec_path" ]]; then
+    "$ipsec_path" stop >/dev/null 2>&1 || true
+fi
+rm -f /var/run/charon.pid /var/run/starter.charon.pid >/dev/null 2>&1 || true
+
 for unit in "${L2TP_UNITS[@]}"; do
     if ! "$systemctl_path" restart "$unit" >/dev/null 2>&1; then
         emit_error 'L2TP_SERVICE_RESTART_FAILED'

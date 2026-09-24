@@ -183,6 +183,8 @@ print('xray-l2tp-removed')
 `).toString('base64');
     return [
         'set -u',
+        'ipsec stop >/dev/null 2>&1 || true',
+        'rm -f /var/run/charon.pid /var/run/starter.charon.pid >/dev/null 2>&1 || true',
         'systemctl stop xl2tpd.service strongswan-starter.service >/dev/null 2>&1 || true',
         'systemctl disable xl2tpd.service strongswan-starter.service >/dev/null 2>&1 || true',
         'nft delete table inet celerity_l2tp >/dev/null 2>&1 || true',
