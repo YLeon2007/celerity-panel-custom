@@ -1052,7 +1052,18 @@
             });
             if (!await handleDraftMutationResponse(res)) return;
             closeModal();
-            loadTopology();
+            await loadTopology();
+            // Honor the "auto-deploy" checkbox: after creating a link, queue
+            // a topology deploy with the (freshly bumped) revision.
+            if (!linkId && data.autoDeploy === true) {
+                try {
+                    const result = await deployTopology();
+                    showToast(deployResultMessage(result));
+                    loadTopology();
+                } catch (deployErr) {
+                    showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');
+                }
+            }
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
@@ -1365,7 +1376,16 @@
             });
             if (!await handleDraftMutationResponse(res)) return;
             closeQuickModal();
-            loadTopology();
+            await loadTopology();
+            if (data.autoDeploy === true) {
+                try {
+                    var result = await deployTopology();
+                    showToast(deployResultMessage(result));
+                    loadTopology();
+                } catch (deployErr) {
+                    showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');
+                }
+            }
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {

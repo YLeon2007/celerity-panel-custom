@@ -1606,7 +1606,16 @@ async function cascadeDelete(linkId, name) {
     const confirmMsg = i18n.confirmDeleteCascade.replace('{name}', name);
     if (!confirm(confirmMsg)) return;
     try {
-        const res = await fetch('/api/cascade/links/' + linkId, { method: 'DELETE' });
+        const linksRes = await fetch('/api/cascade/links');
+        const linksData = await linksRes.json().catch(() => ({}));
+        if (!linksRes.ok || typeof linksData.topologyRevision !== 'number') {
+            throw new Error('HTTP ' + linksRes.status);
+        }
+        const res = await fetch('/api/cascade/links/' + linkId, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+            body: JSON.stringify({ expectedTopologyRevision: linksData.topologyRevision }),
+        });
         if (res.ok) {
             location.reload();
         } else {
