@@ -38,6 +38,7 @@ const installedReadback = {
     stdout: `${RUNNER_DIGEST}  ${RUNNER_PATH}\n750\n`,
     stderr: '',
 };
+const ENSURE_DIRS_COMMAND = '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge';
 
 function runnerSource() {
     return readFileSync(path.join(
@@ -54,7 +55,7 @@ test('ensureRunner atomically installs the pinned topology runner with fixed Nod
     const nodeSSH = {
         async exec(command) {
             calls.push({ method: 'exec', command });
-            if (command === INSTALL_COMMAND) {
+            if (command === INSTALL_COMMAND || command === ENSURE_DIRS_COMMAND) {
                 return { code: 0, stdout: '', stderr: '' };
             }
             return calls.filter(call => call.method === 'exec' && call.command === INSPECT_COMMAND).length === 1
@@ -78,6 +79,7 @@ test('ensureRunner atomically installs the pinned topology runner with fixed Nod
     assert.equal(Object.isFrozen(result), true);
     assert.deepEqual(calls, [
         { method: 'exec', command: INSPECT_COMMAND },
+        { method: 'exec', command: ENSURE_DIRS_COMMAND },
         { method: 'writeFile', remotePath: UPLOAD_PATH, content: runnerSource() },
         { method: 'exec', command: INSTALL_COMMAND },
         { method: 'exec', command: INSPECT_COMMAND },
@@ -98,6 +100,9 @@ test('ensureRunner is idempotent when the pinned hash and mode are already insta
         node: { ssh: { privateKey: nodeSecret } },
         async exec(command) {
             calls.push({ method: 'exec', command });
+            if (command === ENSURE_DIRS_COMMAND) {
+                return { code: 0, stdout: '', stderr: '' };
+            }
             return installedReadback;
         },
         async writeFile(remotePath, content) {
@@ -112,7 +117,10 @@ test('ensureRunner is idempotent when the pinned hash and mode are already insta
         sha256: `sha256:${RUNNER_DIGEST}`,
         mode: '0750',
     });
-    assert.deepEqual(calls, [{ method: 'exec', command: INSPECT_COMMAND }]);
+    assert.deepEqual(calls, [
+        { method: 'exec', command: INSPECT_COMMAND },
+        { method: 'exec', command: ENSURE_DIRS_COMMAND },
+    ]);
     assert.doesNotMatch(JSON.stringify({ bootstrapper }), new RegExp(nodeSecret));
 });
 
@@ -128,7 +136,7 @@ test('ensureRunner upgrades an outdated hash or mode through the same fixed atom
         const nodeSSH = {
             async exec(command) {
                 calls.push({ method: 'exec', command });
-                if (command === INSTALL_COMMAND) {
+                if (command === INSTALL_COMMAND || command === ENSURE_DIRS_COMMAND) {
                     return { code: 0, stdout: '', stderr: '' };
                 }
                 inspections += 1;
@@ -145,6 +153,7 @@ test('ensureRunner upgrades an outdated hash or mode through the same fixed atom
         assert.equal((await bootstrapper.ensureRunner()).changed, true);
         assert.deepEqual(calls, [
             { method: 'exec', command: INSPECT_COMMAND },
+            { method: 'exec', command: ENSURE_DIRS_COMMAND },
             { method: 'writeFile', remotePath: UPLOAD_PATH, content: runnerSource() },
             { method: 'exec', command: INSTALL_COMMAND },
             { method: 'exec', command: INSPECT_COMMAND },
@@ -257,7 +266,7 @@ test('rejects transfer, install, hash, and mode readback failures with one safe 
         const nodeSSH = {
             async exec(command) {
                 commands.push(command);
-                if (command === cleanupCommand) {
+                if (command === cleanupCommand || command === ENSURE_DIRS_COMMAND) {
                     return { code: 0, stdout: '', stderr: '' };
                 }
                 if (command === INSTALL_COMMAND) return failure.install;
@@ -282,6 +291,7 @@ test('rejects transfer, install, hash, and mode readback failures with one safe 
         assert.equal(commands.every(command => [
             INSPECT_COMMAND,
             INSTALL_COMMAND,
+            ENSURE_DIRS_COMMAND,
             cleanupCommand,
         ].includes(command)), true, failure.name);
     }
@@ -297,7 +307,7 @@ test('pins the exported SHA-256 and mode to the exact checked-in runner source',
 });
 
 test('all fixed remote commands are valid non-interactive shell programs', () => {
-    for (const command of [INSPECT_COMMAND, INSTALL_COMMAND]) {
+    for (const command of [INSPECT_COMMAND, INSTALL_COMMAND, ENSURE_DIRS_COMMAND]) {
         const checked = spawnSync('/bin/sh', ['-n', '-c', command], { encoding: 'utf8' });
         assert.equal(checked.status, 0, checked.stderr);
         assert.equal(checked.stdout, '');

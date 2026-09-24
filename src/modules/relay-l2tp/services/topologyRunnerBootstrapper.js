@@ -37,6 +37,12 @@ const INSTALL_COMMAND = Object.freeze([
 const CLEANUP_COMMAND = Object.freeze(
     `/usr/bin/rm -f -- ${TOPOLOGY_RUNNER_UPLOAD_PATH} ${TOPOLOGY_RUNNER_NEXT_PATH}`,
 );
+// The node runner's strict prepare requires the target profile's config
+// parent (e.g. /usr/local/etc/xray-bridge) to exist as a real directory.
+// Fresh relay nodes only have /usr/local/etc/xray, so ensure both upfront.
+const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze(
+    '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge',
+);
 
 /**
  * @typedef {Readonly<{code: number, stdout: string, stderr: string}>} NodeSSHResult
@@ -122,6 +128,9 @@ class TopologyRunnerBootstrapper {
         let transferStarted = false;
         try {
             const current = parseInspection(await this.#nodeSSH.exec(INSPECT_COMMAND));
+            if (!isSilentSuccess(await this.#nodeSSH.exec(ENSURE_CONFIG_DIRS_COMMAND))) {
+                throw new TopologyRunnerBootstrapperError();
+            }
             if (current?.digest === TOPOLOGY_RUNNER_DIGEST
                 && current.mode === TOPOLOGY_RUNNER_MODE) {
                 return success(false);
