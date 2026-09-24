@@ -1780,6 +1780,7 @@
     "online": "online",
     "offline": "offline",
     "copyPsk": "Click to copy the IPsec secret",
+    "copyIp": "Click to copy the relay IP address",
     "copied": "Secret copied to clipboard",
     "noAccounts": "Nothing here yet",
     "deleteAccount": "Delete",

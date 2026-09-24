@@ -54,6 +54,7 @@
         online: t('l2tp.online'),
         offline: t('l2tp.offline'),
         copyPsk: t('l2tp.copyPsk'),
+        copyIp: t('l2tp.copyIp'),
         copyPassword: t('l2tp.copyPassword'),
         copied: t('l2tp.copied'),
         noAccounts: t('l2tp.noAccounts'),
@@ -141,6 +142,9 @@
                     <span class="badge ${relay.online ? 'badge-ok' : 'badge-err'}">${esc(relay.online ? L.online : L.offline)}</span>
                 </span>
                 ${relayBadge(relay)}
+                ${relay.ip
+                    ? `<span class="psk-chip" data-psk="${esc(relay.ip)}" title="${esc(L.copyIp)}">${esc(relay.ip)}</span>`
+                    : ''}
                 ${relay.psk
                     ? `<span class="psk-chip" data-psk="${esc(relay.psk)}" title="${esc(L.copyPsk)}">${esc(relay.psk)}</span>`
                     : ''}

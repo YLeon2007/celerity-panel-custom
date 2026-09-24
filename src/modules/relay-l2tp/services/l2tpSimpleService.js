@@ -310,6 +310,7 @@ class L2tpSimpleService {
             relays.push({
                 id: nodeId,
                 name: typeof node.name === 'string' && node.name.length > 0 ? node.name : nodeId,
+                ip: typeof node.ip === 'string' ? node.ip : '',
                 online: node.status === 'online',
                 installed: state?.status === 'installed',
                 configured: state?.desiredState === 'installed',

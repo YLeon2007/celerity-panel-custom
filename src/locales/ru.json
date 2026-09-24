@@ -1780,6 +1780,7 @@
     "online": "online",
     "offline": "offline",
     "copyPsk": "Нажмите, чтобы скопировать IPsec-секрет",
+    "copyIp": "Нажмите, чтобы скопировать IP-адрес релея",
     "copied": "Секрет скопирован в буфер обмена",
     "noAccounts": "Пока пусто",
     "deleteAccount": "Удалить",
