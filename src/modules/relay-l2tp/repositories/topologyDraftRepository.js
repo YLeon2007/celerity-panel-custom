@@ -177,6 +177,18 @@ class TopologyDraftRepository {
                     { linkId: mutation.id },
                 );
             }
+            // Apply the group side effects computed by the draft builder:
+            // strip paths that referenced the link and drop emptied groups.
+            for (const update of mutation.groupUpdates || []) {
+                await this.CascadeRouteGroup.updateOne(
+                    { _id: update.id },
+                    { $set: { paths: update.paths } },
+                    { runValidators: true, session },
+                );
+            }
+            for (const groupId of mutation.groupDeletes || []) {
+                await this.CascadeRouteGroup.deleteOne({ _id: groupId }, { session });
+            }
             return;
         }
         if (mutation?.kind === 'group.create') {

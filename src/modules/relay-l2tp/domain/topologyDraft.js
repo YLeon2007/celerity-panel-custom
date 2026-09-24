@@ -106,14 +106,28 @@ function buildCandidate(snapshot, mutation) {
         // references them (an active empty group is valid — it simply has no
         // egress path until the operator wires a new one).
         const activeGroupIds = new Set((snapshot.activeRouteGroupIds || []).map(entityId));
+        const groupUpdates = [];
+        const groupDeletes = [];
         groups = groups
             .map(group => {
                 const paths = group.paths || [];
                 const keptPaths = paths.filter(path =>
                     !(path.linkIds || []).some(pathLinkId => entityId(pathLinkId) === linkId));
+                if (keptPaths.length !== paths.length) {
+                    groupUpdates.push({ id: entityId(group), paths: keptPaths });
+                }
                 return keptPaths.length === paths.length ? group : { ...group, paths: keptPaths };
             })
-            .filter(group => (group.paths || []).length > 0 || activeGroupIds.has(entityId(group)));
+            .filter(group => {
+                const keep = (group.paths || []).length > 0 || activeGroupIds.has(entityId(group));
+                if (!keep) groupDeletes.push(entityId(group));
+                return keep;
+            });
+        mutation = {
+            ...mutation,
+            groupUpdates: groupUpdates.filter(update => !groupDeletes.includes(update.id)),
+            groupDeletes,
+        };
         links = links.filter((link, index) => index !== linkIndex);
     } else if (mutation.kind === 'group.create') {
         const routeGroupId = entityId(mutation.document);

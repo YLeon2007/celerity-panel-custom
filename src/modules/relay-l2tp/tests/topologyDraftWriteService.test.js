@@ -241,7 +241,12 @@ test('deletes an unreferenced link as a validated draft mutation', async () => {
     });
 
     assert.deepEqual(result, { revision: 8, deployedRevision: 5 });
-    assert.deepEqual(preparedMutation, { kind: 'link.delete', id: 'link-1' });
+    assert.deepEqual(preparedMutation, {
+        kind: 'link.delete',
+        id: 'link-1',
+        groupUpdates: [],
+        groupDeletes: [],
+    });
 });
 
 test('rejects deleting a route group referenced by active relay state', async () => {

@@ -1611,7 +1611,11 @@ async function cascadeDelete(linkId, name) {
             location.reload();
         } else {
             const data = await res.json().catch(() => ({}));
-            alert(i18n.error + ': ' + (data.error || 'Unknown error'));
+            const errorValue = data?.error;
+            const message = typeof errorValue === 'string'
+                ? errorValue
+                : (errorValue?.message || errorValue?.code || data?.message || 'Unknown error');
+            alert(i18n.error + ': ' + message);
         }
     } catch (err) {
         alert(i18n.error + ': ' + err.message);
