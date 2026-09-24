@@ -164,31 +164,63 @@ test('rejects a candidate with a missing route link before compiling or committi
     assert.equal(persisted, false);
 });
 
-test('rejects deleting a link referenced by a route group', async () => {
-    let persisted = false;
+test('deletes a link referenced by a route group, stripping its paths', async () => {
+    let preparedCandidate;
     const repository = {
         async commitDraft({ prepare }) {
             await prepare(validSnapshot());
-            persisted = true;
             return { revision: 8, deployedRevision: 5 };
         },
     };
-    const service = new TopologyDraftWriteService({ repository });
-
-    await assert.rejects(
-        service.deleteLink({
-            expectedTopologyRevision: 7,
-            linkId: 'link-1',
-        }),
-        error => {
-            assert.equal(error.name, 'TopologyDraftWriteError');
-            assert.equal(error.code, 'CASCADE_LINK_IN_USE');
-            assert.equal(error.linkId, 'link-1');
-            assert.deepEqual(error.routeGroupIds, ['group-1']);
-            return true;
+    const service = new TopologyDraftWriteService({
+        repository,
+        validator: candidate => {
+            preparedCandidate = candidate;
+            return { valid: true, errors: [] };
         },
+        compiler: () => ({ valid: true, errors: [] }),
+    });
+
+    const result = await service.deleteLink({
+        expectedTopologyRevision: 7,
+        linkId: 'link-1',
+    });
+
+    assert.deepEqual(result, { revision: 8, deployedRevision: 5 });
+    assert.equal(preparedCandidate.links.length, 0);
+    assert.equal(
+        preparedCandidate.groups.length,
+        0,
+        'group left without paths must be dropped',
     );
-    assert.equal(persisted, false);
+});
+
+test('keeps an active route group when link deletion empties its paths', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    let preparedCandidate;
+    const repository = {
+        async commitDraft({ prepare }) {
+            await prepare(snapshot);
+            return { revision: 8, deployedRevision: 5 };
+        },
+    };
+    const service = new TopologyDraftWriteService({
+        repository,
+        validator: candidate => {
+            preparedCandidate = candidate;
+            return { valid: true, errors: [] };
+        },
+        compiler: () => ({ valid: true, errors: [] }),
+    });
+
+    await service.deleteLink({
+        expectedTopologyRevision: 7,
+        linkId: 'link-1',
+    });
+
+    assert.equal(preparedCandidate.groups.length, 1);
+    assert.deepEqual(preparedCandidate.groups[0].paths, []);
 });
 
 test('deletes an unreferenced link as a validated draft mutation', async () => {

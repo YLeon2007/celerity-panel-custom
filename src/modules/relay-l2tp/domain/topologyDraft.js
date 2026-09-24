@@ -100,19 +100,20 @@ function buildCandidate(snapshot, mutation) {
                 linkId,
             });
         }
-        const routeGroupIds = groups
-            .filter(group => (group.paths || []).some(path =>
-                (path.linkIds || []).some(pathLinkId => entityId(pathLinkId) === linkId)
-            ))
-            .map(entityId)
-            .sort();
-        if (routeGroupIds.length > 0) {
-            throw new TopologyDraftError(
-                'CASCADE_LINK_IN_USE',
-                'The cascade link is referenced by a route group',
-                { linkId, routeGroupIds },
-            );
-        }
+        // A deleted link must not linger in route group paths (the validator
+        // rejects UNKNOWN_LINK). Strip every path that used the link; groups
+        // left without any path are dropped unless active relay state still
+        // references them (an active empty group is valid — it simply has no
+        // egress path until the operator wires a new one).
+        const activeGroupIds = new Set((snapshot.activeRouteGroupIds || []).map(entityId));
+        groups = groups
+            .map(group => {
+                const paths = group.paths || [];
+                const keptPaths = paths.filter(path =>
+                    !(path.linkIds || []).some(pathLinkId => entityId(pathLinkId) === linkId));
+                return keptPaths.length === paths.length ? group : { ...group, paths: keptPaths };
+            })
+            .filter(group => (group.paths || []).length > 0 || activeGroupIds.has(entityId(group)));
         links = links.filter((link, index) => index !== linkIndex);
     } else if (mutation.kind === 'group.create') {
         const routeGroupId = entityId(mutation.document);
