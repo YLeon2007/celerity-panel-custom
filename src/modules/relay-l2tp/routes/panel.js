@@ -198,15 +198,23 @@ function sendServiceError(res, error) {
         });
     }
 
+    // Diagnostic fields (failureCode / ids / revisions) are safe: they carry
+    // no secrets, only machine-readable failure context.
+    const details = {};
+    for (const key of [
+        'failureCode',
+        'nodeId',
+        'routeGroupId',
+        'expectedTopologyRevision',
+        'topologyRevision',
+    ]) {
+        if (error[key] !== undefined) details[key] = error[key];
+    }
     return res.status(status).json({
         error: {
             code: error.code,
             message: SAFE_ERROR_MESSAGE_BY_CODE.get(error.code) ?? error.message,
-            // Diagnostic detail (failureCode / nodeId / routeGroupId) is safe:
-            // it contains no secrets, only machine-readable failure context.
-            ...(error.details && typeof error.details === 'object'
-                ? { details: error.details }
-                : {}),
+            ...(Object.keys(details).length > 0 ? { details } : {}),
         },
     });
 }
