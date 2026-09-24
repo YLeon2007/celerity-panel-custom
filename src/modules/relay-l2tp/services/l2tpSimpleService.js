@@ -433,6 +433,9 @@ class L2tpSimpleService {
         const routeGroupId = state?.routeGroup
             ? entityId(state.routeGroup)
             : await this.ensureRouteGroup(selectedNodeId);
+        if (routeGroupId) {
+            await this.refreshEmptyRouteGroup(selectedNodeId, routeGroupId);
+        }
 
         if (!state || state.desiredState !== 'installed') {
             // Fresh relay or one whose state was reset by uninstall. Reuse the
@@ -490,6 +493,30 @@ class L2tpSimpleService {
             routeGroupId,
             expectedTopologyRevision: topologyRevision,
         });
+    }
+
+    // Rebuilds the relay route group paths when a topology change (e.g. a
+    // deleted cascade link stripped them) left the group empty and a chain
+    // is available again.
+    async refreshEmptyRouteGroup(nodeId, routeGroupId) {
+        const groups = await this.CascadeRouteGroup.find({}).lean();
+        const group = (groups || []).find(entry => entityId(entry) === routeGroupId);
+        if (!group || (group.paths || []).length > 0) return;
+        let paths;
+        try {
+            paths = await this.buildAutoGroupPaths(nodeId);
+        } catch (error) {
+            // No cascade chain currently leaves this relay — keep the group
+            // empty instead of failing the install.
+            if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
+                return;
+            }
+            throw error;
+        }
+        if (!paths.length || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
+            return;
+        }
+        await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, { $set: { paths } });
     }
 
     // Returns the 10.255.N.x octet shared by every account already pinned to

@@ -79,6 +79,12 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
         CascadeRouteGroup: {
             find: () => chainable(groups),
             create: async document => ({ _id: 'group-auto', ...document }),
+            findByIdAndUpdate: async (id, update) => {
+                const group = groups.find(entry => String(entry._id) === String(id));
+                if (group && update?.$set) Object.assign(group, update.$set);
+                return group ?? null;
+            },
+            _store: groups,
         },
         CascadeLink: {
             find: () => chainable(links),
@@ -359,6 +365,30 @@ test('installRelay auto-creates a route group from a linear cascade chain', asyn
     assert.equal(createdGroup.name, 'auto-l2tp');
     assert.equal(createdGroup.mode, 'reverse');
     assert.deepEqual(createdGroup.paths[0].linkIds.map(String), ['link-1']);
+});
+
+test('installRelay rebuilds paths of an existing route group left empty by link deletion', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        states: [{
+            ...STATE,
+            desiredState: 'not_installed',
+            status: 'not_installed',
+            routeGroup: 'group-empty',
+        }],
+        groups: [{ _id: 'group-empty', name: 'auto-l2tp', mode: 'reverse', paths: [] }],
+        links: [
+            { _id: 'link-1', portalNode: 'relay-1', bridgeNode: 'relay-2' },
+            { _id: 'link-2', portalNode: 'relay-2', bridgeNode: 'bridge-1' },
+        ],
+    });
+    const service = createService({}, models);
+
+    await service.installRelay('relay-1');
+
+    const group = models.CascadeRouteGroup._store.find(entry => entry._id === 'group-empty');
+    assert.equal(group.paths.length, 1);
+    assert.deepEqual(group.paths[0].linkIds.map(String), ['link-1', 'link-2']);
 });
 
 test('installRelay rejects a branching cascade when no route group exists', async () => {
