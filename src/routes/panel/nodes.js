@@ -636,7 +636,11 @@ router.post('/nodes/:id', async (req, res) => {
                 password: req.body['obfs.password'] || '',
             },
             flag: req.body.flag || '',
-            cascadeRole: req.body.cascadeRole || 'standalone',
+            // Keep the existing role when the form omits the field instead of
+            // silently dropping the node back to 'standalone'.
+            cascadeRole: req.body.cascadeRole !== undefined
+                ? req.body.cascadeRole
+                : (existingNode.cascadeRole || 'standalone'),
             country: req.body.country || '',
             comment: typeof req.body.comment === 'string'
                 ? req.body.comment.trim().slice(0, 500)

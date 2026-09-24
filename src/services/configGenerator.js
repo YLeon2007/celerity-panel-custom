@@ -1448,9 +1448,36 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
         outboundTag: 'tunnel-up',
     });
 
-    // THIRD: Route traffic from upstream bridge to downstream portal(s)
-    if (downstreamLinks.length > 1) {
-        const downTags = downstreamLinks.map(l => `portal-down-${String(l._id).slice(-8)}`);
+    // THIRD: Route traffic from upstream bridge to downstream portal(s).
+    // Geo-tagged downstream links get explicit rules first (order matters in
+    // Xray); default links share the balancer or the single direct rule.
+    const geoDownLinks = downstreamLinks.filter(l => l.geoRouting?.enabled
+        && ((l.geoRouting.domains?.length > 0) || (l.geoRouting.geoip?.length > 0)));
+    const defaultDownLinks = downstreamLinks.filter(l => !geoDownLinks.includes(l));
+    for (const geoLink of geoDownLinks) {
+        const geoTag = `portal-down-${String(geoLink._id).slice(-8)}`;
+        if (geoLink.geoRouting.domains?.length > 0) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: ['bridge-up'],
+                domain: geoLink.geoRouting.domains.map(d =>
+                    d.includes(':') ? d : `geosite:${d}`),
+                outboundTag: geoTag,
+            });
+        }
+        if (geoLink.geoRouting.geoip?.length > 0) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: ['bridge-up'],
+                ip: geoLink.geoRouting.geoip.map(g =>
+                    g.includes(':') ? g : `geoip:${g}`),
+                outboundTag: geoTag,
+            });
+        }
+    }
+    const balancerPool = defaultDownLinks.length > 0 ? defaultDownLinks : downstreamLinks;
+    if (balancerPool.length > 1) {
+        const downTags = balancerPool.map(l => `portal-down-${String(l._id).slice(-8)}`);
         config.routing.balancers = config.routing.balancers || [];
         config.routing.balancers.push({
             tag: 'down-balancer',
@@ -1462,8 +1489,8 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
             inboundTag: ['bridge-up'],
             balancerTag: 'down-balancer',
         });
-    } else if (downstreamLinks.length === 1) {
-        const firstPortalTag = `portal-down-${String(downstreamLinks[0]._id).slice(-8)}`;
+    } else if (balancerPool.length === 1) {
+        const firstPortalTag = `portal-down-${String(balancerPool[0]._id).slice(-8)}`;
         config.routing.rules.push({
             type: 'field',
             inboundTag: ['bridge-up'],
@@ -1623,7 +1650,7 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
  *        each installs a loopback socks inbound whose tag joins the rule set
  *        pointing at the chain exit outbound.
  */
-function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathIngress = []) {
+function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathIngress = [], geoBranches = []) {
     if (!forwardLinks || forwardLinks.length === 0) return;
     const ingressTags = [];
     if (cascadePathIngress && cascadePathIngress.length > 0) {
@@ -1691,6 +1718,56 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
         }
 
         config.outbounds.push(outbound);
+    }
+
+    // Geo-routing branches: each geo leaf gets its own outbound that chains
+    // through the main-chain prefix (transport-layer proxy at the branch
+    // point), and matching rules that take precedence over the default exit.
+    for (const branch of geoBranches || []) {
+        if (!branch || !branch.link) continue;
+        const branchLink = branch.link;
+        const branchTag = `fwd-${String(branchLink._id).slice(-8)}`;
+        const branchProto = branchLink.tunnelProtocol || 'vless';
+        const branchBridge = branchLink.bridgeNode;
+        const outbound = {
+            tag: branchTag,
+            protocol: branchProto,
+            settings: {
+                vnext: [{
+                    address: branchBridge?.ip || branchBridge?.domain || '',
+                    port: branchLink.tunnelPort || 10086,
+                    users: [buildOutboundUser(branchLink.tunnelUuid, branchProto)],
+                }],
+            },
+            streamSettings: buildCascadeTunnelStreamSettings(branchLink),
+        };
+        if (branchLink.muxEnabled) {
+            outbound.mux = { enabled: true, concurrency: branchLink.muxConcurrency || 8 };
+        }
+        if (branch.viaTag) {
+            outbound.proxySettings = { tag: branch.viaTag, transportLayer: true };
+        }
+        config.outbounds.push(outbound);
+
+        const geo = branchLink.geoRouting || {};
+        const inTags = tags.length > 0 ? tags : undefined;
+        if (!inTags) continue;
+        if (geo.domains?.length > 0) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: inTags,
+                domain: geo.domains.map(d => (d.includes(':') ? d : `geosite:${d}`)),
+                outboundTag: branchTag,
+            });
+        }
+        if (geo.geoip?.length > 0) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: inTags,
+                ip: geo.geoip.map(g => (g.includes(':') ? g : `geoip:${g}`)),
+                outboundTag: branchTag,
+            });
+        }
     }
 
     if (tags.length === 0) return;

@@ -180,10 +180,10 @@ function projectPinnedSnapshot(pinnedSnapshot) {
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
     const portalCount = nodes.filter(node => node.role === 'portal').length;
     const bridgeCount = nodes.filter(node => node.role === 'bridge').length;
-    if (portalCount !== 1 || bridgeCount !== 1) {
+    if (portalCount !== 1 || bridgeCount < 1) {
         fail(
             'INVALID_TOPOLOGY_ROLES',
-            'Pinned topology requires exactly one portal and one bridge',
+            'Pinned topology requires exactly one portal and at least one bridge',
         );
     }
     const links = topology.links.map(snapshotLink)

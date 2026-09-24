@@ -142,7 +142,7 @@ function uniqueById(items, kind) {
     return byId;
 }
 
-function orderedChain(snapshot) {
+function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
     if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.links)) {
         throw new FrozenTopologyDeploymentPlanError(
             'INVALID_TOPOLOGY_SNAPSHOT',
@@ -162,21 +162,17 @@ function orderedChain(snapshot) {
         }
         roles[node.role].push(id);
     }
-    if (roles.portal.length !== 1 || roles.bridge.length !== 1) {
+    if (roles.portal.length !== 1 || roles.bridge.length < 1) {
         throw new FrozenTopologyDeploymentPlanError(
             'INVALID_TOPOLOGY_ROLES',
-            'Topology v1 requires exactly one portal and one bridge',
-        );
-    }
-    if (linksById.size !== nodesById.size - 1) {
-        throw new FrozenTopologyDeploymentPlanError(
-            'MISSING_TOPOLOGY_LINK',
-            'Topology v1 requires one link between every adjacent node',
+            'Topology requires exactly one portal and at least one bridge',
         );
     }
 
     const outgoing = new Map();
     const incoming = new Map();
+    const geoOutgoing = new Map();
+    const geoIncoming = new Map();
     let mode = null;
     for (const [id, link] of linksById) {
         const source = entityId(link.source ?? link.portalNode);
@@ -199,15 +195,36 @@ function orderedChain(snapshot) {
                 'Topology v1 does not support mixed link modes',
             );
         }
+        mode = link.mode;
+        const entry = { id, link, source, target };
+        if (geoLeafLinkIds.has(id)) {
+            // Geo-routing leaf: must hang off a main-chain node and terminate
+            // at a dedicated bridge that carries no other link.
+            if (geoOutgoing.has(source) && geoOutgoing.get(source).has(id)) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'NON_LINEAR_TOPOLOGY',
+                    'Duplicate geo-routing branch link',
+                );
+            }
+            if (!geoOutgoing.has(source)) geoOutgoing.set(source, new Map());
+            geoOutgoing.get(source).set(id, entry);
+            if (geoIncoming.has(target) || incoming.has(target)) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'GEO_LEAF_TARGET_CONFLICT',
+                    'A geo-routing branch must terminate at its own dedicated bridge',
+                );
+            }
+            geoIncoming.set(target, entry);
+            continue;
+        }
         if (outgoing.has(source) || incoming.has(target)) {
             throw new FrozenTopologyDeploymentPlanError(
                 'NON_LINEAR_TOPOLOGY',
-                'Topology v1 requires a linear chain',
+                'Topology allows one linear main chain; additional bridges require geoRouting',
             );
         }
-        mode = link.mode;
-        outgoing.set(source, { id, link, source, target });
-        incoming.set(target, { id, link, source });
+        outgoing.set(source, entry);
+        incoming.set(target, entry);
     }
 
     const orderedNodes = [];
@@ -229,38 +246,91 @@ function orderedChain(snapshot) {
         currentId = next.target;
     }
 
+    const mainNodeIds = new Set(orderedNodes.map(entry => entry.id));
+    if (orderedNodes.length === 0 || orderedLinks.length !== outgoing.size) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'MISSING_TOPOLOGY_LINK',
+            'Topology requires one link between every adjacent main-chain node',
+        );
+    }
     if (
-        visited.size !== nodesById.size
-        || currentId !== roles.bridge[0]
-        || orderedLinks.length !== linksById.size
+        orderedNodes.at(-1).node.role !== 'bridge'
+        || orderedNodes[0].node.role !== 'portal'
+        || orderedNodes.slice(1, -1).some(entry => entry.node.role !== 'relay')
     ) {
         throw new FrozenTopologyDeploymentPlanError(
             'NON_LINEAR_TOPOLOGY',
-            'Topology v1 must form Portal to Relay to Bridge',
-        );
-    }
-    const orderedRoles = orderedNodes.map(entry => entry.node.role);
-    if (
-        orderedRoles[0] !== 'portal'
-        || orderedRoles.at(-1) !== 'bridge'
-        || orderedRoles.slice(1, -1).some(role => role !== 'relay')
-    ) {
-        throw new FrozenTopologyDeploymentPlanError(
-            'INVALID_TOPOLOGY_ROLES',
-            'Topology v1 must form Portal to Relay to Bridge',
+            'Topology must form a linear Portal to Relay to Bridge main chain',
         );
     }
 
-    return { mode, orderedNodes, orderedLinks };
+    // Every remaining node must be a dedicated geo-bridge leaf; every geo leaf
+    // must be attached to the main chain and terminate at such a node.
+    const geoLeafNodes = [];
+    for (const [id, node] of nodesById) {
+        if (mainNodeIds.has(id)) continue;
+        if (node.role !== 'bridge') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Nodes outside the main chain must be geo-routing bridges',
+            );
+        }
+        const leaf = geoIncoming.get(id);
+        if (!leaf) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Every bridge outside the main chain requires an incoming geoRouting link',
+            );
+        }
+        if (!mainNodeIds.has(leaf.source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_SOURCE_OUTSIDE_CHAIN',
+                'A geo-routing branch must start from a main-chain node',
+            );
+        }
+        if (outgoing.has(id) || geoOutgoing.has(id)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'A geo-routing bridge must be a leaf (no outgoing links)',
+            );
+        }
+        geoLeafNodes.push({ id, node, link: leaf });
+    }
+    for (const [id, entry] of geoIncoming) {
+        if (!mainNodeIds.has(entry.source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_SOURCE_OUTSIDE_CHAIN',
+                'A geo-routing branch must start from a main-chain node',
+            );
+        }
+        if (mainNodeIds.has(id)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_TARGET_CONFLICT',
+                'A geo-routing branch cannot terminate inside the main chain',
+            );
+        }
+    }
+    // Multiple default bridges: a bridge inside the main chain is unique by
+    // construction (incoming/outgoing uniqueness), so no extra check needed.
+    geoLeafNodes.sort((left, right) => left.id.localeCompare(right.id, 'en'));
+
+    return { mode, orderedNodes, orderedLinks, geoLeafNodes };
 }
 
-function topologyRefs(orderedNodes) {
+function topologyRefs(orderedNodes, geoLeafNodes = []) {
     let relayIndex = 0;
-    return new Map(orderedNodes.map(({ id, node }) => {
+    const refs = new Map(orderedNodes.map(({ id, node }) => {
         let ref = node.role;
         if (node.role === 'relay') ref = `relay-${++relayIndex}`;
         return [id, ref];
     }));
+    // Geo-routing bridges get deterministic suffixed refs; the main-chain
+    // (default) bridge keeps the plain 'bridge' ref.
+    let bridgeIndex = 1;
+    for (const { id } of geoLeafNodes) {
+        refs.set(id, `bridge-${++bridgeIndex}`);
+    }
+    return refs;
 }
 
 function assertPort(value) {
@@ -342,6 +412,13 @@ function deterministicTunnelUuid(linkIdentity) {
     ].join('-');
 }
 
+const GEOIP_TAG_RE = /^[a-z0-9-]+$/;
+
+function sanitizeGeoipTag(value) {
+    const tag = String(value).trim().toLowerCase();
+    return GEOIP_TAG_RE.test(tag) ? tag : null;
+}
+
 function projectGeoRouting(metadata) {
     const source = metadata?.geoRouting;
     if (!isPlainObject(source)) return undefined;
@@ -350,8 +427,10 @@ function projectGeoRouting(metadata) {
         domains: Array.isArray(source.domains)
             ? source.domains.filter(value => typeof value === 'string')
             : [],
+        // Drop tags Xray cannot resolve (e.g. Cyrillic "рф") instead of
+        // poisoning the generated config with an unknown geoip file lookup.
         geoip: Array.isArray(source.geoip)
-            ? source.geoip.filter(value => typeof value === 'string')
+            ? source.geoip.map(sanitizeGeoipTag).filter(Boolean)
             : [],
     };
 }
@@ -432,7 +511,15 @@ function relayPathIngress(groups, downstreamLinkId, egressTag) {
 }
 
 function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [] }) {
-    const nodeConfigsById = new Map(chain.orderedNodes.map(({ id, node }) => [
+    const geoLeafNodes = chain.geoLeafNodes || [];
+    const geoLeavesBySource = new Map();
+    for (const leaf of geoLeafNodes) {
+        const list = geoLeavesBySource.get(leaf.link.source) || [];
+        list.push(leaf);
+        geoLeavesBySource.set(leaf.link.source, list);
+    }
+    const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
+    const nodeConfigsById = new Map(allChainNodes.map(({ id, node }) => [
         id,
         projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
     ]));
@@ -442,6 +529,19 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
         linkMetadataById.get(entry.id),
         nodeConfigsById,
     ));
+    const geoLinks = geoLeafNodes.map((leaf, index) => projectCascadeLink(
+        leaf.link,
+        chain.orderedLinks.length + index,
+        linkMetadataById.get(leaf.link.id),
+        nodeConfigsById,
+    ));
+    const geoLinksBySource = new Map();
+    for (let index = 0; index < geoLeafNodes.length; index += 1) {
+        const source = geoLeafNodes[index].link.source;
+        const list = geoLinksBySource.get(source) || [];
+        list.push(geoLinks[index]);
+        geoLinksBySource.set(source, list);
+    }
     const configs = new Map();
     const ingressByNodeId = new Map();
 
@@ -455,9 +555,30 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
             configGenerator.applyXrayApi(config, nodeConfig.xray.apiPort || 61000);
         }
 
+        // Forward chains originate every outbound at the portal (geo branches
+        // included); reverse chains attach geo branches at their source node.
+        const geoBranches = chain.mode === 'forward'
+            ? (node.role === 'portal' ? geoLinks : [])
+            : (geoLinksBySource.get(id) || []);
+
         if (chain.mode === 'forward') {
             if (node.role === 'portal') {
-                configGenerator.applyForwardChain(config, links, clientInboundTags(nodeConfig));
+                // Geo branches chain through the main-chain prefix up to their
+                // source node: the outbound targeting that node acts as the
+                // transport-layer proxy for the geo-leaf outbound.
+                const branches = geoBranches.map(geoLink => {
+                    const leaf = geoLeafNodes[geoLinks.indexOf(geoLink)];
+                    const prefixIndex = chain.orderedLinks.findIndex(
+                        entry => entry.target === leaf.link.source,
+                    );
+                    return {
+                        link: geoLink,
+                        viaTag: prefixIndex >= 0
+                            ? `fwd-${String(links[prefixIndex]._id).slice(-8)}`
+                            : null,
+                    };
+                });
+                configGenerator.applyForwardChain(config, links, clientInboundTags(nodeConfig), [], branches);
             } else {
                 configGenerator.applyForwardHopInbound(config, [links[index - 1]]);
                 if (node.role === 'relay') {
@@ -470,7 +591,7 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
                 }
             }
         } else if (node.role === 'portal') {
-            configGenerator.applyReversePortal(config, [links[index]], clientInboundTags(nodeConfig));
+            configGenerator.applyReversePortal(config, [links[index], ...geoBranches], clientInboundTags(nodeConfig));
         } else if (node.role === 'relay') {
             // Relay reverse candidates are pure cascade configs: the baseline
             // is intentionally not composed in, so the bridge profile never
@@ -484,11 +605,29 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
             config = parseGeneratedConfig(configGenerator.generateRelayConfigWithIngress(
                 links[index - 1],
                 links[index - 1].portalNode,
-                [links[index]],
+                [links[index], ...geoBranches],
                 ingress,
             ));
         } else {
             const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig([links[index - 1]]));
+            cascade.inbounds = cascade.inbounds || [];
+            config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
+        }
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+
+    // Geo-routing bridges are configured exactly like the default bridge,
+    // each with its single upstream geo link.
+    for (let index = 0; index < geoLeafNodes.length; index += 1) {
+        const { id, node } = geoLeafNodes[index];
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        if (chain.mode === 'forward') {
+            configGenerator.applyForwardHopInbound(config, [geoLinks[index]]);
+        } else {
+            const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig([geoLinks[index]]));
             cascade.inbounds = cascade.inbounds || [];
             config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
         }
@@ -551,9 +690,51 @@ function composeFrozenTopologyDeploymentPlan({
             'A valid compiled topology is required',
         );
     }
-    const chain = orderedChain(snapshot);
+    const nodeMetadataById = uniqueById(nodeMetadata, 'NODE_METADATA');
+    const linkMetadataById = uniqueById(linkMetadata, 'LINK_METADATA');
+
+    // Classify geo-routing leaf links BEFORE walking the chain: a link with
+    // enabled geoRouting and at least one valid rule branches off the main
+    // chain towards its own dedicated bridge. Links on the main chain must
+    // not carry geo rules.
+    const geoLeafLinkIds = new Set();
+    const geoRuleOwner = new Map();
+    for (const link of snapshot.links) {
+        const linkId = entityId(link);
+        const metadata = linkMetadataById.get(linkId);
+        if (!metadata) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_LINK_METADATA',
+                'Every topology link requires hydrated metadata',
+            );
+        }
+        const geo = projectGeoRouting(metadata);
+        if (!geo || geo.enabled !== true) continue;
+        if (geo.domains.length === 0 && geo.geoip.length === 0) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_WITHOUT_RULES',
+                'A geo-routing link requires at least one valid domain or geoip rule',
+            );
+        }
+        for (const rule of [
+            ...geo.domains.map(value => `domain:${value}`),
+            ...geo.geoip.map(value => `geoip:${value}`),
+        ]) {
+            const owner = geoRuleOwner.get(rule);
+            if (owner && owner !== linkId) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'DUPLICATE_GEO_RULE',
+                    'Geo-routing rules must be unique across links',
+                );
+            }
+            geoRuleOwner.set(rule, linkId);
+        }
+        geoLeafLinkIds.add(linkId);
+    }
+
+    const chain = orderedChain(snapshot, geoLeafLinkIds);
     const roleByNodeId = new Map(
-        chain.orderedNodes.map(({ id, node }) => [id, node.role]),
+        [...chain.orderedNodes, ...chain.geoLeafNodes].map(({ id, node }) => [id, node.role]),
     );
     const compiledRelayIds = new Set();
     for (const relay of compiledTopology.relays) {
@@ -566,10 +747,8 @@ function composeFrozenTopologyDeploymentPlan({
         }
         compiledRelayIds.add(relayId);
     }
-    const nodeMetadataById = uniqueById(nodeMetadata, 'NODE_METADATA');
-    const linkMetadataById = uniqueById(linkMetadata, 'LINK_METADATA');
 
-    for (const { id, node } of chain.orderedNodes) {
+    for (const { id, node } of [...chain.orderedNodes, ...chain.geoLeafNodes]) {
         const metadata = nodeMetadataById.get(id);
         if (!metadata) {
             throw new FrozenTopologyDeploymentPlanError(
@@ -584,14 +763,12 @@ function composeFrozenTopologyDeploymentPlan({
             );
         }
     }
-    for (const { id, link, source, target } of chain.orderedLinks) {
+    const allLinkEntries = [
+        ...chain.orderedLinks,
+        ...chain.geoLeafNodes.map(leaf => leaf.link),
+    ];
+    for (const { id, link, source, target } of allLinkEntries) {
         const metadata = linkMetadataById.get(id);
-        if (!metadata) {
-            throw new FrozenTopologyDeploymentPlanError(
-                'MISSING_LINK_METADATA',
-                'Every topology link requires hydrated metadata',
-            );
-        }
         const metadataSource = metadata.source === undefined && metadata.portalNode === undefined
             ? source
             : entityId(metadata.source ?? metadata.portalNode);
@@ -606,8 +783,18 @@ function composeFrozenTopologyDeploymentPlan({
             );
         }
     }
+    // Main-chain links must not carry geo rules: branching is allowed only
+    // from a chain node towards a dedicated geo bridge.
+    for (const entry of chain.orderedLinks) {
+        if (geoLeafLinkIds.has(entry.id)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_RULES_ON_MAIN_CHAIN',
+                'Geo-routing rules are allowed only on branch links to dedicated bridges',
+            );
+        }
+    }
 
-    const refs = topologyRefs(chain.orderedNodes);
+    const refs = topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
     let candidateConfigsById;
     let ingressByNodeId;
     try {
@@ -625,15 +812,18 @@ function composeFrozenTopologyDeploymentPlan({
             'Failed to generate a frozen Xray topology candidate',
         );
     }
+    // Deployment order keeps endpoints first for forward chains (bridges
+    // before their upstream) and source-first for reverse chains; geo bridges
+    // deploy alongside the default bridge.
     const deploymentOrder = chain.mode === 'forward'
-        ? [...chain.orderedNodes].reverse()
-        : chain.orderedNodes;
+        ? [...chain.geoLeafNodes, ...[...chain.orderedNodes].reverse()]
+        : [...chain.orderedNodes, ...chain.geoLeafNodes];
     const nodes = deploymentOrder.map(({ id, node }) => candidateForNode({
         mode: chain.mode,
         nodeId: id,
         node,
         nodeRef: refs.get(id),
-        orderedLinks: chain.orderedLinks,
+        orderedLinks: allLinkEntries,
         linkMetadataById,
         config: candidateConfigsById.get(id),
         ingressPorts: (ingressByNodeId.get(id) || []).map(entry => entry.port),
