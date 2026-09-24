@@ -223,6 +223,28 @@ test('keeps an active route group when link deletion empties its paths', async (
     assert.deepEqual(preparedCandidate.groups[0].paths, []);
 });
 
+test('recalculates cascade roles after link mutations only', async () => {
+    const repository = {
+        async commitDraft({ prepare }) {
+            await prepare(validSnapshot());
+            return { revision: 8, deployedRevision: 5 };
+        },
+    };
+    let recalcCalls = 0;
+    const service = new TopologyDraftWriteService({
+        repository,
+        validator: () => ({ valid: true, errors: [] }),
+        compiler: () => ({ valid: true, errors: [] }),
+        recalculateRoles: async () => { recalcCalls += 1; },
+    });
+
+    await service.deleteLink({ expectedTopologyRevision: 7, linkId: 'link-1' });
+    assert.equal(recalcCalls, 1, 'link deletion must refresh node roles');
+
+    await service.deleteRouteGroup({ expectedTopologyRevision: 8, routeGroupId: 'group-1' });
+    assert.equal(recalcCalls, 1, 'group mutations do not change node roles');
+});
+
 test('deletes an unreferenced link as a validated draft mutation', async () => {
     const snapshot = validSnapshot();
     snapshot.groups = [];

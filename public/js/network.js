@@ -1065,7 +1065,7 @@
                     // deploy validator refuses it. That is not an error for
                     // the user: the final link's auto-deploy (or a manual
                     // chain sync) will deploy the completed chain.
-                    if (/adjacent node/i.test(deployErr.message || '')) {
+                    if (/adjacent node|exactly one portal and one bridge/i.test(deployErr.message || '')) {
                         showToast(i18n.deployDeferredIncompleteChain || 'Auto-deploy deferred: chain incomplete');
                     } else {
                         showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');
@@ -1391,7 +1391,7 @@
                     showToast(deployResultMessage(result));
                     loadTopology();
                 } catch (deployErr) {
-                    if (/adjacent node/i.test(deployErr.message || '')) {
+                    if (/adjacent node|exactly one portal and one bridge/i.test(deployErr.message || '')) {
                         showToast(i18n.deployDeferredIncompleteChain || 'Auto-deploy deferred: chain incomplete');
                     } else {
                         showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');

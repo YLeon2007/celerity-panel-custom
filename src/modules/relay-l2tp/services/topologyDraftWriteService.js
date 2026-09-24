@@ -29,6 +29,7 @@ class TopologyDraftWriteService {
         repository,
         validator = validateTopology,
         compiler = compileTopology,
+        recalculateRoles,
     } = {}) {
         if (!repository || typeof repository.commitDraft !== 'function') {
             throw new TypeError('Topology draft writes require repository.commitDraft');
@@ -42,11 +43,12 @@ class TopologyDraftWriteService {
         this.repository = repository;
         this.validator = validator;
         this.compiler = compiler;
+        this.recalculateRoles = recalculateRoles;
     }
 
     async commit(expectedTopologyRevision, mutation) {
         assertRevision(expectedTopologyRevision);
-        return this.repository.commitDraft({
+        const result = await this.repository.commitDraft({
             expectedRevision: expectedTopologyRevision,
             prepare: async snapshot => {
                 let prepared;
@@ -83,6 +85,18 @@ class TopologyDraftWriteService {
                 return { mutation: prepared.mutation };
             },
         });
+        // Link mutations change which nodes participate in the chain, so
+        // cascade roles must follow immediately — otherwise nodes from a
+        // deleted chain keep stale portal/relay/bridge roles and break
+        // deploy validation of the next (possibly smaller) chain.
+        if (
+            result !== null
+            && typeof this.recalculateRoles === 'function'
+            && String(mutation?.kind || '').startsWith('link.')
+        ) {
+            await this.recalculateRoles();
+        }
+        return result;
     }
 
     createLink({ expectedTopologyRevision, link } = {}) {
@@ -132,6 +146,39 @@ class TopologyDraftWriteService {
     }
 }
 
+// Mirrors cascadeService._updateNodeRoles: a node's cascade role derives
+// from the links it participates in; nodes without links are standalone
+// and drop out of the deployable topology.
+async function recalculateNodeRoles(HyNode, CascadeLink) {
+    const links = await CascadeLink.find({ active: true }).lean();
+    const portalSet = new Set(links.map(link => String(link.portalNode)));
+    const bridgeSet = new Set(links.map(link => String(link.bridgeNode)));
+    const allNodes = await HyNode.find({ active: true, type: { $ne: 'virtual' } })
+        .select('_id cascadeRole')
+        .lean();
+    const bulkOps = [];
+    for (const node of allNodes) {
+        const id = String(node._id);
+        const isPortal = portalSet.has(id);
+        const isBridge = bridgeSet.has(id);
+        let role = 'standalone';
+        if (isPortal && isBridge) role = 'relay';
+        else if (isPortal) role = 'portal';
+        else if (isBridge) role = 'bridge';
+        if (node.cascadeRole !== role) {
+            bulkOps.push({
+                updateOne: {
+                    filter: { _id: node._id },
+                    update: { $set: { cascadeRole: role } },
+                },
+            });
+        }
+    }
+    if (bulkOps.length > 0) {
+        await HyNode.bulkWrite(bulkOps, { ordered: false });
+    }
+}
+
 function createTopologyDraftWriteService({
     HyNode,
     CascadeLink,
@@ -151,7 +198,15 @@ function createTopologyDraftWriteService({
         RelayL2tpState,
         transactionRunner,
     });
-    return new TopologyDraftWriteService({ repository, validator, compiler });
+    const recalculateRoles = (HyNode && CascadeLink)
+        ? () => recalculateNodeRoles(HyNode, CascadeLink)
+        : undefined;
+    return new TopologyDraftWriteService({
+        repository,
+        validator,
+        compiler,
+        ...(recalculateRoles ? { recalculateRoles } : {}),
+    });
 }
 
 module.exports = {
