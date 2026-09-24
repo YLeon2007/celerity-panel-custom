@@ -117,12 +117,12 @@ function parseReceipt(result, command, expected) {
             'INVALID_RECEIPT',
             'Invalid topology node receipt',
         );
-        // Diagnostic detail for operators; the message stays stable for tests.
-        error.detail = {
-            exitCode: result && typeof result === 'object' ? result.code : undefined,
-            stderr: typeof result?.stderr === 'string' ? result.stderr.slice(0, 300) : undefined,
-            stdout: typeof result?.stdout === 'string' ? result.stdout.slice(0, 300) : undefined,
-        };
+        // Keep the error sanitized for API consumers (untrusted node output);
+        // diagnostics go to the server log only.
+        try {
+            const logger = require('../../../utils/logger');
+            logger.error(`[TopologyNodeTransport] invalid receipt: exit=${result?.code} stderr=${String(result?.stderr ?? '').slice(0, 300)} stdout=${String(result?.stdout ?? '').slice(0, 300)}`);
+        } catch { /* logger unavailable in tests */ }
         throw error;
     }
     const serialized = result.stdout.slice(0, -1);
