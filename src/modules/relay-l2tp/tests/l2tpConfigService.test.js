@@ -228,7 +228,6 @@ name l2tpd
 mtu 1400
 mru 1400
 nodefaultroute
-lock
 ms-dns 1.1.1.1
 ms-dns 9.9.9.9
 `);

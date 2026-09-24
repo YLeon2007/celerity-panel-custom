@@ -192,7 +192,6 @@ name l2tpd
 mtu 1400
 mru 1400
 nodefaultroute
-lock
 ${dnsOptions}`,
             },
             {
