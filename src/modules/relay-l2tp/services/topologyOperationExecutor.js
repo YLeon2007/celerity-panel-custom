@@ -330,7 +330,9 @@ class TopologyOperationExecutor {
                 && error.code === 'INVALID_FROZEN_NODE_PLAN') {
                 throw error;
             }
-            throw executionFailed();
+            const wrapped = executionFailed();
+            wrapped.cause = error;
+            throw wrapped;
         }
     }
 
