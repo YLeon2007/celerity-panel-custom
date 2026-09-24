@@ -18,7 +18,7 @@ declare -Ar PAYLOAD_SHA256=(
     [verify.sh]='e0d42b1a4be2b537da2042967fa13b4d38da6b4bf1c700d8cbcf7184df28491a'
     [commit.sh]='bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b'
     [rollback.sh]='63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091'
-    [install-runtime.sh]='c9788075b7554b29a6c0aa3bf3041522667ff94800c24e2d33967130c1b23bf5'
+    [install-runtime.sh]='3f315843577198826ab5fe2dd40742f90bbcf5b73c88f799d72f5db19fd1a297'
     [materialize-nft-candidate.sh]='2ce54eded17460e7a4a0d53748a9f177036b4656e4b6a265f18c32f04c63f6d3'
 )
 readonly RECEIVER_LINK_NAME='celerity-l2tp-artifact-receiver'

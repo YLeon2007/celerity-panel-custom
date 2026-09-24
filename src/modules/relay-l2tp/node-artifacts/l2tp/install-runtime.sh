@@ -55,5 +55,17 @@ for package in "${REQUIRED_PACKAGES[@]}"; do
     fi
 done
 
+# Debian's stock /etc/ipsec.conf no longer includes /etc/ipsec.d/*.conf,
+# which would leave the managed conn unloaded — enforce it idempotently.
+readonly IPSEC_CONF='/etc/ipsec.conf'
+if [[ -f "$IPSEC_CONF" && ! -L "$IPSEC_CONF" ]] \
+    && ! grep -Eq '^[[:space:]]*include[[:space:]]+/etc/ipsec\.d/\*\.conf' "$IPSEC_CONF"; then
+    if ! printf '\ninclude /etc/ipsec.d/*.conf\n' >> "$IPSEC_CONF"; then
+        emit_error 'RUNTIME_IPSEC_INCLUDE_FAILED'
+        exit 70
+    fi
+    changed=$((changed + 1))
+fi
+
 printf '{"status":"ok","changed":%d,"present":%d}\n' \
     "$changed" "${#REQUIRED_PACKAGES[@]}"
