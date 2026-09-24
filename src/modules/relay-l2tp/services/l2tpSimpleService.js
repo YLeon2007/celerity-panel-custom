@@ -508,12 +508,16 @@ class L2tpSimpleService {
     // derives each relay's egress plan from the path whose first link starts
     // at that relay. A group auto-created for one relay therefore does not
     // serve another relay mid-chain until its suffix path is appended.
+    // Caveat: the compiler also derives *suffix* candidates, so one long path
+    // covers every downstream relay — overlapping paths at equal priority
+    // block selection with DUPLICATE_PRIORITY. Keep exactly one (longest)
+    // path covering each relay.
     async ensureRelayGroupPath(nodeId, routeGroupId) {
         const group = await this.CascadeRouteGroup.findById(routeGroupId).lean();
         if (!group) return;
-        let paths;
+        let wanted;
         try {
-            paths = await this.buildAutoGroupPaths(nodeId);
+            [wanted] = await this.buildAutoGroupPaths(nodeId);
         } catch (error) {
             // No cascade chain currently leaves this relay — keep the group
             // untouched instead of failing the install.
@@ -522,21 +526,41 @@ class L2tpSimpleService {
             }
             throw error;
         }
-        if (!paths.length || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
+        const wantedIds = (wanted?.linkIds || []).map(String);
+        if (wantedIds.length === 0
+            || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
             return;
         }
-        const wanted = paths[0];
-        const wantedLinks = JSON.stringify((wanted.linkIds || []).map(String));
-        const exists = (group.paths || []).some(path => (
-            JSON.stringify((path?.linkIds || []).map(String)) === wantedLinks
-        ));
-        if (exists) return;
-        const usedKeys = new Set((group.paths || []).map(path => path?.pathKey));
+        const existing = Array.isArray(group.paths) ? group.paths : [];
+        const linkIdsOf = path => (path?.linkIds || []).map(String);
+
+        const covering = existing.filter(path => linkIdsOf(path).includes(wantedIds[0]));
+        if (covering.length === 1 && existing.length === 1) return; // clean coverage
+        if (covering.length > 0) {
+            // The relay is covered, possibly by several overlapping paths —
+            // keep only the longest (most upstream) covering path.
+            const best = covering.reduce((a, b) => (
+                linkIdsOf(b).length > linkIdsOf(a).length ? b : a
+            ));
+            const finalPaths = existing.filter(path => !covering.includes(path) || path === best);
+            if (finalPaths.length !== existing.length) {
+                await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, {
+                    $set: { paths: finalPaths },
+                });
+                await this.stateRepository.advanceTopologyRevision?.();
+            }
+            return;
+        }
+
+        // No coverage: append this relay's path and drop any existing path
+        // that starts strictly inside it — those are now suffix-covered.
+        const kept = existing.filter(path => !wantedIds.slice(1).includes(linkIdsOf(path)[0]));
+        const usedKeys = new Set(kept.map(path => path?.pathKey));
         const pathKey = usedKeys.has(wanted.pathKey)
             ? `${wanted.pathKey}-${String(nodeId).slice(-6)}`
             : wanted.pathKey;
         await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, {
-            $push: { paths: { ...wanted, pathKey } },
+            $set: { paths: [...kept, { ...wanted, pathKey }] },
         });
         await this.stateRepository.advanceTopologyRevision?.();
     }
