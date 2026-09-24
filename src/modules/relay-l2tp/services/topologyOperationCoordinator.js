@@ -160,6 +160,12 @@ function nodeIdsByRef(topology) {
         result.set(ref, current);
         current = outgoing.get(current);
     }
+    // Geo-routing branch bridges never appear in the main chain walk; they get
+    // suffixed refs in the same deterministic order the plan composer uses.
+    const geoBridges = topology.nodes
+        .filter(node => node.role === 'bridge' && !visited.has(node.id))
+        .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+    geoBridges.forEach((node, index) => result.set(`bridge-${index + 2}`, node.id));
     return result;
 }
 
