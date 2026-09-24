@@ -1784,6 +1784,8 @@
     "deleteAccount": "Удалить",
     "confirmDeleteAccount": "Удалить аккаунт со всех релеев:",
     "pendingSync": "синхронизация…",
+    "synced": "синхронизировано",
+    "copyLogin": "копировать логин",
     "requestFailed": "Запрос не выполнен",
     "queued": "Операция в очереди",
     "done": "Готово",

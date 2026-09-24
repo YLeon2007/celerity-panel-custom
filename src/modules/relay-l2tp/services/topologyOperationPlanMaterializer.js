@@ -72,6 +72,12 @@ const LINK_METADATA_SELECT = Object.freeze([
     'muxEnabled',
     'muxConcurrency',
     'geoRouting',
+    'realityDest',
+    'realitySni',
+    'realityPrivateKey',
+    'realityPublicKey',
+    'realityShortIds',
+    'realityFingerprint',
 ].join(' '));
 const LINK_CONFIG_FIELDS = Object.freeze([
     'tunnelPort',
@@ -92,6 +98,12 @@ const LINK_CONFIG_FIELDS = Object.freeze([
     'muxEnabled',
     'muxConcurrency',
     'geoRouting',
+    'realityDest',
+    'realitySni',
+    'realityPrivateKey',
+    'realityPublicKey',
+    'realityShortIds',
+    'realityFingerprint',
 ]);
 
 class TopologyOperationPlanMaterializerError extends Error {
@@ -219,12 +231,6 @@ function projectLinkMetadata(rows) {
         const mode = row?.mode;
         if (!SUPPORTED_MODES.includes(mode)) {
             fail('UNSAFE_LINK_METADATA_MODE', 'Hydrated topology link metadata requires a supported mode');
-        }
-        if (row?.tunnelSecurity === 'reality') {
-            fail(
-                'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY',
-                'Reality topology tunnel security is unsupported',
-            );
         }
         const projected = {
             id,

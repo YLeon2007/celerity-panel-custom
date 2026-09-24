@@ -309,37 +309,59 @@ test('rejects hydrated link metadata that does not match its frozen link', () =>
     );
 });
 
-test('rejects Reality tunnel security before candidate generation', () => {
+test('composes Reality tunnel security into portal and relay candidates', () => {
     const input = reverseChainInput();
     const realityPrivateKey = 'reality-private-key-canary';
-    input.linkMetadata[0].tunnelSecurity = 'reality';
-    input.linkMetadata[0].realityPrivateKey = realityPrivateKey;
-    const portalMetadata = input.nodeMetadata.find(node => node.role === 'portal');
-    const portalXray = portalMetadata.xray;
-    let candidateGenerationReads = 0;
-    Object.defineProperty(portalMetadata, 'xray', {
-        configurable: true,
-        enumerable: true,
-        get() {
-            candidateGenerationReads += 1;
-            return portalXray;
-        },
-    });
-
-    assert.throws(
-        () => composeFrozenTopologyDeploymentPlan(input),
-        error => {
-            assert.equal(error.name, 'FrozenTopologyDeploymentPlanError');
-            assert.equal(error.code, 'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY');
-            assert.equal(error.message, 'Reality topology tunnel security is unsupported');
-            assert.doesNotMatch(
-                `${error.name}:${error.code}:${error.message}`,
-                new RegExp(realityPrivateKey),
-            );
-            return true;
-        },
+    const realityPublicKey = 'reality-public-key-canary';
+    const realityLink = input.linkMetadata.find(
+        link => link.id === 'link-portal-relay-object-id',
     );
-    assert.equal(candidateGenerationReads, 0);
+    realityLink.tunnelSecurity = 'reality';
+    realityLink.realityDest = 'dl.google.com:443';
+    realityLink.realitySni = ['dl.google.com'];
+    realityLink.realityPrivateKey = realityPrivateKey;
+    realityLink.realityPublicKey = realityPublicKey;
+    realityLink.realityShortIds = ['ab01cd23'];
+    realityLink.realityFingerprint = 'chrome';
+
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    const portalCandidate = plan.nodes.find(node => node.role === 'portal');
+    const relayCandidate = plan.nodes.find(node => node.role === 'relay');
+    const portalConfig = candidateConfig(portalCandidate);
+    const relayConfig = candidateConfig(relayCandidate);
+
+    // Portal is the listening side of the reverse tunnel: full server reality
+    // settings including the private key.
+    const portalTunnelInbound = portalConfig.inbounds.find(inbound =>
+        inbound.streamSettings?.security === 'reality');
+    assert.ok(portalTunnelInbound, 'portal listens with reality stream security');
+    assert.equal(
+        portalTunnelInbound.streamSettings.realitySettings.privateKey,
+        realityPrivateKey,
+    );
+    assert.deepEqual(
+        portalTunnelInbound.streamSettings.realitySettings.serverNames,
+        ['dl.google.com'],
+    );
+
+    // Relay dials the portal: client-side reality settings carry the public
+    // key and must never include the private key.
+    const relayTunnelOutbound = relayConfig.outbounds.find(outbound =>
+        outbound.streamSettings?.security === 'reality');
+    assert.ok(relayTunnelOutbound, 'relay dials with reality stream security');
+    assert.equal(
+        relayTunnelOutbound.streamSettings.realitySettings.publicKey,
+        realityPublicKey,
+    );
+    assert.equal(
+        relayTunnelOutbound.streamSettings.realitySettings.privateKey,
+        undefined,
+    );
+    assert.equal(
+        JSON.stringify(relayConfig).includes(realityPrivateKey),
+        false,
+        'relay candidate must not leak the portal reality private key',
+    );
 });
 
 test('rejects compiled relay data for a node outside the frozen topology', () => {

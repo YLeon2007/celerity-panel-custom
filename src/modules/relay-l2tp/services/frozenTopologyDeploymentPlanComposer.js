@@ -70,6 +70,12 @@ const LINK_CONFIG_FIELDS = Object.freeze([
     'tlsServerName',
     'muxEnabled',
     'muxConcurrency',
+    'realityDest',
+    'realitySni',
+    'realityPrivateKey',
+    'realityPublicKey',
+    'realityShortIds',
+    'realityFingerprint',
 ]);
 
 const TARGETS_BY_ROLE = Object.freeze({
@@ -597,12 +603,6 @@ function composeFrozenTopologyDeploymentPlan({
             throw new FrozenTopologyDeploymentPlanError(
                 'LINK_METADATA_MISMATCH',
                 'Hydrated link metadata must match the validated topology snapshot',
-            );
-        }
-        if (metadata.tunnelSecurity === 'reality') {
-            throw new FrozenTopologyDeploymentPlanError(
-                'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY',
-                'Reality topology tunnel security is unsupported',
             );
         }
     }

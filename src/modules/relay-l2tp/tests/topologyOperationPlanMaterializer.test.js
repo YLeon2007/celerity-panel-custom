@@ -302,40 +302,42 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     assert.deepEqual(HyNode.writes, []);
     assert.deepEqual(CascadeLink.writes, []);
     assert.doesNotMatch(NODE_METADATA_SELECT, /ssh|customConfig|initScript|agentToken/i);
-    assert.doesNotMatch(LINK_METADATA_SELECT, /tunnelUuid|privateKey|rawCommand/i);
+    assert.doesNotMatch(LINK_METADATA_SELECT, /tunnelUuid|rawCommand/i);
 
     await Promise.resolve();
     assert.equal(HyNode.calls.filter(call => call.method === 'find').length, 1);
     assert.equal(CascadeLink.calls.filter(call => call.method === 'find').length, 1);
 });
 
-test('rejects Reality tunnel security during allowlisted hydration without leaking secrets', async () => {
+test('hydrates Reality tunnel security through the allowlisted projection', async () => {
     const rows = metadataRows();
     rows.links[0].tunnelSecurity = 'reality';
     rows.links[0].realityPrivateKey = SECRET_CANARIES[4];
+    rows.links[0].realityPublicKey = 'reality-public-key';
+    rows.links[0].realityDest = 'dl.google.com:443';
+    rows.links[0].realitySni = ['dl.google.com'];
     const { HyNode, CascadeLink, materializer } = createMaterializer(rows);
 
-    await assert.rejects(
-        materializer.materialize({
-            target: TEST_TOPOLOGY_TARGET,
-            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
-            pinnedSnapshot: pinnedSnapshot(),
-        }),
-        error => {
-            assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
-            assert.equal(error.code, 'UNSUPPORTED_TOPOLOGY_TUNNEL_SECURITY');
-            assert.equal(error.message, 'Reality topology tunnel security is unsupported');
-            assert.doesNotMatch(
-                `${error.name}:${error.code}:${error.message}`,
-                new RegExp(SECRET_CANARIES[4]),
-            );
-            return true;
-        },
+    const plan = await materializer.materialize({
+        target: TEST_TOPOLOGY_TARGET,
+        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+        pinnedSnapshot: pinnedSnapshot(),
+    });
+
+    // The portal candidate needs the reality private key to terminate the
+    // tunnel — it is hydrated only through the allowlisted link fields.
+    const portalNode = plan.nodes.find(node => node.role === 'portal');
+    const portalConfig = JSON.parse(Buffer.from(portalNode.candidate.bytes).toString('utf8'));
+    const realityInbound = portalConfig.inbounds.find(inbound =>
+        inbound.streamSettings?.security === 'reality');
+    assert.ok(realityInbound, 'portal candidate terminates the reality tunnel');
+    assert.equal(
+        realityInbound.streamSettings.realitySettings.privateKey,
+        SECRET_CANARIES[4],
     );
     assert.equal(CascadeLink.calls.some(call => call.method === 'lean'), true);
     assert.deepEqual(HyNode.writes, []);
     assert.deepEqual(CascadeLink.writes, []);
-    assert.doesNotMatch(LINK_METADATA_SELECT, /realityPrivateKey|privateKey/i);
 });
 
 test('sanitizes metadata read failures without returning database or secret details', async () => {

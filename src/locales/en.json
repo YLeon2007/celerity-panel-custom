@@ -1784,6 +1784,8 @@
     "deleteAccount": "Delete",
     "confirmDeleteAccount": "Delete the account from all relays:",
     "pendingSync": "syncing…",
+    "synced": "synced",
+    "copyLogin": "copy login",
     "requestFailed": "Request failed",
     "queued": "Operation queued",
     "done": "Done",

@@ -11,7 +11,7 @@
 .badge-off { background: rgba(255, 255, 255, .08); color: #999; }
 .badge-warn { background: rgba(241, 196, 15, .15); color: #f1c40f; }
 .badge-err { background: rgba(231, 76, 60, .15); color: #e74c3c; }
-.psk-chip { font-family: monospace; font-size: 12px; background: rgba(255,255,255,.06); border: 1px dashed var(--border-color, #2e2e3e); border-radius: 6px; padding: 4px 10px; cursor: pointer; user-select: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.psk-chip { font-family: monospace; font-size: 12px; color: #e8e8f2; background: rgba(255,255,255,.10); border: 1px dashed var(--border-color, #2e2e3e); border-radius: 6px; padding: 4px 10px; cursor: pointer; user-select: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .psk-chip:hover { border-color: #4a9eff; }
 .relay-chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .relay-chip { font-size: 12px; background: rgba(74, 158, 255, .12); color: #4a9eff; border-radius: 6px; padding: 2px 8px; }
@@ -60,6 +60,8 @@
         deleteAccount: t('l2tp.deleteAccount'),
         confirmDeleteAccount: t('l2tp.confirmDeleteAccount'),
         pendingSync: t('l2tp.pendingSync'),
+        synced: t('l2tp.synced'),
+        copyLogin: t('l2tp.copyLogin'),
         requestFailed: t('l2tp.requestFailed'),
         rateLimited: t('l2tp.rateLimited'),
         queued: t('l2tp.queued'),
@@ -154,8 +156,12 @@
         }
         accountList.innerHTML = accounts.map(account => `
             <div class="l2tp-row" data-login="${esc(account.login)}">
-                <span class="l2tp-name grow">${esc(account.login)}
-                    ${account.pending ? `<span class="badge badge-warn">${esc(L.pendingSync)}</span>` : ''}
+                <span class="l2tp-name grow">
+                    <button class="psk-chip" data-psk="${esc(account.login)}"
+                        title="${esc(L.copyLogin)}">${esc(account.login)}</button>
+                    ${account.pending
+                        ? `<span class="badge badge-warn">${esc(L.pendingSync)}</span>`
+                        : `<span class="badge badge-ok">${esc(L.synced)}</span>`}
                 </span>
                 ${account.password
                     ? `<button class="psk-chip" data-psk="${esc(account.password)}"
@@ -169,11 +175,20 @@
         `).join('');
     }
 
+    let syncTimer = null;
+
     async function refresh() {
         try {
             const data = await api('/panel/l2tp/simple/overview');
             renderRelays(data.relays || []);
             renderAccounts(data.accounts || []);
+            // While any account is syncing, keep polling so the badge flips
+            // to "synced" without a manual page reload.
+            const pending = (data.accounts || []).some(account => account.pending)
+                || (data.relays || []).some(relay => relay.configured && !relay.installed && relay.status !== 'not_installed');
+            if (pending && !syncTimer) {
+                syncTimer = setTimeout(() => { syncTimer = null; refresh(); }, 3000);
+            }
         } catch (error) {
             relayStatus.textContent = fmtError(error);
         }

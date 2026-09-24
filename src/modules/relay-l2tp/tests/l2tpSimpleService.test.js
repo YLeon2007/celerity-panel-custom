@@ -78,6 +78,9 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
         },
         CascadeRouteGroup: {
             find: () => chainable(groups),
+            findById: id => ({
+                lean: async () => groups.find(entry => String(entry._id) === String(id)) ?? null,
+            }),
             create: async document => ({ _id: 'group-auto', ...document }),
             findByIdAndUpdate: async (id, update) => {
                 const group = groups.find(entry => String(entry._id) === String(id));
