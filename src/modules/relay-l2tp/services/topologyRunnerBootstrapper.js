@@ -38,11 +38,34 @@ const CLEANUP_COMMAND = Object.freeze(
     `/usr/bin/rm -f -- ${TOPOLOGY_RUNNER_UPLOAD_PATH} ${TOPOLOGY_RUNNER_NEXT_PATH}`,
 );
 // The node runner's strict prepare requires the target profile's config
-// parent (e.g. /usr/local/etc/xray-bridge) to exist as a real directory.
-// Fresh relay nodes only have /usr/local/etc/xray, so ensure both upfront.
-const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze(
+// parent (e.g. /usr/local/etc/xray-bridge) to exist as a real directory,
+// and commit/verify drive the xray-bridge.service unit. Fresh relay nodes
+// only have the main xray profile, so ensure the dirs and the unit upfront.
+const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze([
     '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge',
-);
+    '&& if /usr/bin/test ! -f /etc/systemd/system/xray-bridge.service; then',
+    `/usr/bin/printf '%s\\n' '${[
+        '[Unit]',
+        'Description=Xray Bridge (Cascade Tunnel)',
+        'After=network.target nss-lookup.target',
+        '',
+        '[Service]',
+        'User=nobody',
+        'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
+        'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
+        'NoNewPrivileges=true',
+        'Type=simple',
+        'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray-bridge/config.json',
+        'Restart=on-failure',
+        'RestartSec=5',
+        'LimitNOFILE=1048576',
+        '',
+        '[Install]',
+        'WantedBy=multi-user.target',
+        '',
+    ].join('\\n')}' > /etc/systemd/system/xray-bridge.service`,
+    '&& /usr/bin/systemctl daemon-reload; fi',
+].join(' '));
 
 /**
  * @typedef {Readonly<{code: number, stdout: string, stderr: string}>} NodeSSHResult
@@ -165,6 +188,7 @@ class TopologyRunnerBootstrapper {
 }
 
 module.exports = {
+    ENSURE_CONFIG_DIRS_COMMAND,
     TOPOLOGY_RUNNER_MODE,
     TOPOLOGY_RUNNER_PATH,
     TOPOLOGY_RUNNER_SHA256,

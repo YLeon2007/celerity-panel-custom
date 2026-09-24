@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+    ENSURE_CONFIG_DIRS_COMMAND: ENSURE_DIRS_COMMAND,
     TOPOLOGY_RUNNER_MODE,
     TOPOLOGY_RUNNER_PATH,
     TOPOLOGY_RUNNER_SHA256,
@@ -38,8 +39,6 @@ const installedReadback = {
     stdout: `${RUNNER_DIGEST}  ${RUNNER_PATH}\n750\n`,
     stderr: '',
 };
-const ENSURE_DIRS_COMMAND = '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge';
-
 function runnerSource() {
     return readFileSync(path.join(
         __dirname,
