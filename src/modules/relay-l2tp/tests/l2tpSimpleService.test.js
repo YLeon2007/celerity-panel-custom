@@ -312,6 +312,11 @@ test('installRelay reconfigures a state reset by uninstall before installing', a
     assert.deepEqual(result, { operationId: 'op-reinstall' });
     assert.equal(calls.configure.length, 1);
     assert.equal(calls.configure[0].input.generatePsk, true);
+    assert.equal(
+        calls.configure[0].input.clientCidr,
+        STATE.clientCidr,
+        'reinstall after uninstall must reuse the relay network layout so pinned account IPs stay valid',
+    );
     assert.equal(calls.install.length, 1);
 });
 

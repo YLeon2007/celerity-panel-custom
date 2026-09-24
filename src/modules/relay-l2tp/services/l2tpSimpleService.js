@@ -96,8 +96,10 @@ function pickThirdOctet(nodeId, states) {
     );
 }
 
-function autoDesiredInput(nodeId, states, routeGroupId) {
-    const third = pickThirdOctet(nodeId, states);
+function autoDesiredInput(nodeId, states, routeGroupId, preferredThird = null) {
+    const third = preferredThird !== null && !usedThirdOctets(states).has(preferredThird)
+        ? preferredThird
+        : pickThirdOctet(nodeId, states);
     return {
         clientCidr: `10.255.${third}.0/24`,
         localAddress: `10.255.${third}.1`,
@@ -433,11 +435,33 @@ class L2tpSimpleService {
             : await this.ensureRouteGroup(selectedNodeId);
 
         if (!state || state.desiredState !== 'installed') {
-            // Fresh relay or one whose state was reset by uninstall —
-            // (re)generate the PSK and mark install as desired.
+            // Fresh relay or one whose state was reset by uninstall. Reuse the
+            // network layout already assigned to this relay (the state record
+            // survives uninstall) so existing accounts keep their pinned IPs.
+            // For a truly fresh state, prefer the subnet of accounts that
+            // already exist for this relay before picking a new octet.
+            const input = state?.clientCidr
+                ? {
+                    clientCidr: state.clientCidr,
+                    localAddress: state.localAddress,
+                    poolStart: state.poolStart,
+                    poolEnd: state.poolEnd,
+                    dnsServers: state.dnsServers,
+                    tproxyPort: state.tproxyPort,
+                    fwmark: state.fwmark,
+                    routeTable: state.routeTable,
+                    routeGroupId,
+                    generatePsk: true,
+                }
+                : autoDesiredInput(
+                    selectedNodeId,
+                    states,
+                    routeGroupId,
+                    await this.preferredThirdOctet(selectedNodeId),
+                );
             await this.stateManagementService.configureRelay(
                 selectedNodeId,
-                autoDesiredInput(selectedNodeId, states, routeGroupId),
+                input,
             );
         } else if (!state.routeGroup) {
             await this.stateManagementService.configureRelay(selectedNodeId, {
@@ -466,6 +490,19 @@ class L2tpSimpleService {
             routeGroupId,
             expectedTopologyRevision: topologyRevision,
         });
+    }
+
+    // Returns the 10.255.N.x octet shared by every account already pinned to
+    // this relay, or null when there are none / they disagree.
+    async preferredThirdOctet(nodeId) {
+        const accounts = await this.listAccounts();
+        const octets = new Set();
+        for (const account of accounts) {
+            if (account.relayNode !== String(nodeId)) continue;
+            const match = /^10\.255\.(\d{1,3})\.\d{1,3}$/.exec(account.ip || '');
+            if (match) octets.add(Number(match[1]));
+        }
+        return octets.size === 1 ? [...octets][0] : null;
     }
 
     // Copies accounts known on other relays onto this relay before install,
