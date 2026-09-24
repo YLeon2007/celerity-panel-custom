@@ -1,6 +1,9 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+
 const { L2tpNodeTransport } = require('./l2tpNodeTransport');
+const { createL2tpArtifactBootstrapper } = require('./l2tpArtifactBootstrapper');
 
 function createL2tpNodeTransportFactory({
     nodeSSHFactory,
@@ -18,6 +21,14 @@ function createL2tpNodeTransportFactory({
     });
 }
 
+function defaultArtifactBootstrapper(nodeSSH) {
+    try {
+        return createL2tpArtifactBootstrapper({ nodeSSH, createHash });
+    } catch {
+        return null;
+    }
+}
+
 function createL2tpNodeTransportResolver({
     nodeExecutionResolver,
     NodeTransport = L2tpNodeTransport,
@@ -29,9 +40,13 @@ function createL2tpNodeTransportResolver({
         throw new TypeError('createL2tpNodeTransportResolver requires NodeTransport');
     }
 
-    return async ({ nodeId }) => new NodeTransport({
-        nodeSSH: await nodeExecutionResolver.resolve(nodeId),
-    });
+    return async ({ nodeId }) => {
+        const nodeSSH = await nodeExecutionResolver.resolve(nodeId);
+        return new NodeTransport({
+            nodeSSH,
+            artifactBootstrapper: defaultArtifactBootstrapper(nodeSSH),
+        });
+    };
 }
 
 module.exports = {

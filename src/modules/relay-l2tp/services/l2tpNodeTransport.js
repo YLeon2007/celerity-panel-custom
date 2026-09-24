@@ -274,11 +274,25 @@ const COMMAND_EXEC_TIMEOUT_MS = Object.freeze({
 });
 
 class L2tpNodeTransport {
-    constructor({ nodeSSH }) {
+    #artifactBootstrapper;
+    #artifactReady;
+
+    constructor({ nodeSSH, artifactBootstrapper = null }) {
         this.nodeSSH = nodeSSH;
+        this.#artifactBootstrapper = artifactBootstrapper;
+        this.#artifactReady = false;
+    }
+
+    async #ensureArtifactBundle() {
+        if (this.#artifactReady) return;
+        if (this.#artifactBootstrapper) {
+            await this.#artifactBootstrapper.ensureArtifact();
+        }
+        this.#artifactReady = true;
     }
 
     async uploadRootFile(request) {
+        await this.#ensureArtifactBundle();
         assertRootFileRequest(request);
         const {
             operationId,
@@ -312,6 +326,7 @@ class L2tpNodeTransport {
     }
 
     async runArtifactCommand(request) {
+        await this.#ensureArtifactBundle();
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new L2tpNodeTransportError(
                 'INVALID_COMMAND_EXPECTATION',
