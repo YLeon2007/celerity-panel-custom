@@ -113,6 +113,7 @@ function createWorker(operationRepository, overrides = {}) {
         stateReconciler: overrides.stateReconciler || (async () => ({ status: 'installed' })),
         operationMaterializer: overrides.operationMaterializer,
         candidateService: overrides.candidateService,
+        afterInstallSucceeded: overrides.afterInstallSucceeded,
         workerId: 'worker-1',
         leaseMs: overrides.leaseMs || 30_000,
         clock: overrides.clock || createClock(),
@@ -354,6 +355,82 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         )),
         false,
     );
+});
+
+test('queues the after-install topology deploy hook only for succeeded installs', async () => {
+    const { operation } = createInstallOperation('operation-autodeploy');
+    const operationRepository = createOperationRepository([operation]);
+    const hookCalls = [];
+    const executor = new L2tpRemoteExecutor({
+        transport: {
+            async uploadRootFile() {},
+            async runArtifactCommand() {},
+        },
+    });
+    const worker = createWorker(operationRepository, {
+        executor,
+        operationMaterializer: materializeInstallOperation,
+        afterInstallSucceeded: async request => {
+            hookCalls.push(request);
+        },
+        candidateService: {
+            async buildCandidate(request) {
+                return {
+                    operationId: request.plan.operationId,
+                    content: '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}',
+                };
+            },
+        },
+        secretResolver: async () => ({
+            psk: 'psk',
+            users: [],
+        }),
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(hookCalls, [{
+        operationId: 'operation-autodeploy',
+        node: operation.node,
+    }]);
+
+    // A hook that throws must not fail the already-succeeded install.
+    hookCalls.length = 0;
+    const { operation: secondOperation } = createInstallOperation('operation-autodeploy-2');
+    const secondRepository = createOperationRepository([secondOperation]);
+    const failingWorker = createWorker(secondRepository, {
+        executor,
+        operationMaterializer: materializeInstallOperation,
+        afterInstallSucceeded: async () => {
+            hookCalls.push('called');
+            throw new Error('deploy queue unavailable');
+        },
+        candidateService: {
+            async buildCandidate(request) {
+                return {
+                    operationId: request.plan.operationId,
+                    content: '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}',
+                };
+            },
+        },
+        secretResolver: async () => ({ psk: 'psk', users: [] }),
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release() { return { ok: true }; },
+        },
+    });
+
+    const secondResult = await failingWorker.runOnce();
+
+    assert.equal(secondResult.status, 'succeeded');
+    assert.deepEqual(hookCalls, ['called']);
 });
 
 test('runs standalone sync_users with typed verification and finalizes before success', async () => {

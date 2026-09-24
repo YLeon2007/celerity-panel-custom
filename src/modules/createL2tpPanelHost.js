@@ -95,6 +95,22 @@ function createL2tpPanelHost({
         CascadeRouteGroup: models.CascadeRouteGroup,
         L2tpOperation: models.L2tpOperation,
     });
+    let topologyDeploymentService;
+    let topologyRecoveryLifecycle;
+
+    // The L2TP install worker may advance the topology revision (route-group
+    // paths are rebuilt for the relay). Deploy automatically right after a
+    // successful install so relay ingress listeners appear without a manual
+    // chain sync. Late-bound: the topology runtime is created below.
+    const deployTopologyAfterInstall = async () => {
+        const service = topologyDeploymentService;
+        if (!service || typeof service.deploy !== 'function') return;
+        if (typeof adapters.stateRepository?.getTopologyRevision !== 'function') return;
+        const revision = await adapters.stateRepository.getTopologyRevision();
+        if (!Number.isSafeInteger(revision) || revision < 0) return;
+        await service.deploy({ expectedTopologyRevision: revision });
+    };
+
     const executionRuntime = createExecutionRuntime({
         workerLifecycle,
         HyNode: injectedHyNode,
@@ -135,11 +151,10 @@ function createL2tpPanelHost({
             clock,
             workerId,
             leaseMs,
+            afterInstallSucceeded: deployTopologyAfterInstall,
         },
     });
 
-    let topologyDeploymentService;
-    let topologyRecoveryLifecycle;
     const { isTopologyTestExecutionEnabled } = require(
         './relay-l2tp/runtime/createTopologyOperationRuntime'
     );

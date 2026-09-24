@@ -70,6 +70,10 @@ function hideInjectedDependencies(target, propertyNames) {
     }
 }
 
+function optional(value, key) {
+    return value === undefined ? {} : { [key]: value };
+}
+
 function createL2tpRuntime(dependencies) {
     assertDependencies(dependencies);
     const {
@@ -89,6 +93,7 @@ function createL2tpRuntime(dependencies) {
         stateReconciler,
         candidateService,
         operationMaterializer = materializeInstallOperation,
+        afterInstallSucceeded,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -122,6 +127,7 @@ function createL2tpRuntime(dependencies) {
         stateReconciler,
         candidateService,
         operationMaterializer,
+        ...optional(afterInstallSucceeded, 'afterInstallSucceeded'),
         workerId,
         leaseMs,
         clock,

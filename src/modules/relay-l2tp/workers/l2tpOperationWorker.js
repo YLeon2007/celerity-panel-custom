@@ -137,6 +137,7 @@ class L2tpOperationWorker {
         stateReconciler,
         candidateService,
         operationMaterializer,
+        afterInstallSucceeded,
         workerId,
         leaseMs,
         clock,
@@ -152,6 +153,7 @@ class L2tpOperationWorker {
         this.stateReconciler = stateReconciler;
         this.candidateService = candidateService;
         this.operationMaterializer = operationMaterializer;
+        this.afterInstallSucceeded = afterInstallSucceeded;
         this.workerId = workerId;
         this.leaseMs = leaseMs;
         this.clock = clock;
@@ -846,6 +848,16 @@ class L2tpOperationWorker {
                 },
             });
             if (succeeded !== true) return leaseLostResult();
+
+            // The install may have advanced the topology revision (route-group
+            // paths rebuilt for the relay). Queue a topology deploy right away
+            // so relay ingress listeners appear without a manual chain sync.
+            // Best effort: a failed auto-deploy must not fail the install.
+            if (operation.kind === 'install' && typeof this.afterInstallSucceeded === 'function') {
+                try {
+                    await this.afterInstallSucceeded({ operationId, node: operation.node });
+                } catch { /* manual chain sync remains available */ }
+            }
 
             return { claimed: true, operationId, status: 'succeeded' };
         } finally {
