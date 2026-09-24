@@ -249,8 +249,12 @@ class TopologyOperationCoordinator {
                 this.operationsByIdempotencyKey.delete(idempotencyKey);
             } else if (typeof this.operationRepository.findPublicById === 'function') {
                 const persisted = await this.operationRepository.findPublicById(settled.operationId);
-                if (persisted) return existing;
-                // The operation record was purged (undeploy): re-queue from scratch.
+                // A live or successful operation satisfies the idempotency key.
+                // A terminally failed one (failed/rolled_back) must not block a
+                // retry of the same revision — re-queue with a fresh run id.
+                if (persisted && persisted.status !== 'failed' && persisted.status !== 'rolled_back') {
+                    return existing;
+                }
                 this.operationsByIdempotencyKey.delete(idempotencyKey);
             } else {
                 return existing;
