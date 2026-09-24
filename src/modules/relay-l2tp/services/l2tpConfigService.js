@@ -171,7 +171,7 @@ conn celerity-l2tp
                 content: `[global]
 port = 1701
 
-[lns celerity-l2tp]
+[lns default]
 ip range = ${desired.poolStart}-${desired.poolEnd}
 local ip = ${desired.localAddress}
 require authentication = yes

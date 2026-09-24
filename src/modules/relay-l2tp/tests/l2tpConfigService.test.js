@@ -206,7 +206,7 @@ test('restricts xl2tpd to the desired client pool and local address', () => {
     assert.equal(fileByPath(result, 'etc/xl2tpd/xl2tpd.conf').content, `[global]
 port = 1701
 
-[lns celerity-l2tp]
+[lns default]
 ip range = 10.77.0.10-10.77.0.200
 local ip = 10.77.0.1
 require authentication = yes
