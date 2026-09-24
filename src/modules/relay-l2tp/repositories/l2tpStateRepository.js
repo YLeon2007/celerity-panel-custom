@@ -126,6 +126,7 @@ function createL2tpServiceRepositoryAdapters(repository) {
             findByNodeId: nodeId => repository.findByNodeId(nodeId),
             findRouteGroupById: routeGroupId => repository.findRouteGroupById(routeGroupId),
             getTopologyRevision: () => repository.getTopologyRevision(),
+            advanceTopologyRevision: () => repository.advanceTopologyRevision(),
             getRelayGroupPlan: (nodeId, routeGroupId) => (
                 repository.getRelayGroupPlan(nodeId, routeGroupId)
             ),
@@ -178,6 +179,19 @@ class L2tpStateRepository {
         const topologyState = await this.CascadeTopologyState.findById('singleton')
             .select('revision')
             .lean();
+        return topologyState?.revision ?? 0;
+    }
+
+    // Route group membership feeds topology candidate composition (per-path
+    // socks ingress on relay nodes), so any path write must advance the
+    // topology revision — otherwise the change is invisible to the deploy
+    // pipeline and relays keep stale (or missing) ingress listeners.
+    async advanceTopologyRevision() {
+        const topologyState = await this.CascadeTopologyState.findByIdAndUpdate(
+            'singleton',
+            { $inc: { revision: 1 } },
+            { new: true, upsert: true, setDefaultsOnInsert: true },
+        ).select('revision').lean();
         return topologyState?.revision ?? 0;
     }
 

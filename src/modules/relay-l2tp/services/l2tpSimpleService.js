@@ -415,6 +415,7 @@ class L2tpSimpleService {
             strategy: 'priority-failover',
             paths,
         });
+        await this.stateRepository.advanceTopologyRevision?.();
         return entityId(created?._id);
     }
 
@@ -517,6 +518,7 @@ class L2tpSimpleService {
             return;
         }
         await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, { $set: { paths } });
+        await this.stateRepository.advanceTopologyRevision?.();
     }
 
     // Returns the 10.255.N.x octet shared by every account already pinned to
