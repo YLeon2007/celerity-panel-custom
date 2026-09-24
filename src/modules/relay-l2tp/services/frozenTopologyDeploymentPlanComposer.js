@@ -412,7 +412,9 @@ function deterministicTunnelUuid(linkIdentity) {
     ].join('-');
 }
 
-const GEOIP_TAG_RE = /^[a-z0-9-]+$/;
+// geoip.dat codes are ISO-3166 alpha-2 (plus a few specials like 'private');
+// this also rejects punycode artifacts such as 'xn--p1ai' (from 'рф').
+const GEOIP_TAG_RE = /^[a-z]{2}$|^private$/;
 
 function sanitizeGeoipTag(value) {
     const tag = String(value).trim().toLowerCase();
