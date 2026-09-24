@@ -122,7 +122,14 @@ function publicError(error) {
 
 function sendError(res, error, routeLogger = logger) {
     const status = ERROR_STATUS_BY_CODE.get(error?.code);
-    if (status) return res.status(status).json(publicError(error));
+    if (status) {
+        // 5xx bodies are sanitized before reaching the client, so the real
+        // message must always land in the log.
+        if (status >= 500) {
+            routeLogger.error(`[Cascade Topology Deploy API] ${error?.code}: ${error?.message || 'Unknown error'}`);
+        }
+        return res.status(status).json(publicError(error));
+    }
     routeLogger.error(`[Cascade Topology Deploy API] ${error?.message || 'Unknown error'}`);
     return res.status(500).json({
         error: {
