@@ -4,6 +4,15 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 
+function loadLogger() {
+    try {
+        return require('../../../utils/logger');
+    } catch {
+        return { error: () => {}, warn: () => {}, info: () => {} };
+    }
+}
+const logger = loadLogger();
+
 const EXECUTOR_METHODS = Object.freeze([
     'prepare',
     'commit',
@@ -747,6 +756,7 @@ class TopologyOperationWorker {
                 }
             } catch (error) {
                 if (error instanceof LeaseLostError) throw error;
+                logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}`);
                 return await this.cleanupAfterPrepareFailure(
                     plan,
                     operationId,
