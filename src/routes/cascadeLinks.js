@@ -69,7 +69,15 @@ function generateRealityKeyPair() {
     return { privateKey: privateJwk.d, publicKey: publicJwk.x };
 }
 
-function resolveRealitySettings(input = {}) {
+function resolveRealitySettings(input = {}, targetNode = null) {
+    // When the link form leaves realityDest/realitySni empty, inherit them
+    // from the TARGET node's card (xray.realityDest/realitySni); the global
+    // google defaults apply only when the target node has none configured.
+    const targetXray = targetNode && typeof targetNode.xray === 'object' ? targetNode.xray : null;
+    const nodeDest = String(targetXray?.realityDest || '').trim();
+    const nodeSni = Array.isArray(targetXray?.realitySni)
+        ? targetXray.realitySni.map(value => String(value).trim()).filter(Boolean)
+        : [];
     let privateKey = String(input.realityPrivateKey || '').trim();
     let publicKey = String(input.realityPublicKey || '').trim();
     if (!privateKey || !publicKey) {
@@ -97,8 +105,8 @@ function resolveRealitySettings(input = {}) {
     }
     const realitySni = normalizeStringArray(input.realitySni).filter(Boolean);
     return {
-        realityDest: String(input.realityDest || '').trim() || 'www.google.com:443',
-        realitySni: realitySni.length > 0 ? realitySni : ['www.google.com'],
+        realityDest: String(input.realityDest || '').trim() || nodeDest || 'www.google.com:443',
+        realitySni: realitySni.length > 0 ? realitySni : (nodeSni.length > 0 ? nodeSni : ['www.google.com']),
         realityPrivateKey: privateKey,
         realityPublicKey: publicKey,
         realityShortIds: inputShortIds.some(Boolean)
@@ -382,7 +390,7 @@ function createCascadeLinksRouter({
                     realityPublicKey,
                     realityShortIds,
                     realityFingerprint,
-                }));
+                }, bridgeNode));
             }
             if (geoRouting && typeof geoRouting === 'object') {
                 link.geoRouting = {
@@ -521,6 +529,8 @@ function createCascadeLinksRouter({
                 || currentLink?.tunnelSecurity
                 || 'none';
             if (effectiveSecurity === 'reality') {
+                const targetNodeId = changes.bridgeNode || currentLink?.bridgeNode;
+                const targetNode = targetNodeId ? await Node.findById(targetNodeId) : null;
                 Object.assign(changes, resolveRealitySettings({
                     realityDest: changes.realityDest !== undefined
                         ? changes.realityDest
@@ -540,7 +550,7 @@ function createCascadeLinksRouter({
                     realityFingerprint: changes.realityFingerprint !== undefined
                         ? changes.realityFingerprint
                         : currentLink?.realityFingerprint,
-                }));
+                }, targetNode));
             }
 
             const revisions = await getWriteService().updateLink({
