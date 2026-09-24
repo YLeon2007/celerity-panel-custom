@@ -112,8 +112,12 @@ function safeQueueError(error, operationId, expectedTopologyRevision) {
     }
     return new TopologyOperationCoordinatorError(
         'TOPOLOGY_OPERATION_QUEUE_FAILED',
-        'The topology operation could not be queued',
-        { operationId, expectedTopologyRevision },
+        `The topology operation could not be queued: ${error?.message || 'unknown error'}`,
+        {
+            operationId,
+            expectedTopologyRevision,
+            causeCode: error?.code,
+        },
     );
 }
 
