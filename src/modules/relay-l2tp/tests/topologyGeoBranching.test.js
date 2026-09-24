@@ -141,13 +141,9 @@ test('reverse chain with a geo-routing branch bridge composes end-to-end', () =>
     assert.ok(geoRuleIndex < defaultRuleIndex, 'geo rules precede the default rule');
     assert.ok(privateIndex > defaultRuleIndex, 'geoip:private stays last');
 
-    // Every plan node carries its durable node id so the coordinator never
-    // re-derives refs by walking a branching link graph.
-    const byRef = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, node]));
-    assert.equal(byRef.portal.node, 'node-portal');
-    assert.equal(byRef['relay-1'].node, 'node-relay');
-    assert.equal(byRef.bridge.node, 'node-bridge');
-    assert.equal(byRef['bridge-2'].node, 'node-bridge-geo');
+    // Plan nodes intentionally carry no durable ids (candidate plans must not
+    // project object ids); the coordinator maps refs via nodeIdsByRef.
+    assert.ok(plan.nodes.every(node => node.node === undefined), 'plan nodes stay id-less');
 
     // The geo bridge is configured like a regular bridge for its own link:
     // in reverse mode it dials out through its tunnel outbound.
@@ -260,4 +256,27 @@ test('rejects a geo branch terminating at the default bridge', () => {
         () => composeFrozenTopologyDeploymentPlan(input),
         { name: 'FrozenTopologyDeploymentPlanError', code: 'GEO_LEAF_TARGET_CONFLICT' },
     );
+});
+
+test('coordinator ref mapping follows the main chain past geo branches', () => {
+    const { nodeIdsByRef } = require('../services/topologyOperationCoordinator');
+    // Geo link id intentionally sorts LAST, like production ObjectIds did.
+    const topology = {
+        nodes: [
+            { id: 'aaa-portal', role: 'portal' },
+            { id: 'bbb-relay', role: 'relay' },
+            { id: 'ccc-default-bridge', role: 'bridge' },
+            { id: 'ddd-geo-bridge', role: 'bridge' },
+        ],
+        links: [
+            { id: 'l1', source: 'aaa-portal', target: 'bbb-relay', mode: 'reverse', geo: false },
+            { id: 'l2', source: 'bbb-relay', target: 'ccc-default-bridge', mode: 'reverse', geo: false },
+            { id: 'l3', source: 'bbb-relay', target: 'ddd-geo-bridge', mode: 'reverse', geo: true },
+        ],
+    };
+    const ids = nodeIdsByRef(topology);
+    assert.equal(ids.get('portal'), 'aaa-portal');
+    assert.equal(ids.get('relay-1'), 'bbb-relay');
+    assert.equal(ids.get('bridge'), 'ccc-default-bridge');
+    assert.equal(ids.get('bridge-2'), 'ddd-geo-bridge');
 });

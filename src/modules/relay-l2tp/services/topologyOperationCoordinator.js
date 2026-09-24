@@ -147,7 +147,12 @@ function projectTopology(snapshot) {
 
 function nodeIdsByRef(topology) {
     const nodes = new Map(topology.nodes.map(node => [node.id, node]));
-    const outgoing = new Map(topology.links.map(link => [link.source, link.target]));
+    // Walk the MAIN chain only: at a branching node (relay with geo-routing
+    // leaf links) a collapsed map would follow whatever link sorted last and
+    // bind the wrong bridge to the 'bridge' ref.
+    const outgoing = new Map(
+        topology.links.filter(link => link.geo !== true).map(link => [link.source, link.target]),
+    );
     const portal = topology.nodes.find(node => node.role === 'portal');
     const result = new Map();
     let current = portal?.id;
@@ -392,5 +397,6 @@ module.exports = {
     assertQueueInput,
     deepFreeze,
     idFromIdempotencyKey,
+    nodeIdsByRef,
     projectTopologyOperationStatus,
 };

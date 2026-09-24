@@ -35,6 +35,9 @@ function projectLinks(links) {
             source: entityId(link.portalNode ?? link.source),
             target: entityId(link.bridgeNode ?? link.target),
             mode: link.mode,
+            // Geo-routing branch links must stay distinguishable after
+            // projection: chain walks use them to pick the default path.
+            geo: link.geoRouting?.enabled === true,
         }));
 }
 

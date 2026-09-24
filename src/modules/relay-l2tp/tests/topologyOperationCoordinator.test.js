@@ -124,6 +124,7 @@ test('queues one frozen fixed-test operation and starts only the injected worker
             source: 'portal-1',
             target: 'bridge-1',
             mode: 'forward',
+            geo: false,
         }],
         groups: [],
     });
