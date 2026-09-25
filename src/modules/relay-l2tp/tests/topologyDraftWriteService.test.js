@@ -6,7 +6,6 @@ const test = require('node:test');
 const {
     createTopologyDraftWriteService,
     TopologyDraftWriteService,
-    recalculateNodeRoles,
 } = require('../services/topologyDraftWriteService');
 
 function validSnapshot() {
@@ -224,40 +223,24 @@ test('keeps an active route group when link deletion empties its paths', async (
     assert.deepEqual(preparedCandidate.groups[0].paths, []);
 });
 
-test('link deletion never downgrades nodes to standalone', async () => {
-    const writes = [];
-    const HyNode = {
-        find: () => ({
-            select: () => ({
-                lean: async () => [
-                    { _id: 'portal-1', cascadeRole: 'portal' },
-                    { _id: 'relay-1', cascadeRole: 'relay' },
-                    { _id: 'bridge-1', cascadeRole: 'bridge' },
-                ],
-            }),
-        }),
-        bulkWrite: async ops => { writes.push(...ops); },
-    };
-    const CascadeLink = { find: () => ({ lean: async () => [] }) };
-
-    await recalculateNodeRoles(HyNode, CascadeLink);
-
-    assert.deepEqual(writes, [], 'nodes without links keep their assigned roles');
-});
-
-test('recalculates cascade roles on link create/update, never on delete', async () => {
+test('link mutations never trigger automatic node role changes', async () => {
+    // Roles are pure operator state: create, update and delete of cascade
+    // links must all commit without any role recalculation hook firing.
     const repository = {
         async commitDraft({ prepare }) {
             await prepare(validSnapshot());
             return { revision: 8, deployedRevision: 5 };
         },
     };
-    let recalcCalls = 0;
     const service = new TopologyDraftWriteService({
         repository,
         validator: () => ({ valid: true, errors: [] }),
         compiler: () => ({ valid: true, errors: [] }),
-        recalculateRoles: async () => { recalcCalls += 1; },
+        // Legacy option: even if a caller still passes a role recalculator,
+        // the service must never invoke it.
+        recalculateRoles: async () => {
+            throw new Error('automatic role recalculation is forbidden');
+        },
     });
 
     await service.createLink({
@@ -270,56 +253,15 @@ test('recalculates cascade roles on link create/update, never on delete', async 
             active: true,
         },
     });
-    assert.equal(recalcCalls, 1, 'link creation assigns roles from the graph');
-
     await service.updateLink({ expectedTopologyRevision: 8, linkId: 'link-1', changes: { name: 'l1b' } });
-    assert.equal(recalcCalls, 2, 'link update refreshes node roles');
-
     await service.deleteLink({ expectedTopologyRevision: 8, linkId: 'link-1' });
-    assert.equal(recalcCalls, 2, 'link deletion must not touch node roles');
-
     await service.deleteRouteGroup({ expectedTopologyRevision: 8, routeGroupId: 'group-1' });
-    assert.equal(recalcCalls, 2, 'group mutations do not change node roles');
 });
 
-test('deleting relay→bridge keeps the relay role (portal→relay remains)', async () => {
-    // Regression: portal→relay→bridge, delete relay→bridge. The remaining
-    // graph makes the relay look like a terminal target ("bridge"); roles
-    // must survive the deletion untouched.
-    const writes = [];
-    const HyNode = {
-        find: () => ({
-            select: () => ({
-                lean: async () => [
-                    { _id: 'portal-1', cascadeRole: 'portal' },
-                    { _id: 'relay-1', cascadeRole: 'relay' },
-                    { _id: 'bridge-1', cascadeRole: 'bridge' },
-                ],
-            }),
-        }),
-        bulkWrite: async ops => { writes.push(...ops); },
-    };
-    const CascadeLink = {
-        find: () => ({
-            lean: async () => [{ portalNode: 'portal-1', bridgeNode: 'relay-1', active: true }],
-        }),
-    };
-    const repository = {
-        async commitDraft({ prepare }) {
-            await prepare(validSnapshot());
-            return { revision: 8, deployedRevision: 5 };
-        },
-    };
-    const service = new TopologyDraftWriteService({
-        repository,
-        validator: () => ({ valid: true, errors: [] }),
-        compiler: () => ({ valid: true, errors: [] }),
-        recalculateRoles: async () => recalculateNodeRoles(HyNode, CascadeLink),
-    });
-
-    await service.deleteLink({ expectedTopologyRevision: 7, linkId: 'link-1' });
-
-    assert.deepEqual(writes, [], 'no role writes may happen on link deletion');
+test('write service exposes no automatic role recalculation API', () => {
+    const exported = require('../services/topologyDraftWriteService');
+    assert.equal('recalculateNodeRoles' in exported, false,
+        'graph-based role inference must not be part of the write service');
 });
 
 test('deletes an unreferenced link as a validated draft mutation', async () => {

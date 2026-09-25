@@ -81,7 +81,6 @@ class CascadeService {
                 },
             });
 
-            await this._updateNodeRoles();
             await this._invalidateTopologyCache();
 
             logger.info(`[Cascade] Link ${link.name} deployed, status=${newStatus}`);
@@ -177,7 +176,6 @@ class CascadeService {
             }
         }
 
-        await this._updateNodeRoles();
         await this._invalidateTopologyCache();
     }
 
@@ -260,7 +258,6 @@ class CascadeService {
             await this.healthCheckLink(link).catch(() => {});
         }
 
-        await this._updateNodeRoles();
         await this._invalidateTopologyCache();
 
         const success = errors.length === 0;
@@ -1010,45 +1007,6 @@ class CascadeService {
             return false;
         } finally {
             ssh.disconnect();
-        }
-    }
-
-    /**
-     * Recalculate cascadeRole for all nodes based on their active links.
-     * Nodes without links keep their current role — deleting a chain must
-     * not silently downgrade every node to standalone.
-     */
-    async _updateNodeRoles() {
-        const links = await CascadeLink.find({ active: true }).lean();
-
-        const portalSet = new Set(links.map(l => String(l.portalNode)));
-        const bridgeSet = new Set(links.map(l => String(l.bridgeNode)));
-
-        const allNodes = await HyNode.find({ active: true, type: { $ne: 'virtual' } }).select('_id cascadeRole').lean();
-
-        const bulkOps = [];
-        for (const node of allNodes) {
-            const id = String(node._id);
-            const isPortal = portalSet.has(id);
-            const isBridge = bridgeSet.has(id);
-
-            let role = node.cascadeRole || 'standalone';
-            if (isPortal && isBridge) role = 'relay';
-            else if (isPortal) role = 'portal';
-            else if (isBridge) role = 'bridge';
-
-            if (node.cascadeRole !== role) {
-                bulkOps.push({
-                    updateOne: {
-                        filter: { _id: node._id },
-                        update: { $set: { cascadeRole: role } },
-                    },
-                });
-            }
-        }
-
-        if (bulkOps.length > 0) {
-            await HyNode.bulkWrite(bulkOps, { ordered: false });
         }
     }
 
