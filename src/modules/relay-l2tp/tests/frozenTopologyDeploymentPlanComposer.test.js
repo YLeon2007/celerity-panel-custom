@@ -687,3 +687,19 @@ test('loads and composes without database, SSH, or CascadeService dependencies',
         delete require.cache[modulePath];
     }
 });
+
+test('disconnected roled nodes are excluded from the plan instead of failing validation', () => {
+    const input = reverseChainInput();
+    input.snapshot.nodes.push(
+        { id: 'node-staged-relay-object-id', role: 'relay' },
+        { id: 'node-staged-bridge-object-id', role: 'bridge' },
+    );
+
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+
+    assert.equal(plan.mode, 'reverse');
+    assert.deepEqual(
+        plan.nodes.map(node => node.nodeRef).sort(),
+        ['bridge', 'portal', 'relay-1'],
+    );
+});

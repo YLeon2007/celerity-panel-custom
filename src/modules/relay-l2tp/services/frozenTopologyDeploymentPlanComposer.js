@@ -152,6 +152,26 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
 
     const nodesById = uniqueById(snapshot.nodes, 'NODE');
     const linksById = uniqueById(snapshot.links, 'LINK');
+
+    // Roles are operator state: a node may keep portal/relay/bridge while
+    // being rewired. Only nodes that actually participate in the link graph
+    // belong to the topology plan; disconnected roled nodes are staged
+    // assets and are left untouched (and unvalidated) by this deployment.
+    const linkedNodeIds = new Set();
+    for (const [, link] of linksById) {
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (source) linkedNodeIds.add(source);
+        if (target) linkedNodeIds.add(target);
+    }
+    const excludedNodeIds = [];
+    for (const id of [...nodesById.keys()]) {
+        if (!linkedNodeIds.has(id)) {
+            nodesById.delete(id);
+            excludedNodeIds.push(id);
+        }
+    }
+
     const roles = { portal: [], relay: [], bridge: [] };
     for (const [id, node] of nodesById) {
         if (!Object.hasOwn(TARGETS_BY_ROLE, node.role)) {
@@ -163,6 +183,14 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
         roles[node.role].push(id);
     }
     if (roles.portal.length !== 1 || roles.bridge.length < 1) {
+        if (excludedNodeIds.length > 0) {
+            // The link graph is incomplete: nodes with cascade roles exist
+            // but are disconnected, so the chain lost its portal/bridge.
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_TOPOLOGY_LINK',
+                'A node with a cascade role is not connected by any link; complete the chain or detach the node',
+            );
+        }
         throw new FrozenTopologyDeploymentPlanError(
             'INVALID_TOPOLOGY_ROLES',
             'Topology requires exactly one portal and at least one bridge',
