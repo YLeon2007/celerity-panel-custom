@@ -410,6 +410,43 @@ test('installRelay rejects a branching cascade when no route group exists', asyn
     );
 });
 
+test('installRelay follows the default hop past a geoRouting branch', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        links: [
+            { _id: 'link-geo', portalNode: 'relay-1', bridgeNode: 'bridge-ru', geoRouting: { enabled: true, domains: ['category-ru'], geoip: ['ru'] } },
+            { _id: 'link-main', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+        ],
+    });
+    let createdGroup;
+    models.CascadeRouteGroup.create = async document => {
+        createdGroup = document;
+        return { _id: 'group-auto' };
+    };
+    const service = createService({
+        stateManagementService: {
+            configureRelay: async (nodeId, input) => {
+                models.RelayL2tpState._store.push({
+                    node: nodeId,
+                    desiredState: 'installed',
+                    status: 'not_installed',
+                    clientCidr: input.clientCidr,
+                    localAddress: input.localAddress,
+                    poolStart: input.poolStart,
+                    poolEnd: input.poolEnd,
+                    routeGroup: input.routeGroupId,
+                    secretRevision: 1,
+                });
+            },
+        },
+    }, models);
+
+    await service.installRelay('relay-1');
+
+    assert.ok(createdGroup, 'expected the auto route group to be created');
+    assert.deepEqual(createdGroup.paths[0].linkIds.map(String), ['link-main']);
+});
+
 test('createAccount fans out to every installed relay with per-relay addresses', async () => {
     const models = createModels({
         nodes: [RELAY, { _id: 'relay-2', name: 'Two', cascadeRole: 'relay', status: 'online' }],

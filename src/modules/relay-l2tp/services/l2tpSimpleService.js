@@ -371,13 +371,20 @@ class L2tpSimpleService {
         for (let hop = 0; hop < MAX_GROUP_WALK_HOPS; hop += 1) {
             const candidates = byPortal.get(current) ?? [];
             if (candidates.length === 0) break;
+            let link = candidates[0];
             if (candidates.length > 1) {
-                throw simpleError(
-                    'ROUTE_GROUP_AMBIGUOUS',
-                    'Automatic L2TP route group creation needs a linear cascade chain',
-                );
+                // Geo-routing links are side branches off the main chain: the
+                // automatic L2TP path always follows the default (non-geo) hop.
+                const mainHops = candidates.filter(candidate => candidate?.geoRouting?.enabled !== true);
+                if (mainHops.length === 1) {
+                    link = mainHops[0];
+                } else {
+                    throw simpleError(
+                        'ROUTE_GROUP_AMBIGUOUS',
+                        'Automatic L2TP route group creation needs a linear cascade chain',
+                    );
+                }
             }
-            const link = candidates[0];
             ordered.push(link._id);
             current = entityId(link.bridgeNode);
             if (visited.has(current)) {
