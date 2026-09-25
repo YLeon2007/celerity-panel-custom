@@ -337,6 +337,9 @@ function createL2tpRouter({
                 csrfToken: res.locals.csrfToken,
             });
         } catch (error) {
+            // Log the real cause: the previous silent catch made L2TP page
+            // failures impossible to diagnose in production.
+            console.error('[L2TP] Page render failed:', error && error.stack ? error.stack : error);
             res.status(500).send('Internal server error');
         }
     });
