@@ -151,6 +151,36 @@ test('reverse chain with a geo-routing branch bridge composes end-to-end', () =>
     assert.ok(geoBridge.outbounds.some(outbound => outbound.tag === 'tunnel-link-3'), 'geo bridge tunnel');
 });
 
+test('relay geo rules also cover L2TP path ingress traffic', () => {
+    const input = geoChainInput('reverse');
+    input.snapshot.groups = [{
+        id: 'group-1',
+        paths: [{
+            pathKey: 'main',
+            linkIds: ['link-portal-relay', 'link-relay-bridge'],
+            priority: 1,
+            enabled: true,
+        }],
+    }];
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    const configs = Object.fromEntries(plan.nodes.map(node => [node.nodeRef, candidateConfig(node)]));
+    const relayRules = configs['relay-1'].routing.rules;
+
+    const geoIpRule = relayRules.find(rule => rule.outboundTag === 'portal-down-link-3'
+        && Array.isArray(rule.ip) && rule.ip.includes('geoip:ru'));
+    const geoDomainRule = relayRules.find(rule => rule.outboundTag === 'portal-down-link-3'
+        && Array.isArray(rule.domain) && rule.domain.includes('geosite:category-ru'));
+    assert.ok(geoIpRule?.inboundTag?.includes('cascade-main'),
+        'geoip rule must cover the L2TP cascade ingress');
+    assert.ok(geoDomainRule?.inboundTag?.includes('cascade-main'),
+        'domain rule must cover the L2TP cascade ingress');
+    const ingressRule = relayRules.find(rule => rule.inboundTag?.includes('cascade-main')
+        && rule.outboundTag === 'portal-down-link-2');
+    assert.ok(ingressRule, 'ingress catch-all still targets the default bridge');
+    assert.ok(relayRules.indexOf(geoIpRule) < relayRules.indexOf(ingressRule),
+        'geo rules precede the ingress catch-all');
+});
+
 test('forward chain with a geo-routing branch bridge composes end-to-end', () => {
     const plan = composeFrozenTopologyDeploymentPlan(geoChainInput('forward'));
 

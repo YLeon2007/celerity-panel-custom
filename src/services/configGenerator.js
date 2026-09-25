@@ -1451,6 +1451,13 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
     // THIRD: Route traffic from upstream bridge to downstream portal(s).
     // Geo-tagged downstream links get explicit rules first (order matters in
     // Xray); default links share the balancer or the single direct rule.
+    // L2TP path ingress listeners (cascade-<pathKey>) receive the same geo
+    // rules as bridge-up traffic, otherwise relayed L2TP clients bypass the
+    // geo branches and always exit through the default downstream link.
+    const geoSourceTags = [
+        'bridge-up',
+        ...(cascadePathIngress || []).map(entry => `cascade-${entry.pathKey}`),
+    ];
     const geoDownLinks = downstreamLinks.filter(l => l.geoRouting?.enabled
         && ((l.geoRouting.domains?.length > 0) || (l.geoRouting.geoip?.length > 0)));
     const defaultDownLinks = downstreamLinks.filter(l => !geoDownLinks.includes(l));
@@ -1459,7 +1466,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
         if (geoLink.geoRouting.domains?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: ['bridge-up'],
+                inboundTag: geoSourceTags,
                 domain: geoLink.geoRouting.domains.map(d =>
                     d.includes(':') ? d : `geosite:${d}`),
                 outboundTag: geoTag,
@@ -1468,7 +1475,7 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
         if (geoLink.geoRouting.geoip?.length > 0) {
             config.routing.rules.push({
                 type: 'field',
-                inboundTag: ['bridge-up'],
+                inboundTag: geoSourceTags,
                 ip: geoLink.geoRouting.geoip.map(g =>
                     g.includes(':') ? g : `geoip:${g}`),
                 outboundTag: geoTag,
