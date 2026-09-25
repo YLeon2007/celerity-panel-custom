@@ -54,10 +54,8 @@ test('default chain walk handles bson ObjectId-shaped ids without recursion', ()
     });
     const links = [{ _id: oid('l1'), portalNode: oid('relay-1'), bridgeNode: oid('bridge-1') }];
     const byId = new Map(NODES.map(node => [node._id, node]));
-    assert.deepEqual(
-        buildDefaultChainLinkIds({ links, nodesById: byId, startNodeId: 'relay-1' }),
-        ['l1'],
-    );
+    const result = buildDefaultChainLinkIds({ links, nodesById: byId, startNodeId: 'relay-1' });
+    assert.deepEqual(result.map(String), ['l1']);
 });
 
 function maintenanceModels({ links, groupPaths }) {
