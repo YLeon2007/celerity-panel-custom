@@ -650,10 +650,12 @@ class L2tpSimpleService {
         if (!node) {
             throw simpleError('NODE_NOT_FOUND', 'L2TP node was not found');
         }
-        if (nodeRole(node) !== 'relay') {
+        const state = await this.RelayL2tpState.findOne({ node: selectedNodeId }).lean();
+        // A re-roled node (relay → bridge) keeps its installed L2TP state;
+        // teardown must stay possible exactly so decommissioning can proceed.
+        if (nodeRole(node) !== 'relay' && state?.status !== 'installed') {
             throw simpleError('NODE_NOT_RELAY', 'L2TP can only be managed on relay nodes');
         }
-        const state = await this.RelayL2tpState.findOne({ node: selectedNodeId }).lean();
         if (!state || state.status !== 'installed') {
             throw simpleError('L2TP_NOT_CONFIGURED', 'L2TP is not installed on this relay');
         }

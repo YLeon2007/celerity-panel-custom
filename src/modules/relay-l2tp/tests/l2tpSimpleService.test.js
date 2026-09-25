@@ -597,6 +597,28 @@ test('deleteAccount purges the record when the pinned node lost its relay role',
     assert.deepEqual(result.results, [{ nodeId: 'relay-1', deleted: true, orphaned: true }]);
 });
 
+test('uninstallRelay still tears down after the node lost its relay role', async () => {
+    const models = createModels({
+        nodes: [{ ...RELAY, cascadeRole: 'bridge' }],
+        states: [STATE],
+    });
+    let script;
+    const service = createService({
+        nodeSSHFactory: () => ({
+            exec: async command => {
+                script = command;
+                return { code: 0, stdout: 'TEARDOWN_OK\n' };
+            },
+            disconnect: () => {},
+        }),
+    }, models);
+
+    const result = await service.uninstallRelay('relay-1');
+
+    assert.equal(result.ok, true);
+    assert.ok(script, 'teardown script must run on the re-roled node');
+});
+
 test('uninstallRelay runs the teardown over SSH and resets the desired state', async () => {
     const models = createModels({ nodes: [RELAY], states: [STATE] });
     let script;
