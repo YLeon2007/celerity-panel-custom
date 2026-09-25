@@ -4,6 +4,10 @@ const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const moduleEntry = require('./relay-l2tp');
 const { compileTopology } = require('./relay-l2tp/domain/topologyCompiler');
+const {
+    computeTopologyDomains,
+    domainOfNode,
+} = require('./relay-l2tp/domain/topologyDomains');
 const { L2tpStateRepository, createL2tpServiceRepositoryAdapters } = require('./relay-l2tp/repositories/l2tpStateRepository');
 const { createPanelOverviewLoader } = require('./relay-l2tp/routes/panelOverview');
 const { createL2tpExecutionRuntime } = require('./relay-l2tp/runtime/createL2tpExecutionRuntime');
@@ -102,13 +106,27 @@ function createL2tpPanelHost({
     // paths are rebuilt for the relay). Deploy automatically right after a
     // successful install so relay ingress listeners appear without a manual
     // chain sync. Late-bound: the topology runtime is created below.
-    const deployTopologyAfterInstall = async () => {
+    // Multi-domain graphs: the deploy is scoped to the relay's own domain.
+    const deployTopologyAfterInstall = async ({ node } = {}) => {
         const service = topologyDeploymentService;
         if (!service || typeof service.deploy !== 'function') return;
         if (typeof adapters.stateRepository?.getTopologyRevision !== 'function') return;
         const revision = await adapters.stateRepository.getTopologyRevision();
         if (!Number.isSafeInteger(revision) || revision < 0) return;
-        await service.deploy({ expectedTopologyRevision: revision });
+        let domainKey;
+        const nodeId = node === null || node === undefined ? null : String(node?._id ?? node);
+        if (nodeId) {
+            const [nodes, links] = await Promise.all([
+                injectedHyNode.find({}).select('_id name cascadeRole').lean(),
+                injectedCascadeLink.find({}).select('_id portalNode bridgeNode').lean(),
+            ]);
+            const domains = computeTopologyDomains({ nodes, links });
+            domainKey = domainOfNode(domains, nodeId)?.key;
+        }
+        await service.deploy({
+            expectedTopologyRevision: revision,
+            ...(domainKey === undefined ? {} : { domainKey }),
+        });
     };
 
     const executionRuntime = createExecutionRuntime({
