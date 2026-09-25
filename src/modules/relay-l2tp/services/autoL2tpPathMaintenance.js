@@ -10,13 +10,17 @@
 
 const { buildDefaultChainLinkIds } = require('../domain/defaultChainPath');
 
-function entityId(value) {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'string') return value;
-    if (typeof value === 'object' && (value._id !== undefined || value.id !== undefined)) {
-        return entityId(value._id ?? value.id);
+function entityId(entity) {
+    if (!entity) return '';
+    if (typeof entity === 'string') return entity;
+    if (typeof entity === 'object') {
+        // bson ObjectId exposes a self-referencing `_id` getter — stringify
+        // it before the generic `_id`/`id` branches to avoid recursion.
+        if (typeof entity.toHexString === 'function') return entity.toHexString();
+        if (entity._id !== undefined && entity._id !== entity) return entityId(entity._id);
+        if (entity.id !== undefined && entity.id !== entity) return entityId(entity.id);
     }
-    return String(value);
+    return String(entity);
 }
 
 function samePaths(groupPaths, wanted) {

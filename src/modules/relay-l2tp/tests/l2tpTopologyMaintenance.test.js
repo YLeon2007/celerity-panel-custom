@@ -46,6 +46,20 @@ test('default chain walk detects loops', () => {
     );
 });
 
+test('default chain walk handles bson ObjectId-shaped ids without recursion', () => {
+    const oid = hex => ({
+        _id: undefined,
+        toHexString: () => hex,
+        toString: () => hex,
+    });
+    const links = [{ _id: oid('l1'), portalNode: oid('relay-1'), bridgeNode: oid('bridge-1') }];
+    const byId = new Map(NODES.map(node => [node._id, node]));
+    assert.deepEqual(
+        buildDefaultChainLinkIds({ links, nodesById: byId, startNodeId: 'relay-1' }),
+        ['l1'],
+    );
+});
+
 function maintenanceModels({ links, groupPaths }) {
     const group = { _id: 'group-a', paths: groupPaths };
     const writes = [];
