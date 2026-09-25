@@ -1205,6 +1205,14 @@ function generateBridgeConfig(link, portalNode) {
                     outboundTag: 'tunnel',
                 },
                 {
+                    // Bridge hosts have no working IPv6 egress; reject IPv6
+                    // targets instantly (blackhole closes the connection) so
+                    // dual-stack clients fall back to IPv4 instead of hanging.
+                    type: 'field',
+                    ip: ['::/0'],
+                    outboundTag: 'blackhole',
+                },
+                {
                     type: 'field',
                     inboundTag: ['bridge'],
                     outboundTag: 'freedom',
@@ -1301,6 +1309,15 @@ function generateCombinedBridgeConfig(links, options = {}) {
             }
         );
     }
+
+    // No working IPv6 egress on bridge hosts: reject IPv6 targets instantly
+    // (blackhole closes the connection) so dual-stack clients fall back to
+    // IPv4 instead of hanging until timeout.
+    config.routing.rules.push({
+        type: 'field',
+        ip: ['::/0'],
+        outboundTag: 'blackhole',
+    });
 
     config.routing.rules.push({
         type: 'field',
@@ -1508,6 +1525,15 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
     // Per-path cascade ingress: loopback socks listeners that let the local
     // L2TP tproxy fragment inject traffic into the selected path's egress.
     applyCascadePathIngress(config, cascadePathIngress);
+
+    // No working IPv6 egress at the chain tail: reject IPv6 targets instantly
+    // (blackhole closes the connection) so dual-stack clients fall back to
+    // IPv4 instead of hanging until timeout.
+    config.routing.rules.push({
+        type: 'field',
+        ip: ['::/0'],
+        outboundTag: 'blackhole',
+    });
 
     // LAST: Blackhole for private IPs
     config.routing.rules.push({
