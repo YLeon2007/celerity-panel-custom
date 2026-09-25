@@ -11,6 +11,7 @@ const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel
 const {
     createTopologyDraftWriteService,
 } = require('../modules/relay-l2tp/services/topologyDraftWriteService');
+const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2tpPathMaintenance');
 const logger = require('../utils/logger');
 const { requireScope } = require('../middleware/auth');
 
@@ -217,6 +218,25 @@ function createCascadeLinksRouter({
             }
         }
     };
+    // Link create/update/delete can strand the L2TP auto route-group path
+    // (deletions strip paths that used the removed link). Rebuild the path
+    // from the live graph so installed L2TP relays heal on the next topology
+    // sync instead of requiring a reinstall. Best-effort: never fails the
+    // link mutation itself.
+    const maintainL2tpPaths = async () => {
+        try {
+            await maintainAutoL2tpPaths({
+                HyNode: Node,
+                CascadeLink: Link,
+                CascadeRouteGroup: RouteGroup,
+                RelayL2tpState: RelayState,
+                CascadeTopologyState: TopologyState,
+                logger,
+            });
+        } catch (error) {
+            logger.warn(`[Cascade Links API] L2TP auto path maintenance failed: ${error.message}`);
+        }
+    };
 
     router.get('/', requireScope('nodes:read'), async (req, res) => {
         try {
@@ -408,6 +428,7 @@ function createCascadeLinksRouter({
                 link,
             });
             await invalidateCaches();
+            await maintainL2tpPaths();
             logger.info(
                 `[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`,
             );
@@ -559,6 +580,7 @@ function createCascadeLinksRouter({
                 changes,
             });
             await invalidateCaches();
+            await maintainL2tpPaths();
             logger.info(`[Cascade Links API] Updated link ${req.params.id}`);
             return res.json(await readLinkSnapshot({
                 Link,
@@ -585,6 +607,7 @@ function createCascadeLinksRouter({
                 linkId: req.params.id,
             });
             await invalidateCaches();
+            await maintainL2tpPaths();
             logger.info(`[Cascade Links API] Deleted link ${req.params.id}`);
             return res.json(await readLinkSnapshot({
                 Link,

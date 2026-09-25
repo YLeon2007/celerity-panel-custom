@@ -127,6 +127,17 @@ if ! "$nft_path" -c -f "$CANDIDATE_PATH" >/dev/null 2>&1; then
     exit 65
 fi
 
+teardown_stale_namespace() {
+    # Leftovers of a previous install whose marker is gone or whose live
+    # state diverged (partial teardown, manual intervention, rolled-back
+    # operation). The table name, rule priority and route-table id belong to
+    # this module, so clearing them makes re-install idempotent instead of
+    # failing with NFT_NAMESPACE_CONFLICT / FIREWALL_STATE_MISMATCH.
+    "$nft_path" delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+    "$ip_path" -4 rule del priority "$RULE_PRIORITY" >/dev/null 2>&1 || true
+    "$ip_path" -4 route flush table "$route_table" >/dev/null 2>&1 || true
+}
+
 if [[ -e "$MARKER_PATH" ]]; then
     if [[ ! -f "$MARKER_PATH" || -L "$MARKER_PATH" ]]; then
         emit_error 'FIREWALL_STATE_INVALID'
@@ -157,20 +168,21 @@ PY
         emit_error 'FIREWALL_STATE_INVALID'
         exit 66
     }
-    if [[ "$marker_values" != "$fwmark $route_table $RULE_PRIORITY" ]] \
-        || ! "$nft_path" list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 \
-        || ! "$ip_path" -4 rule show priority "$RULE_PRIORITY" >/dev/null 2>&1 \
-        || ! "$ip_path" -4 route show table "$route_table" type local >/dev/null 2>&1; then
-        emit_error 'FIREWALL_STATE_MISMATCH'
-        exit 70
+    if [[ "$marker_values" == "$fwmark $route_table $RULE_PRIORITY" ]] \
+        && "$nft_path" list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 \
+        && "$ip_path" -4 rule show priority "$RULE_PRIORITY" >/dev/null 2>&1 \
+        && "$ip_path" -4 route show table "$route_table" type local >/dev/null 2>&1; then
+        printf '%s\n' '{"status":"ok","namespace":"celerity_l2tp","changed":0}'
+        exit 0
     fi
-    printf '%s\n' '{"status":"ok","namespace":"celerity_l2tp","changed":0}'
-    exit 0
+    teardown_stale_namespace
+    rm -f "$MARKER_PATH"
 fi
 
-if "$nft_path" list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
-    emit_error 'NFT_NAMESPACE_CONFLICT'
-    exit 73
+if "$nft_path" list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 \
+    || "$ip_path" -4 rule show priority "$RULE_PRIORITY" >/dev/null 2>&1; then
+    # Stale namespace without a usable marker: clear it and apply fresh.
+    teardown_stale_namespace
 fi
 if ! "$nft_path" -f "$CANDIDATE_PATH" >/dev/null 2>&1; then
     emit_error 'NFT_APPLY_FAILED'

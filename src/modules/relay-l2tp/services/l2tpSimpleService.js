@@ -1,6 +1,10 @@
 'use strict';
 
 const { createHash, randomBytes } = require('node:crypto');
+const {
+    DefaultChainPathError,
+    buildDefaultChainLinkIds,
+} = require('../domain/defaultChainPath');
 
 // Simplified, opinionated facade over the L2TP relay machinery: the panel
 // page only exposes install/uninstall per relay, a revealed per-relay PSK
@@ -376,43 +380,16 @@ class L2tpSimpleService {
             );
         }
         const links = await this.CascadeLink.find({}).lean();
-        const byPortal = new Map();
-        for (const link of links || []) {
-            const portal = entityId(link.portalNode);
-            if (!byPortal.has(portal)) byPortal.set(portal, []);
-            byPortal.get(portal).push(link);
-        }
-        const ordered = [];
-        let current = String(nodeId);
-        const visited = new Set([current]);
-        for (let hop = 0; hop < MAX_GROUP_WALK_HOPS; hop += 1) {
-            const candidates = byPortal.get(current) ?? [];
-            if (candidates.length === 0) break;
-            let link = candidates[0];
-            if (candidates.length > 1) {
-                // Geo-routing links are side branches off the main chain: the
-                // automatic L2TP path always follows the default (non-geo) hop.
-                const mainHops = candidates.filter(candidate => candidate?.geoRouting?.enabled !== true);
-                if (mainHops.length === 1) {
-                    link = mainHops[0];
-                } else {
-                    throw simpleError(
-                        'ROUTE_GROUP_AMBIGUOUS',
-                        'Automatic L2TP route group creation needs a linear cascade chain',
-                    );
-                }
+        const nodes = await this.HyNode.find({}).select('_id cascadeRole').lean();
+        const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
+        let ordered;
+        try {
+            ordered = buildDefaultChainLinkIds({ links, nodesById, startNodeId: nodeId, maxHops: MAX_GROUP_WALK_HOPS });
+        } catch (error) {
+            if (error instanceof DefaultChainPathError) {
+                throw simpleError(error.code, error.message);
             }
-            ordered.push(link._id);
-            current = entityId(link.bridgeNode);
-            if (visited.has(current)) {
-                throw simpleError(
-                    'ROUTE_GROUP_AMBIGUOUS',
-                    'Automatic L2TP route group creation detected a cascade loop',
-                );
-            }
-            visited.add(current);
-            const nextNode = await this.HyNode.findById(current).lean();
-            if (nodeRole(nextNode) === 'bridge') break;
+            throw error;
         }
         if (ordered.length === 0) {
             throw simpleError(

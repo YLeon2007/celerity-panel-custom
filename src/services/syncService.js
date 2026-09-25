@@ -15,6 +15,8 @@
 const HyUser = require('../models/hyUserModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
+const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+const { mergePreservedL2tpConfig } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
@@ -544,6 +546,29 @@ class SyncService {
                     }
                 } catch (cascadeErr) {
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
+                }
+
+                // L2TP relays: the regenerated base config has no L2TP-managed
+                // sections (tproxy inbound, path socks outbound, their rules).
+                // Re-attach them from the live config so a plain node sync does
+                // not strand L2TP clients until a reinstall.
+                try {
+                    const hasInstalledL2tp = await RelayL2tpState.exists({
+                        node: node._id,
+                        desiredState: 'installed',
+                    });
+                    if (hasInstalledL2tp) {
+                        const current = await ssh.exec('cat /usr/local/etc/xray/config.json 2>/dev/null || true');
+                        if (current?.stdout) {
+                            const merged = mergePreservedL2tpConfig(configContent, current.stdout);
+                            if (merged !== configContent) {
+                                logger.info(`[Xray Sync] Node ${node.name}: preserved L2TP-managed Xray sections`);
+                            }
+                            configContent = merged;
+                        }
+                    }
+                } catch (l2tpErr) {
+                    logger.warn(`[Xray Sync] Node ${node.name}: L2TP section preservation skipped: ${l2tpErr.message}`);
                 }
 
                 // When access logging is enabled, the log directory must exist
