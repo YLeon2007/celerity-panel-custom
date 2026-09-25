@@ -155,6 +155,18 @@ Unit + integration (стенд 212.119.42.100):
 
 ## 8. Оценка
 
+### Статус реализации (2026-09-26, день 1 — ядро готово)
+
+- [x] Домены: `domain/topologyDomains.js` (connected components, авто-имена «Порталы X, Y → бриджи Z»), 26fc684.
+- [x] Fan-in в composer'е: `orderedFanInChain` (источники=порталы, ≤1 исходящий non-geo на узел, общий сток=дефолт-бридж, geo-ветки только с общего транка `GEO_LEAF_SOURCE_NOT_COMMON_TRUNK`), refs `portal-1..N` (одиночная цепочка сохраняет `portal` — совместимость), forward-only (reverse+fan-in отклоняется `FAN_IN_REVERSE_UNSUPPORTED`), 1dadc61. Линейный путь `orderedChain` не изменён.
+- [x] Per-domain состояние и деплой: `CascadeTopologyState` документы `domain:<key>`, `deploy({domainKey})`, `sliceTopologyToDomain`, ошибки `TOPOLOGY_DOMAIN_REQUIRED/NOT_FOUND`, 31766ac.
+- [x] L2TP: авто-деплой после install скоуплен по домену релея (f87b7c1); `buildDefaultChainLinkIds` домен-локален по конструкции.
+- [x] API/UI: `domainKey` в `POST /api/cascade/topology/deploy`, `GET /api/cascade/topology/domains`; `network.js` выводит домен из контекста линка автоматически (селектор не потребовался), 9e21cee.
+- [x] Тесты: 657/657 relay-l2tp + routes, npm test зелёный; новые: domains 3, fan-in composer 6, domain deploy 4, route /domains 1.
+- [x] Тестовый контур 212.119.42.100 на ветке `feature/topology-domains` (health 200, логи чистые).
+- [ ] Стендовая приёмка fan-in: ждёт 1–2 дополнительные портальные ноды на тесте.
+- [ ] Деплой-зависимые ограничения: per-domain draft-скоуп в редакторе (draft остаётся общим, валидация формы — на деплое) и группировка/legacy-метки на карте — следующая итерация UI.
+
 - Разработка: 3–5 рабочих дней (валидатор/композер — самая объёмная часть;
   UI-селектор домена; per-domain состояние; тесты).
 - Стендовая приёмка: 0,5–1 день.
