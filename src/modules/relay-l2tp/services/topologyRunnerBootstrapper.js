@@ -41,10 +41,12 @@ const CLEANUP_COMMAND = Object.freeze(
 // parent (e.g. /usr/local/etc/xray-bridge) to exist as a real directory,
 // and commit/verify drive the xray-bridge.service unit. Fresh relay nodes
 // only have the main xray profile, so ensure the dirs and the unit upfront.
+// The unit content is static: always rewrite it so a stale or corrupted
+// unit (e.g. written by an older printf %s revision with literal '\n'
+// sequences) self-heals on the next bootstrap instead of lingering forever.
 const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze([
     '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge',
-    '&& if /usr/bin/test ! -f /etc/systemd/system/xray-bridge.service; then',
-    `/usr/bin/printf '%b\\n' '${[
+    `&& /usr/bin/printf '%b\\n' '${[
         '[Unit]',
         'Description=Xray Bridge (Cascade Tunnel)',
         'After=network.target nss-lookup.target',
@@ -64,7 +66,7 @@ const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze([
         'WantedBy=multi-user.target',
         '',
     ].join('\\n')}' > /etc/systemd/system/xray-bridge.service`,
-    '&& /usr/bin/systemctl daemon-reload; fi',
+    '&& /usr/bin/systemctl daemon-reload',
 ].join(' '));
 
 /**
