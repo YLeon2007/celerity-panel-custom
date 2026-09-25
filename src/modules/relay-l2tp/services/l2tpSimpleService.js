@@ -757,11 +757,24 @@ class L2tpSimpleService {
         for (const user of users) {
             const nodeId = entityId(user.relayNode);
             if (installedNodes.has(nodeId)) {
-                const deleted = await this.userManagementService.deleteUser(
-                    nodeId,
-                    entityId(user._id),
-                );
-                results.push({ nodeId, deleted: true, syncOperationId: deleted.syncOperationId });
+                try {
+                    const deleted = await this.userManagementService.deleteUser(
+                        nodeId,
+                        entityId(user._id),
+                    );
+                    results.push({ nodeId, deleted: true, syncOperationId: deleted.syncOperationId });
+                } catch (error) {
+                    // The pinned node may have been re-roled (relay → bridge)
+                    // or removed while the account record remained. An orphan
+                    // must still be deletable; purge the record instead of
+                    // blocking on the stale role check.
+                    if (error?.code === 'NODE_NOT_RELAY' || error?.code === 'NODE_NOT_FOUND') {
+                        await this.L2tpUser.deleteOne({ _id: user._id });
+                        results.push({ nodeId, deleted: true, orphaned: true });
+                        continue;
+                    }
+                    throw error;
+                }
             } else {
                 await this.L2tpUser.deleteOne({ _id: user._id });
                 results.push({ nodeId, deleted: true });

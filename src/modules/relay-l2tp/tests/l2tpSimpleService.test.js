@@ -569,6 +569,34 @@ test('deleteAccount queues sync on installed relays and purges stale records els
     assert.equal(result.results.length, 2);
 });
 
+test('deleteAccount purges the record when the pinned node lost its relay role', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        states: [STATE],
+        users: [{ _id: 'u1', relayNode: 'relay-1', login: 'bob', ip: '10.255.30.10' }],
+    });
+    const service = createService({
+        userManagementService: {
+            createUser: async () => ({}),
+            deleteUser: async () => {
+                const error = new Error('L2TP users can only be managed for relay nodes');
+                error.code = 'NODE_NOT_RELAY';
+                throw error;
+            },
+            importUser: async () => ({}),
+        },
+    }, models);
+
+    const result = await service.deleteAccount('bob');
+
+    assert.equal(
+        models.L2tpUser._store.some(user => user._id === 'u1'),
+        false,
+        'orphaned account record must be purged',
+    );
+    assert.deepEqual(result.results, [{ nodeId: 'relay-1', deleted: true, orphaned: true }]);
+});
+
 test('uninstallRelay runs the teardown over SSH and resets the desired state', async () => {
     const models = createModels({ nodes: [RELAY], states: [STATE] });
     let script;
