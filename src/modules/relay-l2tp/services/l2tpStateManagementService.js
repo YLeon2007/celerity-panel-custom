@@ -180,11 +180,13 @@ function validateDesiredInput(input) {
 
 function validatePskRequest(input) {
     const generatePsk = input.generatePsk === true;
+    const reusePsk = input.reusePsk === true;
     const hasPsk = typeof input.psk === 'string';
-    if (generatePsk === hasPsk) {
+    const sources = (generatePsk ? 1 : 0) + (reusePsk ? 1 : 0) + (hasPsk ? 1 : 0);
+    if (sources !== 1) {
         throw validationError(
             'PSK_SOURCE_REQUIRED',
-            'Provide exactly one PSK source: psk or generatePsk',
+            'Provide exactly one PSK source: psk, generatePsk or reusePsk',
             'psk',
         );
     }
@@ -271,9 +273,29 @@ class L2tpStateManagementService {
             );
         }
 
-        const psk = input.generatePsk === true
-            ? this.randomBytes(GENERATED_PSK_BYTES).toString('base64url')
-            : input.psk;
+        // reusePsk keeps the credential already stored for this relay so a
+        // reinstall (e.g. after a topology rebuild) does not silently rotate
+        // the IPsec PSK and strand every L2TP client. Falls back to a fresh
+        // PSK when the relay has none yet.
+        let psk;
+        if (input.reusePsk === true) {
+            const existing = await this.repository.findExecutionStateByNodeId(selectedNodeId);
+            if (existing?.pskEncrypted) {
+                try {
+                    psk = this.secretBox.decrypt(existing.pskEncrypted, this.secretKey);
+                } catch {
+                    throw new L2tpStateManagementError(
+                        'PSK_DECRYPTION_FAILED',
+                        'The stored L2TP PSK could not be decrypted',
+                    );
+                }
+            }
+        }
+        if (typeof psk !== 'string') {
+            psk = input.generatePsk === true || input.reusePsk === true
+                ? this.randomBytes(GENERATED_PSK_BYTES).toString('base64url')
+                : input.psk;
+        }
         let pskEncrypted;
         try {
             pskEncrypted = this.secretBox.encrypt(psk, this.secretKey);

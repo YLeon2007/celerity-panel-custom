@@ -475,6 +475,8 @@ class L2tpSimpleService {
             // Fresh relay or one whose state was reset by uninstall. Reuse the
             // network layout already assigned to this relay (the state record
             // survives uninstall) so existing accounts keep their pinned IPs.
+            // The stored PSK is reused too — rotating it on every reinstall
+            // silently strands MikroTik clients (IKE phase-1 decrypt errors).
             // For a truly fresh state, prefer the subnet of accounts that
             // already exist for this relay before picking a new octet.
             const input = state?.clientCidr
@@ -488,7 +490,7 @@ class L2tpSimpleService {
                     fwmark: state.fwmark,
                     routeTable: state.routeTable,
                     routeGroupId,
-                    generatePsk: true,
+                    reusePsk: true,
                 }
                 : autoDesiredInput(
                     selectedNodeId,
@@ -511,7 +513,7 @@ class L2tpSimpleService {
                 fwmark: state.fwmark,
                 routeTable: state.routeTable,
                 routeGroupId,
-                generatePsk: true,
+                reusePsk: true,
             });
         }
 

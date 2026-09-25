@@ -320,7 +320,8 @@ test('installRelay reconfigures a state reset by uninstall before installing', a
 
     assert.deepEqual(result, { operationId: 'op-reinstall' });
     assert.equal(calls.configure.length, 1);
-    assert.equal(calls.configure[0].input.generatePsk, true);
+    assert.equal(calls.configure[0].input.reusePsk, true,
+        'reinstall reuses the stored PSK instead of rotating it');
     assert.equal(
         calls.configure[0].input.clientCidr,
         STATE.clientCidr,
@@ -620,6 +621,37 @@ test('overview drops re-roled nodes once their L2TP state is uninstalled', async
     const nodes = await service.listRelayNodes();
 
     assert.deepEqual(nodes, [], 'uninstalled re-roled nodes must leave the list');
+});
+
+test('installRelay reuses the stored PSK instead of rotating it on reinstall', async () => {
+    const models = createModels({
+        nodes: [RELAY],
+        // State left behind by uninstall: layout survives, desired is not_installed.
+        states: [{ ...STATE, desiredState: 'not_installed', status: 'not_installed' }],
+        groups: [{ _id: 'group-a', name: 'g', paths: [] }],
+    });
+    const calls = { configure: [], install: [] };
+    const service = createService({
+        stateManagementService: {
+            configureRelay: async (nodeId, input) => {
+                calls.configure.push({ nodeId, input });
+            },
+        },
+        l2tpService: {
+            install: async (nodeId, options) => {
+                calls.install.push({ nodeId, options });
+                return { operationId: 'op-1' };
+            },
+        },
+    }, models);
+
+    await service.installRelay(RELAY._id);
+
+    assert.equal(calls.configure.length, 1, 'layout reuse must reconfigure desired state');
+    assert.equal(calls.configure[0].input.reusePsk, true,
+        'reinstall must keep the stored PSK so clients are not stranded');
+    assert.equal(calls.configure[0].input.generatePsk, undefined,
+        'reinstall must not rotate the PSK');
 });
 
 test('uninstallRelay still tears down after the node lost its relay role', async () => {

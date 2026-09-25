@@ -153,6 +153,76 @@ test('configureRelay generates a high-entropy PSK server-side without exposing i
     assert.doesNotMatch(JSON.stringify(result), /psk|generated-envelope|q6urq6/i);
 });
 
+test('configureRelay reusePsk keeps the stored PSK instead of rotating it', async () => {
+    const calls = [];
+    const repository = {
+        async findNodeById() { return { _id: 'relay-1', cascadeRole: 'relay' }; },
+        async findRouteGroupById() { return { _id: 'group-a' }; },
+        async findExecutionStateByNodeId() {
+            return { node: 'relay-1', pskEncrypted: 'stored-envelope' };
+        },
+        async configureRelay(fields) {
+            calls.push({ method: 'configureRelay', fields });
+            return { ...fields, secretRevision: 2 };
+        },
+    };
+    const secretBox = {
+        encrypt(plaintext) {
+            calls.push({ method: 'encrypt', plaintext });
+            return 'reencrypted-envelope';
+        },
+        decrypt(envelope) {
+            calls.push({ method: 'decrypt', envelope });
+            return 'stored-psk-plain';
+        },
+    };
+    const randomBytes = () => { throw new Error('reusePsk must not generate'); };
+    const service = new L2tpStateManagementService({
+        repository,
+        secretBox,
+        secretKey: SECRET_KEY,
+        randomBytes,
+    });
+
+    await service.configureRelay('relay-1', validInput({ psk: undefined, reusePsk: true }));
+
+    assert.deepEqual(calls.map(c => c.method), ['decrypt', 'encrypt', 'configureRelay']);
+    assert.equal(calls[0].envelope, 'stored-envelope');
+    assert.equal(calls[1].plaintext, 'stored-psk-plain');
+    assert.equal(calls[2].fields.pskEncrypted, 'reencrypted-envelope');
+});
+
+test('configureRelay reusePsk falls back to a fresh PSK when none is stored', async () => {
+    const calls = [];
+    const repository = {
+        async findNodeById() { return { _id: 'relay-1', cascadeRole: 'relay' }; },
+        async findRouteGroupById() { return { _id: 'group-a' }; },
+        async findExecutionStateByNodeId() { return null; },
+        async configureRelay(fields) {
+            calls.push({ method: 'configureRelay', fields });
+            return { ...fields, secretRevision: 1 };
+        },
+    };
+    const secretBox = {
+        encrypt(plaintext) {
+            calls.push({ method: 'encrypt', plaintext });
+            return 'fresh-envelope';
+        },
+        decrypt() { throw new Error('nothing to decrypt'); },
+    };
+    const service = new L2tpStateManagementService({
+        repository,
+        secretBox,
+        secretKey: SECRET_KEY,
+        randomBytes: size => Buffer.alloc(size, 0xcd),
+    });
+
+    await service.configureRelay('relay-1', validInput({ psk: undefined, reusePsk: true }));
+
+    assert.deepEqual(calls.map(c => c.method), ['encrypt', 'configureRelay']);
+    assert.equal(calls[1].fields.pskEncrypted, 'fresh-envelope');
+});
+
 test('resolveOperationSecrets decrypts only the matching installed relay PSK in memory', async () => {
     const calls = [];
     const repository = {
