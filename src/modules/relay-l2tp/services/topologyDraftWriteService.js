@@ -147,8 +147,9 @@ class TopologyDraftWriteService {
 }
 
 // Mirrors cascadeService._updateNodeRoles: a node's cascade role derives
-// from the links it participates in; nodes without links are standalone
-// and drop out of the deployable topology.
+// from the links it participates in. Deleting links never downgrades a node
+// to standalone — roles are operator state and stay until reassigned
+// explicitly or by a new link.
 async function recalculateNodeRoles(HyNode, CascadeLink) {
     const links = await CascadeLink.find({ active: true }).lean();
     const portalSet = new Set(links.map(link => String(link.portalNode)));
@@ -161,7 +162,7 @@ async function recalculateNodeRoles(HyNode, CascadeLink) {
         const id = String(node._id);
         const isPortal = portalSet.has(id);
         const isBridge = bridgeSet.has(id);
-        let role = 'standalone';
+        let role = node.cascadeRole || 'standalone';
         if (isPortal && isBridge) role = 'relay';
         else if (isPortal) role = 'portal';
         else if (isBridge) role = 'bridge';
@@ -213,4 +214,5 @@ module.exports = {
     createTopologyDraftWriteService,
     TopologyDraftWriteError,
     TopologyDraftWriteService,
+    recalculateNodeRoles,
 };

@@ -1015,6 +1015,8 @@ class CascadeService {
 
     /**
      * Recalculate cascadeRole for all nodes based on their active links.
+     * Nodes without links keep their current role — deleting a chain must
+     * not silently downgrade every node to standalone.
      */
     async _updateNodeRoles() {
         const links = await CascadeLink.find({ active: true }).lean();
@@ -1030,7 +1032,7 @@ class CascadeService {
             const isPortal = portalSet.has(id);
             const isBridge = bridgeSet.has(id);
 
-            let role = 'standalone';
+            let role = node.cascadeRole || 'standalone';
             if (isPortal && isBridge) role = 'relay';
             else if (isPortal) role = 'portal';
             else if (isBridge) role = 'bridge';

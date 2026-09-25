@@ -6,6 +6,7 @@ const test = require('node:test');
 const {
     createTopologyDraftWriteService,
     TopologyDraftWriteService,
+    recalculateNodeRoles,
 } = require('../services/topologyDraftWriteService');
 
 function validSnapshot() {
@@ -221,6 +222,27 @@ test('keeps an active route group when link deletion empties its paths', async (
 
     assert.equal(preparedCandidate.groups.length, 1);
     assert.deepEqual(preparedCandidate.groups[0].paths, []);
+});
+
+test('link deletion never downgrades nodes to standalone', async () => {
+    const writes = [];
+    const HyNode = {
+        find: () => ({
+            select: () => ({
+                lean: async () => [
+                    { _id: 'portal-1', cascadeRole: 'portal' },
+                    { _id: 'relay-1', cascadeRole: 'relay' },
+                    { _id: 'bridge-1', cascadeRole: 'bridge' },
+                ],
+            }),
+        }),
+        bulkWrite: async ops => { writes.push(...ops); },
+    };
+    const CascadeLink = { find: () => ({ lean: async () => [] }) };
+
+    await recalculateNodeRoles(HyNode, CascadeLink);
+
+    assert.deepEqual(writes, [], 'nodes without links keep their assigned roles');
 });
 
 test('recalculates cascade roles after link mutations only', async () => {
