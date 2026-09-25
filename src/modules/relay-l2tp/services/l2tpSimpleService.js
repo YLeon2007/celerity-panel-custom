@@ -279,7 +279,8 @@ class L2tpSimpleService {
         // Nodes re-roled away from relay (e.g. after a topology rebuild) keep
         // their installed L2TP state and must stay listed so the operator can
         // still uninstall them.
-        const states = await this.listStates();
+        const states = (await this.listStates())
+            .filter(state => state.status === 'installed' || state.desiredState === 'installed');
         const known = new Set(relays.map(node => entityId(node._id)));
         const orphanedIds = (states || [])
             .map(state => entityId(state.node))

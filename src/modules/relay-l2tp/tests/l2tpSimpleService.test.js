@@ -610,6 +610,18 @@ test('overview keeps listing re-roled nodes that still hold L2TP state', async (
         'a node with installed L2TP state stays manageable after re-role');
 });
 
+test('overview drops re-roled nodes once their L2TP state is uninstalled', async () => {
+    const models = createModels({
+        nodes: [{ ...RELAY, cascadeRole: 'bridge' }],
+        states: [{ ...STATE, status: 'not_installed', desiredState: 'not_installed' }],
+    });
+    const service = createService({}, models);
+
+    const nodes = await service.listRelayNodes();
+
+    assert.deepEqual(nodes, [], 'uninstalled re-roled nodes must leave the list');
+});
+
 test('uninstallRelay still tears down after the node lost its relay role', async () => {
     const models = createModels({
         nodes: [{ ...RELAY, cascadeRole: 'bridge' }],
