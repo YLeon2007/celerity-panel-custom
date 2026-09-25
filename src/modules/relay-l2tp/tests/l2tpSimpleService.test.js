@@ -597,6 +597,19 @@ test('deleteAccount purges the record when the pinned node lost its relay role',
     assert.deepEqual(result.results, [{ nodeId: 'relay-1', deleted: true, orphaned: true }]);
 });
 
+test('overview keeps listing re-roled nodes that still hold L2TP state', async () => {
+    const models = createModels({
+        nodes: [{ ...RELAY, cascadeRole: 'bridge' }],
+        states: [STATE],
+    });
+    const service = createService({}, models);
+
+    const nodes = await service.listRelayNodes();
+
+    assert.deepEqual(nodes.map(node => String(node._id)), ['relay-1'],
+        'a node with installed L2TP state stays manageable after re-role');
+});
+
 test('uninstallRelay still tears down after the node lost its relay role', async () => {
     const models = createModels({
         nodes: [{ ...RELAY, cascadeRole: 'bridge' }],

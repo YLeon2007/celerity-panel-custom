@@ -275,7 +275,23 @@ class L2tpSimpleService {
 
     async listRelayNodes() {
         const nodes = await this.HyNode.find({ cascadeRole: 'relay' }).lean();
-        return (nodes || []).filter(node => nodeRole(node) === 'relay');
+        const relays = (nodes || []).filter(node => nodeRole(node) === 'relay');
+        // Nodes re-roled away from relay (e.g. after a topology rebuild) keep
+        // their installed L2TP state and must stay listed so the operator can
+        // still uninstall them.
+        const states = await this.listStates();
+        const known = new Set(relays.map(node => entityId(node._id)));
+        const orphanedIds = (states || [])
+            .map(state => entityId(state.node))
+            .filter(nodeId => nodeId && !known.has(nodeId));
+        if (orphanedIds.length > 0) {
+            const orphans = await this.HyNode.find({ _id: { $in: orphanedIds } }).lean();
+            for (const node of orphans || []) {
+                relays.push(node);
+                known.add(entityId(node._id));
+            }
+        }
+        return relays;
     }
 
     async listAccounts() {
