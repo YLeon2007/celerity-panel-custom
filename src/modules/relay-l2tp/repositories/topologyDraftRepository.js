@@ -23,7 +23,7 @@ const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
     ]),
 });
 const NODE_SELECT = '_id cascadeRole';
-const LINK_SELECT = '_id portalNode bridgeNode mode active';
+const LINK_SELECT = '_id portalNode bridgeNode mode active geoRouting.enabled';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
