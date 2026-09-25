@@ -15,6 +15,9 @@ const NodeOperationLock = require('../modules/relay-l2tp/models/nodeOperationLoc
 const {
     requirePanelCsrf,
 } = require('./panel/csrf');
+const {
+    computeTopologyDomains,
+} = require('../modules/relay-l2tp/domain/topologyDomains');
 const logger = require('../utils/logger');
 
 const DEFAULT_MODELS = Object.freeze({
@@ -39,6 +42,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['TOPOLOGY_DEPLOYMENT_FAILED', 500],
     ['TOPOLOGY_OPERATION_QUEUE_FAILED', 500],
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
+    ['TOPOLOGY_DOMAIN_REQUIRED', 409],
+    ['TOPOLOGY_DOMAIN_NOT_FOUND', 422],
 ]);
 const PUBLIC_ERROR_FIELDS = Object.freeze([
     'operationId',
@@ -49,6 +54,8 @@ const PUBLIC_ERROR_FIELDS = Object.freeze([
     'rolledBackNodeIds',
     'rollbackFailedNodeIds',
     'errors',
+    'domainKey',
+    'domains',
 ]);
 
 class TopologyDeployRequestError extends Error {
@@ -70,10 +77,11 @@ function normalizeDeployRequest(body) {
         );
     }
     const keys = Object.keys(body);
-    if (keys.length !== 1 || keys[0] !== 'expectedTopologyRevision') {
+    const allowedKeys = new Set(['expectedTopologyRevision', 'domainKey']);
+    if (!keys.includes('expectedTopologyRevision') || keys.some(key => !allowedKeys.has(key))) {
         throw new TopologyDeployRequestError(
             'INVALID_REQUEST',
-            'Only expectedTopologyRevision is accepted',
+            'Only expectedTopologyRevision (and optionally domainKey) is accepted',
         );
     }
     const expectedTopologyRevision = body.expectedTopologyRevision;
@@ -83,13 +91,31 @@ function normalizeDeployRequest(body) {
             'expectedTopologyRevision must be a non-negative safe integer',
         );
     }
-    return { expectedTopologyRevision };
+    let domainKey;
+    if (Object.hasOwn(body, 'domainKey')) {
+        if (typeof body.domainKey !== 'string' || body.domainKey.length === 0) {
+            throw new TopologyDeployRequestError(
+                'INVALID_REQUEST',
+                'domainKey must be a non-empty string when provided',
+            );
+        }
+        domainKey = body.domainKey;
+    }
+    return domainKey === undefined
+        ? { expectedTopologyRevision }
+        : { expectedTopologyRevision, domainKey };
 }
 
 function publicResult(result = {}) {
     const body = {};
     for (const field of ['operationId', 'topologyRevision', 'deployedRevision', 'status']) {
         if (result[field] !== undefined) body[field] = result[field];
+    }
+    if (result.domain !== undefined && result.domain !== null) {
+        body.domain = {
+            key: result.domain.key,
+            label: result.domain.label,
+        };
     }
     if (Array.isArray(result.nodeEvidence)) {
         body.nodeEvidence = result.nodeEvidence.map(evidence => {
@@ -178,8 +204,44 @@ function createCascadeTopologyDeployRouter({
 
     const router = express.Router();
     const writeScope = requireScope('nodes:write');
+    const readScope = requireScope('nodes:read');
     const sessionWriteCsrf = (req, res, next) => (
         req.apiKey ? next() : csrf(req, res, next)
+    );
+
+    router.get(
+        '/domains',
+        requireAuth,
+        readScope,
+        async (req, res) => {
+            try {
+                const [nodes, links, domainStates] = await Promise.all([
+                    models.HyNode.find({}).select('_id name role cascadeRole').lean(),
+                    models.CascadeLink.find({}).select('_id source target portalNode bridgeNode').lean(),
+                    models.CascadeTopologyState.find({ _id: /^domain:/ })
+                        .select('_id domainKey label revision deployedRevision updatedAt')
+                        .lean(),
+                ]);
+                const domains = computeTopologyDomains({ nodes, links });
+                const stateByKey = new Map(
+                    (domainStates || []).map(doc => [doc.domainKey || String(doc._id).slice('domain:'.length), doc]),
+                );
+                return res.status(200).json({
+                    domains: domains.map(domain => {
+                        const state = stateByKey.get(domain.key);
+                        return {
+                            key: domain.key,
+                            label: domain.label,
+                            nodeIds: domain.nodeIds,
+                            linkIds: domain.linkIds,
+                            deployedRevision: state?.deployedRevision ?? null,
+                        };
+                    }),
+                });
+            } catch (error) {
+                return sendError(res, error, routeLogger);
+            }
+        },
     );
 
     router.post(

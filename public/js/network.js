@@ -1105,21 +1105,38 @@
         if (el) el.remove();
     }
 
-    async function deployTopology() {
+    async function deployTopology(linkId) {
+        let domainKey;
+        if (linkId) {
+            try {
+                const domRes = await fetch('/api/cascade/topology/domains');
+                if (domRes.ok) {
+                    const domData = await domRes.json().catch(() => ({}));
+                    const domains = Array.isArray(domData.domains) ? domData.domains : [];
+                    const match = domains.find(d => Array.isArray(d.linkIds) && d.linkIds.includes(String(linkId)));
+                    if (match) domainKey = match.key;
+                }
+            } catch (err) { /* domain derivation is best-effort; server validates */ }
+        }
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
-            body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
+            body: JSON.stringify(domainKey
+                ? { expectedTopologyRevision: topologyRevision, domainKey }
+                : { expectedTopologyRevision: topologyRevision }),
         });
         const data = await res.json().catch(() => ({}));
-        if (res.status === 409) {
+        if (res.status === 409 && data?.error?.code !== 'TOPOLOGY_DOMAIN_REQUIRED') {
             await loadTopology();
         }
         if (!res.ok) {
             const errorValue = data?.error;
-            const message = typeof errorValue === 'string'
+            let message = typeof errorValue === 'string'
                 ? errorValue
                 : (errorValue?.message || errorValue?.code || ('HTTP ' + res.status));
+            if (errorValue?.code === 'TOPOLOGY_DOMAIN_REQUIRED' && Array.isArray(data.domains)) {
+                message += ' (' + data.domains.map(d => d.label || d.key).join(' | ') + ')';
+            }
             throw new Error(message);
         }
         if (!['queued', 'succeeded'].includes(data.status)) {
@@ -1143,7 +1160,7 @@
         if (edge.length) edge.data('status', 'syncing');
 
         try {
-            const result = await deployTopology();
+            const result = await deployTopology(linkId);
             showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();
@@ -1160,7 +1177,7 @@
         cy.edges().forEach(function (e) { e.data('status', 'syncing'); });
 
         try {
-            const result = await deployTopology();
+            const result = await deployTopology(linkId);
             showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();
