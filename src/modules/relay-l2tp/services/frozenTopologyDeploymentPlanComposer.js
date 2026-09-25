@@ -361,6 +361,329 @@ function topologyRefs(orderedNodes, geoLeafNodes = []) {
     return refs;
 }
 
+/**
+ * Multi-portal fan-in domain (forward mode only): several portal sources
+ * converge into a shared relay trunk that terminates at a single default
+ * bridge; geo leaves branch off nodes shared by ALL portal paths.
+ *
+ * Shape rules (validator):
+ * - every non-geo node has at most ONE non-geo outgoing link (the default
+ *   route must stay unambiguous, including for L2TP path walking);
+ * - source nodes (no non-geo incoming) must be portals; fan-in (multiple
+ *   non-geo incoming) is allowed on relays only;
+ * - all portal paths terminate at the SAME sink, which must be a bridge;
+ *   intermediate path nodes must be relays;
+ * - a geo branch source must lie on every portal path (common trunk), so
+ *   every portal can reach every geo bridge.
+ */
+function orderedFanInChain(snapshot, geoLeafLinkIds) {
+    const nodesById = uniqueById(snapshot.nodes, 'NODE');
+    const linksById = uniqueById(snapshot.links, 'LINK');
+
+    // Staged assets: roled nodes without links do not participate (same
+    // semantics as orderedChain).
+    const linkedNodeIds = new Set();
+    for (const [, link] of linksById) {
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (source) linkedNodeIds.add(source);
+        if (target) linkedNodeIds.add(target);
+    }
+    for (const id of [...nodesById.keys()]) {
+        if (!linkedNodeIds.has(id)) nodesById.delete(id);
+    }
+
+    for (const [, node] of nodesById) {
+        if (!Object.hasOwn(TARGETS_BY_ROLE, node.role)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_NODE_ROLE',
+                'Every topology node requires a supported role',
+            );
+        }
+    }
+
+    const outgoing = new Map(); // source -> entry (non-geo, unique per node)
+    const incoming = new Map(); // target -> entry[] (non-geo, fan-in allowed)
+    const geoOutgoing = new Map();
+    const geoIncoming = new Map();
+    let mode = null;
+    for (const [id, link] of linksById) {
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (!source || !target || !nodesById.has(source) || !nodesById.has(target)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_TOPOLOGY_LINK_ENDPOINT',
+                'Every topology link requires known source and target nodes',
+            );
+        }
+        if (link.mode !== 'forward' && link.mode !== 'reverse') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'UNSUPPORTED_TOPOLOGY_MODE',
+                'Topology v1 supports only forward or reverse links',
+            );
+        }
+        if (mode !== null && mode !== link.mode) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MIXED_TOPOLOGY_MODES',
+                'Topology v1 does not support mixed link modes',
+            );
+        }
+        mode = link.mode;
+        const entry = { id, link, source, target };
+        if (geoLeafLinkIds.has(id)) {
+            if (!geoOutgoing.has(source)) geoOutgoing.set(source, new Map());
+            geoOutgoing.get(source).set(id, entry);
+            if (geoIncoming.has(target) || incoming.has(target)) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'GEO_LEAF_TARGET_CONFLICT',
+                    'A geo-routing branch must terminate at its own dedicated bridge',
+                );
+            }
+            geoIncoming.set(target, entry);
+            continue;
+        }
+        if (outgoing.has(source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Each node may have only one non-geo (default) outgoing link; additional branches require geoRouting',
+            );
+        }
+        outgoing.set(source, entry);
+        if (!incoming.has(target)) incoming.set(target, []);
+        incoming.get(target).push(entry);
+    }
+
+    if (mode === 'reverse') {
+        throw new FrozenTopologyDeploymentPlanError(
+            'FAN_IN_REVERSE_UNSUPPORTED',
+            'Multi-portal fan-in domains currently support only forward links',
+        );
+    }
+
+    const sources = [...outgoing.keys()]
+        .filter(id => !incoming.has(id))
+        .sort((left, right) => left.localeCompare(right, 'en'));
+    if (sources.length < 2) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'Fan-in composition requires at least two portal source nodes',
+        );
+    }
+    for (const id of sources) {
+        if (nodesById.get(id).role !== 'portal') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Every fan-in source node must be a portal',
+            );
+        }
+    }
+
+    const portalPaths = [];
+    let sinkId = null;
+    for (const sourceId of sources) {
+        const pathLinks = [];
+        const pathNodeIds = [sourceId];
+        const seen = new Set([sourceId]);
+        let current = sourceId;
+        while (outgoing.has(current)) {
+            const entry = outgoing.get(current);
+            pathLinks.push(entry);
+            current = entry.target;
+            if (seen.has(current)) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'NON_LINEAR_TOPOLOGY',
+                    'Topology v1 requires an acyclic graph',
+                );
+            }
+            seen.add(current);
+            pathNodeIds.push(current);
+        }
+        if (sinkId === null) sinkId = current;
+        else if (sinkId !== current) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MULTIPLE_DEFAULT_EGRESS',
+                'All portal paths must terminate at the same default bridge',
+            );
+        }
+        portalPaths.push({ portalId: sourceId, nodeIds: pathNodeIds, links: pathLinks });
+    }
+
+    if (nodesById.get(sinkId).role !== 'bridge') {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'The single non-geo chain end must be a bridge',
+        );
+    }
+    for (const id of incoming.keys()) {
+        if (!outgoing.has(id) && id !== sinkId) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Only the default bridge may terminate a non-geo path',
+            );
+        }
+    }
+    for (const { nodeIds } of portalPaths) {
+        for (const id of nodeIds.slice(1, -1)) {
+            if (nodesById.get(id).role !== 'relay') {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'NON_LINEAR_TOPOLOGY',
+                    'Intermediate fan-in path nodes must be relays',
+                );
+            }
+        }
+    }
+
+    const coveredNodeIds = new Set(portalPaths.flatMap(path => path.nodeIds));
+    const commonNodeIds = new Set(portalPaths[0].nodeIds);
+    for (const path of portalPaths.slice(1)) {
+        const pathNodes = new Set(path.nodeIds);
+        for (const id of [...commonNodeIds]) {
+            if (!pathNodes.has(id)) commonNodeIds.delete(id);
+        }
+    }
+
+    const geoLeafNodes = [];
+    for (const [id, node] of nodesById) {
+        if (coveredNodeIds.has(id)) continue;
+        if (node.role !== 'bridge') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Nodes outside the main chain must be geo-routing bridges',
+            );
+        }
+        const leaf = geoIncoming.get(id);
+        if (!leaf) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Every bridge outside the main chain requires an incoming geoRouting link',
+            );
+        }
+        if (!coveredNodeIds.has(leaf.source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_SOURCE_OUTSIDE_CHAIN',
+                'A geo-routing branch must start from a main-chain node',
+            );
+        }
+        if (!commonNodeIds.has(leaf.source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_SOURCE_NOT_COMMON_TRUNK',
+                'A geo-routing branch must start from a node shared by all portal paths',
+            );
+        }
+        if (outgoing.has(id) || geoOutgoing.has(id)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'A geo-routing bridge must be a leaf (no outgoing links)',
+            );
+        }
+        geoLeafNodes.push({ id, node, link: leaf });
+    }
+    for (const [id, entry] of geoIncoming) {
+        if (!coveredNodeIds.has(entry.source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_SOURCE_OUTSIDE_CHAIN',
+                'A geo-routing branch must start from a main-chain node',
+            );
+        }
+        if (coveredNodeIds.has(id)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'GEO_LEAF_TARGET_CONFLICT',
+                'A geo-routing branch cannot terminate inside the main chain',
+            );
+        }
+    }
+    geoLeafNodes.sort((left, right) => left.id.localeCompare(right.id, 'en'));
+
+    // Deterministic ordering: portals sorted by id, relays in first-seen
+    // path order, sink last; links unique in first-seen path order.
+    const orderedNodes = [];
+    const seenNodes = new Set();
+    for (const { portalId } of portalPaths) {
+        orderedNodes.push({ id: portalId, node: nodesById.get(portalId) });
+        seenNodes.add(portalId);
+    }
+    for (const { nodeIds } of portalPaths) {
+        for (const id of nodeIds.slice(1)) {
+            if (seenNodes.has(id) || id === sinkId) continue;
+            seenNodes.add(id);
+            orderedNodes.push({ id, node: nodesById.get(id) });
+        }
+    }
+    orderedNodes.push({ id: sinkId, node: nodesById.get(sinkId) });
+
+    const orderedLinks = [];
+    const seenLinks = new Set();
+    for (const { links } of portalPaths) {
+        for (const entry of links) {
+            if (seenLinks.has(entry.id)) continue;
+            seenLinks.add(entry.id);
+            orderedLinks.push(entry);
+        }
+    }
+
+    // Distance to sink (single non-geo outgoing per node makes this
+    // well-defined); used for downstream-first deployment ordering.
+    const distToSink = new Map([[sinkId, 0]]);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const { nodeIds } of portalPaths) {
+            for (let index = 0; index < nodeIds.length - 1; index += 1) {
+                const id = nodeIds[index];
+                const next = nodeIds[index + 1];
+                if (distToSink.has(id) || !distToSink.has(next)) continue;
+                distToSink.set(id, distToSink.get(next) + 1);
+                changed = true;
+            }
+        }
+    }
+
+    return {
+        mode,
+        fanIn: true,
+        portalPaths,
+        orderedNodes,
+        orderedLinks,
+        geoLeafNodes,
+        incoming,
+        outgoing,
+        distToSink,
+    };
+}
+
+/** Decide between the classic linear chain and the fan-in domain shape. */
+function selectChainShape(snapshot, geoLeafLinkIds) {
+    const nonGeoTargets = new Set();
+    const nonGeoSources = new Set();
+    for (const link of snapshot.links) {
+        if (geoLeafLinkIds.has(entityId(link))) continue;
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (source) nonGeoSources.add(source);
+        if (target) nonGeoTargets.add(target);
+    }
+    const rootCount = [...nonGeoSources].filter(id => !nonGeoTargets.has(id)).length;
+    return rootCount > 1
+        ? orderedFanInChain(snapshot, geoLeafLinkIds)
+        : orderedChain(snapshot, geoLeafLinkIds);
+}
+
+function topologyFanInRefs(chain) {
+    const refs = new Map();
+    let portalIndex = 0;
+    let relayIndex = 0;
+    for (const { id, node } of chain.orderedNodes) {
+        if (node.role === 'portal') refs.set(id, `portal-${++portalIndex}`);
+        else if (node.role === 'relay') refs.set(id, `relay-${++relayIndex}`);
+        else refs.set(id, 'bridge'); // the default-bridge sink
+    }
+    let bridgeIndex = 1;
+    for (const { id } of chain.geoLeafNodes) {
+        refs.set(id, `bridge-${++bridgeIndex}`);
+    }
+    return refs;
+}
+
 function assertPort(value) {
     if (!Number.isSafeInteger(value) || value < 1 || value > 65535) {
         throw new FrozenTopologyDeploymentPlanError(
@@ -668,6 +991,139 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
     return { configs, ingressByNodeId };
 }
 
+/**
+ * Fan-in (multi-portal, forward-only) candidate configs.
+ * - each portal originates the full forward chain along its own path plus
+ *   every geo branch (chained through its own path prefix);
+ * - a merge relay binds one hop inbound per upstream link and keeps the
+ *   per-path socks ingress chained to its single downstream link;
+ * - the default bridge terminates ALL upstream links.
+ */
+function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [] }) {
+    const geoLeafNodes = chain.geoLeafNodes || [];
+    const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
+    const nodeConfigsById = new Map(allChainNodes.map(({ id, node }) => [
+        id,
+        projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
+    ]));
+    const links = chain.orderedLinks.map((entry, index) => projectCascadeLink(
+        entry,
+        index,
+        linkMetadataById.get(entry.id),
+        nodeConfigsById,
+    ));
+    const geoLinks = geoLeafNodes.map((leaf, index) => projectCascadeLink(
+        leaf.link,
+        chain.orderedLinks.length + index,
+        linkMetadataById.get(leaf.link.id),
+        nodeConfigsById,
+    ));
+    const projectedByEntryId = new Map(chain.orderedLinks.map((entry, index) => [entry.id, links[index]]));
+    const geoProjectedByEntryId = new Map(geoLeafNodes.map((leaf, index) => [leaf.link.id, geoLinks[index]]));
+
+    const configs = new Map();
+    const ingressByNodeId = new Map();
+
+    // Portals: full forward chain along the own path + all geo branches.
+    for (const path of chain.portalPaths) {
+        const id = path.portalId;
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        configGenerator.applyXrayApi(config, nodeConfig.xray.apiPort || 61000);
+        const branches = geoLeafNodes.map(leaf => {
+            const prefixEntry = path.links.find(entry => entry.target === leaf.link.source);
+            return {
+                link: geoProjectedByEntryId.get(leaf.link.id),
+                viaTag: prefixEntry
+                    ? `fwd-${String(projectedByEntryId.get(prefixEntry.id)._id).slice(-8)}`
+                    : null,
+            };
+        });
+        configGenerator.applyForwardChain(
+            config,
+            path.links.map(entry => projectedByEntryId.get(entry.id)),
+            clientInboundTags(nodeConfig),
+            [],
+            branches,
+        );
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+
+    // Relays: one hop inbound per upstream link; per-path socks ingress
+    // chained along the single downstream suffix.
+    for (const { id, node } of chain.orderedNodes) {
+        if (node.role !== 'relay') continue;
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        const upstream = (chain.incoming.get(id) || [])
+            .slice()
+            .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+        configGenerator.applyForwardHopInbound(
+            config,
+            upstream.map(entry => projectedByEntryId.get(entry.id)),
+        );
+        const downstream = chain.outgoing.get(id);
+        if (downstream) {
+            const suffixEntries = [];
+            let current = id;
+            const seen = new Set([id]);
+            while (chain.outgoing.has(current)) {
+                const entry = chain.outgoing.get(current);
+                suffixEntries.push(entry);
+                current = entry.target;
+                if (seen.has(current)) break; // validator rejects cycles already
+                seen.add(current);
+            }
+            const ingress = relayPathIngress(groups, downstream.id);
+            if (ingress.length > 0) {
+                configGenerator.applyForwardChain(
+                    config,
+                    suffixEntries.map(entry => projectedByEntryId.get(entry.id)),
+                    [],
+                    ingress,
+                );
+                ingressByNodeId.set(id, ingress);
+            }
+        }
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+
+    // Default bridge sink: terminates every upstream link.
+    const sinkId = chain.orderedNodes.at(-1).id;
+    {
+        const nodeConfig = nodeConfigsById.get(sinkId);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        const upstream = (chain.incoming.get(sinkId) || [])
+            .slice()
+            .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+        const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig(
+            upstream.map(entry => projectedByEntryId.get(entry.id)),
+        ));
+        cascade.inbounds = cascade.inbounds || [];
+        config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(sinkId, config);
+    }
+
+    // Geo-routing bridges: same as the linear path (single upstream link).
+    for (let index = 0; index < geoLeafNodes.length; index += 1) {
+        const { id } = geoLeafNodes[index];
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        configGenerator.applyForwardHopInbound(config, [geoLinks[index]]);
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+
+    return { configs, ingressByNodeId };
+}
+
 function canonicalize(value) {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (!isPlainObject(value)) return value;
@@ -762,7 +1218,7 @@ function composeFrozenTopologyDeploymentPlan({
         geoLeafLinkIds.add(linkId);
     }
 
-    const chain = orderedChain(snapshot, geoLeafLinkIds);
+    const chain = selectChainShape(snapshot, geoLeafLinkIds);
     const roleByNodeId = new Map(
         [...chain.orderedNodes, ...chain.geoLeafNodes].map(({ id, node }) => [id, node.role]),
     );
@@ -824,11 +1280,15 @@ function composeFrozenTopologyDeploymentPlan({
         }
     }
 
-    const refs = topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
+    const refs = chain.fanIn === true
+        ? topologyFanInRefs(chain)
+        : topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
     let candidateConfigsById;
     let ingressByNodeId;
     try {
-        ({ configs: candidateConfigsById, ingressByNodeId } = buildCandidateConfigs({
+        ({ configs: candidateConfigsById, ingressByNodeId } = (chain.fanIn === true
+            ? buildFanInCandidateConfigs
+            : buildCandidateConfigs)({
             chain,
             refs,
             nodeMetadataById,
@@ -844,9 +1304,16 @@ function composeFrozenTopologyDeploymentPlan({
     }
     // Deployment order keeps endpoints first for forward chains (bridges
     // before their upstream) and source-first for reverse chains; geo bridges
-    // deploy alongside the default bridge.
+    // deploy alongside the default bridge. Fan-in domains order chain nodes
+    // by distance to the sink instead of a linear reverse.
+    const chainDeploymentNodes = chain.fanIn === true
+        ? [...chain.orderedNodes].sort((left, right) => (
+            (chain.distToSink.get(left.id) - chain.distToSink.get(right.id))
+            || left.id.localeCompare(right.id, 'en')
+        ))
+        : [...chain.orderedNodes].reverse();
     const deploymentOrder = chain.mode === 'forward'
-        ? [...chain.geoLeafNodes, ...[...chain.orderedNodes].reverse()]
+        ? [...chain.geoLeafNodes, ...chainDeploymentNodes]
         : [...chain.orderedNodes, ...chain.geoLeafNodes];
     const nodes = deploymentOrder.map(({ id, node }) => candidateForNode({
         mode: chain.mode,
