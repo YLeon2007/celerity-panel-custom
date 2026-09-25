@@ -85,14 +85,17 @@ class TopologyDraftWriteService {
                 return { mutation: prepared.mutation };
             },
         });
-        // Link mutations change which nodes participate in the chain, so
-        // cascade roles must follow immediately — otherwise nodes from a
-        // deleted chain keep stale portal/relay/bridge roles and break
-        // deploy validation of the next (possibly smaller) chain.
+        // Creating or updating a link may bring new nodes into the chain, so
+        // their cascade roles are assigned from the resulting graph. Deleting
+        // a link must NEVER recalculate roles: the remaining graph is
+        // incomplete by definition (e.g. portal→relay after relay→bridge is
+        // removed would make the relay look like a bridge). Roles are
+        // operator state and survive link removal until reassigned explicitly
+        // or by a new link.
         if (
             result !== null
             && typeof this.recalculateRoles === 'function'
-            && String(mutation?.kind || '').startsWith('link.')
+            && (mutation?.kind === 'link.create' || mutation?.kind === 'link.update')
         ) {
             await this.recalculateRoles();
         }
