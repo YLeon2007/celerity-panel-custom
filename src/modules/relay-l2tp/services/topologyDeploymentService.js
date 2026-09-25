@@ -3,6 +3,10 @@
 const { randomUUID } = require('node:crypto');
 const { compileTopology } = require('../domain/topologyCompiler');
 const {
+    computeTopologyDomains,
+    sliceTopologyToDomain,
+} = require('../domain/topologyDomains');
+const {
     projectGroups,
     projectLinks,
     projectNodes,
@@ -145,7 +149,7 @@ class TopologyDeploymentService {
         });
     }
 
-    async deploy({ expectedTopologyRevision } = {}) {
+    async deploy({ expectedTopologyRevision, domainKey } = {}) {
         assertRevision(expectedTopologyRevision);
         const operationId = this.idFactory('operation');
         let pinned;
@@ -161,7 +165,34 @@ class TopologyDeploymentService {
                         groups: projectGroups(snapshot.groups)
                             .sort((left, right) => left._id.localeCompare(right._id)),
                     };
-                    const validation = this.validator(topology);
+                    const domains = computeTopologyDomains({
+                        nodes: topology.nodes,
+                        links: topology.links,
+                    });
+                    let domain = null;
+                    if (domainKey !== undefined && domainKey !== null) {
+                        domain = domains.find(entry => entry.key === domainKey) || null;
+                        if (!domain) {
+                            throw new TopologyDeploymentError(
+                                'TOPOLOGY_DOMAIN_NOT_FOUND',
+                                'The requested topology domain does not exist in the current graph',
+                                { operationId, domainKey },
+                            );
+                        }
+                    } else if (domains.length > 1) {
+                        throw new TopologyDeploymentError(
+                            'TOPOLOGY_DOMAIN_REQUIRED',
+                            'Multiple topology domains exist; deployment requires an explicit domain',
+                            {
+                                operationId,
+                                domains: domains.map(entry => ({ key: entry.key, label: entry.label })),
+                            },
+                        );
+                    }
+                    const scoped = domain === null
+                        ? topology
+                        : sliceTopologyToDomain(topology, domain);
+                    const validation = this.validator(scoped);
                     if (!validation?.valid) {
                         throw new TopologyDeploymentError(
                             'INVALID_TOPOLOGY_DEPLOYMENT',
@@ -169,7 +200,7 @@ class TopologyDeploymentService {
                             { operationId, errors: validation?.errors || [] },
                         );
                     }
-                    const compiled = this.compiler({ ...topology, healthByPathKey: {} });
+                    const compiled = this.compiler({ ...scoped, healthByPathKey: {} });
                     if (!compiled?.valid) {
                         throw new TopologyDeploymentError(
                             'INVALID_TOPOLOGY_DEPLOYMENT',
@@ -178,8 +209,15 @@ class TopologyDeploymentService {
                         );
                     }
                     return {
-                        topology: deepFreeze(topology),
+                        topology: deepFreeze(scoped),
                         compiled: deepFreeze(compiled),
+                        ...(domain === null ? {} : {
+                            domain: deepFreeze({
+                                key: domain.key,
+                                label: domain.label,
+                                nodeIds: [...domain.nodeIds],
+                            }),
+                        }),
                     };
                 },
             });
@@ -266,6 +304,10 @@ class TopologyDeploymentService {
             deployedState = await this.repository.markDeployed({
                 expectedRevision: topologyRevision,
                 expectedDeployedRevision: pinned.deployedRevision,
+                ...(pinned.domain?.key === undefined ? {} : {
+                    domainKey: pinned.domain.key,
+                    domainLabel: pinned.domain.label,
+                }),
             });
         } catch (error) {
             const rollback = await this.rollbackChangedNodes({
@@ -323,6 +365,7 @@ class TopologyDeploymentService {
             topologyRevision,
             deployedRevision: deployedState.deployedRevision,
             nodeEvidence,
+            ...(pinned.domain === undefined ? {} : { domain: pinned.domain }),
         };
     }
 }

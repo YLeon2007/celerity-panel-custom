@@ -124,16 +124,21 @@ test('each route group path is enabled by default and accepts an explicit boolea
     assert.equal(disabled.paths[0].enabled, false);
 });
 
-test('topology state uses a fixed singleton document identity', () => {
+test('topology state supports singleton and per-domain document identities', () => {
     const state = new CascadeTopologyState();
     assert.equal(state._id, 'singleton');
     assert.equal(state.validateSync(), undefined);
 
-    assertValidationKind(
-        new CascadeTopologyState({ _id: 'another-state' }),
-        '_id',
-        'enum',
-    );
+    // Topology domains: 'domain:<key>' documents track per-domain deployed
+    // revisions alongside the global singleton fence.
+    const domainState = new CascadeTopologyState({
+        _id: 'domain:abc123',
+        domainKey: 'abc123',
+        label: 'Портал A → бридж B',
+        revision: 5,
+        deployedRevision: 5,
+    });
+    assert.equal(domainState.validateSync(), undefined);
 });
 
 test('topology state revision rejects negative values', () => {

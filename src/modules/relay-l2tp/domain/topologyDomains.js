@@ -124,8 +124,32 @@ function domainOfNode(domains, nodeId) {
     return domains.find(domain => domain.nodeIds.includes(id)) || null;
 }
 
+/**
+ * Slice a projected topology ({nodes, links, groups}) down to one domain.
+ * Route groups survive only with paths whose linkIds stay inside the domain;
+ * groups left without any path are dropped.
+ */
+function sliceTopologyToDomain(topology, domain) {
+    const nodeIds = new Set(domain.nodeIds);
+    const linkIds = new Set(domain.linkIds);
+    const groups = [];
+    for (const group of topology.groups || []) {
+        const paths = (group.paths || []).filter(path => {
+            const pathLinkIds = (path.linkIds || []).map(entityId);
+            return pathLinkIds.length > 0 && pathLinkIds.every(id => linkIds.has(id));
+        });
+        if (paths.length > 0) groups.push({ ...group, paths });
+    }
+    return {
+        nodes: (topology.nodes || []).filter(node => nodeIds.has(entityId(node))),
+        links: (topology.links || []).filter(link => linkIds.has(entityId(link))),
+        groups,
+    };
+}
+
 module.exports = {
     computeTopologyDomains,
     domainOfNode,
     domainLabel,
+    sliceTopologyToDomain,
 };

@@ -93,7 +93,46 @@ class TopologyDeploymentRepository {
         }
     }
 
-    async markDeployed({ expectedRevision, expectedDeployedRevision }) {
+    async markDeployed({ expectedRevision, expectedDeployedRevision, domainKey, domainLabel } = {}) {
+        if (typeof domainKey === 'string' && domainKey.length > 0) {
+            // Per-domain deploy: fence on the global draft revision only and
+            // upsert the domain's own state document; the legacy singleton
+            // deployedRevision stays untouched so other domains and the
+            // classic single-domain view are unaffected.
+            const fence = await this.CascadeTopologyState.findOneAndUpdate(
+                { _id: 'singleton', revision: expectedRevision },
+                { $set: { revision: expectedRevision } },
+                {
+                    new: true,
+                    runValidators: true,
+                    timestamps: false,
+                },
+            ).select(TOPOLOGY_STATE_SELECT).lean();
+            if (!fence) throw staleRevision(expectedRevision, null);
+            const state = await this.CascadeTopologyState.findOneAndUpdate(
+                { _id: `domain:${domainKey}` },
+                {
+                    $set: {
+                        domainKey,
+                        ...(typeof domainLabel === 'string' ? { label: domainLabel } : {}),
+                        revision: expectedRevision,
+                        deployedRevision: expectedRevision,
+                    },
+                },
+                {
+                    new: true,
+                    upsert: true,
+                    runValidators: true,
+                    timestamps: true,
+                },
+            ).select(TOPOLOGY_STATE_SELECT).lean();
+            if (!state) throw staleRevision(expectedRevision, null);
+            return {
+                revision: state.revision,
+                deployedRevision: state.deployedRevision,
+                domainKey,
+            };
+        }
         const state = await this.CascadeTopologyState.findOneAndUpdate(
             {
                 _id: 'singleton',
