@@ -1618,7 +1618,7 @@ function buildCascadeTunnelStreamSettings(link, opts = {}) {
         } else {
             stream.realitySettings = {
                 serverName: realityServerName,
-                fingerprint: link.realityFingerprint || 'chrome',
+                fingerprint: link.realityFingerprint || 'random',
                 publicKey: link.realityPublicKey || '',
                 shortId: (link.realityShortIds || []).find(id => id && id.length > 0) ||
                     ((link.realityShortIds && link.realityShortIds[0]) || ''),

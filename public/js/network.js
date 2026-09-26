@@ -969,7 +969,7 @@
         form.realityPrivateKey.value = link.realityPrivateKey || '';
         form.realityPublicKey.value = link.realityPublicKey || '';
         form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
-        form.realityFingerprint.value = link.realityFingerprint || 'chrome';
+        form.realityFingerprint.value = link.realityFingerprint || 'random';
 
         const geoEnabled = document.getElementById('geoRoutingEnabled');
         const geoFields = document.getElementById('geoRoutingFields');
@@ -1067,7 +1067,7 @@
             data.realityPrivateKey = form.realityPrivateKey?.value || '';
             data.realityPublicKey = form.realityPublicKey?.value || '';
             data.realityShortIds = form.realityShortIds?.value || '';
-            data.realityFingerprint = form.realityFingerprint?.value || 'chrome';
+            data.realityFingerprint = form.realityFingerprint?.value || 'random';
         }
 
         // Geo routing (always sent so unchecking persists)

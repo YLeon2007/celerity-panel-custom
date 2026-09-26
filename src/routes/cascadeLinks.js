@@ -113,7 +113,7 @@ function resolveRealitySettings(input = {}, targetNode = null) {
         realityShortIds: inputShortIds.some(Boolean)
             ? inputShortIds
             : [crypto.randomBytes(8).toString('hex')],
-        realityFingerprint: String(input.realityFingerprint || 'chrome').trim() || 'chrome',
+        realityFingerprint: String(input.realityFingerprint || 'random').trim() || 'random',
     };
 }
 

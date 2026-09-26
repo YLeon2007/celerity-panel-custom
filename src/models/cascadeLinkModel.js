@@ -47,7 +47,7 @@ const cascadeLinkSchema = new mongoose.Schema({
     realityPrivateKey: { type: String, default: '' },
     realityPublicKey: { type: String, default: '' },
     realityShortIds: { type: [String], default: [''] },
-    realityFingerprint: { type: String, default: 'chrome' },
+    realityFingerprint: { type: String, default: 'random' },
 
     // MUX settings for tunnel outbound
     muxEnabled: { type: Boolean, default: false },

@@ -54,7 +54,7 @@ function extractHandler(name) {
 
 function extractDeployPath(name) {
     // Deploy handlers delegate the network call to the shared deployTopology helper.
-    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology()');
+    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology(linkId)');
     assert.notStrictEqual(helperStart, -1, 'deployTopology helper must exist');
     const helperEnd = NETWORK_SOURCE.indexOf('\n    window.', helperStart);
     assert.notStrictEqual(helperEnd, -1, 'deployTopology helper must precede the handlers');
@@ -66,8 +66,13 @@ test('network UI deploy and chain sync use the revision-safe topology deploy end
         const handler = extractDeployPath(name);
         assert.match(
             handler,
-            /fetch\('\/api\/cascade\/topology\/deploy', \{[\s\S]*?method: 'POST',[\s\S]*?body: JSON\.stringify\(\{ expectedTopologyRevision: topologyRevision \}\)/,
+            /fetch\('\/api\/cascade\/topology\/deploy', \{[\s\S]*?method: 'POST',[\s\S]*?body: JSON\.stringify\([\s\S]*?expectedTopologyRevision: topologyRevision/,
             `${name} must POST to the revision-safe topology deploy endpoint`,
+        );
+        assert.match(
+            handler,
+            /expectedTopologyRevision: topologyRevision, domainKey/,
+            `${name} must send the domain key for domain-scoped deploys`,
         );
         assert.doesNotMatch(
             handler,
