@@ -332,6 +332,11 @@ class TopologyOperationExecutor {
                 && error.code === 'INVALID_FROZEN_NODE_PLAN') {
                 throw error;
             }
+            try {
+                const logger = require('../../../utils/logger');
+                const causeMsg = error?.cause ? ` cause=${error.cause.name}:${error.cause.code || ''} ${error.cause.message}` : '';
+                logger.error(`[TopologyOperationExecutor] node step failed: nodeId=${binding?.nodeId} role=${binding?.role} error=${error?.name}:${error?.code || ''} ${error?.message}${causeMsg}`);
+            } catch { /* logger unavailable in tests */ }
             const wrapped = executionFailed();
             wrapped.cause = error;
             throw wrapped;

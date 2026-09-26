@@ -121,7 +121,7 @@ function parseReceipt(result, command, expected) {
         // diagnostics go to the server log only.
         try {
             const logger = require('../../../utils/logger');
-            logger.error(`[TopologyNodeTransport] invalid receipt: exit=${result?.code} stderr=${String(result?.stderr ?? '').slice(0, 300)} stdout=${String(result?.stdout ?? '').slice(0, 300)}`);
+            logger.error(`[TopologyNodeTransport] invalid receipt: command=${command} nodeId=${expected?.nodeId} operationId=${expected?.operationId} profile=${expected?.targetProfile} exit=${result?.code} stderr=${String(result?.stderr ?? '').slice(0, 300)} stdout=${String(result?.stdout ?? '').slice(0, 300)}`);
         } catch { /* logger unavailable in tests */ }
         throw error;
     }
