@@ -172,3 +172,27 @@ test('fan-in: a node with two non-geo outgoing links is rejected', () => {
         error => error.code === 'NON_LINEAR_TOPOLOGY',
     );
 });
+
+test('fan-in: relay candidates never bind xray-main client inbounds (dual-profile host)', () => {
+    const plan = composeFrozenTopologyDeploymentPlan(fanInInput());
+    const byRef = planByRef(plan);
+    for (const ref of ['relay-1', 'relay-2']) {
+        const config = candidateJson(byRef.get(ref));
+        const tags = (config.inbounds || []).map(inbound => inbound.tag);
+        assert.ok(
+            !tags.some(tag => typeof tag === 'string' && tag.startsWith('client-relay')),
+            `${ref} candidate must not include the node xray-main inbound, got: ${tags.join(',')}`,
+        );
+        const ruleTags = (config.routing?.rules || []).flatMap(rule => rule.inboundTag || []);
+        assert.ok(
+            !ruleTags.some(tag => typeof tag === 'string' && tag.startsWith('client-relay')),
+            `${ref} routing rules must not reference stripped inbounds`,
+        );
+    }
+    // Portals keep their xray-main inbounds (they run the xray-main profile).
+    const portal = candidateJson(byRef.get('portal-1'));
+    assert.ok(
+        (portal.inbounds || []).some(inbound => inbound.tag === 'client-portal-1'),
+        'portal candidate keeps its client inbound',
+    );
+});

@@ -822,6 +822,20 @@ function clientInboundTags(nodeConfig) {
     ];
 }
 
+// xray-bridge profile candidates must not bind the node's xray-main client
+// inbounds: on hosts running both services (e.g. a panel host doubling as a
+// relay) the ports would collide and the bridge service would fail to start.
+function stripServerInbounds(config, nodeConfig) {
+    const tags = new Set(clientInboundTags(nodeConfig));
+    config.inbounds = (config.inbounds || []).filter(inbound => !tags.has(inbound.tag));
+    if (Array.isArray(config.routing?.rules)) {
+        config.routing.rules = config.routing.rules.filter(rule =>
+            !Array.isArray(rule.inboundTag)
+            || !rule.inboundTag.some(tag => tags.has(tag)));
+    }
+    return config;
+}
+
 function composeBaselineWithCascade(baseline, cascade) {
     const config = composeXrayConfig(baseline, [{
         id: 'topology-cascade',
@@ -1056,7 +1070,10 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
     for (const { id, node } of chain.orderedNodes) {
         if (node.role !== 'relay') continue;
         const nodeConfig = nodeConfigsById.get(id);
-        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        let config = stripServerInbounds(
+            parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, [])),
+            nodeConfig,
+        );
         const upstream = (chain.incoming.get(id) || [])
             .slice()
             .sort((left, right) => left.id.localeCompare(right.id, 'en'));
