@@ -61,6 +61,32 @@
     let topologyRevision = null;
     let deployedRevision = null;
     let _allLinks = [];
+    let topologyDomains = [];
+
+    function domainOfLink(linkId) {
+        const id = String(linkId);
+        return topologyDomains.find(d => Array.isArray(d.linkIds) && d.linkIds.map(String).includes(id)) || null;
+    }
+
+    function renderDomainLegend() {
+        const el = document.getElementById('domainLegend');
+        if (!el) return;
+        if (!Array.isArray(topologyDomains) || topologyDomains.length === 0) {
+            el.style.display = 'none';
+            el.innerHTML = '';
+            return;
+        }
+        const items = topologyDomains.map(d => {
+            const legacy = d.valid === false;
+            return '<div class="domain-item' + (legacy ? ' legacy' : '') + '" title="' + escHtml(d.key) + '">'
+                + '<i class="ti ti-topology-star-3"></i> '
+                + '<span class="domain-label">' + escHtml(d.label || d.key) + '</span>'
+                + (legacy ? ' <span class="domain-legacy-badge">' + escHtml(i18n.domainLegacy || 'legacy') + '</span>' : '')
+                + '</div>';
+        }).join('');
+        el.innerHTML = '<div class="domain-title">' + escHtml(i18n.topologyDomains || 'Topology domains') + '</div>' + items;
+        el.style.display = '';
+    }
 
     function applyLinkSnapshot(snapshot) {
         if (!snapshot || !Number.isSafeInteger(snapshot.topologyRevision)
@@ -197,14 +223,19 @@
         showLoading(true);
         setEmptyState(false);
         try {
-            const [topologyRes, linksRes] = await Promise.all([
+            const [topologyRes, linksRes, domainsRes] = await Promise.all([
                 fetch('/api/cascade/topology'),
                 fetch('/api/cascade/links'),
+                fetch('/api/cascade/topology/domains'),
             ]);
             if (!topologyRes.ok) throw new Error('HTTP ' + topologyRes.status);
             if (!linksRes.ok) throw new Error('HTTP ' + linksRes.status);
             const data = await topologyRes.json();
             applyLinkSnapshot(await linksRes.json());
+            topologyDomains = domainsRes.ok
+                ? (await domainsRes.json().catch(() => ({}))).domains || []
+                : [];
+            renderDomainLegend();
             renderGraph(data);
         } catch (err) {
             console.error('[Network] Topology load error:', err);
@@ -730,6 +761,14 @@
         if (d.tunnelSecurity === 'reality') extras.push('REALITY');
 
         const summary = buildRouteSummary(d);
+        const linkDomain = domainOfLink(lid);
+        const domainLegacy = linkDomain && linkDomain.valid === false;
+        const deployButton = domainLegacy
+            ? '<button class="btn btn-sm btn-success" id="btnDeploy" disabled title="'
+                + escHtml(i18n.domainLegacyDeployBlocked || 'Legacy domain: new deploy unavailable') + '">'
+                + '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>'
+            : '<button class="btn btn-sm btn-success" id="btnDeploy" onclick="window._cascadeDeploy(\'' + lid + '\')">'
+                + '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>';
 
         const html =
             '<div class="info-grid">' +
@@ -743,6 +782,13 @@
             field(i18n.drawerStatus || 'Status',
                 '<div class="info-status ' + sc + '">\u25CF ' + (d.status || 'pending') + '</div>') +
             field(i18n.linkMode || 'Mode', modeLabel) +
+            (linkDomain
+                ? field('ti-topology-star-3', i18n.domainLabel || 'Domain',
+                    escHtml(linkDomain.label || linkDomain.key)
+                    + (domainLegacy
+                        ? ' <span class="domain-legacy-badge">' + escHtml(i18n.domainLegacy || 'legacy') + '</span>'
+                        : ''))
+                : '') +
             field('ti-plug',           i18n.drawerTunnelPort        || 'Tunnel Port',         d.tunnelPort || '—') +
             field('ti-arrows-exchange',i18n.drawerProtocolTransport || 'Protocol / Transport',
                 (d.tunnelProtocol || 'vless').toUpperCase() + ' / ' + (d.tunnelTransport || 'tcp') + ' / ' + secLabel) +
@@ -755,8 +801,7 @@
             '<div class="info-actions">' +
             '<button class="btn btn-sm btn-outline" id="btnEdit" onclick="window._cascadeEdit(\'' + lid + '\')">' +
             '<i class="ti ti-edit"></i> ' + (i18n.edit || 'Edit') + '</button>' +
-            '<button class="btn btn-sm btn-success" id="btnDeploy" onclick="window._cascadeDeploy(\'' + lid + '\')">' +
-            '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>' +
+            deployButton +
             '<button class="btn btn-sm btn-primary" id="btnDeployChain" onclick="window._cascadeDeployChain(\'' + lid + '\')">' +
             '<i class="ti ti-link"></i> ' + (i18n.syncChain || 'Sync Chain') + '</button>' +
             '<button class="btn btn-sm btn-outline" id="btnUndeploy" onclick="window._cascadeUndeploy(\'' + lid + '\')">' +
@@ -1108,15 +1153,24 @@
     async function deployTopology(linkId) {
         let domainKey;
         if (linkId) {
-            try {
-                const domRes = await fetch('/api/cascade/topology/domains');
-                if (domRes.ok) {
-                    const domData = await domRes.json().catch(() => ({}));
-                    const domains = Array.isArray(domData.domains) ? domData.domains : [];
-                    const match = domains.find(d => Array.isArray(d.linkIds) && d.linkIds.includes(String(linkId)));
-                    if (match) domainKey = match.key;
+            let match = domainOfLink(linkId);
+            if (!match) {
+                try {
+                    const domRes = await fetch('/api/cascade/topology/domains');
+                    if (domRes.ok) {
+                        const domData = await domRes.json().catch(() => ({}));
+                        topologyDomains = Array.isArray(domData.domains) ? domData.domains : [];
+                        match = domainOfLink(linkId);
+                    }
+                } catch (err) { /* domain derivation is best-effort; server validates */ }
+            }
+            if (match) {
+                if (match.valid === false) {
+                    throw new Error(i18n.domainLegacyDeployBlocked
+                        || 'New deploy is unavailable for a legacy domain; manage it via the classic flow');
                 }
-            } catch (err) { /* domain derivation is best-effort; server validates */ }
+                domainKey = match.key;
+            }
         }
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',

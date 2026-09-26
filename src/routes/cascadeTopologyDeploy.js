@@ -17,7 +17,20 @@ const {
 } = require('./panel/csrf');
 const {
     computeTopologyDomains,
+    sliceTopologyToDomain,
 } = require('../modules/relay-l2tp/domain/topologyDomains');
+const {
+    projectGroups,
+    projectLinks,
+    projectNodes,
+} = require('../modules/relay-l2tp/domain/topologyDraft');
+const { validateTopology } = require('../modules/relay-l2tp/domain/topologyValidator');
+const { compileTopology } = require('../modules/relay-l2tp/domain/topologyCompiler');
+const {
+    TopologyOperationPlanMaterializer,
+    TEST_TOPOLOGY_HOST_IDENTITY,
+    TEST_TOPOLOGY_TARGET,
+} = require('../modules/relay-l2tp/services/topologyOperationPlanMaterializer');
 const logger = require('../utils/logger');
 
 const DEFAULT_MODELS = Object.freeze({
@@ -165,6 +178,31 @@ function sendError(res, error, routeLogger = logger) {
     });
 }
 
+// Mirrors the coordinator's deploy pipeline (project → slice → validate →
+// compile → materialize) so the UI can tell deployable domains from legacy
+// components that only the classic cascade flow may manage.
+async function probeDomainValidity(domain, projected, materializer) {
+    try {
+        const sliced = sliceTopologyToDomain(projected, domain);
+        const validation = validateTopology(sliced);
+        if (validation?.valid !== true) {
+            return { valid: false, errorCode: validation?.errors?.[0]?.code || 'INVALID_TOPOLOGY' };
+        }
+        const compiled = compileTopology({ ...sliced, healthByPathKey: {} });
+        if (compiled?.valid !== true) {
+            return { valid: false, errorCode: compiled?.errors?.[0]?.code || 'INVALID_TOPOLOGY' };
+        }
+        await materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: { revision: 0, topology: sliced, compiled },
+        });
+        return { valid: true };
+    } catch (error) {
+        return { valid: false, errorCode: error?.code || 'INVALID_TOPOLOGY' };
+    }
+}
+
 const defaultDeployRateLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 10,
@@ -187,6 +225,7 @@ function createCascadeTopologyDeployRouter({
     csrf = requirePanelCsrf,
     deployRateLimiter = defaultDeployRateLimiter,
     routeLogger = logger,
+    domainValidityProbe,
 } = {}) {
     if (typeof createService !== 'function') {
         throw new TypeError('Cascade topology deploy router requires a deployment service factory');
@@ -215,29 +254,44 @@ function createCascadeTopologyDeployRouter({
         readScope,
         async (req, res) => {
             try {
-                const [nodes, links, domainStates] = await Promise.all([
+                const [nodes, links, groups, domainStates] = await Promise.all([
                     models.HyNode.find({}).select('_id name role cascadeRole').lean(),
-                    models.CascadeLink.find({}).select('_id source target portalNode bridgeNode').lean(),
+                    models.CascadeLink.find({}).select('_id source target portalNode bridgeNode mode active geoRouting').lean(),
+                    models.CascadeRouteGroup.find({}).lean(),
                     models.CascadeTopologyState.find({ _id: /^domain:/ })
                         .select('_id domainKey label revision deployedRevision updatedAt')
                         .lean(),
                 ]);
+                const projected = {
+                    nodes: projectNodes(nodes),
+                    links: projectLinks(links),
+                    groups: projectGroups(groups),
+                };
                 const domains = computeTopologyDomains({ nodes, links });
                 const stateByKey = new Map(
                     (domainStates || []).map(doc => [doc.domainKey || String(doc._id).slice('domain:'.length), doc]),
                 );
-                return res.status(200).json({
-                    domains: domains.map(domain => {
-                        const state = stateByKey.get(domain.key);
-                        return {
-                            key: domain.key,
-                            label: domain.label,
-                            nodeIds: domain.nodeIds,
-                            linkIds: domain.linkIds,
-                            deployedRevision: state?.deployedRevision ?? null,
-                        };
-                    }),
+                const materializer = new TopologyOperationPlanMaterializer({
+                    HyNode: models.HyNode,
+                    CascadeLink: models.CascadeLink,
                 });
+                const domainsOut = [];
+                for (const domain of domains) {
+                    const state = stateByKey.get(domain.key);
+                    const validity = await (domainValidityProbe
+                        ? domainValidityProbe(domain, projected)
+                        : probeDomainValidity(domain, projected, materializer));
+                    domainsOut.push({
+                        key: domain.key,
+                        label: domain.label,
+                        nodeIds: domain.nodeIds,
+                        linkIds: domain.linkIds,
+                        deployedRevision: state?.deployedRevision ?? null,
+                        valid: validity.valid,
+                        ...(validity.valid ? {} : { validationError: validity.errorCode }),
+                    });
+                }
+                return res.status(200).json({ domains: domainsOut });
             } catch (error) {
                 return sendError(res, error, routeLogger);
             }
