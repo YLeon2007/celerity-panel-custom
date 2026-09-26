@@ -18,7 +18,7 @@ const {
 const RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
 const UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner.upload';
 const NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner.next';
-const RUNNER_DIGEST = '6cb69f9fcc712f032c1a76f53dcc91e8ac6152ce87ca14bdde4d4742e2391099';
+const RUNNER_DIGEST = 'f8588340a42dd3c588614cd52926cb5ef3524714d7fade4d4a06f4b8727fbd69';
 const INSPECT_COMMAND = [
     `if /usr/bin/test -f ${RUNNER_PATH} && /usr/bin/test ! -L ${RUNNER_PATH}; then`,
     `/usr/bin/sha256sum -- ${RUNNER_PATH}`,

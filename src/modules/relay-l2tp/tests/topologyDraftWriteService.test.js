@@ -117,51 +117,47 @@ test('validates the full candidate graph before updating a link', async () => {
     assert.equal(persisted, false);
 });
 
-test('rejects a candidate with a missing route link before compiling or committing it', async () => {
-    let persisted = false;
-    let compilerCalls = 0;
+test('heals a stale route path with a missing link instead of blocking link mutations', async () => {
+    let preparedMutation;
+    let compiledCandidate;
     const snapshot = validSnapshot();
     snapshot.groups[0].paths[0].linkIds = ['link-1', 'missing-link'];
     const repository = {
         async commitDraft({ prepare }) {
-            await prepare(snapshot);
-            persisted = true;
+            preparedMutation = (await prepare(snapshot)).mutation;
             return { revision: 8, deployedRevision: 5 };
         },
     };
     const service = new TopologyDraftWriteService({
         repository,
-        compiler() {
-            compilerCalls += 1;
+        compiler(candidate) {
+            compiledCandidate = candidate;
             return { valid: true, errors: [], relays: [] };
         },
     });
 
-    await assert.rejects(
-        service.createLink({
-            expectedTopologyRevision: 7,
-            link: {
-                _id: 'link-2',
-                portalNode: 'relay-1',
-                bridgeNode: 'bridge-1',
-                mode: 'forward',
-                active: true,
-            },
-        }),
-        error => {
-            assert.equal(error.name, 'TopologyDraftWriteError');
-            assert.equal(error.code, 'INVALID_TOPOLOGY_DRAFT');
-            assert.deepEqual(error.errors, [{
-                code: 'UNKNOWN_LINK',
-                groupId: 'group-1',
-                pathKey: 'primary',
-                linkId: 'missing-link',
-            }]);
-            return true;
+    const result = await service.createLink({
+        expectedTopologyRevision: 7,
+        link: {
+            _id: 'link-2',
+            portalNode: 'relay-1',
+            bridgeNode: 'bridge-1',
+            mode: 'forward',
+            active: true,
         },
+    });
+
+    assert.deepEqual(result, { revision: 8, deployedRevision: 5 });
+    assert.deepEqual(
+        preparedMutation.groupUpdates,
+        [{ id: 'group-1', paths: [] }],
+        'the path referencing an unknown link must be dropped and persisted',
     );
-    assert.equal(compilerCalls, 0);
-    assert.equal(persisted, false);
+    assert.deepEqual(
+        compiledCandidate.groups.find(group => group._id === 'group-1' || group.id === 'group-1').paths,
+        [],
+        'the healed candidate must not contain the stale path',
+    );
 });
 
 test('deletes a link referenced by a route group, stripping its paths', async () => {

@@ -190,6 +190,34 @@ function buildCandidate(snapshot, mutation) {
         );
     }
 
+    // Self-heal stale route group paths on any link mutation. Group paths can
+    // end up referencing links that no longer exist (e.g. after out-of-band
+    // data repairs); without this sweep every link write would stay blocked by
+    // the validator's UNKNOWN_LINK check with no in-panel way out. A path that
+    // mentions an unknown link is dropped whole (same rule as link.delete);
+    // the L2TP path maintenance hook rebuilds the path after the write.
+    if (mutation.kind.startsWith('link.')) {
+        const knownLinkIds = new Set(links.map(link => entityId(link)));
+        const healUpdates = [];
+        groups = groups.map(group => {
+            const paths = group.paths || [];
+            const keptPaths = paths.filter(path =>
+                (path.linkIds || []).every(pathLinkId => knownLinkIds.has(entityId(pathLinkId))));
+            if (keptPaths.length === paths.length) return group;
+            healUpdates.push({ id: entityId(group), paths: keptPaths });
+            return { ...group, paths: keptPaths };
+        });
+        if (healUpdates.length > 0) {
+            const updatesById = new Map((mutation.groupUpdates || []).map(update => [update.id, update]));
+            for (const update of healUpdates) updatesById.set(update.id, update);
+            const deletedIds = new Set(mutation.groupDeletes || []);
+            mutation = {
+                ...mutation,
+                groupUpdates: [...updatesById.values()].filter(update => !deletedIds.has(update.id)),
+            };
+        }
+    }
+
     const candidate = {
         nodes: projectNodes(snapshot.nodes),
         links: projectLinks(links),

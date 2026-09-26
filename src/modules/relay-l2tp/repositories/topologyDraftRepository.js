@@ -151,9 +151,7 @@ class TopologyDraftRepository {
     async persistMutation(mutation, session) {
         if (mutation?.kind === 'link.create') {
             await this.CascadeLink.create([mutation.document], { session });
-            return;
-        }
-        if (mutation?.kind === 'link.update') {
+        } else if (mutation?.kind === 'link.update') {
             const result = await this.CascadeLink.updateOne(
                 { _id: mutation.id },
                 { $set: mutation.changes || {} },
@@ -166,9 +164,7 @@ class TopologyDraftRepository {
                     { linkId: mutation.id },
                 );
             }
-            return;
-        }
-        if (mutation?.kind === 'link.delete') {
+        } else if (mutation?.kind === 'link.delete') {
             const result = await this.CascadeLink.deleteOne({ _id: mutation.id }, { session });
             if (result.deletedCount !== 1) {
                 throw new TopologyDraftRepositoryError(
@@ -177,25 +173,10 @@ class TopologyDraftRepository {
                     { linkId: mutation.id },
                 );
             }
-            // Apply the group side effects computed by the draft builder:
-            // strip paths that referenced the link and drop emptied groups.
-            for (const update of mutation.groupUpdates || []) {
-                await this.CascadeRouteGroup.updateOne(
-                    { _id: update.id },
-                    { $set: { paths: update.paths } },
-                    { runValidators: true, session },
-                );
-            }
-            for (const groupId of mutation.groupDeletes || []) {
-                await this.CascadeRouteGroup.deleteOne({ _id: groupId }, { session });
-            }
-            return;
-        }
-        if (mutation?.kind === 'group.create') {
+        } else if (mutation?.kind === 'group.create') {
             await this.CascadeRouteGroup.create([mutation.document], { session });
             return;
-        }
-        if (mutation?.kind === 'group.update') {
+        } else if (mutation?.kind === 'group.update') {
             const result = await this.CascadeRouteGroup.updateOne(
                 { _id: mutation.id },
                 { $set: mutation.changes || {} },
@@ -209,8 +190,7 @@ class TopologyDraftRepository {
                 );
             }
             return;
-        }
-        if (mutation?.kind === 'group.delete') {
+        } else if (mutation?.kind === 'group.delete') {
             const result = await this.CascadeRouteGroup.deleteOne(
                 { _id: mutation.id },
                 { session },
@@ -223,11 +203,26 @@ class TopologyDraftRepository {
                 );
             }
             return;
+        } else {
+            throw new TopologyDraftRepositoryError(
+                'UNSUPPORTED_TOPOLOGY_MUTATION',
+                `Unsupported topology mutation: ${mutation?.kind}`,
+            );
         }
-        throw new TopologyDraftRepositoryError(
-            'UNSUPPORTED_TOPOLOGY_MUTATION',
-            `Unsupported topology mutation: ${mutation?.kind}`,
-        );
+        // Group side effects computed by the draft builder for link mutations:
+        // strip paths that referenced removed/unknown links and drop emptied
+        // groups. Applied for every link mutation kind so the self-heal sweep
+        // persists just like the link.delete path stripping.
+        for (const update of mutation.groupUpdates || []) {
+            await this.CascadeRouteGroup.updateOne(
+                { _id: update.id },
+                { $set: { paths: update.paths } },
+                { runValidators: true, session },
+            );
+        }
+        for (const groupId of mutation.groupDeletes || []) {
+            await this.CascadeRouteGroup.deleteOne({ _id: groupId }, { session });
+        }
     }
 
     async commitDraft({ expectedRevision, prepare }) {

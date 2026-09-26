@@ -326,6 +326,14 @@ commit_candidate() {
     local target_parent temporary
     assert_bound_state
     file_hash_matches "$CANDIDATE_PATH" || fail 'CANDIDATE_HASH_MISMATCH' 65
+    # No-op fast path: the live config already matches the candidate byte for
+    # byte. Skipping the swap + service restart keeps unchanged nodes fully
+    # online and makes small domain-scoped changes (e.g. one link's
+    # fingerprint) cheap, while verify still proves the service afterwards.
+    if file_hash_matches "$CONFIG_PATH"; then
+        emit_receipt
+        return 0
+    fi
     target_parent="${CONFIG_PATH%/*}"
     [[ -d "$target_parent" && ! -L "$target_parent" ]] || fail 'INVALID_TARGET' 73
     if [[ -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
