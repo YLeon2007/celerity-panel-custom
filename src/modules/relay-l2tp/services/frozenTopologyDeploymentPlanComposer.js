@@ -1194,6 +1194,23 @@ function composeFrozenTopologyDeploymentPlan({
                 'Every topology link requires hydrated metadata',
             );
         }
+        // Fail closed at compose time: a reality link with incomplete
+        // parameters would produce an xray config that cannot start,
+        // triggering a node-side rollout and rollback mid-deploy.
+        if (metadata.tunnelSecurity === 'reality') {
+            const missing = [];
+            if (typeof metadata.realityDest !== 'string' || metadata.realityDest.length === 0) missing.push('realityDest');
+            if (typeof metadata.realityPrivateKey !== 'string' || metadata.realityPrivateKey.length === 0) missing.push('realityPrivateKey');
+            if (typeof metadata.realityPublicKey !== 'string' || metadata.realityPublicKey.length === 0) missing.push('realityPublicKey');
+            // realityShortIds may legitimately be empty (server accepts any
+            // short id), so it is not part of the fail-closed guard.
+            if (missing.length > 0) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'INCOMPLETE_REALITY_PARAMETERS',
+                    `Reality link is missing required parameters: ${missing.join(', ')}`,
+                );
+            }
+        }
         const geo = projectGeoRouting(metadata);
         if (!geo || geo.enabled !== true) continue;
         if (geo.domains.length === 0 && geo.geoip.length === 0) {
