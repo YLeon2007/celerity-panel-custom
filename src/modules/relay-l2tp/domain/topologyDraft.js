@@ -24,6 +24,11 @@ function projectNodes(nodes) {
     return (nodes || []).map(node => ({
         id: entityId(node),
         role: node.cascadeRole ?? node.role,
+        // Kept for human-readable domain labels ("Порталы X, Y → бридж Z");
+        // without it labels fall back to raw node ids.
+        ...(typeof node.name === 'string' && node.name.length > 0
+            ? { name: node.name }
+            : {}),
     }));
 }
 
