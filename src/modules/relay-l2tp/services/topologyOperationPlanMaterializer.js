@@ -178,12 +178,15 @@ function projectPinnedSnapshot(pinnedSnapshot) {
 
     const nodes = topology.nodes.map(snapshotNode)
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+    // Fan-in domains legitimately contain multiple portals; the composer
+    // (orderedChain / orderedFanInChain) performs the authoritative shape
+    // validation. Here we only require the graph to be deployable at all.
     const portalCount = nodes.filter(node => node.role === 'portal').length;
     const bridgeCount = nodes.filter(node => node.role === 'bridge').length;
-    if (portalCount !== 1 || bridgeCount < 1) {
+    if (portalCount < 1 || bridgeCount < 1) {
         fail(
             'INVALID_TOPOLOGY_ROLES',
-            'Pinned topology requires exactly one portal and at least one bridge',
+            'Pinned topology requires at least one portal and at least one bridge',
         );
     }
     const links = topology.links.map(snapshotLink)

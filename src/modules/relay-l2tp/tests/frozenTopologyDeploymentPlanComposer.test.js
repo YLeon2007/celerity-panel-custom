@@ -703,3 +703,16 @@ test('disconnected roled nodes are excluded from the plan instead of failing val
         ['bridge', 'portal', 'relay-1'],
     );
 });
+
+test('rejects a linear chain with two portals (role flipped mid-chain)', () => {
+    const input = reverseChainInput();
+    input.snapshot.nodes.find(node => node.role === 'relay').role = 'portal';
+
+    assert.throws(
+        () => composeFrozenTopologyDeploymentPlan(input),
+        {
+            name: 'FrozenTopologyDeploymentPlanError',
+            code: 'INVALID_TOPOLOGY_ROLES',
+        },
+    );
+});
