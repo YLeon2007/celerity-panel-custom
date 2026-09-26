@@ -1109,7 +1109,11 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
         configs.set(id, config);
     }
 
-    // Default bridge sink: terminates every upstream link.
+    // Default bridge sink: terminates every upstream link. In forward mode the
+    // sink is a transport hop (like a geo leaf): it binds one fwd-hop inbound
+    // per upstream link and forwards the decoded stream directly. The reverse
+    // combined-bridge generator builds a reverse-tunnel (outbounds only, no
+    // listening hop port), which never satisfies the forward verify port check.
     const sinkId = chain.orderedNodes.at(-1).id;
     {
         const nodeConfig = nodeConfigsById.get(sinkId);
@@ -1117,11 +1121,18 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
         const upstream = (chain.incoming.get(sinkId) || [])
             .slice()
             .sort((left, right) => left.id.localeCompare(right.id, 'en'));
-        const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig(
-            upstream.map(entry => projectedByEntryId.get(entry.id)),
-        ));
-        cascade.inbounds = cascade.inbounds || [];
-        config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
+        if (chain.mode === 'forward') {
+            configGenerator.applyForwardHopInbound(
+                config,
+                upstream.map(entry => projectedByEntryId.get(entry.id)),
+            );
+        } else {
+            const cascade = JSON.parse(configGenerator.generateCombinedBridgeConfig(
+                upstream.map(entry => projectedByEntryId.get(entry.id)),
+            ));
+            cascade.inbounds = cascade.inbounds || [];
+            config = composeBaselineWithCascade(config, parseGeneratedConfig(cascade));
+        }
         configGenerator.ensurePrivateIpBlock(config);
         config = composeXrayConfig(config, []);
         configs.set(sinkId, config);

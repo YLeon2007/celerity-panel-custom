@@ -101,9 +101,16 @@ test('fan-in: two portals converge to one default bridge with a geo leaf', () =>
     assert.equal(hopInbounds.length, 2);
     assert.deepEqual(hopInbounds.map(inbound => inbound.port).sort(), [10102, 10103]);
 
-    // Default bridge terminates every upstream link (only link-4 here).
+    // Default bridge terminates every upstream link (only link-4 here): it must
+    // bind a forward hop inbound on the link tunnel port and forward directly,
+    // otherwise the verify port check can never pass.
     const bridge = candidateJson(byRef.get('bridge'));
-    assert.ok(bridge.inbounds.length >= 1);
+    const bridgeHop = bridge.inbounds.find(inbound => String(inbound.tag).startsWith('fwd-hop-'));
+    assert.ok(bridgeHop, 'bridge must bind a fwd-hop inbound');
+    assert.equal(bridgeHop.port, 10104);
+    assert.ok(bridge.routing.rules.some(rule => (
+        rule.inboundTag?.includes(bridgeHop.tag) && rule.outboundTag === 'direct'
+    )), 'bridge fwd-hop must route to direct');
 
     // Each portal originates the full chain along its own path plus the geo
     // branch.
