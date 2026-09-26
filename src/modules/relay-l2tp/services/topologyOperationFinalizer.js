@@ -7,6 +7,7 @@ const FINALIZATION_INPUT_KEYS = Object.freeze([
     'priorDeployedRevision',
     'topologyRevision',
 ]);
+const FINALIZATION_OPTIONAL_KEYS = Object.freeze(['domainKey', 'domainLabel']);
 
 function validDate(value) {
     return value instanceof Date && Number.isFinite(value.getTime());
@@ -16,22 +17,25 @@ function validRevision(value) {
     return Number.isSafeInteger(value) && value >= 0;
 }
 
-function hasExactKeys(value, expectedKeys) {
-    return Boolean(value)
-        && typeof value === 'object'
-        && !Array.isArray(value)
-        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expectedKeys);
+function hasExactKeys(value, expectedKeys, optionalKeys = []) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const keys = Object.keys(value);
+    return expectedKeys.every(key => keys.includes(key))
+        && keys.every(key => expectedKeys.includes(key) || optionalKeys.includes(key));
 }
 
 function assertFinalizationInput(input) {
-    if (!hasExactKeys(input, FINALIZATION_INPUT_KEYS)
+    if (!hasExactKeys(input, FINALIZATION_INPUT_KEYS, FINALIZATION_OPTIONAL_KEYS)
         || typeof input.operationId !== 'string'
         || input.operationId.length === 0
         || typeof input.owner !== 'string'
         || input.owner.length === 0
         || !validDate(input.leaseUntil)
         || !validRevision(input.topologyRevision)
-        || !validRevision(input.priorDeployedRevision)) {
+        || !validRevision(input.priorDeployedRevision)
+        || (Object.hasOwn(input, 'domainKey')
+            && input.domainKey !== null
+            && typeof input.domainKey !== 'string')) {
         throw new TypeError('Invalid topology operation finalization input');
     }
 }

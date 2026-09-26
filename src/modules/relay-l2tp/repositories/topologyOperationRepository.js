@@ -35,6 +35,8 @@ const CLAIM_PROJECTION = Object.freeze({
     _id: 1,
     topologyRevision: 1,
     priorDeployedRevision: 1,
+    domainKey: 1,
+    domainLabel: 1,
     status: 1,
     attempts: 1,
     leaseOwner: 1,
@@ -136,6 +138,8 @@ class TopologyOperationRepository {
         operationId: id,
         topologyRevision,
         priorDeployedRevision,
+        domainKey = null,
+        domainLabel = null,
         nodes,
     }) {
         const metadata = nodes.map(durableNodeMetadata);
@@ -143,6 +147,8 @@ class TopologyOperationRepository {
             _id: id,
             topologyRevision,
             priorDeployedRevision,
+            domainKey,
+            domainLabel,
             status: 'queued',
             attempts: 0,
             leaseOwner: '',

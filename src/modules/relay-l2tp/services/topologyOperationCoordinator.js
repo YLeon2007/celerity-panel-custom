@@ -3,6 +3,10 @@
 const { createHash, randomUUID } = require('node:crypto');
 const { compileTopology } = require('../domain/topologyCompiler');
 const {
+    computeTopologyDomains,
+    sliceTopologyToDomain,
+} = require('../domain/topologyDomains');
+const {
     projectGroups,
     projectLinks,
     projectNodes,
@@ -67,12 +71,25 @@ function idFromIdempotencyKey(idempotencyKey) {
 }
 
 function assertQueueInput(input) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)
-        || Object.keys(input).length !== 1
-        || !Object.hasOwn(input, 'expectedTopologyRevision')) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
         throw new TopologyOperationCoordinatorError(
             'INVALID_REQUEST',
-            'Only expectedTopologyRevision is accepted',
+            'Only expectedTopologyRevision (and optionally domainKey) is accepted',
+        );
+    }
+    const keys = Object.keys(input);
+    if (!keys.includes('expectedTopologyRevision')
+        || keys.some(key => key !== 'expectedTopologyRevision' && key !== 'domainKey')) {
+        throw new TopologyOperationCoordinatorError(
+            'INVALID_REQUEST',
+            'Only expectedTopologyRevision (and optionally domainKey) is accepted',
+        );
+    }
+    if (Object.hasOwn(input, 'domainKey')
+        && (typeof input.domainKey !== 'string' || input.domainKey.length === 0)) {
+        throw new TopologyOperationCoordinatorError(
+            'INVALID_REQUEST',
+            'domainKey must be a non-empty string when provided',
         );
     }
     if (!Number.isSafeInteger(input.expectedTopologyRevision)
@@ -83,6 +100,41 @@ function assertQueueInput(input) {
             { expectedTopologyRevision: input.expectedTopologyRevision },
         );
     }
+}
+
+function publicDomainList(domains) {
+    return (Array.isArray(domains) ? domains : []).map(domain => ({
+        key: domain.key,
+        label: domain.label,
+    }));
+}
+
+function selectTopologyDomain({ topology, domainKey, operationId }) {
+    const domains = computeTopologyDomains({ nodes: topology.nodes, links: topology.links });
+    if (typeof domainKey === 'string') {
+        const domain = domains.find(candidate => candidate.key === domainKey);
+        if (!domain) {
+            throw new TopologyOperationCoordinatorError(
+                'TOPOLOGY_DOMAIN_NOT_FOUND',
+                'The requested topology domain does not exist in the current graph',
+                { operationId, domainKey, domains: publicDomainList(domains) },
+            );
+        }
+        return {
+            topology: sliceTopologyToDomain(topology, domain),
+            domain: { key: domain.key, label: domain.label },
+        };
+    }
+    if (domains.length > 1) {
+        throw new TopologyOperationCoordinatorError(
+            'TOPOLOGY_DOMAIN_REQUIRED',
+            'Multiple topology domains exist; deploy requires an explicit domainKey',
+            { operationId, domains: publicDomainList(domains) },
+        );
+    }
+    // 0 or 1 domains: legacy whole-graph semantics (and the singleton
+    // deployedRevision) are preserved unchanged.
+    return { topology, domain: null };
 }
 
 function sanitizeValidationErrors(errors) {
@@ -264,8 +316,9 @@ class TopologyOperationCoordinator {
 
     async queue(input) {
         assertQueueInput(input);
-        const { expectedTopologyRevision } = input;
-        const idempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
+        const { expectedTopologyRevision, domainKey } = input;
+        const idempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`
+            + (typeof domainKey === 'string' ? `:domain-${domainKey}` : '');
         const existing = this.operationsByIdempotencyKey.get(idempotencyKey);
         if (existing) {
             const settled = await existing.then(operation => operation, () => null);
@@ -285,7 +338,7 @@ class TopologyOperationCoordinator {
             }
         }
 
-        const queued = this.queueOnce({ expectedTopologyRevision, idempotencyKey });
+        const queued = this.queueOnce({ expectedTopologyRevision, domainKey, idempotencyKey });
         this.operationsByIdempotencyKey.set(idempotencyKey, queued);
         try {
             return await queued;
@@ -299,7 +352,7 @@ class TopologyOperationCoordinator {
         return this.queue(input);
     }
 
-    async queueOnce({ expectedTopologyRevision, idempotencyKey }) {
+    async queueOnce({ expectedTopologyRevision, domainKey, idempotencyKey }) {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
         const runIdempotencyKey = `${idempotencyKey}:${randomUUID()}`;
@@ -315,7 +368,12 @@ class TopologyOperationCoordinator {
             pinned = await this.topologyRepository.pinTopology({
                 expectedRevision: expectedTopologyRevision,
                 prepare: async snapshot => {
-                    const topology = projectTopology(snapshot);
+                    const projected = projectTopology(snapshot);
+                    const { topology, domain } = selectTopologyDomain({
+                        topology: projected,
+                        domainKey,
+                        operationId,
+                    });
                     const validation = this.validator(topology);
                     if (validation?.valid !== true) {
                         throw new TopologyOperationCoordinatorError(
@@ -341,7 +399,7 @@ class TopologyOperationCoordinator {
                             compiled,
                         }),
                     });
-                    return { topology, frozenPlan };
+                    return { topology, frozenPlan, domain };
                 },
             });
         } catch (error) {
@@ -360,6 +418,8 @@ class TopologyOperationCoordinator {
                 idempotencyKey: runIdempotencyKey,
                 topologyRevision: pinned.revision,
                 priorDeployedRevision: pinned.deployedRevision,
+                domainKey: pinned.domain?.key ?? null,
+                domainLabel: pinned.domain?.label ?? null,
                 nodes: plan.nodes,
             });
         } catch (error) {
@@ -371,6 +431,7 @@ class TopologyOperationCoordinator {
                         operationId,
                         topologyRevision: pinned.revision,
                         status: existing.status ?? 'queued',
+                        ...(pinned.domain ? { domain: pinned.domain } : {}),
                     });
                 }
             }
@@ -385,6 +446,7 @@ class TopologyOperationCoordinator {
             operationId,
             topologyRevision: pinned.revision,
             status: 'queued',
+            ...(pinned.domain ? { domain: pinned.domain } : {}),
         });
     }
 }

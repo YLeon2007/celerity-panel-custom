@@ -87,18 +87,54 @@ class TopologyOperationFinalizationRepository {
                 }, { runValidators: true, session });
                 if (operation?.matchedCount !== 1) rejectFinalization();
 
-                const topology = await this.CascadeTopologyState.updateOne({
-                    _id: 'singleton',
-                    revision: topologyRevision,
-                    deployedRevision: priorDeployedRevision,
-                }, {
-                    $set: { deployedRevision: topologyRevision },
-                }, {
-                    runValidators: true,
-                    session,
-                    timestamps: false,
-                });
-                if (topology?.matchedCount !== 1) rejectFinalization();
+                const topology = request.domainKey
+                    // Per-domain deploy: fence the global draft revision, then
+                    // upsert the domain state document. The singleton
+                    // deployedRevision is left to legacy whole-graph ops.
+                    ? await this.CascadeTopologyState.updateOne({
+                        _id: `domain:${request.domainKey}`,
+                    }, {
+                        $set: {
+                            domainKey: request.domainKey,
+                            label: request.domainLabel ?? null,
+                            revision: topologyRevision,
+                            deployedRevision: topologyRevision,
+                        },
+                    }, {
+                        runValidators: true,
+                        upsert: true,
+                        session,
+                        timestamps: true,
+                    })
+                    : await this.CascadeTopologyState.updateOne({
+                        _id: 'singleton',
+                        revision: topologyRevision,
+                        deployedRevision: priorDeployedRevision,
+                    }, {
+                        $set: { deployedRevision: topologyRevision },
+                    }, {
+                        runValidators: true,
+                        session,
+                        timestamps: false,
+                    });
+                if (topology?.matchedCount !== 1 && !topology?.upsertedCount) rejectFinalization();
+
+                if (request.domainKey) {
+                    // The global draft revision fence still applies to
+                    // domain-scoped ops: the graph must not have changed
+                    // between pin and finalization.
+                    const fence = await this.CascadeTopologyState.updateOne({
+                        _id: 'singleton',
+                        revision: topologyRevision,
+                    }, {
+                        $set: { revision: topologyRevision },
+                    }, {
+                        runValidators: true,
+                        session,
+                        timestamps: false,
+                    });
+                    if (fence?.matchedCount !== 1) rejectFinalization();
+                }
 
                 if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
                     await this.CascadeLink.updateMany(

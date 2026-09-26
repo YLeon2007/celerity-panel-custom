@@ -1072,6 +1072,8 @@ test('delegates terminal success to the atomic finalizer with only operation lea
         leaseUntil: repository.operation.leaseUntil,
         topologyRevision: 7,
         priorDeployedRevision: 5,
+        domainKey: null,
+        domainLabel: null,
     }]);
     assert.deepEqual(
         repository.calls.filter(call => (

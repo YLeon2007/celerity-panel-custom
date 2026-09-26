@@ -115,6 +115,9 @@ const topologyOperationSchema = new mongoose.Schema({
         enum: OPERATION_STATUSES,
         required: true,
     },
+    // Topology domain this operation deploys (null = legacy whole-graph op).
+    domainKey: { type: String, default: null, trim: true },
+    domainLabel: { type: String, default: null, trim: true },
     attempts: { type: Number, min: 0, default: 0, required: true },
     leaseOwner: { type: String, default: '', trim: true },
     leaseUntil: { type: Date, default: null },

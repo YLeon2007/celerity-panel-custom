@@ -443,3 +443,95 @@ test('projects a deterministic status without candidates, leases, backups, or in
     });
     assert.doesNotMatch(JSON.stringify(status), /candidate|lease|worker|backup|secret/i);
 });
+
+function twoDomainSnapshot() {
+    return {
+        revision: 7,
+        deployedRevision: 5,
+        nodes: [
+            { _id: 'portal-a', cascadeRole: 'portal', name: 'PA' },
+            { _id: 'bridge-a', cascadeRole: 'bridge', name: 'BA' },
+            { _id: 'portal-b', cascadeRole: 'portal', name: 'PB' },
+            { _id: 'bridge-b', cascadeRole: 'bridge', name: 'BB' },
+        ],
+        links: [
+            { _id: 'link-a', portalNode: 'portal-a', bridgeNode: 'bridge-a', mode: 'forward', active: true },
+            { _id: 'link-b', portalNode: 'portal-b', bridgeNode: 'bridge-b', mode: 'forward', active: true },
+        ],
+        groups: [],
+    };
+}
+
+function domainHarness(snapshotValue, calls) {
+    return {
+        topologyRepository: {
+            async pinTopology({ prepare }) {
+                const prepared = await prepare(snapshotValue);
+                return {
+                    revision: snapshotValue.revision,
+                    deployedRevision: snapshotValue.deployedRevision,
+                    ...prepared,
+                };
+            },
+        },
+        planMaterializer: {
+            async materialize(input) {
+                calls.push({ method: 'materialize', input });
+                return materializedPlan();
+            },
+        },
+        operationRepository: {
+            async createFrozen(input) {
+                calls.push({ method: 'createFrozen', input });
+                return { _id: input.operationId, status: 'queued', ...input };
+            },
+        },
+        operationWorker: { async run() { return { claimed: false }; } },
+        validator: () => ({ valid: true, errors: [] }),
+        compiler: () => ({ valid: true, errors: [], relays: [] }),
+        idFactory: () => 'operation-domain',
+    };
+}
+
+test('queue without domainKey is rejected when multiple domains exist', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(domainHarness(twoDomainSnapshot(), calls));
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 7 }),
+        error => {
+            assert.equal(error.code, 'TOPOLOGY_DOMAIN_REQUIRED');
+            assert.equal(error.domains.length, 2);
+            return true;
+        },
+    );
+    assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
+});
+
+test('queue with domainKey slices the pinned topology to that domain', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(domainHarness(twoDomainSnapshot(), calls));
+    const result = await coordinator.queue({ expectedTopologyRevision: 7, domainKey: 'bridge-a' });
+    assert.equal(result.status, 'queued');
+    assert.equal(result.domain.key, 'bridge-a');
+    const materialize = calls.find(call => call.method === 'materialize');
+    assert.deepEqual(
+        materialize.input.pinnedSnapshot.topology.nodes.map(node => node.id).sort(),
+        ['bridge-a', 'portal-a'],
+    );
+    assert.deepEqual(
+        materialize.input.pinnedSnapshot.topology.links.map(link => link.id),
+        ['link-a'],
+    );
+    const frozen = calls.find(call => call.method === 'createFrozen').input;
+    assert.equal(frozen.domainKey, 'bridge-a');
+    assert.match(frozen.idempotencyKey, /^topology:test:revision-7:domain-bridge-a:/);
+});
+
+test('queue with an unknown domainKey fails with TOPOLOGY_DOMAIN_NOT_FOUND', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(domainHarness(twoDomainSnapshot(), calls));
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 7, domainKey: 'ghost' }),
+        error => error.code === 'TOPOLOGY_DOMAIN_NOT_FOUND',
+    );
+});

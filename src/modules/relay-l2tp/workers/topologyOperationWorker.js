@@ -155,6 +155,8 @@ function durablePlan(operation, operationId) {
         operationId,
         topologyRevision: operation.topologyRevision,
         priorDeployedRevision: operation.priorDeployedRevision,
+        domainKey: operation.domainKey ?? null,
+        domainLabel: operation.domainLabel ?? null,
         nodes,
     });
 }
@@ -834,6 +836,8 @@ class TopologyOperationWorker {
                     leaseUntil,
                     topologyRevision: plan.topologyRevision,
                     priorDeployedRevision: plan.priorDeployedRevision,
+                    domainKey: plan.domainKey ?? null,
+                    domainLabel: plan.domainLabel ?? null,
                 });
                 if (!finalized) throw new Error('Topology operation finalization was rejected');
             } catch (error) {
