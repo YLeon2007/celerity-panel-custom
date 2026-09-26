@@ -12,10 +12,17 @@
  */
 
 function entityId(entity) {
-    const value = entity !== null && typeof entity === 'object'
-        ? entity.id ?? entity._id ?? entity.nodeId
-        : entity;
-    return value === null || value === undefined ? null : String(value);
+    if (entity === null || entity === undefined) return null;
+    // bson ObjectId exposes a self-referencing `_id` getter and an `id`
+    // getter returning the raw 12-byte Buffer — stringify via toHexString
+    // before the generic object branches to avoid garbage ids (and the
+    // recursion the earlier defaultChainPath fix addressed).
+    if (typeof entity === 'object') {
+        if (typeof entity.toHexString === 'function') return entity.toHexString();
+        const value = entity.id ?? entity._id ?? entity.nodeId;
+        return value === null || value === undefined ? null : entityId(value);
+    }
+    return String(entity);
 }
 
 function linkEndpoints(link) {

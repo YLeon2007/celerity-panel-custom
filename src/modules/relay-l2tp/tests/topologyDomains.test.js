@@ -65,3 +65,26 @@ test('links referencing unknown nodes are ignored; empty graph has no domains', 
     assert.equal(domains.length, 0);
     assert.deepEqual(computeTopologyDomains({}), []);
 });
+
+test('bson ObjectId-shaped ids resolve to hex strings, not raw buffers', () => {
+    // bson ObjectId: `.id` returns the raw 12-byte Buffer, `toHexString()`
+    // returns the canonical id. Regression: entityId used `.id` first and
+    // produced garbage, so every link was ignored and no domains formed.
+    const oid = hex => ({
+        id: Buffer.from(hex, 'hex'),
+        toHexString: () => hex,
+        toString: () => hex,
+    });
+    const nodes = [
+        { _id: oid('6ab18adc63913ebd4a917471'), name: 'P', cascadeRole: 'portal' },
+        { _id: oid('6ab189dc63913ebd4a917399'), name: 'R', cascadeRole: 'relay' },
+    ];
+    const links = [{ _id: oid('6ab6b94cdaac2c5e217b51b0'), portalNode: oid('6ab18adc63913ebd4a917471'), bridgeNode: oid('6ab189dc63913ebd4a917399') }];
+    const domains = computeTopologyDomains({ nodes, links });
+    assert.equal(domains.length, 1);
+    assert.deepEqual(domains[0].nodeIds.slice().sort(), [
+        '6ab189dc63913ebd4a917399',
+        '6ab18adc63913ebd4a917471',
+    ]);
+    assert.deepEqual(domains[0].linkIds, ['6ab6b94cdaac2c5e217b51b0']);
+});
