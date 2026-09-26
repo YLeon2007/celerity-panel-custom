@@ -69,6 +69,8 @@ function validNodeRef(role, nodeRef) {
     if (role === 'relay') return /^relay-[1-9][0-9]*$/.test(nodeRef);
     // Default bridge keeps 'bridge'; geo-routing branch bridges use 'bridge-N'.
     if (role === 'bridge') return /^bridge(-[1-9][0-9]*)?$/.test(nodeRef);
+    // Single-portal chains keep 'portal'; fan-in domains use 'portal-N'.
+    if (role === 'portal') return /^portal(-[1-9][0-9]*)?$/.test(nodeRef);
     return nodeRef === role;
 }
 
