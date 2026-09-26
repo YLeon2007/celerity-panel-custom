@@ -199,11 +199,55 @@ function projectTopology(snapshot) {
 
 function nodeIdsByRef(topology) {
     const nodes = new Map(topology.nodes.map(node => [node.id, node]));
+    const nonGeoLinks = topology.links.filter(link => link.geo !== true);
+
+    // Fan-in: several portal sources converge into a shared trunk. Mirror the
+    // fan-in composer ref scheme: portal-N (sources sorted by id), relay-N
+    // (first-seen path order), 'bridge' (sink), bridge-2+ (geo leaves).
+    const incoming = new Set(nonGeoLinks.map(link => link.target));
+    const sources = topology.nodes
+        .filter(node => node.role === 'portal' && !incoming.has(node.id))
+        .map(node => node.id)
+        .sort((left, right) => left.localeCompare(right, 'en'));
+    if (sources.length > 1) {
+        const outgoing = new Map(nonGeoLinks.map(link => [link.source, link.target]));
+        const result = new Map();
+        sources.forEach((id, index) => result.set(`portal-${index + 1}`, id));
+        const visited = new Set(sources);
+        let relayIndex = 0;
+        let sink = null;
+        for (const source of sources) {
+            let current = source;
+            while (outgoing.has(current)) {
+                current = outgoing.get(current);
+                if (visited.has(current)) continue;
+                visited.add(current);
+                const node = nodes.get(current);
+                if (!node) break;
+                if (node.role === 'relay') result.set(`relay-${++relayIndex}`, current);
+            }
+        }
+        // The sink is the relay-walk terminus shared by every path.
+        const termini = sources.map(source => {
+            let current = source;
+            while (outgoing.has(current)) current = outgoing.get(current);
+            return current;
+        });
+        sink = termini[0];
+        if (sink && termini.every(id => id === sink)) result.set('bridge', sink);
+        topology.nodes
+            .filter(node => node.role === 'bridge' && !visited.has(node.id) && node.id !== sink)
+            .map(node => node.id)
+            .sort((left, right) => left.localeCompare(right, 'en'))
+            .forEach((id, index) => result.set(`bridge-${index + 2}`, id));
+        return result;
+    }
+
     // Walk the MAIN chain only: at a branching node (relay with geo-routing
     // leaf links) a collapsed map would follow whatever link sorted last and
     // bind the wrong bridge to the 'bridge' ref.
     const outgoing = new Map(
-        topology.links.filter(link => link.geo !== true).map(link => [link.source, link.target]),
+        nonGeoLinks.map(link => [link.source, link.target]),
     );
     const portal = topology.nodes.find(node => node.role === 'portal');
     const result = new Map();
