@@ -63,8 +63,9 @@ const topologyNodeSchema = new mongoose.Schema({
     },
     nodeRef: {
         type: String,
-        // 'bridge-N' refs belong to geo-routing branch bridges.
-        match: /^(?:portal|bridge(?:-[1-9][0-9]*)?|relay-[1-9][0-9]*)$/,
+        // 'bridge-N' refs belong to geo-routing branch bridges; 'portal-N'
+        // refs belong to multi-portal fan-in domains.
+        match: /^(?:portal(?:-[1-9][0-9]*)?|bridge(?:-[1-9][0-9]*)?|relay-[1-9][0-9]*)$/,
         required: true,
     },
     role: {
