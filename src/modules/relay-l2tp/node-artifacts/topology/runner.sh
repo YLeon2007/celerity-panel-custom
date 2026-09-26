@@ -145,6 +145,36 @@ file_hash_matches() {
     [[ "sha256:$digest" == "$CANDIDATE_HASH" ]]
 }
 
+# Semantic equality between the staged candidate and the live config, ignoring
+# the user-managed fragment (inbounds[].settings.clients). VPN users are synced
+# to portal nodes out of band by the panel's user sync, so the live portal
+# config legitimately differs from the topology candidate there; treating that
+# as drift would force a config swap + service restart (and a brief user
+# wipeout) on every single deploy even when the tunnel wiring is unchanged.
+configs_equivalent() {
+    [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] || return 1
+    /usr/bin/python3 - "$CANDIDATE_PATH" "$CONFIG_PATH" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+def canonical(path):
+    with open(path, 'rb') as handle:
+        document = json.loads(handle.read().decode('utf-8'))
+    if not isinstance(document, dict):
+        raise SystemExit(1)
+    for inbound in document.get('inbounds', []):
+        if not isinstance(inbound, dict):
+            continue
+        settings = inbound.get('settings')
+        if isinstance(settings, dict) and isinstance(settings.get('clients'), list):
+            settings['clients'] = []
+    return json.dumps(document, sort_keys=True, separators=(',', ':'))
+
+if canonical(sys.argv[1]) != canonical(sys.argv[2]):
+    raise SystemExit(1)
+PY
+}
+
 candidate_structure_valid() {
     local target="$1"
     /usr/bin/python3 - "$target" >/dev/null 2>&1 <<'PY'
@@ -326,11 +356,12 @@ commit_candidate() {
     local target_parent temporary
     assert_bound_state
     file_hash_matches "$CANDIDATE_PATH" || fail 'CANDIDATE_HASH_MISMATCH' 65
-    # No-op fast path: the live config already matches the candidate byte for
-    # byte. Skipping the swap + service restart keeps unchanged nodes fully
-    # online and makes small domain-scoped changes (e.g. one link's
-    # fingerprint) cheap, while verify still proves the service afterwards.
-    if file_hash_matches "$CONFIG_PATH"; then
+    # No-op fast path: the live config already matches the candidate (byte for
+    # byte, or semantically once the user-managed clients are ignored).
+    # Skipping the swap + service restart keeps unchanged nodes fully online
+    # and makes small domain-scoped changes (e.g. one link's fingerprint)
+    # cheap, while verify still proves the service afterwards.
+    if file_hash_matches "$CONFIG_PATH" || configs_equivalent; then
         emit_receipt
         return 0
     fi
@@ -356,7 +387,7 @@ commit_candidate() {
 verify_candidate() {
     local port listeners
     assert_bound_state
-    file_hash_matches "$CONFIG_PATH" || fail 'VERIFICATION_FAILED' 65
+    file_hash_matches "$CONFIG_PATH" || configs_equivalent || fail 'VERIFICATION_FAILED' 65
     [[ -x "$XRAY_PATH" && -x "$SYSTEMCTL_PATH" ]] \
         || fail 'VERIFICATION_UNAVAILABLE' 69
     [[ -d "$XRAY_ASSET_DIR" && ! -L "$XRAY_ASSET_DIR" \
