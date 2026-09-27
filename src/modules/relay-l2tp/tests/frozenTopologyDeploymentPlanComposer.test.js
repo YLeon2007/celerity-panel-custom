@@ -716,3 +716,69 @@ test('rejects a linear chain with two portals (role flipped mid-chain)', () => {
         },
     );
 });
+
+test('composes a mixed forward/reverse linear chain hop-by-hop', () => {
+    const input = reverseChainInput();
+    // portal -> relay stays forward; relay -> bridge flips to reverse
+    // (bridge dials the relay, e.g. when the forward hop is blocked).
+    input.snapshot.links.find(link => link.id === 'link-portal-relay-object-id').mode = 'forward';
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+
+    assert.equal(plan.mode, 'mixed');
+    const byRef = new Map(plan.nodes.map(node => [node.nodeRef, node]));
+
+    // Portal originates the forward hop and routes clients into it.
+    const portal = candidateConfig(byRef.get('portal'));
+    const fwdOutbound = portal.outbounds.find(outbound => String(outbound.tag).startsWith('fwd-'));
+    assert.ok(fwdOutbound, 'portal must originate the forward hop outbound');
+    assert.ok(portal.routing.rules.some(rule => (
+        rule.inboundTag?.includes('client-portal') && rule.outboundTag === fwdOutbound.tag
+    )));
+    assert.equal(portal.reverse, undefined, 'portal has no reverse artifacts');
+
+    // Relay terminates the forward hop and hosts the reverse portal for the
+    // downstream link; hop traffic re-originates into the reverse portal.
+    const relay = candidateConfig(byRef.get('relay-1'));
+    const hopInbound = relay.inbounds.find(inbound => String(inbound.tag).startsWith('fwd-hop-'));
+    assert.ok(hopInbound, 'relay must bind the forward hop inbound');
+    assert.equal(hopInbound.port, 12001);
+    const conn = relay.inbounds.find(inbound => String(inbound.tag).startsWith('bridge-conn-'));
+    assert.ok(conn, 'relay must bind the reverse connector inbound');
+    assert.equal(conn.port, 12002);
+    const portalEntry = (relay.reverse?.portals || [])[0];
+    assert.ok(portalEntry, 'relay must declare the reverse portal for its downstream link');
+    assert.ok(relay.routing.rules.some(rule => (
+        rule.inboundTag?.includes(hopInbound.tag) && rule.outboundTag === portalEntry.tag
+    )), 'forward hop exit must route into the reverse portal');
+    assert.ok(
+        !relay.outbounds.some(outbound => String(outbound.tag).startsWith('fwd-')),
+        'relay must not dial forward for a reverse downstream link',
+    );
+
+    // Bridge dials the relay (reverse bridge) and exits directly.
+    const bridge = candidateConfig(byRef.get('bridge'));
+    const bridgeEntry = (bridge.reverse?.bridges || [])[0];
+    assert.ok(bridgeEntry, 'bridge must declare the reverse bridge');
+    const tunnel = bridge.outbounds.find(outbound => String(outbound.tag).startsWith('tunnel-'));
+    assert.ok(tunnel, 'bridge must have the reverse tunnel outbound');
+    assert.equal(tunnel.settings?.vnext?.[0]?.address, '192.0.2.2', 'tunnel dials the relay');
+    assert.equal(tunnel.settings?.vnext?.[0]?.port, 12002);
+    assert.ok(bridge.routing.rules.some(rule => (
+        rule.inboundTag?.includes(bridgeEntry.tag) && rule.outboundTag === 'direct'
+    )));
+
+    // The relay listens on both links (forward target + reverse source), plus
+    // the loopback L2TP path ingress ports from the route group.
+    const relayPorts = byRef.get('relay-1').checks
+        .filter(check => check.type === 'port').map(check => check.port);
+    assert.ok(relayPorts.includes(12001));
+    assert.ok(relayPorts.includes(12002));
+    const bridgePorts = byRef.get('bridge').checks
+        .filter(check => check.type === 'port').map(check => check.port);
+    assert.deepEqual(bridgePorts, []);
+
+    // Listener-first order: relay (listener of both links) deploys first.
+    const order = plan.nodes.map(node => node.nodeRef);
+    assert.ok(order.indexOf('relay-1') < order.indexOf('portal'));
+    assert.ok(order.indexOf('relay-1') < order.indexOf('bridge'));
+});

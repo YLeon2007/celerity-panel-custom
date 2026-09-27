@@ -158,13 +158,93 @@ test('fan-in: geo branch off a non-common node is rejected', () => {
     );
 });
 
-test('fan-in: reverse mode is rejected explicitly', () => {
+test('fan-in: mixed forward/reverse links compose hop-by-hop', () => {
+    const input = fanInInput();
+    // pb -> rm becomes reverse: rm dials pb (pb hosts the reverse portal).
+    input.snapshot.links.find(link => link.id === 'link-3').mode = 'reverse';
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.equal(plan.mode, 'mixed');
+    assert.equal(plan.nodes.length, 6);
+
+    const byRef = planByRef(plan);
+
+    // Portal-2 hosts the reverse portal for link-3 and routes its clients in.
+    const portalTwo = candidateJson(byRef.get('portal-2'));
+    const conn = portalTwo.inbounds.find(inbound => String(inbound.tag).startsWith('bridge-conn-'));
+    assert.ok(conn, 'portal-2 must bind the reverse connector inbound');
+    assert.equal(conn.port, 10103);
+    const portalEntry = (portalTwo.reverse?.portals || [])[0];
+    assert.ok(portalEntry, 'portal-2 must declare a reverse portal');
+    assert.ok(portalTwo.routing.rules.some(rule => (
+        rule.inboundTag?.includes('client-portal-2') && rule.outboundTag === portalEntry.tag
+    )), 'portal-2 clients must route into the reverse portal');
+    assert.ok(
+        !portalTwo.outbounds.some(outbound => String(outbound.tag).startsWith('fwd-')),
+        'portal-2 must not originate a forward outbound for a reverse link',
+    );
+
+    // Relay-2 dials portal-2 (reverse bridge) and re-originates downstream:
+    // upstream exits (reverse bridge tag + forward hop inbound) route into the
+    // default downstream outbound.
+    const mergeRelay = candidateJson(byRef.get('relay-2'));
+    const bridgeEntry = (mergeRelay.reverse?.bridges || [])[0];
+    assert.ok(bridgeEntry, 'relay-2 must declare a reverse bridge for link-3');
+    const tunnel = mergeRelay.outbounds.find(outbound => String(outbound.tag).startsWith('tunnel-'));
+    assert.ok(tunnel, 'relay-2 must have a reverse tunnel outbound');
+    assert.equal(
+        tunnel.settings?.vnext?.[0]?.address,
+        '192.0.2.2',
+        'reverse tunnel must dial portal-2',
+    );
+    assert.equal(tunnel.settings?.vnext?.[0]?.port, 10103);
+    const hopInbound = mergeRelay.inbounds.find(inbound => String(inbound.tag).startsWith('fwd-hop-'));
+    assert.ok(hopInbound, 'relay-2 keeps the forward hop inbound for link-2');
+    assert.equal(hopInbound.port, 10102);
+    const fwdOutbound = mergeRelay.outbounds.find(outbound => String(outbound.tag).startsWith('fwd-'));
+    assert.ok(fwdOutbound, 'relay-2 originates the default downstream outbound');
+    assert.ok(mergeRelay.routing.rules.some(rule => (
+        rule.inboundTag?.includes(bridgeEntry.tag) && rule.outboundTag === fwdOutbound.tag
+    )), 'reverse tunnel exit must route into the downstream outbound');
+    assert.ok(mergeRelay.routing.rules.some(rule => (
+        rule.inboundTag?.includes(hopInbound.tag) && rule.outboundTag === fwdOutbound.tag
+    )), 'forward hop inbound must route into the downstream outbound');
+
+    // Deployment order: the reverse listener (portal-2) deploys before its
+    // dialer (relay-2); forward listeners keep target-first ordering.
+    const order = plan.nodes.map(node => node.nodeRef);
+    assert.ok(order.indexOf('portal-2') < order.indexOf('relay-2'), 'reverse listener before dialer');
+    assert.ok(order.indexOf('bridge') < order.indexOf('relay-2'));
+    assert.ok(order.indexOf('relay-2') < order.indexOf('relay-1'));
+    assert.ok(order.indexOf('relay-1') < order.indexOf('portal-1'));
+
+    // Verify checks follow per-link listeners: portal-2 expects the reverse
+    // connector port, relay-2 the forward hop port of link-2.
+    const portalTwoChecks = byRef.get('portal-2').checks
+        .filter(check => check.type === 'port').map(check => check.port);
+    assert.ok(portalTwoChecks.includes(10103));
+    const relayTwoChecks = byRef.get('relay-2').checks
+        .filter(check => check.type === 'port').map(check => check.port);
+    assert.ok(relayTwoChecks.includes(10102));
+    assert.ok(relayTwoChecks.includes(10104) === false, 'dialer does not listen on link-4 port');
+});
+
+test('fan-in: uniform reverse domain composes hop-by-hop', () => {
     const input = fanInInput();
     for (const link of input.snapshot.links) link.mode = 'reverse';
-    assert.throws(
-        () => composeFrozenTopologyDeploymentPlan(input),
-        error => error.code === 'FAN_IN_REVERSE_UNSUPPORTED',
-    );
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.equal(plan.mode, 'reverse');
+    assert.equal(plan.nodes.length, 6);
+    const byRef = planByRef(plan);
+    // Every portal hosts a reverse portal; the sink dials upstream.
+    const portalOne = candidateJson(byRef.get('portal-1'));
+    assert.ok((portalOne.reverse?.portals || []).length === 1);
+    const bridge = candidateJson(byRef.get('bridge'));
+    assert.ok((bridge.reverse?.bridges || []).length === 1, 'sink dials its reverse upstream');
+    assert.ok(bridge.routing.rules.some(rule => rule.outboundTag === 'direct'));
+    // Reverse listeners are link sources: sources deploy before targets.
+    const order = plan.nodes.map(node => node.nodeRef);
+    assert.ok(order.indexOf('portal-1') < order.indexOf('relay-1'));
+    assert.ok(order.indexOf('relay-2') < order.indexOf('bridge'));
 });
 
 test('fan-in: a node with two non-geo outgoing links is rejected', () => {

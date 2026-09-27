@@ -201,7 +201,7 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
     const incoming = new Map();
     const geoOutgoing = new Map();
     const geoIncoming = new Map();
-    let mode = null;
+    const linkModes = new Set();
     for (const [id, link] of linksById) {
         const source = entityId(link.source ?? link.portalNode);
         const target = entityId(link.target ?? link.bridgeNode);
@@ -217,13 +217,11 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
                 'Topology v1 supports only forward or reverse links',
             );
         }
-        if (mode !== null && mode !== link.mode) {
-            throw new FrozenTopologyDeploymentPlanError(
-                'MIXED_TOPOLOGY_MODES',
-                'Topology v1 does not support mixed link modes',
-            );
-        }
-        mode = link.mode;
+        // Link mode is per-hop: forward = source dials target, reverse =
+        // target dials source. Mixed modes within one domain are supported
+        // (RKN may block a forward tunnel while its reverse variant works),
+        // so uniformity is deliberately NOT enforced here.
+        linkModes.add(link.mode);
         const entry = { id, link, source, target };
         if (geoLeafLinkIds.has(id)) {
             // Geo-routing leaf: must hang off a main-chain node and terminate
@@ -342,7 +340,12 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
     // construction (incoming/outgoing uniqueness), so no extra check needed.
     geoLeafNodes.sort((left, right) => left.id.localeCompare(right.id, 'en'));
 
-    return { mode, orderedNodes, orderedLinks, geoLeafNodes };
+    return {
+        mode: linkModes.size === 1 ? [...linkModes][0] : 'mixed',
+        orderedNodes,
+        orderedLinks,
+        geoLeafNodes,
+    };
 }
 
 function topologyRefs(orderedNodes, geoLeafNodes = []) {
@@ -406,7 +409,7 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
     const incoming = new Map(); // target -> entry[] (non-geo, fan-in allowed)
     const geoOutgoing = new Map();
     const geoIncoming = new Map();
-    let mode = null;
+    const linkModes = new Set();
     for (const [id, link] of linksById) {
         const source = entityId(link.source ?? link.portalNode);
         const target = entityId(link.target ?? link.bridgeNode);
@@ -422,13 +425,9 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
                 'Topology v1 supports only forward or reverse links',
             );
         }
-        if (mode !== null && mode !== link.mode) {
-            throw new FrozenTopologyDeploymentPlanError(
-                'MIXED_TOPOLOGY_MODES',
-                'Topology v1 does not support mixed link modes',
-            );
-        }
-        mode = link.mode;
+        // Per-hop link modes (mixed forward/reverse fan-in included) are
+        // supported; uniformity is deliberately not enforced.
+        linkModes.add(link.mode);
         const entry = { id, link, source, target };
         if (geoLeafLinkIds.has(id)) {
             if (!geoOutgoing.has(source)) geoOutgoing.set(source, new Map());
@@ -451,13 +450,6 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
         outgoing.set(source, entry);
         if (!incoming.has(target)) incoming.set(target, []);
         incoming.get(target).push(entry);
-    }
-
-    if (mode === 'reverse') {
-        throw new FrozenTopologyDeploymentPlanError(
-            'FAN_IN_REVERSE_UNSUPPORTED',
-            'Multi-portal fan-in domains currently support only forward links',
-        );
     }
 
     const sources = [...outgoing.keys()]
@@ -639,7 +631,7 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
     }
 
     return {
-        mode,
+        mode: linkModes.size === 1 ? [...linkModes][0] : 'mixed',
         fanIn: true,
         portalPaths,
         orderedNodes,
@@ -1152,6 +1144,217 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
     return { configs, ingressByNodeId };
 }
 
+/**
+ * Hop-by-hop candidate builder for domains whose links mix forward and
+ * reverse modes, and for non-forward fan-in domains. Unlike the uniform
+ * forward builders there is no proxySettings nesting here: every hop
+ * terminates the upstream tunnel and re-originates traffic into its
+ * downstream link.
+ *
+ * Per link L = (source S, target T, mode M) traffic always flows S -> T:
+ * - forward: S originates outbound fwd-<ref8> towards T; T binds hop inbound
+ *   fwd-hop-<ref8>.
+ * - reverse: S binds the reverse portal (portal-<ref8> control block plus
+ *   bridge-conn-<ref8> connector inbound); T dials S (reverse bridge
+ *   bridge-<ref8> control block plus tunnel-<ref8> outbound).
+ *
+ * Routing per node: portal routes client inbound tags, relay routes upstream
+ * tunnel exit tags (plus loopback L2TP path ingress) into the default
+ * downstream artifact; geo-branch rules are placed before the default rule;
+ * terminal nodes (default sink, geo leaves) route exits to 'direct'.
+ */
+function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [] }) {
+    const byEntryId = (left, right) => left.id.localeCompare(right.id, 'en');
+    const geoLeafNodes = chain.geoLeafNodes || [];
+    const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
+    const nodeConfigsById = new Map(allChainNodes.map(({ id, node }) => [
+        id,
+        projectNodeConfig(nodeMetadataById.get(id), node, refs.get(id)),
+    ]));
+    const allEntries = [
+        ...chain.orderedLinks,
+        ...geoLeafNodes.map(leaf => leaf.link),
+    ];
+    const projectedByEntryId = new Map(allEntries.map((entry, index) => [
+        entry.id,
+        projectCascadeLink(entry, index, linkMetadataById.get(entry.id), nodeConfigsById),
+    ]));
+
+    const geoLeafLinkIds = new Set(geoLeafNodes.map(leaf => leaf.link.id));
+    const incoming = new Map(); // target -> entry[] (non-geo)
+    const outgoing = new Map(); // source -> entry (non-geo)
+    const geoIncoming = new Map(); // geo leaf node id -> entry
+    const geoBySource = new Map(); // branch source node id -> entry[]
+    for (const entry of allEntries) {
+        if (geoLeafLinkIds.has(entry.id)) {
+            geoIncoming.set(entry.target, entry);
+            const list = geoBySource.get(entry.source) || [];
+            list.push(entry);
+            geoBySource.set(entry.source, list);
+            continue;
+        }
+        outgoing.set(entry.source, entry);
+        if (!incoming.has(entry.target)) incoming.set(entry.target, []);
+        incoming.get(entry.target).push(entry);
+    }
+
+    const ref8 = entry => String(projectedByEntryId.get(entry.id)._id).slice(-8);
+    const egressTagOf = entry => entry.link.mode === 'reverse'
+        ? `portal-${ref8(entry)}`
+        : `fwd-${ref8(entry)}`;
+    const exitTagOf = entry => entry.link.mode === 'reverse'
+        ? `bridge-${ref8(entry)}`
+        : `fwd-hop-${ref8(entry)}`;
+
+    const configs = new Map();
+    const ingressByNodeId = new Map();
+
+    for (const { id, node } of allChainNodes) {
+        const nodeConfig = nodeConfigsById.get(id);
+        let config = parseGeneratedConfig(configGenerator.generateXrayConfig(nodeConfig, []));
+        if (node.role === 'portal') {
+            configGenerator.applyXrayApi(config, nodeConfig.xray.apiPort || 61000);
+        } else if (node.role === 'relay') {
+            config = stripServerInbounds(config, nodeConfig);
+        }
+
+        const ups = (incoming.get(id) || []).slice().sort(byEntryId);
+        const geoLeafEntry = geoIncoming.get(id) || null;
+        const downstream = outgoing.get(id) || null;
+        const branches = (geoBySource.get(id) || []).slice().sort(byEntryId);
+        const isTerminal = !downstream; // default sink or geo leaf
+
+        // Upstream tunnel artifacts (listener or dialer side per link mode).
+        // Exit routing rules are emitted below, after geo-branch rules.
+        const forwardUps = ups.filter(entry => entry.link.mode === 'forward');
+        const reverseUps = ups.filter(entry => entry.link.mode === 'reverse');
+        if (geoLeafEntry) {
+            (geoLeafEntry.link.mode === 'forward' ? forwardUps : reverseUps).push(geoLeafEntry);
+        }
+        if (forwardUps.length > 0) {
+            configGenerator.applyForwardHopInbound(
+                config,
+                forwardUps.map(entry => projectedByEntryId.get(entry.id)),
+                null,
+            );
+        }
+        if (reverseUps.length > 0) {
+            configGenerator.applyReverseBridge(
+                config,
+                reverseUps.map(entry => projectedByEntryId.get(entry.id)),
+                null,
+            );
+        }
+
+        // Downstream tunnel artifacts: default link plus geo branches.
+        const downstreamArtifacts = [...(downstream ? [downstream] : []), ...branches];
+        for (const entry of downstreamArtifacts) {
+            const projected = projectedByEntryId.get(entry.id);
+            if (entry.link.mode === 'reverse') {
+                configGenerator.applyReversePortal(config, [projected], []);
+            } else {
+                configGenerator.applyForwardChain(config, [projected], [], []);
+            }
+        }
+
+        // Ingress tags this node routes onwards: portals route client
+        // inbounds; relays and terminal nodes route upstream tunnel exits.
+        const transitTags = [
+            ...ups.map(exitTagOf),
+            ...(geoLeafEntry ? [exitTagOf(geoLeafEntry)] : []),
+        ];
+        const ingressTags = node.role === 'portal' ? clientInboundTags(nodeConfig) : transitTags;
+
+        // Loopback L2TP path ingress on relays: socks -> default downstream.
+        if (node.role === 'relay' && downstream) {
+            const ingress = relayPathIngress(groups, downstream.id, egressTagOf(downstream));
+            if (ingress.length > 0) {
+                configGenerator.applyCascadePathIngress(config, ingress);
+                ingressByNodeId.set(id, ingress);
+            }
+        }
+
+        // Geo-branch rules first, so branch matches win over the default rule.
+        for (const entry of branches) {
+            const geo = projectGeoRouting(linkMetadataById.get(entry.id)) || {};
+            const tag = egressTagOf(entry);
+            if (Array.isArray(geo.domains) && geo.domains.length > 0) {
+                config.routing.rules.push({
+                    type: 'field',
+                    inboundTag: ingressTags,
+                    domain: geo.domains.map(item => (item.includes(':') ? item : `geosite:${item}`)),
+                    outboundTag: tag,
+                });
+            }
+            if (Array.isArray(geo.geoip) && geo.geoip.length > 0) {
+                config.routing.rules.push({
+                    type: 'field',
+                    inboundTag: ingressTags,
+                    ip: geo.geoip.map(item => (item.includes(':') ? item : `geoip:${item}`)),
+                    outboundTag: tag,
+                });
+            }
+        }
+        if (isTerminal) {
+            for (const entry of [...ups, ...(geoLeafEntry ? [geoLeafEntry] : [])]) {
+                config.routing.rules.push({
+                    type: 'field',
+                    inboundTag: [exitTagOf(entry)],
+                    outboundTag: 'direct',
+                });
+            }
+        } else if (ingressTags.length > 0) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: ingressTags,
+                outboundTag: egressTagOf(downstream),
+            });
+        }
+
+        configGenerator.ensurePrivateIpBlock(config);
+        config = composeXrayConfig(config, []);
+        configs.set(id, config);
+    }
+
+    return { configs, ingressByNodeId };
+}
+
+/**
+ * Deployment order with per-hop listener-first guarantees: for every link,
+ * the node hosting the tunnel listener (forward: target; reverse: source)
+ * is deployed before the node that dials it. Deterministic (id-ascending)
+ * tie-break. Uniform-mode chains keep their legacy downstream-first order.
+ */
+function mixedDeploymentOrder(chain) {
+    const geoLeafNodes = chain.geoLeafNodes || [];
+    const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
+    const nodeIds = allChainNodes.map(({ id }) => id);
+    const allEntries = [...chain.orderedLinks, ...geoLeafNodes.map(leaf => leaf.link)];
+    const deps = new Map(nodeIds.map(id => [id, new Set()])); // node -> nodes deployed earlier
+    for (const entry of allEntries) {
+        const listener = entry.link.mode === 'reverse' ? entry.source : entry.target;
+        const dialer = entry.link.mode === 'reverse' ? entry.target : entry.source;
+        if (listener !== dialer) deps.get(dialer)?.add(listener);
+    }
+    const order = [];
+    const placed = new Set();
+    while (order.length < nodeIds.length) {
+        const ready = nodeIds
+            .filter(id => !placed.has(id) && [...deps.get(id)].every(dep => placed.has(dep)))
+            .sort((left, right) => left.localeCompare(right, 'en'));
+        if (ready.length === 0) {
+            // Defensive: topological graphs should never cycle; fall back to
+            // remaining ids so the plan stays complete rather than dropping nodes.
+            ready.push(...nodeIds.filter(id => !placed.has(id)).sort((a, b) => a.localeCompare(b, 'en')));
+        }
+        for (const id of ready) {
+            placed.add(id);
+            order.push(id);
+        }
+    }
+    return order;
+}
+
 function canonicalize(value) {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (!isPlainObject(value)) return value;
@@ -1160,11 +1363,13 @@ function canonicalize(value) {
     );
 }
 
-function candidateForNode({ mode, nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [] }) {
+function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [] }) {
     const target = TARGETS_BY_ROLE[node.role];
+    // Tunnel listeners live on the target of forward links and on the source
+    // of reverse links (the dialer connects to them).
     const listeningPorts = [...new Set([
         ...orderedLinks
-            .filter(entry => (mode === 'reverse' ? entry.source : entry.target) === nodeId)
+            .filter(entry => (entry.link.mode === 'reverse' ? entry.source : entry.target) === nodeId)
             .map(entry => assertPort(linkMetadataById.get(entry.id).tunnelPort)),
         ...ingressPorts,
     ])].sort((left, right) => left - right);
@@ -1328,12 +1533,18 @@ function composeFrozenTopologyDeploymentPlan({
     const refs = chain.fanIn === true
         ? topologyFanInRefs(chain)
         : topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
+    // Mixed-mode domains (and fan-in domains with any reverse link) are built
+    // hop-by-hop; uniform domains keep their legacy builders.
+    const useMixedBuilder = chain.mode === 'mixed'
+        || (chain.fanIn === true && chain.mode !== 'forward');
     let candidateConfigsById;
     let ingressByNodeId;
     try {
-        ({ configs: candidateConfigsById, ingressByNodeId } = (chain.fanIn === true
-            ? buildFanInCandidateConfigs
-            : buildCandidateConfigs)({
+        ({ configs: candidateConfigsById, ingressByNodeId } = (useMixedBuilder
+            ? buildMixedCandidateConfigs
+            : chain.fanIn === true
+                ? buildFanInCandidateConfigs
+                : buildCandidateConfigs)({
             chain,
             refs,
             nodeMetadataById,
@@ -1350,18 +1561,27 @@ function composeFrozenTopologyDeploymentPlan({
     // Deployment order keeps endpoints first for forward chains (bridges
     // before their upstream) and source-first for reverse chains; geo bridges
     // deploy alongside the default bridge. Fan-in domains order chain nodes
-    // by distance to the sink instead of a linear reverse.
-    const chainDeploymentNodes = chain.fanIn === true
-        ? [...chain.orderedNodes].sort((left, right) => (
-            (chain.distToSink.get(left.id) - chain.distToSink.get(right.id))
-            || left.id.localeCompare(right.id, 'en')
-        ))
-        : [...chain.orderedNodes].reverse();
-    const deploymentOrder = chain.mode === 'forward'
-        ? [...chain.geoLeafNodes, ...chainDeploymentNodes]
-        : [...chain.orderedNodes, ...chain.geoLeafNodes];
+    // by distance to the sink instead of a linear reverse. Mixed domains use
+    // a per-link listener-first topological order instead.
+    let deploymentOrder;
+    if (useMixedBuilder) {
+        const orderIds = mixedDeploymentOrder(chain);
+        const byId = new Map(
+            [...chain.orderedNodes, ...chain.geoLeafNodes].map(entry => [entry.id, entry]),
+        );
+        deploymentOrder = orderIds.map(id => byId.get(id));
+    } else {
+        const chainDeploymentNodes = chain.fanIn === true
+            ? [...chain.orderedNodes].sort((left, right) => (
+                (chain.distToSink.get(left.id) - chain.distToSink.get(right.id))
+                || left.id.localeCompare(right.id, 'en')
+            ))
+            : [...chain.orderedNodes].reverse();
+        deploymentOrder = chain.mode === 'forward'
+            ? [...chain.geoLeafNodes, ...chainDeploymentNodes]
+            : [...chain.orderedNodes, ...chain.geoLeafNodes];
+    }
     const nodes = deploymentOrder.map(({ id, node }) => candidateForNode({
-        mode: chain.mode,
         nodeId: id,
         node,
         nodeRef: refs.get(id),

@@ -1271,43 +1271,7 @@ function generateCombinedBridgeConfig(links, options = {}) {
             throw new Error(`Portal node is not populated for cascade link ${link.name || link._id}`);
         }
 
-        const tunnelDomain = getCascadeTunnelDomain(link);
-        const protocol = link.tunnelProtocol || 'vless';
-        const linkIdShort = String(link._id).slice(-8);
-        const bridgeTag = `bridge-${linkIdShort}`;
-        const tunnelTag = `tunnel-${linkIdShort}`;
-
-        const tunnelOutbound = {
-            tag: tunnelTag,
-            protocol,
-            settings: {
-                vnext: [{
-                    address: portalNode.ip,
-                    port: link.tunnelPort || 10086,
-                    users: [buildOutboundUser(link.tunnelUuid, protocol)],
-                }],
-            },
-            streamSettings: buildCascadeTunnelStreamSettings(link),
-        };
-        if (link.muxEnabled) {
-            tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
-        }
-
-        config.reverse.bridges.push({ tag: bridgeTag, domain: tunnelDomain });
-        config.outbounds.unshift(tunnelOutbound);
-
-        config.routing.rules.push(
-            {
-                type: 'field',
-                domain: [`full:${tunnelDomain}`],
-                outboundTag: tunnelTag,
-            },
-            {
-                type: 'field',
-                inboundTag: [bridgeTag],
-                outboundTag: 'freedom',
-            }
-        );
+        applyReverseBridge(config, [link], 'freedom');
     }
 
     // No working IPv6 egress on bridge hosts: reject IPv6 targets instantly
@@ -1905,7 +1869,7 @@ function generateForwardHopConfig(linkOrLinks) {
  * @param {Object} config - Parsed Xray config object (mutated in place)
  * @param {Array} hopLinks - CascadeLink documents where this node is bridgeNode (forward mode)
  */
-function applyForwardHopInbound(config, hopLinks) {
+function applyForwardHopInbound(config, hopLinks, egressTag = 'direct') {
     if (!hopLinks || hopLinks.length === 0) return;
 
     config.inbounds = config.inbounds || [];
@@ -1935,12 +1899,86 @@ function applyForwardHopInbound(config, hopLinks) {
 
         // proxySettings.tag builds the full chained path on the entry node.
         // Intermediate hops act as transport proxies and should forward the
-        // decoded stream directly to the next target address.
+        // decoded stream directly to the next target address. Mixed-mode
+        // (hop-by-hop) compositions pass an explicit egressTag pointing at the
+        // downstream tunnel artifact; null suppresses the rule entirely so the
+        // caller can place it after any geo-branch rules.
+        if (egressTag !== null) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: [inboundTag],
+                outboundTag: egressTag,
+            });
+        }
+    }
+}
+
+/**
+ * Apply the bridge (dialer) side of reverse cascade links to an existing
+ * Xray config object. For every link this node dials the portal (source),
+ * installs a reverse bridge (tag bridge-<id8>) plus the tunnel outbound, and
+ * routes traffic leaving the reverse tunnel to `egressTag` ('freedom' on exit
+ * bridges, the downstream tunnel artifact on relays). Pass egressTag=null to
+ * skip the exit rule — mixed-mode composers emit it themselves, ordered after
+ * geo-branch rules. The full:tunnelDomain -> tunnel outbound rule (reverse
+ * control channel) is always installed.
+ *
+ * @param {Object} config - Parsed Xray config object (mutated in place)
+ * @param {Array} links - Reverse-mode CascadeLink documents (this node is bridgeNode)
+ * @param {string|null} egressTag - Where tunnel-exit traffic goes
+ */
+function applyReverseBridge(config, links, egressTag = 'freedom') {
+    if (!links || links.length === 0) return;
+
+    config.reverse = config.reverse || {};
+    config.reverse.bridges = config.reverse.bridges || [];
+    config.outbounds = config.outbounds || [];
+    config.routing = config.routing || { rules: [] };
+    config.routing.rules = config.routing.rules || [];
+
+    for (const link of links) {
+        const portalNode = link.portalNode;
+        if (!portalNode || !portalNode.ip) {
+            throw new Error(`Portal node is not populated for cascade link ${link.name || link._id}`);
+        }
+
+        const tunnelDomain = getCascadeTunnelDomain(link);
+        const protocol = link.tunnelProtocol || 'vless';
+        const linkIdShort = String(link._id).slice(-8);
+        const bridgeTag = `bridge-${linkIdShort}`;
+        const tunnelTag = `tunnel-${linkIdShort}`;
+
+        const tunnelOutbound = {
+            tag: tunnelTag,
+            protocol,
+            settings: {
+                vnext: [{
+                    address: portalNode.ip,
+                    port: link.tunnelPort || 10086,
+                    users: [buildOutboundUser(link.tunnelUuid, protocol)],
+                }],
+            },
+            streamSettings: buildCascadeTunnelStreamSettings(link),
+        };
+        if (link.muxEnabled) {
+            tunnelOutbound.mux = { enabled: true, concurrency: link.muxConcurrency || 8 };
+        }
+
+        config.reverse.bridges.push({ tag: bridgeTag, domain: tunnelDomain });
+        config.outbounds.unshift(tunnelOutbound);
+
         config.routing.rules.push({
             type: 'field',
-            inboundTag: [inboundTag],
-            outboundTag: 'direct',
+            domain: [`full:${tunnelDomain}`],
+            outboundTag: tunnelTag,
         });
+        if (egressTag !== null) {
+            config.routing.rules.push({
+                type: 'field',
+                inboundTag: [bridgeTag],
+                outboundTag: egressTag,
+            });
+        }
     }
 }
 
@@ -2023,6 +2061,7 @@ module.exports = {
     buildXrayStreamSettings,
     generateXraySystemdService,
     applyReversePortal,
+    applyReverseBridge,
     generateBridgeConfig,
     generateCombinedBridgeConfig,
     generateRelayConfig,
