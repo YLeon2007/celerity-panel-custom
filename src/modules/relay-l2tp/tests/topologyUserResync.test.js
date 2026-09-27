@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
     TopologyUserResync,
+    USER_PUSH_ATTEMPTS,
 } = require('../services/topologyUserResync');
 
 function planFixture(kind = 'deploy') {
@@ -27,21 +28,29 @@ function hyNodeFixture(map) {
     };
 }
 
+const silentLogger = { info() {}, warn() {}, error() {} };
+
 test('TopologyUserResync: requires HyNode.findById', () => {
     assert.throws(() => new TopologyUserResync({}), TypeError);
 });
 
 test('TopologyUserResync: no users means a zero-count no-op', async () => {
     const resync = new TopologyUserResync({
-        HyNode: hyNodeFixture({ 'node-portal': { _id: 'p', name: 'P', type: 'xray' } }),
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'p', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
         syncService: {
             async _getUsersForNode() { return []; },
             async addXrayUser() { return true; },
         },
-        logger: { info() {}, warn() {}, error() {} },
+        logger: silentLogger,
     });
     const result = await resync.resyncPlan(planFixture());
-    assert.deepEqual(result, { nodeCount: 1, userCount: 0 });
+    assert.equal(result.nodeCount, 1);
+    assert.equal(result.userCount, 0);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.failedUsers, []);
 });
 
 test('TopologyUserResync: pushes users to deduped xray nodes only', async () => {
@@ -60,17 +69,20 @@ test('TopologyUserResync: pushes users to deduped xray nodes only', async () => 
                 return true;
             },
         },
-        logger: { info() {}, warn() {}, error() {} },
+        logger: silentLogger,
     });
     const result = await resync.resyncPlan(planFixture());
-    assert.deepEqual(result, { nodeCount: 1, userCount: 2 });
+    assert.deepEqual(result, { nodeCount: 1, userCount: 2, failedUsers: [], ok: true });
     assert.deepEqual(pushed, ['P/u1', 'P/u2']);
 });
 
-test('TopologyUserResync: retries a failed push once and continues', async () => {
+test('TopologyUserResync: retries a failed push until the attempt budget is spent', async () => {
     const attempts = [];
     const resync = new TopologyUserResync({
-        HyNode: hyNodeFixture({ 'node-portal': { _id: 'x', name: 'P', type: 'xray' } }),
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'x', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
         syncService: {
             async _getUsersForNode() { return [{ userId: 'u1' }, { userId: 'u2' }]; },
             async addXrayUser(node, user) {
@@ -79,20 +91,90 @@ test('TopologyUserResync: retries a failed push once and continues', async () =>
                 return true;
             },
         },
-        logger: { info() {}, warn() {}, error() {} },
+        logger: silentLogger,
         sleep: async () => {},
     });
     const result = await resync.resyncPlan(planFixture());
-    assert.deepEqual(result, { nodeCount: 1, userCount: 1 });
-    assert.deepEqual(attempts, ['u1', 'u1', 'u2']);
+    assert.equal(result.nodeCount, 1);
+    assert.equal(result.userCount, 1);
+    assert.equal(result.ok, false, 'an unpushable user must mark the resync not-ready');
+    assert.equal(result.failedUsers.length, 1);
+    assert.equal(result.failedUsers[0].node, 'node-portal');
+    assert.equal(result.failedUsers[0].userId, 'u1');
+    assert.equal(attempts.filter(id => id === 'u1').length, USER_PUSH_ATTEMPTS);
+    assert.equal(USER_PUSH_ATTEMPTS >= 4, true, 'two attempts are not a durable retry budget');
+    assert.deepEqual(attempts.at(-1), 'u2', 'one bad user must not starve the remaining users');
+});
+
+test('TopologyUserResync: a recovered push still reports ready', async () => {
+    let calls = 0;
+    const resync = new TopologyUserResync({
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'x', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
+        syncService: {
+            async _getUsersForNode() { return [{ userId: 'u1' }]; },
+            async addXrayUser() {
+                calls += 1;
+                if (calls < 3) throw new Error('agent flapping');
+                return true;
+            },
+        },
+        logger: silentLogger,
+        sleep: async () => {},
+    });
+    const result = await resync.resyncPlan(planFixture());
+    assert.equal(result.ok, true);
+    assert.equal(result.userCount, 1);
+    assert.equal(calls, 3);
+});
+
+test('TopologyUserResync: a plan node missing from the panel fails closed', async () => {
+    const resync = new TopologyUserResync({
+        HyNode: hyNodeFixture({ 'node-portal': { _id: 'p', name: 'P', type: 'xray' } }),
+        syncService: {
+            async _getUsersForNode() { return []; },
+            async addXrayUser() { return true; },
+        },
+        logger: silentLogger,
+        sleep: async () => {},
+    });
+    const result = await resync.resyncPlan(planFixture());
+    assert.equal(result.ok, false, 'a committed plan node that vanished cannot have its users verified');
+    assert.ok(result.failedUsers.some(entry => entry.node === 'node-bridge'
+        && entry.reason === 'NODE_NOT_FOUND'));
+});
+
+test('TopologyUserResync: addXrayUser returning false counts as a failed push', async () => {
+    let calls = 0;
+    const resync = new TopologyUserResync({
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'x', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
+        syncService: {
+            async _getUsersForNode() { return [{ userId: 'u1' }]; },
+            async addXrayUser() { calls += 1; return false; },
+        },
+        logger: silentLogger,
+        sleep: async () => {},
+    });
+    const result = await resync.resyncPlan(planFixture());
+    assert.equal(result.ok, false);
+    assert.equal(calls, USER_PUSH_ATTEMPTS);
+    assert.equal(result.failedUsers[0].userId, 'u1');
 });
 
 test('TopologyUserResync: no-op without legacy syncService user API', async () => {
     const resync = new TopologyUserResync({
-        HyNode: hyNodeFixture({ 'node-portal': { _id: 'x', name: 'P', type: 'xray' } }),
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'x', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
         syncService: {},
-        logger: { info() {}, warn() {}, error() {} },
+        logger: silentLogger,
     });
     const result = await resync.resyncPlan(planFixture());
-    assert.deepEqual(result, { nodeCount: 0, userCount: 0 });
+    assert.deepEqual(result, { nodeCount: 0, userCount: 0, failedUsers: [], ok: true });
 });

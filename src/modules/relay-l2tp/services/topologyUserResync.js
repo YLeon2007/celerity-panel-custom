@@ -8,7 +8,7 @@
 // to every node of a successfully deployed plan via the legacy syncService
 // agent path (the same path used when a user is created or updated).
 
-const USER_PUSH_ATTEMPTS = 2;
+const USER_PUSH_ATTEMPTS = 4;
 const USER_PUSH_RETRY_DELAY_MS = 1500;
 
 function defaultLogger() {
@@ -30,7 +30,7 @@ function delay(ms) {
 }
 
 class TopologyUserResync {
-    constructor({ HyNode, syncService, logger, sleep } = {}) {
+    constructor({ HyNode, syncService, logger, sleep, attempts, retryDelayMs } = {}) {
         if (!HyNode || typeof HyNode.findById !== 'function') {
             throw new TypeError('TopologyUserResync requires HyNode.findById');
         }
@@ -38,6 +38,12 @@ class TopologyUserResync {
         this._syncService = syncService;
         this.logger = logger || defaultLogger();
         this.sleep = typeof sleep === 'function' ? sleep : delay;
+        this.attempts = Number.isSafeInteger(attempts) && attempts >= 1
+            ? attempts
+            : USER_PUSH_ATTEMPTS;
+        this.retryDelayMs = Number.isSafeInteger(retryDelayMs) && retryDelayMs >= 0
+            ? retryDelayMs
+            : USER_PUSH_RETRY_DELAY_MS;
     }
 
     get syncService() {
@@ -68,13 +74,21 @@ class TopologyUserResync {
         const syncService = this.syncService;
         if (typeof syncService?._getUsersForNode !== 'function'
             || typeof syncService?.addXrayUser !== 'function') {
-            return { nodeCount: 0, userCount: 0 };
+            return { nodeCount: 0, userCount: 0, failedUsers: [], ok: true };
         }
         let nodeCount = 0;
         let userCount = 0;
+        const failedUsers = [];
         for (const id of this.planNodeIds(plan)) {
             const node = await this.HyNode.findById(id).lean();
-            if (!node || node.type !== 'xray') {
+            if (!node) {
+                // The operation committed a candidate to this node, so it must
+                // still exist; without the node record no user can be verified
+                // or pushed — fail closed instead of claiming readiness.
+                failedUsers.push({ node: id, userId: null, reason: 'NODE_NOT_FOUND' });
+                continue;
+            }
+            if (node.type !== 'xray') {
                 continue;
             }
             nodeCount += 1;
@@ -82,14 +96,21 @@ class TopologyUserResync {
             for (const user of users || []) {
                 if (await this.pushUser(node, user)) {
                     userCount += 1;
+                } else {
+                    failedUsers.push({
+                        node: id,
+                        nodeName: node.name,
+                        userId: user?.userId || user?.username || null,
+                        reason: 'PUSH_FAILED',
+                    });
                 }
             }
         }
-        return { nodeCount, userCount };
+        return { nodeCount, userCount, failedUsers, ok: failedUsers.length === 0 };
     }
 
     async pushUser(node, user) {
-        for (let attempt = 1; attempt <= USER_PUSH_ATTEMPTS; attempt += 1) {
+        for (let attempt = 1; attempt <= this.attempts; attempt += 1) {
             try {
                 const ok = await this.syncService.addXrayUser(node, user);
                 if (ok !== false) {
@@ -100,8 +121,8 @@ class TopologyUserResync {
                     `[Topology] user resync push failed for ${node.name}/${user?.userId || user?.username}: ${error?.message || error}`,
                 );
             }
-            if (attempt < USER_PUSH_ATTEMPTS) {
-                await this.sleep(USER_PUSH_RETRY_DELAY_MS);
+            if (attempt < this.attempts) {
+                await this.sleep(this.retryDelayMs);
             }
         }
         this.logger.warn(`[Topology] user resync gave up on ${node.name}/${user?.userId || user?.username}`);
