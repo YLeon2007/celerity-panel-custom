@@ -584,6 +584,38 @@ test('scoped queue pins only the requested component and never pulls in pending 
     );
 });
 
+test('scoped queue rejects a preexisting pending link even when a caller includes its id', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 8, scope: {
+            kind: 'domain.reconcile', linkId: 'link-pr',
+            linkIds: ['link-pr', 'link-rb', 'link-pending'],
+        } }),
+        error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error.causeCode === 'SCOPE_LINK_UNCONFIRMED',
+    );
+    assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
+    assert.equal(calls.filter(call => call.method === 'createFrozen').length, 0);
+    assert.equal(calls.filter(call => call.method === 'worker.run').length, 0);
+});
+
+test('scoped queue rejects an inactive requested link', async () => {
+    const calls = [];
+    const snapshot = scopedSnapshot();
+    snapshot.links[0].active = false;
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 8, scope: {
+            kind: 'link.apply', linkId: 'link-pr', linkIds: ['link-pr'],
+        } }),
+        error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error.causeCode === 'SCOPE_LINK_MISSING',
+    );
+    assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
+});
+
 test('legacy unscoped queue keeps the full-sync idempotency key and records no scope', async () => {
     const calls = [];
     const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));

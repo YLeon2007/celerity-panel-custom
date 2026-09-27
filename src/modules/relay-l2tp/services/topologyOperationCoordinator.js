@@ -173,9 +173,10 @@ function projectTopology(snapshot) {
 // Scoped reconcile: the effective graph is exactly the requested link plus the
 // links the caller proved deployed. Anything else — in particular preexisting
 // pending links — must stay out of the plan, even on shared relays.
-function applyScopeToTopology(topology, scope, operationId) {
+function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
     const wanted = new Set(scope.linkIds);
     const available = new Set(topology.links.map(link => link.id));
+    const rawById = new Map(rawLinks.map(link => [entityId(link._id ?? link.id), link]));
     for (const linkId of wanted) {
         if (!available.has(linkId)) {
             throw new TopologyOperationCoordinatorError(
@@ -183,6 +184,20 @@ function applyScopeToTopology(topology, scope, operationId) {
                 'A scoped link is missing from the pinned topology',
                 { operationId, causeCode: 'SCOPE_LINK_MISSING', linkId },
             );
+        }
+        // A request may activate only its own explicit link. Every other
+        // member must already be confirmed deployed; never trust caller-supplied
+        // linkIds to pull an old active/pending edge into a new candidate.
+        if (linkId !== scope.linkId) {
+            const status = rawById.get(linkId)?.status;
+            if (status !== undefined && status !== null
+                && status !== 'deployed' && status !== 'online') {
+                throw new TopologyOperationCoordinatorError(
+                    'INVALID_TOPOLOGY_DEPLOYMENT',
+                    'A scoped baseline link is not confirmed deployed',
+                    { operationId, causeCode: 'SCOPE_LINK_UNCONFIRMED', linkId },
+                );
+            }
         }
     }
     const links = topology.links.filter(link => wanted.has(link.id));
@@ -387,7 +402,7 @@ class TopologyOperationCoordinator {
                     // selects the scope of coordination only — it never marks
                     // a link physically applied by itself.
                     const topology = scope
-                        ? applyScopeToTopology(projected, scope, operationId)
+                        ? applyScopeToTopology(projected, scope, operationId, snapshot.links)
                         : projected;
                     const validation = this.validator(topology);
                     if (validation?.valid !== true) {
