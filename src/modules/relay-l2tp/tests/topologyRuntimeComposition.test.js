@@ -213,6 +213,7 @@ test('enabled composition builds the real typed executor with the injected NodeS
 
     assert.ok(service instanceof TopologyOperationCoordinator);
     assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
+    assert.equal(typeof service.operationWorker.userResync?.resyncPlan, 'function');
     assert.deepEqual(calls, []);
 });
 

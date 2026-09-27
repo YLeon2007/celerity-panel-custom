@@ -448,7 +448,7 @@ test('fresh worker resumes an expired preparing claim from durable candidates on
     assert.equal(operation.attempts, 1);
 });
 
-test('successful deploy triggers best-effort subscription user resync', async () => {
+test('successful deploy resyncs users before atomic success finalization', async () => {
     const operation = durableOperation();
     operation.status = 'preparing';
     operation.leaseOwner = 'stopped-process';
@@ -467,12 +467,21 @@ test('successful deploy triggers best-effort subscription user resync', async ()
         async rollback() { return { ok: true }; },
     };
     const resynced = [];
+    const events = [];
     const worker = createWorker({
         repository,
         executor,
+        finalizer: {
+            async finalizeSucceeded() {
+                events.push('finalized');
+                return { ok: true };
+            },
+        },
         userResync: {
             async resyncPlan(plan) {
+                events.push('resynced');
                 resynced.push(plan.operationId ?? plan.kind);
+                return { ok: true };
             },
         },
     });
@@ -481,9 +490,10 @@ test('successful deploy triggers best-effort subscription user resync', async ()
 
     assert.equal(result.status, 'succeeded');
     assert.equal(resynced.length, 1);
+    assert.deepEqual(events, ['resynced', 'finalized']);
 });
 
-test('user resync failure does not fail a committed deployment', async () => {
+test('user resync failure rolls back changed nodes before finalization', async () => {
     const operation = durableOperation();
     operation.status = 'preparing';
     operation.leaseOwner = 'stopped-process';
@@ -501,9 +511,20 @@ test('user resync failure does not fail a committed deployment', async () => {
         async cleanupPrepared() { return { ok: true }; },
         async rollback() { return { ok: true }; },
     };
+    const rollbackNodes = [];
+    let finalized = false;
     const worker = createWorker({
         repository,
-        executor,
+        executor: {
+            ...executor,
+            async rollback(request) {
+                rollbackNodes.push(String(request.node.node));
+                return { ok: true };
+            },
+        },
+        finalizer: {
+            async finalizeSucceeded() { finalized = true; return { ok: true }; },
+        },
         userResync: {
             async resyncPlan() { throw new Error('agent down'); },
         },
@@ -511,7 +532,9 @@ test('user resync failure does not fail a committed deployment', async () => {
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'succeeded');
+    assert.equal(result.status, 'rolled_back');
+    assert.equal(finalized, false);
+    assert.ok(rollbackNodes.length > 0);
 });
 
 test('lease heartbeat renews while a typed executor call is still running', async () => {

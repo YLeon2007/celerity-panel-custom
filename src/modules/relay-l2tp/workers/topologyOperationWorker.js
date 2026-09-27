@@ -826,6 +826,28 @@ class TopologyOperationWorker {
                 }
             }
 
+            // The candidate restart clears dynamic Xray users. Reconcile and
+            // verify them while the operation still owns its node locks and
+            // lease, before the atomic topology success transition. A failed
+            // user sync must roll back the changed candidate, not report ready.
+            if (this.userResync) {
+                try {
+                    await this.renew(operationId);
+                    const resynced = await heartbeat.run(() => this.userResync.resyncPlan(plan));
+                    if (resynced?.ok !== true) {
+                        throw new Error('Topology user synchronization was not verified');
+                    }
+                } catch (error) {
+                    if (error instanceof LeaseLostError) throw error;
+                    return await this.rollbackAfterCommitFailure(
+                        plan,
+                        operationId,
+                        prepared,
+                        changing,
+                        heartbeat,
+                    );
+                }
+            }
             const leaseUntil = await heartbeat.renew();
             try {
                 const finalized = await this.finalizer.finalizeSucceeded({
@@ -848,17 +870,6 @@ class TopologyOperationWorker {
                     changing,
                     heartbeat,
                 );
-            }
-            // Subscription users live in the xray runtime only (agent API),
-            // so the deploy's config restart wiped them; re-push before
-            // declaring the chain usable. Resync failure must not fail the
-            // already-committed deployment.
-            if (this.userResync) {
-                try {
-                    await this.userResync.resyncPlan(plan);
-                } catch {
-                    // best-effort: users are re-added on the next user change
-                }
             }
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {

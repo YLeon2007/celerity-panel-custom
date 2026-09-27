@@ -194,12 +194,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
-        let userResync;
-        try {
-            userResync = new TopologyUserResync({ HyNode });
-        } catch {
-            userResync = undefined;
-        }
+        const userResync = new TopologyUserResync({ HyNode });
         const operationWorker = new OperationWorker({
             operationRepository,
             executor,
