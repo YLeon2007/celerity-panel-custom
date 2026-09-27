@@ -46,6 +46,10 @@ assert(/[Ѐ-ӿ]/.test(ui.topologyCauseText('STALE_TOPOLOGY_REVISION')),
     'STALE_TOPOLOGY_REVISION must have a Russian description');
 assert(/[Ѐ-ӿ]/.test(ui.topologyCauseText('TOPOLOGY_DEPLOY_RATE_LIMITED')),
     'TOPOLOGY_DEPLOY_RATE_LIMITED must have a Russian description');
+for (const code of ['UNCONFIRMED_LINK_IN_FULL_DEPLOY', 'USER_SYNC_UNAVAILABLE',
+    'L2TP_PPP_READBACK_UNAVAILABLE', 'L2TP_PPP_CHAP_SECRETS_DRIFT']) {
+    assert(/[Ѐ-ӿ]/.test(ui.topologyCauseText(code)), `${code} needs a Russian diagnosis`);
+}
 assert.strictEqual(ui.topologyCauseText('NOT_A_REAL_CODE'), null,
     'unknown cause codes must fall back, not guess');
 
