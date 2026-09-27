@@ -2,6 +2,11 @@
 
 const FINALIZATION_REJECTED = Symbol('TOPOLOGY_OPERATION_FINALIZATION_REJECTED');
 
+// Operation kinds whose commit is confined to the links they explicitly
+// touched: an autoDeploy link.apply / domain.reconcile must mark only its own
+// linkIds deployed and must never advance the global deployedRevision.
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
+
 function validDate(value) {
     return value instanceof Date && Number.isFinite(value.getTime());
 }
@@ -38,6 +43,22 @@ function defaultTransactionRunner(TopologyOperation, CascadeTopologyState) {
 
 function rejectFinalization() {
     throw FINALIZATION_REJECTED;
+}
+
+async function loadOperationScope(TopologyOperation, operationId, session) {
+    if (typeof TopologyOperation.findById !== 'function') return null;
+    const operation = await TopologyOperation.findById(operationId)
+        .select('kind linkIds')
+        .session(session)
+        .lean();
+    if (!operation
+        || !SCOPED_OPERATION_KINDS.has(operation.kind)
+        || !Array.isArray(operation.linkIds)
+        || operation.linkIds.length === 0
+        || !operation.linkIds.every(linkId => typeof linkId === 'string' && linkId.length > 0)) {
+        return null;
+    }
+    return { kind: operation.kind, linkIds: [...operation.linkIds] };
 }
 
 class TopologyOperationFinalizationRepository {
@@ -87,22 +108,33 @@ class TopologyOperationFinalizationRepository {
                 }, { runValidators: true, session });
                 if (operation?.matchedCount !== 1) rejectFinalization();
 
-                const topology = await this.CascadeTopologyState.updateOne({
-                    _id: 'singleton',
-                    revision: topologyRevision,
-                    deployedRevision: priorDeployedRevision,
-                }, {
-                    $set: { deployedRevision: topologyRevision },
-                }, {
-                    runValidators: true,
+                const scope = await loadOperationScope(
+                    this.TopologyOperation,
+                    operationId,
                     session,
-                    timestamps: false,
-                });
-                if (topology?.matchedCount !== 1) rejectFinalization();
+                );
+
+                if (!scope) {
+                    const topology = await this.CascadeTopologyState.updateOne({
+                        _id: 'singleton',
+                        revision: topologyRevision,
+                        deployedRevision: priorDeployedRevision,
+                    }, {
+                        $set: { deployedRevision: topologyRevision },
+                    }, {
+                        runValidators: true,
+                        session,
+                        timestamps: false,
+                    });
+                    if (topology?.matchedCount !== 1) rejectFinalization();
+                }
 
                 if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
+                    const linkFilter = scope
+                        ? { _id: { $in: scope.linkIds } }
+                        : { active: true };
                     await this.CascadeLink.updateMany(
-                        { active: true },
+                        linkFilter,
                         { $set: { status: 'deployed' } },
                         { runValidators: true, session },
                     );
