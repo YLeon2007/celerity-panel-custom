@@ -1119,6 +1119,21 @@
         if (domGroup) domGroup.style.display = '';
     }
 
+    function handleCreatedLinkAutoDeploy(snapshot, optedIn) {
+        if (!optedIn) return;
+        const operation = snapshot?.autoDeployOperation;
+        if (operation?.status === 'queued' && operation.operationId) {
+            startOperationPolling(operation);
+            showToast(deployResultMessage(operation));
+            return;
+        }
+        // Creating a draft is not evidence of physical deployment. In
+        // particular, never fall back to an unscoped full-topology deploy.
+        const cause = snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus;
+        showToast((i18n.deployFailed || 'Failed') + ': '
+            + (topologyCauseText(cause) || cause || 'Автодеплой не поставлен в очередь'), 'error');
+    }
+
     async function onAddLinkSubmit(e) {
         e.preventDefault();
         const form = e.target;
@@ -1181,28 +1196,11 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data),
             });
-            if (!await handleDraftMutationResponse(res)) return;
+            const createdSnapshot = await handleDraftMutationResponse(res);
+            if (!createdSnapshot) return;
             closeModal();
             await loadTopology();
-            // Honor the "auto-deploy" checkbox: after creating a link, queue
-            // a topology deploy with the (freshly bumped) revision.
-            if (!linkId && data.autoDeploy === true) {
-                try {
-                    const result = await deployTopology();
-                    showToast(deployResultMessage(result));
-                    loadTopology();
-                } catch (deployErr) {
-                    // Mid-build the chain is legitimately incomplete — the
-                    // deploy validator refuses it. That is not an error for
-                    // the user: the final link's auto-deploy (or a manual
-                    // chain sync) will deploy the completed chain.
-                    if (/adjacent node|exactly one portal and one bridge/i.test(deployErr.message || '')) {
-                        showToast(i18n.deployDeferredIncompleteChain || 'Auto-deploy deferred: chain incomplete');
-                    } else {
-                        showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');
-                    }
-                }
-            }
+            if (!linkId) handleCreatedLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
@@ -1566,22 +1564,11 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data),
             });
-            if (!await handleDraftMutationResponse(res)) return;
+            const createdSnapshot = await handleDraftMutationResponse(res);
+            if (!createdSnapshot) return;
             closeQuickModal();
             await loadTopology();
-            if (data.autoDeploy === true) {
-                try {
-                    var result = await deployTopology();
-                    showToast(deployResultMessage(result));
-                    loadTopology();
-                } catch (deployErr) {
-                    if (/adjacent node|exactly one portal and one bridge/i.test(deployErr.message || '')) {
-                        showToast(i18n.deployDeferredIncompleteChain || 'Auto-deploy deferred: chain incomplete');
-                    } else {
-                        showToast((i18n.deployFailed || 'Failed') + ': ' + deployErr.message, 'error');
-                    }
-                }
-            }
+            handleCreatedLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {

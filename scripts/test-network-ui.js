@@ -112,6 +112,21 @@ assert.strictEqual(ui.shouldContinueOperationPolling({
     attempt: 2, maxAttempts: 5, targetRevision: 7, deployedRevision: null,
 }), true, 'a transient snapshot failure must not kill polling early');
 
+// ---------- create opt-in must not trigger global full-topology deploy ----------
+for (const [start, end] of [
+    ['async function onAddLinkSubmit(e)', '// ==================== CASCADE ACTIONS'],
+    ['async function onQuickLinkSubmit(e)', '// ==================== START'],
+]) {
+    const slice = networkJs.split(start)[1]?.split(end)[0];
+    assert(slice, `missing create handler ${start}`);
+    assert(!slice.includes('await deployTopology()'),
+        `${start} must not silently deploy unrelated active/pending links`);
+    assert(slice.includes('handleCreatedLinkAutoDeploy('),
+        `${start} must consume only the scoped operation returned by create`);
+}
+assert(networkJs.includes('snapshot?.autoDeployOperation'),
+    'create opt-in must consume the returned operation identity');
+
 // ---------- wiring assertions on the real assets ----------
 
 assert(!/setInterval\([^)]*operation/i.test(networkJs),
