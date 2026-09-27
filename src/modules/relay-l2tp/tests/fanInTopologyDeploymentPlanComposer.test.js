@@ -209,6 +209,9 @@ test('fan-in: mixed forward/reverse links compose hop-by-hop', () => {
         rule.inboundTag?.includes(hopInbound.tag) && rule.outboundTag === fwdOutbound.tag
     )), 'forward hop inbound must route into the downstream outbound');
 
+    // geoip rules require on-demand DNS so domain targets can match them.
+    assert.equal(mergeRelay.routing.domainStrategy, 'IPOnDemand');
+
     // Deployment order: the reverse listener (portal-2) deploys before its
     // dialer (relay-2); forward listeners keep target-first ordering.
     const order = plan.nodes.map(node => node.nodeRef);

@@ -1293,6 +1293,9 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
                     ip: geo.geoip.map(item => (item.includes(':') ? item : `geoip:${item}`)),
                     outboundTag: tag,
                 });
+                // Domain targets skip ip-only rules under IPIfNonMatch and
+                // fall into the default route; IPOnDemand resolves them.
+                config.routing.domainStrategy = 'IPOnDemand';
             }
         }
         if (isTerminal) {

@@ -1097,6 +1097,9 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
                 ),
                 outboundTag: portalTag,
             });
+            // Domain targets skip ip-only rules under IPIfNonMatch and fall
+            // into the default route; IPOnDemand resolves them for geoip.
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     }
 
@@ -1764,6 +1767,9 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                 ip: geo.geoip.map(g => (g.includes(':') ? g : `geoip:${g}`)),
                 outboundTag: branchTag,
             });
+            // Domain targets skip ip-only rules under IPIfNonMatch and
+            // fall into the default route; IPOnDemand resolves them.
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     }
 
@@ -1798,6 +1804,8 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                 ),
                 outboundTag: exitTag,
             });
+            // See above: ip-only geo rules need IPOnDemand for domain targets.
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     } else {
         // Default: route all client traffic through the forward chain
