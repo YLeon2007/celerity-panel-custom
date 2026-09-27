@@ -815,6 +815,18 @@ class CascadeService {
      * @param {Array<string>} [opts.excludeLinkIds] - Link IDs to exclude (used during undeploy)
      */
     async _deployPortalConfig(portalNode, opts = {}) {
+        // Topology-managed nodes get their full Xray config from the topology
+        // deployment; the classic cascade writer would clobber it and uses
+        // the persisted link.tunnelUuid, which mismatches the deterministic
+        // tunnel credentials the topology composer derives for the other end.
+        const topologyManaged = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
+            .every(flag => process.env[flag] === 'true')
+            && ['portal', 'relay', 'bridge'].includes(portalNode?.cascadeRole);
+        if (topologyManaged) {
+            logger.info(`[Cascade] Node ${portalNode.name}: classic config deploy skipped (topology-managed node)`);
+            return;
+        }
+
         const syncService = require('./syncService');
         const users = await syncService._getUsersForNode(portalNode);
 

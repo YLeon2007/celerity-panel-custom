@@ -431,17 +431,19 @@ class SyncService {
     }
 
     /**
-     * True when the topology deployment executes live on this contour and the
-     * node is a relay/bridge: hop listeners then belong to the xray-bridge
-     * service and must not also be added to the classic xray-main config.
+     * True when live topology execution is enabled on this contour and the
+     * node participates in a topology domain (portal/relay/bridge). The
+     * topology deployment then owns the node's full Xray config (cascade
+     * outbounds, reverse structures, hop listeners); the classic sync must
+     * not regenerate and overwrite it — it only syncs users via the agent.
      *
      * @param {Object} node - HyNode document
      * @returns {boolean}
      */
-    _topologyOwnsHopListeners(node) {
+    _topologyManagesNode(node) {
         const enabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
             .every(flag => process.env[flag] === 'true');
-        return enabled && ['relay', 'bridge'].includes(node?.cascadeRole);
+        return enabled && ['portal', 'relay', 'bridge'].includes(node?.cascadeRole);
     }
 
     /**
@@ -509,8 +511,17 @@ class SyncService {
             throw genErr;
         }
 
-        // Step 1: Upload config.json via SSH (only if SSH is configured)
-        if (node.ssh?.password || node.ssh?.privateKey) {
+        // Step 1: Upload config.json via SSH (only if SSH is configured).
+        // Skipped for topology-managed nodes: the topology deployment owns
+        // the full Xray config there, and a classic rewrite would clobber
+        // its cascade structure (and used the persisted link.tunnelUuid,
+        // which mismatches the deterministic tunnel credentials the
+        // topology composer puts on the other end of the link).
+        const topologyManaged = this._topologyManagesNode(node);
+        if (topologyManaged) {
+            logger.info(`[Xray Sync] Node ${node.name}: config upload skipped (topology-managed node)`);
+        }
+        if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
@@ -547,7 +558,7 @@ class SyncService {
                         // them to xray-main too would bind the same ports twice
                         // (SO_REUSEPORT silently load-balances between the two
                         // xray processes and breaks ~half of REALITY handshakes).
-                        const topologyOwnsHopListeners = this._topologyOwnsHopListeners(node);
+                        const topologyOwnsHopListeners = this._topologyManagesNode(node);
                         const classicHopLinks = topologyOwnsHopListeners ? [] : forwardHopLinks;
                         if (classicHopLinks.length > 0) {
                             configGenerator.applyForwardHopInbound(configObj, classicHopLinks);
