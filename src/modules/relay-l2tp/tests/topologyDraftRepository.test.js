@@ -145,6 +145,15 @@ test('reads the transactional topology snapshot without parallel session operati
     });
 });
 
+test('pinned link snapshot selects status for scoped pending-link guard', async () => {
+    const trace = [];
+    const session = { id: 'link-status-session' };
+    const repository = new TopologyDraftRepository(createModels(trace, session));
+    await repository.readDraft(session);
+    const projection = trace.find(entry => entry.label === 'links.select');
+    assert.ok(projection.paths.split(/\s+/).includes('status'));
+});
+
 test('projects path enablement into topology draft snapshots', async () => {
     const trace = [];
     const session = { id: 'projection-session' };
