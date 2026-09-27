@@ -1,5 +1,10 @@
 'use strict';
 
+process.env.PANEL_DOMAIN = process.env.PANEL_DOMAIN || 'panel.example.test';
+process.env.ACME_EMAIL = process.env.ACME_EMAIL || 'admin@example.test';
+process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '01234567890123456789012345678901';
+process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'test-session-secret';
+
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
@@ -442,4 +447,233 @@ test('projects a deterministic status without candidates, leases, backups, or in
         nodes: [{ nodeId: 'node-a', state: 'prepared' }],
     });
     assert.doesNotMatch(JSON.stringify(status), /candidate|lease|worker|backup|secret/i);
+});
+
+// ---------------------------------------------------------------------------
+// Scoped queueing: an explicit per-link autoDeploy event reconciles only the
+// affected component. Confirmed-deployed links plus the explicitly requested
+// link form the effective graph; preexisting pending links are never pulled
+// in silently, even when they share a relay with the requested link.
+// ---------------------------------------------------------------------------
+
+function scopedSnapshot(overrides = {}) {
+    return {
+        revision: 8,
+        deployedRevision: 5,
+        nodes: [
+            { _id: 'portal-1', cascadeRole: 'portal' },
+            { _id: 'relay-1', cascadeRole: 'relay' },
+            { _id: 'bridge-1', cascadeRole: 'bridge' },
+            { _id: 'portal-2', cascadeRole: 'portal' },
+        ],
+        links: [
+            {
+                _id: 'link-pr',
+                portalNode: 'portal-1',
+                bridgeNode: 'relay-1',
+                mode: 'reverse',
+                active: true,
+                status: 'pending',
+            },
+            {
+                _id: 'link-rb',
+                portalNode: 'relay-1',
+                bridgeNode: 'bridge-1',
+                mode: 'reverse',
+                active: true,
+                status: 'deployed',
+            },
+            {
+                // Preexisting pending link on the same relay: never deployed
+                // by the operator, so a scoped reconcile must exclude it.
+                _id: 'link-pending',
+                portalNode: 'portal-2',
+                bridgeNode: 'relay-1',
+                mode: 'reverse',
+                active: true,
+                status: 'pending',
+            },
+        ],
+        groups: [],
+        ...overrides,
+    };
+}
+
+function scopedHarness(snapshotValue, calls = []) {
+    return {
+        topologyRepository: {
+            async pinTopology({ expectedRevision, prepare }) {
+                calls.push({ method: 'pinTopology', expectedRevision });
+                const prepared = await prepare(snapshotValue);
+                return {
+                    revision: snapshotValue.revision,
+                    deployedRevision: snapshotValue.deployedRevision,
+                    ...prepared,
+                };
+            },
+        },
+        planMaterializer: {
+            async materialize(input) {
+                calls.push({ method: 'materialize', input });
+                return materializedPlan();
+            },
+        },
+        operationRepository: {
+            async createFrozen(input) {
+                calls.push({ method: 'createFrozen', input });
+                return { _id: input.operationId, status: 'queued', ...input };
+            },
+        },
+        operationWorker: {
+            async run(operationId) {
+                calls.push({ method: 'worker.run', operationId });
+                return { claimed: false, operationId };
+            },
+        },
+        validator: () => ({ valid: true, errors: [] }),
+        compiler: () => ({ valid: true, errors: [], relays: [] }),
+        idFactory(idempotencyKey) {
+            calls.push({ method: 'idFactory', idempotencyKey });
+            return 'operation-scoped';
+        },
+    };
+}
+
+test('scoped queue pins only the requested component and never pulls in pending links', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+
+    const result = await coordinator.queue({
+        expectedTopologyRevision: 8,
+        scope: {
+            kind: 'domain.reconcile',
+            linkId: 'link-pr',
+            linkIds: ['link-rb', 'link-pr'],
+        },
+    });
+    await Promise.resolve();
+
+    assert.equal(result.operationId, 'operation-scoped');
+    assert.equal(result.status, 'queued');
+    assert.equal(result.kind, 'domain.reconcile');
+    assert.equal(result.linkId, 'link-pr');
+
+    const materialize = calls.find(call => call.method === 'materialize');
+    const topology = materialize.input.pinnedSnapshot.topology;
+    assert.deepEqual(
+        topology.links.map(link => link.id).sort(),
+        ['link-pr', 'link-rb'],
+        'the preexisting pending link must not enter the effective graph',
+    );
+    assert.deepEqual(
+        topology.nodes.map(node => node.id).sort(),
+        ['bridge-1', 'portal-1', 'relay-1'],
+        'nodes of excluded pending links must not enter the scoped plan',
+    );
+
+    const frozen = calls.find(call => call.method === 'createFrozen');
+    assert.equal(frozen.input.kind, 'domain.reconcile');
+    assert.equal(frozen.input.linkId, 'link-pr');
+    assert.deepEqual(frozen.input.linkIds, ['link-pr', 'link-rb']);
+    assert.equal(calls.filter(call => call.method === 'worker.run').length, 1);
+
+    const key = calls.find(call => call.method === 'idFactory').idempotencyKey;
+    assert.ok(
+        key.startsWith('topology:test:revision-8:domain.reconcile:'),
+        `scoped idempotency key must be distinguishable from the legacy full sync key, got ${key}`,
+    );
+});
+
+test('legacy unscoped queue keeps the full-sync idempotency key and records no scope', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+
+    await coordinator.queue({ expectedTopologyRevision: 8 });
+    await Promise.resolve();
+
+    const materialize = calls.find(call => call.method === 'materialize');
+    assert.equal(materialize.input.pinnedSnapshot.topology.links.length, 3,
+        'legacy full sync still sees every active link');
+    const frozen = calls.find(call => call.method === 'createFrozen');
+    assert.equal(frozen.input.kind, undefined);
+    assert.equal(frozen.input.linkId, undefined);
+    const key = calls.find(call => call.method === 'idFactory').idempotencyKey;
+    assert.ok(key.startsWith('topology:test:revision-8:'),
+        `legacy key must keep its shape, got ${key}`);
+    assert.ok(!key.includes('domain.reconcile') && !key.includes('domain.sync'));
+});
+
+test('invalid operation scopes are rejected before any topology pin', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+
+    for (const scope of [
+        { kind: 'domain.nuke', linkId: 'link-pr', linkIds: ['link-pr'] },
+        { kind: 'domain.reconcile', linkId: '', linkIds: ['link-pr'] },
+        { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: [] },
+        { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-rb'] },
+        { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-pr'] },
+        'domain.reconcile',
+    ]) {
+        await assert.rejects(
+            coordinator.queue({ expectedTopologyRevision: 8, scope }),
+            error => error?.code === 'INVALID_REQUEST',
+            `scope ${JSON.stringify(scope)} must be rejected`,
+        );
+    }
+    assert.equal(calls.filter(call => call.method === 'pinTopology').length, 0);
+});
+
+test('scope referencing a missing pinned link fails closed with SCOPE_LINK_MISSING', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+
+    await assert.rejects(
+        coordinator.queue({
+            expectedTopologyRevision: 8,
+            scope: { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-gone'] },
+        }),
+        error => error?.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error?.causeCode === 'SCOPE_LINK_MISSING',
+    );
+    assert.equal(calls.filter(call => call.method === 'createFrozen').length, 0);
+    assert.equal(calls.filter(call => call.method === 'worker.run').length, 0);
+});
+
+test('groups fully outside the scope are dropped; mixed groups fail with SCOPE_GROUP_CONFLICT', async () => {
+    const withOutsideGroup = scopedSnapshot({
+        groups: [{
+            _id: 'group-outside',
+            mode: 'reverse',
+            paths: [{ pathKey: 'default', linkIds: ['link-pending'], priority: 100 }],
+        }],
+    });
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(withOutsideGroup, calls));
+    await coordinator.queue({
+        expectedTopologyRevision: 8,
+        scope: { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-rb'] },
+    });
+    const materialize = calls.find(call => call.method === 'materialize');
+    assert.deepEqual(materialize.input.pinnedSnapshot.topology.groups, [],
+        'a route group that only references other components must be excluded');
+
+    const withMixedGroup = scopedSnapshot({
+        groups: [{
+            _id: 'group-mixed',
+            mode: 'reverse',
+            paths: [{ pathKey: 'default', linkIds: ['link-pr', 'link-pending'], priority: 100 }],
+        }],
+    });
+    const mixedCalls = [];
+    const mixedCoordinator = new TopologyOperationCoordinator(scopedHarness(withMixedGroup, mixedCalls));
+    await assert.rejects(
+        mixedCoordinator.queue({
+            expectedTopologyRevision: 8,
+            scope: { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-rb'] },
+        }),
+        error => error?.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error?.causeCode === 'SCOPE_GROUP_CONFLICT',
+    );
+    assert.equal(mixedCalls.filter(call => call.method === 'createFrozen').length, 0);
 });

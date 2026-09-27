@@ -66,13 +66,37 @@ function idFromIdempotencyKey(idempotencyKey) {
     return createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
 }
 
-function assertQueueInput(input) {
-    if (!input || typeof input !== 'object' || Array.isArray(input)
-        || Object.keys(input).length !== 1
-        || !Object.hasOwn(input, 'expectedTopologyRevision')) {
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
+
+function normalizeOperationScope(scope) {
+    if (scope === undefined) return null;
+    if (!scope || typeof scope !== 'object' || Array.isArray(scope)
+        || !Object.keys(scope).every(key => ['kind', 'linkId', 'linkIds'].includes(key))
+        || !SCOPED_OPERATION_KINDS.has(scope.kind)
+        || typeof scope.linkId !== 'string' || scope.linkId.length === 0
+        || !Array.isArray(scope.linkIds) || scope.linkIds.length === 0
+        || scope.linkIds.some(linkId => typeof linkId !== 'string' || linkId.length === 0)
+        || new Set(scope.linkIds).size !== scope.linkIds.length
+        || !scope.linkIds.includes(scope.linkId)) {
         throw new TopologyOperationCoordinatorError(
             'INVALID_REQUEST',
-            'Only expectedTopologyRevision is accepted',
+            'A scoped topology operation requires kind, a linkId contained in unique linkIds',
+        );
+    }
+    return {
+        kind: scope.kind,
+        linkId: scope.linkId,
+        linkIds: [...scope.linkIds].sort((left, right) => left.localeCompare(right, 'en')),
+    };
+}
+
+function assertQueueInput(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+        || !Object.hasOwn(input, 'expectedTopologyRevision')
+        || !Object.keys(input).every(key => ['expectedTopologyRevision', 'scope'].includes(key))) {
+        throw new TopologyOperationCoordinatorError(
+            'INVALID_REQUEST',
+            'Only expectedTopologyRevision and an optional scope are accepted',
         );
     }
     if (!Number.isSafeInteger(input.expectedTopologyRevision)
@@ -83,6 +107,7 @@ function assertQueueInput(input) {
             { expectedTopologyRevision: input.expectedTopologyRevision },
         );
     }
+    return normalizeOperationScope(input.scope);
 }
 
 function sanitizeValidationErrors(errors) {
@@ -143,6 +168,43 @@ function projectTopology(snapshot) {
         groups: projectGroups(snapshot.groups)
             .sort((left, right) => left._id.localeCompare(right._id, 'en')),
     };
+}
+
+// Scoped reconcile: the effective graph is exactly the requested link plus the
+// links the caller proved deployed. Anything else — in particular preexisting
+// pending links — must stay out of the plan, even on shared relays.
+function applyScopeToTopology(topology, scope, operationId) {
+    const wanted = new Set(scope.linkIds);
+    const available = new Set(topology.links.map(link => link.id));
+    for (const linkId of wanted) {
+        if (!available.has(linkId)) {
+            throw new TopologyOperationCoordinatorError(
+                'INVALID_TOPOLOGY_DEPLOYMENT',
+                'A scoped link is missing from the pinned topology',
+                { operationId, causeCode: 'SCOPE_LINK_MISSING', linkId },
+            );
+        }
+    }
+    const links = topology.links.filter(link => wanted.has(link.id));
+    const nodeIds = new Set(links.flatMap(link => [link.source, link.target]));
+    const nodes = topology.nodes.filter(node => nodeIds.has(node.id));
+    const groups = [];
+    for (const group of topology.groups) {
+        const referenced = new Set(
+            (group.paths || []).flatMap(path => path.linkIds || []),
+        );
+        const inside = [...referenced].filter(linkId => wanted.has(linkId));
+        if (inside.length === 0) continue;
+        if (inside.length !== referenced.size) {
+            throw new TopologyOperationCoordinatorError(
+                'INVALID_TOPOLOGY_DEPLOYMENT',
+                'A route group straddles the scoped component boundary',
+                { operationId, causeCode: 'SCOPE_GROUP_CONFLICT', groupId: group._id },
+            );
+        }
+        groups.push(group);
+    }
+    return { nodes, links, groups };
 }
 
 function nodeIdsByRef(topology) {
@@ -263,9 +325,13 @@ class TopologyOperationCoordinator {
     }
 
     async queue(input) {
-        assertQueueInput(input);
+        const scope = assertQueueInput(input);
         const { expectedTopologyRevision } = input;
-        const idempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
+        // A scoped reconcile gets its own idempotency key so it can never be
+        // collapsed with (or satisfied by) a legacy full-sync operation.
+        const idempotencyKey = scope
+            ? `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}:${scope.kind}:${scope.linkId}`
+            : `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
         const existing = this.operationsByIdempotencyKey.get(idempotencyKey);
         if (existing) {
             const settled = await existing.then(operation => operation, () => null);
@@ -285,7 +351,7 @@ class TopologyOperationCoordinator {
             }
         }
 
-        const queued = this.queueOnce({ expectedTopologyRevision, idempotencyKey });
+        const queued = this.queueOnce({ expectedTopologyRevision, scope, idempotencyKey });
         this.operationsByIdempotencyKey.set(idempotencyKey, queued);
         try {
             return await queued;
@@ -299,7 +365,7 @@ class TopologyOperationCoordinator {
         return this.queue(input);
     }
 
-    async queueOnce({ expectedTopologyRevision, idempotencyKey }) {
+    async queueOnce({ expectedTopologyRevision, scope, idempotencyKey }) {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
         const runIdempotencyKey = `${idempotencyKey}:${randomUUID()}`;
@@ -315,7 +381,14 @@ class TopologyOperationCoordinator {
             pinned = await this.topologyRepository.pinTopology({
                 expectedRevision: expectedTopologyRevision,
                 prepare: async snapshot => {
-                    const topology = projectTopology(snapshot);
+                    const projected = projectTopology(snapshot);
+                    // Scoped reconcile: plan only the caller-declared
+                    // component (deployed links + the requested link). This
+                    // selects the scope of coordination only — it never marks
+                    // a link physically applied by itself.
+                    const topology = scope
+                        ? applyScopeToTopology(projected, scope, operationId)
+                        : projected;
                     const validation = this.validator(topology);
                     if (validation?.valid !== true) {
                         throw new TopologyOperationCoordinatorError(
@@ -354,6 +427,9 @@ class TopologyOperationCoordinator {
             topology: pinned.topology,
             plan: pinned.frozenPlan,
         });
+        const scopedIdentity = scope
+            ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds] }
+            : {};
         try {
             await this.operationRepository.createFrozen({
                 operationId,
@@ -361,6 +437,7 @@ class TopologyOperationCoordinator {
                 topologyRevision: pinned.revision,
                 priorDeployedRevision: pinned.deployedRevision,
                 nodes: plan.nodes,
+                ...scopedIdentity,
             });
         } catch (error) {
             if ((error?.code === 11000 || error?.code === 11001)
@@ -371,6 +448,7 @@ class TopologyOperationCoordinator {
                         operationId,
                         topologyRevision: pinned.revision,
                         status: existing.status ?? 'queued',
+                        ...scopedIdentity,
                     });
                 }
             }
@@ -385,6 +463,7 @@ class TopologyOperationCoordinator {
             operationId,
             topologyRevision: pinned.revision,
             status: 'queued',
+            ...scopedIdentity,
         });
     }
 }
