@@ -6,6 +6,113 @@
 (function () {
     'use strict';
 
+    // ==================== PURE HELPERS (exported for tests) ====================
+
+    // New links default to the Random REALITY fingerprint. Existing links keep
+    // whatever was saved; a link saved before this default existed keeps the
+    // legacy 'chrome' fallback so re-saving it never silently rewrites it.
+    const CREATE_DEFAULT_FINGERPRINT = 'random';
+    const LEGACY_DEFAULT_FINGERPRINT = 'chrome';
+
+    function resolveRealityFingerprint(saved, mode) {
+        const value = typeof saved === 'string' && saved.trim() ? saved.trim() : null;
+        if (value) return value;
+        return mode === 'edit' ? LEGACY_DEFAULT_FINGERPRINT : CREATE_DEFAULT_FINGERPRINT;
+    }
+
+    // Backend cause codes -> Russian UI text. Codes are enum-like and safe to
+    // display; free-form backend messages are not trusted (see below).
+    const TOPOLOGY_CAUSE_TEXT_RU = Object.freeze({
+        INVALID_REQUEST: 'Некорректный запрос',
+        INVALID_TOPOLOGY_REVISION: 'Некорректная ревизия топологии',
+        STALE_TOPOLOGY_REVISION: 'Топология изменилась — обновите данные и повторите',
+        INVALID_TOPOLOGY_DEPLOYMENT: 'Топология не прошла проверку',
+        NODE_DEPLOY_FAILED: 'Не удалось применить конфигурацию на узле',
+        NODE_VERIFICATION_FAILED: 'Узел не прошёл проверку после деплоя',
+        NODE_DEPLOYER_CONTRACT_VIOLATION: 'Узел вернул некорректный результат деплоя',
+        DEPLOYED_REVISION_UPDATE_FAILED: 'Не удалось зафиксировать применённую ревизию',
+        TOPOLOGY_DEPLOYMENT_FAILED: 'Деплой топологии завершился ошибкой',
+        TOPOLOGY_OPERATION_QUEUE_FAILED: 'Не удалось поставить операцию в очередь',
+        TOPOLOGY_DEPLOYMENT_UNAVAILABLE: 'Сервис деплоя топологии недоступен',
+        TOPOLOGY_DEPLOY_RATE_LIMITED: 'Слишком много запросов на деплой — повторите позже',
+        SCOPE_LINK_MISSING: 'Связь отсутствует в зафиксированной топологии',
+        SCOPE_LINK_UNCONFIRMED: 'Базовая связь ещё не подтверждена как применённая',
+        SCOPE_GROUP_CONFLICT: 'Группа маршрутов пересекает границу выбранного участка',
+        INCOMPLETE_REALITY_PARAMETERS: 'Неполные параметры REALITY',
+        INVALID_TOPOLOGY_ROLES: 'Некорректные роли узлов в топологии',
+        MISSING_NODE_ROLE: 'У узла не задана роль',
+        INVALID_TUNNEL_PORT: 'Некорректный порт туннеля',
+        INVALID_NODE_CONFIG: 'Некорректная конфигурация узла',
+    });
+
+    function topologyCauseText(code) {
+        if (typeof code !== 'string' || !code) return null;
+        return TOPOLOGY_CAUSE_TEXT_RU[code] || null;
+    }
+
+    // Strip secret-looking material (long key/token runs) from any backend
+    // text before it reaches a toast. Keeps human context, drops key material.
+    function sanitizeServerText(text) {
+        if (typeof text !== 'string') return '';
+        return text.replace(/[A-Za-z0-9_+\/-]{32,}={0,2}/g, '…').trim();
+    }
+
+    function describeTopologyError(payload, fallback) {
+        const err = payload && payload.error;
+        const validationCode = Array.isArray(payload && payload.errors)
+            && payload.errors[0] && typeof payload.errors[0].code === 'string'
+            ? payload.errors[0].code
+            : null;
+        const causeCode = (err && err.causeCode)
+            || (payload && payload.causeCode)
+            || validationCode
+            || (err && err.code)
+            || null;
+        const mapped = topologyCauseText(causeCode);
+        if (mapped) return mapped + ' (' + causeCode + ')';
+        const raw = (err && (err.message || err.code))
+            || (payload && payload.message)
+            || '';
+        const cleaned = sanitizeServerText(raw);
+        return cleaned || fallback || '';
+    }
+
+    // Operation-specific polling: while a queued topology operation is in
+    // flight, refresh faster than the global 30s status loop. Bounded by a
+    // finite attempt budget and driven by a self-terminating setTimeout chain,
+    // so it can never leave an infinite timer behind.
+    const OPERATION_POLL_INTERVAL_MS = 3000;
+    const OPERATION_POLL_MAX_ATTEMPTS = 40; // ~2 minutes, then the 30s loop takes over
+
+    function shouldContinueOperationPolling(state = {}) {
+        const attempt = Number.isSafeInteger(state.attempt) ? state.attempt : 0;
+        const maxAttempts = Number.isSafeInteger(state.maxAttempts)
+            ? state.maxAttempts
+            : OPERATION_POLL_MAX_ATTEMPTS;
+        if (attempt >= maxAttempts) return false;
+        const { targetRevision, deployedRevision } = state;
+        if (Number.isSafeInteger(targetRevision) && Number.isSafeInteger(deployedRevision)
+            && deployedRevision >= targetRevision) {
+            return false;
+        }
+        return true;
+    }
+
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = {
+            CREATE_DEFAULT_FINGERPRINT,
+            LEGACY_DEFAULT_FINGERPRINT,
+            OPERATION_POLL_INTERVAL_MS,
+            OPERATION_POLL_MAX_ATTEMPTS,
+            TOPOLOGY_CAUSE_TEXT_RU,
+            describeTopologyError,
+            resolveRealityFingerprint,
+            sanitizeServerText,
+            shouldContinueOperationPolling,
+            topologyCauseText,
+        };
+    }
+
     if (typeof cytoscape === 'undefined') return;
 
     if (typeof cytoscapeDagre !== 'undefined') {
@@ -76,7 +183,9 @@
 
     async function handleDraftMutationResponse(response) {
         const payload = await response.json().catch(() => ({}));
-        const errorMessage = payload?.error?.message || payload?.error || ('HTTP ' + response.status);
+        const errorMessage = sanitizeServerText(
+            payload?.error?.message || payload?.error || ('HTTP ' + response.status),
+        );
         if (response.status === 409) {
             await loadTopology();
             showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');
@@ -854,6 +963,18 @@
 
     // ==================== ADD LINK MODAL ====================
 
+    function ensureFingerprintOption(select, value) {
+        if (!select || !value) return;
+        const exists = Array.prototype.some.call(select.options, o => o.value === value);
+        if (!exists) {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = value;
+            select.appendChild(opt);
+        }
+        select.value = value;
+    }
+
     async function openAddLinkModal() {
         const modal       = document.getElementById('addLinkModal');
         const portalSelect = document.getElementById('selectPortal');
@@ -866,6 +987,10 @@
         if (title) title.textContent = i18n.addLink || 'Add Link';
         if (submit) submit.textContent = i18n.createLink || 'Create';
         if (linkIdInput) linkIdInput.value = '';
+        // A brand-new link starts from the Random REALITY fingerprint, even if
+        // the form still carries an injected option from a previous edit.
+        var createFp = document.querySelector('#addLinkForm [name="realityFingerprint"]');
+        if (createFp) createFp.value = resolveRealityFingerprint(null, 'create');
 
         try {
             const [nodesRes, linksRes] = await Promise.all([
@@ -924,7 +1049,12 @@
         form.realityPrivateKey.value = link.realityPrivateKey || '';
         form.realityPublicKey.value = link.realityPublicKey || '';
         form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
-        form.realityFingerprint.value = link.realityFingerprint || 'chrome';
+        // Preserve the saved fingerprint exactly; inject an option if the saved
+        // value is outside the builtin list so re-saving never rewrites it.
+        ensureFingerprintOption(
+            form.realityFingerprint,
+            resolveRealityFingerprint(link.realityFingerprint, 'edit'),
+        );
 
         const geoEnabled = document.getElementById('geoRoutingEnabled');
         const geoFields = document.getElementById('geoRoutingFields');
@@ -1022,7 +1152,8 @@
             data.realityPrivateKey = form.realityPrivateKey?.value || '';
             data.realityPublicKey = form.realityPublicKey?.value || '';
             data.realityShortIds = form.realityShortIds?.value || '';
-            data.realityFingerprint = form.realityFingerprint?.value || 'chrome';
+            data.realityFingerprint = form.realityFingerprint?.value
+                || resolveRealityFingerprint(null, linkId ? 'edit' : 'create');
         }
 
         // Geo routing (always sent so unchecking persists)
@@ -1116,16 +1247,69 @@
             await loadTopology();
         }
         if (!res.ok) {
-            const errorValue = data?.error;
-            const message = typeof errorValue === 'string'
-                ? errorValue
-                : (errorValue?.message || errorValue?.code || ('HTTP ' + res.status));
-            throw new Error(message);
+            throw new Error(describeTopologyError(data, 'HTTP ' + res.status));
         }
         if (!['queued', 'succeeded'].includes(data.status)) {
             throw new Error((i18n.deploymentEndedWithStatus || 'Deployment ended with status') + ': ' + (data.status || 'unknown'));
         }
+        if (data.status === 'queued') startOperationPolling(data);
         return data;
+    }
+
+    // ==================== OPERATION-SPECIFIC POLLING ====================
+
+    let operationPollTimer = null;
+
+    function stopOperationPolling() {
+        if (operationPollTimer) {
+            clearTimeout(operationPollTimer);
+            operationPollTimer = null;
+        }
+    }
+
+    function startOperationPolling(result) {
+        stopOperationPolling();
+        if (!result || result.status !== 'queued') return;
+        if (!Number.isSafeInteger(result.topologyRevision)) return;
+        scheduleOperationPollStep({ targetRevision: result.topologyRevision }, 0);
+    }
+
+    function scheduleOperationPollStep(state, attempt) {
+        operationPollTimer = setTimeout(function () {
+            operationPollTimer = null;
+            runOperationPollStep(state, attempt);
+        }, OPERATION_POLL_INTERVAL_MS);
+    }
+
+    async function runOperationPollStep(state, attempt) {
+        let snapshot = null;
+        try {
+            const res = await fetch('/api/cascade/links');
+            if (res.ok) {
+                snapshot = applyLinkSnapshot(await res.json());
+                refreshStatuses();
+            }
+        } catch (_) {
+            // Transient failure: stay within the attempt budget and retry.
+        }
+        const deployed = snapshot ? snapshot.deployedRevision : null;
+        if (shouldContinueOperationPolling({
+            attempt,
+            maxAttempts: OPERATION_POLL_MAX_ATTEMPTS,
+            targetRevision: state.targetRevision,
+            deployedRevision: deployed,
+        })) {
+            scheduleOperationPollStep(state, attempt + 1);
+            return;
+        }
+        const applied = Number.isSafeInteger(deployed) && deployed >= state.targetRevision;
+        await loadTopology();
+        showToast(
+            applied
+                ? (i18n.operationApplied || 'Деплой завершён: топология применена')
+                : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
+            applied ? 'success' : 'error',
+        );
     }
 
     function deployResultMessage(result) {
