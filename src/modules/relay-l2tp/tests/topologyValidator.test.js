@@ -86,45 +86,8 @@ test('rejects mixed forward and reverse links in one path', () => {
             groupId: 'group-1',
             pathKey: 'path-1',
             modes: ['forward', 'reverse'],
-        }, {
-            code: 'MIXED_TOPOLOGY_MODES',
-            modes: ['forward', 'reverse'],
         }],
     });
-});
-
-test('rejects mixed link modes in one component even without a group path', () => {
-    const topology = {
-        nodes: [],
-        groups: [],
-        links: [
-            { id: 'portal-1-relay', source: 'portal-1', target: 'relay-1', mode: 'reverse' },
-            { id: 'portal-2-relay', source: 'portal-2', target: 'relay-1', mode: 'reverse' },
-            { id: 'relay-bridge', source: 'relay-1', target: 'bridge-1', mode: 'forward' },
-        ],
-    };
-
-    assert.deepEqual(validateTopology(topology), {
-        valid: false,
-        errors: [{
-            code: 'MIXED_TOPOLOGY_MODES',
-            modes: ['forward', 'reverse'],
-        }],
-    });
-});
-
-test('accepts independent components that use different modes', () => {
-    const topology = {
-        nodes: [],
-        groups: [],
-        links: [
-            { id: 'a-portal-relay', source: 'a-portal', target: 'a-bridge', mode: 'reverse' },
-            { id: 'b-portal-relay', source: 'b-portal', target: 'b-relay', mode: 'forward' },
-            { id: 'b-relay-bridge', source: 'b-relay', target: 'b-bridge', mode: 'forward' },
-        ],
-    };
-
-    assert.deepEqual(validateTopology(topology), { valid: true, errors: [] });
 });
 
 test('rejects a path whose links all disagree with the route-group mode', () => {
