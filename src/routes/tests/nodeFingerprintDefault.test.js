@@ -24,6 +24,21 @@ test('new Xray node and extra inbound use literal random by default, explicit va
     assert.equal(node.xray.fingerprint, 'firefox');
 });
 
+test('blank fingerprint in a direct API/MCP create has the same default as omission', () => {
+    const node = new HyNode({ type: 'xray', name: 'blank', ip: '127.0.0.1', xray: {
+        fingerprint: '',
+        extraInbounds: [{ id: 'extra1', port: 8443, inboundTag: 'extra1', fingerprint: '' }],
+    } });
+    assert.equal(node.xray.fingerprint, 'random');
+    assert.equal(node.xray.extraInbounds[0].fingerprint, 'random');
+
+    const legacy = HyNode.hydrate({ type: 'xray', name: 'legacy', ip: '127.0.0.1', xray: {
+        fingerprint: '', extraInbounds: [{ id: 'extra1', port: 8443, inboundTag: 'extra1', fingerprint: '' }],
+    } });
+    assert.equal(legacy.xray.fingerprint, '', 'reading a saved legacy node does not rewrite it');
+    assert.equal(legacy.xray.extraInbounds[0].fingerprint, '', 'reading a saved legacy inbound does not rewrite it');
+});
+
 test('form parser defaults an omitted extra inbound fingerprint and keeps an explicit main value', () => {
     const extras = parseExtraInbounds({
         xray_extra_id: 'e1', xray_extra_port: '8443', xray_extra_inboundTag: 'e1',

@@ -4,6 +4,11 @@
 
 const mongoose = require('mongoose');
 
+// API/MCP callers may send an empty field instead of omitting it. Defaults
+// apply only to undefined; hydration of saved nodes must remain unchanged.
+const defaultBlankFingerprint = value =>
+    typeof value === 'string' && value.trim() === '' ? 'random' : value;
+
 const portConfigSchema = new mongoose.Schema({
     name: { type: String, default: '' },
     port: { type: Number, required: true },
@@ -123,7 +128,7 @@ const xrayExtraInboundSchema = new mongoose.Schema({
     security: { type: String, enum: ['reality', 'tls', 'none'], default: 'reality' },
     flow: { type: String, default: 'xtls-rprx-vision' },
 
-    fingerprint: { type: String, default: 'random' },
+    fingerprint: { type: String, default: 'random', set: defaultBlankFingerprint },
     // Optional set of fingerprints; when non-empty, one is chosen at random when
     // the subscription cache is (re)built, rotating per cache TTL rather than on
     // every request (overrides the single `fingerprint`).
@@ -159,7 +164,7 @@ const xrayConfigSchema = new mongoose.Schema({
     flow: { type: String, default: 'xtls-rprx-vision' },
 
     // TLS Fingerprint (uTLS) — chrome, firefox, safari, ios, android, edge, 360, qq, random, randomized
-    fingerprint: { type: String, default: 'random' },
+    fingerprint: { type: String, default: 'random', set: defaultBlankFingerprint },
     // Optional set of fingerprints; when non-empty, one is chosen at random when
     // the subscription cache is (re)built, rotating per cache TTL rather than on
     // every request (overrides the single `fingerprint`).
