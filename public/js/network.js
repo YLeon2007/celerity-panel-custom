@@ -90,12 +90,7 @@
             ? state.maxAttempts
             : OPERATION_POLL_MAX_ATTEMPTS;
         if (attempt >= maxAttempts) return false;
-        const { targetRevision, deployedRevision } = state;
-        if (Number.isSafeInteger(targetRevision) && Number.isSafeInteger(deployedRevision)
-            && deployedRevision >= targetRevision) {
-            return false;
-        }
-        return true;
+        return !['succeeded', 'failed', 'rolled_back'].includes(state.status);
     }
 
     if (typeof module !== 'undefined' && module.exports) {
@@ -1257,8 +1252,9 @@
     // ==================== OPERATION-SPECIFIC POLLING ====================
 
     let operationPollTimer = null;
-
+    let operationPollGeneration = 0;
     function stopOperationPolling() {
+        operationPollGeneration += 1;
         if (operationPollTimer) {
             clearTimeout(operationPollTimer);
             operationPollTimer = null;
@@ -1268,44 +1264,52 @@
     function startOperationPolling(result) {
         stopOperationPolling();
         if (!result || result.status !== 'queued') return;
-        if (!Number.isSafeInteger(result.topologyRevision)) return;
-        scheduleOperationPollStep({ targetRevision: result.topologyRevision }, 0);
+        if (!/^[a-f0-9]{24}$/i.test(result.operationId || '')) return;
+        scheduleOperationPollStep({ operationId: result.operationId }, 0, operationPollGeneration);
     }
 
-    function scheduleOperationPollStep(state, attempt) {
+    function scheduleOperationPollStep(state, attempt, generation) {
         operationPollTimer = setTimeout(function () {
             operationPollTimer = null;
-            runOperationPollStep(state, attempt);
+            runOperationPollStep(state, attempt, generation);
         }, OPERATION_POLL_INTERVAL_MS);
     }
 
-    async function runOperationPollStep(state, attempt) {
-        let snapshot = null;
+    async function runOperationPollStep(state, attempt, generation) {
+        let operation = null;
         try {
-            const res = await fetch('/api/cascade/links');
+            const res = await fetch('/api/cascade/topology/operations/' + encodeURIComponent(state.operationId));
             if (res.ok) {
-                snapshot = applyLinkSnapshot(await res.json());
-                refreshStatuses();
+                const payload = await res.json();
+                if (payload?.operationId === state.operationId) operation = payload;
+                const linksResponse = await fetch('/api/cascade/links');
+                if (linksResponse.ok) {
+                    applyLinkSnapshot(await linksResponse.json());
+                    refreshStatuses();
+                }
             }
         } catch (_) {
             // Transient failure: stay within the attempt budget and retry.
         }
-        const deployed = snapshot ? snapshot.deployedRevision : null;
+        if (generation !== operationPollGeneration) return;
+        const status = operation?.status || null;
         if (shouldContinueOperationPolling({
             attempt,
             maxAttempts: OPERATION_POLL_MAX_ATTEMPTS,
-            targetRevision: state.targetRevision,
-            deployedRevision: deployed,
+            status,
         })) {
-            scheduleOperationPollStep(state, attempt + 1);
+            scheduleOperationPollStep(state, attempt + 1, generation);
             return;
         }
-        const applied = Number.isSafeInteger(deployed) && deployed >= state.targetRevision;
         await loadTopology();
+        if (generation !== operationPollGeneration) return;
+        const applied = status === 'succeeded';
         showToast(
             applied
                 ? (i18n.operationApplied || 'Деплой завершён: топология применена')
-                : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
+                : status === 'failed' || status === 'rolled_back'
+                    ? (i18n.deployFailed || 'Деплой не выполнен') + ': ' + status
+                    : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
             applied ? 'success' : 'error',
         );
     }

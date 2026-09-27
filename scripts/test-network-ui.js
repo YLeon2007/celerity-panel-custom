@@ -97,20 +97,27 @@ assert(Number.isFinite(ui.OPERATION_POLL_MAX_ATTEMPTS) && ui.OPERATION_POLL_MAX_
     'operation polling must be bounded (no infinite timers)');
 
 assert.strictEqual(ui.shouldContinueOperationPolling({
-    attempt: 0, maxAttempts: 5, targetRevision: 7, deployedRevision: 6,
-}), true, 'polling continues while the deployed revision lags the pinned one');
+    attempt: 0, maxAttempts: 5, status: 'queued',
+}), true, 'polling continues while the operation is queued');
 assert.strictEqual(ui.shouldContinueOperationPolling({
-    attempt: 0, maxAttempts: 5, targetRevision: 7, deployedRevision: 7,
-}), false, 'polling stops once the deployed revision catches up');
+    attempt: 0, maxAttempts: 5, status: 'committing',
+}), true, 'polling continues while the operation is committing');
+for (const status of ['succeeded', 'failed', 'rolled_back']) {
+    assert.strictEqual(ui.shouldContinueOperationPolling({
+        attempt: 0, maxAttempts: 5, status,
+    }), false, `polling stops on terminal ${status}`);
+}
 assert.strictEqual(ui.shouldContinueOperationPolling({
-    attempt: 0, maxAttempts: 5, targetRevision: 7, deployedRevision: 8,
-}), false, 'polling stops when the deployed revision moved past the pinned one');
-assert.strictEqual(ui.shouldContinueOperationPolling({
-    attempt: 5, maxAttempts: 5, targetRevision: 7, deployedRevision: 6,
+    attempt: 5, maxAttempts: 5, status: 'queued',
 }), false, 'polling stops at the attempt budget even if the operation is unresolved');
 assert.strictEqual(ui.shouldContinueOperationPolling({
-    attempt: 2, maxAttempts: 5, targetRevision: 7, deployedRevision: null,
-}), true, 'a transient snapshot failure must not kill polling early');
+    attempt: 2, maxAttempts: 5, status: null,
+}), true, 'a transient status fetch failure must not kill polling early');
+assert.strictEqual(ui.shouldContinueOperationPolling({
+    attempt: 0, maxAttempts: 5, targetRevision: 7, deployedRevision: 8, status: 'queued',
+}), true, 'global revision must not impersonate scoped operation success');
+assert(networkJs.includes('/api/cascade/topology/operations/'),
+    'polling must read the exact operation ID, not a global revision');
 
 // ---------- create opt-in must not trigger global full-topology deploy ----------
 for (const [start, end] of [
