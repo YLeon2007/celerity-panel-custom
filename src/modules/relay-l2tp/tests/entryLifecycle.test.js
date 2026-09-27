@@ -472,6 +472,9 @@ test('root deployment factory exposes only the exact opted-in queued composition
         NodeOperationLock: {},
     };
 
+    // An enabled runtime must have a real user-resync lookup capability;
+    // construction itself remains side-effect-free.
+    models.HyNode.findById = () => { throw new Error('construction must not read nodes'); };
     const service = entry.createTopologyDeploymentService({
         ...models,
         env: {
