@@ -532,6 +532,9 @@ class TopologyOperationWorker {
             entry.state = state;
         }
 
+        if (!rollbackFailed && !(await this.restoreUsersAfterRollback(plan, operationId, heartbeat))) {
+            rollbackFailed = true;
+        }
         const status = rollbackFailed ? 'failed' : 'rolled_back';
         const finished = await this.operationRepository.finishClaimed({
             operationId,
@@ -590,6 +593,21 @@ class TopologyOperationWorker {
         return { claimed: true, operationId, status };
     }
 
+
+    async restoreUsersAfterRollback(plan, operationId, heartbeat) {
+        if (!this.userResync) return true;
+        await this.renew(operationId);
+        try {
+            // Restoring a node config restarts Xray and clears dynamic users
+            // again. A successful config rollback alone is not client recovery.
+            const result = await heartbeat.run(() => this.userResync.resyncPlan(plan));
+            return result?.ok === true;
+        } catch (error) {
+            if (error instanceof LeaseLostError) throw error;
+            logger.warn?.('[TopologyWorker] user restoration after rollback failed');
+            return false;
+        }
+    }
 
     async rollbackAfterCommitFailure(plan, operationId, prepared, changing, heartbeat) {
         const rollingBack = await this.operationRepository.setPhase({
@@ -654,6 +672,9 @@ class TopologyOperationWorker {
             if (recorded !== true) throw new LeaseLostError();
         }
 
+        if (!rollbackFailed && !(await this.restoreUsersAfterRollback(plan, operationId, heartbeat))) {
+            rollbackFailed = true;
+        }
         const status = rollbackFailed ? 'failed' : 'rolled_back';
         const finished = await this.operationRepository.finishClaimed({
             operationId,

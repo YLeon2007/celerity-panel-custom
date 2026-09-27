@@ -513,6 +513,7 @@ test('user resync failure rolls back changed nodes before finalization', async (
     };
     const rollbackNodes = [];
     let finalized = false;
+    let resyncCalls = 0;
     const worker = createWorker({
         repository,
         executor: {
@@ -526,7 +527,12 @@ test('user resync failure rolls back changed nodes before finalization', async (
             async finalizeSucceeded() { finalized = true; return { ok: true }; },
         },
         userResync: {
-            async resyncPlan() { throw new Error('agent down'); },
+            async resyncPlan() {
+                resyncCalls += 1;
+                if (resyncCalls === 1) throw new Error('agent down');
+                assert.ok(rollbackNodes.length > 0, 'restore users only after node rollback');
+                return { ok: true };
+            },
         },
     });
 
@@ -535,6 +541,27 @@ test('user resync failure rolls back changed nodes before finalization', async (
     assert.equal(result.status, 'rolled_back');
     assert.equal(finalized, false);
     assert.ok(rollbackNodes.length > 0);
+    assert.equal(resyncCalls, 2);
+});
+
+test('persistent user sync failure after rollback cannot be reported as recovered', async () => {
+    const repository = createRepository(durableOperation());
+    const executor = {
+        async prepare(request) { return { backupId: `backup-${request.node.node}`, prepared: { node: request.node.node } }; },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+    };
+    let resyncCalls = 0;
+    const worker = createWorker({
+        repository,
+        executor,
+        userResync: { async resyncPlan() { resyncCalls += 1; return { ok: false }; } },
+    });
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'failed');
+    assert.equal(resyncCalls, 2);
 });
 
 test('lease heartbeat renews while a typed executor call is still running', async () => {
