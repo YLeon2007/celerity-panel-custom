@@ -54,13 +54,8 @@
         return TOPOLOGY_CAUSE_TEXT_RU[code] || null;
     }
 
-    // Strip secret-looking material (long key/token runs) from any backend
-    // text before it reaches a toast. Keeps human context, drops key material.
-    function sanitizeServerText(text) {
-        if (typeof text !== 'string') return '';
-        return text.replace(/[A-Za-z0-9_+\/-]{32,}={0,2}/g, '…').trim();
-    }
-
+    // Free-form backend messages can contain short credentials, not just long
+    // key-like tokens. Show only known diagnostics or a bounded machine code.
     function describeTopologyError(payload, fallback) {
         const err = payload && payload.error;
         const validationCode = Array.isArray(payload && payload.errors)
@@ -74,11 +69,10 @@
             || null;
         const mapped = topologyCauseText(causeCode);
         if (mapped) return mapped + ' (' + causeCode + ')';
-        const raw = (err && (err.message || err.code))
-            || (payload && payload.message)
-            || '';
-        const cleaned = sanitizeServerText(raw);
-        return cleaned || fallback || '';
+        if (typeof causeCode === 'string' && /^[A-Z][A-Z0-9_]{1,64}$/.test(causeCode)) {
+            return 'Операция не выполнена (' + causeCode + ')';
+        }
+        return fallback || 'Операция не выполнена';
     }
 
     // Operation-specific polling: while a queued topology operation is in
@@ -106,7 +100,6 @@
             TOPOLOGY_CAUSE_TEXT_RU,
             describeTopologyError,
             resolveRealityFingerprint,
-            sanitizeServerText,
             shouldContinueOperationPolling,
             topologyCauseText,
         };
@@ -183,9 +176,7 @@
 
     async function handleDraftMutationResponse(response) {
         const payload = await response.json().catch(() => ({}));
-        const errorMessage = sanitizeServerText(
-            payload?.error?.message || payload?.error || ('HTTP ' + response.status),
-        );
+        const errorMessage = describeTopologyError(payload, 'HTTP ' + response.status);
         if (response.status === 409) {
             await loadTopology();
             showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');

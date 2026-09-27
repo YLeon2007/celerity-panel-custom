@@ -74,8 +74,11 @@ const sanitized = ui.describeTopologyError(
     { error: { code: 'WEIRD_UNLISTED_CODE', message: 'node failed with key ' + secret + ' at step 3' } },
     'fallback',
 );
-assert(!sanitized.includes(secret), 'key-like tokens must be redacted from backend messages');
-assert(sanitized.includes('node failed with key'), 'non-secret message context must be kept');
+assert(!sanitized.includes(secret), 'key-like tokens must not appear in backend errors');
+assert(!sanitized.includes('node failed with key'), 'untrusted backend text may contain short secrets too');
+assert(sanitized.includes('WEIRD_UNLISTED_CODE'), 'unknown safe machine code remains available');
+assert(!ui.describeTopologyError({ error: { message: 'password=abc' } }, 'fallback').includes('abc'),
+    'a short secret in a free-form error must not reach the UI');
 
 const fromValidationErrors = ui.describeTopologyError({
     error: { code: 'INVALID_TOPOLOGY_DEPLOYMENT', message: 'pinned invalid' },
