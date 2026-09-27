@@ -431,6 +431,20 @@ class SyncService {
     }
 
     /**
+     * True when the topology deployment executes live on this contour and the
+     * node is a relay/bridge: hop listeners then belong to the xray-bridge
+     * service and must not also be added to the classic xray-main config.
+     *
+     * @param {Object} node - HyNode document
+     * @returns {boolean}
+     */
+    _topologyOwnsHopListeners(node) {
+        const enabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
+            .every(flag => process.env[flag] === 'true');
+        return enabled && ['relay', 'bridge'].includes(node?.cascadeRole);
+    }
+
+    /**
      * Add user to all active Xray nodes they belong to (fire-and-forget safe)
      */
     async addUserToAllXrayNodes(user) {
@@ -528,16 +542,23 @@ class SyncService {
                         if (forwardLinks.length > 0) {
                             configGenerator.applyForwardChain(configObj, forwardLinks, inboundTags);
                         }
-                        if (forwardHopLinks.length > 0) {
-                            configGenerator.applyForwardHopInbound(configObj, forwardHopLinks);
+                        // On relay/bridge nodes the topology deployment owns hop
+                        // listeners via the separate xray-bridge service; adding
+                        // them to xray-main too would bind the same ports twice
+                        // (SO_REUSEPORT silently load-balances between the two
+                        // xray processes and breaks ~half of REALITY handshakes).
+                        const topologyOwnsHopListeners = this._topologyOwnsHopListeners(node);
+                        const classicHopLinks = topologyOwnsHopListeners ? [] : forwardHopLinks;
+                        if (classicHopLinks.length > 0) {
+                            configGenerator.applyForwardHopInbound(configObj, classicHopLinks);
                         }
 
                         // geoip:private block must be last, after all cascade rules
                         configGenerator.ensurePrivateIpBlock(configObj);
 
                         configContent = JSON.stringify(configObj, null, 2);
-                        const total = reverseLinks.length + forwardLinks.length + forwardHopLinks.length;
-                        logger.info(`[Xray Sync] Node ${node.name}: applied ${total} cascade link(s) (${reverseLinks.length}R/${forwardLinks.length}F/${forwardHopLinks.length}H)`);
+                        const total = reverseLinks.length + forwardLinks.length + classicHopLinks.length;
+                        logger.info(`[Xray Sync] Node ${node.name}: applied ${total} cascade link(s) (${reverseLinks.length}R/${forwardLinks.length}F/${classicHopLinks.length}H)`);
                     } else {
                         // No cascade links, still ensure geoip:private is present
                         const configObj = JSON.parse(configContent);
