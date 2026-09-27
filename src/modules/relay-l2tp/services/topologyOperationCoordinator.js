@@ -445,6 +445,7 @@ class TopologyOperationCoordinator {
                     const frozenPlan = await this.planMaterializer.materialize({
                         target: TEST_TOPOLOGY_TARGET,
                         hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                        operationKind: scope?.kind,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,
                             topology,
