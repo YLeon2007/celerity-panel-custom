@@ -196,7 +196,7 @@ function parseExtraInbounds(body) {
             transport,
             security,
             flow: String(flows[i] !== undefined ? flows[i] : 'xtls-rprx-vision'),
-            fingerprint: _pickEnum(fingerprints[i], XRAY_FINGERPRINT_VALUES, 'chrome'),
+            fingerprint: _pickEnum(fingerprints[i], XRAY_FINGERPRINT_VALUES, 'random'),
             fingerprintPool: _parseFingerprintPool(fingerprintPools[i]),
             alpn: alpns[i] !== undefined ? (_splitCsv(alpns[i]) || []) : [],
             realityDest: String(realityDests[i] || 'www.google.com:443'),
@@ -235,7 +235,7 @@ function parseXrayFormFields(body) {
     }
     if (body['xray.flow'] !== undefined) xray.flow = body['xray.flow'];
     if (body['xray.fingerprint']) {
-        xray.fingerprint = _pickEnum(body['xray.fingerprint'], XRAY_FINGERPRINT_VALUES, 'chrome');
+        xray.fingerprint = _pickEnum(body['xray.fingerprint'], XRAY_FINGERPRINT_VALUES, 'random');
     }
     if (body['xray.fingerprintPool'] !== undefined) {
         xray.fingerprintPool = _parseFingerprintPool(body['xray.fingerprintPool']);

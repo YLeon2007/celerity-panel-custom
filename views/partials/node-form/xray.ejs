@@ -51,7 +51,7 @@
                     <div id="xrayFingerprintSingle" class="fp-mode-block" style="margin-top:8px;<%= _fpMode === 'single' ? '' : 'display:none' %>">
                         <select id="xrayFingerprint" name="xray.fingerprint">
                             <% _fpList.forEach(function(f) { %>
-                                <option value="<%= f %>" <%= (node?.xray?.fingerprint === f || (!node?.xray?.fingerprint && f === 'chrome')) ? 'selected' : '' %>><%= _fpLabel(f) %></option>
+                                <option value="<%= f %>" <%= (node?.xray?.fingerprint === f || (!node?.xray?.fingerprint && f === 'random')) ? 'selected' : '' %>><%= _fpLabel(f) %></option>
                             <% }); %>
                         </select>
                     </div>

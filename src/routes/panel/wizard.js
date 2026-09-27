@@ -269,7 +269,7 @@ router.post('/wizard/self-host', wizardLimiter, async (req, res) => {
         if (installXray) {
             const xrayPort = parseInt(req.body['xray.port']) || 8443;
             const xrayTransport   = (req.body['xray.transport']   || 'tcp').trim();
-            const xrayFingerprint = (req.body['xray.fingerprint'] || 'chrome').trim();
+            const xrayFingerprint = (req.body['xray.fingerprint'] || 'random').trim();
             const xrayFlow        = (req.body['xray.flow']        || '').trim();
             const xrayRealityDest = (req.body['xray.realityDest'] || 'www.google.com:443').trim();
             const xrayRealitySni  = (req.body['xray.realitySni']  || 'www.google.com')

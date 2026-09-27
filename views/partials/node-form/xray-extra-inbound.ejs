@@ -7,7 +7,7 @@
     const e = extra || {};
     const transport = e.transport || 'tcp';
     const security = e.security || 'reality';
-    const fingerprint = e.fingerprint || 'chrome';
+    const fingerprint = e.fingerprint || 'random';
     const fingerprintPool = e.fingerprintPool || [];
     const fpMode = fingerprintPool.length > 0 ? 'pool' : 'single';
     const fingerprintList = ['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized'];
