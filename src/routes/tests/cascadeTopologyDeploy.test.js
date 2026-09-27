@@ -99,6 +99,13 @@ function guardHarness(calls) {
             }
             return next();
         },
+        operationStatusRateLimiter(req, res, next) {
+            calls.push('status-rate');
+            if (req.headers['x-test-status-rate-limit'] === 'blocked') {
+                return res.status(429).json({ error: 'too many status polls' });
+            }
+            return next();
+        },
     };
 }
 
@@ -115,6 +122,43 @@ function runIsolatedProbe(source) {
         .find(line => line.startsWith('PROBE_RESULT='));
     assert.ok(output, result.stdout);
     return JSON.parse(output.slice('PROBE_RESULT='.length));
+}
+
+async function requestOperationStatus(router, { id = '507f1f77bcf86cd799439021', headers = {} } = {}) {
+    const app = express();
+    app.use(express.json());
+    app.use(router);
+    const server = await new Promise(resolve => {
+        const candidate = app.listen(0, '127.0.0.1', () => resolve(candidate));
+    });
+    try {
+        const response = await fetch(
+            `http://127.0.0.1:${server.address().port}/operations/${encodeURIComponent(id)}`,
+            { method: 'GET', headers },
+        );
+        return { status: response.status, body: await response.json(), headers: response.headers };
+    } finally {
+        await new Promise((resolve, reject) => {
+            server.close(error => (error ? reject(error) : resolve()));
+        });
+    }
+}
+
+function operationStatusHarness({ document = null, calls = [], projections = [] } = {}) {
+    return {
+        models: {
+            TopologyOperation: {
+                findById(id) {
+                    calls.push(id);
+                    return {
+                        select(fields) { projections.push(fields); return this; },
+                        lean: async () => document,
+                    };
+                },
+            },
+        },
+        topologyDeploymentService: { async deploy() { return {}; } },
+    };
 }
 
 test('mounts the deployment boundary without replacing topology transfer registration', () => {
@@ -515,6 +559,155 @@ test('MCP cascade mutations cannot bypass the revision-safe deploy boundary', ()
         code: 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED',
         error: 'Reconnect the topology draft, then deploy its exact revision',
     }]);
+});
+
+test('operation status endpoint enforces authentication, nodes:read scope, and status rate limit', async () => {
+    const calls = [];
+    const findCalls = [];
+    const document = {
+        _id: '507f1f77bcf86cd799439021',
+        topologyRevision: 7,
+        status: 'queued',
+    };
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({ document, calls: findCalls }),
+        ...guardHarness(calls),
+    });
+
+    const unauthenticated = await requestOperationStatus(router);
+    assert.equal(unauthenticated.status, 401);
+    assert.deepEqual(calls, ['auth']);
+
+    calls.length = 0;
+    const readKey = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(readKey.status, 200);
+    assert.deepEqual(calls, ['auth', 'scope:nodes:read', 'status-rate']);
+
+    calls.length = 0;
+    const session = await requestOperationStatus(router, { headers: { 'x-test-auth': 'session' } });
+    assert.equal(session.status, 200);
+    assert.deepEqual(calls, ['auth', 'scope:nodes:read', 'status-rate']);
+
+    calls.length = 0;
+    const rateLimited = await requestOperationStatus(router, {
+        headers: { 'x-test-auth': 'api-read', 'x-test-status-rate-limit': 'blocked' },
+    });
+    assert.equal(rateLimited.status, 429);
+    assert.deepEqual(calls, ['auth', 'scope:nodes:read', 'status-rate']);
+
+    // Read-only polling must never trip CSRF or the deploy rate limiter.
+    assert.ok(!calls.includes('csrf'));
+    assert.ok(!calls.includes('rate'));
+    assert.deepEqual(findCalls, ['507f1f77bcf86cd799439021', '507f1f77bcf86cd799439021']);
+});
+
+test('operation status endpoint rejects malformed operation ids before touching the model', async () => {
+    const findCalls = [];
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({ calls: findCalls }),
+        ...guardHarness([]),
+    });
+    const headers = { 'x-test-auth': 'api-read' };
+
+    for (const id of ['not-an-object-id', '507f1f77bcf86cd79943902', '507f1f77bcf86cd7994390210', 'zz7f1f77bcf86cd799439021']) {
+        const response = await requestOperationStatus(router, { id, headers });
+        assert.equal(response.status, 400, id);
+        assert.equal(response.body.error.code, 'INVALID_OPERATION_ID', id);
+    }
+    assert.deepEqual(findCalls, []);
+});
+
+test('operation status endpoint returns 404 for an unknown operation', async () => {
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({ document: null }),
+        ...guardHarness([]),
+    });
+
+    const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(response.status, 404);
+    assert.equal(response.body.error.code, 'OPERATION_NOT_FOUND');
+});
+
+test('operation status endpoint returns only the strict public projection', async () => {
+    const projections = [];
+    const document = {
+        _id: '507f1f77bcf86cd799439021',
+        topologyRevision: 7,
+        priorDeployedRevision: 6,
+        deployedRevision: 7,
+        status: 'committing',
+        kind: 'link.apply',
+        causeCode: 'SCOPE_LINK_UNCONFIRMED',
+        reason: 'SCOPE_BASELINE_STALE',
+        plan: { steps: [{ artifacts: 'must-not-leak' }] },
+        reality: { fingerprint: 'must-not-leak' },
+        user: 'must-not-leak',
+        credentials: { password: 'must-not-leak' },
+        nodes: [{
+            node: '507f1f77bcf86cd799439099',
+            candidate: { bytes: [1, 2, 3], sha256: 'candidate-secret' },
+            candidateHash: 'candidate-secret',
+        }],
+        logs: [{ level: 'error', message: 'ssh password must-not-leak' }],
+        leaseOwner: 'worker-host-identity',
+        idempotencyKey: 'must-not-leak',
+        __v: 0,
+    };
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({ document, projections }),
+        ...guardHarness([]),
+    });
+
+    const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(projections, ['_id status topologyRevision']);
+    assert.deepEqual(response.body, {
+        operationId: '507f1f77bcf86cd799439021',
+        status: 'committing',
+        topologyRevision: 7,
+    });
+    assert.doesNotMatch(
+        JSON.stringify(response.body),
+        /plan|candidate|reality|user|credential|password|logs|leaseOwner|idempotency|must-not-leak|secret/i,
+    );
+});
+
+test('operation status endpoint covers the full status lifecycle', async () => {
+    const headers = { 'x-test-auth': 'api-read' };
+    for (const status of ['queued', 'committing', 'succeeded', 'failed', 'rolled_back']) {
+        const router = createCascadeTopologyDeployRouter({
+            ...operationStatusHarness({
+                document: { _id: '507f1f77bcf86cd799439021', topologyRevision: 7, status },
+            }),
+            ...guardHarness([]),
+        });
+        const response = await requestOperationStatus(router, { headers });
+        assert.equal(response.status, 200, status);
+        assert.equal(response.body.status, status, status);
+    }
+});
+
+test('operation status endpoint drops non-enum status, kind, causeCode, and reason', async () => {
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({
+            document: {
+                _id: '507f1f77bcf86cd799439021',
+                topologyRevision: 7,
+                status: 'pwned; drop table',
+                kind: 'rm -rf /',
+                causeCode: 'ssh password leaked in freeform text',
+                reason: 'freeform log message with details',
+            },
+        }),
+        ...guardHarness([]),
+    });
+
+    const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+        operationId: '507f1f77bcf86cd799439021',
+        topologyRevision: 7,
+    });
 });
 
 test('OpenAPI advertises only the revision-safe topology deployment endpoint', () => {

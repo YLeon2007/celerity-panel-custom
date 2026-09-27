@@ -30,6 +30,8 @@ const DEFAULT_MODELS = Object.freeze({
 const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_REQUEST', 400],
     ['INVALID_TOPOLOGY_REVISION', 400],
+    ['INVALID_OPERATION_ID', 400],
+    ['OPERATION_NOT_FOUND', 404],
     ['STALE_TOPOLOGY_REVISION', 409],
     ['INVALID_TOPOLOGY_DEPLOYMENT', 422],
     ['NODE_DEPLOY_FAILED', 502],
@@ -84,6 +86,35 @@ function normalizeDeployRequest(body) {
         );
     }
     return { expectedTopologyRevision };
+}
+
+const OPERATION_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
+// Status lifecycle mirrors TopologyOperation. No kind/causeCode/reason or any
+// freeform field ever leaves this boundary.
+const OPERATION_STATUS_VALUES = new Set([
+    'queued',
+    'preparing',
+    'committing',
+    'rolling_back',
+    'succeeded',
+    'failed',
+    'rolled_back',
+]);
+
+// UI polls scoped operations (link.apply/domain.reconcile) by operationId
+// because they intentionally do not advance the global deployedRevision.
+// Strict projection: never leaks plan/candidate/reality/user/credentials.
+function publicOperationStatus(operation = {}) {
+    const body = {};
+    const operationId = operation.operationId ?? operation._id ?? operation.id;
+    if (operationId !== undefined && operationId !== null) {
+        body.operationId = String(operationId);
+    }
+    if (OPERATION_STATUS_VALUES.has(operation.status)) body.status = operation.status;
+    if (Number.isSafeInteger(operation.topologyRevision) && operation.topologyRevision >= 0) {
+        body.topologyRevision = operation.topologyRevision;
+    }
+    return body;
 }
 
 function publicResult(result = {}) {
@@ -152,6 +183,21 @@ const defaultDeployRateLimiter = rateLimit({
     }),
 });
 
+// UI polling is read-only and frequent, so it gets its own higher cap that
+// never shares budget with the deploy mutation limiter.
+const defaultOperationStatusRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({
+        error: {
+            code: 'TOPOLOGY_OPERATION_STATUS_RATE_LIMITED',
+            message: 'Too many topology operation status requests',
+        },
+    }),
+});
+
 function createCascadeTopologyDeployRouter({
     topologyDeploymentService,
     createService = relayL2tpModule.createTopologyDeploymentService,
@@ -160,6 +206,7 @@ function createCascadeTopologyDeployRouter({
     requireScope = requireAuthMiddleware.requireScope,
     csrf = requirePanelCsrf,
     deployRateLimiter = defaultDeployRateLimiter,
+    operationStatusRateLimiter = defaultOperationStatusRateLimiter,
     routeLogger = logger,
 } = {}) {
     if (typeof createService !== 'function') {
@@ -172,14 +219,49 @@ function createCascadeTopologyDeployRouter({
     if (typeof requireAuth !== 'function' || typeof requireScope !== 'function') {
         throw new TypeError('Cascade topology deploy router requires authentication and authorization');
     }
-    if (typeof csrf !== 'function' || typeof deployRateLimiter !== 'function') {
+    if (typeof csrf !== 'function' || typeof deployRateLimiter !== 'function'
+        || typeof operationStatusRateLimiter !== 'function') {
         throw new TypeError('Cascade topology deploy router requires CSRF and rate-limit protection');
     }
 
     const router = express.Router();
+    const readScope = requireScope('nodes:read');
     const writeScope = requireScope('nodes:write');
     const sessionWriteCsrf = (req, res, next) => (
         req.apiKey ? next() : csrf(req, res, next)
+    );
+
+    // Read-only operation polling for the UI; authenticated, nodes:read
+    // scoped, and rate limited — but no CSRF since it never mutates state.
+    router.get(
+        '/operations/:operationId',
+        requireAuth,
+        readScope,
+        operationStatusRateLimiter,
+        async (req, res) => {
+            try {
+                const { operationId } = req.params;
+                if (!OPERATION_ID_PATTERN.test(operationId)) {
+                    throw new TopologyDeployRequestError(
+                        'INVALID_OPERATION_ID',
+                        'Operation id must be a 24-character hex string',
+                    );
+                }
+                const operation = await models.TopologyOperation.findById(operationId)
+                    .select('_id status topologyRevision')
+                    .lean();
+                if (!operation) {
+                    throw new TopologyDeployRequestError(
+                        'OPERATION_NOT_FOUND',
+                        'Topology operation not found',
+                    );
+                }
+                res.set('Cache-Control', 'no-store');
+                return res.status(200).json(publicOperationStatus(operation));
+            } catch (error) {
+                return sendError(res, error, routeLogger);
+            }
+        },
     );
 
     router.post(
@@ -212,5 +294,6 @@ module.exports.TopologyDeployRequestError = TopologyDeployRequestError;
 module.exports.createCascadeTopologyDeployRouter = createCascadeTopologyDeployRouter;
 module.exports.normalizeDeployRequest = normalizeDeployRequest;
 module.exports.publicError = publicError;
+module.exports.publicOperationStatus = publicOperationStatus;
 module.exports.publicResult = publicResult;
 module.exports.sendError = sendError;
