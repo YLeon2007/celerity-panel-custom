@@ -136,6 +136,8 @@ test('staged reverse P->R: two-node plan, terminal relay blocks transit', () => 
         rule.inboundTag?.includes(bridgeEntry.tag) && rule.outboundTag === 'block'
     ));
     assert.equal(blockRules.length, 1, 'tunnel-exit transit must route to block exactly once');
+    assert.ok(relay.outbounds.some(outbound => outbound.tag === 'block'
+        && outbound.protocol === 'blackhole'), 'block route must resolve to a blackhole outbound');
     assert.deepEqual(
         transitLeakRules(relay, [bridgeEntry.tag]),
         [],
