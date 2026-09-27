@@ -41,14 +41,14 @@ function samePaths(groupPaths, wanted) {
     return JSON.stringify(normalize(groupPaths)) === JSON.stringify(normalize(wanted));
 }
 
-// A path belongs to a relay when its first hop leaves that relay. Paths whose
-// first link is gone (mid-delete) are treated as foreign and preserved — the
-// draft mutation is responsible for stripping dangling references.
-function pathOwnedByRelay(path, linksById, relayId) {
-    const firstLinkId = (path?.linkIds || [])[0];
-    if (firstLinkId === undefined || firstLinkId === null) return false;
-    const firstLink = linksById.get(entityId(firstLinkId));
-    return firstLink !== undefined && entityId(firstLink.portalNode) === relayId;
+// Route-group path keys are unique by schema and are recorded on the installed
+// relay state. Do not infer ownership from the first link: that link may have
+// been deleted or reassigned before this maintenance pass. Two installed relays
+// claiming the same key in one group are ambiguous; leave the group untouched.
+function pathKeyForState(state) {
+    return typeof state.activePathKey === 'string' && state.activePathKey.trim()
+        ? state.activePathKey
+        : 'main';
 }
 
 async function maintainAutoL2tpPaths({
@@ -70,7 +70,6 @@ async function maintainAutoL2tpPaths({
     const links = await CascadeLink.find({}).lean();
     const nodes = await HyNode.find({}).select('_id cascadeRole').lean();
     const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
-    const linksById = new Map((links || []).map(link => [entityId(link._id), link]));
 
     let updated = 0;
     const deferred = [];
@@ -78,6 +77,14 @@ async function maintainAutoL2tpPaths({
         const relayId = entityId(state.node);
         const groupId = entityId(state.routeGroup);
         if (!groupId) continue;
+        const pathKey = pathKeyForState(state);
+        const claimants = states.filter(other =>
+            entityId(other.routeGroup) === groupId && pathKeyForState(other) === pathKey);
+        if (claimants.length !== 1) {
+            logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: ambiguous route group path key`);
+            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
+            continue;
+        }
         const group = await CascadeRouteGroup.findById(groupId).lean();
         if (!group) continue;
 
@@ -102,14 +109,16 @@ async function maintainAutoL2tpPaths({
         }
 
         const existingPaths = group.paths || [];
-        const newPath = { pathKey: 'main', linkIds: chain.linkIds, priority: 1, enabled: true };
-        // Replace this relay's own path in place (stable order keeps the
-        // write idempotent across multiple relays sharing one group); append
-        // only when the relay had no path of its own. Foreign paths keep
-        // their entries and positions untouched.
         const ownedIndexes = existingPaths
-            .map((path, index) => (pathOwnedByRelay(path, linksById, relayId) ? index : -1))
+            .map((path, index) => (path.pathKey === pathKey ? index : -1))
             .filter(index => index >= 0);
+        if (ownedIndexes.length > 1) {
+            logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: duplicate route group path key`);
+            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
+            continue;
+        }
+        const newPath = { pathKey, linkIds: chain.linkIds, priority: 1, enabled: true };
+        // Replace the recorded key in place; foreign keys keep their entries.
         const wanted = ownedIndexes.length === 0
             ? [...existingPaths, newPath]
             : existingPaths

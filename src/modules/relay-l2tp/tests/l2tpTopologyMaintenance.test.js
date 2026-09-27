@@ -203,8 +203,8 @@ function maintenanceHarness({ links, nodes = NODES_MULTI, states, groups }) {
     return models;
 }
 
-function installedState(node, routeGroup) {
-    return { node, desiredState: 'installed', routeGroup };
+function installedState(node, routeGroup, activePathKey = 'main') {
+    return { node, desiredState: 'installed', routeGroup, activePathKey };
 }
 
 test('maintenance never publishes an empty path during a delete/recreate gap', async () => {
@@ -268,6 +268,22 @@ test('maintenance never publishes a partial path that stops short of a bridge', 
     assert.equal(result.deferred[0]?.reason, 'CHAIN_INCOMPLETE');
 });
 
+test('maintenance replaces a stale main path after a link changes relay ownership', async () => {
+    const links = [
+        { _id: 'l-old', portalNode: 'relay-2', bridgeNode: 'bridge-2' },
+        { _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+    ];
+    const group = { _id: 'group-a', paths: [
+        { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true },
+    ] };
+    const models = maintenanceHarness({ links, states: [installedState('relay-1', 'group-a')], groups: { 'group-a': group } });
+    const result = await maintainAutoL2tpPaths(models);
+    assert.equal(result.updated, 1);
+    assert.deepEqual(group.paths, [
+        { pathKey: 'main', linkIds: ['l-new'], priority: 1, enabled: true },
+    ]);
+});
+
 test('maintenance rebuilds only the relay-owned path and preserves other relays in a shared group', async () => {
     // Two installed L2TP relays share one route group; relay-2's path is
     // already correct while relay-1 needs a rebuild after a link recreate.
@@ -278,11 +294,11 @@ test('maintenance rebuilds only the relay-owned path and preserves other relays 
     ];
     const group = {
         _id: 'group-shared',
-        paths: [{ pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true }],
+        paths: [{ pathKey: 'main-relay-2', linkIds: ['l2'], priority: 1, enabled: true }],
     };
     const states = [
-        installedState('relay-1', 'group-shared'),
-        installedState('relay-2', 'group-shared'),
+        installedState('relay-1', 'group-shared', 'main-relay-1'),
+        installedState('relay-2', 'group-shared', 'main-relay-2'),
     ];
     const models = maintenanceHarness({ links, states, groups: { 'group-shared': group } });
 
@@ -291,9 +307,29 @@ test('maintenance rebuilds only the relay-owned path and preserves other relays 
     assert.equal(result.updated, 1, 'only relay-1 needed a path write');
     assert.equal(models.writes.length, 1);
     assert.deepEqual(group.paths, [
-        { pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true },
-        { pathKey: 'main', linkIds: ['l1'], priority: 1, enabled: true },
+        { pathKey: 'main-relay-2', linkIds: ['l2'], priority: 1, enabled: true },
+        { pathKey: 'main-relay-1', linkIds: ['l1'], priority: 1, enabled: true },
     ], 'the foreign relay path must survive the rebuild');
+});
+
+test('maintenance refuses a shared route group with duplicate relay path keys', async () => {
+    const links = [
+        { _id: 'l1', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+        { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2' },
+    ];
+    const group = { _id: 'group-shared', paths: [
+        { pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true },
+    ] };
+    const models = maintenanceHarness({
+        links,
+        states: [installedState('relay-1', 'group-shared'), installedState('relay-2', 'group-shared')],
+        groups: { 'group-shared': group },
+    });
+    const result = await maintainAutoL2tpPaths(models);
+    assert.equal(result.updated, 0);
+    assert.equal(models.writes.length, 0);
+    assert.ok(result.deferred.some(item => item.reason === 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP'));
+    assert.deepEqual(group.paths, [{ pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true }]);
 });
 
 test('maintenance keeps geo branch links out of the published default path', async () => {
