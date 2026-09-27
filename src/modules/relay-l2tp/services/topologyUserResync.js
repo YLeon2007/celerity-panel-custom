@@ -1,6 +1,6 @@
 'use strict';
 
-// After a topology deploy commits, xray on the node restarts with the
+// After topology candidates commit to nodes (before operation success), xray
 // candidate config, which contains no subscription clients: users live only
 // in the xray runtime, added through the node agent HTTP API. Without a
 // re-push the freshly deployed chain authenticates nobody and clients see
@@ -118,7 +118,7 @@ class TopologyUserResync {
         for (let attempt = 1; attempt <= this.attempts; attempt += 1) {
             try {
                 const ok = await this.syncService.addXrayUser(node, user);
-                if (ok !== false) {
+                if (ok === true) {
                     return true;
                 }
             } catch (error) {

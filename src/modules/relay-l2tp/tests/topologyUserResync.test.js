@@ -166,6 +166,24 @@ test('TopologyUserResync: addXrayUser returning false counts as a failed push', 
     assert.equal(result.failedUsers[0].userId, 'u1');
 });
 
+test('TopologyUserResync: an ambiguous addXrayUser result cannot report readiness', async () => {
+    const resync = new TopologyUserResync({
+        HyNode: hyNodeFixture({
+            'node-portal': { _id: 'x', name: 'P', type: 'xray' },
+            'node-bridge': { _id: 'b', name: 'B', type: 'hy2' },
+        }),
+        syncService: {
+            async _getUsersForNode() { return [{ userId: 'u1' }]; },
+            async addXrayUser() { return undefined; },
+        },
+        logger: silentLogger,
+        sleep: async () => {},
+    });
+    const result = await resync.resyncPlan(planFixture());
+    assert.equal(result.ok, false);
+    assert.equal(result.failedUsers[0].reason, 'PUSH_FAILED');
+});
+
 test('TopologyUserResync: missing user synchronization capability cannot report readiness', async () => {
     const resync = new TopologyUserResync({
         HyNode: hyNodeFixture({
