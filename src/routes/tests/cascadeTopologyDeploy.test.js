@@ -11,6 +11,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const express = require('express');
+const sshPool = require('../../services/sshPoolService');
+test.after(() => sshPool.closeAll());
 
 const {
     createCascadeTopologyDeployRouter,
