@@ -251,6 +251,30 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
     assert.equal(response.body.links[0].autoDeploy, true);
 });
 
+test('POST returns the post-maintenance revision used by the next auto-deploy event', async () => {
+    let links = [];
+    const router = createCascadeLinksRouter({
+        Link: {
+            find() { return queryResult(links); },
+            async findOne() { return null; },
+        },
+        Node: { async findById(id) { return { _id: id, name: id }; } },
+        topologyDraftWriteService: {
+            async createLink({ link }) {
+                links = [{ ...link }];
+                return { revision: 8, deployedRevision: 5 };
+            },
+        },
+        maintainAutoL2tpPathsFn: async () => ({ updated: 1, revision: 9 }),
+        invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    });
+    const response = await request(router, { method: 'POST', body: validCreateBody() });
+    assert.equal(response.status, 201);
+    assert.equal(response.body.topologyRevision, 9);
+    assert.equal(response.body.createdLinkId, response.body.links[0]._id);
+});
+
 test('POST without the autoDeploy opt-in records an explicit false and never deploys', async () => {
     const calls = {};
     let links = [];

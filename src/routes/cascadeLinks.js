@@ -232,7 +232,7 @@ function createCascadeLinksRouter({
     // link mutation itself.
     const maintainL2tpPaths = async () => {
         try {
-            await maintainAutoL2tpPathsFn({
+            return await maintainAutoL2tpPathsFn({
                 HyNode: Node,
                 CascadeLink: Link,
                 CascadeRouteGroup: RouteGroup,
@@ -437,14 +437,17 @@ function createCascadeLinksRouter({
                 link,
             });
             await invalidateCaches();
-            await maintainL2tpPaths();
+            const maintenance = await maintainL2tpPaths();
+            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+                ? { ...revisions, revision: maintenance.revision }
+                : revisions;
             logger.info(
                 `[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`,
             );
             const snapshot = await readLinkSnapshot({
                 Link,
                 TopologyState,
-                revisions,
+                revisions: finalRevisions,
             });
             return res.status(201).json({ ...snapshot, createdLinkId: String(link._id) });
         } catch (error) {
@@ -593,12 +596,15 @@ function createCascadeLinksRouter({
                 changes,
             });
             await invalidateCaches();
-            await maintainL2tpPaths();
+            const maintenance = await maintainL2tpPaths();
+            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+                ? { ...revisions, revision: maintenance.revision }
+                : revisions;
             logger.info(`[Cascade Links API] Updated link ${req.params.id}`);
             return res.json(await readLinkSnapshot({
                 Link,
                 TopologyState,
-                revisions,
+                revisions: finalRevisions,
             }));
         } catch (error) {
             return sendError(res, error, 'Update');
@@ -620,12 +626,15 @@ function createCascadeLinksRouter({
                 linkId: req.params.id,
             });
             await invalidateCaches();
-            await maintainL2tpPaths();
+            const maintenance = await maintainL2tpPaths();
+            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+                ? { ...revisions, revision: maintenance.revision }
+                : revisions;
             logger.info(`[Cascade Links API] Deleted link ${req.params.id}`);
             return res.json(await readLinkSnapshot({
                 Link,
                 TopologyState,
-                revisions,
+                revisions: finalRevisions,
             }));
         } catch (error) {
             return sendError(res, error, 'Delete');
