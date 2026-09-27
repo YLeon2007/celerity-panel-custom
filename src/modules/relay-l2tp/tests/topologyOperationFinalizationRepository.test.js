@@ -286,8 +286,8 @@ test('rolls back both document updates when the transaction fails', async () => 
 // silently reported as deployed by an operation that never touched it.
 // ---------------------------------------------------------------------------
 
-function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'] } = {}) {
-    const harness = createHarness();
+function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], topology = {}, includeLinks = true } = {}) {
+    const harness = createHarness({ topology });
     const linkCalls = [];
     const TopologyOperation = {
         ...harness.repository.TopologyOperation,
@@ -310,8 +310,8 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
     const repository = new TopologyOperationFinalizationRepository({
         TopologyOperation,
         CascadeTopologyState: harness.repository.CascadeTopologyState,
-        CascadeLink,
-        transactionRunner: async work => work(SESSION),
+        CascadeLink: includeLinks ? CascadeLink : null,
+        transactionRunner: harness.repository.transactionRunner,
     });
     return { harness, repository, linkCalls };
 }
@@ -324,13 +324,14 @@ test('scoped domain.reconcile commit marks only its own links and keeps the glob
     assert.deepEqual(finalized, {
         operationId: 'operation-7',
         topologyRevision: 7,
-        deployedRevision: 7,
+        deployedRevision: 5,
         finishedAt: NOW,
     });
     assert.equal(harness.store.operation.status, 'succeeded');
     assert.equal(harness.store.topology.deployedRevision, 5,
         'a scoped reconcile must not claim the whole revision is deployed');
-    assert.equal(harness.calls.filter(call => call.model === 'CascadeTopologyState').length, 0);
+    assert.equal(harness.calls.filter(call => call.model === 'CascadeTopologyState').length, 1,
+        'a scoped commit must still fence the pinned revision and prior deployed revision');
     assert.deepEqual(linkCalls, [{
         filter: { _id: { $in: ['link-a', 'link-b'] } },
         update: { $set: { status: 'deployed' } },
@@ -349,6 +350,36 @@ test('scoped link.apply commit is likewise confined to its own links', async () 
     assert.equal(finalized?.topologyRevision, 7);
     assert.equal(harness.store.topology.deployedRevision, 5);
     assert.deepEqual(linkCalls.map(call => call.filter), [{ _id: { $in: ['link-only'] } }]);
+});
+
+test('malformed scoped operation cannot fall back to global deployment', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({ kind: 'link.apply', linkIds: [] });
+    const finalized = await repository.finalizeSucceeded(request());
+
+    assert.equal(finalized, null);
+    assert.equal(harness.store.operation.status, 'committing');
+    assert.equal(harness.store.topology.deployedRevision, 5);
+    assert.deepEqual(linkCalls, []);
+    assert.equal(harness.calls.at(-1).transaction, 'abort');
+});
+
+test('scoped finalization refuses a stale topology revision before marking links', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({ topology: { revision: 8 } });
+    const finalized = await repository.finalizeSucceeded(request());
+
+    assert.equal(finalized, null);
+    assert.equal(harness.store.operation.status, 'committing');
+    assert.equal(harness.store.topology.deployedRevision, 5);
+    assert.deepEqual(linkCalls, []);
+    assert.equal(harness.calls.at(-1).transaction, 'abort');
+});
+
+test('scoped finalization requires a cascade-link updater', async () => {
+    const { harness, repository } = scopedHarness({ includeLinks: false });
+    const finalized = await repository.finalizeSucceeded(request());
+    assert.equal(finalized, null);
+    assert.equal(harness.store.operation.status, 'committing');
+    assert.equal(harness.store.topology.deployedRevision, 5);
 });
 
 test('an explicit domain.sync keeps the legacy global commit semantics', async () => {

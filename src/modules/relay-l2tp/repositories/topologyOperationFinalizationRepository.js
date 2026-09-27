@@ -51,12 +51,13 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
         .select('kind linkIds')
         .session(session)
         .lean();
-    if (!operation
-        || !SCOPED_OPERATION_KINDS.has(operation.kind)
+    if (!operation) return { invalid: true };
+    if (operation.kind === undefined || operation.kind === 'domain.sync') return null;
+    if (!SCOPED_OPERATION_KINDS.has(operation.kind)
         || !Array.isArray(operation.linkIds)
         || operation.linkIds.length === 0
         || !operation.linkIds.every(linkId => typeof linkId === 'string' && linkId.length > 0)) {
-        return null;
+        return { invalid: true };
     }
     return { kind: operation.kind, linkIds: [...operation.linkIds] };
 }
@@ -114,36 +115,39 @@ class TopologyOperationFinalizationRepository {
                     session,
                 );
 
-                if (!scope) {
-                    const topology = await this.CascadeTopologyState.updateOne({
-                        _id: 'singleton',
-                        revision: topologyRevision,
-                        deployedRevision: priorDeployedRevision,
-                    }, {
-                        $set: { deployedRevision: topologyRevision },
-                    }, {
-                        runValidators: true,
-                        session,
-                        timestamps: false,
-                    });
-                    if (topology?.matchedCount !== 1) rejectFinalization();
-                }
+                if (scope?.invalid) rejectFinalization();
+                if (scope && typeof this.CascadeLink?.updateMany !== 'function') rejectFinalization();
+                const topology = await this.CascadeTopologyState.updateOne({
+                    _id: 'singleton',
+                    revision: topologyRevision,
+                    deployedRevision: priorDeployedRevision,
+                }, {
+                    // A scoped commit only checks the fence; it cannot claim
+                    // the rest of the draft revision has been deployed.
+                    $set: { deployedRevision: scope ? priorDeployedRevision : topologyRevision },
+                }, {
+                    runValidators: true,
+                    session,
+                    timestamps: false,
+                });
+                if (topology?.matchedCount !== 1) rejectFinalization();
 
                 if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
                     const linkFilter = scope
                         ? { _id: { $in: scope.linkIds } }
                         : { active: true };
-                    await this.CascadeLink.updateMany(
+                    const linked = await this.CascadeLink.updateMany(
                         linkFilter,
                         { $set: { status: 'deployed' } },
                         { runValidators: true, session },
                     );
+                    if (scope && linked?.matchedCount !== scope.linkIds.length) rejectFinalization();
                 }
 
                 return {
                     operationId,
                     topologyRevision,
-                    deployedRevision: topologyRevision,
+                    deployedRevision: scope ? priorDeployedRevision : topologyRevision,
                     finishedAt: now,
                 };
             });
