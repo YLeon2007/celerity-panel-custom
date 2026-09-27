@@ -166,7 +166,7 @@ test('TopologyUserResync: addXrayUser returning false counts as a failed push', 
     assert.equal(result.failedUsers[0].userId, 'u1');
 });
 
-test('TopologyUserResync: no-op without legacy syncService user API', async () => {
+test('TopologyUserResync: missing user synchronization capability cannot report readiness', async () => {
     const resync = new TopologyUserResync({
         HyNode: hyNodeFixture({
             'node-portal': { _id: 'x', name: 'P', type: 'xray' },
@@ -176,5 +176,10 @@ test('TopologyUserResync: no-op without legacy syncService user API', async () =
         logger: silentLogger,
     });
     const result = await resync.resyncPlan(planFixture());
-    assert.deepEqual(result, { nodeCount: 0, userCount: 0, failedUsers: [], ok: true });
+    assert.deepEqual(result, {
+        nodeCount: 0,
+        userCount: 0,
+        failedUsers: [{ node: null, userId: null, reason: 'USER_SYNC_UNAVAILABLE' }],
+        ok: false,
+    });
 });

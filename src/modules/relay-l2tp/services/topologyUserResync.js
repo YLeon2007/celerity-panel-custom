@@ -74,7 +74,12 @@ class TopologyUserResync {
         const syncService = this.syncService;
         if (typeof syncService?._getUsersForNode !== 'function'
             || typeof syncService?.addXrayUser !== 'function') {
-            return { nodeCount: 0, userCount: 0, failedUsers: [], ok: true };
+            return {
+                nodeCount: 0,
+                userCount: 0,
+                failedUsers: [{ node: null, userId: null, reason: 'USER_SYNC_UNAVAILABLE' }],
+                ok: false,
+            };
         }
         let nodeCount = 0;
         let userCount = 0;
