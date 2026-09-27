@@ -1097,6 +1097,8 @@ function applyReversePortal(config, portalLinks, clientInboundTags) {
                 ),
                 outboundTag: portalTag,
             });
+            // A domain target needs DNS resolution to match an ip-only geo rule.
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     }
 
@@ -1800,6 +1802,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                 ip: geo.geoip.map(g => (g.includes(':') ? g : `geoip:${g}`)),
                 outboundTag: branchTag,
             });
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     }
 
@@ -1834,6 +1837,7 @@ function applyForwardChain(config, forwardLinks, clientInboundTags, cascadePathI
                 ),
                 outboundTag: exitTag,
             });
+            config.routing.domainStrategy = 'IPOnDemand';
         }
     } else {
         // Default: route all client traffic through the forward chain
