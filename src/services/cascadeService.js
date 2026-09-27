@@ -851,7 +851,14 @@ class CascadeService {
             mode: 'forward',
             active: true,
         })).filter(l => !excludeSet.has(String(l._id)));
-        if (forwardHopLinks.length > 0) {
+        // On relay/bridge nodes the topology deployment owns hop listeners via
+        // the separate xray-bridge service; adding them to xray-main too would
+        // bind the same ports twice (SO_REUSEPORT splits REALITY handshakes
+        // between two xray processes).
+        const topologyOwnsHopListeners = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
+            .every(flag => process.env[flag] === 'true')
+            && ['relay', 'bridge'].includes(portalNode?.cascadeRole);
+        if (forwardHopLinks.length > 0 && !topologyOwnsHopListeners) {
             configGenerator.applyForwardHopInbound(config, forwardHopLinks);
         }
 
