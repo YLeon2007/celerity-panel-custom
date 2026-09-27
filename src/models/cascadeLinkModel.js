@@ -68,7 +68,7 @@ const cascadeLinkSchema = new mongoose.Schema({
     autoDeploy: { type: Boolean, default: false },
     status: {
         type: String,
-        enum: ['pending', 'deployed', 'online', 'offline', 'error'],
+        enum: ['pending', 'staged', 'deployed', 'online', 'offline', 'error'],
         default: 'pending',
     },
     lastError: { type: String, default: '' },

@@ -124,6 +124,7 @@
         error:    '#ef4444',
         syncing:  '#eab308',
         deployed: '#3b82f6',
+        staged:   '#d97706',
         pending:  '#475569',
     };
 
@@ -1266,7 +1267,7 @@
         stopOperationPolling();
         if (!result || result.status !== 'queued') return;
         if (!/^[a-f0-9]{24}$/i.test(result.operationId || '')) return;
-        scheduleOperationPollStep({ operationId: result.operationId }, 0, operationPollGeneration);
+        scheduleOperationPollStep({ operationId: result.operationId, kind: result.kind || null }, 0, operationPollGeneration);
     }
 
     function scheduleOperationPollStep(state, attempt, generation) {
@@ -1307,7 +1308,9 @@
         const applied = status === 'succeeded';
         showToast(
             applied
-                ? (i18n.operationApplied || 'Деплой завершён: топология применена')
+                ? state.kind === 'link.apply'
+                    ? 'Связь установлена; готовность полной цепочки ещё не подтверждена'
+                    : (i18n.operationApplied || 'Деплой завершён: топология применена')
                 : status === 'failed' || status === 'rolled_back'
                     ? (i18n.deployFailed || 'Деплой не выполнен') + ': ' + status
                     : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),

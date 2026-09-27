@@ -48,18 +48,21 @@ function rejectFinalization() {
 async function loadOperationScope(TopologyOperation, operationId, session) {
     if (typeof TopologyOperation.findById !== 'function') return null;
     const operation = await TopologyOperation.findById(operationId)
-        .select('kind linkIds')
+        .select('kind linkId linkIds')
         .session(session)
         .lean();
     if (!operation) return { invalid: true };
     if (operation.kind === undefined || operation.kind === 'domain.sync') return null;
     if (!SCOPED_OPERATION_KINDS.has(operation.kind)
+        || typeof operation.linkId !== 'string' || operation.linkId.length === 0
         || !Array.isArray(operation.linkIds)
         || operation.linkIds.length === 0
+        || new Set(operation.linkIds).size !== operation.linkIds.length
+        || !operation.linkIds.includes(operation.linkId)
         || !operation.linkIds.every(linkId => typeof linkId === 'string' && linkId.length > 0)) {
         return { invalid: true };
     }
-    return { kind: operation.kind, linkIds: [...operation.linkIds] };
+    return { kind: operation.kind, linkId: operation.linkId, linkIds: [...operation.linkIds] };
 }
 
 class TopologyOperationFinalizationRepository {
@@ -133,15 +136,18 @@ class TopologyOperationFinalizationRepository {
                 if (topology?.matchedCount !== 1) rejectFinalization();
 
                 if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
+                    const linkIds = scope?.kind === 'link.apply'
+                        ? [scope.linkId]
+                        : scope?.linkIds;
                     const linkFilter = scope
-                        ? { _id: { $in: scope.linkIds } }
+                        ? { _id: { $in: linkIds } }
                         : { active: true };
                     const linked = await this.CascadeLink.updateMany(
                         linkFilter,
-                        { $set: { status: 'deployed' } },
+                        { $set: { status: scope?.kind === 'link.apply' ? 'staged' : 'deployed' } },
                         { runValidators: true, session },
                     );
-                    if (scope && linked?.matchedCount !== scope.linkIds.length) rejectFinalization();
+                    if (scope && linked?.matchedCount !== linkIds.length) rejectFinalization();
                 }
 
                 return {

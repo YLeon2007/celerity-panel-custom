@@ -1225,7 +1225,7 @@ These endpoints are not under \`/api\` and are not part of this specification:
                     tunnelSecurity: { type: 'string', enum: ['none', 'tls', 'reality'] },
                     tunnelTransport: { type: 'string', enum: ['tcp', 'ws', 'grpc', 'xhttp', 'splithttp'] },
                     active: { type: 'boolean' },
-                    status: { type: 'string', enum: ['pending', 'deployed', 'online', 'offline', 'error'] },
+                    status: { type: 'string', enum: ['pending', 'staged', 'deployed', 'online', 'offline', 'error'] },
                     lastError: { type: 'string' },
                     lastHealthCheck: { type: 'string', format: 'date-time', nullable: true },
                     latencyMs: { type: 'integer', nullable: true },
@@ -2405,7 +2405,7 @@ See the request body examples panel for both flavours.`,
                 summary: 'List cascade links',
                 parameters: [
                     { name: 'active', in: 'query', schema: { type: 'boolean' } },
-                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['pending', 'deployed', 'online', 'offline', 'error'] } },
+                    { name: 'status', in: 'query', schema: { type: 'string', enum: ['pending', 'staged', 'deployed', 'online', 'offline', 'error'] } },
                     { name: 'nodeId', in: 'query', schema: { type: 'string' }, description: 'Filter links that touch this node' },
                 ],
                 responses: {

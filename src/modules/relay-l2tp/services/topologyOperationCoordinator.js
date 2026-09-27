@@ -191,7 +191,7 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
         if (linkId !== scope.linkId) {
             const status = rawById.get(linkId)?.status;
             if (status !== undefined && status !== null
-                && status !== 'deployed' && status !== 'online') {
+                && status !== 'deployed' && status !== 'online' && status !== 'staged') {
                 throw new TopologyOperationCoordinatorError(
                     'INVALID_TOPOLOGY_DEPLOYMENT',
                     'A scoped baseline link is not confirmed deployed',
@@ -403,7 +403,8 @@ class TopologyOperationCoordinator {
                         const active = snapshot.links.filter(link => link.active !== false);
                         const hasPending = active.some(link => link.status === 'pending');
                         const hasConfirmed = active.some(link => link.status === 'deployed'
-                            || link.status === 'online' || link.status == null);
+                            || link.status === 'online' || link.status === 'staged'
+                            || link.status == null);
                         if (hasPending && hasConfirmed) {
                             throw new TopologyOperationCoordinatorError(
                                 'INVALID_TOPOLOGY_DEPLOYMENT',

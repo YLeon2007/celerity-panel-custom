@@ -286,7 +286,7 @@ test('rolls back both document updates when the transaction fails', async () => 
 // silently reported as deployed by an operation that never touched it.
 // ---------------------------------------------------------------------------
 
-function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], topology = {}, includeLinks = true } = {}) {
+function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], linkId = linkIds[0], topology = {}, includeLinks = true } = {}) {
     const harness = createHarness({ topology });
     const linkCalls = [];
     const TopologyOperation = {
@@ -296,7 +296,7 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
                 select() { return this; },
                 session() { return this; },
                 async lean() {
-                    return id === 'operation-7' ? { kind, linkIds } : null;
+                    return id === 'operation-7' ? { kind, linkId, linkIds } : null;
                 },
             };
         },
@@ -304,7 +304,8 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
     const CascadeLink = {
         updateMany(filter, update, options) {
             linkCalls.push({ filter, update, options });
-            return Promise.resolve({ matchedCount: linkIds.length, modifiedCount: linkIds.length });
+            const count = Array.isArray(filter._id?.$in) ? filter._id.$in.length : linkIds.length;
+            return Promise.resolve({ matchedCount: count, modifiedCount: count });
         },
     };
     const repository = new TopologyOperationFinalizationRepository({
@@ -350,6 +351,31 @@ test('scoped link.apply commit is likewise confined to its own links', async () 
     assert.equal(finalized?.topologyRevision, 7);
     assert.equal(harness.store.topology.deployedRevision, 5);
     assert.deepEqual(linkCalls.map(call => call.filter), [{ _id: { $in: ['link-only'] } }]);
+    assert.deepEqual(linkCalls.map(call => call.update), [{ $set: { status: 'staged' } }]);
+});
+
+test('scoped link.apply stages only its requested link, not its deployed baseline', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({
+        kind: 'link.apply', linkId: 'link-new',
+        linkIds: ['link-old', 'link-new'],
+    });
+    const finalized = await repository.finalizeSucceeded(request());
+    assert.equal(finalized?.topologyRevision, 7);
+    assert.equal(harness.store.topology.deployedRevision, 5);
+    assert.deepEqual(linkCalls, [{
+        filter: { _id: { $in: ['link-new'] } },
+        update: { $set: { status: 'staged' } },
+        options: { runValidators: true, session: SESSION },
+    }]);
+});
+
+test('scoped finalization rejects a requested link outside its declared links', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({
+        kind: 'link.apply', linkId: 'link-outsider', linkIds: ['link-old'],
+    });
+    assert.equal(await repository.finalizeSucceeded(request()), null);
+    assert.equal(harness.store.operation.status, 'committing');
+    assert.deepEqual(linkCalls, []);
 });
 
 test('malformed scoped operation cannot fall back to global deployment', async () => {
