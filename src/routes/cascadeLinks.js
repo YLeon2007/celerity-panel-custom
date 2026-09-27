@@ -54,6 +54,12 @@ function normalizeExpectedTopologyRevision(input) {
     return revision;
 }
 
+function normalizeAutoDeploy(value) {
+    if (value === undefined || value === null || value === false || value === 'false') return false;
+    if (value === true || value === 'true') return true;
+    throw new RequestValidationError('autoDeploy must be a boolean', undefined, 'INVALID_AUTO_DEPLOY');
+}
+
 function normalizeStringArray(value) {
     if (Array.isArray(value)) return value.map(candidate => String(candidate).trim());
     if (value === undefined || value === null || value === '') return [];
@@ -113,7 +119,7 @@ function resolveRealitySettings(input = {}, targetNode = null) {
         realityShortIds: inputShortIds.some(Boolean)
             ? inputShortIds
             : [crypto.randomBytes(8).toString('hex')],
-        realityFingerprint: String(input.realityFingerprint || 'chrome').trim() || 'chrome',
+        realityFingerprint: String(input.realityFingerprint || 'random').trim() || 'random',
     };
 }
 
@@ -190,6 +196,7 @@ function createCascadeLinksRouter({
     RelayState = RelayL2tpState,
     topologyDraftWriteService,
     createDraftWriteService = createTopologyDraftWriteService,
+    maintainAutoL2tpPathsFn = maintainAutoL2tpPaths,
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
@@ -225,7 +232,7 @@ function createCascadeLinksRouter({
     // link mutation itself.
     const maintainL2tpPaths = async () => {
         try {
-            await maintainAutoL2tpPaths({
+            await maintainAutoL2tpPathsFn({
                 HyNode: Node,
                 CascadeLink: Link,
                 CascadeRouteGroup: RouteGroup,
@@ -312,6 +319,7 @@ function createCascadeLinksRouter({
                 realityPublicKey,
                 realityShortIds,
                 realityFingerprint,
+                autoDeploy,
                 priority,
             } = req.body || {};
             if (!name || !portalNodeId || !bridgeNodeId) {
@@ -401,6 +409,7 @@ function createCascadeLinksRouter({
                 muxEnabled: !!muxEnabled,
                 muxConcurrency: parseInt(muxConcurrency, 10) || 8,
                 priority: parseInt(priority, 10) || 100,
+                autoDeploy: normalizeAutoDeploy(autoDeploy),
             };
             if (security === 'reality') {
                 Object.assign(link, resolveRealitySettings({
@@ -432,11 +441,12 @@ function createCascadeLinksRouter({
             logger.info(
                 `[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`,
             );
-            return res.status(201).json(await readLinkSnapshot({
+            const snapshot = await readLinkSnapshot({
                 Link,
                 TopologyState,
                 revisions,
-            }));
+            });
+            return res.status(201).json({ ...snapshot, createdLinkId: String(link._id) });
         } catch (error) {
             return sendError(res, error, 'Create');
         }
@@ -455,7 +465,7 @@ function createCascadeLinksRouter({
             const allowedFields = [
                 'name', 'mode', 'tunnelPort', 'tunnelDomain', 'tunnelProtocol',
                 'tunnelSecurity', 'tunnelTransport', 'tunnelUuid',
-                'tcpFastOpen', 'tcpKeepAlive', 'tcpNoDelay', 'active', 'priority',
+                'tcpFastOpen', 'tcpKeepAlive', 'tcpNoDelay', 'active', 'priority', 'autoDeploy',
                 'wsPath', 'wsHost', 'grpcServiceName',
                 'xhttpPath', 'xhttpHost', 'xhttpMode',
                 'muxEnabled', 'muxConcurrency',
@@ -465,6 +475,9 @@ function createCascadeLinksRouter({
             const changes = {};
             for (const key of allowedFields) {
                 if (req.body?.[key] !== undefined) changes[key] = req.body[key];
+            }
+            if (changes.autoDeploy !== undefined) {
+                changes.autoDeploy = normalizeAutoDeploy(changes.autoDeploy);
             }
             if (changes.tunnelProtocol !== undefined
                 && !TUNNEL_PROTOCOLS.has(changes.tunnelProtocol)) {

@@ -6,6 +6,7 @@ const express = require('express');
 const fs = require('node:fs');
 const path = require('node:path');
 const mongoose = require('mongoose');
+const CascadeLink = require('../../models/cascadeLinkModel');
 
 const {
     createCascadeLinksRouter,
@@ -88,6 +89,13 @@ function validCreateBody(overrides = {}) {
     };
 }
 
+test('new link model defaults Reality fingerprint to random without changing an explicit choice', () => {
+    assert.equal(new CascadeLink().realityFingerprint, 'random');
+    assert.equal(new CascadeLink({ realityFingerprint: 'chrome' }).realityFingerprint, 'chrome');
+    assert.equal(new CascadeLink().autoDeploy, false,
+        'legacy links and direct creates must never imply an auto-deploy event');
+});
+
 test('cascade API mounts the versioned links router without legacy CRUD or reconnect mutation routes', () => {
     assert.match(
         CASCADE_ROUTE_SOURCE,
@@ -119,7 +127,7 @@ test('GET returns the versioned link snapshot used by network clients', async ()
             return queryResult({ revision: 21, deployedRevision: 18 }, calls, 'topology');
         },
     };
-    const router = createCascadeLinksRouter({ Link, TopologyState });
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {}, Link, TopologyState });
 
     const response = await request(router);
 
@@ -142,7 +150,7 @@ test('GET by id preserves the populated cascade link contract', async () => {
             return queryResult(link, calls, 'single');
         },
     };
-    const router = createCascadeLinksRouter({ Link });
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {}, Link });
 
     const response = await request(router, { path: `/${LINK_A}` });
 
@@ -181,7 +189,7 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
             return { revision: 8, deployedRevision: 5 };
         },
     };
-    const router = createCascadeLinksRouter({
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link,
         Node,
         topologyDraftWriteService,
@@ -225,6 +233,9 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
             muxEnabled: false,
             muxConcurrency: 8,
             priority: 100,
+            // Explicit per-link autoDeploy opt-in is part of the link record:
+            // the server never derives it from incidental events.
+            autoDeploy: true,
         },
     );
     assert.match(calls.createLink.link.tunnelUuid, /^[0-9a-f-]{36}$/i);
@@ -233,9 +244,86 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
     assert.equal(calls.topologyInvalidation, 1);
     assert.equal(response.body.topologyRevision, 8);
     assert.equal(response.body.deployedRevision, 5);
+    assert.equal(response.body.createdLinkId, String(calls.createLink.link._id),
+        'the create response must identify the new link so the UI can auto-deploy exactly it');
     assert.equal(response.body.links.length, 1);
     assert.equal(response.body.links[0]._id, String(calls.createLink.link._id));
-    assert.equal(response.body.links[0].autoDeploy, undefined);
+    assert.equal(response.body.links[0].autoDeploy, true);
+});
+
+test('POST without the autoDeploy opt-in records an explicit false and never deploys', async () => {
+    const calls = {};
+    let links = [];
+    const Link = {
+        find() {
+            return queryResult(links, calls, 'link');
+        },
+        async findOne() { return null; },
+    };
+    const Node = {
+        async findById(id) { return { _id: id, name: id }; },
+    };
+    const topologyDraftWriteService = {
+        async createLink(input) {
+            calls.createLink = input;
+            links = [{ ...input.link }];
+            return { revision: 9, deployedRevision: 5 };
+        },
+    };
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
+        Link,
+        Node,
+        topologyDraftWriteService,
+        invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    });
+
+    const body = validCreateBody();
+    delete body.autoDeploy;
+    const response = await request(router, { method: 'POST', body });
+
+    assert.equal(response.status, 201);
+    assert.equal(calls.createLink.link.autoDeploy, false,
+        'a missing checkbox must persist as an explicit opt-out, not an ambiguous absence');
+});
+
+test('POST REALITY defaults the link fingerprint to literal random but preserves an explicit choice', async () => {
+    const calls = {};
+    const Link = {
+        find() { return queryResult([], calls, 'link'); },
+        async findOne() { return null; },
+    };
+    const Node = {
+        async findById(id) { return { _id: id, name: id }; },
+    };
+    const topologyDraftWriteService = {
+        async createLink(input) {
+            (calls.created ||= []).push(input.link);
+            return { revision: 9, deployedRevision: 5 };
+        },
+    };
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
+        Link,
+        Node,
+        topologyDraftWriteService,
+        invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    });
+
+    const defaulted = await request(router, {
+        method: 'POST',
+        body: validCreateBody({ tunnelSecurity: 'reality' }),
+    });
+    assert.equal(defaulted.status, 201);
+    assert.equal(calls.created[0].realityFingerprint, 'random');
+
+    const explicit = await request(router, {
+        method: 'POST',
+        body: validCreateBody({ tunnelSecurity: 'reality', realityFingerprint: 'chrome' }),
+    });
+    assert.equal(explicit.status, 201);
+    assert.equal(calls.created[1].realityFingerprint, 'chrome',
+        'an explicitly selected fingerprint is never rewritten');
 });
 
 test('PUT updates allowlisted settings through the versioned draft boundary without redeployment', async () => {
@@ -276,7 +364,7 @@ test('PUT updates allowlisted settings through the versioned draft boundary with
             return { revision: 13, deployedRevision: 10 };
         },
     };
-    const router = createCascadeLinksRouter({
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link,
         topologyDraftWriteService,
         async invalidateSubscriptions() { calls.subscriptionInvalidation += 1; },
@@ -331,6 +419,48 @@ test('PUT updates allowlisted settings through the versioned draft boundary with
     assert.doesNotMatch(JSON.stringify(calls.updateLink), /autoRedeploy|attacker-controlled|createdAt/);
 });
 
+test('PUT accepts the explicit autoDeploy flag as a coerced boolean opt-in/out', async () => {
+    const calls = {};
+    const links = [{
+        _id: LINK_A,
+        name: 'Link',
+        portalNode: PORTAL_A,
+        bridgeNode: BRIDGE_A,
+        tunnelPort: 10086,
+        active: true,
+    }];
+    const Link = {
+        find() { return queryResult(links, calls, 'link'); },
+        async findById(id) { return links.find(link => link._id === id) || null; },
+        async findOne() { return null; },
+    };
+    const topologyDraftWriteService = {
+        async updateLink(input) {
+            calls.updateLink = input;
+            return { revision: 14, deployedRevision: 10 };
+        },
+    };
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
+        Link,
+        topologyDraftWriteService,
+        invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    });
+
+    const response = await request(router, {
+        method: 'PUT',
+        path: `/${LINK_A}`,
+        body: { expectedTopologyRevision: 13, autoDeploy: false },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.updateLink, {
+        expectedTopologyRevision: 13,
+        linkId: LINK_A,
+        changes: { autoDeploy: false },
+    });
+});
+
 test('DELETE removes a link through the versioned draft boundary without undeployment', async () => {
     const calls = { deployment: 0, subscriptionInvalidation: 0, topologyInvalidation: 0 };
     let links = [{
@@ -355,7 +485,7 @@ test('DELETE removes a link through the versioned draft boundary without undeplo
             return { revision: 15, deployedRevision: 10 };
         },
     };
-    const router = createCascadeLinksRouter({
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link,
         topologyDraftWriteService,
         async invalidateSubscriptions() { calls.subscriptionInvalidation += 1; },
@@ -390,7 +520,7 @@ test('DELETE removes a link through the versioned draft boundary without undeplo
 
 test('POST rejects an unsupported tunnel protocol before writing the draft', async () => {
     let writes = 0;
-    const router = createCascadeLinksRouter({
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link: {
             async findOne() { return null; },
         },
@@ -418,7 +548,7 @@ test('POST rejects an unsupported tunnel protocol before writing the draft', asy
 
 test('POST rejects an explicit out-of-range tunnel port before writing the draft', async () => {
     let writes = 0;
-    const router = createCascadeLinksRouter({
+    const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link: {
             async findOne() { return null; },
         },

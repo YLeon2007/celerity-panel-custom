@@ -47,7 +47,7 @@ const cascadeLinkSchema = new mongoose.Schema({
     realityPrivateKey: { type: String, default: '' },
     realityPublicKey: { type: String, default: '' },
     realityShortIds: { type: [String], default: [''] },
-    realityFingerprint: { type: String, default: 'chrome' },
+    realityFingerprint: { type: String, default: 'random' },
 
     // MUX settings for tunnel outbound
     muxEnabled: { type: Boolean, default: false },
@@ -64,6 +64,8 @@ const cascadeLinkSchema = new mongoose.Schema({
     priority: { type: Number, default: 100 },
 
     active: { type: Boolean, default: true },
+    // Metadata only. Startup must never infer a fresh deploy from this flag.
+    autoDeploy: { type: Boolean, default: false },
     status: {
         type: String,
         enum: ['pending', 'deployed', 'online', 'offline', 'error'],
