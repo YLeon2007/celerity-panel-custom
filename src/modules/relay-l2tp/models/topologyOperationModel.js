@@ -114,6 +114,8 @@ const topologyOperationSchema = new mongoose.Schema({
     kind: { type: String, enum: ['link.apply', 'domain.reconcile'] },
     linkId: { type: String, match: /^[a-f0-9]{24}$/i },
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
+    // Only link.apply records whether the frozen plan has a terminal relay.
+    staged: { type: Boolean },
     status: {
         type: String,
         enum: OPERATION_STATUSES,
@@ -128,12 +130,14 @@ const topologyOperationSchema = new mongoose.Schema({
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     const scoped = this.kind !== undefined || this.linkId !== undefined
-        || this.linkIds !== undefined;
+        || this.linkIds !== undefined || this.staged !== undefined;
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
         || !Array.isArray(ids) || ids.length === 0
-        || new Set(ids).size !== ids.length || !ids.includes(this.linkId)) {
+        || new Set(ids).size !== ids.length || !ids.includes(this.linkId)
+        || (this.kind === 'link.apply' ? typeof this.staged !== 'boolean'
+            : this.staged !== undefined)) {
         throw new Error('Incomplete scoped topology operation identity');
     }
 });

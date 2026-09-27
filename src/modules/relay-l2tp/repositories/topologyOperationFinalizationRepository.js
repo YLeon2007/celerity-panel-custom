@@ -48,21 +48,28 @@ function rejectFinalization() {
 async function loadOperationScope(TopologyOperation, operationId, session) {
     if (typeof TopologyOperation.findById !== 'function') return null;
     const operation = await TopologyOperation.findById(operationId)
-        .select('kind linkId linkIds')
+        .select('kind linkId linkIds staged')
         .session(session)
         .lean();
     if (!operation) return { invalid: true };
-    if (operation.kind === undefined || operation.kind === 'domain.sync') return null;
+    if (operation.kind === undefined || operation.kind === 'domain.sync') {
+        return operation.linkId === undefined && operation.linkIds === undefined
+            && operation.staged === undefined ? null : { invalid: true };
+    }
     if (!SCOPED_OPERATION_KINDS.has(operation.kind)
         || typeof operation.linkId !== 'string' || operation.linkId.length === 0
         || !Array.isArray(operation.linkIds)
         || operation.linkIds.length === 0
         || new Set(operation.linkIds).size !== operation.linkIds.length
         || !operation.linkIds.includes(operation.linkId)
-        || !operation.linkIds.every(linkId => typeof linkId === 'string' && linkId.length > 0)) {
+        || !operation.linkIds.every(linkId => typeof linkId === 'string' && linkId.length > 0)
+        || (operation.kind === 'link.apply'
+            ? typeof operation.staged !== 'boolean'
+            : operation.staged !== undefined)) {
         return { invalid: true };
     }
-    return { kind: operation.kind, linkId: operation.linkId, linkIds: [...operation.linkIds] };
+    return { kind: operation.kind, linkId: operation.linkId,
+        linkIds: [...operation.linkIds], staged: operation.staged };
 }
 
 class TopologyOperationFinalizationRepository {
@@ -136,15 +143,14 @@ class TopologyOperationFinalizationRepository {
                 if (topology?.matchedCount !== 1) rejectFinalization();
 
                 if (this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
-                    const linkIds = scope?.kind === 'link.apply'
-                        ? [scope.linkId]
-                        : scope?.linkIds;
+                    const isStagedApply = scope?.kind === 'link.apply' && scope.staged === true;
+                    const linkIds = isStagedApply ? [scope.linkId] : scope?.linkIds;
                     const linkFilter = scope
                         ? { _id: { $in: linkIds } }
                         : { active: true };
                     const linked = await this.CascadeLink.updateMany(
                         linkFilter,
-                        { $set: { status: scope?.kind === 'link.apply' ? 'staged' : 'deployed' } },
+                        { $set: { status: isStagedApply ? 'staged' : 'deployed' } },
                         { runValidators: true, session },
                     );
                     if (scope && linked?.matchedCount !== linkIds.length) rejectFinalization();

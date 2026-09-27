@@ -466,7 +466,8 @@ class TopologyOperationCoordinator {
             plan: pinned.frozenPlan,
         });
         const scopedIdentity = scope
-            ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds] }
+            ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds],
+                ...(scope.kind === 'link.apply' ? { staged: pinned.frozenPlan.staged === true } : {}) }
             : {};
         try {
             await this.operationRepository.createFrozen({

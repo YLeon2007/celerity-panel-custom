@@ -141,14 +141,17 @@ class TopologyOperationRepository {
         kind,
         linkId,
         linkIds,
+        staged,
     }) {
-        const scoped = kind !== undefined || linkId !== undefined || linkIds !== undefined;
+        const scoped = kind !== undefined || linkId !== undefined
+            || linkIds !== undefined || staged !== undefined;
         if (scoped && (!SCOPED_OPERATION_KINDS.has(kind)
             || typeof linkId !== 'string' || linkId.length === 0
             || !Array.isArray(linkIds) || linkIds.length === 0
             || !linkIds.every(id => typeof id === 'string' && id.length > 0)
             || new Set(linkIds).size !== linkIds.length
-            || !linkIds.includes(linkId))) {
+            || !linkIds.includes(linkId)
+            || (kind === 'link.apply' ? typeof staged !== 'boolean' : staged !== undefined))) {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
@@ -156,7 +159,8 @@ class TopologyOperationRepository {
             _id: id,
             topologyRevision,
             priorDeployedRevision,
-            ...(scoped ? { kind, linkId, linkIds: [...linkIds] } : {}),
+            ...(scoped ? { kind, linkId, linkIds: [...linkIds],
+                ...(kind === 'link.apply' ? { staged } : {}) } : {}),
             status: 'queued',
             attempts: 0,
             leaseOwner: '',

@@ -659,6 +659,8 @@ test('scoped queue accepts a staged baseline link as physically applied', async 
     assert.equal(result.status, 'queued');
     const materialize = calls.find(call => call.method === 'materialize');
     assert.equal(materialize.input.operationKind, 'link.apply');
+    const frozen = calls.find(call => call.method === 'createFrozen');
+    assert.equal(frozen.input.staged, false);
     assert.deepEqual(
         materialize.input.pinnedSnapshot.topology.links.map(link => link.id).sort(),
         ['link-new-hop', 'link-pr'],

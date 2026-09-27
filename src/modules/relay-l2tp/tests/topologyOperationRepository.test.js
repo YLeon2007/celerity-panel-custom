@@ -27,17 +27,20 @@ test('scoped operation identity survives repository creation and strict Mongo sc
         priorDeployedRevision: 5,
         nodes: [],
         kind: 'link.apply',
+        staged: true,
         linkId: '507f191e810c19729de860ea',
         linkIds: ['507f191e810c19729de860ea'],
     });
     const durable = stored.toObject();
     assert.equal(durable.kind, 'link.apply');
+    assert.equal(durable.staged, true);
     assert.equal(durable.linkId, '507f191e810c19729de860ea');
     assert.deepEqual(durable.linkIds, ['507f191e810c19729de860ea']);
 });
 
 test('strict Mongo schema refuses partially scoped operation identity', async () => {
     for (const scope of [
+        { kind: 'link.apply', linkId: '507f191e810c19729de860ea', linkIds: ['507f191e810c19729de860ea'] },
         { kind: 'link.apply' },
         { kind: 'link.apply', linkId: '507f191e810c19729de860ea', linkIds: [] },
         { linkId: '507f191e810c19729de860ea' },

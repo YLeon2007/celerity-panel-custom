@@ -286,7 +286,7 @@ test('rolls back both document updates when the transaction fails', async () => 
 // silently reported as deployed by an operation that never touched it.
 // ---------------------------------------------------------------------------
 
-function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], linkId = linkIds[0], topology = {}, includeLinks = true } = {}) {
+function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], linkId = linkIds[0], staged = kind === 'link.apply' ? true : undefined, missingStaged = false, topology = {}, includeLinks = true } = {}) {
     const harness = createHarness({ topology });
     const linkCalls = [];
     const TopologyOperation = {
@@ -296,7 +296,10 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
                 select() { return this; },
                 session() { return this; },
                 async lean() {
-                    return id === 'operation-7' ? { kind, linkId, linkIds } : null;
+                    return id === 'operation-7'
+                        ? kind === 'domain.sync' ? { kind }
+                            : { kind, linkId, linkIds, ...(missingStaged ? {} : { staged }) }
+                        : null;
                 },
             };
         },
@@ -375,6 +378,27 @@ test('scoped finalization rejects a requested link outside its declared links', 
     });
     assert.equal(await repository.finalizeSucceeded(request()), null);
     assert.equal(harness.store.operation.status, 'committing');
+    assert.deepEqual(linkCalls, []);
+});
+
+test('complete scoped link.apply activates every staged baseline link without global Sync', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({
+        kind: 'link.apply', linkId: 'link-b', linkIds: ['link-a', 'link-b'], staged: false,
+    });
+    const finalized = await repository.finalizeSucceeded(request());
+    assert.equal(finalized?.topologyRevision, 7);
+    assert.equal(harness.store.topology.deployedRevision, 5);
+    assert.deepEqual(linkCalls.map(call => call.filter), [{ _id: { $in: ['link-a', 'link-b'] } }]);
+    assert.deepEqual(linkCalls.map(call => call.update), [{ $set: { status: 'deployed' } }]);
+});
+
+test('scoped link.apply without durable staged bit cannot finalize as ready', async () => {
+    const { harness, repository, linkCalls } = scopedHarness({
+        kind: 'link.apply', linkId: 'link-a', linkIds: ['link-a'], missingStaged: true,
+    });
+    assert.equal(await repository.finalizeSucceeded(request()), null);
+    assert.equal(harness.store.operation.status, 'committing');
+    assert.equal(harness.store.topology.deployedRevision, 5);
     assert.deepEqual(linkCalls, []);
 });
 
