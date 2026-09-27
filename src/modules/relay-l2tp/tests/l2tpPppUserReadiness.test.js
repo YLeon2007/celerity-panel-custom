@@ -41,6 +41,7 @@ function createService(overrides = {}) {
         loadRelayState: async () => installedState(),
         loadUsers: async () => syncedUsers(),
         queueSync: async request => { queueCalls.push(request); },
+        readback: async () => ({ ok: true, code: 'USERS_VERIFIED', credentialRevision: 41, enabledUserCount: 1, managedUserCount: 1 }),
         clock: { now: () => NOW },
         ...overrides,
     });
@@ -101,9 +102,10 @@ test('constructor rejects missing dependencies', () => {
     );
 });
 
-test('treats an installed relay without users as ready', async () => {
+test('treats an installed relay without users as ready after confirming empty node state', async () => {
     const { service, queueCalls } = createService({
         loadUsers: async () => [],
+        readback: async () => ({ ok: true, code: 'USERS_VERIFIED', credentialRevision: 0, enabledUserCount: 0, managedUserCount: 0 }),
     });
 
     const result = await service.assess({ relayNode: 'relay-1' });
@@ -120,6 +122,7 @@ test('tracks retry budgets independently per relay', async () => {
         loadRelayState: async () => installedState(),
         loadUsers: async relay => (relay === 'relay-1' ? driftedUsers() : syncedUsers()),
         queueSync: async request => { queueCalls.push(request); },
+        readback: async () => ({ ok: true, code: 'USERS_VERIFIED', credentialRevision: 41, enabledUserCount: 1, managedUserCount: 1 }),
         clock: { now: () => new Date(now) },
         maxSyncAttempts: 1,
         minRetryIntervalMs: 0,
@@ -327,12 +330,14 @@ test('fails closed when the relay chap-secrets readback fails', async () => {
     assert.equal(queueCalls.length, 0);
 });
 
-test('marks database-only readiness as node-unverified when no readback is configured', async () => {
-    const { service } = createService();
+test('does not report readiness when node readback is unavailable', async () => {
+    const { service } = createService({ readback: undefined });
 
     const result = await service.assess({ relayNode: 'relay-1' });
 
-    assert.equal(result.ready, true);
+    assert.equal(result.ready, false);
+    assert.equal(result.status, 'blocked');
+    assert.equal(result.reason.code, 'L2TP_PPP_READBACK_UNAVAILABLE');
     assert.equal(result.nodeVerified, false);
 });
 

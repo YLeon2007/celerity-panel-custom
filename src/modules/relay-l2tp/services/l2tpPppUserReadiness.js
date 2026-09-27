@@ -12,6 +12,7 @@ const REASONS = Object.freeze({
     L2TP_PPP_SYNC_QUEUE_FAILED: 'Не удалось поставить синхронизацию PPP-пользователей в очередь',
     L2TP_PPP_CHAP_SECRETS_DRIFT: 'Фактические PPP-учётные записи на релее не совпадают с желаемыми; запущена синхронизация',
     L2TP_PPP_READBACK_FAILED: 'Не удалось проверить фактические PPP-учётные записи на релее',
+    L2TP_PPP_READBACK_UNAVAILABLE: 'Проверка фактических PPP-учётных записей на релее недоступна; готовность не подтверждена',
     L2TP_PPP_READINESS_CHECK_FAILED: 'Не удалось проверить готовность PPP-пользователей',
 });
 
@@ -213,31 +214,31 @@ class L2tpPppUserReadinessService {
             });
         }
 
-        let nodeVerified = false;
-        if (this.readback) {
-            let actual;
-            try {
-                actual = await this.readback({ relayNode: relay });
-            } catch {
-                return blocked('L2TP_PPP_READBACK_FAILED', { ...snapshot, nodeVerified: false });
-            }
-            const readbackMatches = actual
-                && actual.ok === true
-                && actual.code === 'USERS_VERIFIED'
-                && actual.credentialRevision === expectedCredentialRevision
-                && actual.enabledUserCount === enabledUserCount
-                && actual.managedUserCount === enabledUserCount;
-            if (!readbackMatches) {
-                return this.#handleDrift({
-                    relay,
-                    checkedAt,
-                    base: { ...snapshot, nodeVerified: false },
-                    reasonCode: 'L2TP_PPP_CHAP_SECRETS_DRIFT',
-                    episode: this.#episodeFor(relay, desiredHash),
-                });
-            }
-            nodeVerified = true;
+        if (!this.readback) {
+            return blocked('L2TP_PPP_READBACK_UNAVAILABLE', { ...snapshot, nodeVerified: false });
         }
+        let actual;
+        try {
+            actual = await this.readback({ relayNode: relay });
+        } catch {
+            return blocked('L2TP_PPP_READBACK_FAILED', { ...snapshot, nodeVerified: false });
+        }
+        const readbackMatches = actual
+            && actual.ok === true
+            && actual.code === 'USERS_VERIFIED'
+            && actual.credentialRevision === expectedCredentialRevision
+            && actual.enabledUserCount === enabledUserCount
+            && actual.managedUserCount === enabledUserCount;
+        if (!readbackMatches) {
+            return this.#handleDrift({
+                relay,
+                checkedAt,
+                base: { ...snapshot, nodeVerified: false },
+                reasonCode: 'L2TP_PPP_CHAP_SECRETS_DRIFT',
+                episode: this.#episodeFor(relay, desiredHash),
+            });
+        }
+        const nodeVerified = true;
 
         this.#clearEpisode(relay);
         return {
