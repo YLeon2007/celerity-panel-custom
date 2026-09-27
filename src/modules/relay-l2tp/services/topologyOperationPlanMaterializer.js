@@ -166,7 +166,7 @@ function projectPinnedGroups(groups) {
     }).sort((left, right) => left._id.localeCompare(right._id, 'en'));
 }
 
-function projectPinnedSnapshot(pinnedSnapshot) {
+function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     const topology = pinnedSnapshot?.topology;
     const compiled = pinnedSnapshot?.compiled;
     if (!topology || !Array.isArray(topology.nodes) || !Array.isArray(topology.links)) {
@@ -182,12 +182,19 @@ function projectPinnedSnapshot(pinnedSnapshot) {
     // (orderedChain / orderedFanInChain) performs the authoritative shape
     // validation. Here we only require the graph to be deployable at all.
     const portalCount = nodes.filter(node => node.role === 'portal').length;
-    const bridgeCount = nodes.filter(node => node.role === 'bridge').length;
-    if (portalCount < 1 || bridgeCount < 1) {
+    if (portalCount < 1) {
         fail(
             'INVALID_TOPOLOGY_ROLES',
-            'Pinned topology requires at least one portal and at least one bridge',
+            'Pinned topology requires at least one portal',
         );
+    }
+    // A bridge-less snapshot is an incomplete scoped component: the plan is
+    // composed in explicitly staged mode (terminal relay blocks transit,
+    // never direct). The composer validates the staged shape and fails
+    // closed on anything but one portal-rooted run of relays.
+    const staged = !nodes.some(node => node.role === 'bridge');
+    if (staged && operationKind !== 'link.apply') {
+        fail('INVALID_TOPOLOGY_ROLES', 'Only a scoped link.apply may stage a bridge-less chain');
     }
     const links = topology.links.map(snapshotLink)
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
@@ -199,6 +206,7 @@ function projectPinnedSnapshot(pinnedSnapshot) {
     return {
         snapshot: { nodes, links, groups },
         compiledTopology: { valid: true, relays },
+        staged,
     };
 }
 
@@ -264,7 +272,7 @@ class TopologyOperationPlanMaterializer {
         this.#CascadeLink = CascadeLink;
     }
 
-    async materialize({ target, hostIdentity, pinnedSnapshot } = {}) {
+    async materialize({ target, hostIdentity, pinnedSnapshot, operationKind } = {}) {
         if (target !== TEST_TOPOLOGY_TARGET) {
             fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations are restricted to the test target');
         }
@@ -275,7 +283,7 @@ class TopologyOperationPlanMaterializer {
             );
         }
 
-        const input = projectPinnedSnapshot(pinnedSnapshot);
+        const input = projectPinnedSnapshot(pinnedSnapshot, operationKind);
         const nodeIds = input.snapshot.nodes.map(node => node.id);
         const linkIds = input.snapshot.links.map(link => link.id);
         let nodeRows;

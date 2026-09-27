@@ -475,6 +475,109 @@ test('rejects missing, unsafe, non-test, and invalid role identities before meta
     }
 });
 
+function stagedPinnedSnapshot() {
+    // Scoped link.apply for an incomplete P -> R chain: the pinned snapshot
+    // contains exactly the requested link's endpoints and no bridge.
+    return {
+        revision: 18,
+        topology: {
+            nodes: [
+                { id: 'portal-1', role: 'portal' },
+                { id: 'relay-1', role: 'relay' },
+            ],
+            links: [
+                { id: 'portal-relay', source: 'portal-1', target: 'relay-1', mode: 'reverse' },
+            ],
+            groups: [],
+        },
+        compiled: {
+            valid: true,
+            errors: [],
+            relays: [{ nodeId: 'relay-1' }],
+        },
+    };
+}
+
+test('unscoped incomplete snapshot is rejected before metadata reads', async () => {
+    const { HyNode, CascadeLink, materializer } = createMaterializer();
+    await assert.rejects(
+        materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: stagedPinnedSnapshot(),
+        }),
+        error => error.code === 'INVALID_TOPOLOGY_ROLES',
+    );
+    assert.deepEqual(HyNode.calls, []);
+    assert.deepEqual(CascadeLink.calls, []);
+});
+
+test('materializes a fail-closed staged plan for an incomplete scoped P->R chain', async () => {
+    const rows = metadataRows();
+    rows.nodes = rows.nodes.filter(row => row._id !== 'bridge-1');
+    rows.links = rows.links.filter(row => row._id === 'portal-relay');
+    const { HyNode, CascadeLink, materializer } = createMaterializer(rows);
+
+    const plan = await materializer.materialize({
+        target: TEST_TOPOLOGY_TARGET,
+        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+        pinnedSnapshot: stagedPinnedSnapshot(),
+        operationKind: 'link.apply',
+    });
+
+    assert.equal(isDeepFrozen(plan), true);
+    assert.equal(plan.staged, true, 'incomplete scoped chain must be marked staged');
+    assert.deepEqual(plan.nodes.map(node => node.nodeRef).sort(), ['portal', 'relay-1']);
+
+    const relayNode = plan.nodes.find(node => node.nodeRef === 'relay-1');
+    const relay = JSON.parse(Buffer.from(relayNode.candidate.bytes).toString('utf8'));
+    const bridgeEntry = (relay.reverse?.bridges || [])[0];
+    assert.ok(bridgeEntry, 'terminal relay must declare the reverse bridge');
+    assert.ok(relay.routing.rules.some(rule => (
+        rule.inboundTag?.includes(bridgeEntry.tag) && rule.outboundTag === 'block'
+    )), 'terminal relay transit must route to block');
+    assert.ok(!relay.routing.rules.some(rule => (
+        rule.inboundTag?.includes(bridgeEntry.tag)
+        && (rule.outboundTag === 'direct' || rule.outboundTag === 'freedom')
+    )), 'terminal relay transit must never route to direct/freedom');
+    assert.ok(!relay.inbounds.some(inbound => inbound.protocol === 'socks'),
+        'no path ingress may be chained into a missing downstream');
+
+    const serialized = JSON.stringify(plan);
+    for (const secret of SECRET_CANARIES) assert.equal(serialized.includes(secret), false);
+    assert.deepEqual(HyNode.writes, []);
+    assert.deepEqual(CascadeLink.writes, []);
+    assert.deepEqual(
+        HyNode.calls.find(call => call.method === 'find')?.filter?._id?.$in,
+        ['portal-1', 'relay-1'],
+        'staged materialization reads only the two endpoint nodes',
+    );
+});
+
+test('rejects a bridge-less snapshot that also has no portal before metadata reads', async () => {
+    const snapshot = stagedPinnedSnapshot();
+    snapshot.topology.nodes = [
+        { id: 'relay-1', role: 'relay' },
+        { id: 'relay-2', role: 'relay' },
+    ];
+    snapshot.topology.links = [
+        { id: 'portal-relay', source: 'relay-1', target: 'relay-2', mode: 'reverse' },
+    ];
+    snapshot.compiled.relays = [{ nodeId: 'relay-1' }, { nodeId: 'relay-2' }];
+    const { HyNode, CascadeLink, materializer } = createMaterializer();
+
+    await assert.rejects(
+        materializer.materialize({
+            target: TEST_TOPOLOGY_TARGET,
+            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            pinnedSnapshot: snapshot,
+        }),
+        error => error.code === 'INVALID_TOPOLOGY_ROLES',
+    );
+    assert.deepEqual(HyNode.calls, []);
+    assert.deepEqual(CascadeLink.calls, []);
+});
+
 test('normalizes pinned and hydrated row order into identical composer inputs and plan hashes', async () => {
     const firstRows = metadataRows();
     const secondRows = metadataRows();

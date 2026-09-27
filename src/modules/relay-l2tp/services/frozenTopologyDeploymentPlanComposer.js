@@ -660,6 +660,154 @@ function selectChainShape(snapshot, geoLeafLinkIds) {
         : orderedChain(snapshot, geoLeafLinkIds);
 }
 
+/**
+ * Staged scoped chain (link.apply on an incomplete component): a single
+ * portal source followed by one linear run of relays that never reaches a
+ * bridge. The terminal relay is a dead end by definition — candidate
+ * builders must route its transit to `block` (fail closed), never `direct`.
+ *
+ * Deliberately stricter than the complete-chain walkers:
+ * - exactly ONE portal source (a multi-portal bridge-less graph cannot be
+ *   mapped back to node refs by the scoped coordinator, so it is a
+ *   structural error rather than an implicit choice);
+ * - no geo-routing leaf links (a geo branch requires a dedicated bridge,
+ *   which a bridge-less graph cannot have);
+ * - every linked node must lie on the single portal path, and every node
+ *   after the portal must be a relay (including the terminal node).
+ */
+function orderedStagedChain(snapshot, geoLeafLinkIds) {
+    const nodesById = uniqueById(snapshot.nodes, 'NODE');
+    const linksById = uniqueById(snapshot.links, 'LINK');
+
+    if (geoLeafLinkIds.size > 0) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'A geo-routing branch requires a dedicated bridge; staged chains cannot carry geo rules',
+        );
+    }
+
+    // Staged assets: roled nodes without links do not participate (same
+    // semantics as orderedChain / orderedFanInChain).
+    const linkedNodeIds = new Set();
+    for (const [, link] of linksById) {
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (source) linkedNodeIds.add(source);
+        if (target) linkedNodeIds.add(target);
+    }
+    for (const id of [...nodesById.keys()]) {
+        if (!linkedNodeIds.has(id)) nodesById.delete(id);
+    }
+
+    const outgoing = new Map();
+    const incoming = new Map();
+    const linkModes = new Set();
+    for (const [id, link] of linksById) {
+        const source = entityId(link.source ?? link.portalNode);
+        const target = entityId(link.target ?? link.bridgeNode);
+        if (!source || !target || !nodesById.has(source) || !nodesById.has(target)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_TOPOLOGY_LINK_ENDPOINT',
+                'Every topology link requires known source and target nodes',
+            );
+        }
+        if (link.mode !== 'forward' && link.mode !== 'reverse') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'UNSUPPORTED_TOPOLOGY_MODE',
+                'Topology v1 supports only forward or reverse links',
+            );
+        }
+        linkModes.add(link.mode);
+        const entry = { id, link, source, target };
+        if (outgoing.has(source)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Each node may have only one non-geo (default) outgoing link; additional branches require geoRouting',
+            );
+        }
+        outgoing.set(source, entry);
+        if (!incoming.has(target)) incoming.set(target, []);
+        incoming.get(target).push(entry);
+    }
+
+    for (const [id, node] of nodesById) {
+        if (!Object.hasOwn(TARGETS_BY_ROLE, node.role)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'MISSING_NODE_ROLE',
+                'Every topology node requires a supported role',
+            );
+        }
+        if (node.role === 'bridge') {
+            throw new FrozenTopologyDeploymentPlanError(
+                'INVALID_TOPOLOGY_ROLES',
+                'A staged chain must not contain a bridge node',
+            );
+        }
+    }
+
+    const sources = [...outgoing.keys()]
+        .filter(id => !incoming.has(id))
+        .sort((left, right) => left.localeCompare(right, 'en'));
+    if (sources.length !== 1 || nodesById.get(sources[0])?.role !== 'portal') {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'A staged chain requires exactly one portal source reaching every linked node',
+        );
+    }
+
+    const orderedNodes = [];
+    const orderedLinks = [];
+    const visited = new Set();
+    let currentId = sources[0];
+    while (currentId) {
+        if (visited.has(currentId)) {
+            throw new FrozenTopologyDeploymentPlanError(
+                'NON_LINEAR_TOPOLOGY',
+                'Topology v1 requires an acyclic linear chain',
+            );
+        }
+        visited.add(currentId);
+        orderedNodes.push({ id: currentId, node: nodesById.get(currentId) });
+        const next = outgoing.get(currentId);
+        if (!next) break;
+        orderedLinks.push(next);
+        currentId = next.target;
+    }
+
+    // Fail closed on shape drift: every linked node must be covered by the
+    // single portal path, and every hop after the portal must be a relay —
+    // including the terminal dead end (a terminal portal/bridge would either
+    // strand clients or silently become an egress).
+    if (orderedNodes.length !== nodesById.size || orderedLinks.length !== linksById.size) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'A staged chain requires every linked node on one portal-rooted path',
+        );
+    }
+    if (orderedNodes[0].node.role !== 'portal'
+        || orderedNodes.slice(1).some(entry => entry.node.role !== 'relay')) {
+        throw new FrozenTopologyDeploymentPlanError(
+            'NON_LINEAR_TOPOLOGY',
+            'A staged chain must run Portal to Relay(s); the terminal node must be a relay',
+        );
+    }
+
+    return {
+        mode: linkModes.size === 1 ? [...linkModes][0] : 'mixed',
+        staged: true,
+        portalPaths: [{
+            portalId: sources[0],
+            nodeIds: orderedNodes.map(entry => entry.id),
+            links: orderedLinks,
+        }],
+        orderedNodes,
+        orderedLinks,
+        geoLeafNodes: [],
+        incoming,
+        outgoing,
+    };
+}
+
 function topologyFanInRefs(chain) {
     const refs = new Map();
     let portalIndex = 0;
@@ -1262,9 +1410,11 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
  * Routing per node: portal routes client inbound tags, relay routes upstream
  * tunnel exit tags (plus loopback L2TP path ingress) into the default
  * downstream artifact; geo-branch rules are placed before the default rule;
- * terminal nodes (default sink, geo leaves) route exits to 'direct'.
+ * terminal nodes (default sink, geo leaves) route exits to `terminalEgressTag`
+ * ('direct' for complete chains, 'block' for staged incomplete chains whose
+ * terminal relay is a dead end and must never egress directly).
  */
-function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [] }) {
+function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [], terminalEgressTag = 'direct' }) {
     const byEntryId = (left, right) => left.id.localeCompare(right.id, 'en');
     const geoLeafNodes = chain.geoLeafNodes || [];
     const allChainNodes = [...chain.orderedNodes, ...geoLeafNodes];
@@ -1403,7 +1553,7 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
                 config.routing.rules.push({
                     type: 'field',
                     inboundTag: [exitTagOf(entry)],
-                    outboundTag: 'direct',
+                    outboundTag: terminalEgressTag,
                 });
             }
         } else if (ingressTags.length > 0) {
@@ -1505,6 +1655,7 @@ function composeFrozenTopologyDeploymentPlan({
     nodeMetadata = [],
     linkMetadata = [],
     compiledTopology,
+    staged = false,
 } = {}) {
     if (compiledTopology?.valid !== true || !Array.isArray(compiledTopology.relays)) {
         throw new FrozenTopologyDeploymentPlanError(
@@ -1571,7 +1722,16 @@ function composeFrozenTopologyDeploymentPlan({
         geoLeafLinkIds.add(linkId);
     }
 
-    const chain = selectChainShape(snapshot, geoLeafLinkIds);
+    // A bridge-less graph is an incomplete chain. By default this stays a
+    // structural error (manual domain sync relies on diagnosing it per
+    // domain). Only an explicitly staged compose (scoped link.apply whose
+    // path does not reach a bridge yet) builds a staged plan whose terminal
+    // relay blocks transit. Graphs with a bridge keep the existing
+    // complete-chain walkers unchanged.
+    const hasBridgeNode = snapshot.nodes.some(node => node?.role === 'bridge');
+    const chain = !hasBridgeNode && staged === true
+        ? orderedStagedChain(snapshot, geoLeafLinkIds)
+        : selectChainShape(snapshot, geoLeafLinkIds);
     const roleByNodeId = new Map(
         [...chain.orderedNodes, ...chain.geoLeafNodes].map(({ id, node }) => [id, node.role]),
     );
@@ -1637,8 +1797,11 @@ function composeFrozenTopologyDeploymentPlan({
         ? topologyFanInRefs(chain)
         : topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
     // Mixed-mode domains (and fan-in domains with any reverse link) are built
-    // hop-by-hop; uniform domains keep their legacy builders.
-    const useMixedBuilder = chain.mode === 'mixed'
+    // hop-by-hop; uniform domains keep their legacy builders. Staged chains
+    // are always built hop-by-hop with the terminal dead end routing transit
+    // to `block` instead of `direct` (fail closed: no direct egress).
+    const useMixedBuilder = chain.staged === true
+        || chain.mode === 'mixed'
         || (chain.fanIn === true && chain.mode !== 'forward');
     let candidateConfigsById;
     let ingressByNodeId;
@@ -1653,6 +1816,7 @@ function composeFrozenTopologyDeploymentPlan({
             nodeMetadataById,
             linkMetadataById,
             groups: snapshot.groups,
+            ...(chain.staged === true ? { terminalEgressTag: 'block' } : {}),
         }));
     } catch (error) {
         if (error instanceof FrozenTopologyDeploymentPlanError) throw error;
@@ -1697,6 +1861,7 @@ function composeFrozenTopologyDeploymentPlan({
     return deepFreeze({
         schemaVersion: 1,
         mode: chain.mode,
+        ...(chain.staged === true ? { staged: true } : {}),
         nodes,
     });
 }
