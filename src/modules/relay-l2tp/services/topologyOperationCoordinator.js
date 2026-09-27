@@ -67,6 +67,11 @@ function idFromIdempotencyKey(idempotencyKey) {
 }
 
 const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
+// Baseline members of a scoped operation must be physically applied already:
+// deployed/online are fully confirmed, staged means a link.apply finished
+// applying the link to its endpoints but the component is not client-ready
+// yet. Anything else (pending, error, offline) is never a valid baseline.
+const CONFIRMED_BASELINE_LINK_STATUSES = new Set(['deployed', 'online', 'staged']);
 
 function normalizeOperationScope(scope) {
     if (scope === undefined) return null;
@@ -191,7 +196,7 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
         if (linkId !== scope.linkId) {
             const status = rawById.get(linkId)?.status;
             if (status !== undefined && status !== null
-                && status !== 'deployed' && status !== 'online' && status !== 'staged') {
+                && !CONFIRMED_BASELINE_LINK_STATUSES.has(status)) {
                 throw new TopologyOperationCoordinatorError(
                     'INVALID_TOPOLOGY_DEPLOYMENT',
                     'A scoped baseline link is not confirmed deployed',

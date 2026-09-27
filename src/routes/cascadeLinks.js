@@ -60,6 +60,78 @@ function normalizeAutoDeploy(value) {
     throw new RequestValidationError('autoDeploy must be a boolean', undefined, 'INVALID_AUTO_DEPLOY');
 }
 
+// Confirmed-applied link statuses: deployed/online are fully confirmed;
+// staged means a link.apply physically applied the link to its endpoints but
+// the component is not client-ready yet. All three are valid auto-deploy
+// baseline members; pending/error/offline never are.
+const CONFIRMED_DEPLOYED_LINK_STATUSES = new Set(['deployed', 'online', 'staged']);
+
+function scopedLinkEntityId(value) {
+    const id = value !== null && typeof value === 'object'
+        ? value._id ?? value.id ?? value.node
+        : value;
+    return id === null || id === undefined ? '' : String(id);
+}
+
+// The auto-deploy baseline is the connected component of confirmed-applied
+// (deployed/online/staged), active links reachable from either endpoint of
+// the newly created link. Traversal deliberately never crosses a pending, errored,
+// offline, or disabled edge: an old pending link on a shared relay is not
+// proof of deployment and must stay out of the scoped candidate even when it
+// touches the exact node the new link attaches to.
+function selectLinkApplyBaselineLinkIds({ links, linkId, portalNodeId, bridgeNodeId } = {}) {
+    const requestedId = scopedLinkEntityId(linkId);
+    const adjacency = new Map();
+    for (const link of Array.isArray(links) ? links : []) {
+        const id = scopedLinkEntityId(link?._id ?? link?.id);
+        if (!id || id === requestedId) continue;
+        if (link?.active === false) continue;
+        if (!CONFIRMED_DEPLOYED_LINK_STATUSES.has(link?.status)) continue;
+        const source = scopedLinkEntityId(link?.portalNode);
+        const target = scopedLinkEntityId(link?.bridgeNode);
+        if (!source || !target) continue;
+        if (!adjacency.has(source)) adjacency.set(source, []);
+        if (!adjacency.has(target)) adjacency.set(target, []);
+        adjacency.get(source).push({ nodeId: target, linkId: id });
+        adjacency.get(target).push({ nodeId: source, linkId: id });
+    }
+    const visitedNodes = new Set();
+    const baseline = new Set();
+    const queue = [scopedLinkEntityId(portalNodeId), scopedLinkEntityId(bridgeNodeId)]
+        .filter(Boolean);
+    while (queue.length > 0) {
+        const nodeId = queue.shift();
+        if (visitedNodes.has(nodeId)) continue;
+        visitedNodes.add(nodeId);
+        for (const edge of adjacency.get(nodeId) || []) {
+            if (!baseline.has(edge.linkId)) {
+                baseline.add(edge.linkId);
+                queue.push(edge.nodeId);
+            }
+        }
+    }
+    return [...baseline].sort((left, right) => left.localeCompare(right, 'en'));
+}
+
+const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
+    'INVALID_REQUEST',
+    'INVALID_TOPOLOGY_REVISION',
+    'STALE_TOPOLOGY_REVISION',
+    'INVALID_TOPOLOGY_DEPLOYMENT',
+    'TOPOLOGY_OPERATION_QUEUE_FAILED',
+    'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+]);
+
+function autoDeployBlockedError(error) {
+    const code = typeof error?.code === 'string' && SAFE_AUTO_DEPLOY_BLOCKED_CODES.has(error.code)
+        ? error.code
+        : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+    return {
+        code,
+        message: 'The auto-deploy operation could not be queued',
+    };
+}
+
 function normalizeStringArray(value) {
     if (Array.isArray(value)) return value.map(candidate => String(candidate).trim());
     if (value === undefined || value === null || value === '') return [];
@@ -197,6 +269,17 @@ function createCascadeLinksRouter({
     topologyDraftWriteService,
     createDraftWriteService = createTopologyDraftWriteService,
     maintainAutoL2tpPathsFn = maintainAutoL2tpPaths,
+    topologyCoordinator,
+    createTopologyCoordinator = () => require('../modules/relay-l2tp')
+        .createTopologyDeploymentService({
+            HyNode: Node,
+            CascadeLink: Link,
+            CascadeRouteGroup: RouteGroup,
+            CascadeTopologyState: TopologyState,
+            RelayL2tpState: RelayState,
+            TopologyOperation: require('../modules/relay-l2tp/models/topologyOperationModel'),
+            NodeOperationLock: require('../modules/relay-l2tp/models/nodeOperationLockModel'),
+        }),
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
@@ -213,6 +296,72 @@ function createCascadeLinksRouter({
             });
         }
         return writeService;
+    };
+    let coordinator = topologyCoordinator;
+    // The scoped operation coordinator is resolved lazily and only on an
+    // explicit autoDeploy opt-in: merely requiring this router must never
+    // construct (or start) the topology runtime.
+    const getTopologyCoordinator = () => {
+        if (!coordinator) {
+            coordinator = createTopologyCoordinator();
+        }
+        return coordinator;
+    };
+    // Queue the scoped link.apply for an explicit autoDeploy opt-in. Runs
+    // strictly AFTER the draft write transaction and L2TP path maintenance
+    // have settled, pinning the post-maintenance revision. The result is
+    // truthful: an operation id with its real queued status, or a blocked
+    // reason — never a readiness claim.
+    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links }) => {
+        const linkId = String(link._id);
+        const baselineLinkIds = selectLinkApplyBaselineLinkIds({
+            links,
+            linkId,
+            portalNodeId,
+            bridgeNodeId,
+        });
+        try {
+            const scopedCoordinator = await getTopologyCoordinator();
+            if (typeof scopedCoordinator?.queue !== 'function') {
+                const error = new Error('Topology deployment capabilities are unavailable');
+                error.code = 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE';
+                throw error;
+            }
+            const result = await scopedCoordinator.queue({
+                expectedTopologyRevision: revision,
+                scope: {
+                    kind: 'link.apply',
+                    linkId,
+                    linkIds: [linkId, ...baselineLinkIds],
+                },
+            });
+            if (!result || typeof result.operationId !== 'string'
+                || result.operationId.length === 0
+                || result.topologyRevision !== revision
+                || !['queued', 'preparing', 'committing', 'succeeded'].includes(result.status)) {
+                const error = new Error('The topology operation could not be queued');
+                error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+                throw error;
+            }
+            return {
+                autoDeployOperation: {
+                    operationId: result.operationId,
+                    topologyRevision: result.topologyRevision,
+                    // Preserve the actual operation lifecycle state; a queued
+                    // operation is not a client-ready chain.
+                    status: result.status,
+                },
+            };
+        } catch (error) {
+            const blocked = autoDeployBlockedError(error);
+            logger.warn(
+                `[Cascade Links API] Auto-deploy of link ${linkId} blocked: ${blocked.code}: ${blocked.message}`,
+            );
+            return {
+                autoDeployStatus: 'blocked',
+                autoDeployError: blocked,
+            };
+        }
     };
     const invalidateCaches = async () => {
         const results = await Promise.allSettled([
@@ -449,7 +598,17 @@ function createCascadeLinksRouter({
                 TopologyState,
                 revisions: finalRevisions,
             });
-            return res.status(201).json({ ...snapshot, createdLinkId: String(link._id) });
+            const body = { ...snapshot, createdLinkId: String(link._id) };
+            if (link.autoDeploy === true) {
+                Object.assign(body, await queueAutoDeploy({
+                    link,
+                    portalNodeId,
+                    bridgeNodeId,
+                    revision: finalRevisions.revision,
+                    links: snapshot.links,
+                }));
+            }
+            return res.status(201).json(body);
         } catch (error) {
             return sendError(res, error, 'Create');
         }
@@ -657,3 +816,4 @@ module.exports.normalizeExpectedTopologyRevision = normalizeExpectedTopologyRevi
 module.exports.normalizeStringArray = normalizeStringArray;
 module.exports.readLinkSnapshot = readLinkSnapshot;
 module.exports.resolveRealitySettings = resolveRealitySettings;
+module.exports.selectLinkApplyBaselineLinkIds = selectLinkApplyBaselineLinkIds;

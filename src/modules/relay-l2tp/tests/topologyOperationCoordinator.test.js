@@ -628,6 +628,43 @@ test('scoped queue rejects a preexisting pending link even when a caller include
     assert.equal(calls.filter(call => call.method === 'worker.run').length, 0);
 });
 
+test('scoped queue accepts a staged baseline link as physically applied', async () => {
+    const calls = [];
+    const snapshot = scopedSnapshot();
+    // A previous link.apply applied portal-1 -> relay-1 to its endpoints but
+    // the component is not client-ready yet: staged is a valid baseline,
+    // unlike the old pending link on the same relay.
+    snapshot.links[0].status = 'staged';
+    snapshot.links.push({
+        _id: 'link-new-hop',
+        portalNode: 'relay-1',
+        bridgeNode: 'bridge-1',
+        mode: 'reverse',
+        active: true,
+        status: 'pending',
+    });
+    snapshot.links = snapshot.links.filter(link => link._id !== 'link-rb');
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
+
+    const result = await coordinator.queue({
+        expectedTopologyRevision: 8,
+        scope: {
+            kind: 'link.apply',
+            linkId: 'link-new-hop',
+            linkIds: ['link-new-hop', 'link-pr'],
+        },
+    });
+    await Promise.resolve();
+
+    assert.equal(result.status, 'queued');
+    const materialize = calls.find(call => call.method === 'materialize');
+    assert.deepEqual(
+        materialize.input.pinnedSnapshot.topology.links.map(link => link.id).sort(),
+        ['link-new-hop', 'link-pr'],
+        'the staged first hop joins the effective graph; the pending shared-relay link stays out',
+    );
+});
+
 test('scoped queue rejects an inactive requested link', async () => {
     const calls = [];
     const snapshot = scopedSnapshot();
