@@ -62,6 +62,33 @@ function materializedPlan() {
     });
 }
 
+test('legacy full deploy refuses pending links before composing or marking all links', async () => {
+    const currentSnapshot = snapshot();
+    currentSnapshot.links[0].status = 'deployed';
+    currentSnapshot.links.push({
+        _id: 'link-old-pending', portalNode: 'portal-2',
+        bridgeNode: 'bridge-1', mode: 'reverse', active: true, status: 'pending',
+    });
+    let materialized = false;
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: {
+            async pinTopology({ prepare }) { return prepare(currentSnapshot); },
+        },
+        planMaterializer: {
+            async materialize() { materialized = true; return materializedPlan(); },
+        },
+        operationRepository: { async createFrozen() { throw new Error('must not persist'); } },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+    });
+    await assert.rejects(
+        coordinator.queue({ expectedTopologyRevision: 7 }),
+        error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error.causeCode === 'UNCONFIRMED_LINK_IN_FULL_DEPLOY',
+    );
+    assert.equal(materialized, false);
+});
+
 test('queues one frozen fixed-test operation and starts only the injected worker', async () => {
     const calls = [];
     const currentSnapshot = snapshot();
@@ -618,7 +645,9 @@ test('scoped queue rejects an inactive requested link', async () => {
 
 test('legacy unscoped queue keeps the full-sync idempotency key and records no scope', async () => {
     const calls = [];
-    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+    const allConfirmed = scopedSnapshot();
+    allConfirmed.links.forEach(link => { link.status = 'deployed'; });
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(allConfirmed, calls));
 
     await coordinator.queue({ expectedTopologyRevision: 8 });
     await Promise.resolve();

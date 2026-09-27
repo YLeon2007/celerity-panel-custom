@@ -396,6 +396,22 @@ class TopologyOperationCoordinator {
             pinned = await this.topologyRepository.pinTopology({
                 expectedRevision: expectedTopologyRevision,
                 prepare: async snapshot => {
+                    // Legacy full-sync finalization marks every active link
+                    // deployed. Never let it silently claim an unrelated
+                    // pending draft alongside already deployed links.
+                    if (!scope) {
+                        const active = snapshot.links.filter(link => link.active !== false);
+                        const hasPending = active.some(link => link.status === 'pending');
+                        const hasConfirmed = active.some(link => link.status === 'deployed'
+                            || link.status === 'online' || link.status == null);
+                        if (hasPending && hasConfirmed) {
+                            throw new TopologyOperationCoordinatorError(
+                                'INVALID_TOPOLOGY_DEPLOYMENT',
+                                'Mixed pending and deployed links require an explicit scoped operation',
+                                { operationId, causeCode: 'UNCONFIRMED_LINK_IN_FULL_DEPLOY' },
+                            );
+                        }
+                    }
                     const projected = projectTopology(snapshot);
                     // Scoped reconcile: plan only the caller-declared
                     // component (deployed links + the requested link). This

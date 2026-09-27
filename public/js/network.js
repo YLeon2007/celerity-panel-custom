@@ -37,6 +37,7 @@
         TOPOLOGY_DEPLOY_RATE_LIMITED: 'Слишком много запросов на деплой — повторите позже',
         SCOPE_LINK_MISSING: 'Связь отсутствует в зафиксированной топологии',
         SCOPE_LINK_UNCONFIRMED: 'Базовая связь ещё не подтверждена как применённая',
+        UNCONFIRMED_LINK_IN_FULL_DEPLOY: 'Есть ожидающие связи: используйте отдельный деплой связи, не синхронизируйте всю топологию',
         SCOPE_GROUP_CONFLICT: 'Группа маршрутов пересекает границу выбранного участка',
         INCOMPLETE_REALITY_PARAMETERS: 'Неполные параметры REALITY',
         INVALID_TOPOLOGY_ROLES: 'Некорректные роли узлов в топологии',
