@@ -261,6 +261,8 @@ test('empty graph yields an empty report instead of an error', () => {
 test('default deployed-link policy treats only confirmed links as deployed', () => {
     assert.equal(defaultIsDeployedLink({ active: true, status: 'online' }), true);
     assert.equal(defaultIsDeployedLink({ active: true, status: 'deployed' }), true);
+    // A staged hop was physically applied, but is not client-ready.
+    assert.equal(defaultIsDeployedLink({ active: true, status: 'staged' }), true);
     assert.equal(defaultIsDeployedLink({ active: true, status: 'pending' }), false);
     assert.equal(defaultIsDeployedLink({ active: true, status: 'error' }), false);
     assert.equal(defaultIsDeployedLink({ active: true, status: 'offline' }), false);

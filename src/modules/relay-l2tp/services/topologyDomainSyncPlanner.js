@@ -16,8 +16,9 @@
  * integration layer's responsibility.
  *
  * Deployed baseline: links carry a per-link deploy `status`
- * ('pending'|'deployed'|'online'|'offline'|'error'). Only confirmed-deployed
- * links form the baseline partition; draft/pending links are still planned
+ * ('pending'|'staged'|'deployed'|'online'|'offline'|'error'). Only
+ * physically applied links (including staged, not client-ready) form the
+ * baseline partition; draft/pending links are still planned
  * (and diagnosed) in the desired partition but never enter the baseline.
  * Legacy rows without a status are treated as deployed to preserve
  * pre-domain behavior.
@@ -38,7 +39,7 @@ const {
     composeFrozenTopologyDeploymentPlan,
 } = require('./frozenTopologyDeploymentPlanComposer');
 
-const DEPLOYED_LINK_STATUSES = Object.freeze(['deployed', 'online']);
+const DEPLOYED_LINK_STATUSES = Object.freeze(['staged', 'deployed', 'online']);
 const SAFE_VALIDATION_ERROR_FIELDS = Object.freeze([
     'code',
     'groupId',
@@ -59,9 +60,9 @@ class TopologyDomainSyncPlannerError extends Error {
 }
 
 /**
- * Default baseline membership policy: a link belongs to the deployed
- * baseline only when it is active and confirmed deployed. Links without any
- * status predate per-link deploy tracking and count as deployed.
+ * Default baseline membership policy: a link belongs to the physically
+ * applied baseline when active and confirmed deployed or staged. Staged is
+ * not client-ready. Links without any status predate per-link deploy tracking.
  */
 function defaultIsDeployedLink(link) {
     if (link?.active === false) return false;
