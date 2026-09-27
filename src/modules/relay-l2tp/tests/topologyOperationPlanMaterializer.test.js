@@ -421,14 +421,9 @@ test('rejects missing, unsafe, non-test, and invalid role identities before meta
             },
             code: 'UNSAFE_TOPOLOGY_NODE_ROLE',
         },
-        {
-            name: 'duplicate portal role topology',
-            input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
-            mutate(snapshot) {
-                snapshot.topology.nodes.find(node => node.role === 'relay').role = 'portal';
-            },
-            code: 'INVALID_TOPOLOGY_ROLES',
-        },
+        // NOTE: multi-portal topologies are legitimate (fan-in domains) — the
+        // materializer no longer rejects them; shape validation lives in the
+        // composer (covered by frozenTopologyDeploymentPlanComposer tests).
         {
             name: 'unsafe route group identity',
             input: { target: TEST_TOPOLOGY_TARGET, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },

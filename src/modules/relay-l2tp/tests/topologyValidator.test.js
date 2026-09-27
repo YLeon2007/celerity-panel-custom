@@ -68,53 +68,22 @@ test('rejects route-group paths that reference an unknown link', () => {
     });
 });
 
-test('rejects mixed forward and reverse links in one path', () => {
+test('accepts mixed forward and reverse links in one path', () => {
+    // Link mode is per-hop tunnel semantics (who dials whom); a path may mix
+    // modes, e.g. when a forward hop is blocked but reverse still works.
     const topology = validTopology();
     topology.links[1].mode = 'reverse';
 
-    assert.deepEqual(validateTopology(topology), {
-        valid: false,
-        errors: [{
-            code: 'GROUP_MODE_MISMATCH',
-            groupId: 'group-1',
-            pathKey: 'path-1',
-            linkId: 'relay-bridge',
-            groupMode: 'forward',
-            linkMode: 'reverse',
-        }, {
-            code: 'MIXED_LINK_MODES',
-            groupId: 'group-1',
-            pathKey: 'path-1',
-            modes: ['forward', 'reverse'],
-        }],
-    });
+    assert.deepEqual(validateTopology(topology), { valid: true, errors: [] });
 });
 
-test('rejects a path whose links all disagree with the route-group mode', () => {
+test('accepts a path whose links disagree with the route-group mode', () => {
+    // group.mode is operator metadata; the deployment composer resolves the
+    // tunnel direction per link.
     const topology = validTopology();
     topology.groups[0].mode = 'reverse';
 
-    assert.deepEqual(validateTopology(topology), {
-        valid: false,
-        errors: [
-            {
-                code: 'GROUP_MODE_MISMATCH',
-                groupId: 'group-1',
-                pathKey: 'path-1',
-                linkId: 'portal-relay',
-                groupMode: 'reverse',
-                linkMode: 'forward',
-            },
-            {
-                code: 'GROUP_MODE_MISMATCH',
-                groupId: 'group-1',
-                pathKey: 'path-1',
-                linkId: 'relay-bridge',
-                groupMode: 'reverse',
-                linkMode: 'forward',
-            },
-        ],
-    });
+    assert.deepEqual(validateTopology(topology), { valid: true, errors: [] });
 });
 
 test('rejects a self-loop in a path', () => {

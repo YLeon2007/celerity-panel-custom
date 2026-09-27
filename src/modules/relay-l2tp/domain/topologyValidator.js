@@ -53,16 +53,6 @@ function validateTopology({ links = [], groups = [] } = {}) {
             }
 
             for (const link of pathLinks) {
-                if (group.mode && link.mode !== group.mode) {
-                    errors.push({
-                        code: 'GROUP_MODE_MISMATCH',
-                        groupId,
-                        pathKey,
-                        linkId: String(link.id),
-                        groupMode: group.mode,
-                        linkMode: link.mode,
-                    });
-                }
                 if (link.source !== link.target) continue;
                 errors.push({
                     code: 'SELF_LOOP',
@@ -92,16 +82,6 @@ function validateTopology({ links = [], groups = [] } = {}) {
                     pathKey,
                     sourceNodeId,
                     targetNodeId,
-                });
-            }
-
-            const modes = [...new Set(pathLinks.map(link => link.mode))].sort();
-            if (modes.length > 1) {
-                errors.push({
-                    code: 'MIXED_LINK_MODES',
-                    groupId,
-                    pathKey,
-                    modes,
                 });
             }
         }
