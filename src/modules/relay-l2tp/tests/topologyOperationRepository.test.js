@@ -7,6 +7,65 @@ const test = require('node:test');
 const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
+const TopologyOperation = require('../models/topologyOperationModel');
+
+test('scoped operation identity survives repository creation and strict Mongo schema', async () => {
+    let stored;
+    const model = {
+        async create(document) {
+            stored = new TopologyOperation(document);
+            await stored.validate();
+            return stored;
+        },
+        async findOneAndUpdate() {},
+        async updateOne() {},
+    };
+    const repository = new TopologyOperationRepository({ model });
+    await repository.createFrozen({
+        operationId: '507f1f77bcf86cd799439011',
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+        nodes: [],
+        kind: 'link.apply',
+        linkId: '507f191e810c19729de860ea',
+        linkIds: ['507f191e810c19729de860ea'],
+    });
+    const durable = stored.toObject();
+    assert.equal(durable.kind, 'link.apply');
+    assert.equal(durable.linkId, '507f191e810c19729de860ea');
+    assert.deepEqual(durable.linkIds, ['507f191e810c19729de860ea']);
+});
+
+test('strict Mongo schema refuses partially scoped operation identity', async () => {
+    for (const scope of [
+        { kind: 'link.apply' },
+        { kind: 'link.apply', linkId: '507f191e810c19729de860ea', linkIds: [] },
+        { linkId: '507f191e810c19729de860ea' },
+    ]) {
+        const operation = new TopologyOperation({
+            topologyRevision: 7, priorDeployedRevision: 5,
+            status: 'queued', nodes: [], ...scope,
+        });
+        await assert.rejects(operation.validate());
+    }
+});
+
+test('scoped operation rejects missing or inconsistent link identity before creating', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    for (const scope of [
+        { kind: 'link.apply', linkId: 'a', linkIds: [] },
+        { kind: 'link.apply', linkId: 'a', linkIds: ['b'] },
+        { kind: 'link.apply', linkId: 'a', linkIds: ['a', 'a'] },
+        { kind: 'unsupported', linkId: 'a', linkIds: ['a'] },
+    ]) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], ...scope,
+        }), TypeError);
+    }
+    assert.deepEqual(model.calls, []);
+});
 
 test('findPublicById returns only the public status projection', async () => {
     let captured;

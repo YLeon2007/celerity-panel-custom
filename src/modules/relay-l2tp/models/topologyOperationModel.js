@@ -110,6 +110,10 @@ const topologyOperationSchema = new mongoose.Schema({
         required: true,
         min: 0,
     },
+    // No default: legacy full-sync operations have no scoped identity.
+    kind: { type: String, enum: ['link.apply', 'domain.reconcile'] },
+    linkId: { type: String, match: /^[a-f0-9]{24}$/i },
+    linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     status: {
         type: String,
         enum: OPERATION_STATUSES,
@@ -121,5 +125,17 @@ const topologyOperationSchema = new mongoose.Schema({
     finishedAt: { type: Date, default: null },
     nodes: { type: [topologyNodeSchema], default: [] },
 }, { timestamps: true });
+
+topologyOperationSchema.pre('validate', function validateScopedIdentity() {
+    const scoped = this.kind !== undefined || this.linkId !== undefined
+        || this.linkIds !== undefined;
+    if (!scoped) return;
+    const ids = this.linkIds;
+    if (!this.kind || typeof this.linkId !== 'string'
+        || !Array.isArray(ids) || ids.length === 0
+        || new Set(ids).size !== ids.length || !ids.includes(this.linkId)) {
+        throw new Error('Incomplete scoped topology operation identity');
+    }
+});
 
 module.exports = mongoose.model('TopologyOperation', topologyOperationSchema);

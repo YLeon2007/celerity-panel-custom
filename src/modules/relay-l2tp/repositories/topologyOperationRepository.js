@@ -11,6 +11,7 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -137,12 +138,25 @@ class TopologyOperationRepository {
         topologyRevision,
         priorDeployedRevision,
         nodes,
+        kind,
+        linkId,
+        linkIds,
     }) {
+        const scoped = kind !== undefined || linkId !== undefined || linkIds !== undefined;
+        if (scoped && (!SCOPED_OPERATION_KINDS.has(kind)
+            || typeof linkId !== 'string' || linkId.length === 0
+            || !Array.isArray(linkIds) || linkIds.length === 0
+            || !linkIds.every(id => typeof id === 'string' && id.length > 0)
+            || new Set(linkIds).size !== linkIds.length
+            || !linkIds.includes(linkId))) {
+            throw new TypeError('Invalid scoped topology operation identity');
+        }
         const metadata = nodes.map(durableNodeMetadata);
         return this.model.create({
             _id: id,
             topologyRevision,
             priorDeployedRevision,
+            ...(scoped ? { kind, linkId, linkIds: [...linkIds] } : {}),
             status: 'queued',
             attempts: 0,
             leaseOwner: '',
