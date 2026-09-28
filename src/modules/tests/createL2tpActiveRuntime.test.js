@@ -551,6 +551,17 @@ test('explicit complete activation wires execution factories lazily and starts o
     ]);
 });
 
+test('active host install is disabled before admission acquisition and SSH even with a ready gate', async () => {
+    const { host, calls, admissionGate } = createActiveHost({ admissionReady: true });
+    await assert.rejects(host.runtime.service.install('node-a', {
+        routeGroupId: 'group-a', expectedTopologyRevision: 17,
+    }), { code: 'REMOTE_ADMISSION_UNAVAILABLE' });
+    assert.equal(admissionGate.remoteAdmissionCount, 0);
+    assert.equal(calls.some(call => call.kind === 'NodeSSH.construct'
+        || call.kind === 'CascadeTopologyState.updateOne'
+        || call.kind === 'operationRepository.create'), false);
+});
+
 test('active preflight fails closed at admission before transport on a missing singleton', async () => {
     const { calls, host } = createActiveHost();
     assert.deepEqual(calls, []);

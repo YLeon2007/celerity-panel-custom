@@ -24,6 +24,7 @@ function createService(overrides = {}) {
         })),
         preflightRunner: overrides.preflightRunner || (async () => ({ ok: true, checks: [] })),
         remoteAdmissionRepository: overrides.remoteAdmissionRepository,
+        enableInstallAdmission: overrides.enableInstallAdmission,
         clock: overrides.clock || { now: () => new Date(NOW) },
     });
 }
@@ -572,7 +573,17 @@ test('install rejects a failed preflight without building or persisting a plan',
     let operationCreates = 0;
     const service = createService({
         ...repositories,
-        preflightRunner: async () => preflightResult,
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async release(id) { assert.equal(id, 'admission-1'); },
+            async queueInstall() { throw new Error('refusal must not queue'); },
+            async markRecoveryRequired() { throw new Error('verified refusal must release'); },
+        },
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return preflightResult;
+        },
         planBuilder: () => {
             planCalls += 1;
             return { ok: true, steps: [] };
@@ -603,7 +614,17 @@ test('install rejects a fail-closed plan without persisting an operation', async
     let operationCreates = 0;
     const service = createService({
         ...repositories,
-        preflightRunner: async () => ({ ok: true, checks: [] }),
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async release(id) { assert.equal(id, 'admission-1'); },
+            async queueInstall() { throw new Error('rejected plan must not queue'); },
+            async markRecoveryRequired() { throw new Error('attested completion must release'); },
+        },
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true, checks: [] };
+        },
         planBuilder: () => ({
             ok: false,
             error: {
@@ -632,6 +653,130 @@ test('install rejects a fail-closed plan without persisting an operation', async
     assert.equal(operationCreates, 0);
 });
 
+test('install without explicit test opt-in fails closed before transport or persistence', async () => {
+    const context = installContext();
+    const calls = [];
+    const service = createService({
+        ...createContextRepositories(context),
+        remoteAdmissionRepository: {
+            async acquireInstall() { calls.push('acquire'); },
+            async queueInstall() { calls.push('queue'); },
+        },
+        preflightRunner: async () => { calls.push('ssh'); return { ok: true }; },
+        operationRepository: { async create() { calls.push('create'); } },
+    });
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'REMOTE_ADMISSION_UNAVAILABLE' });
+    assert.deepEqual(calls, []);
+});
+
+test('opted-in install acquires before SSH and queues the same counted operation without release', async () => {
+    const context = installContext();
+    const events = [];
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall(request) {
+                events.push(['acquire', request]);
+                return 'admission-1';
+            },
+            async queueInstall(request) { events.push(['queue', request]); },
+            async release() { throw new Error('must not release after handoff'); },
+            async markRecoveryRequired() { throw new Error('must not recover after handoff'); },
+        },
+        preflightRunner: async request => {
+            events.push(['preflight', request]);
+            request.onVerifiedRemoteComplete();
+            return { ok: true, checks: [] };
+        },
+        planBuilder: request => {
+            events.push(['plan', request]);
+            return { ok: true, operationId: request.operationId, relayId: 'relay-1', topologyRevision: 17 };
+        },
+        operationRepository: { async create() { throw new Error('legacy create forbidden'); } },
+    });
+    const result = await service.install(context.node.id, context.input);
+    assert.match(result.operationId, /^[0-9a-f]{24}$/);
+    assert.deepEqual(events.map(event => event[0]), ['acquire', 'preflight', 'plan', 'queue']);
+    assert.deepEqual(events[0][1], { nodeId: 'relay-1' });
+    assert.equal(typeof events[1][1].onVerifiedRemoteComplete, 'function');
+    assert.equal(events[2][1].operationId, result.operationId);
+    assert.equal(events[3][1].admissionId, 'admission-1');
+    assert.equal(events[3][1].operationDocument._id, result.operationId);
+    assert.equal(events[3][1].operationDocument.plan.operationId, result.operationId);
+});
+
+test('opted-in install requires full admission API before SSH', async () => {
+    const context = installContext();
+    let transportCalls = 0;
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: { async acquireInstall() { throw new Error('unexpected acquire'); } },
+        preflightRunner: async () => { transportCalls += 1; },
+    });
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'REMOTE_ADMISSION_UNAVAILABLE' });
+    assert.equal(transportCalls, 0);
+});
+
+for (const [name, runner] of [
+    ['missing attestation', async () => ({ ok: true })],
+    ['invalid response', async request => { request.onVerifiedRemoteComplete(); return { ok: 'true' }; }],
+    ['invalid attested error', async request => {
+        request.onVerifiedRemoteComplete();
+        return { ok: false, error: { code: 'PREFLIGHT_RESPONSE_INVALID' } };
+    }],
+    ['runner exception', async () => { throw new Error('SSH upload timed out'); }],
+    ['attested runner exception', async request => {
+        request.onVerifiedRemoteComplete();
+        throw new Error('SSH command timed out');
+    }],
+]) {
+    test(`install ${name} retains count and marks recovery without planning`, async () => {
+        const context = installContext();
+        const events = [];
+        const service = createService({
+            ...createContextRepositories(context),
+            enableInstallAdmission: true,
+            preflightRunner: runner,
+            planBuilder: () => { events.push('plan'); },
+            remoteAdmissionRepository: {
+                async acquireInstall() { events.push('acquire'); return 'admission-1'; },
+                async queueInstall() { events.push('queue'); },
+                async release() { events.push('release'); },
+                async markRecoveryRequired(id) { events.push(`recover:${id}`); },
+            },
+        });
+        await assert.rejects(service.install(context.node.id, context.input));
+        assert.deepEqual(events, ['acquire', 'recover:admission-1']);
+    });
+}
+
+test('attested materialization failure releases once; release failure propagates without retry', async () => {
+    const context = installContext();
+    const events = [];
+    const releaseError = new Error('release commit unknown');
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+        operationMaterializer: () => { throw new Error('materialization failed'); },
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async release() { events.push('release'); throw releaseError; },
+            async queueInstall() { events.push('queue'); },
+            async markRecoveryRequired() { events.push('recover'); },
+        },
+    });
+    await assert.rejects(service.install(context.node.id, context.input), error => error === releaseError);
+    assert.deepEqual(events, ['release']);
+});
+
 test('install validates context, builds a plan, and persists one queued operation', async () => {
     const context = installContext();
     const repositories = createContextRepositories(context);
@@ -643,17 +788,21 @@ test('install validates context, builds a plan, and persists one queued operatio
         routeGroupId: 'group-a',
         steps: [{ type: 'preflight' }, { type: 'verify' }, { type: 'commit' }],
     };
-    const operationRepository = {
-        async create(operation) {
-            events.push({ method: 'create', operation });
-            return operation;
-        },
-    };
     const service = createService({
         ...repositories,
-        operationRepository,
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { events.push({ method: 'acquire' }); return 'admission-1'; },
+            async queueInstall({ admissionId, operationDocument }) {
+                events.push({ method: 'queue', admissionId, operation: operationDocument });
+            },
+            async release() { throw new Error('must not release'); },
+            async markRecoveryRequired() { throw new Error('must not recover'); },
+        },
+        operationRepository: { async create() { throw new Error('legacy create forbidden'); } },
         preflightRunner: async request => {
             events.push({ method: 'preflightRunner', request });
+            request.onVerifiedRemoteComplete();
             return { ok: true, checks: [{ code: 'READY', ok: true }] };
         },
         planBuilder: request => {
@@ -666,9 +815,10 @@ test('install validates context, builds a plan, and persists one queued operatio
 
     assert.deepEqual(Object.keys(result), ['operationId']);
     assert.match(result.operationId, /^[0-9a-f]{24}$/);
-    assert.equal(events.length, 3);
-    assert.equal(events[0].method, 'preflightRunner');
-    assert.deepEqual(events[1], {
+    assert.equal(events.length, 4);
+    assert.equal(events[0].method, 'acquire');
+    assert.equal(events[1].method, 'preflightRunner');
+    assert.deepEqual(events[2], {
         method: 'planBuilder',
         request: {
             operationId: result.operationId,
@@ -685,8 +835,9 @@ test('install validates context, builds a plan, and persists one queued operatio
             },
         },
     });
-    assert.deepEqual(events[2], {
-        method: 'create',
+    assert.deepEqual(events[3], {
+        method: 'queue',
+        admissionId: 'admission-1',
         operation: {
             _id: result.operationId,
             node: 'relay-1',
@@ -701,66 +852,124 @@ test('install validates context, builds a plan, and persists one queued operatio
     });
 });
 
-test('install replaces a terminal operation holding the same idempotency key', async () => {
+test('terminal duplicate is not deleted or retried and leaves new admission counted', async () => {
     const context = installContext();
-    const repositories = createContextRepositories(context);
     const events = [];
+    const duplicate = Object.assign(new Error('E11000 duplicate key'), { code: 11000 });
     const service = createService({
-        ...repositories,
-        planBuilder: request => buildInstallPlan(request),
-        operationMaterializer: request => materializeInstallOperation(request),
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+        planBuilder: buildInstallPlan,
+        operationMaterializer: materializeInstallOperation,
+        remoteAdmissionRepository: {
+            async acquireInstall() { events.push('acquire'); return 'admission-1'; },
+            async queueInstall() { events.push('queue'); throw duplicate; },
+            async release() { events.push('release'); },
+            async markRecoveryRequired() { events.push('recover'); },
+        },
         operationRepository: {
-            async create() {
-                events.push('create');
-                if (events.filter(event => event === 'create').length === 1) {
-                    const error = new Error('E11000 duplicate key');
-                    error.code = 11000;
-                    throw error;
-                }
-            },
-            async findByIdempotencyKey() {
-                return { _id: 'stale-op', status: 'failed' };
-            },
-            async deleteById(operationId) {
-                events.push(`delete:${operationId}`);
-            },
+            async create() { throw new Error('legacy create forbidden'); },
+            async deleteById() { events.push('delete'); },
         },
     });
-
-    const result = await service.install(context.node.id, context.input);
-
-    assert.deepEqual(events, ['create', 'delete:stale-op', 'create']);
-    assert.notEqual(result.operationId, 'stale-op');
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'INSTALL_OPERATION_CONFLICT' });
+    assert.deepEqual(events, ['acquire', 'queue']);
 });
 
-test('install returns the active operation for a duplicate idempotency key', async () => {
+test('active duplicate without proven counted admission is not reported as success', async () => {
     const context = installContext();
-    const repositories = createContextRepositories(context);
-    let creates = 0;
+    const events = [];
+    const duplicate = Object.assign(new Error('E11000 duplicate key'), { code: 11000 });
     const service = createService({
-        ...repositories,
-        planBuilder: request => buildInstallPlan(request),
-        operationMaterializer: request => materializeInstallOperation(request),
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+        planBuilder: buildInstallPlan,
+        operationMaterializer: materializeInstallOperation,
+        remoteAdmissionRepository: {
+            async acquireInstall() { events.push('acquire'); return 'admission-1'; },
+            async queueInstall() { events.push('queue'); throw duplicate; },
+            async release() { events.push('release'); },
+            async markRecoveryRequired() { events.push('recover'); },
+        },
         operationRepository: {
-            async create() {
-                creates += 1;
-                const error = new Error('E11000 duplicate key');
-                error.code = 11000;
-                throw error;
-            },
-            async findByIdempotencyKey() {
-                return { _id: 'active-op', status: 'running' };
-            },
-            async deleteById() {
-                throw new Error('active operations must not be deleted');
-            },
+            async findByIdempotencyKey() { return { _id: 'legacy-op', status: 'running' }; },
+            async deleteById() { events.push('delete'); },
         },
     });
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'INSTALL_OPERATION_CONFLICT' });
+    assert.deepEqual(events, ['acquire', 'queue']);
+});
 
+test('ambiguous queue commit succeeds only after exact admission-operation readback', async () => {
+    const context = installContext();
+    let requested;
+    const events = [];
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+        planBuilder: ({ operationId }) => ({ ok: true, operationId, relayId: 'relay-1', topologyRevision: 17 }),
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async queueInstall(request) { requested = request; throw new Error('commit timed out'); },
+            async findInstallHandoff(request) {
+                events.push(request);
+                return {
+                    admission: {
+                        _id: 'admission-1', nodeId: 'relay-1', kind: 'install',
+                        phase: 'queued', operationId: requested.operationDocument._id,
+                    },
+                    operation: {
+                        ...requested.operationDocument, admissionId: 'admission-1',
+                    },
+                };
+            },
+            async release() { throw new Error('must not release'); },
+            async markRecoveryRequired() { throw new Error('must not recover'); },
+        },
+    });
     const result = await service.install(context.node.id, context.input);
+    assert.equal(result.operationId, requested.operationDocument._id);
+    assert.deepEqual(events, [{ admissionId: 'admission-1', operationId: result.operationId }]);
+});
 
-    assert.equal(creates, 1);
-    assert.deepEqual(result, { operationId: 'active-op' });
+test('ambiguous queue readback with wrong admission link fails closed', async () => {
+    const context = installContext();
+    const events = [];
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+        planBuilder: ({ operationId }) => ({ ok: true, operationId, relayId: 'relay-1', topologyRevision: 17 }),
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async queueInstall() { events.push('queue'); throw new Error('commit timed out'); },
+            async findInstallHandoff() {
+                events.push('read');
+                return { admission: { phase: 'queued', operationId: 'other' }, operation: null };
+            },
+            async release() { events.push('release'); },
+            async markRecoveryRequired() { events.push('recover'); },
+        },
+    });
+    await assert.rejects(service.install(context.node.id, context.input));
+    assert.deepEqual(events, ['queue', 'read']);
 });
 
 test('install materializes a secret-safe durable payload after validation and before persistence', async () => {
@@ -786,8 +995,19 @@ test('install materializes a secret-safe durable payload after validation and be
     let createdOperation;
     const service = createService({
         ...repositories,
-        preflightRunner: async () => {
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-1'; },
+            async queueInstall({ operationDocument }) {
+                events.push('persist');
+                createdOperation = operationDocument;
+            },
+            async release() { throw new Error('must not release'); },
+            async markRecoveryRequired() { throw new Error('must not recover'); },
+        },
+        preflightRunner: async request => {
             events.push('preflight');
+            request.onVerifiedRemoteComplete();
             return { ok: true, checks: [] };
         },
         planBuilder: request => {
@@ -799,10 +1019,7 @@ test('install materializes a secret-safe durable payload after validation and be
             return materializeInstallOperation(request);
         },
         operationRepository: {
-            async create(operation) {
-                events.push('persist');
-                createdOperation = operation;
-            },
+            async create() { throw new Error('legacy create forbidden'); },
         },
     });
 

@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomBytes } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 
 class L2tpServiceError extends Error {
     constructor(code, message, details = {}) {
@@ -41,6 +42,7 @@ class L2tpService {
         operationMaterializer,
         preflightRunner,
         remoteAdmissionRepository,
+        enableInstallAdmission = false,
         clock,
     }) {
         this.nodeRepository = nodeRepository;
@@ -50,6 +52,7 @@ class L2tpService {
         this.operationMaterializer = operationMaterializer;
         this.preflightRunner = preflightRunner;
         this.remoteAdmissionRepository = remoteAdmissionRepository;
+        this.enableInstallAdmission = enableInstallAdmission === true;
         this.clock = clock;
     }
 
@@ -81,9 +84,9 @@ class L2tpService {
     }
 
     async preflight(nodeId, input) {
-        // Standalone preflight admission only. install() has its own preflight
-        // path and is not protected by this first slice; do not enable drain or
-        // replacement acquisition until all remote paths are admitted.
+        // Standalone preflight has separate admission. Install's test-only
+        // preflight acquires its own counted admission; the active host keeps
+        // install disabled until admission-aware worker claims are available.
         const context = await this._loadInstallContext(nodeId, input);
         const admissions = this.remoteAdmissionRepository;
         if (!admissions || typeof admissions.acquire !== 'function'
@@ -122,86 +125,136 @@ class L2tpService {
 
     async install(nodeId, input) {
         const context = await this._loadInstallContext(nodeId, input);
-        const preflightResult = await this.preflightRunner(context);
-        if (preflightResult?.ok !== true) {
+        // The active host never opts in: its worker cannot yet claim counted
+        // admissions. An unsupported install must fail before remote transport.
+        const admissions = this.remoteAdmissionRepository;
+        if (!this.enableInstallAdmission || !admissions
+            || typeof admissions.acquireInstall !== 'function'
+            || typeof admissions.queueInstall !== 'function'
+            || typeof admissions.release !== 'function'
+            || typeof admissions.markRecoveryRequired !== 'function') {
+            throw new L2tpServiceError('REMOTE_ADMISSION_UNAVAILABLE', 'Install admission is unavailable');
+        }
+        const admissionId = await admissions.acquireInstall({ nodeId: entityId(context.node) });
+        let verifiedComplete = false;
+        let preflightResult;
+        let runnerError;
+        try {
+            preflightResult = await this.preflightRunner({
+                ...context,
+                onVerifiedRemoteComplete: () => { verifiedComplete = true; },
+            });
+        } catch (error) {
+            runnerError = error;
+        }
+        const validResult = preflightResult && typeof preflightResult === 'object'
+            && typeof preflightResult.ok === 'boolean'
+            && preflightResult.error?.code !== 'PREFLIGHT_RESPONSE_INVALID';
+        if (!verifiedComplete || runnerError || !validResult) {
+            await admissions.markRecoveryRequired(admissionId);
+            if (runnerError) throw runnerError;
+            throw new L2tpServiceError('PREFLIGHT_RESPONSE_INVALID', 'Install preflight was not verified');
+        }
+        if (preflightResult.ok === false) {
+            await admissions.release(admissionId);
             throw new L2tpServiceError(
                 'PREFLIGHT_FAILED',
                 'L2TP install preflight failed',
                 {
                     nodeId: String(nodeId),
-                    failureCode: preflightResult?.error?.code ?? 'PREFLIGHT_FAILED',
-                    checks: preflightResult?.checks ?? [],
+                    failureCode: preflightResult.error?.code ?? 'PREFLIGHT_FAILED',
+                    checks: preflightResult.checks ?? [],
                 },
             );
         }
 
         const operationId = randomBytes(12).toString('hex');
         const topologyRevision = context.topologyRevision;
-        const plan = await this.planBuilder({
-            operationId,
-            topologyRevision,
-            relay: context.relay,
-            routeGroup: context.routeGroup,
-            relayGroupPlan: context.relayGroupPlan,
-            desired: context.desired,
-        });
-        if (plan?.ok !== true) {
-            const code = plan?.error?.code === 'NO_HEALTHY_PATH'
-                ? 'NO_HEALTHY_PATH'
-                : 'INSTALL_PLAN_REJECTED';
-            throw new L2tpServiceError(
-                code,
-                'L2TP install plan was rejected',
-                {
-                    nodeId: String(nodeId),
-                    routeGroupId: entityId(context.routeGroup),
-                },
-            );
-        }
-
-        const materialized = await this.operationMaterializer({
-            plan,
-            desired: context.desired,
-        });
-        const persistedPlan = materialized?.persistedPlan;
-        if (!persistedPlan || typeof persistedPlan !== 'object') {
-            throw new L2tpServiceError(
-                'INSTALL_PLAN_REJECTED',
-                'L2TP install plan materialization failed',
-                { nodeId: String(nodeId) },
-            );
-        }
-
-        const operationDocument = {
-            _id: operationId,
-            node: entityId(context.node),
-            kind: 'install',
-            status: 'queued',
-            idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}`,
-            progress: 0,
-            attempts: 0,
-            plan: persistedPlan,
-            createdAt: this.clock.now(),
-        };
+        let operationDocument;
         try {
-            await this.operationRepository.create(operationDocument);
-        } catch (error) {
-            // A terminal operation keeps the unique idempotency key forever,
-            // which used to block every retry at the same topology revision.
-            // Active duplicates stay idempotent; terminal ones are replaced.
-            if (error?.code !== 11000) throw error;
-            const existing = await this.operationRepository.findByIdempotencyKey(
-                operationDocument.idempotencyKey,
-            );
-            if (!existing) throw error;
-            const existingId = entityId(existing._id ?? existing.id);
-            if (['queued', 'claimed', 'running'].includes(existing.status)) {
-                return { operationId: existingId };
+            const plan = await this.planBuilder({
+                operationId,
+                topologyRevision,
+                relay: context.relay,
+                routeGroup: context.routeGroup,
+                relayGroupPlan: context.relayGroupPlan,
+                desired: context.desired,
+            });
+            if (plan?.ok !== true) {
+                const code = plan?.error?.code === 'NO_HEALTHY_PATH'
+                    ? 'NO_HEALTHY_PATH'
+                    : 'INSTALL_PLAN_REJECTED';
+                throw new L2tpServiceError(
+                    code,
+                    'L2TP install plan was rejected',
+                    {
+                        nodeId: String(nodeId),
+                        routeGroupId: entityId(context.routeGroup),
+                    },
+                );
             }
-            await this.operationRepository.deleteById(existingId);
-            await this.operationRepository.create(operationDocument);
+            const materialized = await this.operationMaterializer({ plan, desired: context.desired });
+            const persistedPlan = materialized?.persistedPlan;
+            if (!persistedPlan || typeof persistedPlan !== 'object') {
+                throw new L2tpServiceError(
+                    'INSTALL_PLAN_REJECTED',
+                    'L2TP install plan materialization failed',
+                    { nodeId: String(nodeId) },
+                );
+            }
+            operationDocument = {
+                _id: operationId,
+                node: entityId(context.node),
+                kind: 'install',
+                status: 'queued',
+                idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}`,
+                progress: 0,
+                attempts: 0,
+                plan: persistedPlan,
+                createdAt: this.clock.now(),
+            };
+        } catch (error) {
+            // This is after attested remote completion but before any queue write.
+            await admissions.release(admissionId);
+            throw error;
         }
-
+        // A queue rejection may be an ambiguous transaction commit. Neither
+        // release nor retry with another ID: keep the admission counted.
+        try {
+            await admissions.queueInstall({ admissionId, operationDocument });
+        } catch (error) {
+            // Only the exact committed admission/operation pair proves an
+            // ambiguous handoff. Missing readback, a different admission or an
+            // uncounted legacy operation must never authorize a success.
+            let handoff;
+            if (typeof admissions.findInstallHandoff === 'function') {
+                try {
+                    handoff = await admissions.findInstallHandoff({ admissionId, operationId });
+                } catch { /* The original queue error remains the failure. */ }
+            }
+            const admission = handoff?.admission;
+            const operation = handoff?.operation;
+            if (entityId(admission) === String(admissionId)
+                && admission.nodeId === operationDocument.node
+                && admission.kind === 'install'
+                && admission.phase === 'queued'
+                && String(admission.operationId) === operationId
+                && entityId(operation) === operationId
+                && String(operation.admissionId) === String(admissionId)
+                && operation.node === operationDocument.node
+                && operation.kind === 'install'
+                && ['queued', 'claimed', 'running'].includes(operation.status)
+                && operation.idempotencyKey === operationDocument.idempotencyKey
+                && isDeepStrictEqual(operation.plan, operationDocument.plan)) {
+                return { operationId };
+            }
+            if (error?.code === 11000) {
+                throw new L2tpServiceError('INSTALL_OPERATION_CONFLICT',
+                    'An install operation already holds the idempotency key',
+                    { nodeId: String(nodeId), operationId, admissionId });
+            }
+            throw error;
+        }
         return { operationId };
     }
 
