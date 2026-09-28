@@ -231,6 +231,61 @@ test('rejects disabling an installed L2TP route link without a replacement path'
     );
 });
 
+test('rejects all changed fields on an installed L2TP route link before persistence', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    snapshot.links[0].status = 'online';
+    snapshot.links[0].geoRouting = { enabled: false, domains: [] };
+    let persisted = false;
+    const service = new TopologyDraftWriteService({ repository: {
+        async commitDraft({ prepare }) {
+            await prepare(snapshot);
+            persisted = true;
+            return { revision: 8, deployedRevision: 5 };
+        },
+    } });
+    for (const changes of [
+        { status: 'pending' },
+        { portalNode: 'relay-1' },
+        { bridgeNode: 'bridge-1' },
+        { mode: 'reverse' },
+        { 'geoRouting.enabled': true },
+        { geoRouting: { enabled: true } },
+        { name: 'renamed' },
+    ]) {
+        await assert.rejects(
+            service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-1', changes }),
+            error => error.code === 'CASCADE_LINK_IN_USE' && error.groupId === 'group-1',
+            JSON.stringify(changes),
+        );
+    }
+    assert.equal(persisted, false);
+});
+
+test('allows installed link no-op edits and pending sibling link edits', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    snapshot.links[0].status = 'online';
+    snapshot.links.push({
+        _id: 'link-2', portalNode: 'relay-1', bridgeNode: 'bridge-1',
+        mode: 'forward', status: 'online', active: true,
+    });
+    snapshot.links.push({
+        _id: 'link-3', portalNode: 'relay-1', bridgeNode: 'bridge-1',
+        mode: 'forward', status: 'pending', active: true,
+    });
+    const committed = [];
+    const service = new TopologyDraftWriteService({ repository: {
+        async commitDraft({ prepare }) {
+            committed.push((await prepare(snapshot)).mutation);
+            return { revision: 8, deployedRevision: 5 };
+        },
+    } });
+    await service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-1', changes: { status: 'online', mode: 'forward' } });
+    await service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-3', changes: { name: 'pending sibling' } });
+    assert.equal(committed.length, 2);
+});
+
 test('link mutations never trigger automatic node role changes', async () => {
     // Roles are pure operator state: create, update and delete of cascade
     // links must all commit without any role recalculation hook firing.
@@ -381,6 +436,62 @@ test('updates a route group through candidate validation and compilation', async
             paths: [{ pathKey: 'primary', linkIds: ['link-1'], priority: 5 }],
         },
     });
+});
+
+test('rejects topology changes to an installed active route group including empty and replacement paths', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    snapshot.links.push({ _id: 'link-2', portalNode: 'relay-1', bridgeNode: 'bridge-1', mode: 'forward', active: true });
+    let persisted = false;
+    const service = new TopologyDraftWriteService({ repository: {
+        async commitDraft({ prepare }) {
+            await prepare(snapshot);
+            persisted = true;
+            return { revision: 8, deployedRevision: 5 };
+        },
+    } });
+    for (const changes of [
+        { paths: [] },
+        { paths: [{ pathKey: 'replacement', linkIds: ['link-1', 'link-2'], priority: 1 }] },
+        { paths: [{ pathKey: 'primary', linkIds: ['link-1', 'link-2'], priority: 2 }] },
+        { paths: [{ pathKey: 'primary', linkIds: ['link-1', 'link-2'], priority: 1, enabled: false }] },
+        { mode: 'reverse' },
+        { strategy: 'other' },
+    ]) {
+        await assert.rejects(
+            service.updateRouteGroup({ expectedTopologyRevision: 7, routeGroupId: 'group-1', changes }),
+            error => error.code === 'CASCADE_ROUTE_GROUP_IN_USE' && error.routeGroupId === 'group-1',
+            JSON.stringify(changes),
+        );
+    }
+    assert.equal(persisted, false);
+});
+
+test('allows installed group metadata and no-op topology edits, and non-installed group replacement', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    snapshot.links.push({ _id: 'link-2', portalNode: 'relay-1', bridgeNode: 'bridge-1', mode: 'forward', active: true });
+    snapshot.groups.push({
+        _id: 'group-2', name: 'draft', mode: 'forward', strategy: 'priority-failover',
+        paths: [{ pathKey: 'primary', linkIds: ['link-1'], priority: 1 }],
+    });
+    const committed = [];
+    const service = new TopologyDraftWriteService({ repository: {
+        async commitDraft({ prepare }) {
+            committed.push((await prepare(snapshot)).mutation);
+            return { revision: 8, deployedRevision: 5 };
+        },
+    } });
+    await service.updateRouteGroup({
+        expectedTopologyRevision: 7, routeGroupId: 'group-1',
+        changes: { name: 'renamed', mode: 'forward', strategy: 'priority-failover',
+            paths: snapshot.groups[0].paths.map(path => ({ ...path, linkIds: [...path.linkIds], enabled: true })) },
+    });
+    await service.updateRouteGroup({
+        expectedTopologyRevision: 7, routeGroupId: 'group-2',
+        changes: { paths: [{ pathKey: 'alternate', linkIds: ['link-1'], priority: 2 }] },
+    });
+    assert.equal(committed.length, 2);
 });
 
 test('preserves disabled route paths through draft validation and compilation', async () => {

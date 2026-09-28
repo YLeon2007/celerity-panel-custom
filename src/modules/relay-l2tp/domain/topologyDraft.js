@@ -1,5 +1,6 @@
 'use strict';
 
+const { isDeepStrictEqual } = require('node:util');
 const {
     cascadePathIngressPort,
     cascadePathIngressTag,
@@ -85,6 +86,29 @@ function assertLinkNotInInstalledRoute(snapshot, groups, linkId) {
     }
 }
 
+function fieldValue(document, key) {
+    return key.split('.').reduce((value, part) => value?.[part], document);
+}
+
+function changedField(document, key, value) {
+    const previous = fieldValue(document, key);
+    if (key === 'portalNode' || key === 'bridgeNode' || key === 'source' || key === 'target') {
+        return entityId(previous) !== entityId(value);
+    }
+    return !isDeepStrictEqual(previous, value);
+}
+
+function changedGroupField(group, key, value) {
+    if (key === 'paths') {
+        // Compare effective paths, not Mongoose defaults or ObjectId wrappers.
+        return !isDeepStrictEqual(
+            projectGroups([group])[0].paths,
+            projectGroups([{ ...group, paths: value }])[0].paths,
+        );
+    }
+    return changedField(group, key, value);
+}
+
 function buildCandidate(snapshot, mutation) {
     let links = [...(snapshot.links || [])];
     let groups = [...(snapshot.groups || [])];
@@ -108,7 +132,10 @@ function buildCandidate(snapshot, mutation) {
                 linkId,
             });
         }
-        if (mutation.changes?.active === false) {
+        if (Object.entries(mutation.changes || {}).some(([key, value]) =>
+            changedField(links[linkIndex], key, value))) {
+            // Any real edit, including readiness or metadata, needs a dedicated
+            // replacement operation while an installed path uses this link.
             assertLinkNotInInstalledRoute(snapshot, groups, linkId);
         }
         links[linkIndex] = {
@@ -174,6 +201,16 @@ function buildCandidate(snapshot, mutation) {
             throw new TopologyDraftError(
                 'CASCADE_ROUTE_GROUP_NOT_FOUND',
                 'The cascade route group was not found',
+                { routeGroupId },
+            );
+        }
+        if ((snapshot.activeRouteGroupIds || []).some(id => entityId(id) === routeGroupId)
+            && Object.entries(mutation.changes || {}).some(([key, value]) =>
+                key !== 'name' && changedGroupField(groups[groupIndex], key, value))) {
+            // Name is display-only; applied topology needs a replacement operation.
+            throw new TopologyDraftError(
+                'CASCADE_ROUTE_GROUP_IN_USE',
+                'The cascade route group is referenced by active relay state',
                 { routeGroupId },
             );
         }

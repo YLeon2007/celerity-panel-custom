@@ -532,6 +532,32 @@ test('PUT accepts the explicit autoDeploy flag as a coerced boolean opt-in/out',
     });
 });
 
+test('link CRUD maps in-use and reserved replacement errors to HTTP conflicts', async () => {
+    for (const code of ['CASCADE_LINK_IN_USE', 'TOPOLOGY_REPLACEMENT_RESERVED']) {
+        for (const method of ['PUT', 'DELETE']) {
+            const topologyDraftWriteService = {
+                async updateLink() {
+                    const error = new Error('Route is in use');
+                    error.code = code;
+                    throw error;
+                },
+                async deleteLink() {
+                    const error = new Error('Route is in use');
+                    error.code = code;
+                    throw error;
+                },
+            };
+            const router = createCascadeLinksRouter({ topologyDraftWriteService });
+            const response = await request(router, {
+                method, path: `/${LINK_A}`,
+                body: { expectedTopologyRevision: 7, name: 'new link name' },
+            });
+            assert.equal(response.status, 409, `${method} ${code}`);
+            assert.equal(response.body.error.code, code);
+        }
+    }
+});
+
 test('DELETE removes a link through the versioned draft boundary without undeployment', async () => {
     const calls = { deployment: 0, subscriptionInvalidation: 0, topologyInvalidation: 0 };
     let links = [{

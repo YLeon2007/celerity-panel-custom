@@ -499,6 +499,7 @@ test('draft boundary errors map to safe 400, 404, 409, 422, and 500 responses', 
         { code: 'STALE_TOPOLOGY_REVISION', status: 409 },
         { code: 'CASCADE_ROUTE_GROUP_CONFLICT', status: 409 },
         { code: 'CASCADE_ROUTE_GROUP_IN_USE', status: 409 },
+        { code: 'TOPOLOGY_REPLACEMENT_RESERVED', status: 409 },
         {
             code: 'INVALID_TOPOLOGY_DRAFT',
             status: 422,
