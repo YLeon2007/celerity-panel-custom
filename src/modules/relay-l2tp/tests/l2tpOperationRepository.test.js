@@ -35,6 +35,8 @@ function createCasModel(operation) {
             const matches = query._id === document._id
                 && (query.status === undefined || query.status === document.status)
                 && (query.leaseOwner === undefined || query.leaseOwner === document.leaseOwner)
+                && ['ownerGeneration', 'admissionId'].every(field =>
+                    query[field]?.$exists !== false || !Object.hasOwn(document, field))
                 && (
                     query.leaseUntil === undefined
                     || document.leaseUntil > query.leaseUntil.$gt
@@ -54,6 +56,96 @@ function createCasModel(operation) {
     };
 }
 
+const LEGACY_FILTER = {
+    ownerGeneration: { $exists: false },
+    admissionId: { $exists: false },
+};
+const JOURNAL = { at: NOW, level: 'info', code: 'STEP_OK', message: 'verified' };
+const LEGACY_WRITES = [
+    ['renewLease', { owner: 'worker-1', leaseMs: 30_000, now: NOW }, {
+        status: 'running', leaseOwner: 'worker-1', leaseUntil: { $gt: NOW },
+    }],
+    ['succeedClaimed', { owner: 'worker-1', now: NOW, step: 'verify', journal: JOURNAL }, {
+        status: 'running', leaseOwner: 'worker-1', leaseUntil: { $gt: NOW },
+    }],
+    ['recordStep', { step: 'verify', progress: 67, journal: JOURNAL }, {}],
+    ['setStatus', { status: 'failed', journal: JOURNAL }, {}],
+];
+
+for (const [method, fields, claimFilter] of LEGACY_WRITES) {
+    test(`${method} excludes generation and admission operations without a generation token`, async () => {
+        for (const countedFields of [
+            { ownerGeneration: 2 }, { admissionId: 'admission-1' },
+            { ownerGeneration: 2, admissionId: 'admission-1' },
+        ]) {
+            const model = createCasModel({
+                _id: 'operation-1', status: 'running', leaseOwner: 'worker-1',
+                leaseUntil: new Date('2026-09-22T10:00:30.000Z'), ...countedFields,
+            });
+            const before = structuredClone(model.document);
+            const result = await new L2tpOperationRepository({ model })[method]({
+                operationId: 'operation-1', ...fields,
+            });
+            assert.deepEqual(model.calls[0].query, {
+                _id: 'operation-1', ...claimFilter, ...LEGACY_FILTER,
+            });
+            if (method === 'renewLease' || method === 'succeedClaimed') {
+                assert.equal(result, false);
+            } else {
+                assert.equal(result.matchedCount, 0);
+            }
+            assert.deepEqual(model.document, before);
+        }
+    });
+}
+
+test('legacy writes still match and update unversioned, unadmitted operations', async () => {
+    for (const [method, fields, claimFilter] of LEGACY_WRITES) {
+        const model = createCasModel({
+            _id: 'operation-1', status: 'running', leaseOwner: 'worker-1',
+            leaseUntil: new Date('2026-09-22T10:00:30.000Z'),
+        });
+        const result = await new L2tpOperationRepository({ model })[method]({
+            operationId: 'operation-1', ...fields,
+        });
+        assert.deepEqual(model.calls[0].query, {
+            _id: 'operation-1', ...claimFilter, ...LEGACY_FILTER,
+        });
+        if (method === 'renewLease' || method === 'succeedClaimed') {
+            assert.equal(result, true, method);
+        } else {
+            assert.equal(result.matchedCount, 1, method);
+        }
+        assert.equal(Object.hasOwn(model.document, 'ownerGeneration'), false, method);
+        assert.equal(Object.hasOwn(model.document, 'admissionId'), false, method);
+    }
+});
+
+test('claimNext leaves queued counted or admitted operations for generation-aware admission', async () => {
+    for (const countedFields of [
+        { ownerGeneration: 1 }, { admissionId: 'admission-1' },
+        { ownerGeneration: 1, admissionId: 'admission-1' },
+    ]) {
+        const operation = { _id: 'operation-1', status: 'queued', ...countedFields };
+        let query;
+        const model = {
+            async findOneAndUpdate(filter) {
+                query = filter;
+                if (filter.status !== operation.status
+                    || ['ownerGeneration', 'admissionId'].some(field =>
+                        filter[field]?.$exists === false && Object.hasOwn(operation, field))) {
+                    return null;
+                }
+                return operation;
+            },
+        };
+        assert.equal(await new L2tpOperationRepository({ model }).claimNext({
+            owner: 'worker-1', leaseMs: 30_000, now: NOW,
+        }), null);
+        assert.deepEqual(query, { status: 'queued', ...LEGACY_FILTER });
+    }
+});
+
 test('claimNext query excludes every running operation, including expired leases', async () => {
     const claimedOperation = { _id: 'operation-1', status: 'running' };
     const model = createModel(claimedOperation);
@@ -66,7 +158,7 @@ test('claimNext query excludes every running operation, including expired leases
     });
 
     assert.equal(result, claimedOperation);
-    assert.deepEqual(model.calls[0].query, { status: 'queued' });
+    assert.deepEqual(model.calls[0].query, { status: 'queued', ...LEGACY_FILTER });
 });
 
 test('claimNext starts a deterministic lease and returns the claimed operation', async () => {
@@ -113,6 +205,7 @@ test('renewLease extends only the current unexpired lease owned by the running w
             status: 'running',
             leaseOwner: 'worker-1',
             leaseUntil: { $gt: NOW },
+            ...LEGACY_FILTER,
         },
         update: {
             $set: {
@@ -250,7 +343,7 @@ test('recordStep atomically stores progress and appends a bounded journal entry'
     assert.equal(result, updateResult);
     assert.deepEqual(model.calls, [{
         method: 'updateOne',
-        query: { _id: 'operation-1' },
+        query: { _id: 'operation-1', ...LEGACY_FILTER },
         update: {
             $set: {
                 step: 'verify',
@@ -293,7 +386,7 @@ test('setStatus persists only explicit lifecycle fields and a bounded journal en
     assert.equal(result, updateResult);
     assert.deepEqual(model.calls, [{
         method: 'updateOne',
-        query: { _id: 'operation-1' },
+        query: { _id: 'operation-1', ...LEGACY_FILTER },
         update: {
             $set: {
                 status: 'failed',

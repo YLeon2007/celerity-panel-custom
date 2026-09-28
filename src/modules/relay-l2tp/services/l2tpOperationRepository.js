@@ -1,5 +1,12 @@
 'use strict';
 
+// Legacy writes must not match counted/admitted operations; those require a
+// generation-fenced claim even if an older caller knows the lease owner.
+const LEGACY_OPERATION_FILTER = {
+    ownerGeneration: { $exists: false },
+    admissionId: { $exists: false },
+};
+
 class L2tpOperationRepository {
     constructor({ model }) {
         this.model = model;
@@ -10,7 +17,7 @@ class L2tpOperationRepository {
 
         // An expired running lease does not prove its SSH process has stopped.
         // Leave it quarantined for authoritative remote reconciliation.
-        return this.model.findOneAndUpdate({ status: 'queued' }, {
+        return this.model.findOneAndUpdate({ status: 'queued', ...LEGACY_OPERATION_FILTER }, {
             $set: {
                 status: 'running',
                 leaseOwner: owner,
@@ -31,6 +38,7 @@ class L2tpOperationRepository {
             status: 'running',
             leaseOwner: owner,
             leaseUntil: { $gt: now },
+            ...LEGACY_OPERATION_FILTER,
         }, {
             $set: { leaseUntil },
         }, { runValidators: true });
@@ -58,6 +66,7 @@ class L2tpOperationRepository {
             status: 'running',
             leaseOwner: owner,
             leaseUntil: { $gt: now },
+            ...LEGACY_OPERATION_FILTER,
         }, {
             $set: {
                 status: 'succeeded',
@@ -78,8 +87,7 @@ class L2tpOperationRepository {
         return result.matchedCount === 1;
     }
 
-    // Dormant generation-fenced API: legacy calls above/below are deliberately
-    // unchanged. A caller must explicitly opt into all five claim fences.
+    // A caller must explicitly opt into all five generation claim fences.
     async _updateClaimed({ operationId, owner, ownerGeneration, expectedStatus, now }, update) {
         if (!operationId || typeof owner !== 'string' || !owner.trim()
             || !Number.isSafeInteger(ownerGeneration) || ownerGeneration < 1
@@ -153,7 +161,7 @@ class L2tpOperationRepository {
     }
 
     async recordStep({ operationId, step, progress, journal }) {
-        return this.model.updateOne({ _id: operationId }, {
+        return this.model.updateOne({ _id: operationId, ...LEGACY_OPERATION_FILTER }, {
             $set: { step, progress },
             $push: {
                 logs: {
@@ -181,7 +189,7 @@ class L2tpOperationRepository {
         if (errorMessage !== undefined) fields.errorMessage = errorMessage;
         if (finishedAt !== undefined) fields.finishedAt = finishedAt;
 
-        return this.model.updateOne({ _id: operationId }, {
+        return this.model.updateOne({ _id: operationId, ...LEGACY_OPERATION_FILTER }, {
             $set: fields,
             $push: {
                 logs: {
