@@ -337,10 +337,13 @@ test('manual domain Sync traverses the route and pinned coordinator without enro
     };
     const materialized = [];
     const frozen = [];
+    const session = { inTransaction: () => true };
     const coordinator = new TopologyOperationCoordinator({
-        topologyRepository: { async pinTopology({ expectedRevision, prepare }) {
+        topologyRepository: { async admitTopology({ expectedRevision, prepare, admit }) {
             assert.equal(expectedRevision, 7);
-            return { revision: 7, deployedRevision: 5, ...await prepare(snapshot) };
+            const pinned = { revision: 7, deployedRevision: 5, ...await prepare(snapshot, session) };
+            await admit(pinned, session);
+            return pinned;
         } },
         planMaterializer: { async materialize(input) {
             materialized.push(input);
@@ -363,6 +366,7 @@ test('manual domain Sync traverses the route and pinned coordinator without enro
     assert.equal(response.status, 202);
     assert.equal(response.body.kind, 'domain.reconcile');
     assert.equal(materialized.length, 1);
+    assert.strictEqual(materialized[0].session, session);
     assert.equal(materialized[0].operationKind, 'domain.reconcile');
     assert.deepEqual(materialized[0].pinnedSnapshot.topology.links.map(link => [link.id, link.mode]),
         [[anchor, 'forward'], [companion, 'reverse']]);
@@ -370,6 +374,9 @@ test('manual domain Sync traverses the route and pinned coordinator without enro
         ['b1', 'p1', 'r1']);
     assert.deepEqual(frozen.map(input => [input.kind, input.linkIds]),
         [['domain.reconcile', [anchor, companion]]]);
+    assert.strictEqual(frozen[0].session, session);
+    assert.equal(frozen[0].heldTopologyAdmission, true);
+    assert.match(frozen[0].admissionFingerprint, /^[a-f0-9]{64}$/);
 });
 
 test('manual domain Sync refuses a pending anchor and ambiguous request before queue', async () => {
@@ -522,12 +529,12 @@ test('deployment API maps replacement reservation from the pinned coordinator to
     const operationId = '507f1f77bcf86cd799439021';
     const headers = { 'x-test-auth': 'api-write' };
     for (const scope of [{}, { linkId }, { domainLinkId: linkId }]) {
-        let pinCalls = 0;
+        let admissionCalls = 0;
         let materializeCalls = 0;
         let createCalls = 0;
         const coordinator = new TopologyOperationCoordinator({
-            topologyRepository: { async pinTopology({ expectedRevision }) {
-                pinCalls += 1;
+            topologyRepository: { async admitTopology({ expectedRevision }) {
+                admissionCalls += 1;
                 assert.equal(expectedRevision, 7);
                 const error = new Error('reservation token=private-pin-secret');
                 error.code = 'TOPOLOGY_REPLACEMENT_RESERVED';
@@ -560,7 +567,7 @@ test('deployment API maps replacement reservation from the pinned coordinator to
             expectedTopologyRevision: 7,
         });
         assert.doesNotMatch(JSON.stringify(response.body), /token|body|password|diagnostic|private|queued|kind/i);
-        assert.equal(pinCalls, 1);
+        assert.equal(admissionCalls, 1);
         assert.equal(materializeCalls, 0);
         assert.equal(createCalls, 0);
     }
