@@ -39,7 +39,7 @@ const REQUIRED_NODE_EXECUTABLE_PATHS = Object.freeze([
     'validate-nft.sh',
     'validate-xray.sh',
     'verify.sh',
-].map(name => `${NODE_ARTIFACT_ROOT}/${name}`).sort((left, right) => left.localeCompare(right, 'en')));
+].map(name => `${NODE_ARTIFACT_ROOT}/${name}`).sort());
 const RELEASE_CONTENTS = Object.freeze({
     migrationRegistry: 'module/migrations/index.js',
     migrations: Object.freeze([
@@ -152,7 +152,7 @@ function listGitFiles(repoRoot, sourceCommit, pathspec) {
 function listModuleSourceEntries(repoRoot, sourceCommit) {
     return listGitFiles(repoRoot, sourceCommit, MODULE_PATH)
         .filter(entry => !entry.path.startsWith(`${MODULE_PATH}/tests/`))
-        .sort((left, right) => left.path.localeCompare(right.path, 'en'));
+        .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
 function listModuleSourceFiles(repoRoot, sourceRef = 'HEAD') {
@@ -238,7 +238,7 @@ function buildArtifact({ repoRoot, outputDir, sourceRef = 'HEAD' }) {
         assertNoSecretMaterial(payloadEntries);
 
         const sortedFileHashes = fileHashes
-            .sort((left, right) => left.path.localeCompare(right.path, 'en'));
+            .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
         const nodeExecutables = sortedFileHashes
             .filter(file => file.path.startsWith(`${NODE_ARTIFACT_ROOT}/`) && executablePaths.has(file.path));
         if (JSON.stringify(nodeExecutables.map(file => file.path))
