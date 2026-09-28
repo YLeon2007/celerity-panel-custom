@@ -8,6 +8,7 @@ const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
 const TopologyOperation = require('../models/topologyOperationModel');
+const ADMISSION_FINGERPRINT = 'a'.repeat(64);
 
 test('scoped operation identity survives repository creation and strict Mongo schema', async () => {
     let stored;
@@ -169,6 +170,22 @@ function createModel() {
     };
 }
 
+test('createFrozen refuses to claim a held admission without an active session', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+    }), TypeError);
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5, nodes: [],
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+    }), TypeError);
+    assert.deepEqual(model.calls, []);
+});
+
 test('createFrozen inserts one scoped operation with its frozen candidate on the supplied session', async () => {
     const model = createModel();
     const session = { inTransaction: () => true };
@@ -189,6 +206,8 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
         staged: true,
         linkId: 'link-a',
         linkIds: ['link-a'],
+        heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
         session,
     });
 
@@ -203,6 +222,8 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
         linkIds: ['link-a'],
         staged: true,
         status: 'queued',
+        heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,
         leaseOwner: '',
         leaseUntil: null,
@@ -227,7 +248,8 @@ test('createFrozen rejects null, malformed, or inactive sessions before writing'
         { inTransaction: () => false }]) {
         await assert.rejects(repository.createFrozen({
             operationId: 'operation-1', topologyRevision: 7,
-            priorDeployedRevision: 5, nodes: [], session,
+            priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
+            admissionFingerprint: ADMISSION_FINGERPRINT, session,
         }), TypeError);
     }
     assert.deepEqual(model.calls, []);
@@ -241,12 +263,14 @@ test('createFrozen rejects invalid scoped identity and candidate before a sessio
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [],
         kind: 'link.apply', linkId: 'link-a', linkIds: ['link-b'], staged: true,
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
         session,
     }), TypeError);
     await assert.rejects(repository.createFrozen({
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5,
         nodes: [{ ...nodePlan('node-a', 'portal', 'portal'), candidateHash: '0'.repeat(64) }],
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
         session,
     }), TypeError);
     assert.deepEqual(model.calls, []);
@@ -263,12 +287,15 @@ test('createFrozen propagates session insert rejection without an unscoped fallb
     const repository = new TopologyOperationRepository({ model });
     await assert.rejects(repository.createFrozen({
         operationId: 'operation-1', topologyRevision: 7,
-        priorDeployedRevision: 5, nodes: [], session,
+        priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT, session,
     }), error => error === failure);
     assert.equal(model.calls.length, 1);
     assert.deepEqual(model.calls[0], [[{
         _id: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
-        status: 'queued', attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
+        status: 'queued', heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+        attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
     }], { session }]);
 });
 
@@ -283,7 +310,8 @@ test('createFrozen fails closed on malformed session create results without retr
         const repository = new TopologyOperationRepository({ model });
         await assert.rejects(repository.createFrozen({
             operationId: 'operation-1', topologyRevision: 7,
-            priorDeployedRevision: 5, nodes: [], session,
+            priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
+            admissionFingerprint: ADMISSION_FINGERPRINT, session,
         }), TypeError);
         assert.equal(model.calls.length, 1);
         assert.strictEqual(model.calls[0][1].session, session);

@@ -45,20 +45,29 @@ const linkMetadata = links.map((link, index) => ({
 function setup(mutatePlan = plan => plan) {
     const saved = [];
     const model = {
-        async create(input) {
-            const document = new TopologyOperation(input);
+        async create(input, options) {
+            assert.ok(Array.isArray(input));
+            assert.equal(input.length, 1);
+            assert.equal(options?.session?.inTransaction(), true);
+            assert.equal(input[0].heldTopologyAdmission, true);
+            assert.match(input[0].admissionFingerprint, /^[a-f0-9]{64}$/);
+            const document = new TopologyOperation(input[0]);
             await document.validate();
             saved.push(document);
-            return document;
+            return [document];
         },
         findOneAndUpdate() {}, updateOne() {},
     };
     const repository = new TopologyOperationRepository({ model });
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology({ prepare }) {
+            async admitTopology({ expectedRevision, prepare, admit }) {
                 const snapshot = { revision: 7, deployedRevision: 5, nodes, links, groups: [] };
-                return { ...snapshot, ...await prepare(snapshot) };
+                assert.equal(expectedRevision, snapshot.revision);
+                const session = { inTransaction: () => true };
+                const pinned = { ...snapshot, ...await prepare(snapshot, session) };
+                await admit(pinned, session);
+                return pinned;
             },
         },
         planMaterializer: {

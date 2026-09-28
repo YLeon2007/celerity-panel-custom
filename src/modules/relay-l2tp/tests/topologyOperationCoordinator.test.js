@@ -65,6 +65,15 @@ function materializedPlan() {
     });
 }
 
+const fakeSession = Object.freeze({ inTransaction: () => true });
+async function admitFakeSnapshot(value, { expectedRevision, prepare, admit }, deployedRevision = value.deployedRevision) {
+    assert.equal(expectedRevision, value.revision);
+    const prepared = await prepare(value, fakeSession);
+    const pinned = { revision: value.revision, deployedRevision, ...prepared };
+    await admit(pinned, fakeSession);
+    return pinned;
+}
+
 test('legacy full deploy refuses pending links before composing or marking all links', async () => {
     const currentSnapshot = snapshot();
     currentSnapshot.links[0].status = 'deployed';
@@ -75,7 +84,7 @@ test('legacy full deploy refuses pending links before composing or marking all l
     let materialized = false;
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology({ prepare }) { return prepare(currentSnapshot); },
+            async admitTopology(input) { return admitFakeSnapshot(currentSnapshot, input); },
         },
         planMaterializer: {
             async materialize() { materialized = true; return materializedPlan(); },
@@ -92,18 +101,135 @@ test('legacy full deploy refuses pending links before composing or marking all l
     assert.equal(materialized, false);
 });
 
+test('queue keeps materialization, counted admission and frozen insert inside one transaction', async () => {
+    const calls = [];
+    const session = { inTransaction: () => true };
+    let committed = false;
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: { async admitTopology({ expectedRevision, prepare, admit }) {
+            assert.equal(expectedRevision, 7);
+            calls.push('read');
+            const prepared = await prepare(snapshot(), session);
+            calls.push('cas');
+            await admit({ revision: 7, deployedRevision: 5, ...prepared }, session);
+            committed = true;
+            calls.push('commit');
+            return { revision: 7, deployedRevision: 5, ...prepared };
+        } },
+        planMaterializer: { async materialize(input) {
+            assert.strictEqual(input.session, session);
+            calls.push('materialize');
+            return materializedPlan();
+        } },
+        operationRepository: { async createFrozen(input) {
+            assert.strictEqual(input.session, session);
+            assert.equal(committed, false);
+            calls.push('insert');
+            return { _id: input.operationId };
+        } },
+        operationWorker: { async run() {
+            assert.equal(committed, true);
+            calls.push('worker');
+        } },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+        idFactory: () => 'operation-atomic',
+    });
+    const result = await coordinator.queue({ expectedTopologyRevision: 7 });
+    assert.equal(result.operationId, 'operation-atomic');
+    assert.deepEqual(calls, ['read', 'materialize', 'cas', 'insert', 'commit', 'worker']);
+});
+
+test('ambiguous commit acknowledges only exact held operation identity without starting worker', async () => {
+    let inserted;
+    let workerRuns = 0;
+    const ambiguous = new Error('private commit detail');
+    ambiguous.hasErrorLabel = label => label === 'UnknownTransactionCommitResult';
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: { async admitTopology({ prepare, admit }) {
+            const session = { inTransaction: () => true };
+            const prepared = await prepare(snapshot(), session);
+            await admit({ revision: 7, deployedRevision: 5, ...prepared }, session);
+            throw ambiguous;
+        } },
+        planMaterializer: { async materialize() { return materializedPlan(); } },
+        operationRepository: {
+            async createFrozen(input) { inserted = input; },
+            async findAdmissionById(id) {
+                assert.equal(id, 'operation-ambiguous');
+                return { _id: id, topologyRevision: 7, priorDeployedRevision: 5,
+                    heldTopologyAdmission: true, admissionFingerprint: inserted.admissionFingerprint,
+                    status: 'queued' };
+            },
+        },
+        operationWorker: { async run() { workerRuns += 1; } },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+        idFactory: () => 'operation-ambiguous',
+    });
+    const result = await coordinator.queue({ expectedTopologyRevision: 7 });
+    assert.equal(result.operationId, 'operation-ambiguous');
+    assert.match(inserted.admissionFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(workerRuns, 0);
+});
+
+test('ambiguous commit rejects mismatched or unavailable readback without leaking details or starting worker', async () => {
+    const ambiguous = new Error('private commit detail');
+    ambiguous.hasErrorLabel = label => label === 'UnknownTransactionCommitResult';
+    for (const readback of [
+        null,
+        { _id: 'different-operation', topologyRevision: 7, priorDeployedRevision: 5,
+            heldTopologyAdmission: true, status: 'queued' },
+        { _id: 'operation-ambiguous', topologyRevision: 8, priorDeployedRevision: 5,
+            heldTopologyAdmission: true, status: 'queued' },
+        { _id: 'operation-ambiguous', topologyRevision: 7, priorDeployedRevision: 5,
+            heldTopologyAdmission: false, status: 'queued' },
+        { _id: 'operation-ambiguous', topologyRevision: 7, priorDeployedRevision: 5,
+            heldTopologyAdmission: true, admissionFingerprint: 'b'.repeat(64), status: 'queued' },
+        { _id: 'operation-ambiguous', topologyRevision: 7, priorDeployedRevision: 4,
+            heldTopologyAdmission: true, status: 'queued' },
+        { _id: 'operation-ambiguous', topologyRevision: 7, priorDeployedRevision: 5,
+            heldTopologyAdmission: true, status: 'unexpected' },
+    ]) {
+        let inserted;
+        let workerRuns = 0;
+        const coordinator = new TopologyOperationCoordinator({
+            topologyRepository: { async admitTopology({ prepare, admit }) {
+                const prepared = await prepare(snapshot(), fakeSession);
+                await admit({ revision: 7, deployedRevision: 5, ...prepared }, fakeSession);
+                throw ambiguous;
+            } },
+            planMaterializer: { async materialize() { return materializedPlan(); } },
+            operationRepository: {
+                async createFrozen(input) { inserted = input; },
+                async findAdmissionById(id) {
+                    assert.equal(id, 'operation-ambiguous');
+                    return readback && { ...readback,
+                        admissionFingerprint: readback.admissionFingerprint ?? inserted.admissionFingerprint };
+                },
+            },
+            operationWorker: { async run() { workerRuns += 1; } },
+            validator: () => ({ valid: true }),
+            compiler: () => ({ valid: true }),
+            idFactory: () => 'operation-ambiguous',
+        });
+        await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
+            assert.equal(error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+            assert.doesNotMatch(JSON.stringify(error), /private commit detail/);
+            return true;
+        });
+        assert.equal(workerRuns, 0);
+    }
+});
+
 test('queues one frozen fixed-test operation and starts only the injected worker', async () => {
     const calls = [];
     const currentSnapshot = snapshot();
     const topologyRepository = {
-        async pinTopology({ expectedRevision, prepare }) {
-            calls.push({ method: 'pinTopology', expectedRevision });
-            const prepared = await prepare(currentSnapshot);
-            return {
-                revision: currentSnapshot.revision,
-                deployedRevision: currentSnapshot.deployedRevision,
-                ...prepared,
-            };
+        async admitTopology(input) {
+            const { expectedRevision } = input;
+            calls.push({ method: 'admitTopology', expectedRevision });
+            return admitFakeSnapshot(currentSnapshot, input);
         },
     };
     const planMaterializer = {
@@ -172,6 +298,9 @@ test('queues one frozen fixed-test operation and starts only the injected worker
     );
     assert.equal(frozenInput.topologyRevision, 7);
     assert.equal(frozenInput.priorDeployedRevision, 5);
+    assert.strictEqual(frozenInput.session, fakeSession);
+    assert.equal(frozenInput.heldTopologyAdmission, true);
+    assert.match(frozenInput.admissionFingerprint, /^[a-f0-9]{64}$/);
     assert.ok(Array.isArray(frozenInput.nodes));
     const durableNodes = calls.find(call => call.method === 'createFrozen').input.nodes;
     assert.equal(Object.isFrozen(durableNodes), true);
@@ -197,8 +326,8 @@ test('stale revisions expose only safe revision context and do not materialize o
     stale.topologyRevision = 8;
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology(input) {
-                calls.push({ method: 'pinTopology', input });
+            async admitTopology(input) {
+                calls.push({ method: 'admitTopology', input });
                 throw stale;
             },
         },
@@ -232,7 +361,7 @@ test('stale revisions expose only safe revision context and do not materialize o
             return true;
         },
     );
-    assert.deepEqual(calls.map(call => call.method), ['pinTopology']);
+    assert.deepEqual(calls.map(call => call.method), ['admitTopology']);
 });
 
 test('held reservation returns a safe typed queue conflict without materialization or persistence', async () => {
@@ -243,7 +372,7 @@ test('held reservation returns a safe typed queue conflict without materializati
             return { ...snapshot(), replacementReservation: { ownerToken: 'private-token' } };
         } },
         CascadeTopologyState: { findOneAndUpdate() { calls.push('pin.cas'); throw new Error('must not pin'); } },
-        transactionRunner: async work => work({ id: 'held-session' }),
+        transactionRunner: async work => work(fakeSession),
     });
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository,
@@ -264,8 +393,8 @@ test('held reservation returns a safe typed queue conflict without materializati
 
 test('reservation injected between draft read and singleton CAS never queues an operation', async () => {
     const calls = [];
-    const state = { revision: 7, deployedRevision: 5 };
-    const session = { id: 'race-session' };
+    const state = { revision: 7, deployedRevision: 5, topologyAdmissionCount: 0 };
+    const session = fakeSession;
     const topologyRepository = new TopologyDeploymentRepository({
         snapshotReader: { async readDraft(candidateSession) {
             assert.strictEqual(candidateSession, session);
@@ -274,7 +403,9 @@ test('reservation injected between draft read and singleton CAS never queues an 
         } },
         CascadeTopologyState: { findOneAndUpdate(filter, update, options) {
             assert.strictEqual(options.session, session);
-            calls.push('pin.cas');
+            calls.push('admission.cas');
+            assert.equal(filter.topologyAdmissionCount, 0);
+            assert.deepEqual(update.$inc, { topologyAdmissionCount: 1 });
             // Simulate a concurrent reservation after the transaction's read.
             state.replacementReservation = { ownerToken: 'private-token' };
             const matches = filter._id === 'singleton' && filter.revision === state.revision
@@ -283,7 +414,7 @@ test('reservation injected between draft read and singleton CAS never queues an 
             return { select() { return this; }, session(actual) {
                 assert.strictEqual(actual, session);
                 return this;
-            }, lean: async () => matches ? { ...state, ...update.$set } : null };
+            }, lean: async () => matches ? { ...state } : null };
         } },
         transactionRunner: async work => work(session),
     });
@@ -305,11 +436,11 @@ test('reservation injected between draft read and singleton CAS never queues an 
     });
     await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
         assert.equal(error.name, 'TopologyOperationCoordinatorError');
-        assert.equal(error.code, 'STALE_TOPOLOGY_REVISION');
+        assert.equal(error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
         assert.doesNotMatch(JSON.stringify(error), /private-token/);
         return true;
     });
-    assert.deepEqual(calls, ['readDraft', 'materialize', 'pin.cas']);
+    assert.deepEqual(calls, ['readDraft', 'materialize', 'admission.cas']);
     assert.deepEqual(operations, []);
 });
 
@@ -318,9 +449,9 @@ test('invalid pinned topology is sanitized before any plan or worker call', asyn
     const currentSnapshot = snapshot();
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology({ prepare }) {
-                calls.push({ method: 'pinTopology' });
-                return prepare(currentSnapshot);
+            async admitTopology({ prepare }) {
+                calls.push({ method: 'admitTopology' });
+                return prepare(currentSnapshot, fakeSession);
             },
         },
         planMaterializer: {
@@ -359,15 +490,15 @@ test('invalid pinned topology is sanitized before any plan or worker call', asyn
             return true;
         },
     );
-    assert.deepEqual(calls.map(call => call.method), ['pinTopology']);
+    assert.deepEqual(calls.map(call => call.method), ['admitTopology']);
 });
 
 test('plan validation failures surface as 422 INVALID_TOPOLOGY_DEPLOYMENT with the reason', async () => {
     const { FrozenTopologyDeploymentPlanError } = require('../services/frozenTopologyDeploymentPlanComposer');
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology({ prepare }) {
-                return prepare(snapshot());
+            async admitTopology(input) {
+                return admitFakeSnapshot(snapshot(), input);
             },
         },
         planMaterializer: {
@@ -406,17 +537,17 @@ test('plan validation failures surface as 422 INVALID_TOPOLOGY_DEPLOYMENT with t
     );
 });
 
-test('re-deploy of an already-recorded revision returns the existing operation without re-running work', async () => {
+test('duplicate frozen insert fails closed without acknowledging a different operation or running work', async () => {
     for (const existingStatus of ['succeeded', 'failed', 'rolled_back']) {
         const calls = [];
         const duplicate = new Error('E11000 duplicate key error');
         duplicate.code = 11000;
         const coordinator = new TopologyOperationCoordinator({
             topologyRepository: {
-                async pinTopology({ expectedRevision, prepare }) {
-                    calls.push({ method: 'pinTopology', expectedRevision });
-                    const prepared = await prepare(snapshot());
-                    return { revision: 7, deployedRevision: 7, ...prepared };
+                async admitTopology(input) {
+                    const { expectedRevision } = input;
+                    calls.push({ method: 'admitTopology', expectedRevision });
+                    return admitFakeSnapshot(snapshot(), input, 7);
                 },
             },
             planMaterializer: {
@@ -430,8 +561,8 @@ test('re-deploy of an already-recorded revision returns the existing operation w
                     calls.push({ method: 'createFrozen' });
                     throw duplicate;
                 },
-                async findPublicById(operationId) {
-                    calls.push({ method: 'findPublicById', operationId });
+                async findAdmissionById(operationId) {
+                    calls.push({ method: 'findAdmissionById', operationId });
                     return { status: existingStatus, topologyRevision: 7 };
                 },
             },
@@ -445,18 +576,15 @@ test('re-deploy of an already-recorded revision returns the existing operation w
             idFactory: () => 'operation-dup',
         });
 
-        const result = await coordinator.deploy({ expectedTopologyRevision: 7 });
+        await assert.rejects(coordinator.deploy({ expectedTopologyRevision: 7 }), error => {
+            assert.equal(error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+            assert.doesNotMatch(error.message, /E11000|duplicate key/i);
+            return true;
+        });
         await Promise.resolve();
 
-        assert.deepEqual(result, {
-            operationId: 'operation-dup',
-            topologyRevision: 7,
-            status: existingStatus,
-        });
-        assert.deepEqual(calls.find(call => call.method === 'findPublicById'), {
-            method: 'findPublicById',
-            operationId: 'operation-dup',
-        });
+        assert.equal(calls.some(call => call.method === 'findAdmissionById'), false,
+            'a duplicate insert is not an ambiguous commit and cannot acknowledge any existing record');
         assert.equal(calls.some(call => call.method === 'worker.run'), false,
             `worker must not re-run for an existing ${existingStatus} operation`);
     }
@@ -467,10 +595,10 @@ test('a cached idempotent result whose operation was purged (undeploy) is re-que
     let persisted = { status: 'succeeded', topologyRevision: 7 };
     const coordinator = new TopologyOperationCoordinator({
         topologyRepository: {
-            async pinTopology({ expectedRevision, prepare }) {
-                calls.push({ method: 'pinTopology', expectedRevision });
-                const prepared = await prepare(snapshot());
-                return { revision: 7, deployedRevision: 5, ...prepared };
+            async admitTopology(input) {
+                const { expectedRevision } = input;
+                calls.push({ method: 'admitTopology', expectedRevision });
+                return admitFakeSnapshot(snapshot(), input);
             },
         },
         planMaterializer: {
@@ -523,7 +651,7 @@ test('a cached idempotent result whose operation was purged (undeploy) is re-que
 
 test('projects a deterministic status without candidates, leases, backups, or invalid states', () => {
     const coordinator = new TopologyOperationCoordinator({
-        topologyRepository: { async pinTopology() {} },
+        topologyRepository: { async admitTopology() {} },
         planMaterializer: { async materialize() {} },
         operationRepository: { async createFrozen() {} },
     });
@@ -610,14 +738,10 @@ function scopedSnapshot(overrides = {}) {
 function scopedHarness(snapshotValue, calls = []) {
     return {
         topologyRepository: {
-            async pinTopology({ expectedRevision, prepare }) {
-                calls.push({ method: 'pinTopology', expectedRevision });
-                const prepared = await prepare(snapshotValue);
-                return {
-                    revision: snapshotValue.revision,
-                    deployedRevision: snapshotValue.deployedRevision,
-                    ...prepared,
-                };
+            async admitTopology(input) {
+                const { expectedRevision } = input;
+                calls.push({ method: 'admitTopology', expectedRevision });
+                return admitFakeSnapshot(snapshotValue, input);
             },
         },
         planMaterializer: {
@@ -886,7 +1010,7 @@ test('invalid operation scopes are rejected before any topology pin', async () =
             `scope ${JSON.stringify(scope)} must be rejected`,
         );
     }
-    assert.equal(calls.filter(call => call.method === 'pinTopology').length, 0);
+    assert.equal(calls.filter(call => call.method === 'admitTopology').length, 0);
 });
 
 test('scope referencing a missing pinned link fails closed with SCOPE_LINK_MISSING', async () => {

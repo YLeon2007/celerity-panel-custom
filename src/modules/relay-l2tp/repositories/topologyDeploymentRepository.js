@@ -33,7 +33,7 @@ function withSession(query, session) {
 }
 
 class TopologyDeploymentRepository {
-    constructor({ snapshotReader, CascadeTopologyState, transactionRunner } = {}) {
+    constructor({ snapshotReader, CascadeTopologyState, TopologyOperation, transactionRunner } = {}) {
         if (!snapshotReader || typeof snapshotReader.readDraft !== 'function') {
             throw new TypeError('Topology deployment repository requires snapshotReader.readDraft');
         }
@@ -49,6 +49,69 @@ class TopologyDeploymentRepository {
         this.snapshotReader = snapshotReader;
         this.CascadeTopologyState = CascadeTopologyState;
         this.transactionRunner = runTransaction;
+        this.TopologyOperation = TopologyOperation;
+        this.usesDefaultRunner = transactionRunner === undefined;
+    }
+
+    // Admission is separate from the legacy pin API: a caller cannot accidentally
+    // acknowledge a pin without committing its frozen operation in the same tx.
+    async admitTopology({ expectedRevision, prepare, admit }) {
+        if (typeof prepare !== 'function' || typeof admit !== 'function') {
+            throw new TypeError('Topology admission requires prepare and admit callbacks');
+        }
+        const connection = this.CascadeTopologyState.db;
+        const participatingModels = [this.TopologyOperation,
+            this.snapshotReader.HyNode, this.snapshotReader.CascadeLink,
+            this.snapshotReader.CascadeRouteGroup, this.snapshotReader.RelayL2tpState];
+        if (this.usesDefaultRunner && (!connection
+            || participatingModels.some(model => model?.db !== connection))) {
+            throw new TypeError('Topology admission requires models on one transactional connection');
+        }
+        if (connection && participatingModels.some(model => model?.db !== connection)) {
+            throw new TypeError('Topology admission requires models on one transactional connection');
+        }
+        return this.transactionRunner(async session => {
+            if (!session || typeof session.inTransaction !== 'function'
+                || session.inTransaction() !== true) {
+                throw new TypeError('Topology admission requires an active Mongo transaction');
+            }
+            const snapshot = await this.snapshotReader.readDraft(session);
+            if (snapshot.revision !== expectedRevision) {
+                throw staleRevision(expectedRevision, snapshot.revision);
+            }
+            if (snapshot.replacementReservation) {
+                throw new TopologyDeploymentRepositoryError(
+                    'TOPOLOGY_REPLACEMENT_RESERVED',
+                    'A topology replacement owns the deployment fence',
+                );
+            }
+            const prepared = await prepare(snapshot, session);
+            // Never upsert or infer that a legacy singleton's missing counter is
+            // zero. This real write conflicts with a concurrent reservation CAS.
+            const state = await withSession(this.CascadeTopologyState.findOneAndUpdate(
+                {
+                    _id: 'singleton',
+                    revision: expectedRevision,
+                    replacementReservation: { $exists: false },
+                    topologyAdmissionCount: 0,
+                },
+                { $inc: { topologyAdmissionCount: 1 } },
+                { new: true, runValidators: true, session, timestamps: false, upsert: false },
+            ).select(TOPOLOGY_STATE_SELECT), session).lean();
+            if (!state) {
+                throw new TopologyDeploymentRepositoryError(
+                    'TOPOLOGY_ADMISSION_UNAVAILABLE',
+                    'Topology admission is unavailable or the topology fence changed',
+                );
+            }
+            const pinned = {
+                revision: state.revision,
+                deployedRevision: state.deployedRevision ?? 0,
+                ...prepared,
+            };
+            await admit(pinned, session);
+            return pinned;
+        });
     }
 
     async pinTopology({ expectedRevision, prepare }) {

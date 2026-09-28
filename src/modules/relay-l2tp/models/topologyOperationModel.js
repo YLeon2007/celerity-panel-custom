@@ -119,6 +119,9 @@ const topologyOperationSchema = new mongoose.Schema({
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     // Only link.apply records whether the frozen plan has a terminal relay.
     staged: { type: Boolean },
+    // Remains held through failure/rollback until a proven-safe transactional release.
+    heldTopologyAdmission: { type: Boolean },
+    admissionFingerprint: { type: String, match: DIGEST_PATTERN },
     status: {
         type: String,
         enum: OPERATION_STATUSES,

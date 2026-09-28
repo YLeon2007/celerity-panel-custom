@@ -178,6 +178,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const topologyRepository = new DeploymentRepository({
             snapshotReader,
             CascadeTopologyState,
+            TopologyOperation,
             ...optional(transactionRunner, 'transactionRunner'),
         });
         const planMaterializer = new PlanMaterializer({ HyNode, CascadeLink });

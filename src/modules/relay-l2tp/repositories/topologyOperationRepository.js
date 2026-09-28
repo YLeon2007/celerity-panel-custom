@@ -138,6 +138,8 @@ class TopologyOperationRepository {
         linkId,
         linkIds,
         staged,
+        heldTopologyAdmission,
+        admissionFingerprint,
         session,
     }) {
         const scoped = kind !== undefined || linkId !== undefined
@@ -152,6 +154,15 @@ class TopologyOperationRepository {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
+        if (heldTopologyAdmission === true || admissionFingerprint !== undefined) {
+            if (session === undefined || heldTopologyAdmission !== true
+                || !/^[a-f0-9]{64}$/.test(admissionFingerprint)) {
+                throw new TypeError('Held topology admission requires an active session and fingerprint');
+            }
+        }
+        if (session !== undefined && heldTopologyAdmission !== true) {
+            throw new TypeError('Session-bound topology operation requires a held admission identity');
+        }
         const document = {
             _id: id,
             topologyRevision,
@@ -159,6 +170,8 @@ class TopologyOperationRepository {
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
                 ...(kind === 'link.apply' ? { staged } : {}) } : {}),
             status: 'queued',
+            ...(heldTopologyAdmission === true
+                ? { heldTopologyAdmission: true, admissionFingerprint } : {}),
             attempts: 0,
             leaseOwner: '',
             leaseUntil: null,
@@ -177,6 +190,12 @@ class TopologyOperationRepository {
             throw new TypeError('Topology operation session create returned an invalid result');
         }
         return created[0];
+    }
+
+    async findAdmissionById(operationId) {
+        return this.model.findById(operationId)
+            .select('status topologyRevision priorDeployedRevision heldTopologyAdmission admissionFingerprint')
+            .lean();
     }
 
     async findPublicById(operationId) {

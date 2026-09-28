@@ -163,11 +163,10 @@ function safeQueueError(error, operationId, expectedTopologyRevision) {
     }
     return new TopologyOperationCoordinatorError(
         'TOPOLOGY_OPERATION_QUEUE_FAILED',
-        `The topology operation could not be queued: ${error?.message || 'unknown error'}`,
+        'The topology operation could not be queued',
         {
             operationId,
             expectedTopologyRevision,
-            causeCode: error?.code,
         },
     );
 }
@@ -390,8 +389,8 @@ class TopologyOperationCoordinator {
         idFactory = idFromIdempotencyKey,
         onWorkerError = () => {},
     } = {}) {
-        if (!topologyRepository || typeof topologyRepository.pinTopology !== 'function') {
-            throw new TypeError('Topology operation coordinator requires topologyRepository.pinTopology');
+        if (!topologyRepository || typeof topologyRepository.admitTopology !== 'function') {
+            throw new TypeError('Topology operation coordinator requires topologyRepository.admitTopology');
         }
         if (!planMaterializer || typeof planMaterializer.materialize !== 'function') {
             throw new TypeError('Topology operation coordinator requires planMaterializer.materialize');
@@ -474,10 +473,13 @@ class TopologyOperationCoordinator {
             );
         }
         let pinned;
+        let scopedIdentity;
+        let admissionFingerprint;
+        let admittedPriorDeployedRevision;
         try {
-            pinned = await this.topologyRepository.pinTopology({
+            pinned = await this.topologyRepository.admitTopology({
                 expectedRevision: expectedTopologyRevision,
-                prepare: async snapshot => {
+                prepare: async (snapshot, session) => {
                     // Legacy full-sync finalization marks every active link
                     // deployed. Never let it silently claim an unrelated
                     // pending draft alongside already deployed links.
@@ -523,6 +525,7 @@ class TopologyOperationCoordinator {
                         target: TEST_TOPOLOGY_TARGET,
                         hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
                         operationKind: scope?.kind,
+                        session,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,
                             topology,
@@ -531,41 +534,60 @@ class TopologyOperationCoordinator {
                     });
                     return { topology, frozenPlan };
                 },
-            });
-        } catch (error) {
-            throw safeQueueError(error, operationId, expectedTopologyRevision);
-        }
-        const plan = operationPlan({
-            operationId,
-            topologyRevision: pinned.revision,
-            priorDeployedRevision: pinned.deployedRevision,
-            topology: pinned.topology,
-            plan: pinned.frozenPlan,
-        });
-        const scopedIdentity = scope
-            ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds],
-                ...(scope.kind === 'link.apply' ? { staged: pinned.frozenPlan.staged === true } : {}) }
-            : {};
-        try {
-            await this.operationRepository.createFrozen({
-                operationId,
-                idempotencyKey: runIdempotencyKey,
-                topologyRevision: pinned.revision,
-                priorDeployedRevision: pinned.deployedRevision,
-                nodes: plan.nodes,
-                ...scopedIdentity,
-            });
-        } catch (error) {
-            if ((error?.code === 11000 || error?.code === 11001)
-                && typeof this.operationRepository.findPublicById === 'function') {
-                const existing = await this.operationRepository.findPublicById(operationId);
-                if (existing) {
-                    return Object.freeze({
+                admit: async (admitted, session) => {
+                    admittedPriorDeployedRevision = admitted.deployedRevision;
+                    const plan = operationPlan({
                         operationId,
-                        topologyRevision: pinned.revision,
-                        status: existing.status ?? 'queued',
-                        ...scopedIdentity,
+                        topologyRevision: admitted.revision,
+                        priorDeployedRevision: admitted.deployedRevision,
+                        topology: admitted.topology,
+                        plan: admitted.frozenPlan,
                     });
+                    scopedIdentity = scope
+                        ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds],
+                            ...(scope.kind === 'link.apply'
+                                ? { staged: admitted.frozenPlan.staged === true } : {}) }
+                        : {};
+                    admissionFingerprint = createHash('sha256').update(JSON.stringify({
+                        operationId,
+                        topologyRevision: admitted.revision,
+                        priorDeployedRevision: admitted.deployedRevision,
+                        nodes: plan.nodes,
+                        ...scopedIdentity,
+                    })).digest('hex');
+                    await this.operationRepository.createFrozen({
+                        operationId,
+                        idempotencyKey: runIdempotencyKey,
+                        topologyRevision: admitted.revision,
+                        priorDeployedRevision: admitted.deployedRevision,
+                        nodes: plan.nodes,
+                        ...scopedIdentity,
+                        heldTopologyAdmission: true,
+                        admissionFingerprint,
+                        session,
+                    });
+                },
+            });
+        } catch (error) {
+            if (admissionFingerprint
+                && error?.hasErrorLabel?.('UnknownTransactionCommitResult') === true
+                && typeof this.operationRepository.findAdmissionById === 'function') {
+                try {
+                    const found = await this.operationRepository.findAdmissionById(operationId);
+                    if (found && String(found._id) === operationId
+                        && found.topologyRevision === expectedTopologyRevision
+                        && found.heldTopologyAdmission === true
+                        && found.admissionFingerprint === admissionFingerprint
+                        && found.priorDeployedRevision === admittedPriorDeployedRevision
+                        && OPERATION_STATUSES.has(found.status)) {
+                        // A confirmed commit is left to the gated recovery scan;
+                        // never start a worker on an ambiguous response path.
+                        return Object.freeze({ operationId,
+                            topologyRevision: found.topologyRevision,
+                            status: found.status, ...scopedIdentity });
+                    }
+                } catch {
+                    // An unavailable readback cannot establish a safe commit.
                 }
             }
             throw safeQueueError(error, operationId, expectedTopologyRevision);

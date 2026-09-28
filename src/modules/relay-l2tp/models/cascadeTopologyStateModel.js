@@ -30,6 +30,9 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
     // Never infer an absent counter as zero: legacy singleton needs an explicit
     // audited initialization before standalone remote admissions can begin.
     remoteAdmissionCount: { type: Number, min: 0 },
+    // Explicitly audited initialization only. Missing legacy state is not zero.
+    // Queue admission increments this on the same transaction as the operation.
+    topologyAdmissionCount: { type: Number, min: 0 },
     remoteDrain: {
         type: new mongoose.Schema({
             ownerToken: { type: String, required: true },
