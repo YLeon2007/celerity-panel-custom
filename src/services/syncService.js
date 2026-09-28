@@ -431,19 +431,19 @@ class SyncService {
     }
 
     /**
-     * True when live topology execution is enabled on this contour and the
-     * node participates in a topology domain (portal/relay/bridge). The
-     * topology deployment then owns the node's full Xray config (cascade
-     * outbounds, reverse structures, hop listeners); the classic sync must
-     * not regenerate and overwrite it — it only syncs users via the agent.
-     *
-     * @param {Object} node - HyNode document
-     * @returns {boolean}
+     * Topology owns the whole generated Xray config only for connected nodes
+     * while execution is enabled. A prepared portal without an active link
+     * still needs the ordinary config upload on Sync.
      */
-    _topologyManagesNode(node) {
+    async _topologyManagesNode(node) {
         const enabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
             .every(flag => process.env[flag] === 'true');
-        return enabled && ['portal', 'relay', 'bridge'].includes(node?.cascadeRole);
+        if (!enabled || !['portal', 'relay', 'bridge'].includes(node?.cascadeRole)) return false;
+        const CascadeLink = require('../models/cascadeLinkModel');
+        return !!(await CascadeLink.exists({
+            active: true,
+            $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
+        }));
     }
 
     /**
@@ -484,31 +484,34 @@ class SyncService {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
-        // Pull the operator-supplied private key if the node uses manual TLS;
-        // it is intentionally hidden from default queries (select:false).
-        await ensureManualKeyLoaded(node);
+        // Resolve ownership before generation: topology config may use a
+        // different certificate and must never be rebuilt by classic Sync.
+        const topologyManaged = await this._topologyManagesNode(node);
+        if (!topologyManaged) await ensureManualKeyLoaded(node);
 
         const users = await this._getUsersForNode(node);
 
-        // Bail out early on cert-availability errors — pushing a broken
-        // config would silently crash Xray on the node.
+        // Bail out early on cert-availability errors only when classic Sync
+        // owns the config; topology-managed nodes still sync users via agent.
         let configContent;
-        try {
-            configContent = configGenerator.generateXrayConfigWithApi(node, users);
-        } catch (genErr) {
-            if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
-                logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
-                await HyNode.updateOne({ _id: node._id }, {
-                    $set: {
-                        status: 'error',
-                        lastSync: new Date(),
-                        lastError: genErr.message,
-                    },
-                });
-                await invalidateNodesCache();
-                return false;
+        if (!topologyManaged) {
+            try {
+                configContent = configGenerator.generateXrayConfigWithApi(node, users);
+            } catch (genErr) {
+                if (genErr.code === 'PANEL_CERT_UNAVAILABLE' || genErr.code === 'MANUAL_CERT_UNAVAILABLE') {
+                    logger.error(`[Xray Sync] Node ${node.name}: skipping push — ${genErr.message}`);
+                    await HyNode.updateOne({ _id: node._id }, {
+                        $set: {
+                            status: 'error',
+                            lastSync: new Date(),
+                            lastError: genErr.message,
+                        },
+                    });
+                    await invalidateNodesCache();
+                    return false;
+                }
+                throw genErr;
             }
-            throw genErr;
         }
 
         // Step 1: Upload config.json via SSH (only if SSH is configured).
@@ -517,9 +520,8 @@ class SyncService {
         // its cascade structure (and used the persisted link.tunnelUuid,
         // which mismatches the deterministic tunnel credentials the
         // topology composer puts on the other end of the link).
-        const topologyManaged = this._topologyManagesNode(node);
         if (topologyManaged) {
-            logger.info(`[Xray Sync] Node ${node.name}: config upload skipped (topology-managed node)`);
+            logger.info(`[Xray Sync] Node ${node.name}: config upload and restart skipped (topology-managed node)`);
         }
         if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
             const ssh = new NodeSSH(node);
@@ -553,23 +555,18 @@ class SyncService {
                         if (forwardLinks.length > 0) {
                             configGenerator.applyForwardChain(configObj, forwardLinks, inboundTags);
                         }
-                        // On relay/bridge nodes the topology deployment owns hop
-                        // listeners via the separate xray-bridge service; adding
-                        // them to xray-main too would bind the same ports twice
-                        // (SO_REUSEPORT silently load-balances between the two
-                        // xray processes and breaks ~half of REALITY handshakes).
-                        const topologyOwnsHopListeners = this._topologyManagesNode(node);
-                        const classicHopLinks = topologyOwnsHopListeners ? [] : forwardHopLinks;
-                        if (classicHopLinks.length > 0) {
-                            configGenerator.applyForwardHopInbound(configObj, classicHopLinks);
+                        // This branch only runs for classic-owned nodes; keep
+                        // the normal hop listener in their main config.
+                        if (forwardHopLinks.length > 0) {
+                            configGenerator.applyForwardHopInbound(configObj, forwardHopLinks);
                         }
 
                         // geoip:private block must be last, after all cascade rules
                         configGenerator.ensurePrivateIpBlock(configObj);
 
                         configContent = JSON.stringify(configObj, null, 2);
-                        const total = reverseLinks.length + forwardLinks.length + classicHopLinks.length;
-                        logger.info(`[Xray Sync] Node ${node.name}: applied ${total} cascade link(s) (${reverseLinks.length}R/${forwardLinks.length}F/${classicHopLinks.length}H)`);
+                        const total = reverseLinks.length + forwardLinks.length + forwardHopLinks.length;
+                        logger.info(`[Xray Sync] Node ${node.name}: applied ${total} cascade link(s) (${reverseLinks.length}R/${forwardLinks.length}F/${forwardHopLinks.length}H)`);
                     } else {
                         // No cascade links, still ensure geoip:private is present
                         const configObj = JSON.parse(configContent);
@@ -644,7 +641,7 @@ class SyncService {
 
         // Step 2: Restart Xray via Agent (preferred) or SSH fallback
         const hasAgent = !!(node.xray?.agentToken);
-        if (hasAgent) {
+        if (!topologyManaged && hasAgent) {
             try {
                 // /restart blocks until Xray is running and users are restored (~2-3s)
                 await this._agentRequest(node, 'POST', '/restart');
@@ -652,7 +649,7 @@ class SyncService {
             } catch (error) {
                 logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
             }
-        } else if (node.ssh?.password || node.ssh?.privateKey) {
+        } else if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
             const ssh = new NodeSSH(node);
             try {
                 await ssh.connect();
