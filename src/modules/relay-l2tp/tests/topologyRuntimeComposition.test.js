@@ -76,7 +76,10 @@ function compositionDependencies(calls = []) {
         CascadeLink: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeRouteGroup: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate', 'updateOne'], calls),
-        RelayL2tpState: modelWith(['find'], calls),
+        RelayL2tpState: modelWith(['find', 'findOne'], calls),
+        L2tpUser: modelWith(['find'], calls),
+        L2tpOperation: modelWith(['findOne'], calls),
+        NodeSSH: class FakeNodeSSH {},
         TopologyOperation: modelWith(['create', 'findOneAndUpdate', 'updateOne'], calls),
         NodeOperationLock: modelWith(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'], calls),
         transactionRunner: async work => work({ id: 'test-session' }),
@@ -214,6 +217,7 @@ test('enabled composition builds the real typed executor with the injected NodeS
     assert.ok(service instanceof TopologyOperationCoordinator);
     assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
     assert.equal(typeof service.operationWorker.userResync?.resyncPlan, 'function');
+    assert.equal(typeof service.operationWorker.pppReadinessGate?.verifyPlan, 'function');
     assert.deepEqual(calls, []);
 });
 

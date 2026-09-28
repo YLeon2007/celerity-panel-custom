@@ -72,7 +72,17 @@ expect_error() {
 [[ -x "$RUNNER_SOURCE" ]] || fail 'runner artifact is missing or not executable'
 mkdir -p "$TMP_DIR/lib" "$TMP_DIR/bin"
 : >"$TMP_DIR/mutations.log"
-cp "$RUNNER_SOURCE" "$TMP_DIR/lib/runner.sh"
+# Exercise the production runner without writing to its privileged /var/lib tree.
+# Keep the fixed artifact dispatch intact; only sandbox its operation root/owner.
+production_root="readonly OPERATIONS_ROOT='/var/lib/celerity/l2tp/operations'"
+production_owner='-o root -g root -- "$OPERATION_DIR"'
+runner_fixture="$(<"$RUNNER_SOURCE")"
+[[ "$runner_fixture" == *"$production_root"* && "$runner_fixture" == *"$production_owner"* ]] \
+    || fail 'runner operation root or owner contract changed'
+operations_root="$TMP_DIR/operations"
+runner_fixture="${runner_fixture/"$production_root"/"readonly OPERATIONS_ROOT='$operations_root'"}"
+runner_fixture="${runner_fixture/"$production_owner"/"-o $(id -un) -g $(id -gn) -- \"\$OPERATION_DIR\""}"
+printf '%s\n' "$runner_fixture" >"$TMP_DIR/lib/runner.sh"
 chmod +x "$TMP_DIR/lib/runner.sh"
 ln -s "$TMP_DIR/lib/runner.sh" "$TMP_DIR/bin/celerity-l2tp-artifact-runner"
 make_sibling_artifact preflight.sh
@@ -102,7 +112,7 @@ invoke_runner preflight --operation-id operation_18-ABC --command preflight
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 2 ]] || fail 'preflight received an unexpected argument count'
 [[ "${call[0]}" == 'preflight.sh' ]] || fail 'preflight invoked the wrong artifact'
-[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation_18-ABC/desired.json' ]] \
+[[ "${call[1]}" == "$operations_root/operation_18-ABC/desired.json" ]] \
     || fail 'preflight received the wrong desired-state path'
 
 rm -f "$TMP_DIR/call.log"
@@ -113,7 +123,7 @@ invoke_runner stage --operation-id operation-19 --command stage_managed_files
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 3 ]] || fail 'stage_managed_files received an unexpected argument count'
 [[ "${call[0]}" == 'apply.sh' ]] || fail 'stage_managed_files invoked the wrong artifact'
-[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-19/artifacts.json' ]] \
+[[ "${call[1]}" == "$operations_root/operation-19/artifacts.json" ]] \
     || fail 'stage_managed_files received the wrong manifest path'
 [[ "${call[2]}" == '/' ]] || fail 'stage_managed_files received a non-root apply target'
 
@@ -125,7 +135,7 @@ invoke_runner backup --operation-id operation-19 --command backup
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 3 ]] || fail 'backup received an unexpected argument count'
 [[ "${call[0]}" == 'backup.sh' ]] || fail 'backup invoked the wrong artifact'
-[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-19' ]] \
+[[ "${call[1]}" == "$operations_root/operation-19" ]] \
     || fail 'backup received the wrong operation directory'
 [[ "${call[2]}" == '/' ]] || fail 'backup received a non-root backup target'
 
@@ -143,7 +153,7 @@ rm -f "$TMP_DIR/call.log"
 invoke_runner max-id --operation-id "$max_operation_id" --command preflight
 [[ "$status" -eq 0 ]] || fail '128-character operation id was rejected'
 mapfile -t call <"$TMP_DIR/call.log"
-[[ "${call[1]}" == "/var/lib/celerity/l2tp/operations/$max_operation_id/desired.json" ]] \
+[[ "${call[1]}" == "$operations_root/$max_operation_id/desired.json" ]] \
     || fail 'maximum-length operation id was not passed as data'
 
 declare -A command_artifacts=(
@@ -167,7 +177,7 @@ for command in compose_xray_fragment validate_xray apply_firewall_policy start_l
     mapfile -t call <"$TMP_DIR/call.log"
     [[ "${#call[@]}" -eq 2 ]] || fail "$command received an unexpected argument count"
     [[ "${call[0]}" == "$artifact" ]] || fail "$command invoked the wrong artifact"
-    [[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    [[ "${call[1]}" == "$operations_root/operation-20" ]] \
         || fail "$command received the wrong operation directory"
 done
 
@@ -179,9 +189,9 @@ invoke_runner validate_nft --operation-id operation-20 --command validate_nft
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 4 ]] || fail 'validate_nft did not invoke exactly two fixed artifacts'
 [[ "${call[0]}" == 'materialize-nft-candidate.sh' \
-    && "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' \
+    && "${call[1]}" == "$operations_root/operation-20" \
     && "${call[2]}" == 'validate-nft.sh' \
-    && "${call[3]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    && "${call[3]}" == "$operations_root/operation-20" ]] \
     || fail 'validate_nft did not materialize the fixed candidate before validation'
 
 rm -f "$TMP_DIR/call.log"
@@ -192,7 +202,7 @@ unset MATERIALIZE_NFT_STATUS
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 2 \
     && "${call[0]}" == 'materialize-nft-candidate.sh' \
-    && "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+    && "${call[1]}" == "$operations_root/operation-20" ]] \
     || fail 'validate_nft invoked the validator after materialization failed'
 
 rm -f "$TMP_DIR/call.log"
@@ -203,7 +213,7 @@ invoke_runner activate_xray --operation-id operation-20 --command activate_xray
 mapfile -t call <"$TMP_DIR/call.log"
 [[ "${#call[@]}" -eq 3 ]] || fail 'activate_xray received an unexpected argument count'
 [[ "${call[0]}" == 'activate-xray.sh' ]] || fail 'activate_xray invoked the wrong artifact'
-[[ "${call[1]}" == '/var/lib/celerity/l2tp/operations/operation-20' ]] \
+[[ "${call[1]}" == "$operations_root/operation-20" ]] \
     || fail 'activate_xray received the wrong operation directory'
 [[ "${call[2]}" == '/' ]] || fail 'activate_xray received a non-root activation target'
 

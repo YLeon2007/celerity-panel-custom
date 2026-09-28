@@ -209,6 +209,7 @@ function createWorker({
     timer,
     renewalIntervalMs,
     userResync,
+    pppReadinessGate,
 } = {}) {
     const effectiveLockService = lockService || {
         async acquire() { return { ok: true }; },
@@ -236,6 +237,7 @@ function createWorker({
         timer,
         renewalIntervalMs,
         userResync,
+        pppReadinessGate,
     });
 }
 
@@ -542,6 +544,66 @@ test('user resync failure rolls back changed nodes before finalization', async (
     assert.equal(finalized, false);
     assert.ok(rollbackNodes.length > 0);
     assert.equal(resyncCalls, 2);
+});
+
+test('only an explicitly staged durable link apply reaches the PPP gate as staged', async t => {
+    for (const [kind, staged, expected] of [
+        ['link.apply', true, true],
+        ['link.apply', false, undefined],
+        ['domain.reconcile', true, undefined],
+    ]) {
+        await t.test(`${kind} staged=${staged}`, async () => {
+            const repository = createRepository({ ...durableThreeNodeOperation(), kind, staged });
+            const worker = createWorker({
+                repository,
+                executor: {
+                    async prepare() { return { backupId: 'backup', prepared: {} }; },
+                    async commit() { return { ok: true }; },
+                    async verify() { return { ok: true }; },
+                    async cleanupPrepared() { return { ok: true }; },
+                    async rollback() { return { ok: true }; },
+                },
+                pppReadinessGate: { async verifyPlan(plan) {
+                    assert.equal(plan.staged, expected);
+                    return { ok: true, verifiedRelayCount: expected ? 0 : 1,
+                        ...(expected ? { skippedRelayCount: 1 } : {}) };
+                } },
+            });
+            assert.equal((await worker.run('operation-1')).status, 'succeeded');
+        });
+    }
+});
+
+test('PPP node readback failure rolls back changed nodes before terminal success', async t => {
+    for (const unavailable of [false, true]) {
+        await t.test(unavailable ? 'runner unavailable' : 'runner mismatch', async () => {
+            const events = [];
+            const repository = createRepository(durableThreeNodeOperation());
+            const worker = createWorker({
+                repository,
+                executor: {
+                    async prepare(request) { return { backupId: `backup-${request.node.node}`, prepared: {} }; },
+                    async commit() { return { ok: true }; },
+                    async verify() { return { ok: true }; },
+                    async cleanupPrepared() { return { ok: true }; },
+                    async rollback(request) { events.push(`rollback:${request.node.node}`); return { ok: true }; },
+                },
+                userResync: { async resyncPlan() { events.push('xray-sync'); return { ok: true }; } },
+                pppReadinessGate: { async verifyPlan(plan) {
+                    events.push('ppp-readback');
+                    assert.ok(Object.isFrozen(plan));
+                    if (unavailable) throw new Error('private-ppp-password');
+                    return { ok: false, verifiedRelayCount: 0 };
+                } },
+                finalizer: { async finalizeSucceeded() { events.push('finalized'); return { ok: true }; } },
+            });
+            const result = await worker.run('operation-1');
+            assert.equal(result.status, 'rolled_back');
+            assert.deepEqual(events.slice(0, 2), ['xray-sync', 'ppp-readback']);
+            assert.equal(events.includes('finalized'), false);
+            assert.equal(events.filter(event => event.startsWith('rollback:')).length, 3);
+        });
+    }
 });
 
 test('persistent user sync failure after rollback cannot be reported as recovered', async () => {

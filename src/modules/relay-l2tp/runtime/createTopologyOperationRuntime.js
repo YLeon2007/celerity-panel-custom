@@ -45,6 +45,9 @@ const {
     TopologyUserResync,
 } = require('../services/topologyUserResync');
 const {
+    createTopologyPppReadinessGate,
+} = require('../services/topologyPppReadinessGate');
+const {
     NodeOperationLockRepository,
 } = require('../services/nodeOperationLockRepository');
 const {
@@ -122,6 +125,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
         CascadeRouteGroup,
         CascadeTopologyState,
         RelayL2tpState,
+        L2tpUser,
+        L2tpOperation,
         TopologyOperation,
         NodeSSH,
         createTopologyOperationExecutor: executorFactoryOverride,
@@ -195,6 +200,15 @@ function createTopologyOperationRuntime(dependencies = {}) {
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
         const userResync = new TopologyUserResync({ HyNode });
+        // The TEST runtime always wires the real node runner verifier. Missing
+        // execution/model capabilities make the runtime unavailable, not ready.
+        const pppReadinessGate = createTopologyPppReadinessGate({
+            RelayL2tpState,
+            L2tpUser: L2tpUser ?? require('../models/l2tpUserModel'),
+            L2tpOperation: L2tpOperation ?? require('../models/l2tpOperationModel'),
+            HyNode,
+            NodeSSH: NodeSSH ?? require('../../../services/nodeSSH'),
+        });
         const operationWorker = new OperationWorker({
             operationRepository,
             executor,
@@ -204,6 +218,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             leaseMs,
             clock,
             ...optional(userResync, 'userResync'),
+            pppReadinessGate,
         });
         return new Coordinator({
             topologyRepository,

@@ -37,6 +37,8 @@ const CLAIM_PROJECTION = Object.freeze({
     _id: 1,
     topologyRevision: 1,
     priorDeployedRevision: 1,
+    kind: 1,
+    staged: 1,
     status: 1,
     attempts: 1,
     leaseOwner: 1,

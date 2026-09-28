@@ -149,6 +149,8 @@ function durablePlan(operation, operationId) {
         operationId,
         topologyRevision: operation.topologyRevision,
         priorDeployedRevision: operation.priorDeployedRevision,
+        // Only the durable scoped link.apply identity can authorize a PPP skip.
+        ...(operation.kind === 'link.apply' && operation.staged === true ? { staged: true } : {}),
         nodes,
     });
 }
@@ -209,6 +211,7 @@ class TopologyOperationWorker {
         timer = globalThis,
         renewalIntervalMs,
         userResync,
+        pppReadinessGate,
     } = {}) {
         const repositoryMethods = [
             'claim',
@@ -262,6 +265,11 @@ class TopologyOperationWorker {
             throw new TypeError('Topology operation worker user resync requires resyncPlan');
         }
         this.userResync = userResync;
+        if (pppReadinessGate !== undefined
+            && typeof pppReadinessGate?.verifyPlan !== 'function') {
+            throw new TypeError('Topology operation worker PPP gate requires verifyPlan');
+        }
+        this.pppReadinessGate = pppReadinessGate;
         this.running = new Set();
     }
 
@@ -860,6 +868,20 @@ class TopologyOperationWorker {
                         prepared,
                         changing,
                         heartbeat,
+                    );
+                }
+            }
+            if (this.pppReadinessGate) {
+                try {
+                    await this.renew(operationId);
+                    const readiness = await heartbeat.run(() => this.pppReadinessGate.verifyPlan(plan));
+                    if (readiness?.ok !== true) {
+                        throw new Error('Topology PPP node readback was not verified');
+                    }
+                } catch (error) {
+                    if (error instanceof LeaseLostError) throw error;
+                    return await this.rollbackAfterCommitFailure(
+                        plan, operationId, prepared, changing, heartbeat,
                     );
                 }
             }

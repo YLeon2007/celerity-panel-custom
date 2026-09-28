@@ -467,7 +467,10 @@ test('root deployment factory exposes only the exact opted-in queued composition
         CascadeLink: {},
         CascadeRouteGroup: {},
         CascadeTopologyState: { updateOne() {} },
-        RelayL2tpState: {},
+        RelayL2tpState: { findOne() {} },
+        L2tpUser: { find() {} },
+        L2tpOperation: { findOne() {} },
+        NodeSSH: class FakeNodeSSH {},
         TopologyOperation: { updateOne() {} },
         NodeOperationLock: {},
     };
