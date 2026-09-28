@@ -254,28 +254,65 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
 
 function nodeIdsByRef(topology) {
     const nodes = new Map(topology.nodes.map(node => [node.id, node]));
-    // Walk the MAIN chain only: at a branching node (relay with geo-routing
-    // leaf links) a collapsed map would follow whatever link sorted last and
-    // bind the wrong bridge to the 'bridge' ref.
-    const outgoing = new Map(
-        topology.links.filter(link => link.geo !== true).map(link => [link.source, link.target]),
-    );
-    const portal = topology.nodes.find(node => node.role === 'portal');
-    const result = new Map();
-    let current = portal?.id;
-    let relayIndex = 0;
-    const visited = new Set();
-    while (current && nodes.has(current) && !visited.has(current)) {
-        visited.add(current);
-        const node = nodes.get(current);
-        const ref = node.role === 'relay' ? `relay-${++relayIndex}` : node.role;
-        result.set(ref, current);
-        current = outgoing.get(current);
+    const outgoing = new Map();
+    const incoming = new Set();
+    const geoTargets = new Set();
+    for (const link of topology.links) {
+        if (!nodes.has(link.source) || !nodes.has(link.target)) {
+            throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT', 'Invalid node ref endpoint');
+        }
+        if (link.geo === true) {
+            if (geoTargets.has(link.target)) {
+                throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT', 'Ambiguous geo node ref');
+            }
+            geoTargets.add(link.target);
+        } else {
+            if (outgoing.has(link.source)) {
+                throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT', 'Ambiguous node ref path');
+            }
+            outgoing.set(link.source, link.target);
+            incoming.add(link.target);
+        }
     }
-    // Geo-routing branch bridges never appear in the main chain walk; they get
-    // suffixed refs in the same deterministic order the plan composer uses.
-    const geoBridges = topology.nodes
-        .filter(node => node.role === 'bridge' && !visited.has(node.id))
+    // Mirror the composer's ordering: portal sources sorted by id, then
+    // relays in first-seen portal-path order, then the shared default sink.
+    const portals = topology.nodes.filter(node => node.role === 'portal' && outgoing.has(node.id) && !incoming.has(node.id))
+        .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+    const paths = portals.map(portal => {
+        const path = [];
+        const seen = new Set();
+        let id = portal.id;
+        while (id) {
+            if (seen.has(id)) {
+                throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT', 'Invalid cyclic node ref path');
+            }
+            seen.add(id);
+            path.push(id);
+            id = outgoing.get(id);
+        }
+        return path;
+    });
+    const fanIn = portals.length > 1;
+    const ordered = fanIn
+        ? [...portals.map(portal => portal.id), ...paths.flatMap(path => path.slice(1))]
+        : (paths[0] || []);
+    const visited = new Set();
+    const result = new Map();
+    let portalIndex = 0;
+    let relayIndex = 0;
+    for (const id of ordered) {
+        if (visited.has(id)) continue;
+        visited.add(id);
+        const role = nodes.get(id).role;
+        const ref = role === 'portal' ? (fanIn ? `portal-${++portalIndex}` : 'portal')
+            : role === 'relay' ? `relay-${++relayIndex}` : 'bridge';
+        if (result.has(ref)) {
+            throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT', 'Ambiguous node ref role');
+        }
+        result.set(ref, id);
+    }
+    // Composer numbers geo bridge leaves by sorted id, starting at 2.
+    const geoBridges = topology.nodes.filter(node => geoTargets.has(node.id) && !visited.has(node.id))
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
     geoBridges.forEach((node, index) => result.set(`bridge-${index + 2}`, node.id));
     return result;
@@ -283,16 +320,24 @@ function nodeIdsByRef(topology) {
 
 function operationPlan({ operationId, topologyRevision, priorDeployedRevision, topology, plan }) {
     const idsByRef = nodeIdsByRef(topology);
+    const seenRefs = new Set();
+    const seenIds = new Set();
+    const rolesById = new Map(topology.nodes.map(node => [node.id, node.role]));
     const nodes = plan.nodes.map(node => {
-        const nodeId = entityId(node.node) || idsByRef.get(node.nodeRef) || '';
+        const nodeId = idsByRef.get(node.nodeRef);
         const candidateHash = node.candidateHash ?? node.candidate?.sha256;
-        if (!nodeId || typeof candidateHash !== 'string' || candidateHash.length === 0) {
+        if (!nodeId || (entityId(node.node) && entityId(node.node) !== nodeId)
+            || rolesById.get(nodeId) !== node.role
+            || seenRefs.has(node.nodeRef) || seenIds.has(nodeId)
+            || typeof candidateHash !== 'string' || candidateHash.length === 0) {
             throw new TopologyOperationCoordinatorError(
                 'INVALID_TOPOLOGY_DEPLOYMENT',
                 'The frozen topology operation plan is invalid',
                 { operationId },
             );
         }
+        seenRefs.add(node.nodeRef);
+        seenIds.add(nodeId);
         return {
             ...node,
             node: nodeId,

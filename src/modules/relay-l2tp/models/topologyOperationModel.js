@@ -1,6 +1,7 @@
 'use strict';
 
 const mongoose = require('mongoose');
+const { validNodeRef } = require('../services/topologyNodeRef');
 
 const OPERATION_STATUSES = [
     'queued',
@@ -63,8 +64,10 @@ const topologyNodeSchema = new mongoose.Schema({
     },
     nodeRef: {
         type: String,
-        // 'bridge-N' refs belong to geo-routing branch bridges.
-        match: /^(?:portal|bridge(?:-[1-9][0-9]*)?|relay-[1-9][0-9]*)$/,
+        validate: {
+            validator(value) { return validNodeRef(this.role, value); },
+            message: 'nodeRef must match its node role',
+        },
         required: true,
     },
     role: {

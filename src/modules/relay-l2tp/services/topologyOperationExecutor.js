@@ -106,13 +106,7 @@ function executionFailed() {
     );
 }
 
-function validNodeRef(role, nodeRef) {
-    if (role === 'relay') return /^relay-[1-9][0-9]*$/.test(nodeRef);
-    // The default bridge keeps the plain 'bridge' ref; geo-routing branch
-    // bridges get deterministic 'bridge-N' refs.
-    if (role === 'bridge') return /^bridge(-[1-9][0-9]*)?$/.test(nodeRef);
-    return nodeRef === role;
-}
+const { validNodeRef } = require('./topologyNodeRef');
 
 function validChecks(checks, target) {
     return Array.isArray(checks) && checks.every(check => {

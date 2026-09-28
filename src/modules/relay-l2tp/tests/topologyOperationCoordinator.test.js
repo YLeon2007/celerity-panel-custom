@@ -755,7 +755,22 @@ test('legacy unscoped queue keeps the full-sync idempotency key and records no s
     const calls = [];
     const allConfirmed = scopedSnapshot();
     allConfirmed.links.forEach(link => { link.status = 'deployed'; });
-    const coordinator = new TopologyOperationCoordinator(scopedHarness(allConfirmed, calls));
+    const coordinator = new TopologyOperationCoordinator({
+        ...scopedHarness(allConfirmed, calls),
+        planMaterializer: {
+            async materialize(input) {
+                calls.push({ method: 'materialize', input });
+                return {
+                    nodes: [
+                        { nodeRef: 'portal-1', role: 'portal', candidateHash: 'hash-1' },
+                        { nodeRef: 'portal-2', role: 'portal', candidateHash: 'hash-2' },
+                        { nodeRef: 'relay-1', role: 'relay', candidateHash: 'hash-3' },
+                        { nodeRef: 'bridge', role: 'bridge', candidateHash: 'hash-4' },
+                    ],
+                };
+            },
+        },
+    });
 
     await coordinator.queue({ expectedTopologyRevision: 8 });
     await Promise.resolve();

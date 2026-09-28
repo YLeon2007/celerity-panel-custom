@@ -3,6 +3,7 @@
 const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
+const { validNodeRef } = require('../services/topologyNodeRef');
 
 function loadLogger() {
     try {
@@ -70,13 +71,6 @@ function hasExactKeys(value, keys) {
         && typeof value === 'object'
         && !Array.isArray(value)
         && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(keys);
-}
-
-function validNodeRef(role, nodeRef) {
-    if (role === 'relay') return /^relay-[1-9][0-9]*$/.test(nodeRef);
-    // Default bridge keeps 'bridge'; geo-routing branch bridges use 'bridge-N'.
-    if (role === 'bridge') return /^bridge(-[1-9][0-9]*)?$/.test(nodeRef);
-    return nodeRef === role;
 }
 
 function validChecks(checks, target) {
@@ -916,6 +910,7 @@ class TopologyOperationWorker {
 module.exports = {
     LeaseLostError,
     TopologyOperationWorker,
+    durablePlan,
     isDeepFrozen,
     matchesFrozenMetadata,
     orderedPlanNodes,
