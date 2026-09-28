@@ -482,6 +482,39 @@ test('composes forward plans in Bridge to Relay to Portal order with exact check
     assert(configs.portal.inbounds.some(inbound => inbound.tag === 'API_INBOUND'));
 });
 
+test('forward relay sidecar never rebinds xray-main client listeners', () => {
+    const input = forwardChainInput();
+    const relayMetadata = input.nodeMetadata.find(node => node.role === 'relay');
+    relayMetadata.xray.extraInbounds = [{
+        port: 25002,
+        inboundTag: 'client-relay-extra',
+        transport: 'ws',
+        security: 'none',
+        wsPath: '/relay-extra',
+    }];
+    const main = JSON.parse(generateXrayConfigWithApi(relayMetadata, []));
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    const relay = candidateConfig(plan.nodes.find(node => node.role === 'relay'));
+
+    for (const tag of ['client-relay', 'client-relay-extra']) {
+        const mainInbound = main.inbounds.find(inbound => inbound.tag === tag);
+        assert.ok(mainInbound, `${tag} belongs to xray-main`);
+        assert.equal(
+            relay.inbounds.some(inbound => inbound.listen === mainInbound.listen
+                && inbound.port === mainInbound.port),
+            false,
+            `xray-bridge must not bind xray-main ${tag} on ${mainInbound.listen}:${mainInbound.port}`,
+        );
+        assert.equal(relay.routing.rules.some(rule => rule.inboundTag?.includes(tag)), false);
+    }
+    assert(relay.inbounds.some(inbound => inbound.tag === 'fwd-hop-link-1' && inbound.port === 12001));
+    assert.deepEqual(relay.inbounds.filter(inbound => inbound.protocol === 'socks')
+        .map(inbound => inbound.tag), ['cascade-backup', 'cascade-main']);
+    const portal = candidateConfig(plan.nodes.find(node => node.role === 'portal'));
+    assert(portal.inbounds.some(inbound => inbound.tag === 'client-portal'));
+    assert(portal.inbounds.some(inbound => inbound.tag === 'client-portal-extra'));
+});
+
 test('composes every relay in a longer reverse v1 chain', () => {
     const input = reverseChainInput();
     const relayBridge = input.snapshot.links.find(link => (

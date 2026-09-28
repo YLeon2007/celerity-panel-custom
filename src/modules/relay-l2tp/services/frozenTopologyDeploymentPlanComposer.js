@@ -1188,6 +1188,9 @@ function buildCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById
                 });
                 configGenerator.applyForwardChain(config, links, clientInboundTags(nodeConfig), [], branches);
             } else {
+                if (node.role === 'relay') {
+                    config = stripServerInbounds(config, nodeConfig);
+                }
                 configGenerator.applyForwardHopInbound(config, [links[index - 1]]);
                 if (node.role === 'relay') {
                     const ingress = relayPathIngress(groups, chain.orderedLinks[index].id);
