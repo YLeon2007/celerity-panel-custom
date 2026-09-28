@@ -86,6 +86,35 @@ class RemoteAdmissionRepository {
         return String(operationId);
     }
 
+    async acquireInstall({ nodeId } = {}) {
+        if (!nodeId) throw new TypeError('Invalid install admission');
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection) {
+            throw new TypeError('Install admission requires both models on one transactional Mongo connection');
+        }
+        const id = randomUUID();
+        try {
+            await this.transactionRunner(async session => {
+                const gate = await this.CascadeTopologyState.updateOne({
+                    _id: 'singleton', remoteDrain: { $exists: false },
+                    replacementReservation: { $exists: false },
+                    remoteAdmissionCount: { $gte: 0 },
+                }, { $inc: { remoteAdmissionCount: 1 } }, { session });
+                if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_BLOCKED');
+                await this.RemoteAdmission.create([{
+                    _id: id, nodeId: String(nodeId), kind: 'install', phase: 'running', ownerGeneration: 1,
+                }], { session });
+            });
+        } catch (error) {
+            // An uncertain commit can already own the gate. Never retry or release
+            // on behalf of the caller; expose the one identity for reconciliation.
+            if (error && typeof error === 'object') error.admissionId = id;
+            throw error;
+        }
+        return id;
+    }
+
     async acquire({ nodeId, kind = 'standalone_preflight' }) {
         if (!nodeId || kind !== 'standalone_preflight') throw new TypeError('Invalid standalone admission');
         const id = randomUUID();
