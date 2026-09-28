@@ -51,98 +51,138 @@ function pathKeyForState(state) {
         : 'main';
 }
 
+function maintenanceError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+function defaultTransactionRunner(models) {
+    const connection = models.CascadeTopologyState?.db;
+    if (!connection || typeof connection.transaction !== 'function'
+        || Object.values(models).some(model => model?.db !== connection)) {
+        throw new TypeError('L2TP path maintenance requires models on one transactional Mongo connection');
+    }
+    return work => connection.transaction(work);
+}
+
 async function maintainAutoL2tpPaths({
     HyNode,
     CascadeLink,
     CascadeRouteGroup,
     RelayL2tpState,
     CascadeTopologyState,
+    transactionRunner,
     logger,
 } = {}) {
-    const states = await RelayL2tpState.find({
-        desiredState: 'installed',
-        routeGroup: { $ne: null },
-    }).lean();
-    if (!Array.isArray(states) || states.length === 0) {
-        return { updated: 0, deferred: [], revision: null };
+    const models = { HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState, CascadeTopologyState };
+    const runTransaction = transactionRunner ?? defaultTransactionRunner(models);
+    if (typeof runTransaction !== 'function') {
+        throw new TypeError('L2TP path maintenance requires a transaction runner');
     }
-
-    const links = await CascadeLink.find({}).lean();
-    const nodes = await HyNode.find({}).select('_id cascadeRole').lean();
-    const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
-
-    let updated = 0;
-    const deferred = [];
-    for (const state of states) {
-        const relayId = entityId(state.node);
-        const groupId = entityId(state.routeGroup);
-        if (!groupId) continue;
-        const pathKey = pathKeyForState(state);
-        const claimants = states.filter(other =>
-            entityId(other.routeGroup) === groupId && pathKeyForState(other) === pathKey);
-        if (claimants.length !== 1) {
-            logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: ambiguous route group path key`);
-            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
-            continue;
+    // Graph, group paths and the singleton CAS share one Mongo snapshot. A
+    // reservation arriving after this read also conflicts with the CAS below;
+    // Mongo aborts the transaction and rolls back every staged group path.
+    return runTransaction(async session => {
+        const topology = await CascadeTopologyState.findById('singleton')
+            .select('revision replacementReservation').session(session).lean();
+        if (topology?.replacementReservation) {
+            throw maintenanceError('TOPOLOGY_REPLACEMENT_RESERVED', 'A topology replacement owns the maintenance fence');
         }
-        const group = await CascadeRouteGroup.findById(groupId).lean();
-        if (!group) continue;
-
-        let chain;
-        try {
-            chain = buildDefaultChainPath({ links, nodesById, startNodeId: relayId });
-        } catch (error) {
-            // Ambiguous branch or loop: the graph is mid-rebuild — leave the
-            // group untouched and let the operator finish the topology.
-            logger?.warn?.(`[L2TP] auto path rebuild skipped for relay ${relayId}: ${error.message}`);
-            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: error.code });
-            continue;
-        }
-        if (!chain.complete || chain.linkIds.length === 0) {
-            // Gap or partial suffix: keep the last working path. Publishing an
-            // empty or bridge-less path would strand L2TP clients or leak PPP
-            // traffic without a cascade egress; fail-closed with automatic
-            // recovery on the next link mutation instead.
-            logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: chain does not reach a bridge yet`);
-            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'CHAIN_INCOMPLETE' });
-            continue;
+        const expectedRevision = topology?.revision ?? 0;
+        const states = await RelayL2tpState.find({
+            desiredState: 'installed',
+            routeGroup: { $ne: null },
+        }).session(session).lean();
+        if (!Array.isArray(states) || states.length === 0) {
+            return { updated: 0, deferred: [], revision: null };
         }
 
-        const existingPaths = group.paths || [];
-        const ownedIndexes = existingPaths
-            .map((path, index) => (path.pathKey === pathKey ? index : -1))
-            .filter(index => index >= 0);
-        if (ownedIndexes.length > 1) {
-            logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: duplicate route group path key`);
-            deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
-            continue;
+        const links = await CascadeLink.find({}).session(session).lean();
+        const nodes = await HyNode.find({}).select('_id cascadeRole').session(session).lean();
+        const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
+
+        let updated = 0;
+        const deferred = [];
+        for (const state of states) {
+            const relayId = entityId(state.node);
+            const groupId = entityId(state.routeGroup);
+            if (!groupId) continue;
+            const pathKey = pathKeyForState(state);
+            const claimants = states.filter(other =>
+                entityId(other.routeGroup) === groupId && pathKeyForState(other) === pathKey);
+            if (claimants.length !== 1) {
+                logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: ambiguous route group path key`);
+                deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
+                continue;
+            }
+            const group = await CascadeRouteGroup.findById(groupId).session(session).lean();
+            if (!group) continue;
+
+            let chain;
+            try {
+                chain = buildDefaultChainPath({ links, nodesById, startNodeId: relayId });
+            } catch (error) {
+                // Ambiguous branch or loop: the graph is mid-rebuild — leave the
+                // group untouched and let the operator finish the topology.
+                logger?.warn?.(`[L2TP] auto path rebuild skipped for relay ${relayId}: ${error.message}`);
+                deferred.push({ relayNode: relayId, routeGroup: groupId, reason: error.code });
+                continue;
+            }
+            if (!chain.complete || chain.linkIds.length === 0) {
+                // Gap or partial suffix: keep the last working path. Publishing an
+                // empty or bridge-less path would strand L2TP clients or leak PPP
+                // traffic without a cascade egress; fail-closed with automatic
+                // recovery on the next link mutation instead.
+                logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: chain does not reach a bridge yet`);
+                deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'CHAIN_INCOMPLETE' });
+                continue;
+            }
+
+            const existingPaths = group.paths || [];
+            const ownedIndexes = existingPaths
+                .map((path, index) => (path.pathKey === pathKey ? index : -1))
+                .filter(index => index >= 0);
+            if (ownedIndexes.length > 1) {
+                logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: duplicate route group path key`);
+                deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'AMBIGUOUS_ROUTE_GROUP_OWNERSHIP' });
+                continue;
+            }
+            const newPath = { pathKey, linkIds: chain.linkIds, priority: 1, enabled: true };
+            // Replace the recorded key in place; foreign keys keep their entries.
+            const wanted = ownedIndexes.length === 0
+                ? [...existingPaths, newPath]
+                : existingPaths
+                    .map((path, index) => (index === ownedIndexes[0] ? newPath : path))
+                    .filter((path, index) => !ownedIndexes.includes(index) || index === ownedIndexes[0]);
+            if (samePaths(existingPaths, wanted)) continue;
+
+            const result = await CascadeRouteGroup.updateOne(
+                { _id: groupId }, { $set: { paths: wanted } }, { runValidators: true, session },
+            );
+            if (result.matchedCount !== 1) {
+                throw maintenanceError('CASCADE_ROUTE_GROUP_NOT_FOUND', 'The route group changed during maintenance');
+            }
+            updated += 1;
         }
-        const newPath = { pathKey, linkIds: chain.linkIds, priority: 1, enabled: true };
-        // Replace the recorded key in place; foreign keys keep their entries.
-        const wanted = ownedIndexes.length === 0
-            ? [...existingPaths, newPath]
-            : existingPaths
-                .map((path, index) => (index === ownedIndexes[0] ? newPath : path))
-                .filter((path, index) => !ownedIndexes.includes(index) || index === ownedIndexes[0]);
-        if (samePaths(existingPaths, wanted)) continue;
 
-        await CascadeRouteGroup.findByIdAndUpdate(groupId, { $set: { paths: wanted } });
-        updated += 1;
-        logger?.info?.(`[L2TP] auto-l2tp path rebuilt for relay ${relayId} (${chain.linkIds.length} hop(s))`);
-    }
-
-    let revision = null;
-    if (updated > 0 && CascadeTopologyState) {
-        // Re-read the post-maintenance revision so callers never act on a
-        // snapshot taken before the path write.
-        const state = await CascadeTopologyState.findByIdAndUpdate(
-            'singleton',
-            { $inc: { revision: 1 } },
-            { upsert: true, new: true },
-        );
-        revision = state?.revision ?? null;
-    }
-    return { updated, deferred, revision };
+        if (updated === 0) return { updated, deferred, revision: null };
+        const update = { $inc: { revision: 1 } };
+        if (!topology) update.$setOnInsert = { deployedRevision: 0 };
+        const state = await CascadeTopologyState.findOneAndUpdate(
+            {
+                _id: 'singleton',
+                revision: expectedRevision,
+                replacementReservation: { $exists: false },
+            },
+            update,
+            { new: true, runValidators: true, session, upsert: !topology },
+        ).select('revision').lean();
+        if (!state) {
+            throw maintenanceError('TOPOLOGY_MAINTENANCE_CONFLICT', 'The topology changed during L2TP path maintenance');
+        }
+        return { updated, deferred, revision: state.revision };
+    });
 }
 
 module.exports = { maintainAutoL2tpPaths };

@@ -92,27 +92,11 @@ test('default chain walk never follows a geo-only branch as the main path', () =
 });
 
 function maintenanceModels({ links, groupPaths }) {
-    const group = { _id: 'group-a', paths: groupPaths };
-    const writes = [];
-    return {
-        writes,
-        HyNode: {
-            find: () => ({ select: () => ({ lean: async () => NODES }) }),
-        },
-        CascadeLink: { find: () => ({ lean: async () => links }) },
-        CascadeRouteGroup: {
-            findById: () => ({ lean: async () => group }),
-            findByIdAndUpdate: async (id, update) => { writes.push({ id, update }); },
-        },
-        RelayL2tpState: {
-            find: () => ({
-                lean: async () => [{ node: 'relay-1', desiredState: 'installed', routeGroup: 'group-a' }],
-            }),
-        },
-        CascadeTopologyState: {
-            findByIdAndUpdate: async () => ({}),
-        },
-    };
+    return maintenanceHarness({
+        links, nodes: NODES,
+        states: [{ node: 'relay-1', desiredState: 'installed', routeGroup: 'group-a' }],
+        groups: { 'group-a': { _id: 'group-a', paths: groupPaths } },
+    });
 }
 
 test('maintenance rebuilds the auto-l2tp path after link topology changed', async () => {
@@ -174,29 +158,48 @@ function maintenanceHarness({ links, nodes = NODES_MULTI, states, groups }) {
     const groupStore = new Map(Object.entries(groups));
     const writes = [];
     const topologyUpdates = [];
+    const topology = { _id: 'singleton', revision: 112 };
+    const session = {};
+    let staged = new Map();
+    const query = value => ({
+        session(received) { assert.equal(received, session); return this; },
+        select() { return this; },
+        async lean() { return value; },
+    });
     const models = {
         writes,
         topologyUpdates,
-        HyNode: {
-            find: () => ({ select: () => ({ lean: async () => nodes }) }),
+        transactionRunner: async work => {
+            staged = new Map();
+            const result = await work(session);
+            for (const [id, paths] of staged) groupStore.get(id).paths = paths;
+            return result;
         },
-        CascadeLink: { find: () => ({ lean: async () => links }) },
+        HyNode: { find: () => query(nodes) },
+        CascadeLink: { find: () => query(links) },
         CascadeRouteGroup: {
-            findById: id => ({ lean: async () => groupStore.get(id) ?? null }),
-            findByIdAndUpdate: async (id, update) => {
-                writes.push({ id, update });
-                const group = groupStore.get(id);
-                if (group) group.paths = update.$set.paths;
-                return group;
+            findById: id => query(groupStore.has(id)
+                ? { ...groupStore.get(id), paths: staged.get(id) ?? groupStore.get(id).paths }
+                : null),
+            updateOne: async (filter, update, options) => {
+                assert.equal(options.session, session);
+                assert.equal(options.runValidators, true);
+                writes.push({ id: filter._id, update });
+                if (!groupStore.has(filter._id)) return { matchedCount: 0 };
+                staged.set(filter._id, update.$set.paths);
+                return { matchedCount: 1 };
             },
         },
-        RelayL2tpState: {
-            find: () => ({ lean: async () => states }),
-        },
+        RelayL2tpState: { find: () => query(states) },
         CascadeTopologyState: {
-            findByIdAndUpdate: async (id, update, options) => {
-                topologyUpdates.push({ id, update, options });
-                return { _id: id, revision: 113, deployedRevision: 111 };
+            findById: () => query({ ...topology }),
+            findOneAndUpdate: (filter, update, options) => {
+                assert.equal(options.session, session);
+                topologyUpdates.push({ filter, update, options });
+                assert.deepEqual(filter.replacementReservation, { $exists: false });
+                assert.equal(filter.revision, topology.revision);
+                topology.revision += update.$inc.revision;
+                return query({ ...topology });
             },
         },
     };
