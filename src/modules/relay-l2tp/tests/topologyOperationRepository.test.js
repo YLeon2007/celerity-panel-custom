@@ -169,6 +169,127 @@ function createModel() {
     };
 }
 
+test('createFrozen inserts one scoped operation with its frozen candidate on the supplied session', async () => {
+    const model = createModel();
+    const session = { inTransaction: () => true };
+    const createdDocument = { _id: 'operation-1', persisted: true };
+    model.create = async (...args) => {
+        model.calls.push(args);
+        return [createdDocument];
+    };
+    const repository = new TopologyOperationRepository({ model });
+    const plan = nodePlan('node-a', 'portal', 'portal');
+
+    const result = await repository.createFrozen({
+        operationId: 'operation-1',
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+        nodes: [{ ...plan, rawShell: 'must-not-persist' }],
+        kind: 'link.apply',
+        staged: true,
+        linkId: 'link-a',
+        linkIds: ['link-a'],
+        session,
+    });
+
+    assert.strictEqual(result, createdDocument);
+    assert.equal(model.calls.length, 1);
+    assert.deepEqual(model.calls[0], [[{
+        _id: 'operation-1',
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+        kind: 'link.apply',
+        linkId: 'link-a',
+        linkIds: ['link-a'],
+        staged: true,
+        status: 'queued',
+        attempts: 0,
+        leaseOwner: '',
+        leaseUntil: null,
+        nodes: [{
+            node: 'node-a',
+            nodeRef: 'portal',
+            role: 'portal',
+            targetProfile: 'xray-main',
+            checks: plan.checks,
+            state: 'pending',
+            candidateHash: plan.candidateHash,
+            candidate: plan.candidate,
+            backupId: '',
+        }],
+    }], { session }]);
+});
+
+test('createFrozen rejects null, malformed, or inactive sessions before writing', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    for (const session of [null, false, '', {}, [], { inTransaction: true },
+        { inTransaction: () => false }]) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], session,
+        }), TypeError);
+    }
+    assert.deepEqual(model.calls, []);
+});
+
+test('createFrozen rejects invalid scoped identity and candidate before a session write', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    const session = { inTransaction: () => true };
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5, nodes: [],
+        kind: 'link.apply', linkId: 'link-a', linkIds: ['link-b'], staged: true,
+        session,
+    }), TypeError);
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5,
+        nodes: [{ ...nodePlan('node-a', 'portal', 'portal'), candidateHash: '0'.repeat(64) }],
+        session,
+    }), TypeError);
+    assert.deepEqual(model.calls, []);
+});
+
+test('createFrozen propagates session insert rejection without an unscoped fallback', async () => {
+    const model = createModel();
+    const session = { inTransaction: () => true };
+    const failure = new Error('session insert rejected');
+    model.create = async (...args) => {
+        model.calls.push(args);
+        throw failure;
+    };
+    const repository = new TopologyOperationRepository({ model });
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5, nodes: [], session,
+    }), error => error === failure);
+    assert.equal(model.calls.length, 1);
+    assert.deepEqual(model.calls[0], [[{
+        _id: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
+        status: 'queued', attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
+    }], { session }]);
+});
+
+test('createFrozen fails closed on malformed session create results without retrying', async () => {
+    for (const result of [undefined, null, [], [{}, {}], {}, [null], [false], [{}], [{ _id: 'different' }]]) {
+        const model = createModel();
+        const session = { inTransaction: () => true };
+        model.create = async (...args) => {
+            model.calls.push(args);
+            return result;
+        };
+        const repository = new TopologyOperationRepository({ model });
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], session,
+        }), TypeError);
+        assert.equal(model.calls.length, 1);
+        assert.strictEqual(model.calls[0][1].session, session);
+    }
+});
+
 test('createFrozen durably preserves composer deployment order without sorting by node id', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });

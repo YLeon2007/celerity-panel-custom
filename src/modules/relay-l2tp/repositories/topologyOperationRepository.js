@@ -138,6 +138,7 @@ class TopologyOperationRepository {
         linkId,
         linkIds,
         staged,
+        session,
     }) {
         const scoped = kind !== undefined || linkId !== undefined
             || linkIds !== undefined || staged !== undefined;
@@ -151,7 +152,7 @@ class TopologyOperationRepository {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
-        return this.model.create({
+        const document = {
             _id: id,
             topologyRevision,
             priorDeployedRevision,
@@ -162,7 +163,20 @@ class TopologyOperationRepository {
             leaseOwner: '',
             leaseUntil: null,
             nodes: metadata,
-        });
+        };
+        if (session === undefined) return this.model.create(document);
+        if (!session || typeof session !== 'object'
+            || typeof session.inTransaction !== 'function' || session.inTransaction() !== true) {
+            throw new TypeError('Topology operation requires an active Mongo session');
+        }
+        const created = await this.model.create([document], { session });
+        if (!Array.isArray(created) || created.length !== 1
+            || !created[0] || typeof created[0] !== 'object'
+            || created[0]._id === undefined || created[0]._id === null
+            || String(created[0]._id) !== String(id)) {
+            throw new TypeError('Topology operation session create returned an invalid result');
+        }
+        return created[0];
     }
 
     async findPublicById(operationId) {
