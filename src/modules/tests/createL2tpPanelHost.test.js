@@ -531,7 +531,7 @@ test('assembled flag-positive host cannot claim or SSH through topology recovery
         CascadeRouteGroup: model(['find', 'create', 'updateOne', 'deleteOne']),
         CascadeTopologyState: model(['findById', 'findOneAndUpdate', 'updateOne']),
         L2tpOperation: model(['findOne']),
-        TopologyOperation: model(['create', 'findOneAndUpdate', 'updateOne']),
+        TopologyOperation: model(['create', 'findById', 'findOneAndUpdate', 'updateOne']),
         NodeOperationLock: model(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne']),
         L2tpUser: model(['find']),
     };

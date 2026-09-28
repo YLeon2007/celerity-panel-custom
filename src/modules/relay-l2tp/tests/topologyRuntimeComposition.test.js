@@ -80,7 +80,7 @@ function compositionDependencies(calls = []) {
         L2tpUser: modelWith(['find'], calls),
         L2tpOperation: modelWith(['findOne'], calls),
         NodeSSH: class FakeNodeSSH {},
-        TopologyOperation: modelWith(['create', 'findOneAndUpdate', 'updateOne'], calls),
+        TopologyOperation: modelWith(['create', 'findById', 'findOneAndUpdate', 'updateOne'], calls),
         NodeOperationLock: modelWith(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'], calls),
         transactionRunner: async work => work({ id: 'test-session' }),
         clock: {

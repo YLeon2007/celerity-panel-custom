@@ -474,7 +474,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
         L2tpUser: { find() {} },
         L2tpOperation: { findOne() {} },
         NodeSSH: class FakeNodeSSH {},
-        TopologyOperation: { updateOne() {} },
+        TopologyOperation: { updateOne() {}, findById() {} },
         NodeOperationLock: {},
     };
 

@@ -37,6 +37,9 @@ function matches(document, filter) {
 
 function applySet(document, update) {
     Object.assign(document, clone(update.$set || {}));
+    for (const [field, increment] of Object.entries(update.$inc || {})) {
+        document[field] += increment;
+    }
 }
 
 function createHarness(overrides = {}) {
@@ -61,6 +64,14 @@ function createHarness(overrides = {}) {
     };
     const calls = [];
     const TopologyOperation = {
+        findById(id) {
+            return {
+                select() { return this; },
+                session(value) { assert.strictEqual(value, SESSION); return this; },
+                async lean() { return id === store.operation._id
+                    ? { heldTopologyAdmission: store.operation.heldTopologyAdmission } : null; },
+            };
+        },
         updateOne(filter, update, options) {
             calls.push({ model: 'TopologyOperation', filter, update, options });
             if (!matches(store.operation, filter)) return Promise.resolve({ matchedCount: 0 });
@@ -203,6 +214,29 @@ test('atomically marks the leased committing operation succeeded and advances de
     assert.doesNotMatch(JSON.stringify(harness.calls), /candidate|bytes|secret/i);
 });
 
+test('successful admitted operation releases its slot in the same transaction so a second link can queue', async () => {
+    const harness = createHarness({
+        operation: { heldTopologyAdmission: true },
+        topology: { topologyAdmissionCount: 1 },
+    });
+    const finalized = await harness.repository.finalizeSucceeded(request());
+    assert.equal(finalized?.operationId, 'operation-7');
+    assert.equal(harness.store.operation.status, 'succeeded');
+    assert.equal(harness.store.operation.heldTopologyAdmission, false);
+    assert.equal(harness.store.topology.topologyAdmissionCount, 0);
+    const singletonWrite = harness.calls.find(call => call.model === 'CascadeTopologyState');
+    assert.equal(singletonWrite.filter.topologyAdmissionCount, 1);
+    assert.deepEqual(singletonWrite.update.$inc, { topologyAdmissionCount: -1 });
+});
+
+test('an unavailable admission slot aborts both success and release', async () => {
+    const harness = createHarness({
+        operation: { heldTopologyAdmission: true },
+        topology: { topologyAdmissionCount: 0 },
+    });
+    await assertRejectedWithoutChanges(harness);
+});
+
 async function assertRejectedWithoutChanges(harness, candidateRequest = request()) {
     const before = clone(harness.store);
 
@@ -287,8 +321,11 @@ test('rolls back both document updates when the transaction fails', async () => 
 // silently reported as deployed by an operation that never touched it.
 // ---------------------------------------------------------------------------
 
-function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], linkId = linkIds[0], staged = kind === 'link.apply' ? true : undefined, missingStaged = false, topology = {}, includeLinks = true } = {}) {
-    const harness = createHarness({ topology });
+function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b'], linkId = linkIds[0], staged = kind === 'link.apply' ? true : undefined, missingStaged = false, topology = {}, includeLinks = true, heldAdmission = false } = {}) {
+    const harness = createHarness({
+        topology: { ...topology, ...(heldAdmission ? { topologyAdmissionCount: 1 } : {}) },
+        ...(heldAdmission ? { operation: { heldTopologyAdmission: true } } : {}),
+    });
     const linkCalls = [];
     const TopologyOperation = {
         ...harness.repository.TopologyOperation,
@@ -298,8 +335,10 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
                 session() { return this; },
                 async lean() {
                     return id === 'operation-7'
-                        ? kind === 'domain.sync' ? { kind }
-                            : { kind, linkId, linkIds, ...(missingStaged ? {} : { staged }) }
+                        ? kind === 'domain.sync' ? { kind,
+                            ...(heldAdmission ? { heldTopologyAdmission: harness.store.operation.heldTopologyAdmission } : {}) }
+                            : { kind, linkId, linkIds, ...(missingStaged ? {} : { staged }),
+                                ...(heldAdmission ? { heldTopologyAdmission: harness.store.operation.heldTopologyAdmission } : {}) }
                         : null;
                 },
             };
@@ -320,6 +359,21 @@ function scopedHarness({ kind = 'domain.reconcile', linkIds = ['link-a', 'link-b
     });
     return { harness, repository, linkCalls };
 }
+
+test('each successful scoped auto-deploy releases its own admission without advancing unrelated draft baseline', async t => {
+    for (const kind of ['link.apply', 'domain.reconcile']) {
+        await t.test(kind, async () => {
+            const { harness, repository } = scopedHarness({ kind, heldAdmission: true });
+            const result = await repository.finalizeSucceeded(request());
+            assert.equal(result?.scopeKind, kind);
+            assert.equal(harness.store.topology.deployedRevision, 5);
+            assert.equal(harness.store.topology.topologyAdmissionCount, 0);
+            assert.equal(harness.store.operation.heldTopologyAdmission, false);
+            assert.equal(await repository.finalizeSucceeded(request()), null,
+                'a replay cannot release a second slot');
+        });
+    }
+});
 
 test('scoped domain.reconcile commit marks only its own links and keeps the global revision', async () => {
     const { harness, repository, linkCalls } = scopedHarness();

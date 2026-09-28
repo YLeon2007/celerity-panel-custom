@@ -74,7 +74,8 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
 
 class TopologyOperationFinalizationRepository {
     constructor({ TopologyOperation, CascadeTopologyState, CascadeLink, transactionRunner } = {}) {
-        if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function') {
+        if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function'
+            || typeof TopologyOperation.findById !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
         }
         if (!CascadeTopologyState || typeof CascadeTopologyState.updateOne !== 'function') {
@@ -103,6 +104,12 @@ class TopologyOperationFinalizationRepository {
         } = request;
         try {
             return await this.transactionRunner(async session => {
+                const admission = await this.TopologyOperation.findById(operationId)
+                    .select('heldTopologyAdmission')
+                    .session(session)
+                    .lean();
+                if (!admission) rejectFinalization();
+                const releasesAdmission = admission.heldTopologyAdmission === true;
                 const operation = await this.TopologyOperation.updateOne({
                     _id: operationId,
                     topologyRevision,
@@ -115,6 +122,7 @@ class TopologyOperationFinalizationRepository {
                         status: 'succeeded',
                         finishedAt: now,
                         leaseUntil: null,
+                        ...(releasesAdmission ? { heldTopologyAdmission: false } : {}),
                     },
                 }, { runValidators: true, session });
                 if (operation?.matchedCount !== 1) rejectFinalization();
@@ -131,10 +139,12 @@ class TopologyOperationFinalizationRepository {
                     _id: 'singleton',
                     revision: topologyRevision,
                     deployedRevision: priorDeployedRevision,
+                    ...(releasesAdmission ? { topologyAdmissionCount: 1 } : {}),
                 }, {
                     // A scoped commit only checks the fence; it cannot claim
                     // the rest of the draft revision has been deployed.
                     $set: { deployedRevision: scope ? priorDeployedRevision : topologyRevision },
+                    ...(releasesAdmission ? { $inc: { topologyAdmissionCount: -1 } } : {}),
                 }, {
                     runValidators: true,
                     session,
