@@ -945,6 +945,26 @@ class L2tpOperationWorker {
                 },
             });
 
+            // A verified terminal operation must release its counted Mongo
+            // admission before a later replacement can enter the same contour.
+            if (typeof this.remoteAdmissionRepository.completeVerifiedOperation === 'function') {
+                await heartbeat.stop();
+                try {
+                    const completed = await this.remoteAdmissionRepository.completeVerifiedOperation({
+                        admissionId: operation.admissionId,
+                        operationId,
+                        nodeId: String(operation.node),
+                        owner: this.workerId,
+                        ownerGeneration: claim.ownerGeneration,
+                        kind: operation.kind,
+                    });
+                    if (completed !== true) throw new Error('Admission completion not confirmed');
+                } catch {
+                    return { claimed: true, operationId, status: 'succeeded', stopped: true,
+                        errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED' };
+                }
+            }
+
             // Topology auto-deploy reuses this relay. Hand off its exact
             // generation only after verified L2TP success is durable.
             if (typeof this.lockService.releaseVerified === 'function') {

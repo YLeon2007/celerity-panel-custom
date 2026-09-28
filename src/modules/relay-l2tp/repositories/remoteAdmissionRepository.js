@@ -402,6 +402,35 @@ class RemoteAdmissionRepository {
         return id;
     }
 
+    async completeVerifiedOperation({ admissionId, operationId, nodeId, owner,
+        ownerGeneration, kind } = {}) {
+        if (!admissionId || !operationId || !nodeId || !owner
+            || !Number.isSafeInteger(ownerGeneration) || ownerGeneration < 1
+            || !['install', 'sync_users'].includes(kind)
+            || this.L2tpOperation?.db !== this.CascadeTopologyState.db
+            || this.RemoteAdmission.db !== this.CascadeTopologyState.db
+            || typeof this.L2tpOperation?.findOne !== 'function') {
+            throw admissionError('REMOTE_ADMISSION_INVALID_COMPLETION');
+        }
+        return this.transactionRunner(async session => {
+            const succeeded = await this.L2tpOperation.findOne({
+                _id: operationId, node: nodeId, kind, status: 'succeeded',
+                admissionId, leaseOwner: owner, ownerGeneration,
+            }).session(session).lean();
+            if (!succeeded) throw admissionError('REMOTE_ADMISSION_NOT_VERIFIED');
+            const changed = await this.RemoteAdmission.updateOne({
+                _id: admissionId, nodeId, kind, phase: 'running', operationId,
+                leaseOwner: owner, ownerGeneration,
+            }, { $set: { phase: 'completed' } }, { session });
+            if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
+            const gate = await this.CascadeTopologyState.updateOne({
+                _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+            }, { $inc: { remoteAdmissionCount: -1 } }, { session });
+            if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_GATE_MISSING');
+            return true;
+        });
+    }
+
     async markRecoveryRequired(id) {
         await this.transactionRunner(async session => {
             const changed = await this.RemoteAdmission.updateOne(

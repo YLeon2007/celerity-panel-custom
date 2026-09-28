@@ -255,6 +255,7 @@ function createWorker(operationRepository, overrides = {}) {
     const worker = new L2tpOperationWorker({
         operationRepository,
         remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
+            completeVerifiedOperation: overrides.completeVerifiedOperation,
             async claimQueuedInstall(request) {
                 const operation = operationRepository.operations?.find(candidate =>
                     candidate.status === 'queued' && candidate.kind === 'install');
@@ -555,6 +556,14 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const worker = createWorker(operationRepository, {
         executor,
         operationMaterializer: materializeInstallOperation,
+        completeVerifiedOperation: async request => {
+            assert.equal(request.admissionId, `admission-${operation.id}`);
+            assert.equal(request.operationId, operation.id);
+            assert.equal(request.kind, 'install');
+            assert.equal(request.ownerGeneration, 1);
+            handoffOrder.push('admission');
+            return true;
+        },
         afterInstallSucceeded: async request => {
             handoffOrder.push('topology');
             hookCalls.push(request);
@@ -586,7 +595,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const result = await worker.runOnce();
 
     assert.equal(result.status, 'succeeded');
-    assert.deepEqual(handoffOrder, ['release', 'topology']);
+    assert.deepEqual(handoffOrder, ['admission', 'release', 'topology']);
     assert.deepEqual(hookCalls, [{
         operationId: 'operation-autodeploy',
         node: operation.node,
