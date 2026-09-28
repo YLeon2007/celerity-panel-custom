@@ -207,6 +207,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
         NodeOperationLock: {},
     };
     const topologyDependencies = [];
+    let l2tpWorkerAllowed;
     let topologyWorker;
     let recoveryStarts = 0;
     const moduleEntry = {
@@ -219,7 +220,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
     };
 
     const host = createL2tpPanelHost({
-        env: TOPOLOGY_ENABLED_ENV,
+        env: { ...TOPOLOGY_ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' },
         moduleEntry,
         topologyRuntime: {},
         Repository: class FakeRepository {},
@@ -229,11 +230,14 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
             operationRepository: {},
         }),
         createPanelOverviewLoader: () => async () => ({}),
-        createExecutionRuntime: () => ({
-            runtime: { stateManagementService: {} },
-            start: () => ({}),
-            async stop() {},
-        }),
+        createExecutionRuntime: dependencies => {
+            l2tpWorkerAllowed = dependencies.runtimeDependencies.enableUnsafeExecutionForTests;
+            return {
+                runtime: { stateManagementService: {} },
+                start: () => ({}),
+                async stop() {},
+            };
+        },
         createTopologyRecoveryLifecycle(dependencies) {
             assert.strictEqual(dependencies.worker, topologyWorker);
             return {
@@ -249,6 +253,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
 
     assert.equal(topologyDependencies.length, 1);
     assert.strictEqual(topologyDependencies[0].NodeOperationLock, models.NodeOperationLock);
+    assert.equal(l2tpWorkerAllowed, true);
     assert.equal(recoveryStarts, 1);
 });
 

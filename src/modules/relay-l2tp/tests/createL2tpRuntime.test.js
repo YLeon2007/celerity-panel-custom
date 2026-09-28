@@ -75,6 +75,13 @@ function createDependencies() {
     };
 }
 
+test('explicit worker option reaches the L2TP worker, with default off', () => {
+    const dormant = createL2tpRuntime(createDependencies());
+    assert.equal(dormant.worker.enableUnsafeExecutionForTests, false);
+    const enabled = createL2tpRuntime({ ...createDependencies(), enableUnsafeExecutionForTests: true });
+    assert.equal(enabled.worker.enableUnsafeExecutionForTests, true);
+});
+
 test('composes the L2TP service, worker, router, and fragment registry', async () => {
     const dependencies = createDependencies();
 

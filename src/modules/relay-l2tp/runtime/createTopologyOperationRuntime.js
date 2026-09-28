@@ -75,6 +75,11 @@ function isTopologyTestExecutionEnabled(env) {
         && REQUIRED_TEST_RUNTIME_FLAGS.every(flagName => env[flagName] === 'true');
 }
 
+function isTestWorkerExecutionAllowed(env) {
+    return isTopologyTestExecutionEnabled(env)
+        && env.PANEL_DOMAIN === TEST_TOPOLOGY_HOST_IDENTITY;
+}
+
 function isTypedExecutor(executor) {
     return Boolean(executor)
         && typeof executor === 'object'
@@ -220,6 +225,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             clock,
             ...optional(userResync, 'userResync'),
             pppReadinessGate,
+            allowUnprovenTestExecution: isTestWorkerExecutionAllowed(env),
         });
         return new Coordinator({
             topologyRepository,
@@ -243,5 +249,6 @@ module.exports = {
     createTopologyOperationExecutor,
     createTopologyOperationRuntime,
     isTopologyTestExecutionEnabled,
+    isTestWorkerExecutionAllowed,
     isTypedExecutor,
 };

@@ -111,6 +111,10 @@ function createL2tpPanelHost({
         await service.deploy({ expectedTopologyRevision: revision });
     };
 
+    const { isTopologyTestExecutionEnabled, isTestWorkerExecutionAllowed } = require(
+        './relay-l2tp/runtime/createTopologyOperationRuntime'
+    );
+    const testWorkerExecutionAllowed = isTestWorkerExecutionAllowed(env);
     const executionRuntime = createExecutionRuntime({
         workerLifecycle,
         HyNode: injectedHyNode,
@@ -154,12 +158,10 @@ function createL2tpPanelHost({
             workerId,
             leaseMs,
             afterInstallSucceeded: deployTopologyAfterInstall,
+            enableUnsafeExecutionForTests: testWorkerExecutionAllowed,
         },
     });
 
-    const { isTopologyTestExecutionEnabled } = require(
-        './relay-l2tp/runtime/createTopologyOperationRuntime'
-    );
     if (isTopologyTestExecutionEnabled(env)) {
         if (typeof injectedModuleEntry.createTopologyDeploymentService !== 'function') {
             throw new TypeError(

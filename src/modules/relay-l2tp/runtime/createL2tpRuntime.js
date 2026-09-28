@@ -95,6 +95,7 @@ function createL2tpRuntime(dependencies) {
         candidateService,
         operationMaterializer = materializeInstallOperation,
         afterInstallSucceeded,
+        enableUnsafeExecutionForTests = false,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -134,6 +135,7 @@ function createL2tpRuntime(dependencies) {
         workerId,
         leaseMs,
         clock,
+        enableUnsafeExecutionForTests,
     });
     hideInjectedDependencies(stateManagementService, [
         'repository',

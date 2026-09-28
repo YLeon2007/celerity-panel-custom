@@ -221,6 +221,25 @@ test('enabled composition builds the real typed executor with the injected NodeS
     assert.deepEqual(calls, []);
 });
 
+test('only the TEST host enables topology execution', () => {
+    const captured = [];
+    class CaptureWorker extends TopologyOperationWorker {
+        constructor(options) {
+            super(options);
+            captured.push(options.allowUnprovenTestExecution);
+        }
+    }
+    for (const domain of ['other.invalid', TEST_TOPOLOGY_HOST_IDENTITY]) {
+        const service = createTopologyOperationRuntime({
+            ...compositionDependencies(),
+            env: { ...ENABLED_ENV, PANEL_DOMAIN: domain },
+            OperationWorker: CaptureWorker,
+        });
+        assert.ok(service instanceof TopologyOperationCoordinator);
+    }
+    assert.deepEqual(captured, [false, true]);
+});
+
 test('flag-positive composed default worker stays unclaimed without quiescence proof', async () => {
     const calls = [];
     const service = createTopologyOperationRuntime({
