@@ -110,6 +110,10 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "Bad request: "+err.Error())
 		return
 	}
+	if !a.userStore.acceptingMutations() {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -149,13 +153,12 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	a.userStore.Sync(req.Users)
+	if !a.userStore.Sync(req.Users) {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 	a.persister.MarkDirty()
-	go func() {
-		if err := a.userStore.Save(); err != nil {
-			log.Printf("[store] Save: %v", err)
-		}
-	}()
+	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
 
 	log.Printf("[sync] Done: +%d -%d errors=%d total=%d", added, removed, errors, len(req.Users))
 	jsonOK(w, map[string]any{
@@ -177,6 +180,10 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "id and email are required")
 		return
 	}
+	if !a.userStore.acceptingMutations() {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -187,15 +194,22 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.userStore.Add(&u)
+	if !a.userStore.Add(&u) {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 	a.persister.MarkDirty()
-	go func() { _ = a.userStore.Save() }()
+	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
 
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
 // DELETE /users/{email} — remove a single user
 func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
+	if !a.userStore.acceptingMutations() {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 	email := r.PathValue("email")
 	if email == "" {
 		jsonErr(w, http.StatusBadRequest, "email is required")
@@ -210,9 +224,12 @@ func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[api] RemoveUser %s: %v", email, err)
 	}
 
-	a.userStore.Remove(email)
+	if !a.userStore.Remove(email) {
+		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
+		return
+	}
 	a.persister.MarkDirty()
-	go func() { _ = a.userStore.Save() }()
+	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
 
 	jsonOK(w, map[string]string{"status": "ok"})
 }

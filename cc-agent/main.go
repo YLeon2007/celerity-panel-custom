@@ -104,14 +104,13 @@ func main() {
 		}
 	}()
 
-	// Periodic user store flush to disk every 5 minutes
+	// Periodic user store flush; cancel and join this loop before store Stop.
+	storeTicker := time.NewTicker(5 * time.Minute)
+	stopStoreSaves := make(chan struct{})
+	storeSaverDone := make(chan struct{})
 	go func() {
-		for {
-			time.Sleep(5 * time.Minute)
-			if err := userStore.Save(); err != nil {
-				log.Printf("[store] Save error: %v", err)
-			}
-		}
+		defer close(storeSaverDone)
+		runPeriodicUserSaves(stopStoreSaves, storeTicker.C, userStore)
 	}()
 
 	// Optional access-log shipping module. It remains inert unless explicitly enabled.
@@ -178,13 +177,36 @@ func main() {
 	if shipper != nil {
 		shipper.Stop()
 	}
+	storeTicker.Stop()
+	close(stopStoreSaves)
+	<-storeSaverDone
 
-	// Stop drains in-flight and pending config writes before returning. This
-	// does not drain independent UserStore.Save goroutines or startup work.
+	// Close user mutation admission before the config persister's final
+	// snapshot, so both files reflect the same accepted user state.
+	if err := userStore.Stop(); err != nil {
+		log.Printf("[store] Final save: %v", err)
+	}
 	if err := persister.Stop(); err != nil {
 		log.Printf("[config] Final flush: %v", err)
 	}
-
-	_ = userStore.Save()
 	log.Printf("[main] Shutdown complete")
+}
+
+func runPeriodicUserSaves(stop <-chan struct{}, ticks <-chan time.Time, store *UserStore) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticks:
+			// If cancellation raced with a tick, do not start another write.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := store.Save(); err != nil {
+				log.Printf("[store] Save error: %v", err)
+			}
+		}
+	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -23,22 +24,41 @@ type persistedData struct {
 
 // UserStore holds users in memory and persists them to disk
 type UserStore struct {
-	mu       sync.RWMutex
-	users    map[string]*User // keyed by email
-	filePath string
-	lastSync time.Time
+	mu        sync.RWMutex
+	users     map[string]*User // keyed by email
+	filePath  string
+	lastSync  time.Time
+	stopped   bool
+	stopDone  chan struct{}
+	stopErr   error
+	pending   sync.WaitGroup             // admitted Save calls, including unscheduled async calls
+	writeMu   sync.Mutex                 // serialize snapshots and disk writes together
+	writeFile func(string, []byte) error // test seam at the actual disk write
+}
+
+var errUserStoreStopped = errors.New("user store stopped")
+
+func (s *UserStore) acceptingMutations() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.stopped
 }
 
 func NewUserStore(cfg *Config) *UserStore {
 	return &UserStore{
-		users:    make(map[string]*User),
-		filePath: filepath.Join(cfg.DataDir, "users.json"),
+		users:     make(map[string]*User),
+		filePath:  filepath.Join(cfg.DataDir, "users.json"),
+		stopDone:  make(chan struct{}),
+		writeFile: func(path string, data []byte) error { return os.WriteFile(path, data, 0600) },
 	}
 }
 
 func (s *UserStore) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopped {
+		return errUserStoreStopped
+	}
 
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
@@ -62,6 +82,59 @@ func (s *UserStore) Load() error {
 }
 
 func (s *UserStore) Save() error {
+	if !s.admitSave() {
+		return errUserStoreStopped
+	}
+	defer s.pending.Done()
+	return s.saveSnapshot()
+}
+
+// SaveAsync registers the write before returning to its caller, so Stop can
+// drain it even if the goroutine has not been scheduled yet.
+func (s *UserStore) SaveAsync() bool {
+	if !s.admitSave() {
+		return false
+	}
+	go func() {
+		defer s.pending.Done()
+		if err := s.saveSnapshot(); err != nil {
+			log.Printf("[store] Save: %v", err)
+		}
+	}()
+	return true
+}
+
+func (s *UserStore) admitSave() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
+	s.pending.Add(1)
+	return true
+}
+
+// Stop closes write and mutation admission, joins all admitted writes, then
+// persists the final state exactly once. It does not fence external writers.
+func (s *UserStore) Stop() error {
+	s.mu.Lock()
+	if s.stopped {
+		done := s.stopDone
+		s.mu.Unlock()
+		<-done
+		return s.stopErr
+	}
+	s.stopped = true
+	s.mu.Unlock()
+	s.pending.Wait()
+	s.stopErr = s.saveSnapshot()
+	close(s.stopDone)
+	return s.stopErr
+}
+
+func (s *UserStore) saveSnapshot() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.RLock()
 	users := make([]*User, 0, len(s.users))
 	for _, u := range s.users {
@@ -84,19 +157,27 @@ func (s *UserStore) Save() error {
 		return err
 	}
 
-	return os.WriteFile(s.filePath, data, 0600)
+	return s.writeFile(s.filePath, data)
 }
 
-func (s *UserStore) Add(u *User) {
+func (s *UserStore) Add(u *User) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
 	s.users[u.Email] = u
+	return true
 }
 
-func (s *UserStore) Remove(email string) {
+func (s *UserStore) Remove(email string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
 	delete(s.users, email)
+	return true
 }
 
 func (s *UserStore) List() []*User {
@@ -116,20 +197,28 @@ func (s *UserStore) Count() int {
 }
 
 // Sync replaces all users and updates lastSync
-func (s *UserStore) Sync(users []*User) {
+func (s *UserStore) Sync(users []*User) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
 	s.users = make(map[string]*User, len(users))
 	for _, u := range users {
 		s.users[u.Email] = u
 	}
 	s.lastSync = time.Now()
-	s.mu.Unlock()
+	return true
 }
 
-func (s *UserStore) SetLastSync(t time.Time) {
+func (s *UserStore) SetLastSync(t time.Time) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return false
+	}
 	s.lastSync = t
-	s.mu.Unlock()
+	return true
 }
 
 func (s *UserStore) GetLastSync() time.Time {
