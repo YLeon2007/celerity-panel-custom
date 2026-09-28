@@ -409,7 +409,7 @@ test('persists the draft and advances the singleton revision once in one transac
     }]);
     assert.deepEqual(trace.filter(entry => entry.label === 'topology.cas'), [{
         label: 'topology.cas',
-        filter: { _id: 'singleton', revision: 7 },
+        filter: { _id: 'singleton', revision: 7, replacementReservation: { $exists: false } },
         update: { $inc: { revision: 1 } },
         options: {
             new: true,
@@ -420,4 +420,120 @@ test('persists the draft and advances the singleton revision once in one transac
     }]);
     assert.equal(trace.filter(entry => entry.label === 'transaction.begin').length, 1);
     assert.equal(trace.filter(entry => entry.label === 'transaction.commit').length, 1);
+});
+
+test('held replacement reservation rejects link and group CRUD before mutation', async () => {
+    for (const kind of [
+        'link.create', 'link.update', 'link.delete',
+        'group.create', 'group.update', 'group.delete',
+    ]) {
+        const trace = [];
+        const session = { id: `${kind}-held` };
+        const models = createModels(trace, session);
+        models.CascadeTopologyState.findById = () => queryResult({
+            revision: 7,
+            deployedRevision: 5,
+            replacementReservation: { ownerToken: 'worker-token', epoch: 4 },
+        }, trace, 'topology');
+        const repository = new TopologyDraftRepository(models);
+        await assert.rejects(repository.commitDraft({
+            expectedRevision: 7,
+            prepare: async () => ({ mutation: { kind, document: { _id: kind } } }),
+        }), error => {
+            assert.equal(error.name, 'TopologyDraftRepositoryError');
+            assert.equal(error.code, 'TOPOLOGY_REPLACEMENT_RESERVED');
+            return true;
+        });
+        assert.equal(trace.some(entry => entry.label === 'transaction.commit'), false);
+        assert.equal(trace.some(entry => [
+            'links.create', 'links.updateOne', 'links.deleteOne',
+            'groups.create', 'groups.updateOne', 'groups.deleteOne', 'topology.cas',
+        ].includes(entry.label)), false);
+    }
+});
+
+test('legacy singleton without reservation retains revision-zero upsert', async () => {
+    const trace = [];
+    const session = { id: 'legacy-zero' };
+    const models = createModels(trace, session);
+    models.CascadeTopologyState.findById = () => queryResult(null, trace, 'topology');
+    models.CascadeTopologyState.findOneAndUpdate = (filter, update, options) => {
+        trace.push({ label: 'topology.cas', filter, update, options });
+        return queryResult({ revision: 1, deployedRevision: 0 }, trace, 'topology.cas');
+    };
+    const repository = new TopologyDraftRepository(models);
+    assert.deepEqual(await repository.commitDraft({
+        expectedRevision: 0,
+        prepare: async () => ({ mutation: { kind: 'group.create', document: { _id: 'group-1' } } }),
+    }), { revision: 1, deployedRevision: 0 });
+    const cas = trace.find(entry => entry.label === 'topology.cas');
+    assert.deepEqual(cas.filter, {
+        _id: 'singleton', revision: 0, replacementReservation: { $exists: false },
+    });
+    assert.deepEqual(cas.update, { $inc: { revision: 1 }, $setOnInsert: { deployedRevision: 0 } });
+    assert.equal(cas.options.upsert, true);
+    assert.strictEqual(cas.options.session, session);
+});
+
+test('stale draft revision still rejects before link or group writes', async () => {
+    const trace = [];
+    const repository = new TopologyDraftRepository(createModels(trace, { id: 'stale' }));
+    await assert.rejects(repository.commitDraft({
+        expectedRevision: 6,
+        prepare: async () => ({ mutation: { kind: 'link.create', document: { _id: 'link-1' } } }),
+    }), error => {
+        assert.equal(error.code, 'STALE_TOPOLOGY_REVISION');
+        assert.equal(error.topologyRevision, 7);
+        return true;
+    });
+    assert.equal(trace.some(entry => ['links.create', 'topology.cas', 'transaction.commit'].includes(entry.label)), false);
+});
+
+test('simulated second-transaction reservation after snapshot rejects link and group writes', async () => {
+    for (const kind of ['link.create', 'group.create']) {
+        const trace = [];
+        const session = { id: `${kind}-race` };
+        const models = createModels(trace, session);
+        const state = { links: [], groups: [], revision: 7, deployedRevision: 5 };
+        models.CascadeTopologyState.findById = () => queryResult({
+            revision: state.revision, deployedRevision: state.deployedRevision,
+        }, trace, 'topology');
+        models.CascadeLink.create = async documents => { state.links.push(...documents); };
+        models.CascadeRouteGroup.create = async documents => { state.groups.push(...documents); };
+        models.CascadeTopologyState.findOneAndUpdate = (filter, update, options) => {
+            trace.push({ label: 'topology.cas', filter, update, options });
+            // Simulate the singleton predicate evaluated after another transaction
+            // commits its reservation, with the original snapshot still at revision 7.
+            if (filter.revision !== state.revision
+                || (filter.replacementReservation?.$exists === false
+                    && state.replacementReservation !== undefined)) {
+                return queryResult(null, trace, 'topology.cas');
+            }
+            state.revision += update.$inc.revision;
+            return queryResult({ revision: state.revision, deployedRevision: state.deployedRevision },
+                trace, 'topology.cas');
+        };
+        models.transactionRunner = async work => {
+            const before = structuredClone(state);
+            try { return await work(session); } catch (error) {
+                state.links = before.links;
+                state.groups = before.groups;
+                throw error;
+            }
+        };
+        const repository = new TopologyDraftRepository(models);
+        await assert.rejects(repository.commitDraft({
+            expectedRevision: 7,
+            async prepare() {
+                // Another transaction owns the singleton without advancing topology revision.
+                state.replacementReservation = { ownerToken: 'new-owner', epoch: 4 };
+                return { mutation: { kind, document: { _id: kind } } };
+            },
+        }), error => error.code === 'STALE_TOPOLOGY_REVISION');
+        assert.deepEqual(state.links, []);
+        assert.deepEqual(state.groups, []);
+        assert.deepEqual(state.replacementReservation, { ownerToken: 'new-owner', epoch: 4 });
+        assert.equal(state.revision, 7);
+        assert.equal(trace.filter(entry => entry.label === 'topology.cas').length, 1);
+    }
 });

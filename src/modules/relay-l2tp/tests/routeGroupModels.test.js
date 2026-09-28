@@ -136,6 +136,25 @@ test('topology state uses a fixed singleton document identity', () => {
     );
 });
 
+test('replacement reservation is dormant by default and requires a durable owner and epoch', () => {
+    const dormant = new CascadeTopologyState();
+    assert.equal(dormant.replacementReservation, undefined);
+    assert.equal(dormant.replacementEpoch, 0);
+    const reserved = new CascadeTopologyState({
+        replacementEpoch: 4,
+        replacementReservation: { ownerToken: 'worker-token', epoch: 4 },
+    });
+    assert.equal(reserved.validateSync(), undefined);
+    assert.equal(reserved.replacementReservation.ownerToken, 'worker-token');
+    assertValidationKind(new CascadeTopologyState({
+        replacementReservation: { epoch: 1 },
+    }), 'replacementReservation.ownerToken', 'required');
+    assertValidationKind(new CascadeTopologyState({
+        replacementReservation: { ownerToken: 'worker-token' },
+    }), 'replacementReservation.epoch', 'required');
+    assertValidationKind(new CascadeTopologyState({ replacementEpoch: -1 }), 'replacementEpoch', 'min');
+});
+
 test('topology state revision rejects negative values', () => {
     assertValidationKind(
         new CascadeTopologyState({ revision: -1 }),

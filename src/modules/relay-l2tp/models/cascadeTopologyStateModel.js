@@ -18,6 +18,20 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
         default: 0,
         min: 0,
     },
+    // Reserved for a future replacement workflow; no acquisition path is enabled yet.
+    // Keep the epoch after release so an old owner token cannot be reused as authority.
+    replacementEpoch: {
+        type: Number,
+        default: 0,
+        min: 0,
+    },
+    replacementReservation: {
+        type: new mongoose.Schema({
+            ownerToken: { type: String, required: true },
+            epoch: { type: Number, required: true, min: 1 },
+        }, { _id: false }),
+        default: undefined,
+    },
 }, { timestamps: true });
 
 module.exports = mongoose.model('CascadeTopologyState', cascadeTopologyStateSchema);

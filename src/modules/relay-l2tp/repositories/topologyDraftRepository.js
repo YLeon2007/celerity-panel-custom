@@ -26,7 +26,7 @@ const NODE_SELECT = '_id cascadeRole';
 const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup';
-const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
+const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation';
 
 class TopologyDraftRepositoryError extends Error {
     constructor(code, message, details = {}) {
@@ -139,6 +139,7 @@ class TopologyDraftRepository {
         return {
             revision: state?.revision ?? 0,
             deployedRevision: state?.deployedRevision ?? 0,
+            ...(state?.replacementReservation ? { replacementReservation: state.replacementReservation } : {}),
             nodes: nodes || [],
             links: links || [],
             groups: groups || [],
@@ -240,6 +241,12 @@ class TopologyDraftRepository {
                 if (snapshot.revision !== expectedRevision) {
                     throw staleRevision(expectedRevision, snapshot.revision);
                 }
+                if (snapshot.replacementReservation) {
+                    throw new TopologyDraftRepositoryError(
+                        'TOPOLOGY_REPLACEMENT_RESERVED',
+                        'A topology replacement owns the draft mutation fence',
+                    );
+                }
                 const prepared = await prepare(snapshot);
                 await this.persistMutation(prepared?.mutation, session);
                 const update = { $inc: { revision: 1 } };
@@ -247,7 +254,11 @@ class TopologyDraftRepository {
                     update.$setOnInsert = { deployedRevision: 0 };
                 }
                 const state = await this.CascadeTopologyState.findOneAndUpdate(
-                    { _id: 'singleton', revision: expectedRevision },
+                    {
+                        _id: 'singleton',
+                        revision: expectedRevision,
+                        replacementReservation: { $exists: false },
+                    },
                     update,
                     {
                         new: true,
