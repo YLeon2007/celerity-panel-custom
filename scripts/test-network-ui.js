@@ -20,8 +20,10 @@ assert.strictEqual(ui.resolveRealityFingerprint(null, 'create'), 'random',
 assert.strictEqual(ui.resolveRealityFingerprint('', 'create'), 'random',
     'an empty saved value in create mode must default to Random');
 
-assert.strictEqual(ui.resolveRealityFingerprint(undefined, 'edit'), 'chrome',
-    'an existing link without a saved fingerprint keeps the legacy chrome default');
+assert.strictEqual(ui.resolveRealityFingerprint(undefined, 'edit'), '',
+    'an existing link without a saved fingerprint must not be given a new value');
+assert.strictEqual(ui.resolveRealityFingerprint('', 'edit'), '',
+    'an empty legacy fingerprint must be preserved');
 assert.strictEqual(ui.resolveRealityFingerprint('firefox', 'edit'), 'firefox',
     'an existing saved fingerprint must be preserved');
 assert.strictEqual(ui.resolveRealityFingerprint('safari', 'create'), 'safari',

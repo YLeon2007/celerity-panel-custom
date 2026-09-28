@@ -8,16 +8,18 @@
 
     // ==================== PURE HELPERS (exported for tests) ====================
 
-    // New links default to the Random REALITY fingerprint. Existing links keep
-    // whatever was saved; a link saved before this default existed keeps the
-    // legacy 'chrome' fallback so re-saving it never silently rewrites it.
+    // Newly created links default to Random. Edits must retain even an empty
+    // legacy value unless the operator explicitly selects a fingerprint.
     const CREATE_DEFAULT_FINGERPRINT = 'random';
-    const LEGACY_DEFAULT_FINGERPRINT = 'chrome';
 
     function resolveRealityFingerprint(saved, mode) {
-        const value = typeof saved === 'string' && saved.trim() ? saved.trim() : null;
-        if (value) return value;
-        return mode === 'edit' ? LEGACY_DEFAULT_FINGERPRINT : CREATE_DEFAULT_FINGERPRINT;
+        const value = typeof saved === 'string' ? saved : '';
+        return mode === 'edit' ? value : (value.trim() || CREATE_DEFAULT_FINGERPRINT);
+    }
+
+    function fingerprintForLinkEdit(saved, selected) {
+        if (!saved && !selected) return undefined;
+        return selected;
     }
 
     // Backend cause codes -> Russian UI text. Codes are enum-like and safe to
@@ -94,11 +96,11 @@
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             CREATE_DEFAULT_FINGERPRINT,
-            LEGACY_DEFAULT_FINGERPRINT,
             OPERATION_POLL_INTERVAL_MS,
             OPERATION_POLL_MAX_ATTEMPTS,
             TOPOLOGY_CAUSE_TEXT_RU,
             describeTopologyError,
+            fingerprintForLinkEdit,
             resolveRealityFingerprint,
             shouldContinueOperationPolling,
             topologyCauseText,
@@ -158,6 +160,7 @@
 
     let cy = null;
     let linkModalMode = 'create';
+    let linkModalSavedFingerprint = null;
     let topologyRevision = null;
     let deployedRevision = null;
     let _allLinks = [];
@@ -955,12 +958,12 @@
     // ==================== ADD LINK MODAL ====================
 
     function ensureFingerprintOption(select, value) {
-        if (!select || !value) return;
+        if (!select) return;
         const exists = Array.prototype.some.call(select.options, o => o.value === value);
         if (!exists) {
             const opt = document.createElement('option');
             opt.value = value;
-            opt.textContent = value;
+            opt.textContent = value || 'Сохранить прежнее значение';
             select.appendChild(opt);
         }
         select.value = value;
@@ -975,13 +978,19 @@
         const linkIdInput = document.getElementById('linkIdInput');
 
         linkModalMode = 'create';
+        linkModalSavedFingerprint = null;
         if (title) title.textContent = i18n.addLink || 'Add Link';
         if (submit) submit.textContent = i18n.createLink || 'Create';
         if (linkIdInput) linkIdInput.value = '';
         // A brand-new link starts from the Random REALITY fingerprint, even if
         // the form still carries an injected option from a previous edit.
         var createFp = document.querySelector('#addLinkForm [name="realityFingerprint"]');
-        if (createFp) createFp.value = resolveRealityFingerprint(null, 'create');
+        if (createFp) {
+            Array.from(createFp.options).forEach(option => {
+                if (option.value === '') option.remove();
+            });
+            createFp.value = resolveRealityFingerprint(null, 'create');
+        }
 
         try {
             const [nodesRes, linksRes] = await Promise.all([
@@ -1042,9 +1051,10 @@
         form.realityShortIds.value = Array.isArray(link.realityShortIds) ? link.realityShortIds.join(', ') : (link.realityShortIds || '');
         // Preserve the saved fingerprint exactly; inject an option if the saved
         // value is outside the builtin list so re-saving never rewrites it.
+        linkModalSavedFingerprint = link.realityFingerprint;
         ensureFingerprintOption(
             form.realityFingerprint,
-            resolveRealityFingerprint(link.realityFingerprint, 'edit'),
+            resolveRealityFingerprint(linkModalSavedFingerprint, 'edit'),
         );
 
         const geoEnabled = document.getElementById('geoRoutingEnabled');
@@ -1158,8 +1168,10 @@
             data.realityPrivateKey = form.realityPrivateKey?.value || '';
             data.realityPublicKey = form.realityPublicKey?.value || '';
             data.realityShortIds = form.realityShortIds?.value || '';
-            data.realityFingerprint = form.realityFingerprint?.value
-                || resolveRealityFingerprint(null, linkId ? 'edit' : 'create');
+            const fingerprint = linkId
+                ? fingerprintForLinkEdit(linkModalSavedFingerprint, form.realityFingerprint?.value)
+                : resolveRealityFingerprint(form.realityFingerprint?.value, 'create');
+            if (fingerprint !== undefined) data.realityFingerprint = fingerprint;
         }
 
         // Geo routing (always sent so unchecking persists)

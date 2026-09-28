@@ -725,6 +725,8 @@ function createCascadeLinksRouter({
                 || currentLink?.tunnelSecurity
                 || 'none';
             if (effectiveSecurity === 'reality') {
+                const unchangedFingerprint = changes.realityFingerprint !== undefined
+                    && changes.realityFingerprint === currentLink?.realityFingerprint;
                 const targetNodeId = changes.bridgeNode || currentLink?.bridgeNode;
                 const targetNode = targetNodeId ? await Node.findById(targetNodeId) : null;
                 Object.assign(changes, resolveRealitySettings({
@@ -747,6 +749,13 @@ function createCascadeLinksRouter({
                         ? changes.realityFingerprint
                         : currentLink?.realityFingerprint,
                 }, targetNode));
+                // Only a new link or a changed fingerprint adopts the Random
+                // default. Preserve a legacy value even if an edit resubmits it.
+                if (req.body?.realityFingerprint === undefined) {
+                    delete changes.realityFingerprint;
+                } else if (unchangedFingerprint) {
+                    changes.realityFingerprint = currentLink.realityFingerprint;
+                }
             }
 
             const revisions = await getWriteService().updateLink({

@@ -350,6 +350,53 @@ test('POST REALITY defaults the link fingerprint to literal random but preserves
         'an explicitly selected fingerprint is never rewritten');
 });
 
+test('PUT of other REALITY settings does not rewrite a saved legacy fingerprint', async () => {
+    const calls = [];
+    const current = {
+        _id: LINK_A, name: 'Legacy', mode: 'reverse',
+        portalNode: PORTAL_A, bridgeNode: BRIDGE_A,
+        tunnelSecurity: 'reality', tunnelTransport: 'tcp',
+        realityDest: 'old.example:443', realitySni: ['old.example'],
+        realityPrivateKey: 'a'.repeat(43), realityPublicKey: 'b'.repeat(43),
+        realityShortIds: ['abcd'], realityFingerprint: 'chrome',
+    };
+    const Link = {
+        find() { return queryResult([current], {}, 'link'); },
+        async findById() { return current; },
+    };
+    const router = createCascadeLinksRouter({
+        maintainAutoL2tpPathsFn: async () => {},
+        Link,
+        Node: { async findById() { return { xray: {} }; } },
+        topologyDraftWriteService: {
+            async updateLink(input) {
+                calls.push(input.changes);
+                return { revision: 2, deployedRevision: 1 };
+            },
+        },
+        invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    });
+    for (const saved of ['chrome', '']) {
+        current.realityFingerprint = saved;
+        const result = await request(router, {
+            method: 'PUT', path: `/${LINK_A}`,
+            body: { expectedTopologyRevision: 1, realityDest: 'new.example:443' },
+        });
+        assert.equal(result.status, 200);
+        assert.ok(!Object.hasOwn(calls.at(-1), 'realityFingerprint'),
+            'an unrelated edit must not migrate the persisted fingerprint');
+        assert.equal(current.realityFingerprint, saved);
+        const explicit = await request(router, {
+            method: 'PUT', path: `/${LINK_A}`,
+            body: { expectedTopologyRevision: 1, realityDest: 'new.example:443', realityFingerprint: saved },
+        });
+        assert.equal(explicit.status, 200);
+        assert.equal(calls.at(-1).realityFingerprint, saved,
+            'an unchanged explicitly supplied legacy fingerprint must survive the PUT');
+    }
+});
+
 test('PUT updates allowlisted settings through the versioned draft boundary without redeployment', async () => {
     const calls = { deployment: 0, subscriptionInvalidation: 0, topologyInvalidation: 0 };
     let links = [{

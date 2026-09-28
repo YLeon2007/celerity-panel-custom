@@ -144,6 +144,16 @@ test('chain Sync targets its selected domain while Full Sync stays a separate ex
     assert.match(extractHandler('_cascadeDeployFull'), /deployTopology\(\)/);
 });
 
+test('editing a link with a legacy empty fingerprint leaves it untouched unless changed', () => {
+    const { resolveRealityFingerprint, fingerprintForLinkEdit } = require('../../../public/js/network');
+    assert.equal(resolveRealityFingerprint('', 'edit'), '');
+    assert.equal(resolveRealityFingerprint(null, 'create'), 'random');
+    assert.equal(fingerprintForLinkEdit('chrome', 'chrome'), 'chrome');
+    assert.equal(fingerprintForLinkEdit('', ''), undefined);
+    assert.equal(fingerprintForLinkEdit('', 'random'), 'random');
+    assert.match(NETWORK_SOURCE, /fingerprintForLinkEdit\(linkModalSavedFingerprint, form\.realityFingerprint\?\.value\)/);
+});
+
 test('nodes view exposes the CSRF token for network module requests', () => {
     assert.match(NODES_VIEW_SOURCE, /window\._networkCsrfToken = <%- JSON\.stringify\(csrfToken \|\| ''\) %>;/);
 });
