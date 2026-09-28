@@ -356,7 +356,7 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
 });
 
 test('binds both allowlisted reads to the identical supplied session and executes sequentially', async () => {
-    const session = { id: 'same-transaction' };
+    const session = { inTransaction: () => true };
     const { events, HyNode, CascadeLink, materializer } = createSessionMaterializer();
     const plan = await materializer.materialize({
         target: TEST_TOPOLOGY_TARGET,
@@ -402,6 +402,39 @@ test('keeps no-session reads concurrent without invoking query.session', async (
     assert.equal(CascadeLink.calls.some(call => call.method === 'session'), false);
 });
 
+for (const [label, session] of [
+    ['null', null],
+    ['missing inTransaction', { id: 'same-transaction' }],
+    ['non-callable inTransaction', { inTransaction: true }],
+    ['inactive transaction', { inTransaction: () => false }],
+    ['truthy non-boolean inTransaction', { inTransaction: () => 1 }],
+    ['string', 'session-secret-canary'],
+    ['throwing inTransaction', { inTransaction: () => { throw new Error('session-secret-canary'); } }],
+]) {
+    test(`rejects ${label} session before constructing metadata queries`, async () => {
+        const { events, HyNode, CascadeLink, materializer } = createSessionMaterializer();
+        await assert.rejects(
+            materializer.materialize({
+                target: TEST_TOPOLOGY_TARGET,
+                hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                pinnedSnapshot: pinnedSnapshot(),
+                session,
+            }),
+            error => {
+                assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
+                assert.equal(error.code, 'TOPOLOGY_METADATA_READ_FAILED');
+                assert.equal(error.message, 'Pinned topology metadata could not be loaded');
+                assert.equal(Object.hasOwn(error, 'cause'), false);
+                assert.doesNotMatch(JSON.stringify(error), /session-secret-canary|same-transaction/);
+                return true;
+            },
+        );
+        assert.deepEqual(HyNode.calls, []);
+        assert.deepEqual(CascadeLink.calls, []);
+        assert.deepEqual(events, []);
+    });
+}
+
 for (const [label, nodeOptions, linkOptions, expectedReads] of [
     ['node read', { failRead: true }, {}, ['node.read-start']],
     ['link read', {}, { failRead: true }, ['node.read-start', 'link.read-start']],
@@ -415,7 +448,7 @@ for (const [label, nodeOptions, linkOptions, expectedReads] of [
                 target: TEST_TOPOLOGY_TARGET,
                 hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
                 pinnedSnapshot: pinnedSnapshot(),
-                session: { id: 'same-transaction' },
+                session: { inTransaction: () => true },
             }),
             error => {
                 assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
@@ -441,7 +474,7 @@ for (const missing of ['node', 'link']) {
                 target: TEST_TOPOLOGY_TARGET,
                 hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
                 pinnedSnapshot: pinnedSnapshot(),
-                session: { id: 'same-transaction' },
+                session: { inTransaction: () => true },
             }),
             error => error.code === 'TOPOLOGY_METADATA_READ_FAILED'
                 && error.message === 'Pinned topology metadata could not be loaded'

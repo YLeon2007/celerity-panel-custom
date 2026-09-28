@@ -289,6 +289,11 @@ class TopologyOperationPlanMaterializer {
         let nodeRows;
         let linkRows;
         try {
+            if (session !== undefined && (
+                typeof session?.inTransaction !== 'function' || session.inTransaction() !== true
+            )) {
+                throw new TypeError('An active transaction is required for session-bound metadata reads');
+            }
             const nodeQuery = this.#HyNode.find({
                 ...NODE_METADATA_FILTER,
                 _id: { $in: nodeIds },
@@ -300,7 +305,7 @@ class TopologyOperationPlanMaterializer {
             if (session !== undefined) {
                 // MongoDB sessions cannot execute concurrent operations. Require
                 // both injected queries to support session binding before reading.
-                if (session === null || typeof nodeQuery.session !== 'function'
+                if (typeof nodeQuery.session !== 'function'
                     || typeof linkQuery.session !== 'function') {
                     throw new TypeError('Session-bound topology metadata reads are unavailable');
                 }
