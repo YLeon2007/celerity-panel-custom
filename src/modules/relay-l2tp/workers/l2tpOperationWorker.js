@@ -126,6 +126,12 @@ function verifiedUsersAttestation(result, plan, resolvedUsers) {
     };
 }
 
+function lostClaim() {
+    const error = new Error('L2TP operation generation or lease was lost');
+    error.code = 'L2TP_OPERATION_LEASE_LOST';
+    return error;
+}
+
 class L2tpOperationWorker {
     constructor({
         operationRepository,
@@ -174,10 +180,16 @@ class L2tpOperationWorker {
             ?? Math.max(1, Math.floor(leaseMs / 3));
     }
 
-    async failClaimedOperation({ operationId, errorCode, errorMessage }) {
+    async writeClaimed(method, claim, fields = {}) {
+        const matched = await this.operationRepository[method]({
+            ...claim, now: this.clock.now(), ...fields,
+        });
+        if (matched !== true) throw lostClaim();
+    }
+
+    async failClaimedOperation({ claim, errorCode, errorMessage }) {
         const finishedAt = this.clock.now();
-        await this.operationRepository.setStatus({
-            operationId,
+        await this.writeClaimed('transitionClaimed', claim, {
             status: 'failed',
             progress: 0,
             errorCode,
@@ -190,7 +202,7 @@ class L2tpOperationWorker {
                 message: errorMessage,
             },
         });
-        return { claimed: true, operationId, status: 'failed' };
+        return { claimed: true, operationId: claim.operationId, status: 'failed' };
     }
 
     async prepareInstallPlan(operation) {
@@ -302,7 +314,7 @@ class L2tpOperationWorker {
         );
     }
 
-    createLeaseHeartbeat({ operationId, node }) {
+    createLeaseHeartbeat({ claim, node, lockGeneration }) {
         let intervalId;
         let inFlight = null;
         let renewalError = null;
@@ -314,22 +326,18 @@ class L2tpOperationWorker {
             intervalId = undefined;
         };
         const renew = async () => {
-            const operationRenewed = await this.operationRepository.renewLease({
-                operationId,
-                owner: this.workerId,
+            const operationRenewed = await this.operationRepository.renewClaimed({
+                ...claim,
                 leaseMs: this.leaseMs,
                 now: this.clock.now(),
             });
-            if (!operationRenewed) {
-                const error = new Error('L2TP operation lease is no longer owned by this worker');
-                error.code = 'L2TP_OPERATION_LEASE_LOST';
-                throw error;
-            }
+            if (!operationRenewed) throw lostClaim();
 
             const lockRenewed = await this.lockService.renew({
                 node,
                 owner: this.workerId,
-                operationId,
+                operationId: claim.operationId,
+                generation: lockGeneration,
                 leaseMs: this.leaseMs,
             });
             if (!lockRenewed?.ok) {
@@ -372,6 +380,21 @@ class L2tpOperationWorker {
     }
 
     async runOnce() {
+        let claimedId;
+        let claimedStatus = 'running';
+        try {
+            return await this.runClaimedOperation((id, status = 'running') => {
+                claimedId = id;
+                claimedStatus = status;
+            });
+        } catch (error) {
+            if (error?.code !== 'L2TP_OPERATION_LEASE_LOST' || !claimedId) throw error;
+            return { claimed: true, operationId: claimedId, status: claimedStatus,
+                stopped: true, errorCode: error.code };
+        }
+    }
+
+    async runClaimedOperation(rememberClaim) {
         // Never consume counted admission while execution/finalization is not
         // fenced. Missing transactional claims are likewise not a reason to
         // fall back to the generic (uncounted) operation repository.
@@ -387,10 +410,10 @@ class L2tpOperationWorker {
         };
         const firstKind = this.nextClaimKind;
         const secondKind = firstKind === 'install' ? 'sync_users' : 'install';
-        const claim = kind => kind === 'install'
+        const claimQueued = kind => kind === 'install'
             ? this.remoteAdmissionRepository.claimQueuedInstall(request)
             : this.remoteAdmissionRepository.claimQueuedSyncUsers(request);
-        const operation = await claim(firstKind) || await claim(secondKind);
+        const operation = await claimQueued(firstKind) || await claimQueued(secondKind);
 
         if (!operation) return { claimed: false };
 
@@ -406,13 +429,17 @@ class L2tpOperationWorker {
         this.nextClaimKind = operation.kind === 'install' ? 'sync_users' : 'install';
 
         const operationId = String(operation._id ?? operation.id);
+        rememberClaim(operationId);
+        const claim = Object.freeze({ operationId, owner: this.workerId,
+            ownerGeneration: operation.ownerGeneration, expectedStatus: 'running' });
+        const rollbackClaim = Object.freeze({ ...claim, expectedStatus: 'rolling_back' });
         let preparedInstallPlan = null;
         let preparedSyncUsersPlan = null;
         if (operation.kind === 'install') {
             const prepared = await this.prepareInstallPlan(operation);
             if (prepared.errorCode) {
                 return this.failClaimedOperation({
-                    operationId,
+                    claim,
                     errorCode: prepared.errorCode,
                     errorMessage: prepared.errorMessage,
                 });
@@ -422,7 +449,7 @@ class L2tpOperationWorker {
             const prepared = await this.prepareSyncUsersPlan(operation);
             if (prepared.errorCode) {
                 return this.failClaimedOperation({
-                    operationId,
+                    claim,
                     errorCode: prepared.errorCode,
                     errorMessage: prepared.errorMessage,
                 });
@@ -440,7 +467,7 @@ class L2tpOperationWorker {
         if (!hasVerifyStep) {
             const errorMessage = 'L2TP operation plan must include a verify step';
             const finishedAt = this.clock.now();
-            await this.operationRepository.setStatus({
+            await this.writeClaimed('transitionClaimed', claim, {
                 operationId,
                 status: 'failed',
                 progress: 0,
@@ -463,7 +490,7 @@ class L2tpOperationWorker {
                 candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
             } catch {
                 return this.failClaimedOperation({
-                    operationId,
+                    claim,
                     errorCode: 'XRAY_CANDIDATE_FAILED',
                     errorMessage: 'Failed to build the L2TP Xray candidate',
                 });
@@ -482,7 +509,7 @@ class L2tpOperationWorker {
             const errorCode = lock?.error?.code || 'NODE_LOCK_UNAVAILABLE';
             const errorMessage = 'Could not acquire node operation lock';
             const finishedAt = this.clock.now();
-            await this.operationRepository.setStatus({
+            await this.writeClaimed('transitionClaimed', claim, {
                 operationId,
                 status: 'failed',
                 progress: 0,
@@ -499,9 +526,17 @@ class L2tpOperationWorker {
             return { claimed: true, operationId, status: 'failed' };
         }
 
+        if (typeof lock.lock?.generation !== 'string' || !lock.lock.generation) {
+            // A lock without its distinct UUID fence cannot be renewed or released.
+            // It remains remote-uncertain; never execute SSH on this claim.
+            return { claimed: true, operationId, status: 'running', stopped: true,
+                errorCode: 'NODE_OPERATION_LOCK_LOST' };
+        }
+        const lockGeneration = lock.lock.generation;
         const heartbeat = this.createLeaseHeartbeat({
-            operationId,
+            claim,
             node: operation.node,
+            lockGeneration,
         });
         const leaseLostResult = () => ({
             claimed: true,
@@ -510,8 +545,6 @@ class L2tpOperationWorker {
             stopped: true,
             errorCode: heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED',
         });
-        let verifiedTerminalSuccess = false;
-
         try {
             let executionSteps = preparedInstallPlan?.steps
                 ?? preparedSyncUsersPlan?.steps
@@ -535,7 +568,7 @@ class L2tpOperationWorker {
                     if (heartbeat.getError()) return leaseLostResult();
                     await heartbeat.stop();
                     return this.failClaimedOperation({
-                        operationId,
+                        claim,
                         errorCode: 'SECRET_RESOLUTION_FAILED',
                         errorMessage: 'Failed to resolve L2TP operation secrets',
                     });
@@ -565,7 +598,7 @@ class L2tpOperationWorker {
                     if (heartbeat.getError()) return leaseLostResult();
                     await heartbeat.stop();
                     return this.failClaimedOperation({
-                        operationId,
+                        claim,
                         errorCode: 'USER_SNAPSHOT_RESOLUTION_FAILED',
                         errorMessage: 'Failed to resolve the current L2TP user snapshot',
                     });
@@ -578,7 +611,7 @@ class L2tpOperationWorker {
                 const startingProgress = Math.round((index / executionSteps.length) * 100);
                 const completedProgress = Math.round(((index + 1) / executionSteps.length) * 100);
 
-                await this.operationRepository.recordStep({
+                await this.writeClaimed('recordClaimedStep', claim, {
                     operationId,
                     step: stepType,
                     progress: startingProgress,
@@ -611,7 +644,7 @@ class L2tpOperationWorker {
 
                     const errorCode = error.code || 'EXECUTOR_FAILED';
                     const errorMessage = error.message || 'L2TP operation executor failed';
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', claim, {
                         operationId,
                         status: 'rolling_back',
                         step: stepType,
@@ -625,6 +658,7 @@ class L2tpOperationWorker {
                             message: `L2TP operation step failed: ${stepType}`,
                         },
                     });
+                    rememberClaim(operationId, 'rolling_back');
 
                     try {
                         await this.executor.rollback({
@@ -638,7 +672,7 @@ class L2tpOperationWorker {
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
                         const finishedAt = this.clock.now();
-                        await this.operationRepository.setStatus({
+                        await this.writeClaimed('transitionClaimed', rollbackClaim, {
                             operationId,
                             status: 'failed',
                             step: stepType,
@@ -658,7 +692,7 @@ class L2tpOperationWorker {
                     }
 
                     const finishedAt = this.clock.now();
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
                         status: 'rolled_back',
                         step: stepType,
@@ -678,7 +712,7 @@ class L2tpOperationWorker {
                 }
 
                 completedSteps.push(secretFreeStep(step));
-                await this.operationRepository.recordStep({
+                await this.writeClaimed('recordClaimedStep', claim, {
                     operationId,
                     step: stepType,
                     progress: completedProgress,
@@ -708,12 +742,14 @@ class L2tpOperationWorker {
                     await heartbeat.renewNow();
                     if (heartbeat.getError()) return leaseLostResult();
                 } catch {
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
                     const errorCode = 'STATE_RECONCILIATION_FAILED';
                     const errorMessage = 'Failed to reconcile verified L2TP state';
                     const reconciliationError = Object.assign(new Error(errorMessage), {
                         code: errorCode,
                     });
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', claim, {
                         operationId,
                         status: 'rolling_back',
                         step: finalStep,
@@ -727,6 +763,7 @@ class L2tpOperationWorker {
                             message: errorMessage,
                         },
                     });
+                    rememberClaim(operationId, 'rolling_back');
 
                     try {
                         await this.executor.rollback({
@@ -740,7 +777,7 @@ class L2tpOperationWorker {
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
                         const rollbackFinishedAt = this.clock.now();
-                        await this.operationRepository.setStatus({
+                        await this.writeClaimed('transitionClaimed', rollbackClaim, {
                             operationId,
                             status: 'failed',
                             step: finalStep,
@@ -759,7 +796,7 @@ class L2tpOperationWorker {
                     }
 
                     const rollbackFinishedAt = this.clock.now();
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
                         status: 'rolled_back',
                         step: finalStep,
@@ -778,32 +815,34 @@ class L2tpOperationWorker {
                 }
             } else if (operation.kind === 'sync_users') {
                 try {
-                    if (typeof this.userSyncReconciler?.finalizeVerifiedSync !== 'function') {
+                    if (typeof this.userSyncReconciler?.finalizeClaimedVerifiedSync !== 'function') {
                         const unavailable = new Error('L2TP user sync reconciler is unavailable');
                         unavailable.code = 'L2TP_USER_SYNC_RECONCILER_UNAVAILABLE';
                         throw unavailable;
                     }
-                    const finalized = await this.userSyncReconciler.finalizeVerifiedSync({
+                    const finalized = await this.userSyncReconciler.finalizeClaimedVerifiedSync({
                         operation,
                         resolvedUsers: resolvedSyncUsers,
                         verification: userVerification,
                         workerId: this.workerId,
+                        ownerGeneration: claim.ownerGeneration,
                     });
-                    if (finalized?.ok !== true) {
-                        throw new Error('L2TP user sync finalization was rejected');
-                    }
+                    if (finalized?.ok !== true) throw lostClaim();
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
                     await heartbeat.renewNow();
                     if (heartbeat.getError()) return leaseLostResult();
-                } catch {
+                } catch (error) {
+                    if (error?.code === 'L2TP_OPERATION_LEASE_LOST') throw error;
+                    await heartbeat.waitForIdle();
+                    if (heartbeat.getError()) return leaseLostResult();
                     const errorCode = 'USER_SYNC_FINALIZATION_FAILED';
                     const errorMessage = 'Failed to finalize verified L2TP user sync';
                     const finalizationError = Object.assign(new Error(errorMessage), {
                         code: errorCode,
                     });
                     await heartbeat.stop();
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', claim, {
                         operationId,
                         status: 'rolling_back',
                         step: finalStep,
@@ -817,6 +856,7 @@ class L2tpOperationWorker {
                             message: errorMessage,
                         },
                     });
+                    rememberClaim(operationId, 'rolling_back');
 
                     try {
                         await this.executor.rollback({
@@ -830,7 +870,7 @@ class L2tpOperationWorker {
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
                         const rollbackFinishedAt = this.clock.now();
-                        await this.operationRepository.setStatus({
+                        await this.writeClaimed('transitionClaimed', rollbackClaim, {
                             operationId,
                             status: 'failed',
                             step: finalStep,
@@ -849,7 +889,7 @@ class L2tpOperationWorker {
                     }
 
                     const rollbackFinishedAt = this.clock.now();
-                    await this.operationRepository.setStatus({
+                    await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
                         status: 'rolled_back',
                         step: finalStep,
@@ -868,9 +908,7 @@ class L2tpOperationWorker {
                 }
             }
             const finishedAt = this.clock.now();
-            const succeeded = await this.operationRepository.succeedClaimed({
-                operationId,
-                owner: this.workerId,
+            await this.writeClaimed('succeedGenerationClaimed', claim, {
                 now: finishedAt,
                 step: finalStep,
                 journal: {
@@ -880,8 +918,6 @@ class L2tpOperationWorker {
                     message: 'L2TP operation succeeded after verification',
                 },
             });
-            if (succeeded !== true) return leaseLostResult();
-            verifiedTerminalSuccess = true;
 
             // The install may have advanced the topology revision (route-group
             // paths rebuilt for the relay). Queue a topology deploy right away
@@ -896,16 +932,9 @@ class L2tpOperationWorker {
             return { claimed: true, operationId, status: 'succeeded' };
         } finally {
             await heartbeat.stop();
-            // Failure/rollback or lost renewal cannot prove earlier remote work ended.
-            // Retaining this lock is only a local mitigation: expiry may still allow
-            // another operation to acquire it while the remote command remains live.
-            if (verifiedTerminalSuccess && !heartbeat.getError()) {
-                await this.lockService.release({
-                    node: operation.node,
-                    owner: this.workerId,
-                    operationId,
-                });
-            }
+            // Counted locks remain remote-uncertain. There is no attested
+            // remote-completion API to clear that bit, so retain the UUID lock
+            // even after a verified operation succeeds.
             this.executor.releaseOperation?.(operation);
         }
     }

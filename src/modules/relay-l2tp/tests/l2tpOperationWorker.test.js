@@ -31,7 +31,11 @@ test('worker stays disabled before any claim or SSH even with a queued operation
 test('opted-in worker selects both counted kinds fairly, without generic claim', async () => {
     const claims = [];
     const operationRepository = { async claimNext() { throw new Error('uncounted claim'); },
-        async setStatus() {} };
+        async transitionClaimed(request) {
+            assert.equal(request.ownerGeneration, 1);
+            assert.equal(request.expectedStatus, 'running');
+            return true;
+        } };
     const queued = { install: ['install-a', 'install-b'], sync_users: ['sync-a', 'sync-b'] };
     const remoteAdmissionRepository = Object.fromEntries([
         ['claimQueuedInstall', 'install'], ['claimQueuedSyncUsers', 'sync_users'],
@@ -116,6 +120,44 @@ function createOperationRepository(initialOperations = []) {
         calls,
         operations,
         async claimNext() { throw new Error('Generic claim is forbidden'); },
+        // Compatibility adapter for historical execution assertions: validate
+        // counted fences before routing to the existing interaction spies.
+        countedMatch(request) {
+            const operation = operations.find(candidate => candidate.id === request.operationId);
+            return !!operation && operation.status === request.expectedStatus
+                && operation.leaseOwner === request.owner
+                && operation.ownerGeneration === request.ownerGeneration
+                && request.now instanceof Date && request.now < operation.leaseUntil;
+        },
+        async renewClaimed(request) {
+            if (!this.countedMatch(request)) return false;
+            const renewed = await this.renewLease({ operationId: request.operationId,
+                owner: request.owner, leaseMs: request.leaseMs, now: request.now });
+            if (renewed) operations.find(candidate => candidate.id === request.operationId)
+                .leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+            return renewed;
+        },
+        async recordClaimedStep(request) {
+            if (!this.countedMatch(request)) return false;
+            await this.recordStep({ operationId: request.operationId, step: request.step,
+                progress: request.progress, journal: request.journal });
+            return true;
+        },
+        async transitionClaimed(request) {
+            if (!this.countedMatch(request)) return false;
+            await this.setStatus(Object.fromEntries(Object.entries({
+                operationId: request.operationId, status: request.status,
+                step: request.step, progress: request.progress, errorCode: request.errorCode,
+                errorMessage: request.errorMessage, finishedAt: request.finishedAt,
+                journal: request.journal,
+            }).filter(([, value]) => value !== undefined)));
+            return true;
+        },
+        async succeedGenerationClaimed(request) {
+            if (!this.countedMatch(request)) return false;
+            return this.succeedClaimed({ operationId: request.operationId, owner: request.owner,
+                now: request.now, step: request.step, journal: request.journal });
+        },
         async renewLease(request) {
             calls.push({ method: 'renewLease', request });
             return true;
@@ -194,6 +236,21 @@ function createWorker(operationRepository, overrides = {}) {
         async renew() { return { ok: true }; },
         ...(overrides.lockService || {}),
     };
+    const acquire = lockService.acquire;
+    if (acquire) lockService.acquire = async request => {
+        const result = await acquire(request);
+        return result?.ok === true ? { ...result, lock: {
+            ...result.lock, generation: result.lock?.generation ?? 'fixture-lock-uuid',
+            remoteUncertain: true,
+        } } : result;
+    };
+    const userSyncReconciler = overrides.userSyncReconciler && {
+        ...overrides.userSyncReconciler,
+        async finalizeClaimedVerifiedSync(request) {
+            assert.equal(request.ownerGeneration, 1);
+            return overrides.userSyncReconciler.finalizeVerifiedSync?.(request);
+        },
+    };
 
     const worker = new L2tpOperationWorker({
         operationRepository,
@@ -205,6 +262,7 @@ function createWorker(operationRepository, overrides = {}) {
                 if (!operation) return null;
                 operation.status = 'running';
                 operation.leaseOwner = request.owner;
+                operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
                 return operation;
             },
             async claimQueuedSyncUsers(request) {
@@ -214,6 +272,7 @@ function createWorker(operationRepository, overrides = {}) {
                 if (!operation) return null;
                 operation.status = 'running';
                 operation.leaseOwner = request.owner;
+                operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
                 return operation;
             },
         },
@@ -223,7 +282,7 @@ function createWorker(operationRepository, overrides = {}) {
         secretResolver: overrides.secretResolver ?? (legacyExecutionFixture
             ? async () => ({ psk: 'fixture-secret' }) : undefined),
         userSnapshotResolver: overrides.userSnapshotResolver,
-        userSyncReconciler: overrides.userSyncReconciler,
+        userSyncReconciler,
         stateReconciler: overrides.stateReconciler || (async () => ({ status: 'installed' })),
         operationMaterializer: overrides.operationMaterializer ?? (legacyExecutionFixture
             ? async ({ plan }) => ({ persistedPlan: plan, remoteArtifacts: [] }) : undefined),
@@ -402,7 +461,8 @@ test('claims an install once and resolves its PSK once before typed artifact upl
         secret: 'psk',
     }]);
     assert.deepEqual(candidateCalls, [{ plan: operation.plan }]);
-    assert.deepEqual(lockCalls.map(call => call.method), ['acquire', 'release']);
+    assert.deepEqual(lockCalls.map(call => call.method), ['acquire'],
+        'remote-uncertain lock is never released without quiescence proof');
 
     const uploads = transportCalls.filter(call => call.method === 'uploadRootFile');
     assert.equal(uploads.length, 3);
@@ -693,6 +753,7 @@ test('runs standalone sync_users with typed verification and finalizes before su
             code: 'USERS_VERIFIED',
         },
         workerId: 'worker-1',
+        ownerGeneration: 1,
     });
     assert.ok(
         events.findIndex(event => event.method === 'finalizeVerifiedSync')
@@ -910,7 +971,7 @@ test('rolls back and never succeeds when guarded user sync finalization rejects 
     }
 });
 
-test('rolls back and never succeeds when user sync finalization returns a rejected result', async () => {
+test('generation-CAS rejection stops without rollback or success', async () => {
     const password = 'finalization-private-password';
     const operationRepository = createOperationRepository([
         createSyncUsersOperation('operation-finalize-rejected-result'),
@@ -969,13 +1030,43 @@ test('rolls back and never succeeds when user sync finalization returns a reject
     assert.deepEqual(result, {
         claimed: true,
         operationId: 'operation-finalize-rejected-result',
-        status: 'rolled_back',
+        status: 'running',
+        stopped: true,
+        errorCode: 'L2TP_OPERATION_LEASE_LOST',
     });
-    assert.deepEqual(events, ['backup', 'sync_users', 'verify_users', 'finalize', 'rollback']);
+    assert.deepEqual(events, ['backup', 'sync_users', 'verify_users', 'finalize']);
     const statuses = operationRepository.calls.filter(call => call.method === 'setStatus');
-    assert.deepEqual(statuses.map(call => call.request.status), ['rolling_back', 'rolled_back']);
-    assert.equal(statuses.some(call => call.request.status === 'succeeded'), false);
+    assert.deepEqual(statuses, [], 'CAS rejection cannot authorize mutation');
     assert.doesNotMatch(JSON.stringify({ result, statuses }), new RegExp(password));
+});
+
+test('expired rollback lease reports rolling_back without terminal mutation or lock release', async () => {
+    const clock = createClock();
+    const operationRepository = createOperationRepository([{
+        id: 'operation-rollback-expired', node: 'relay-1', status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    const releases = [];
+    const worker = createWorker(operationRepository, {
+        clock,
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
+        },
+        executor: {
+            async executeStep() { throw new Error('step failed'); },
+            async rollback() { clock.advance(30_001); },
+        },
+    });
+
+    assert.deepEqual(await worker.runOnce(), {
+        claimed: true, operationId: 'operation-rollback-expired', status: 'rolling_back',
+        stopped: true, errorCode: 'L2TP_OPERATION_LEASE_LOST',
+    });
+    assert.equal(operationRepository.operations[0].status, 'rolling_back');
+    assert.deepEqual(operationRepository.calls.filter(call => call.method === 'setStatus')
+        .map(call => call.request.status), ['rolling_back']);
+    assert.deepEqual(releases, []);
 });
 
 test('rejects invalid claimed install plans before resolving secrets or remote work', async () => {
@@ -1563,6 +1654,9 @@ test('renews operation and node leases while a step runs longer than the lease',
         ],
     );
     assert.equal(lockRenewals.length, 6);
+    assert.ok(lockRenewals.every(request => request.generation === 'fixture-lock-uuid'
+        && request.operationId === 'operation-long-step' && request.owner === 'worker-1'));
+    assert.notEqual(lockRenewals[0].generation, operationRepository.operations[0].ownerGeneration);
     assert.ok(timer.calls[0].intervalMs < 30_000);
     assert.equal(timer.activeCount(), 0);
     assert.equal(timer.calls.filter(call => call.method === 'clearInterval').length, 1);
@@ -2001,7 +2095,7 @@ test('lock conflict fails the claimed operation without executing it', async () 
     );
 });
 
-test('success is persisted only after verify and before releasing the lock', async () => {
+test('success is persisted after verify without releasing remote-uncertain lock', async () => {
     const events = [];
     const operationRepository = createOperationRepository([{
         id: 'operation-success',
@@ -2070,15 +2164,8 @@ test('success is persisted only after verify and before releasing the lock', asy
                 },
             },
         },
-        {
-            method: 'release',
-            request: {
-                node: 'node-success',
-                owner: 'worker-1',
-                operationId: 'operation-success',
-            },
-        },
     ]);
+    assert.equal(events.some(event => event.method === 'release'), false);
     assert.deepEqual(
         operationRepository.calls.filter(call => call.method === 'succeedClaimed'),
         [{
@@ -2126,7 +2213,7 @@ test('does not report success when the terminal owner-and-lease CAS rejects', as
         operationId: 'operation-terminal-cas',
         status: 'running',
         stopped: true,
-        errorCode: 'L2TP_LEASE_RENEWAL_FAILED',
+        errorCode: 'L2TP_OPERATION_LEASE_LOST',
     });
     assert.equal(
         operationRepository.calls.some(call => (
@@ -2185,6 +2272,11 @@ test('rechecks the lease at the actual terminal time after reconciliation or fin
     function makeLeaseAware(operation, clock) {
         const operationRepository = createOperationRepository([operation]);
         let leaseUntil = new Date(NOW.getTime() + 30_000);
+        const renewClaimed = operationRepository.renewClaimed;
+        operationRepository.renewClaimed = async function (request) {
+            this.calls.push({ method: 'renewClaimed', request });
+            return renewClaimed.call(this, request);
+        };
 
         operationRepository.renewLease = async request => {
             operationRepository.calls.push({ method: 'renewLease', request });
@@ -2255,7 +2347,7 @@ test('rechecks the lease at the actual terminal time after reconciliation or fin
             false,
         );
         assert.deepEqual(
-            operationRepository.calls.filter(call => call.method === 'renewLease').at(-1).request.now,
+            operationRepository.calls.filter(call => call.method === 'renewClaimed').at(-1).request.now,
             new Date('2026-09-22T10:00:30.001Z'),
         );
     });
@@ -2310,7 +2402,7 @@ test('rechecks the lease at the actual terminal time after reconciliation or fin
             false,
         );
         assert.deepEqual(
-            operationRepository.calls.filter(call => call.method === 'renewLease').at(-1).request.now,
+            operationRepository.calls.filter(call => call.method === 'renewClaimed').at(-1).request.now,
             new Date('2026-09-22T10:00:30.001Z'),
         );
     });
@@ -2370,12 +2462,12 @@ test('verified install state is reconciled before the operation can become succe
     });
     const reconcileIndex = events.findIndex(event => event.method === 'reconcile');
     const successIndex = events.findIndex(event => event.method === 'succeedClaimed');
-    const releaseIndex = events.findIndex(event => event.method === 'release');
     assert.ok(reconcileIndex > events.findIndex(event => (
         event.method === 'executeStep' && event.step === 'verify'
     )));
     assert.ok(reconcileIndex < successIndex);
-    assert.ok(successIndex < releaseIndex);
+    assert.equal(events.some(event => event.method === 'release'), false,
+        'successful reconciliation does not prove remote quiescence');
     assert.deepEqual(events[reconcileIndex].request, {
         operation: operationRepository.operations[0],
         verifiedAt: NOW,
