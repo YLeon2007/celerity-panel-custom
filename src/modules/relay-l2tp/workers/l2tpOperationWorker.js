@@ -945,6 +945,25 @@ class L2tpOperationWorker {
                 },
             });
 
+            // Topology auto-deploy reuses this relay. Hand off its exact
+            // generation only after verified L2TP success is durable.
+            if (typeof this.lockService.releaseVerified === 'function') {
+                await heartbeat.stop();
+                let released;
+                try {
+                    released = await this.lockService.releaseVerified({
+                        node: operation.node,
+                        owner: this.workerId,
+                        operationId,
+                        generation: lockGeneration,
+                    });
+                } catch { /* Keep the operation terminal; the node stays blocked. */ }
+                if (released?.ok !== true) {
+                    return { claimed: true, operationId, status: 'succeeded', stopped: true,
+                        errorCode: 'NODE_LOCK_RELEASE_FAILED' };
+                }
+            }
+
             // The install may have advanced the topology revision (route-group
             // paths rebuilt for the relay). Queue a topology deploy right away
             // so relay ingress listeners appear without a manual chain sync.

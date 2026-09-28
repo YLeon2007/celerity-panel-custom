@@ -35,6 +35,15 @@ function fixture(existing = null) {
             row.leaseUntil = input.leaseUntil;
             return true;
         },
+        async deleteVerifiedOwned(input) {
+            calls.push({ method: 'deleteVerifiedOwned', input });
+            const row = rows.get(input.node);
+            if (!row || !input.generation || row.generation !== input.generation ||
+                row.owner !== input.owner || row.operationId !== input.operationId ||
+                row.remoteUncertain !== true) return false;
+            rows.delete(input.node);
+            return true;
+        },
         async deleteOwned(input) {
             calls.push({ method: 'deleteOwned', input });
             const row = rows.get(input.node);
@@ -140,6 +149,15 @@ test('only a proven generation is released with a matching token', async () => {
     assert.equal(result.ok, true);
     assert.equal(result.code, RESULT_CODES.RELEASED);
     assert.equal(repository.getRow(), null);
+});
+
+test('verified terminal success releases only its exact uncertain generation once', async () => {
+    const {service,repository}=fixture({...identity,generation,leaseUntil:until,remoteUncertain:true});
+    assert.equal((await service.releaseVerified({...identity,generation:'stale'})).ok,false);
+    assert.ok(repository.getRow());
+    assert.equal((await service.releaseVerified({...identity,generation})).ok,true);
+    assert.equal(repository.getRow(),null);
+    assert.equal((await service.releaseVerified({...identity,generation})).ok,false);
 });
 
 test('acquireMany sorts nodes and reports a blocked duplicate lock', async () => {

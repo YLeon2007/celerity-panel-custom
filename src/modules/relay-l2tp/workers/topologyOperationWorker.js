@@ -292,12 +292,13 @@ class TopologyOperationWorker {
         return leaseUntil;
     }
 
-    async renewLocks(operationId, lockedNodeIds) {
-        for (const node of lockedNodeIds) {
+    async renewLocks(operationId, lockedNodes) {
+        for (const { node, generation } of lockedNodes) {
             const renewed = await this.lockService.renew({
                 node,
                 owner: this.workerId,
                 operationId,
+                generation,
                 leaseMs: this.leaseMs,
             });
             if (renewed?.ok !== true) throw new LeaseLostError();
@@ -384,21 +385,25 @@ class TopologyOperationWorker {
             if (acquired?.ok !== true) {
                 return acquired?.error?.code || 'NODE_LOCK_UNAVAILABLE';
             }
-            acquiredNodeIds.push(nodeId);
+            if (typeof acquired.lock?.generation !== 'string' || !acquired.lock.generation) {
+                return 'NODE_OPERATION_LOCK_LOST';
+            }
+            acquiredNodeIds.push({ node: nodeId, generation: acquired.lock.generation });
         }
         return null;
     }
 
-    async releaseLocks(operationId, acquiredNodeIds) {
-        for (const node of [...acquiredNodeIds].reverse()) {
+    async releaseVerifiedLocks(operationId, acquiredNodeIds) {
+        for (const { node, generation } of [...acquiredNodeIds].reverse()) {
             try {
-                await this.lockService.release({
+                await this.lockService.releaseVerified({
                     node,
                     owner: this.workerId,
                     operationId,
+                    generation,
                 });
             } catch {
-                // Owned locks are leased; continue unwinding the remaining nodes.
+                // Failed release leaves this node blocked for TEST rollback.
             }
         }
     }
@@ -712,6 +717,7 @@ class TopologyOperationWorker {
         }
         this.running.add(operationId);
         let heartbeat;
+        let terminalSuccess = false;
         const acquiredNodeIds = [];
         try {
             const operation = await this.operationRepository.claim({
@@ -922,6 +928,7 @@ class TopologyOperationWorker {
                     heartbeat,
                 );
             }
+            terminalSuccess = true;
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {
             if (error instanceof LeaseLostError
@@ -937,7 +944,7 @@ class TopologyOperationWorker {
             throw error;
         } finally {
             if (heartbeat) await heartbeat.stop();
-            await this.releaseLocks(operationId, acquiredNodeIds);
+            if (terminalSuccess) await this.releaseVerifiedLocks(operationId, acquiredNodeIds);
             this.running.delete(operationId);
         }
     }

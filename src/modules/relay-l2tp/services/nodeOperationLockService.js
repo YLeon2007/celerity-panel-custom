@@ -109,6 +109,21 @@ class NodeOperationLockService {
         };
     }
 
+    async releaseVerified({ node, owner, operationId, generation }) {
+        if (!generation) {
+            return { ok: false, error: { code: RESULT_CODES.NOT_OWNED, node } };
+        }
+        const released = await this.repository.deleteVerifiedOwned({
+            node,
+            owner,
+            operationId,
+            generation,
+        });
+        return released
+            ? { ok: true, code: RESULT_CODES.RELEASED, node }
+            : { ok: false, error: { code: RESULT_CODES.NOT_OWNED, node } };
+    }
+
     async release({ node, owner, operationId, generation }) {
         if (!generation) {
             return { ok: false, error: { code: RESULT_CODES.NOT_OWNED, node } };

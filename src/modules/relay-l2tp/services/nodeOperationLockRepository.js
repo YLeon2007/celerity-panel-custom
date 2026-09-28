@@ -59,6 +59,18 @@ class NodeOperationLockRepository {
         return result.matchedCount === 1;
     }
 
+    async deleteVerifiedOwned({ node, owner, operationId, generation }) {
+        if (!generation) return false;
+        const result = await this.model.deleteOne({
+            node,
+            owner,
+            operationId,
+            generation,
+            remoteUncertain: true,
+        });
+        return result.deletedCount === 1;
+    }
+
     async deleteOwned({ node, owner, operationId, generation }) {
         if (!generation) return false;
         const result = await this.model.deleteOne({

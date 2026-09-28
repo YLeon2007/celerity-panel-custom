@@ -545,6 +545,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const { operation } = createInstallOperation('operation-autodeploy');
     const operationRepository = createOperationRepository([operation]);
     const hookCalls = [];
+    const handoffOrder = [];
     const executor = new L2tpRemoteExecutor({
         transport: {
             async uploadRootFile() {},
@@ -555,6 +556,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
         executor,
         operationMaterializer: materializeInstallOperation,
         afterInstallSucceeded: async request => {
+            handoffOrder.push('topology');
             hookCalls.push(request);
         },
         candidateService: {
@@ -572,6 +574,11 @@ test('queues the after-install topology deploy hook only for succeeded installs'
         lockService: {
             async acquire() { return { ok: true }; },
             async renew() { return { ok: true }; },
+            async releaseVerified(request) {
+                assert.equal(request.generation, 'fixture-lock-uuid');
+                handoffOrder.push('release');
+                return { ok: true };
+            },
             async release() { return { ok: true }; },
         },
     });
@@ -579,6 +586,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const result = await worker.runOnce();
 
     assert.equal(result.status, 'succeeded');
+    assert.deepEqual(handoffOrder, ['release', 'topology']);
     assert.deepEqual(hookCalls, [{
         operationId: 'operation-autodeploy',
         node: operation.node,

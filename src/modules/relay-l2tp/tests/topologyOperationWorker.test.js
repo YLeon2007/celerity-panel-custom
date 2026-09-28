@@ -214,10 +214,29 @@ function createWorker({
     pppReadinessGate,
     allowUnprovenTestExecution = true,
 } = {}) {
-    const effectiveLockService = lockService || {
-        async acquire() { return { ok: true }; },
+    const suppliedLockService = lockService || {
+        async acquire({ node }) { return { ok: true, lock: { generation: `test-${node}` } }; },
         async renew() { return { ok: true }; },
+        async releaseVerified() { return { ok: true }; },
         async release() { return { ok: true }; },
+    };
+    // Old behavioral fixtures predate generation; supply a test-only token.
+    const effectiveLockService = {
+        ...suppliedLockService,
+        renew: request => suppliedLockService.renew(request),
+        release: request => suppliedLockService.release
+            ? suppliedLockService.release(request) : Promise.resolve({ ok: true }),
+        async acquire(request) {
+            const result = await suppliedLockService.acquire(request);
+            return result?.ok && !result.lock?.generation
+                ? { ...result, lock: { generation: `test-${request.node}` } }
+                : result;
+        },
+        async releaseVerified(request) {
+            return suppliedLockService.releaseVerified
+                ? suppliedLockService.releaseVerified(request)
+                : suppliedLockService.release(request);
+        },
     };
     const effectiveFinalizer = finalizer || {
         async finalizeSucceeded(request) {
@@ -278,7 +297,7 @@ test('worker without test-only execution permission rejects before claim, lock, 
     assert.equal(repository.operation.attempts, 0);
 });
 
-async function successfulLifecycleEvents(order) {
+async function successfulLifecycleEvents(order, lockService) {
     const repository = createRepository(durableTopologyOperation(order));
     const events = [];
     const executor = {
@@ -303,6 +322,7 @@ async function successfulLifecycleEvents(order) {
     const worker = createWorker({
         repository,
         executor,
+        lockService,
         deploymentRepository: {
             async markDeployed() { return { revision: 7, deployedRevision: 7 }; },
         },
@@ -312,6 +332,22 @@ async function successfulLifecycleEvents(order) {
     assert.equal(result.status, 'succeeded');
     return events;
 }
+
+test('a verified topology success renews and releases exact-generation node locks for the next link', async () => {
+    const held = new Set();
+    const lockService = {
+        async acquire({node}) { held.add(node); return {ok:true, lock:{generation:`gen-${node}`}}; },
+        async renew({node,generation}) { assert.equal(generation,`gen-${node}`); return {ok:true}; },
+        async releaseVerified({node,generation}) {
+            assert.equal(generation,`gen-${node}`);
+            assert.equal(held.delete(node),true);
+            return {ok:true};
+        },
+        async release() { throw new Error('uncertain lock must not be released'); },
+    };
+    await successfulLifecycleEvents(['portal','relay','bridge'],lockService);
+    assert.equal(held.size,0);
+});
 
 async function rollbackRolesAfterFinalVerifyFailure(order) {
     const repository = createRepository(durableTopologyOperation(order));
@@ -816,10 +852,11 @@ test('operation and owned-lock heartbeat stays active during every slow executor
             harness.release();
             assert.equal((await running).status, harness.expectedStatus);
             assert.equal(timer.isActive(), false, 'heartbeat timer must be stopped');
-            assert.deepEqual(events.filter(event => event.method === 'release'), [
-                { method: 'release', node: 'node-b' },
-                { method: 'release', node: 'node-a' },
-            ]);
+            assert.deepEqual(events.filter(event => event.method === 'release'),
+                harness.expectedStatus === 'succeeded' ? [
+                    { method: 'release', node: 'node-b' },
+                    { method: 'release', node: 'node-a' },
+                ] : []);
         });
     }
 });
@@ -879,10 +916,7 @@ test('owned-lock renewal loss in every slow executor phase fences progress and s
             assert.equal(repository.calls.filter(call => (
                 ['recordNode', 'setPhase', 'finishClaimed'].includes(call.method)
             )).length, durableMutations, 'stale worker must not persist further progress');
-            assert.deepEqual(events.filter(event => event.method === 'release'), [
-                { method: 'release', node: 'node-b' },
-                { method: 'release', node: 'node-a' },
-            ]);
+            assert.deepEqual(events.filter(event => event.method === 'release'), []);
         });
     }
 });
@@ -951,10 +985,7 @@ test('lease loss during commit fences durable progress after that executor call'
     assert.equal(result.errorCode, 'TOPOLOGY_OPERATION_LEASE_LOST');
     assert.equal(finalized, false);
     assert.equal(timer.isActive(), false);
-    assert.deepEqual(lockEvents, [
-        { method: 'release', node: 'node-b' },
-        { method: 'release', node: 'node-a' },
-    ]);
+    assert.deepEqual(lockEvents, []);
     assert.equal(repository.calls.some(call => (
         call.method === 'recordNode'
         && call.request.node === 'node-a'
@@ -1023,7 +1054,7 @@ test('node locks are acquired by deterministic node id and released in reverse o
     );
 });
 
-test('partial node-lock acquisition unwinds only acquired locks in reverse order', async () => {
+test('partial node-lock acquisition keeps acquired locks blocked for TEST rollback', async () => {
     const repository = createRepository(durableTopologyOperation([
         'bridge',
         'relay',
@@ -1082,8 +1113,6 @@ test('partial node-lock acquisition unwinds only acquired locks in reverse order
         { method: 'acquire', node: 'node-a' },
         { method: 'acquire', node: 'node-m' },
         { method: 'acquire', node: 'node-z' },
-        { method: 'release', node: 'node-m' },
-        { method: 'release', node: 'node-a' },
     ]);
 });
 

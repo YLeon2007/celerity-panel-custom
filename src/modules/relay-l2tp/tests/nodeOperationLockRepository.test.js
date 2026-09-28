@@ -120,6 +120,16 @@ for (const [name, row] of [
     });
 }
 
+test('verified success atomically deletes only the matching uncertain lock', async () => {
+    const row = { ...identity, generation: token, leaseUntil: until, remoteUncertain: true };
+    const { repository, getRow, calls } = fixture(row);
+    assert.equal(await repository.deleteVerifiedOwned({ ...identity, generation: 'stale' }), false);
+    assert.deepEqual(getRow(), row);
+    assert.equal(await repository.deleteVerifiedOwned({ ...identity, generation: token }), true);
+    assert.equal(getRow(), null);
+    assert.deepEqual(calls[1].filter, { ...identity, generation: token, remoteUncertain: true });
+});
+
 test('only a matching proven generation is deletable, never a stale generation', async () => {
     const row = { ...identity, generation: token, leaseUntil: until, remoteUncertain: false };
     const { repository, getRow, calls } = fixture(row);
