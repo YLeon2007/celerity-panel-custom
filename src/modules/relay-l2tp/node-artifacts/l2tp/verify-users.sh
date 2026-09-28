@@ -259,9 +259,21 @@ def main():
             raise VerificationError('VERIFY_USERS_INPUT_INVALID') from error
         revision, users = validate_desired(desired)
         enabled_count = sum(1 for _login, _password, _address, active in users if active)
-        parent = open_target_parent(root)
         try:
-            content = read_regular(parent, TARGET_COMPONENTS[-1], 'CHAP_SECRETS_INVALID', exact_mode=0o600)
+            parent = open_target_parent(root)
+        except VerificationError as error:
+            if error.code == 'CHAP_SECRETS_INVALID':
+                error.revision = revision
+                error.enabled = enabled_count
+            raise
+        try:
+            try:
+                content = read_regular(parent, TARGET_COMPONENTS[-1], 'CHAP_SECRETS_INVALID', exact_mode=0o600)
+            except VerificationError as error:
+                if error.code == 'CHAP_SECRETS_INVALID':
+                    error.revision = revision
+                    error.enabled = enabled_count
+                raise
         finally:
             os.close(parent)
         lines = managed_lines(content, revision, enabled_count)

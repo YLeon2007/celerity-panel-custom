@@ -120,6 +120,14 @@ write_chap "# BEGIN CELERITY MANAGED L2TP USERS
 expect_failure disabled DISABLED_USERS_PRESENT 3
 
 write_chap "$expected_block"
+# chap-secrets missing or unreadable on the relay is a distinct drift class:
+# the node must still attest the bound revision/enabled count so the transport
+# and executor gates can propagate CHAP_SECRETS_INVALID instead of flattening
+# it into a generic command failure.
+rm -f "$TMP_DIR/root/etc/ppp/chap-secrets"
+expect_failure no-chap-secrets CHAP_SECRETS_INVALID 0
+
+write_chap "$expected_block"
 invoke_verify extra-argument "$TMP_DIR/outside"
 [[ "$status" -ne 0 ]] || fail 'verify-users accepted an arbitrary path'
 [[ "$result" == '{"ok":false,"credentialRevision":null,"enabledUserCount":0,"managedUserCount":0,"code":"INVALID_ARGUMENTS"}' ]] \
