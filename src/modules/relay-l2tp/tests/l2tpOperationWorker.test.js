@@ -8,6 +8,8 @@ const { L2tpOperationRepository } = require('../services/l2tpOperationRepository
 const { L2tpRemoteExecutor } = require('../services/l2tpRemoteExecutor');
 const { buildInstallPlan, INSTALL_STEP_TYPES } = require('../services/l2tpProvisionPlanService');
 const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
+const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
+const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 
@@ -1130,6 +1132,35 @@ test('runOnce reports idle when no queued operation can be claimed', async () =>
             now: NOW,
         },
     }]);
+});
+
+test('expired durable node lock blocks new L2TP claim before executor and repeat claim', async () => {
+    const held = { node: 'relay-1', owner: 'old-worker', operationId: 'old-operation',
+        leaseUntil: new Date(NOW.getTime() - 1), remoteUncertain: true, generation: 'old-token' };
+    let inserts = 0;
+    const lockService = new NodeOperationLockService({
+        repository: new NodeOperationLockRepository({ model: {
+            async create() { inserts += 1; throw Object.assign(new Error('duplicate key'), { code: 11000 }); },
+            findOne() { return { lean: async () => ({ ...held }) }; },
+        } }),
+        clock: createClock(),
+    });
+    const operationRepository = createOperationRepository([{
+        id: 'new-operation', node: 'relay-1', kind: 'uninstall', status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    let dispatched = 0;
+    const worker = createWorker(operationRepository, {
+        lockService: { acquire: request => lockService.acquire(request) },
+        executor: { async executeStep() { dispatched += 1; } },
+    });
+    assert.deepEqual(await worker.runOnce(), {
+        claimed: true, operationId: 'new-operation', status: 'failed',
+    });
+    assert.deepEqual(await worker.runOnce(), { claimed: false });
+    assert.equal(dispatched, 0);
+    assert.equal(inserts, 1);
+    assert.equal(held.generation, 'old-token');
 });
 
 test('runOnce does not redispatch SSH for a competing expired-running operation', async () => {

@@ -22,6 +22,15 @@ const nodeOperationLockSchema = new mongoose.Schema({
         type: Date,
         required: true,
     },
+    generation: {
+        type: String,
+        required: true,
+    },
+    // No default: missing values on legacy rows must never be considered clean.
+    remoteUncertain: {
+        type: Boolean,
+        required: true,
+    },
 }, { timestamps: true });
 
 nodeOperationLockSchema.index({ node: 1 }, { unique: true });

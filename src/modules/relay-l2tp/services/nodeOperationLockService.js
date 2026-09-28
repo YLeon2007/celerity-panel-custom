@@ -1,5 +1,7 @@
 'use strict';
 
+const { randomUUID } = require('node:crypto');
+
 const RESULT_CODES = Object.freeze({
     ACQUIRED: 'NODE_OPERATION_LOCK_ACQUIRED',
     RENEWED: 'NODE_OPERATION_LOCK_RENEWED',
@@ -21,6 +23,8 @@ class NodeOperationLockService {
             node,
             owner,
             operationId,
+            generation: randomUUID(),
+            remoteUncertain: true,
             leaseUntil: new Date(now.getTime() + leaseMs),
         };
         const claim = await this.repository.acquireLease({
@@ -42,26 +46,21 @@ class NodeOperationLockService {
             };
         }
 
-        const previousLock = claim.previousLock;
-        const isRenewal = Boolean(previousLock)
-            && previousLock.leaseUntil.getTime() > now.getTime()
-            && String(previousLock.owner) === String(owner)
-            && String(previousLock.operationId) === String(operationId);
-
         return {
             ok: true,
-            code: isRenewal ? RESULT_CODES.RENEWED : RESULT_CODES.ACQUIRED,
-            lock: lease,
+            code: RESULT_CODES.ACQUIRED,
+            lock: claim.lock,
         };
     }
 
-    async renew({ node, owner, operationId, leaseMs }) {
+    async renew({ node, owner, operationId, generation, leaseMs }) {
         const now = this.clock.now();
         const leaseUntil = new Date(now.getTime() + leaseMs);
         const renewed = await this.repository.renewLease({
             node,
             owner,
             operationId,
+            generation,
             now,
             leaseUntil,
         });
@@ -83,6 +82,7 @@ class NodeOperationLockService {
                 node,
                 owner,
                 operationId,
+                generation,
                 leaseUntil,
             },
         };
@@ -109,11 +109,15 @@ class NodeOperationLockService {
         };
     }
 
-    async release({ node, owner, operationId }) {
+    async release({ node, owner, operationId, generation }) {
+        if (!generation) {
+            return { ok: false, error: { code: RESULT_CODES.NOT_OWNED, node } };
+        }
         const released = await this.repository.deleteOwned({
             node,
             owner,
             operationId,
+            generation,
         });
 
         if (!released) {

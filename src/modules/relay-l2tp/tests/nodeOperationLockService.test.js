@@ -2,524 +2,161 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { NodeOperationLockService, RESULT_CODES } = require('../services/nodeOperationLockService');
 
-const {
-    NodeOperationLockService,
-    RESULT_CODES,
-} = require('../services/nodeOperationLockService');
+const now = new Date('2026-09-21T12:00:00.000Z');
+const until = new Date('2026-09-21T12:00:30.000Z');
+const identity = { node: 'node-a', owner: 'worker-a', operationId: 'operation-a' };
+const request = { ...identity, leaseMs: 30_000 };
+const generation = '11111111-1111-4111-8111-111111111111';
+const clock = { now: () => new Date(now) };
 
-const NOW = new Date('2026-09-21T12:00:00.000Z');
-
-function createRepository(initialLocks = []) {
-    const locks = new Map(initialLocks.map(lock => [String(lock.node), { ...lock }]));
-    const calls = [];
-
-    return {
-        calls,
-        async findByNode(node) {
-            calls.push({ method: 'findByNode', node });
-            return locks.get(String(node)) || null;
-        },
-        async acquireLease(request) {
-            calls.push({ method: 'acquireLease', request: { ...request } });
-            const currentLock = locks.get(String(request.node));
-            const previousLock = currentLock ? { ...currentLock } : null;
-            const eligible = !previousLock
-                || previousLock.leaseUntil.getTime() <= request.now.getTime()
-                || (String(previousLock.owner) === String(request.owner)
-                    && String(previousLock.operationId) === String(request.operationId));
-            if (!eligible) {
-                return { acquired: false, currentLock: previousLock };
-            }
-
-            const lock = {
-                node: request.node,
-                owner: request.owner,
-                operationId: request.operationId,
-                leaseUntil: request.leaseUntil,
-            };
-            locks.set(String(request.node), { ...lock });
-            return { acquired: true, previousLock };
-        },
-        async save(lock) {
-            calls.push({ method: 'save', lock: { ...lock } });
-            locks.set(String(lock.node), { ...lock });
-            return { ...lock };
-        },
-        async renewLease(request) {
-            calls.push({ method: 'renewLease', request: { ...request } });
-            const lock = locks.get(String(request.node));
-            const matches = lock
-                && String(lock.owner) === String(request.owner)
-                && String(lock.operationId) === String(request.operationId)
-                && lock.leaseUntil.getTime() > request.now.getTime();
-            if (!matches) return false;
-
-            lock.leaseUntil = request.leaseUntil;
-            return true;
-        },
-        async deleteOwned(request) {
-            calls.push({ method: 'deleteOwned', request: { ...request } });
-            const lock = locks.get(String(request.node));
-            const matches = lock
-                && String(lock.owner) === String(request.owner)
-                && String(lock.operationId) === String(request.operationId);
-            if (!matches) return false;
-
-            locks.delete(String(request.node));
-            return true;
-        },
-    };
-}
-
-function createService(repository) {
-    return new NodeOperationLockService({
-        repository,
-        clock: { now: () => new Date(NOW) },
-    });
-}
-
-function createConcurrentRepository(initialLock = null) {
-    let currentLock = initialLock ? { ...initialLock } : null;
-    const calls = [];
-    const pendingReads = [];
-
-    function releaseReads() {
-        while (pendingReads.length > 0) {
-            pendingReads.shift()(currentLock ? { ...currentLock } : null);
-        }
-    }
-
-    return {
-        calls,
-        async findByNode(node) {
-            calls.push({ method: 'findByNode', node });
-            return new Promise(resolve => {
-                pendingReads.push(lock => resolve(lock));
-                if (pendingReads.length === 2) releaseReads();
-            });
-        },
-        async save(lock) {
-            calls.push({ method: 'save', lock: { ...lock } });
-            currentLock = { ...lock };
-            return { ...lock };
-        },
-        async acquireLease(request) {
-            calls.push({ method: 'acquireLease', request: { ...request } });
-            const previousLock = currentLock ? { ...currentLock } : null;
-            const eligible = !previousLock
-                || previousLock.leaseUntil.getTime() <= request.now.getTime()
-                || (String(previousLock.owner) === String(request.owner)
-                    && String(previousLock.operationId) === String(request.operationId));
-            if (!eligible) {
-                return { acquired: false, currentLock: previousLock };
-            }
-
-            currentLock = {
-                node: request.node,
-                owner: request.owner,
-                operationId: request.operationId,
-                leaseUntil: request.leaseUntil,
-            };
-            return { acquired: true, previousLock };
-        },
-        getCurrentLock() {
-            return currentLock;
-        },
-    };
-}
-
-test('concurrent absent competitors allow only one acquire', async () => {
-    const repository = createConcurrentRepository();
-    const service = createService(repository);
-
-    const results = await Promise.all([
-        service.acquire({
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseMs: 30_000,
-        }),
-        service.acquire({
-            node: 'node-a',
-            owner: 'worker-b',
-            operationId: 'operation-b',
-            leaseMs: 30_000,
-        }),
-    ]);
-
-    assert.deepEqual(results.map(result => result.ok).sort(), [false, true]);
-    assert.deepEqual(repository.getCurrentLock(), {
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-    });
-});
-
-test('concurrent expired competitors allow only one replacement', async () => {
-    const repository = createConcurrentRepository({
-        node: 'node-a',
-        owner: 'worker-expired',
-        operationId: 'operation-expired',
-        leaseUntil: new Date('2026-09-21T11:59:59.999Z'),
-    });
-    const service = createService(repository);
-
-    const results = await Promise.all([
-        service.acquire({
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseMs: 30_000,
-        }),
-        service.acquire({
-            node: 'node-a',
-            owner: 'worker-b',
-            operationId: 'operation-b',
-            leaseMs: 30_000,
-        }),
-    ]);
-
-    assert.deepEqual(results.map(result => result.ok).sort(), [false, true]);
-    assert.deepEqual(repository.getCurrentLock(), {
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-    });
-});
-
-test('acquire creates a lease when the node has no lock', async () => {
-    const repository = createRepository();
-    const service = createService(repository);
-
-    const result = await service.acquire({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
-    assert.deepEqual(result, {
-        ok: true,
-        code: RESULT_CODES.ACQUIRED,
-        lock: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-        },
-    });
-});
-
-test('acquire rejects an active lease owned by another operation', async () => {
-    const leaseUntil = new Date('2026-09-21T12:01:00.000Z');
-    const repository = createRepository([{
-        node: 'node-a',
-        owner: 'worker-b',
-        operationId: 'operation-b',
-        leaseUntil,
-    }]);
-    const service = createService(repository);
-
-    const result = await service.acquire({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
-    assert.deepEqual(result, {
-        ok: false,
-        error: {
-            code: RESULT_CODES.CONFLICT,
-            node: 'node-a',
-            owner: 'worker-b',
-            operationId: 'operation-b',
-            leaseUntil,
-        },
-    });
-    assert.equal(repository.calls.filter(call => call.method === 'save').length, 0);
-    assert.equal(repository.calls.filter(call => call.method === 'findByNode').length, 0);
-});
-
-test('acquire replaces an expired lease', async () => {
-    const repository = createRepository([{
-        node: 'node-a',
-        owner: 'worker-b',
-        operationId: 'operation-b',
-        leaseUntil: new Date('2026-09-21T11:59:59.999Z'),
-    }]);
-    const service = createService(repository);
-
-    const result = await service.acquire({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
-    assert.deepEqual(result, {
-        ok: true,
-        code: RESULT_CODES.ACQUIRED,
-        lock: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-        },
-    });
-});
-
-test('acquire renews an active lease for the same owner and operation', async () => {
-    const repository = createRepository([{
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:00:05.000Z'),
-    }]);
-    const service = createService(repository);
-
-    const result = await service.acquire({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
-    assert.deepEqual(result, {
-        ok: true,
-        code: RESULT_CODES.RENEWED,
-        lock: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-        },
-    });
-});
-
-test('renew extends the current unexpired lease with an atomic ownership match', async () => {
-    const repository = createRepository([{
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:00:05.000Z'),
-    }]);
-    const service = createService(repository);
-
-    const result = await service.renew({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
-    assert.deepEqual(result, {
-        ok: true,
-        code: RESULT_CODES.RENEWED,
-        lock: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-        },
-    });
-    assert.deepEqual(repository.calls, [{
-        method: 'renewLease',
-        request: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-            now: NOW,
-            leaseUntil: new Date('2026-09-21T12:00:30.000Z'),
-        },
-    }]);
-});
-
-test('release removes a lease for the matching owner and operation', async () => {
-    const repository = createRepository([{
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
-    }]);
-    const service = createService(repository);
-
-    const result = await service.release({
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-    });
-
-    assert.deepEqual(result, {
-        ok: true,
-        code: RESULT_CODES.RELEASED,
-        node: 'node-a',
-    });
-    assert.deepEqual(repository.calls, [{
-        method: 'deleteOwned',
-        request: {
-            node: 'node-a',
-            owner: 'worker-a',
-            operationId: 'operation-a',
-        },
-    }]);
-});
-
-test('release cannot delete a successor that replaces the predecessor before deletion', async () => {
-    const predecessor = {
-        node: 'node-a',
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
-    };
-    const successor = {
-        node: 'node-a',
-        owner: 'worker-b',
-        operationId: 'operation-b',
-        leaseUntil: new Date('2026-09-21T12:02:00.000Z'),
-    };
-    let currentLock = { ...predecessor };
+function fixture(existing = null) {
+    const rows = new Map(existing ? [[existing.node, { ...existing }]] : []);
     const calls = [];
     const repository = {
-        async findByNode(node) {
-            calls.push({ method: 'findByNode', node });
-            const observedLock = currentLock;
-            currentLock = { ...successor };
-            return observedLock;
+        calls,
+        getRow: (node = 'node-a') => rows.get(node) || null,
+        async acquireLease(input) {
+            calls.push({ method: 'acquireLease', input });
+            const row = rows.get(input.node);
+            if (row) return { acquired: false, currentLock: { ...row } };
+            const inserted = { node: input.node, owner: input.owner, operationId: input.operationId,
+                generation: input.generation, leaseUntil: input.leaseUntil, remoteUncertain: true };
+            rows.set(input.node, inserted);
+            return { acquired: true, lock: { ...inserted } };
         },
-        async deleteByNode(node) {
-            calls.push({ method: 'deleteByNode', node });
-            if (!currentLock || String(currentLock.node) !== String(node)) return false;
-            currentLock = null;
+        async renewLease(input) {
+            calls.push({ method: 'renewLease', input });
+            const row = rows.get(input.node);
+            if (!row || !input.generation || row.generation !== input.generation ||
+                row.owner !== input.owner || row.operationId !== input.operationId ||
+                row.leaseUntil <= input.now) return false;
+            row.leaseUntil = input.leaseUntil;
             return true;
         },
-        async deleteOwned(request) {
-            calls.push({ method: 'deleteOwned', request: { ...request } });
-            currentLock = { ...successor };
-            const matches = String(currentLock.node) === String(request.node)
-                && String(currentLock.owner) === String(request.owner)
-                && String(currentLock.operationId) === String(request.operationId);
-            if (matches) currentLock = null;
-            return matches;
+        async deleteOwned(input) {
+            calls.push({ method: 'deleteOwned', input });
+            const row = rows.get(input.node);
+            if (!row || !input.generation || row.generation !== input.generation ||
+                row.owner !== input.owner || row.operationId !== input.operationId ||
+                row.remoteUncertain !== false) return false;
+            rows.delete(input.node);
+            return true;
         },
     };
-    const service = createService(repository);
+    return { service: new NodeOperationLockService({ repository, clock }), repository };
+}
 
-    const result = await service.release({
-        node: predecessor.node,
-        owner: predecessor.owner,
-        operationId: predecessor.operationId,
-    });
-
-    assert.equal(calls.some(call => call.method === 'findByNode'), false);
-    assert.deepEqual(result, {
-        ok: false,
-        error: {
-            code: RESULT_CODES.NOT_OWNED,
-            node: 'node-a',
-        },
-    });
-    assert.deepEqual(currentLock, successor);
-});
-
-test('release leaves a lease untouched unless owner and operation both match', async t => {
-    const cases = [
-        {
-            name: 'different owner',
-            owner: 'worker-b',
-            operationId: 'operation-a',
-        },
-        {
-            name: 'different operation',
-            owner: 'worker-a',
-            operationId: 'operation-b',
-        },
-    ];
-
-    for (const releaseRequest of cases) {
-        await t.test(releaseRequest.name, async () => {
-            const repository = createRepository([{
-                node: 'node-a',
-                owner: 'worker-a',
-                operationId: 'operation-a',
-                leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
-            }]);
-            const service = createService(repository);
-
-            const result = await service.release({
-                node: 'node-a',
-                owner: releaseRequest.owner,
-                operationId: releaseRequest.operationId,
-            });
-
-            assert.deepEqual(result, {
-                ok: false,
-                error: {
-                    code: RESULT_CODES.NOT_OWNED,
-                    node: 'node-a',
-                },
-            });
-            assert.deepEqual(repository.calls, [{
-                method: 'deleteOwned',
-                request: {
-                    node: 'node-a',
-                    owner: releaseRequest.owner,
-                    operationId: releaseRequest.operationId,
-                },
-            }]);
-            assert.deepEqual(await repository.findByNode('node-a'), {
-                node: 'node-a',
-                owner: 'worker-a',
-                operationId: 'operation-a',
-                leaseUntil: new Date('2026-09-21T12:01:00.000Z'),
-            });
-        });
-    }
-});
-
-test('acquireMany sorts node ids before making repository calls', async () => {
-    const repository = createRepository();
-    const service = createService(repository);
-
-    const result = await service.acquireMany({
-        nodeIds: ['node-c', 'node-a', 'node-b'],
-        owner: 'worker-a',
-        operationId: 'operation-a',
-        leaseMs: 30_000,
-    });
-
+test('acquire returns unique generation and remote-uncertain insert', async () => {
+    const { service, repository } = fixture();
+    const result = await service.acquire(request);
     assert.equal(result.ok, true);
-    assert.equal(result.code, RESULT_CODES.BATCH_ACQUIRED);
-    assert.deepEqual(
-        result.results.map(item => item.lock.node),
-        ['node-a', 'node-b', 'node-c'],
-    );
-    assert.deepEqual(
-        repository.calls
-            .filter(call => call.method === 'acquireLease')
-            .map(call => call.request.node),
-        ['node-a', 'node-b', 'node-c'],
-    );
+    assert.equal(result.code, RESULT_CODES.ACQUIRED);
+    assert.match(result.lock.generation, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.deepEqual(result.lock, repository.getRow());
+    assert.equal(repository.calls[0].input.generation, result.lock.generation);
+    assert.equal(result.lock.remoteUncertain, true);
+    assert.deepEqual(result.lock.leaseUntil, until);
 });
 
-test('lock model stores lease identity and has one unique lock per node', () => {
-    const NodeOperationLock = require('../models/nodeOperationLockModel');
-    const { schema } = NodeOperationLock;
+test('successive admissions get fresh generations, even with same owner', async () => {
+    const { service } = fixture();
+    const first = await service.acquire(request);
+    const other = await fixture().service.acquire(request);
+    assert.notEqual(first.lock.generation, other.lock.generation);
+});
 
-    assert.equal(schema.path('node').instance, 'ObjectId');
-    assert.equal(schema.path('node').options.ref, 'HyNode');
-    assert.equal(schema.path('node').options.required, true);
-    assert.equal(schema.path('owner').instance, 'String');
-    assert.equal(schema.path('owner').options.required, true);
-    assert.equal(schema.path('operationId').instance, 'String');
-    assert.equal(schema.path('operationId').options.required, true);
-    assert.equal(schema.path('leaseUntil').instance, 'Date');
+test('newly acquired generation remains fenced even when its owner requests release', async () => {
+    const { service, repository } = fixture();
+    const acquired = await service.acquire(request);
+    assert.equal(acquired.ok, true);
+    const released = await service.release({ ...identity, generation: acquired.lock.generation });
+    assert.equal(released.ok, false);
+    assert.equal(repository.getRow().remoteUncertain, true);
+    assert.equal((await service.acquire(request)).error.code, RESULT_CODES.CONFLICT);
+    assert.equal(typeof service.markQuiescent, 'undefined');
+});
+
+for (const [name, lock] of [
+    ['expired other owner', { ...identity, owner: 'other', generation, leaseUntil: now, remoteUncertain: true }],
+    ['active same owner', { ...identity, generation, leaseUntil: until, remoteUncertain: true }],
+    ['expired same owner', { ...identity, generation, leaseUntil: now, remoteUncertain: true }],
+    ['legacy', { ...identity, leaseUntil: now }],
+]) {
+    test(`acquire rejects ${name} without reentrant dispatch`, async () => {
+        const { service, repository } = fixture(lock);
+        const result = await service.acquire(request);
+        assert.equal(result.ok, false);
+        assert.equal(result.error.code, RESULT_CODES.CONFLICT);
+        assert.deepEqual(repository.getRow(), lock);
+        assert.equal(repository.calls.length, 1);
+    });
+}
+
+test('renew carries generation and refuses missing or stale token', async () => {
+    const { service, repository } = fixture({ ...identity, generation, leaseUntil: until, remoteUncertain: true });
+    assert.equal((await service.renew(request)).ok, false);
+    assert.equal((await service.renew({ ...request, generation: 'stale' })).ok, false);
+    const result = await service.renew({ ...request, generation });
+    assert.equal(result.ok, true);
+    assert.equal(result.code, RESULT_CODES.RENEWED);
+    assert.equal(result.lock.generation, generation);
+    assert.equal(repository.calls.at(-1).input.generation, generation);
+});
+
+test('release without generation refuses and never invokes deletion', async () => {
+    const { service, repository } = fixture({ ...identity, generation, leaseUntil: until, remoteUncertain: true });
+    const result = await service.release(identity);
+    assert.equal(result.ok, false);
+    assert.equal(repository.calls.length, 0);
+    assert.deepEqual(repository.getRow().generation, generation);
+});
+
+for (const [name, lock] of [
+    ['active uncertain', { ...identity, generation, leaseUntil: until, remoteUncertain: true }],
+    ['expired uncertain', { ...identity, generation, leaseUntil: now, remoteUncertain: true }],
+    ['legacy', { ...identity, leaseUntil: now }],
+]) {
+    test(`release cannot clear ${name}`, async () => {
+        const { service, repository } = fixture(lock);
+        const result = await service.release({ ...identity, generation });
+        assert.equal(result.ok, false);
+        assert.deepEqual(repository.getRow(), lock);
+    });
+}
+
+test('late release with old generation cannot remove a proven successor', async () => {
+    const successor = { ...identity, generation: 'new', remoteUncertain: false, leaseUntil: until };
+    const { service, repository } = fixture(successor);
+    const result = await service.release({ ...identity, generation });
+    assert.equal(result.ok, false);
+    assert.deepEqual(repository.getRow(), successor);
+});
+
+test('only a proven generation is released with a matching token', async () => {
+    const { service, repository } = fixture({ ...identity, generation, remoteUncertain: false, leaseUntil: until });
+    const result = await service.release({ ...identity, generation });
+    assert.equal(result.ok, true);
+    assert.equal(result.code, RESULT_CODES.RELEASED);
+    assert.equal(repository.getRow(), null);
+});
+
+test('acquireMany sorts nodes and reports a blocked duplicate lock', async () => {
+    const { service, repository } = fixture();
+    const result = await service.acquireMany({ nodeIds: ['node-c', 'node-a', 'node-b', 'node-a'],
+        owner: 'worker-a', operationId: 'operation-a', leaseMs: 30_000 });
+    assert.deepEqual(result.results.map(item => item.ok), [true, false, true, true]);
+    assert.equal(result.results[1].error.code, RESULT_CODES.CONFLICT);
+    assert.deepEqual(repository.calls.map(call => call.input.node), ['node-a', 'node-a', 'node-b', 'node-c']);
+});
+
+test('lock schema has mandatory generation and uncertain state plus unique node index', () => {
+    const model = require('../models/nodeOperationLockModel');
+    const { schema } = model;
+    assert.equal(schema.path('generation').options.required, true);
+    assert.equal(schema.path('remoteUncertain').options.required, true);
+    assert.equal(schema.path('remoteUncertain').options.default, undefined);
     assert.equal(schema.path('leaseUntil').options.required, true);
-
-    const nodeIndex = schema.indexes().find(([fields]) => fields.node === 1);
-    assert.ok(nodeIndex, 'node index exists');
-    assert.equal(nodeIndex[1].unique, true);
+    assert.equal(schema.indexes().find(([fields]) => fields.node === 1)[1].unique, true);
 });

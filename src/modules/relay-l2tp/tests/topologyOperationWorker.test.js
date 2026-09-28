@@ -5,6 +5,8 @@ const { createHash } = require('node:crypto');
 const test = require('node:test');
 
 const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
+const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
@@ -448,6 +450,39 @@ test('fresh worker resumes an expired preparing claim from durable candidates on
     assert.equal(repository.calls[0].method, 'claim');
     assert.equal(repository.calls[0].request.operationId, 'operation-1');
     assert.equal(operation.attempts, 1);
+});
+
+test('expired durable node lock stops topology recovery before any executor dispatch', async () => {
+    const operation = durableOperation();
+    operation.status = 'preparing';
+    operation.leaseUntil = new Date(NOW.getTime() - 1);
+    const repository = createRepository(operation);
+    let inserts = 0;
+    const held = { node: 'node-a', owner: 'stopped-process', operationId: 'operation-1',
+        leaseUntil: new Date(NOW.getTime() - 1), remoteUncertain: true, generation: 'old-token' };
+    const lockService = new NodeOperationLockService({
+        repository: new NodeOperationLockRepository({ model: {
+            async create() { inserts += 1; throw Object.assign(new Error('duplicate key'), { code: 11000 }); },
+            findOne() { return { lean: async () => ({ ...held }) }; },
+        } }),
+        clock: { now: () => new Date(NOW) },
+    });
+    let dispatched = 0;
+    const forbidden = async () => { dispatched += 1; throw new Error('unexpected dispatch'); };
+    const worker = createWorker({ repository, lockService,
+        executor: { prepare: forbidden, commit: forbidden, verify: forbidden,
+            cleanupPrepared: forbidden, rollback: forbidden },
+    });
+    for (const attempt of [1, 2]) {
+        operation.leaseUntil = new Date(NOW.getTime() - 1);
+        assert.deepEqual(await worker.run('operation-1'), {
+            claimed: true, operationId: 'operation-1', status: 'preparing',
+            stopped: true, errorCode: 'NODE_OPERATION_LOCK_CONFLICT',
+        }, `attempt ${attempt} must remain blocked`);
+    }
+    assert.equal(inserts, 2);
+    assert.equal(dispatched, 0);
+    assert.equal(held.generation, 'old-token');
 });
 
 test('successful deploy resyncs users before atomic success finalization', async () => {

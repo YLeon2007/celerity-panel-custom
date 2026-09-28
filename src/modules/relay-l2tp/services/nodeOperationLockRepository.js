@@ -19,34 +19,16 @@ class NodeOperationLockRepository {
         return lean(this.model.findOne({ node }));
     }
 
-    async acquireLease({ node, owner, operationId, now, leaseUntil }) {
+    async acquireLease({ node, owner, operationId, generation, leaseUntil }) {
+        if (!generation) throw new TypeError('acquireLease requires generation');
         try {
-            const previousLock = await lean(this.model.findOneAndUpdate(
-                {
-                    node,
-                    $or: [
-                        { leaseUntil: { $lte: now } },
-                        { owner, operationId },
-                    ],
-                },
-                {
-                    $set: {
-                        owner,
-                        operationId,
-                        leaseUntil,
-                    },
-                },
-                {
-                    upsert: true,
-                    new: false,
-                    runValidators: true,
-                    setDefaultsOnInsert: true,
-                },
-            ));
+            const lock = await this.model.create({
+                node, owner, operationId, generation, leaseUntil, remoteUncertain: true,
+            });
 
             return {
                 acquired: true,
-                previousLock,
+                lock: typeof lock.toObject === 'function' ? lock.toObject() : lock,
             };
         } catch (error) {
             if (error?.code !== 11000) throw error;
@@ -58,30 +40,17 @@ class NodeOperationLockRepository {
         }
     }
 
-    save({ node, owner, operationId, leaseUntil }) {
-        return lean(this.model.findOneAndUpdate(
-            { node },
-            {
-                $set: {
-                    owner,
-                    operationId,
-                    leaseUntil,
-                },
-            },
-            {
-                upsert: true,
-                new: true,
-                runValidators: true,
-                setDefaultsOnInsert: true,
-            },
-        ));
+    save() {
+        throw new Error('Unsafe lock save is disabled; use insert-only acquireLease');
     }
 
-    async renewLease({ node, owner, operationId, now, leaseUntil }) {
+    async renewLease({ node, owner, operationId, generation, now, leaseUntil }) {
+        if (!generation) return false;
         const result = await this.model.updateOne({
             node,
             owner,
             operationId,
+            generation,
             leaseUntil: { $gt: now },
         }, {
             $set: { leaseUntil },
@@ -90,18 +59,20 @@ class NodeOperationLockRepository {
         return result.matchedCount === 1;
     }
 
-    async deleteOwned({ node, owner, operationId }) {
+    async deleteOwned({ node, owner, operationId, generation }) {
+        if (!generation) return false;
         const result = await this.model.deleteOne({
             node,
             owner,
             operationId,
+            generation,
+            remoteUncertain: false,
         });
         return result.deletedCount === 1;
     }
 
-    async deleteByNode(node) {
-        const result = await this.model.deleteOne({ node });
-        return result.deletedCount === 1;
+    deleteByNode() {
+        throw new Error('Unsafe lock deleteByNode is disabled');
     }
 }
 
