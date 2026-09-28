@@ -10,13 +10,15 @@ const {
 const TopologyOperation = require('../models/topologyOperationModel');
 const ADMISSION_FINGERPRINT = 'a'.repeat(64);
 
-test('scoped operation identity survives repository creation and strict Mongo schema', async () => {
+test('scoped operation identity survives session-bound repository creation and strict Mongo schema', async () => {
     let stored;
+    const session = { inTransaction: () => true };
     const model = {
-        async create(document) {
-            stored = new TopologyOperation(document);
+        async create(documents, options) {
+            assert.deepEqual(options, { session });
+            stored = new TopologyOperation(documents[0]);
             await stored.validate();
-            return stored;
+            return [stored];
         },
         async findOneAndUpdate() {},
         async updateOne() {},
@@ -31,12 +33,16 @@ test('scoped operation identity survives repository creation and strict Mongo sc
         staged: true,
         linkId: '507f191e810c19729de860ea',
         linkIds: ['507f191e810c19729de860ea'],
+        heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+        session,
     });
     const durable = stored.toObject();
     assert.equal(durable.kind, 'link.apply');
     assert.equal(durable.staged, true);
     assert.equal(durable.linkId, '507f191e810c19729de860ea');
     assert.deepEqual(durable.linkIds, ['507f191e810c19729de860ea']);
+    assert.equal(durable.heldTopologyAdmission, true);
 });
 
 test('strict Mongo schema refuses partially scoped operation identity', async () => {
@@ -170,6 +176,20 @@ function createModel() {
     };
 }
 
+test('createFrozen refuses legacy and scoped operations without a held admission session', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    for (const scope of [{}, {
+        kind: 'link.apply', linkId: 'link-a', linkIds: ['link-a'], staged: false,
+    }]) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], ...scope,
+        }), TypeError);
+    }
+    assert.deepEqual(model.calls, []);
+});
+
 test('createFrozen refuses to claim a held admission without an active session', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
@@ -182,6 +202,17 @@ test('createFrozen refuses to claim a held admission without an active session',
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [],
         admissionFingerprint: ADMISSION_FINGERPRINT,
+    }), TypeError);
+    assert.deepEqual(model.calls, []);
+});
+
+test('createFrozen refuses a session-bound operation without the held admission identity', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7,
+        priorDeployedRevision: 5, nodes: [],
+        session: { inTransaction: () => true },
     }), TypeError);
     assert.deepEqual(model.calls, []);
 });
@@ -320,6 +351,11 @@ test('createFrozen fails closed on malformed session create results without retr
 
 test('createFrozen durably preserves composer deployment order without sorting by node id', async () => {
     const model = createModel();
+    const session = { inTransaction: () => true };
+    model.create = async (documents, options) => {
+        model.calls.push({ method: 'create', documents, options });
+        return documents;
+    };
     const repository = new TopologyOperationRepository({ model });
     const bridgeCandidate = candidate('bridge');
     const portalCandidate = candidate('portal');
@@ -345,6 +381,9 @@ test('createFrozen durably preserves composer deployment order without sorting b
             },
         ],
         secret: 'top-level secret',
+        heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+        session,
     });
 
     const expected = {
@@ -352,6 +391,8 @@ test('createFrozen durably preserves composer deployment order without sorting b
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'queued',
+        heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,
         leaseOwner: '',
         leaseUntil: null,
@@ -381,7 +422,7 @@ test('createFrozen durably preserves composer deployment order without sorting b
         ],
     };
     assert.deepEqual(created, expected);
-    assert.deepEqual(model.calls, [{ method: 'create', document: expected }]);
+    assert.deepEqual(model.calls, [{ method: 'create', documents: [expected], options: { session } }]);
     assert.doesNotMatch(
         JSON.stringify(model.calls),
         /sshPassword|rawShell|tunnelPsk|secret-canary|raw-shell-canary/i,

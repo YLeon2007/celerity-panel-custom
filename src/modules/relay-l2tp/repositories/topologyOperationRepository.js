@@ -177,7 +177,9 @@ class TopologyOperationRepository {
             leaseUntil: null,
             nodes: metadata,
         };
-        if (session === undefined) return this.model.create(document);
+        if (session === undefined) {
+            throw new TypeError('Topology operation requires an active Mongo session');
+        }
         if (!session || typeof session !== 'object'
             || typeof session.inTransaction !== 'function' || session.inTransaction() !== true) {
             throw new TypeError('Topology operation requires an active Mongo session');
