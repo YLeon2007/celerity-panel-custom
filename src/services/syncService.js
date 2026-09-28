@@ -431,9 +431,9 @@ class SyncService {
     }
 
     /**
-     * Topology owns the whole generated Xray config only for connected nodes
-     * while execution is enabled. A prepared portal without an active link
-     * still needs the ordinary config upload on Sync.
+     * Only a confirmed, physically applied link gives topology ownership of
+     * this node's config. A pending draft must not suppress initial Sync;
+     * staged links were applied by the topology runner but are not client-ready.
      */
     async _topologyManagesNode(node) {
         const enabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
@@ -442,6 +442,7 @@ class SyncService {
         const CascadeLink = require('../models/cascadeLinkModel');
         return !!(await CascadeLink.exists({
             active: true,
+            status: { $in: ['staged', 'deployed', 'online'] },
             $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
         }));
     }
@@ -641,6 +642,15 @@ class SyncService {
 
         // Step 2: Restart Xray via Agent (preferred) or SSH fallback
         const hasAgent = !!(node.xray?.agentToken);
+        if (topologyManaged && !hasAgent) {
+            const message = 'topology-managed node has no agent token for user sync';
+            logger.warn(`[Xray Sync] Node ${node.name}: ${message}`);
+            await HyNode.updateOne({ _id: node._id }, {
+                $set: { status: 'error', lastSync: new Date(), lastError: message, healthFailures: 0 },
+            });
+            await invalidateNodesCache();
+            return false;
+        }
         if (!topologyManaged && hasAgent) {
             try {
                 // /restart blocks until Xray is running and users are restored (~2-3s)
@@ -676,6 +686,13 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
             } catch (error) {
                 logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${error.message}`);
+                if (topologyManaged) {
+                    await HyNode.updateOne({ _id: node._id }, {
+                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent user sync failed: ${error.message}`, healthFailures: 0 },
+                    });
+                    await invalidateNodesCache();
+                    return false;
+                }
             }
         }
 

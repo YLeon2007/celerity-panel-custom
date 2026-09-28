@@ -34,13 +34,14 @@ function node(role = 'portal') {
         ssh: { password: 'test' }, xray: { agentToken: 'test', transport: 'tcp', security: 'reality' } };
 }
 
-function stubSync(t, { connected = true } = {}) {
-    const calls = { queries: [], uploads: [], sshConnections: 0, agent: [], generated: 0 };
+function stubSync(t, { connected = true, linkStatuses = ['deployed'] } = {}) {
+    const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0 };
     t.mock.method(CascadeLink, 'exists', async query => {
         calls.queries.push(query);
-        return connected ? { _id: 'link-1' } : null;
+        return connected && linkStatuses.some(status => !query.status || query.status.$in?.includes(status))
+            ? { _id: 'link-1' } : null;
     });
-    t.mock.method(HyNode, 'updateOne', async () => ({}));
+    t.mock.method(HyNode, 'updateOne', async (_query, update) => { calls.updates.push(update); return {}; });
     t.mock.method(CascadeLink, 'find', () => ({ populate: async () => [] }));
     t.mock.method(RelayL2tpState, 'exists', async () => null);
     t.mock.method(nodeSetup, 'reloadCcAgent', async () => {});
@@ -81,21 +82,82 @@ test('connected portal/relay/bridge topology owns full config, never regenerates
     assert.equal(calls.queries.length, 3);
     for (const query of calls.queries) {
         assert.equal(query.active, true);
+        assert.deepEqual(query.status, { $in: ['staged', 'deployed', 'online'] });
         assert.deepEqual(query.$or, [{ portalNode: '507f1f77bcf86cd799439011' }, { bridgeNode: '507f1f77bcf86cd799439011' }]);
     }
 });
 
-test('connected topology node without agent does not fall back to SSH restart', async t => {
+test('managed node without agent fails closed without falling back to SSH restart', async t => {
     const calls = stubSync(t);
     const relay = node('relay');
     delete relay.xray.agentToken;
     await withFlags([true, true, true], async () => {
-        assert.equal(await syncService.updateXrayNodeConfig(relay), true);
+        assert.equal(await syncService.updateXrayNodeConfig(relay), false);
     });
     assert.equal(calls.generated, 0);
     assert.equal(calls.sshConnections, 0);
     assert.deepEqual(calls.uploads, []);
     assert.deepEqual(calls.agent, []);
+    assert.equal(calls.updates.at(-1).$set.status, 'error');
+    assert.match(calls.updates.at(-1).$set.lastError, /no agent token/);
+});
+
+test('managed node with failing user sync fails closed and never reports online', async t => {
+    const calls = stubSync(t);
+    t.mock.method(syncService, '_agentRequest', async () => { throw new Error('agent /sync unavailable'); });
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), false);
+    });
+    assert.equal(calls.generated, 0);
+    assert.equal(calls.sshConnections, 0);
+    assert.deepEqual(calls.uploads, []);
+    assert.equal(calls.updates.at(-1).$set.status, 'error');
+    assert.match(calls.updates.at(-1).$set.lastError, /agent \/sync unavailable/);
+});
+
+test('pending-only prepared portal still receives its initial classic config', async t => {
+    const calls = stubSync(t, { linkStatuses: ['pending'] });
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), true);
+    });
+    assert.equal(calls.generated, 1);
+    assert.equal(calls.uploads.length, 1);
+    assert.equal(calls.uploads[0].path, '/usr/local/etc/xray/config.json');
+    assert.deepEqual(calls.agent.map(c => c.path), ['/restart', '/sync']);
+});
+
+test('a confirmed applied link protects config even with a pending sibling', async t => {
+    const calls = stubSync(t, { linkStatuses: ['pending', 'staged'] });
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), true);
+    });
+    assert.equal(calls.generated, 0);
+    assert.deepEqual(calls.uploads, []);
+    assert.deepEqual(calls.agent.map(c => c.path), ['/sync']);
+});
+
+test('online applied links retain topology ownership', async t => {
+    const calls = stubSync(t, { linkStatuses: ['online'] });
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node('bridge')), true);
+    });
+    assert.equal(calls.generated, 0);
+    assert.deepEqual(calls.uploads, []);
+    assert.deepEqual(calls.agent.map(c => c.path), ['/sync']);
+});
+
+test('legacy classic sync preserves its result on failed agent user sync', async t => {
+    const calls = stubSync(t, { connected: false });
+    t.mock.method(syncService, '_agentRequest', async (_node, _method, path) => {
+        if (path === '/sync') throw new Error('agent /sync unavailable');
+        return { data: {} };
+    });
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), true);
+    });
+    assert.equal(calls.generated, 1);
+    assert.equal(calls.uploads.length, 1);
+    assert.equal(calls.updates.at(-1).$set.status, 'online');
 });
 
 test('prepared unconnected portal keeps ordinary full config upload, restart and user sync', async t => {
