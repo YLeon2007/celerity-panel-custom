@@ -243,9 +243,10 @@ class L2tpService {
                 && String(operation.admissionId) === String(admissionId)
                 && operation.node === operationDocument.node
                 && operation.kind === 'install'
-                && ['queued', 'claimed', 'running'].includes(operation.status)
+                && operation.status === 'queued'
                 && operation.idempotencyKey === operationDocument.idempotencyKey
-                && isDeepStrictEqual(operation.plan, operationDocument.plan)) {
+                && isDeepStrictEqual(operation.plan,
+                    JSON.parse(JSON.stringify(operationDocument.plan)))) {
                 return { operationId };
             }
             if (error?.code === 11000) {

@@ -10,6 +10,47 @@ function admissionError(code) {
 
 const CLAIM_CAS_MISS = new Error('Queued install claim CAS miss');
 
+// The readback is returned to the install service for exact comparison, never
+// to logs. Reject unexpected plan fields instead of copying possible secrets.
+const PLAN_FIELDS = new Set(['ok', 'operationId', 'topologyRevision', 'relayId',
+    'routeGroupId', 'selectedPathKey', 'nextHopNodeId', 'desired', 'steps']);
+const DESIRED_FIELDS = new Set(['clientCidr', 'localAddress', 'poolStart', 'poolEnd',
+    'dnsServers', 'tproxyPort', 'fwmark', 'routeTable', 'credentialRevision']);
+const STEP_FIELDS = new Set(['type', 'artifacts']);
+const ARTIFACT_FIELDS = new Set(['type', 'path']);
+
+function safePlanObject(value, fields) {
+    return value && typeof value === 'object' && !Array.isArray(value)
+        && Object.keys(value).every(key => fields.has(key));
+}
+
+function safeScalar(value) {
+    return typeof value === 'string' || typeof value === 'boolean'
+        || typeof value === 'number' && Number.isFinite(value);
+}
+
+function normalizedInstallPlan(plan) {
+    if (!safePlanObject(plan, PLAN_FIELDS) || plan.ok !== true
+        || typeof plan.operationId !== 'string' || typeof plan.relayId !== 'string'
+        || !Number.isSafeInteger(plan.topologyRevision) || plan.topologyRevision < 0
+        || !['routeGroupId', 'selectedPathKey', 'nextHopNodeId'].every(key =>
+            plan[key] === undefined || typeof plan[key] === 'string')
+        || plan.desired !== undefined && (!safePlanObject(plan.desired, DESIRED_FIELDS)
+            || Object.entries(plan.desired).some(([key, value]) =>
+                key === 'dnsServers' ? !Array.isArray(value)
+                    || !value.every(item => typeof item === 'string') : !safeScalar(value)))
+        || !Array.isArray(plan.steps) || !plan.steps.every(step =>
+            safePlanObject(step, STEP_FIELDS) && typeof step.type === 'string'
+            && (step.artifacts === undefined || Array.isArray(step.artifacts)
+                && step.artifacts.every(artifact => safePlanObject(artifact, ARTIFACT_FIELDS)
+                    && typeof artifact.type === 'string' && typeof artifact.path === 'string')))) {
+        return null;
+    }
+    // Safe shape is fully bounded above. JSON cloning strips prototypes from
+    // lean/Mongoose values without propagating metadata or credential fields.
+    return JSON.parse(JSON.stringify(plan));
+}
+
 function transactionRunnerFor(CascadeTopologyState, RemoteAdmission) {
     const connection = CascadeTopologyState?.db;
     if (!connection || RemoteAdmission?.db !== connection || typeof connection.startSession !== 'function') {
@@ -41,6 +82,65 @@ class RemoteAdmissionRepository {
         this.RemoteAdmission = RemoteAdmission;
         // Optional until the install handoff is explicitly wired by a caller.
         this.L2tpOperation = L2tpOperation;
+    }
+
+    /** Exact counted, still-queued readback for an uncertain queue commit. */
+    async findInstallHandoff({ admissionId, operationId } = {}) {
+        if (typeof admissionId !== 'string' || !admissionId
+            || typeof operationId !== 'string' || !operationId) return null;
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection || this.L2tpOperation?.db !== connection
+            || typeof this.CascadeTopologyState.findOne !== 'function'
+            || typeof this.RemoteAdmission.findOne !== 'function'
+            || typeof this.L2tpOperation?.findOne !== 'function') return null;
+
+        const session = await connection.startSession();
+        try {
+            let handoff;
+            await session.withTransaction(async () => {
+                handoff = await this._readInstallHandoff({ admissionId, operationId, session });
+            }, { readConcern: { level: 'snapshot' } });
+            return handoff;
+        } finally {
+            await session.endSession();
+        }
+    }
+
+    async _readInstallHandoff({ admissionId, operationId, session }) {
+        const gate = await this.CascadeTopologyState.findOne({
+            _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+            remoteDrain: { $exists: false }, replacementReservation: { $exists: false },
+        }).session(session).lean();
+        if (gate?._id !== 'singleton' || typeof gate.remoteAdmissionCount !== 'number'
+            || !Number.isSafeInteger(gate.remoteAdmissionCount) || gate.remoteAdmissionCount <= 0
+            || gate.remoteDrain !== undefined || gate.replacementReservation !== undefined) return null;
+
+        const admission = await this.RemoteAdmission.findOne({ _id: admissionId,
+            kind: 'install', phase: 'queued', operationId }).session(session).lean();
+        if (admission?._id !== admissionId || admission.kind !== 'install'
+            || admission.phase !== 'queued' || admission.operationId !== operationId
+            || admission.leaseOwner !== undefined
+            || typeof admission.nodeId !== 'string' || !admission.nodeId) return null;
+
+        const operation = await this.L2tpOperation.findOne({ _id: operationId,
+            admissionId, kind: 'install', status: 'queued' }).session(session).lean();
+        if (!operation || String(operation._id) !== operationId
+            || String(operation.node) !== admission.nodeId
+            || operation.kind !== 'install' || operation.status !== 'queued'
+            || operation.ownerGeneration !== undefined || operation.attempts !== 0
+            || operation.admissionId !== admissionId
+            || operation.idempotencyKey !== `install:${admission.nodeId}:revision-${operation.plan?.topologyRevision}`) {
+            return null;
+        }
+        const plan = normalizedInstallPlan(operation.plan);
+        if (!plan || plan.operationId !== operationId || plan.relayId !== admission.nodeId) return null;
+        return {
+            admission: { _id: admissionId, nodeId: admission.nodeId, kind: 'install',
+                phase: 'queued', operationId },
+            operation: { _id: operationId, node: admission.nodeId, kind: 'install',
+                status: 'queued', admissionId, idempotencyKey: operation.idempotencyKey, plan },
+        };
     }
 
     async queueInstall({ admissionId, operationDocument } = {}) {
