@@ -27,6 +27,16 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
         default: 0,
         min: 0,
     },
+    // Never infer an absent counter as zero: legacy singleton needs an explicit
+    // audited initialization before standalone remote admissions can begin.
+    remoteAdmissionCount: { type: Number, min: 0 },
+    remoteDrain: {
+        type: new mongoose.Schema({
+            ownerToken: { type: String, required: true },
+            epoch: { type: Number, required: true, min: 1 },
+        }, { _id: false }),
+        default: undefined,
+    },
     replacementReservation: {
         type: new mongoose.Schema({
             ownerToken: { type: String, required: true },

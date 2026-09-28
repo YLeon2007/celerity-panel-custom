@@ -84,6 +84,7 @@ function createL2tpRuntime(dependencies) {
         stateManagementService,
         userManagementService,
         preflightRunner,
+        remoteAdmissionRepository,
         transport,
         transportResolver,
         lockService,
@@ -112,6 +113,7 @@ function createL2tpRuntime(dependencies) {
         planBuilder: buildInstallPlan,
         operationMaterializer,
         preflightRunner,
+        remoteAdmissionRepository,
         clock,
     });
     const executor = new L2tpRemoteExecutor(
@@ -150,6 +152,7 @@ function createL2tpRuntime(dependencies) {
         'planBuilder',
         'operationMaterializer',
         'preflightRunner',
+        'remoteAdmissionRepository',
         'clock',
     ]);
     hideInjectedDependencies(worker, [

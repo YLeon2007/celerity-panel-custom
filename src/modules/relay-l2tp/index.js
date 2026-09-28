@@ -14,6 +14,7 @@ function registerModels({ modelRegistry } = {}) {
         L2tpUser: require('./models/l2tpUserModel'),
         CascadeRouteGroup: require('./models/cascadeRouteGroupModel'),
         CascadeTopologyState: require('./models/cascadeTopologyStateModel'),
+        RemoteAdmission: require('./models/remoteAdmissionModel'),
         L2tpOperation: require('./models/l2tpOperationModel'),
         TopologyOperation: require('./models/topologyOperationModel'),
         NodeOperationLock: require('./models/nodeOperationLockModel'),

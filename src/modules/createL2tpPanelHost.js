@@ -120,6 +120,7 @@ function createL2tpPanelHost({
         CascadeLink: injectedCascadeLink,
         CascadeTopologyState: models.CascadeTopologyState,
         operationModel: models.L2tpOperation,
+        RemoteAdmission: models.RemoteAdmission,
         lockModel: models.NodeOperationLock,
         NodeSSH,
         NodeTransport,

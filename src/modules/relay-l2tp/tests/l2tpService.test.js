@@ -23,6 +23,7 @@ function createService(overrides = {}) {
             persistedPlan: plan,
         })),
         preflightRunner: overrides.preflightRunner || (async () => ({ ok: true, checks: [] })),
+        remoteAdmissionRepository: overrides.remoteAdmissionRepository,
         clock: overrides.clock || { now: () => new Date(NOW) },
     });
 }
@@ -212,17 +213,26 @@ test('preflight validates injected state and delegates to the injected runner', 
     const repositories = createContextRepositories(context);
     const expectedResult = { ok: true, checks: [{ code: 'OS_SUPPORTED', ok: true }] };
     const calls = [];
+    const admissions = [];
     const service = createService({
         ...repositories,
+        remoteAdmissionRepository: {
+            async acquire(request) { admissions.push(['acquire', request]); return 'admission-1'; },
+            async release(id) { admissions.push(['release', id]); },
+            async markRecoveryRequired(id) { admissions.push(['recovery', id]); },
+        },
         preflightRunner: async request => {
             calls.push(request);
+            request.onVerifiedRemoteComplete();
             return expectedResult;
         },
     });
 
     assert.strictEqual(await service.preflight(context.node.id, context.input), expectedResult);
+    assert.deepEqual(admissions, [['acquire', { nodeId: 'relay-1' }], ['release', 'admission-1']]);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0], {
+    assert.equal(typeof calls[0].onVerifiedRemoteComplete, 'function');
+    assert.deepEqual({ ...calls[0], onVerifiedRemoteComplete: undefined }, {
         node: context.node,
         relay: { ...context.node, role: 'relay' },
         state: context.state,
@@ -237,6 +247,7 @@ test('preflight validates injected state and delegates to the injected runner', 
         relayGroupPlan: context.relayGroupPlan,
         topologyRevision: 17,
         input: context.input,
+        onVerifiedRemoteComplete: undefined,
     });
 });
 

@@ -40,6 +40,7 @@ class L2tpService {
         planBuilder,
         operationMaterializer,
         preflightRunner,
+        remoteAdmissionRepository,
         clock,
     }) {
         this.nodeRepository = nodeRepository;
@@ -48,6 +49,7 @@ class L2tpService {
         this.planBuilder = planBuilder;
         this.operationMaterializer = operationMaterializer;
         this.preflightRunner = preflightRunner;
+        this.remoteAdmissionRepository = remoteAdmissionRepository;
         this.clock = clock;
     }
 
@@ -79,9 +81,43 @@ class L2tpService {
     }
 
     async preflight(nodeId, input) {
+        // Standalone preflight admission only. install() has its own preflight
+        // path and is not protected by this first slice; do not enable drain or
+        // replacement acquisition until all remote paths are admitted.
         const context = await this._loadInstallContext(nodeId, input);
-
-        return this.preflightRunner(context);
+        const admissions = this.remoteAdmissionRepository;
+        if (!admissions || typeof admissions.acquire !== 'function'
+            || typeof admissions.release !== 'function'
+            || typeof admissions.markRecoveryRequired !== 'function') {
+            throw new L2tpServiceError('REMOTE_ADMISSION_UNAVAILABLE', 'Remote admission is unavailable');
+        }
+        const id = await admissions.acquire({ nodeId: entityId(context.node) });
+        let verifiedComplete = false;
+        let result;
+        let runnerError;
+        try {
+            result = await this.preflightRunner({ ...context,
+                onVerifiedRemoteComplete: () => { verifiedComplete = true; },
+            });
+        } catch (error) {
+            runnerError = error;
+        }
+        if (verifiedComplete && !runnerError && result
+            && typeof result === 'object' && typeof result.ok === 'boolean'
+            && result.error?.code !== 'PREFLIGHT_RESPONSE_INVALID') {
+            try {
+                await admissions.release(id);
+            } catch (error) {
+                // A failed/ambiguous commit cannot authorize a second release.
+                // The transaction either left the count held or completed once.
+                try { await admissions.markRecoveryRequired(id); } catch { /* already completed or DB down */ }
+                throw error;
+            }
+        } else {
+            await admissions.markRecoveryRequired(id);
+        }
+        if (runnerError) throw runnerError;
+        return result;
     }
 
     async install(nodeId, input) {

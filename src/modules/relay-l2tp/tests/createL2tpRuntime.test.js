@@ -45,6 +45,8 @@ function createDependencies() {
             async disableUser() {},
         },
         preflightRunner: async () => ({ ok: true }),
+        remoteAdmissionRepository: { acquire: async () => 'id', release: async () => {},
+            markRecoveryRequired: async () => {} },
         transport: {
             async uploadRootFile() {},
             async runArtifactCommand() {},
@@ -90,6 +92,7 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.strictEqual(runtime.service.operationRepository, dependencies.operationRepository);
     assert.strictEqual(runtime.service.planBuilder, buildInstallPlan);
     assert.strictEqual(runtime.service.preflightRunner, dependencies.preflightRunner);
+    assert.strictEqual(runtime.service.remoteAdmissionRepository, dependencies.remoteAdmissionRepository);
     assert.strictEqual(runtime.service.clock, dependencies.clock);
     assert.strictEqual(runtime.stateManagementService, dependencies.stateManagementService);
     assert.strictEqual(runtime.userManagementService, dependencies.userManagementService);

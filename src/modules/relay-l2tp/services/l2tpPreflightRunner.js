@@ -147,7 +147,16 @@ class L2tpPreflightRunner {
             return failure('PREFLIGHT_COMMAND_FAILED');
         }
 
-        return sanitizePreflightResult(result) ?? failure('PREFLIGHT_RESPONSE_INVALID');
+        const validated = sanitizePreflightResult(result);
+        if (!validated || validated.error?.code === 'PREFLIGHT_RESPONSE_INVALID') {
+            return failure('PREFLIGHT_RESPONSE_INVALID');
+        }
+        // Only the real runner can attest that the remote command returned a
+        // validated response. Upload/SSH timeouts are never completion evidence.
+        if (typeof context.onVerifiedRemoteComplete === 'function') {
+            context.onVerifiedRemoteComplete();
+        }
+        return validated;
     }
 }
 

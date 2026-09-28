@@ -11,6 +11,7 @@ const { L2tpStateManagementService } = require('../services/l2tpStateManagementS
 const { L2tpUserManagementService } = require('../services/l2tpUserManagementService');
 const { L2tpUserSyncReconciler } = require('../services/l2tpUserSyncReconciler');
 const { L2tpUserSyncRepository } = require('../repositories/l2tpUserSyncRepository');
+const { RemoteAdmissionRepository } = require('../repositories/remoteAdmissionRepository');
 const { L2tpUserResolver } = require('../services/l2tpUserResolver');
 const { L2tpSimpleService } = require('../services/l2tpSimpleService');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
@@ -141,6 +142,8 @@ function assertActiveExecutionDependencies({
     RelayL2tpState,
     L2tpUser,
     CascadeRouteGroup,
+    CascadeTopologyState,
+    RemoteAdmission,
     operationModel,
     lockModel,
     NodeSSH,
@@ -168,6 +171,8 @@ function assertActiveExecutionDependencies({
         RelayL2tpState,
         L2tpUser,
         CascadeRouteGroup,
+        CascadeTopologyState,
+        RemoteAdmission,
         operationModel,
         lockModel,
     })) {
@@ -220,6 +225,7 @@ function createL2tpExecutionRuntime({
     CascadeRouteGroup,
     CascadeLink,
     CascadeTopologyState,
+    RemoteAdmission,
     operationModel,
     lockModel,
     NodeSSH,
@@ -267,6 +273,8 @@ function createL2tpExecutionRuntime({
         RelayL2tpState,
         L2tpUser,
         CascadeRouteGroup,
+        CascadeTopologyState,
+        RemoteAdmission,
         operationModel,
         lockModel,
         NodeSSH,
@@ -364,6 +372,10 @@ function createL2tpExecutionRuntime({
         return { ...secrets, users };
     };
     const lockRepository = new NodeOperationLockRepository({ model: lockModel });
+    const remoteAdmissionRepository = new RemoteAdmissionRepository({
+        CascadeTopologyState,
+        RemoteAdmission,
+    });
     const lockService = new NodeOperationLockService({
         repository: lockRepository,
         clock,
@@ -371,6 +383,7 @@ function createL2tpExecutionRuntime({
     const runtime = createRuntime({
         ...runtimeDependencies,
         preflightRunner,
+        remoteAdmissionRepository,
         candidateService,
         transportResolver,
         operationMaterializer,

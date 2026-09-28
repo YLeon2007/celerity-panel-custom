@@ -132,8 +132,13 @@ function createActiveHost(overrides = {}) {
             throw new Error('not used while listing users');
         },
     };
+    const admissionGate = overrides.admissionReady === true ? { remoteAdmissionCount: 0 } : null;
+    const admissionRecords = new Map();
     const testSession = { id: 'active-runtime-state-fence' };
-    const db = { transaction: work => work(testSession) };
+    const admissionSession = {
+        withTransaction: async work => work(), endSession: async () => {},
+    };
+    const db = { transaction: work => work(testSession), startSession: async () => admissionSession };
     RelayL2tpState.db = db;
     const models = {
         RelayL2tpState,
@@ -147,6 +152,19 @@ function createActiveHost(overrides = {}) {
         CascadeTopologyState: {
             modelName: 'CascadeTopologyState',
             db,
+            async updateOne(filter, update, options) {
+                calls.push({ kind: 'CascadeTopologyState.updateOne', filter, update, options });
+                assert.strictEqual(options.session, admissionSession);
+                // Legacy singleton has no remoteAdmissionCount; Mongo's $gte:0 cannot match it.
+                if (!admissionGate || filter.remoteAdmissionCount?.$gte !== undefined
+                    && admissionGate.remoteAdmissionCount < filter.remoteAdmissionCount.$gte
+                    || filter.remoteAdmissionCount?.$gt !== undefined
+                    && admissionGate.remoteAdmissionCount <= filter.remoteAdmissionCount.$gt) {
+                    return { matchedCount: 0 };
+                }
+                admissionGate.remoteAdmissionCount += update.$inc.remoteAdmissionCount;
+                return { matchedCount: 1 };
+            },
             findById(id) {
                 calls.push({ kind: 'CascadeTopologyState.findById', id });
                 return queryResult({ stateTransitionRevision: 0 }, calls, 'CascadeTopologyState');
@@ -154,6 +172,20 @@ function createActiveHost(overrides = {}) {
             findOneAndUpdate(filter, update, options) {
                 calls.push({ kind: 'CascadeTopologyState.findOneAndUpdate', filter, update, options });
                 return queryResult({ stateTransitionRevision: 1 }, calls, 'CascadeTopologyState');
+            },
+        },
+        RemoteAdmission: { db,
+            async create(documents, options) {
+                assert.strictEqual(options.session, admissionSession);
+                if (!admissionGate) throw new Error('blocked admission must not create a record');
+                for (const document of documents) admissionRecords.set(document._id, { ...document });
+            },
+            async updateOne(filter, update, options) {
+                assert.strictEqual(options.session, admissionSession);
+                const record = admissionRecords.get(filter._id);
+                if (!record || record.phase !== filter.phase) return { matchedCount: 0 };
+                Object.assign(record, update.$set);
+                return { matchedCount: 1 };
             },
         },
         L2tpOperation: { modelName: 'L2tpOperation' },
@@ -310,6 +342,8 @@ function createActiveHost(overrides = {}) {
     });
 
     return {
+        admissionGate,
+        admissionRecords,
         calls,
         candidateDependencies: {
             configGenerator: generateXrayConfig,
@@ -377,6 +411,9 @@ test('explicit complete activation wires execution factories lazily and starts o
             'stateReconciler',
         ],
     );
+    assert.strictEqual(host.runtime.service.remoteAdmissionRepository,
+        runtimeCalls[0].remoteAdmissionRepository);
+    assert.equal(typeof runtimeCalls[0].remoteAdmissionRepository.acquire, 'function');
     assert.equal(preflightFactoryCalls.length, 1);
     assert.strictEqual(
         preflightFactoryCalls[0].transportResolver,
@@ -514,51 +551,50 @@ test('explicit complete activation wires execution factories lazily and starts o
     ]);
 });
 
-test('active preflight resolves transport only on demand without operations, secrets, or candidates', async () => {
+test('active preflight fails closed at admission before transport on a missing singleton', async () => {
     const { calls, host } = createActiveHost();
-
     assert.deepEqual(calls, []);
     assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
+    // The assembled legacy singleton lacks a remote admission counter;
+    // it must refuse before transport rather than inventing an empty gate.
+    await assert.rejects(host.runtime.service.preflight('node-a', {
+        routeGroupId: 'group-a', expectedTopologyRevision: 17,
+    }), { code: 'REMOTE_ADMISSION_BLOCKED' });
+    assert.deepEqual(calls.filter(call => call.kind === 'CascadeTopologyState.updateOne').map(call => ({
+        filter: call.filter, update: call.update,
+    })), [{
+        filter: { _id: 'singleton', remoteDrain: { $exists: false },
+            replacementReservation: { $exists: false }, remoteAdmissionCount: { $gte: 0 } },
+        update: { $inc: { remoteAdmissionCount: 1 } },
+    }]);
+    assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 0);
+    assert.equal(calls.filter(call => call.kind === 'NodeSSH.exec').length, 0);
+    assert.equal(calls.some(call => call.kind === 'operationRepository.create'), false);
+});
 
+test('active preflight with admission reaches upload and retains an uncertain response', async () => {
+    const { calls, host, admissionRecords, admissionGate } = createActiveHost({ admissionReady: true });
     const result = await host.runtime.service.preflight('node-a', {
-        routeGroupId: 'group-a',
-        expectedTopologyRevision: 17,
+        routeGroupId: 'group-a', expectedTopologyRevision: 17,
     });
-
-    assert.deepEqual(result, {
-        ok: false,
-        checks: [],
-        error: { code: 'PREFLIGHT_RESPONSE_INVALID' },
-    });
-    assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 1);
+    assert.deepEqual(result, { ok: false, checks: [], error: { code: 'PREFLIGHT_RESPONSE_INVALID' } });
+    assert.equal(admissionGate.remoteAdmissionCount, 1);
+    assert.equal([...admissionRecords.values()][0].phase, 'recovery_required');
     const remoteCalls = calls.filter(call => call.kind === 'NodeSSH.exec');
     assert.equal(remoteCalls.length, 3);
-    assert.deepEqual(remoteCalls[0], {
-        kind: 'NodeSSH.exec', command: INSPECT_COMMAND, options: undefined,
-    });
-    const upload = remoteCalls[1];
-    const match = upload.command.match(/^\/usr\/local\/bin\/celerity-l2tp-artifact-receiver --operation-id (preflight-[0-9a-f]{24}) --artifact-name desired\.json$/);
-    assert.ok(match, 'preflight uploads desired.json through the fixed receiver');
-    assert.equal(upload.options.stdin.endsWith('\n'), true);
-    assert.deepEqual(JSON.parse(upload.options.stdin), {
-        clientCidr: '10.77.0.0/24',
-        localAddress: '10.77.0.1',
-        poolStart: '10.77.0.10',
-        poolEnd: '10.77.0.200',
-        dnsServers: ['1.1.1.1'],
-        tproxyPort: 12345,
-        fwmark: 77,
-        routeTable: 177,
+    assert.equal(remoteCalls[0].command, INSPECT_COMMAND);
+    const match = remoteCalls[1].command.match(/^\/usr\/local\/bin\/celerity-l2tp-artifact-receiver --operation-id (preflight-[0-9a-f]{24}) --artifact-name desired\.json$/);
+    assert.ok(match);
+    assert.deepEqual(JSON.parse(remoteCalls[1].options.stdin), {
+        clientCidr: '10.77.0.0/24', localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10', poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1'], tproxyPort: 12345, fwmark: 77, routeTable: 177,
     });
     assert.deepEqual(remoteCalls[2], {
         kind: 'NodeSSH.exec',
         command: `/usr/local/bin/celerity-l2tp-artifact-runner --operation-id ${match[1]} --command preflight`,
         options: { timeout: 120000 },
     });
-    assert.equal(calls.some(call => call.kind === 'operationRepository.create'), false);
-    assert.equal(calls.some(call => call.kind === 'secretBox.decrypt'), false);
-    assert.equal(calls.some(call => call.kind === 'candidateNodeResolver'), false);
-    assert.equal(calls.some(call => call.kind === 'candidateUserResolver'), false);
 });
 
 test('active worker reconciler persists verified install state through the management service', async () => {
