@@ -9,6 +9,7 @@ function admissionError(code) {
 }
 
 const CLAIM_CAS_MISS = new Error('Queued install claim CAS miss');
+const SYNC_CLAIM_CAS_MISS = new Error('Queued sync_users claim CAS miss');
 
 // The readback is returned to the install service for exact comparison, never
 // to logs. Reject unexpected plan fields instead of copying possible secrets.
@@ -68,6 +69,29 @@ function transactionRunnerFor(CascadeTopologyState, RemoteAdmission) {
     };
 }
 
+// withTransaction may retry a callback or an uncertain commit. A counted
+// first claim must make one attempt with one stable admission identity.
+function oneShotTransactionRunnerFor(connection) {
+    return async work => {
+        const session = await connection.startSession();
+        let commitStarted = false;
+        try {
+            session.startTransaction();
+            const value = await work(session);
+            commitStarted = true;
+            await session.commitTransaction();
+            return value;
+        } catch (error) {
+            if (!commitStarted) {
+                try { await session.abortTransaction(); } catch { /* preserve original failure */ }
+            }
+            throw error;
+        } finally {
+            await session.endSession();
+        }
+    };
+}
+
 class RemoteAdmissionRepository {
     constructor({ CascadeTopologyState, RemoteAdmission, L2tpOperation, transactionRunner } = {}) {
         if (typeof CascadeTopologyState?.updateOne !== 'function'
@@ -77,6 +101,8 @@ class RemoteAdmissionRepository {
         }
         // No non-transaction fallback: even injected test runners must be explicit.
         this.transactionRunner = transactionRunner ?? transactionRunnerFor(CascadeTopologyState, RemoteAdmission);
+        this.syncClaimRunner = transactionRunner ?? (CascadeTopologyState?.db?.startSession
+            ? oneShotTransactionRunnerFor(CascadeTopologyState.db) : null);
         if (typeof this.transactionRunner !== 'function') throw new TypeError('Remote admission requires transactions');
         this.CascadeTopologyState = CascadeTopologyState;
         this.RemoteAdmission = RemoteAdmission;
@@ -255,6 +281,70 @@ class RemoteAdmissionRepository {
             // Throwing inside the transaction (rather than returning null) is
             // essential: an admission CAS miss must roll back the operation write.
             if (error === CLAIM_CAS_MISS) return null;
+            throw error;
+        }
+    }
+
+    /** Dormant DB-only first claim; no worker or release path uses this yet. */
+    async claimQueuedSyncUsers({ owner, leaseMs, now } = {}) {
+        if (typeof owner !== 'string' || !owner.trim()
+            || !Number.isSafeInteger(leaseMs) || leaseMs <= 0
+            || !(now instanceof Date) || !Number.isFinite(now.getTime())
+            || !Number.isFinite(now.getTime() + leaseMs)) {
+            throw new TypeError('Invalid queued sync_users claim');
+        }
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection || this.L2tpOperation?.db !== connection
+            || typeof this.L2tpOperation.findOne !== 'function'
+            || typeof this.L2tpOperation.updateOne !== 'function'
+            || typeof this.RemoteAdmission.create !== 'function'
+            || typeof this.CascadeTopologyState.updateOne !== 'function') {
+            throw new TypeError('Queued sync_users claim requires three models on one transactional Mongo connection');
+        }
+
+        const admissionId = randomUUID();
+        const leaseUntil = new Date(now.getTime() + leaseMs);
+        try {
+            return await this.syncClaimRunner(async session => {
+                const candidate = await this.L2tpOperation.findOne({
+                    status: 'queued', kind: 'sync_users', admissionId: { $exists: false },
+                    ownerGeneration: { $exists: false },
+                }).sort({ createdAt: 1, _id: 1 }).session(session).lean();
+                if (!candidate) return null;
+                if (!Number.isSafeInteger(candidate.attempts) || candidate.attempts < 0
+                    || candidate.attempts >= Number.MAX_SAFE_INTEGER) return null;
+
+                // The singleton CAS serializes concurrent admissions and excludes
+                // drain/reservation. A later CAS/insert failure aborts the count.
+                const gate = await this.CascadeTopologyState.updateOne({
+                    _id: 'singleton', remoteDrain: { $exists: false },
+                    replacementReservation: { $exists: false },
+                    remoteAdmissionCount: { $gte: 0 },
+                }, { $inc: { remoteAdmissionCount: 1 } }, { session });
+                if (gate.matchedCount !== 1) return null;
+                const changed = await this.L2tpOperation.updateOne({
+                    _id: candidate._id, node: candidate.node, kind: 'sync_users',
+                    status: 'queued', admissionId: { $exists: false },
+                    ownerGeneration: { $exists: false }, attempts: candidate.attempts,
+                }, { $set: { status: 'running', admissionId, leaseOwner: owner,
+                    leaseUntil, ownerGeneration: 1 }, $inc: { attempts: 1 } },
+                { session, runValidators: true });
+                if (changed.matchedCount !== 1) throw SYNC_CLAIM_CAS_MISS;
+                await this.RemoteAdmission.create([{
+                    _id: admissionId, kind: 'sync_users', phase: 'running',
+                    operationId: String(candidate._id), nodeId: String(candidate.node),
+                    ownerGeneration: 1, leaseOwner: owner,
+                }], { session });
+                return { ...candidate, status: 'running', admissionId,
+                    leaseOwner: owner, leaseUntil, attempts: candidate.attempts + 1,
+                    ownerGeneration: 1 };
+            });
+        } catch (error) {
+            if (error === SYNC_CLAIM_CAS_MISS) return null;
+            // An ambiguous commit may already have persisted the admission.
+            // Expose its identity; never retry or release on the caller's behalf.
+            if (error && typeof error === 'object') error.admissionId = admissionId;
             throw error;
         }
     }

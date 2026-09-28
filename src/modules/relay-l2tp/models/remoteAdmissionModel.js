@@ -7,12 +7,16 @@ const mongoose = require('mongoose');
 const remoteAdmissionSchema = new mongoose.Schema({
     _id: { type: String, required: true },
     nodeId: { type: String, required: true },
-    kind: { type: String, enum: ['standalone_preflight', 'install'], required: true },
+    kind: { type: String, enum: ['standalone_preflight', 'install', 'sync_users'], required: true },
     phase: { type: String, enum: ['running', 'queued', 'recovery_required', 'completed'], required: true },
     operationId: { type: String },
-    // Only populated by the queued-install claim; older running admissions stay valid.
+    // Populated by counted queued claims; older running admissions stay valid.
     leaseOwner: { type: String },
     ownerGeneration: { type: Number, required: true, min: 1 },
 }, { timestamps: true, strict: 'throw' });
+
+// Scope uniqueness to new sync_users admissions: legacy install rows need no migration.
+remoteAdmissionSchema.index({ operationId: 1 }, { unique: true,
+    partialFilterExpression: { kind: 'sync_users', operationId: { $type: 'string' } } });
 
 module.exports = mongoose.model('RemoteAdmission', remoteAdmissionSchema);
