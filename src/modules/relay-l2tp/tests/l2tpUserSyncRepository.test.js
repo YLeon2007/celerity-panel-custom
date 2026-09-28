@@ -244,6 +244,124 @@ test('atomically fences operation and relay state before reconciling enabled and
     })));
 });
 
+test('claimed finalization guards owner generation in the transactional operation CAS before state or user writes', async () => {
+    const { repository, trace } = createHarness();
+    const result = await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration: 2 }));
+
+    assert.deepEqual(result, {
+        operationId: 'operation-17',
+        reconciledUserCount: 2,
+        finalizedAt: NOW,
+    });
+    const operationCas = trace.find(entry => entry.label === 'operation.cas');
+    assert.deepEqual(operationCas.filter, {
+        _id: 'operation-17',
+        node: 'relay-1',
+        kind: 'sync_users',
+        status: 'running',
+        leaseOwner: 'worker-1',
+        leaseUntil: { $gt: NOW },
+        ownerGeneration: 2,
+        'plan.operationId': 'operation-17',
+        'plan.relayId': 'relay-1',
+        'plan.desired.credentialRevision': 9,
+    });
+    assert.equal(operationCas.options.session, SESSION);
+    assert.equal(trace.at(-1).label, 'transaction.commit');
+    assert.equal(trace.filter(entry => entry.label === 'state.cas').length, 1);
+    assert.equal(trace.filter(entry => entry.label === 'users.bulkWrite').length, 1);
+});
+
+test('claimed operation CAS rolls back if state CAS rejects, with no user writes', async () => {
+    const { repository, trace } = createHarness({
+        RelayL2tpState: {
+            findOneAndUpdate(filter, update, options) {
+                trace.push({ label: 'state.cas', filter, update, options });
+                return nullQuery();
+            },
+        },
+    });
+    assert.equal(await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration: 2 })), null);
+    assert.deepEqual(trace.map(entry => entry.label), [
+        'transaction.begin', 'operation.cas', 'operation.select', 'operation.lean',
+        'state.cas', 'transaction.abort',
+    ]);
+    assert.equal(trace.some(entry => entry.label === 'transaction.commit'), false);
+    assert.equal(trace.some(entry => entry.label === 'users.find' || entry.label === 'users.bulkWrite'), false);
+});
+
+test('claimed finalization rejects the same worker with a stale generation and aborts without state or user writes', async () => {
+    const { repository, trace } = createHarness({
+        L2tpOperation: {
+            findOneAndUpdate(filter, update, options) {
+                trace.push({ label: 'operation.cas', filter, update, options });
+                // The persisted claim has moved to generation 3, but retained the same worker ID.
+                return filter.ownerGeneration === 3 ? queryReturning({}, trace, 'operation') : nullQuery();
+            },
+        },
+    });
+
+    const result = await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration: 2 }));
+    assert.equal(result, null);
+    assert.deepEqual(trace.map(entry => entry.label), [
+        'transaction.begin', 'operation.cas', 'transaction.abort',
+    ]);
+    assert.equal(trace.find(entry => entry.label === 'operation.cas').filter.leaseOwner, 'worker-1');
+});
+
+test('claimed finalization cannot match a legacy persisted operation without owner generation', async () => {
+    const { repository, trace } = createHarness({
+        L2tpOperation: {
+            findOneAndUpdate(filter, update, options) {
+                trace.push({ label: 'operation.cas', filter, update, options });
+                // Legacy persisted operation has no ownerGeneration field.
+                return filter.ownerGeneration === undefined
+                    ? queryReturning({}, trace, 'operation') : nullQuery();
+            },
+        },
+    });
+    assert.equal(await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration: 2 })), null);
+    assert.deepEqual(trace.map(entry => entry.label), [
+        'transaction.begin', 'operation.cas', 'transaction.abort',
+    ]);
+});
+
+test('claimed finalization rejects an expired lease before state or user writes', async () => {
+    const { repository, trace } = createHarness({
+        L2tpOperation: {
+            findOneAndUpdate(filter, update, options) {
+                trace.push({ label: 'operation.cas', filter, update, options });
+                const persistedLeaseUntil = new Date('2026-09-22T09:59:59.000Z');
+                return persistedLeaseUntil > filter.leaseUntil?.$gt
+                    ? queryReturning({}, trace, 'operation') : nullQuery();
+            },
+        },
+    });
+
+    assert.equal(await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration: 2 })), null);
+    assert.deepEqual(trace.map(entry => entry.label), [
+        'transaction.begin', 'operation.cas', 'transaction.abort',
+    ]);
+    assert.deepEqual(trace.find(entry => entry.label === 'operation.cas').filter.leaseUntil, { $gt: NOW });
+});
+
+test('claimed finalization rejects absent or malformed counted identities before any transaction', async () => {
+    for (const ownerGeneration of [undefined, null, 0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1]) {
+        const { repository, trace } = createHarness();
+        assert.equal(await repository.finalizeClaimedVerifiedSync(finalizeRequest({ ownerGeneration })), null);
+        assert.deepEqual(trace, [], String(ownerGeneration));
+    }
+    const { repository, trace } = createHarness();
+    assert.equal(await repository.finalizeClaimedVerifiedSync(finalizeRequest({ workerId: '', ownerGeneration: 2 })), null);
+    assert.deepEqual(trace, []);
+});
+
+test('legacy finalization cannot silently downgrade an explicitly counted request', async () => {
+    const { repository, trace } = createHarness();
+    assert.equal(await repository.finalizeVerifiedSync(finalizeRequest({ ownerGeneration: 2 })), null);
+    assert.deepEqual(trace, []);
+});
+
 test('accepts an idempotent retry when every guarded user still matches but no row changes', async () => {
     let attempts = 0;
     const { repository, trace } = createHarness({

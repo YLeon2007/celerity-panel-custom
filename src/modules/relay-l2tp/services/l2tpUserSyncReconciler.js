@@ -81,14 +81,29 @@ class L2tpUserSyncReconciler {
         this.clock = clock;
     }
 
-    async finalizeVerifiedSync({ operation, resolvedUsers, verification, workerId } = {}) {
+    async finalizeVerifiedSync(request = {}) {
+        if (request && Object.hasOwn(request, 'ownerGeneration')) return finalizeRejected();
+        return this._finalizeVerifiedSync(request, false);
+    }
+
+    async finalizeClaimedVerifiedSync(request = {}) {
+        if (!Number.isSafeInteger(request?.ownerGeneration) || request.ownerGeneration < 1) {
+            return finalizeRejected();
+        }
+        return this._finalizeVerifiedSync(request, true);
+    }
+
+    async _finalizeVerifiedSync({ operation, resolvedUsers, verification, workerId, ownerGeneration } = {}, claimed) {
         try {
             const snapshot = operationSnapshot(operation);
-            const finalized = await this.repository.finalizeVerifiedSync({
+            const repositoryMethod = claimed ? 'finalizeClaimedVerifiedSync' : 'finalizeVerifiedSync';
+            if (typeof this.repository[repositoryMethod] !== 'function') return finalizeRejected();
+            const finalized = await this.repository[repositoryMethod]({
                 ...snapshot,
                 resolvedUsers: resolvedUsers.map(secretFreeUserSnapshot),
                 verification: safeVerification(verification),
                 workerId,
+                ...(claimed ? { ownerGeneration } : {}),
                 now: this.clock.now(),
             });
             return safeSuccess(finalized, snapshot.operationId, resolvedUsers.length)

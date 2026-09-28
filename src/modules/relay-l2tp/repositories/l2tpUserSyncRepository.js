@@ -147,6 +147,17 @@ class L2tpUserSyncRepository {
     }
 
     async finalizeVerifiedSync(request) {
+        // Legacy worker path is deliberately separate from counted finalization.
+        if (request && Object.hasOwn(request, 'ownerGeneration')) return null;
+        return this._finalizeVerifiedSync(request, null);
+    }
+
+    async finalizeClaimedVerifiedSync(request) {
+        if (!positiveRevision(request?.ownerGeneration)) return null;
+        return this._finalizeVerifiedSync(request, request.ownerGeneration);
+    }
+
+    async _finalizeVerifiedSync(request, ownerGeneration) {
         try {
             assertRequest(request);
             const operationId = entityId(request.operationId);
@@ -171,6 +182,7 @@ class L2tpUserSyncRepository {
                         status: 'running',
                         leaseOwner: workerId,
                         leaseUntil: { $gt: now },
+                        ...(ownerGeneration === null ? {} : { ownerGeneration }),
                         'plan.operationId': operationId,
                         'plan.relayId': relayNode,
                         'plan.desired.credentialRevision': credentialRevision,

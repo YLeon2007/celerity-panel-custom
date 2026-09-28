@@ -131,6 +131,72 @@ test('finalizeVerifiedSync passes a secret-free snapshot to atomic persistence a
     );
 });
 
+test('claimed finalization passes explicit generation and secret-free snapshots only to the protected repository method', async () => {
+    const calls = [];
+    const reconciler = new L2tpUserSyncReconciler({
+        repository: {
+            async finalizeVerifiedSync() { throw new Error('legacy method must not run'); },
+            async finalizeClaimedVerifiedSync(request) {
+                calls.push(request);
+                return {
+                    operationId: request.operationId,
+                    reconciledUserCount: request.resolvedUsers.length,
+                    finalizedAt: request.now,
+                    password: 'do-not-return',
+                };
+            },
+        },
+        clock: { now: () => NOW },
+    });
+
+    assert.deepEqual(await reconciler.finalizeClaimedVerifiedSync({
+        operation: runningOperation({ ownerGeneration: 99, password: 'operation-secret' }),
+        resolvedUsers: resolvedUsers(),
+        verification: verifiedAttestation({ rawCommand: 'private-command' }),
+        workerId: 'worker-1',
+        ownerGeneration: 2,
+    }), {
+        ok: true,
+        operationId: 'operation-17',
+        reconciledUserCount: 2,
+        finalizedAt: NOW,
+    });
+    assert.deepEqual(calls, [{
+        operationId: 'operation-17',
+        relayNode: 'relay-1',
+        credentialRevision: 9,
+        resolvedUsers: resolvedUsers().map(({ id, relayNode, login, ip, enabled, desiredRevision }) => ({
+            id, relayNode, login, ip, enabled, desiredRevision,
+        })),
+        verification: verifiedAttestation(),
+        workerId: 'worker-1',
+        ownerGeneration: 2,
+        now: NOW,
+    }]);
+    assert.doesNotMatch(JSON.stringify(calls), /password|private-command|operation-secret/);
+});
+
+test('claimed wrapper fails closed on missing generation, missing protected method, and legacy downgrade', async () => {
+    let calls = 0;
+    const repository = {
+        async finalizeVerifiedSync() { calls += 1; return { operationId: 'operation-17', reconciledUserCount: 2, finalizedAt: NOW }; },
+    };
+    const reconciler = new L2tpUserSyncReconciler({ repository, clock: { now: () => NOW } });
+    const request = {
+        operation: runningOperation({ ownerGeneration: 2 }),
+        resolvedUsers: resolvedUsers(),
+        verification: verifiedAttestation(),
+        workerId: 'worker-1',
+    };
+    for (const ownerGeneration of [undefined, null, 0, '2', 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        const result = await reconciler.finalizeClaimedVerifiedSync({ ...request, ownerGeneration });
+        assert.equal(result.error.code, 'L2TP_USER_SYNC_FINALIZE_REJECTED');
+    }
+    assert.equal((await reconciler.finalizeClaimedVerifiedSync({ ...request, ownerGeneration: 2 })).ok, false);
+    assert.equal((await reconciler.finalizeVerifiedSync({ ...request, ownerGeneration: 2 })).ok, false);
+    assert.equal(calls, 0);
+});
+
 test('returns one fixed sanitized failure for rejected or failed atomic finalization', async () => {
     const expectedFailure = {
         ok: false,
