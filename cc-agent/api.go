@@ -110,10 +110,12 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "Bad request: "+err.Error())
 		return
 	}
-	if !a.userStore.acceptingMutations() {
+	lease := a.userStore.admitMutation()
+	if lease == nil {
 		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
 		return
 	}
+	defer lease.Done()
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -153,12 +155,9 @@ func (a *API) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !a.userStore.Sync(req.Users) {
-		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
-		return
-	}
+	lease.Sync(req.Users)
 	a.persister.MarkDirty()
-	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
+	a.userStore.SaveAsync() // Stop's final snapshot covers closed write admission.
 
 	log.Printf("[sync] Done: +%d -%d errors=%d total=%d", added, removed, errors, len(req.Users))
 	jsonOK(w, map[string]any{
@@ -180,10 +179,12 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "id and email are required")
 		return
 	}
-	if !a.userStore.acceptingMutations() {
+	lease := a.userStore.admitMutation()
+	if lease == nil {
 		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
 		return
 	}
+	defer lease.Done()
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -194,22 +195,21 @@ func (a *API) handleAddUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !a.userStore.Add(&u) {
-		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
-		return
-	}
+	lease.Add(&u)
 	a.persister.MarkDirty()
-	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
+	a.userStore.SaveAsync() // Stop's final snapshot covers closed write admission.
 
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
 // DELETE /users/{email} — remove a single user
 func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
-	if !a.userStore.acceptingMutations() {
+	lease := a.userStore.admitMutation()
+	if lease == nil {
 		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
 		return
 	}
+	defer lease.Done()
 	email := r.PathValue("email")
 	if email == "" {
 		jsonErr(w, http.StatusBadRequest, "email is required")
@@ -224,12 +224,9 @@ func (a *API) handleRemoveUser(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[api] RemoveUser %s: %v", email, err)
 	}
 
-	if !a.userStore.Remove(email) {
-		jsonErr(w, http.StatusServiceUnavailable, "user store stopped")
-		return
-	}
+	lease.Remove(email)
 	a.persister.MarkDirty()
-	a.userStore.SaveAsync() // Stop's final snapshot covers a concurrent rejection.
+	a.userStore.SaveAsync() // Stop's final snapshot covers closed write admission.
 
 	jsonOK(w, map[string]string{"status": "ok"})
 }

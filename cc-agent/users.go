@@ -32,6 +32,7 @@ type UserStore struct {
 	stopDone  chan struct{}
 	stopErr   error
 	pending   sync.WaitGroup             // admitted Save calls, including unscheduled async calls
+	mutations sync.WaitGroup             // HTTP mutations admitted before Stop's fence
 	writeMu   sync.Mutex                 // serialize snapshots and disk writes together
 	writeFile func(string, []byte) error // test seam at the actual disk write
 }
@@ -42,6 +43,45 @@ func (s *UserStore) acceptingMutations() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return !s.stopped
+}
+
+// admitMutation leases the entire HTTP -> Xray -> store -> persister operation.
+// Stop closes admission under mu before waiting, so WaitGroup.Add cannot race
+// with Wait. The lease's local store updates remain valid after the fence.
+func (s *UserStore) admitMutation() *mutationLease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return nil
+	}
+	s.mutations.Add(1)
+	return &mutationLease{store: s}
+}
+
+type mutationLease struct{ store *UserStore }
+
+func (m *mutationLease) Done() { m.store.mutations.Done() }
+
+func (m *mutationLease) Add(u *User) {
+	m.store.mu.Lock()
+	defer m.store.mu.Unlock()
+	m.store.users[u.Email] = u
+}
+
+func (m *mutationLease) Remove(email string) {
+	m.store.mu.Lock()
+	defer m.store.mu.Unlock()
+	delete(m.store.users, email)
+}
+
+func (m *mutationLease) Sync(users []*User) {
+	m.store.mu.Lock()
+	defer m.store.mu.Unlock()
+	m.store.users = make(map[string]*User, len(users))
+	for _, u := range users {
+		m.store.users[u.Email] = u
+	}
+	m.store.lastSync = time.Now()
 }
 
 func NewUserStore(cfg *Config) *UserStore {
@@ -114,8 +154,8 @@ func (s *UserStore) admitSave() bool {
 	return true
 }
 
-// Stop closes write and mutation admission, joins all admitted writes, then
-// persists the final state exactly once. It does not fence external writers.
+// Stop closes write and mutation admission, joins admitted HTTP mutations and
+// writes, then persists the final state exactly once. It does not fence external writers.
 func (s *UserStore) Stop() error {
 	s.mu.Lock()
 	if s.stopped {
@@ -126,6 +166,7 @@ func (s *UserStore) Stop() error {
 	}
 	s.stopped = true
 	s.mu.Unlock()
+	s.mutations.Wait()
 	s.pending.Wait()
 	s.stopErr = s.saveSnapshot()
 	close(s.stopDone)
