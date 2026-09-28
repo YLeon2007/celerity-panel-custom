@@ -1225,9 +1225,10 @@
         if (el) el.remove();
     }
 
-    async function deployTopology(linkId) {
+    async function deployTopology(linkId, domainLinkId) {
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
+        if (domainLinkId) payload.domainLinkId = domainLinkId;
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
@@ -1343,15 +1344,31 @@
         if (!confirm(i18n.confirmDeployChain || 'Deploy entire chain? This will sync all connected nodes in the correct order.')) return;
         setActionLoading(i18n.syncingChain || 'Syncing chain...');
 
-        cy.edges().forEach(function (e) { e.data('status', 'syncing'); });
+        const edge = cy.edges().filter(e => e.data('linkId') === linkId);
+        if (edge.length) edge.data('status', 'syncing');
 
         try {
-            const result = await deployTopology();
+            const result = await deployTopology(null, linkId);
             showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();
         } catch (err) {
             showToast((i18n.chainDeployFailed || 'Chain sync failed') + ': ' + err.message, 'error');
+            loadTopology();
+        } finally { resetActionLoading(); }
+    };
+
+    // Explicit legacy full Sync includes every active edge. The per-chain
+    // action never falls through to this global operation.
+    window._cascadeDeployFull = async function () {
+        if (!confirm('Синхронизировать всю топологию? Все активные связи будут включены.')) return;
+        setActionLoading(i18n.syncingChain || 'Syncing topology...');
+        try {
+            const result = await deployTopology();
+            showToast(deployResultMessage(result));
+            loadTopology();
+        } catch (err) {
+            showToast((i18n.chainDeployFailed || 'Full sync failed') + ': ' + err.message, 'error');
             loadTopology();
         } finally { resetActionLoading(); }
     };

@@ -390,6 +390,7 @@ function nodeMetaFor(node) {
             <!-- Legend -->
             <div class="network-legend" id="networkLegend">
                 <div class="legend-title"><%= t('network.legendTitle') %></div>
+                <button type="button" class="btn btn-sm btn-outline-secondary" onclick="window._cascadeDeployFull()">Full Sync (все связи)</button>
                 <div class="legend-section">
                     <div class="legend-item"><span class="legend-dot" style="background:#22c55e"></span><%= t('network.legendOnline') %></div>
                     <div class="legend-item"><span class="legend-dot" style="background:#ef4444"></span><%= t('network.legendOffline') %></div>

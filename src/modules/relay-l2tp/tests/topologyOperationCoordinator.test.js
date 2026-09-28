@@ -568,7 +568,9 @@ function scopedHarness(snapshotValue, calls = []) {
 
 test('scoped queue pins only the requested component and never pulls in pending links', async () => {
     const calls = [];
-    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+    const snapshot = scopedSnapshot();
+    snapshot.links[0].status = 'deployed';
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
 
     const result = await coordinator.queue({
         expectedTopologyRevision: 8,
@@ -626,6 +628,72 @@ test('scoped queue rejects a preexisting pending link even when a caller include
     assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
     assert.equal(calls.filter(call => call.method === 'createFrozen').length, 0);
     assert.equal(calls.filter(call => call.method === 'worker.run').length, 0);
+});
+
+test('scoped queue rejects a baseline link with raw undefined or null status', async () => {
+    for (const kind of ['link.apply', 'domain.reconcile']) {
+        for (const status of [undefined, null]) {
+            const snapshot = scopedSnapshot();
+            snapshot.links[0].status = 'deployed';
+            snapshot.links[1].status = status;
+            const calls = [];
+            const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
+            await assert.rejects(coordinator.queue({ expectedTopologyRevision: 8, scope: {
+                kind, linkId: 'link-pr', linkIds: ['link-pr', 'link-rb'],
+            } }), error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+                && ['SCOPE_LINK_UNCONFIRMED', 'SCOPE_DOMAIN_AMBIGUOUS'].includes(error.causeCode));
+            assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
+            assert.equal(calls.filter(call => call.method === 'createFrozen').length, 0);
+        }
+    }
+});
+
+test('domain reconcile refuses a pending anchor before materialization', async () => {
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(scopedSnapshot(), calls));
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 8, scope: {
+        kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-rb'],
+    } }), error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+        && error.causeCode === 'SCOPE_LINK_UNCONFIRMED');
+    assert.equal(calls.filter(call => call.method === 'createFrozen').length, 0);
+});
+
+test('domain reconcile refuses an omitted or foreign confirmed link in its pinned component', async () => {
+    const snapshot = scopedSnapshot();
+    snapshot.links[0].status = 'online';
+    snapshot.nodes.push({ _id: 'portal-3', cascadeRole: 'portal' },
+        { _id: 'bridge-3', cascadeRole: 'bridge' });
+    snapshot.links.push({ _id: 'link-foreign', portalNode: 'portal-3',
+        bridgeNode: 'bridge-3', active: true, status: 'deployed', mode: 'forward' });
+    for (const linkIds of [['link-pr'], ['link-pr', 'link-rb', 'link-foreign']]) {
+        const calls = [];
+        const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
+        await assert.rejects(coordinator.queue({ expectedTopologyRevision: 8, scope: {
+            kind: 'domain.reconcile', linkId: 'link-pr', linkIds,
+        } }), error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
+            && error.causeCode === 'SCOPE_DOMAIN_AMBIGUOUS');
+        assert.equal(calls.filter(call => call.method === 'materialize').length, 0);
+    }
+});
+
+test('domain reconcile pins mixed modes in one domain, excluding pending and independent domains', async () => {
+    const snapshot = scopedSnapshot();
+    snapshot.links[0].status = 'online';
+    snapshot.links[0].mode = 'forward';
+    snapshot.nodes.push({ _id: 'portal-3', cascadeRole: 'portal' },
+        { _id: 'bridge-3', cascadeRole: 'bridge' });
+    snapshot.links.push({ _id: 'link-foreign', portalNode: 'portal-3',
+        bridgeNode: 'bridge-3', active: true, status: 'deployed', mode: 'forward' });
+    const calls = [];
+    const coordinator = new TopologyOperationCoordinator(scopedHarness(snapshot, calls));
+    const result = await coordinator.queue({ expectedTopologyRevision: 8, scope: {
+        kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-rb'],
+    } });
+    assert.equal(result.kind, 'domain.reconcile');
+    assert.deepEqual(calls.find(call => call.method === 'materialize').input.pinnedSnapshot.topology.links
+        .map(link => [link.id, link.mode]), [['link-pr', 'forward'], ['link-rb', 'reverse']]);
+    assert.deepEqual(calls.find(call => call.method === 'createFrozen').input.linkIds,
+        ['link-pr', 'link-rb']);
 });
 
 test('scoped queue accepts a staged baseline link as physically applied', async () => {
@@ -732,7 +800,7 @@ test('scope referencing a missing pinned link fails closed with SCOPE_LINK_MISSI
     await assert.rejects(
         coordinator.queue({
             expectedTopologyRevision: 8,
-            scope: { kind: 'domain.reconcile', linkId: 'link-pr', linkIds: ['link-pr', 'link-gone'] },
+            scope: { kind: 'link.apply', linkId: 'link-pr', linkIds: ['link-pr', 'link-gone'] },
         }),
         error => error?.code === 'INVALID_TOPOLOGY_DEPLOYMENT'
             && error?.causeCode === 'SCOPE_LINK_MISSING',
@@ -749,6 +817,7 @@ test('groups fully outside the scope are dropped; mixed groups fail with SCOPE_G
             paths: [{ pathKey: 'default', linkIds: ['link-pending'], priority: 100 }],
         }],
     });
+    withOutsideGroup.links[0].status = 'deployed';
     const calls = [];
     const coordinator = new TopologyOperationCoordinator(scopedHarness(withOutsideGroup, calls));
     await coordinator.queue({
@@ -766,6 +835,7 @@ test('groups fully outside the scope are dropped; mixed groups fail with SCOPE_G
             paths: [{ pathKey: 'default', linkIds: ['link-pr', 'link-pending'], priority: 100 }],
         }],
     });
+    withMixedGroup.links[0].status = 'deployed';
     const mixedCalls = [];
     const mixedCoordinator = new TopologyOperationCoordinator(scopedHarness(withMixedGroup, mixedCalls));
     await assert.rejects(

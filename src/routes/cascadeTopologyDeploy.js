@@ -76,14 +76,18 @@ function normalizeDeployRequest(body) {
         );
     }
     const keys = Object.keys(body);
-    if (keys.some(key => key !== 'expectedTopologyRevision' && key !== 'linkId')) {
+    if (keys.some(key => !['expectedTopologyRevision', 'linkId', 'domainLinkId'].includes(key))
+        || (Object.hasOwn(body, 'linkId') && Object.hasOwn(body, 'domainLinkId'))) {
         throw new TopologyDeployRequestError(
             'INVALID_REQUEST',
-            'Only expectedTopologyRevision and an optional linkId are accepted',
+            'Only expectedTopologyRevision and one optional linkId or domainLinkId are accepted',
         );
     }
     if (Object.hasOwn(body, 'linkId') && !/^[0-9a-fA-F]{24}$/.test(body.linkId)) {
         throw new TopologyDeployRequestError('INVALID_LINK_ID', 'Link id must be a 24-character hex string');
+    }
+    if (Object.hasOwn(body, 'domainLinkId') && !/^[0-9a-fA-F]{24}$/.test(body.domainLinkId)) {
+        throw new TopologyDeployRequestError('INVALID_LINK_ID', 'Domain link id must be a 24-character hex string');
     }
     const expectedTopologyRevision = body.expectedTopologyRevision;
     if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) {
@@ -95,6 +99,7 @@ function normalizeDeployRequest(body) {
     return {
         expectedTopologyRevision,
         ...(Object.hasOwn(body, 'linkId') ? { linkId: body.linkId } : {}),
+        ...(Object.hasOwn(body, 'domainLinkId') ? { domainLinkId: body.domainLinkId } : {}),
     };
 }
 
@@ -292,7 +297,7 @@ function createCascadeTopologyDeployRouter({
             try {
                 const input = normalizeDeployRequest(req.body);
                 let result;
-                if (input.linkId) {
+                if (input.linkId || input.domainLinkId) {
                     if (typeof deploymentService.queue !== 'function') {
                         throw new TopologyDeployRequestError(
                             'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
@@ -305,25 +310,32 @@ function createCascadeTopologyDeployRouter({
                     const links = await models.CascadeLink.find({})
                         .select('_id portalNode bridgeNode active status')
                         .lean();
-                    const selected = links.find(link => String(link._id) === input.linkId);
+                    const linkId = input.linkId || input.domainLinkId;
+                    const selected = links.find(link => String(link._id) === linkId);
                     if (!selected) {
                         throw new TopologyDeployRequestError('CASCADE_LINK_NOT_FOUND', 'Cascade link not found');
                     }
                     if (selected.active === false) {
                         throw new TopologyDeployRequestError('CASCADE_LINK_DISABLED', 'Cascade link is disabled');
                     }
+                    if (input.domainLinkId && !['deployed', 'online', 'staged'].includes(selected.status)) {
+                        throw new TopologyDeployRequestError(
+                            'INVALID_TOPOLOGY_DEPLOYMENT',
+                            'The chosen domain link is not confirmed applied',
+                        );
+                    }
                     const baseline = selectLinkApplyBaselineLinkIds({
                         links,
-                        linkId: input.linkId,
+                        linkId,
                         portalNodeId: selected.portalNode,
                         bridgeNodeId: selected.bridgeNode,
                     });
                     result = await deploymentService.queue({
                         expectedTopologyRevision: input.expectedTopologyRevision,
                         scope: {
-                            kind: 'link.apply',
-                            linkId: input.linkId,
-                            linkIds: [input.linkId, ...baseline],
+                            kind: input.domainLinkId ? 'domain.reconcile' : 'link.apply',
+                            linkId,
+                            linkIds: [linkId, ...baseline],
                         },
                     });
                     if (!result || result.topologyRevision !== input.expectedTopologyRevision
@@ -339,7 +351,8 @@ function createCascadeTopologyDeployRouter({
                 const status = result?.status === 'queued' ? 202 : 200;
                 return res.status(status).json({
                     ...publicResult(result),
-                    ...(input.linkId ? { kind: 'link.apply' } : {}),
+                    ...(input.linkId ? { kind: 'link.apply' }
+                        : input.domainLinkId ? { kind: 'domain.reconcile' } : {}),
                 });
             } catch (error) {
                 return sendError(res, error, routeLogger);

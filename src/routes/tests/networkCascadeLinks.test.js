@@ -54,7 +54,7 @@ function extractHandler(name) {
 
 function extractDeployPath(name) {
     // Deploy handlers delegate the network call to the shared deployTopology helper.
-    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology(linkId)');
+    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology(linkId, domainLinkId)');
     assert.notStrictEqual(helperStart, -1, 'deployTopology helper must exist');
     const helperEnd = NETWORK_SOURCE.indexOf('\n    window.', helperStart);
     assert.notStrictEqual(helperEnd, -1, 'deployTopology helper must precede the handlers');
@@ -126,14 +126,22 @@ test('network UI deploy never stringifies a bare error object', () => {
         'Операция не выполнена (INVALID_TOPOLOGY)');
 });
 
-test('per-link deploy targets only selected link while chain Sync remains unscoped', () => {
+test('per-link deploy targets only selected link while chain Sync targets its domain', () => {
     const helper = extractDeployPath('_cascadeDeploy');
-    assert.match(helper, /async function deployTopology\(linkId\)/);
+    assert.match(helper, /async function deployTopology\(linkId, domainLinkId\)/);
     assert.match(helper, /const payload = \{ expectedTopologyRevision: topologyRevision \};/);
     assert.match(helper, /if \(linkId\) payload\.linkId = linkId;/);
     assert.match(helper, /body: JSON\.stringify\(payload\)/);
     assert.match(extractHandler('_cascadeDeploy'), /deployTopology\(linkId\)/);
-    assert.match(extractHandler('_cascadeDeployChain'), /deployTopology\(\)/);
+    assert.match(extractHandler('_cascadeDeployChain'), /deployTopology\(null, linkId\)/);
+});
+
+test('chain Sync targets its selected domain while Full Sync stays a separate explicit action', () => {
+    const helper = extractDeployPath('_cascadeDeployChain');
+    assert.match(helper, /if \(domainLinkId\) payload\.domainLinkId = domainLinkId;/);
+    assert.match(extractHandler('_cascadeDeployChain'), /deployTopology\(null, linkId\)/);
+    assert.match(NODES_VIEW_SOURCE, /onclick="window\._cascadeDeployFull\(\)"/);
+    assert.match(extractHandler('_cascadeDeployFull'), /deployTopology\(\)/);
 });
 
 test('nodes view exposes the CSRF token for network module requests', () => {

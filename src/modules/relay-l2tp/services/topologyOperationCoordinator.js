@@ -8,6 +8,7 @@ const {
     projectNodes,
 } = require('../domain/topologyDraft');
 const { validateTopology } = require('../domain/topologyValidator');
+const { computeTopologyDomains } = require('../domain/topologyDomains');
 const {
     TEST_TOPOLOGY_HOST_IDENTITY,
     TEST_TOPOLOGY_TARGET,
@@ -182,6 +183,31 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
     const wanted = new Set(scope.linkIds);
     const available = new Set(topology.links.map(link => link.id));
     const rawById = new Map(rawLinks.map(link => [entityId(link._id ?? link.id), link]));
+    if (scope.kind === 'domain.reconcile') {
+        const anchor = rawById.get(scope.linkId);
+        if (!CONFIRMED_BASELINE_LINK_STATUSES.has(anchor?.status)) {
+            throw new TopologyOperationCoordinatorError(
+                'INVALID_TOPOLOGY_DEPLOYMENT',
+                'A domain Sync requires a confirmed applied anchor',
+                { operationId, causeCode: 'SCOPE_LINK_UNCONFIRMED' },
+            );
+        }
+        // Recompute membership from the pinned revision, not the route's
+        // earlier read. Pending links do not join components; omitted or
+        // foreign confirmed links make caller-supplied scope ambiguous.
+        const confirmed = topology.links.filter(link =>
+            CONFIRMED_BASELINE_LINK_STATUSES.has(rawById.get(link.id)?.status));
+        const domain = computeTopologyDomains({ nodes: topology.nodes, links: confirmed })
+            .find(component => component.linkIds.includes(scope.linkId));
+        if (!domain || domain.linkIds.length !== wanted.size
+            || domain.linkIds.some(linkId => !wanted.has(linkId))) {
+            throw new TopologyOperationCoordinatorError(
+                'INVALID_TOPOLOGY_DEPLOYMENT',
+                'The selected domain scope does not match the pinned topology',
+                { operationId, causeCode: 'SCOPE_DOMAIN_AMBIGUOUS' },
+            );
+        }
+    }
     for (const linkId of wanted) {
         if (!available.has(linkId)) {
             throw new TopologyOperationCoordinatorError(
@@ -195,8 +221,7 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
         // linkIds to pull an old active/pending edge into a new candidate.
         if (linkId !== scope.linkId) {
             const status = rawById.get(linkId)?.status;
-            if (status !== undefined && status !== null
-                && !CONFIRMED_BASELINE_LINK_STATUSES.has(status)) {
+            if (!CONFIRMED_BASELINE_LINK_STATUSES.has(status)) {
                 throw new TopologyOperationCoordinatorError(
                     'INVALID_TOPOLOGY_DEPLOYMENT',
                     'A scoped baseline link is not confirmed deployed',

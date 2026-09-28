@@ -18,6 +18,7 @@ const {
     createCascadeTopologyDeployRouter,
 } = require('../cascadeTopologyDeploy');
 const { buildSpec } = require('../../docs/openapi');
+const { TopologyOperationCoordinator } = require('../../modules/relay-l2tp/services/topologyOperationCoordinator');
 
 const ROOT_ENTRY_SOURCE = fs.readFileSync(path.resolve(__dirname, '../../../index.js'), 'utf8');
 const CASCADE_ROUTE_SOURCE = fs.readFileSync(path.resolve(__dirname, '../cascade.js'), 'utf8');
@@ -282,6 +283,114 @@ test('per-link deploy queues only the selected link and applied component, never
     }]);
     assert.equal(response.body.operationId, '507f1f77bcf86cd799439021');
     assert.equal(response.body.status, 'queued');
+});
+
+test('manual domain Sync queues only the chosen confirmed component, not another domain or pending link', async () => {
+    const selectedId = '507f1f77bcf86cd799439011';
+    const companionId = '507f1f77bcf86cd799439012';
+    const otherId = '507f1f77bcf86cd799439013';
+    const pendingId = '507f1f77bcf86cd799439014';
+    const inputs = [];
+    const links = [
+        { _id: selectedId, portalNode: 'p1', bridgeNode: 'r1', active: true, status: 'online', mode: 'forward' },
+        { _id: companionId, portalNode: 'r1', bridgeNode: 'b1', active: true, status: 'staged', mode: 'reverse' },
+        { _id: pendingId, portalNode: 'p3', bridgeNode: 'r1', active: true, status: 'pending' },
+        { _id: otherId, portalNode: 'p2', bridgeNode: 'b2', active: true, status: 'deployed' },
+    ];
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: { find() { return { select() { return { lean: async () => links }; } }; } } },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('domain Sync must not call full deploy'); },
+            async queue(input) {
+                inputs.push(input);
+                return { operationId: '507f1f77bcf86cd799439021', topologyRevision: 7, status: 'queued' };
+            },
+        },
+        ...guardHarness([]),
+    });
+    const response = await request(router, {
+        body: { expectedTopologyRevision: 7, domainLinkId: selectedId },
+        headers: { 'x-test-auth': 'api-write' },
+    });
+    assert.equal(response.status, 202);
+    assert.equal(response.body.kind, 'domain.reconcile');
+    assert.deepEqual(inputs, [{ expectedTopologyRevision: 7, scope: {
+        kind: 'domain.reconcile', linkId: selectedId, linkIds: [selectedId, companionId],
+    } }]);
+});
+
+test('manual domain Sync traverses the route and pinned coordinator without enrolling old pending links', async () => {
+    const anchor = '507f1f77bcf86cd799439011';
+    const companion = '507f1f77bcf86cd799439012';
+    const pending = '507f1f77bcf86cd799439013';
+    const independent = '507f1f77bcf86cd799439014';
+    const links = [
+        { _id: anchor, portalNode: 'p1', bridgeNode: 'r1', active: true, status: 'online', mode: 'forward' },
+        { _id: companion, portalNode: 'r1', bridgeNode: 'b1', active: true, status: 'staged', mode: 'reverse' },
+        { _id: pending, portalNode: 'p3', bridgeNode: 'r1', active: true, status: 'pending', mode: 'reverse' },
+        { _id: independent, portalNode: 'p2', bridgeNode: 'b2', active: true, status: 'deployed', mode: 'reverse' },
+    ];
+    const snapshot = {
+        revision: 7, deployedRevision: 5, links,
+        nodes: ['p1', 'r1', 'b1', 'p3', 'p2', 'b2'].map(_id => ({ _id, cascadeRole: 'relay' })),
+        groups: [],
+    };
+    const materialized = [];
+    const frozen = [];
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: { async pinTopology({ expectedRevision, prepare }) {
+            assert.equal(expectedRevision, 7);
+            return { revision: 7, deployedRevision: 5, ...await prepare(snapshot) };
+        } },
+        planMaterializer: { async materialize(input) {
+            materialized.push(input);
+            return { nodes: [] };
+        } },
+        operationRepository: { async createFrozen(input) { frozen.push(input); } },
+        operationWorker: { async run() {} },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+    });
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: { find() { return { select() { return { lean: async () => links }; } }; } } },
+        topologyDeploymentService: coordinator,
+        ...guardHarness([]),
+    });
+    const response = await request(router, {
+        body: { expectedTopologyRevision: 7, domainLinkId: anchor },
+        headers: { 'x-test-auth': 'api-write' },
+    });
+    assert.equal(response.status, 202);
+    assert.equal(response.body.kind, 'domain.reconcile');
+    assert.equal(materialized.length, 1);
+    assert.equal(materialized[0].operationKind, 'domain.reconcile');
+    assert.deepEqual(materialized[0].pinnedSnapshot.topology.links.map(link => [link.id, link.mode]),
+        [[anchor, 'forward'], [companion, 'reverse']]);
+    assert.deepEqual(materialized[0].pinnedSnapshot.topology.nodes.map(node => node.id),
+        ['b1', 'p1', 'r1']);
+    assert.deepEqual(frozen.map(input => [input.kind, input.linkIds]),
+        [['domain.reconcile', [anchor, companion]]]);
+});
+
+test('manual domain Sync refuses a pending anchor and ambiguous request before queue', async () => {
+    const pendingId = '507f1f77bcf86cd799439014';
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: { find() { return { select() { return { lean: async () => [
+            { _id: pendingId, portalNode: 'p', bridgeNode: 'b', active: true, status: 'pending' },
+        ] }; } }; } } },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('must not deploy'); },
+            async queue() { assert.fail('must not queue'); },
+        }, ...guardHarness([]),
+    });
+    const headers = { 'x-test-auth': 'api-write' };
+    const pending = await request(router, { body: { expectedTopologyRevision: 7, domainLinkId: pendingId }, headers });
+    assert.equal(pending.status, 422);
+    assert.equal(pending.body.error.code, 'INVALID_TOPOLOGY_DEPLOYMENT');
+    const ambiguous = await request(router, { body: {
+        expectedTopologyRevision: 7, domainLinkId: pendingId, linkId: pendingId,
+    }, headers });
+    assert.equal(ambiguous.status, 400);
 });
 
 test('per-link deploy does not expose backend failure text in response or log', async () => {
@@ -829,6 +938,7 @@ test('OpenAPI advertises only the revision-safe topology deployment endpoint', (
                     maximum: Number.MAX_SAFE_INTEGER,
                 },
                 linkId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' },
+                domainLinkId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' },
             },
         },
     );
@@ -846,7 +956,7 @@ test('OpenAPI advertises only the revision-safe topology deployment endpoint', (
                 operationId: { type: 'string' },
                 topologyRevision: { type: 'integer', minimum: 0 },
                 status: { type: 'string', enum: ['queued'] },
-                kind: { type: 'string', enum: ['link.apply'] },
+                kind: { type: 'string', enum: ['link.apply', 'domain.reconcile'] },
             },
         },
     );
