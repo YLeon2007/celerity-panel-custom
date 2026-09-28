@@ -286,7 +286,15 @@ class SyncService {
         const response = await axios(options);
 
         if (response.status === 401) {
-            throw new Error(`[Agent] Unauthorized — check agentToken for node ${node.name}`);
+            const error = new Error(`[Agent] Unauthorized — check agentToken for node ${node.name}`);
+            error.code = 'AGENT_HTTP_ERROR';
+            throw error;
+        }
+        if (!Number.isInteger(response.status) || response.status < 200 || response.status >= 300) {
+            // Never include the agent's response body: it may contain secrets.
+            const error = new Error(`[Agent] HTTP ${Number.isInteger(response.status) ? response.status : 'unknown'} for node ${node.name}`);
+            error.code = 'AGENT_HTTP_ERROR';
+            throw error;
         }
 
         return response;
@@ -665,6 +673,13 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
             } catch (error) {
                 logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
+                if (error.code === 'AGENT_HTTP_ERROR') {
+                    await HyNode.updateOne({ _id: node._id }, {
+                        $set: { status: 'error', lastSync: new Date(), lastError: `Agent restart failed: ${error.message}`, healthFailures: 0 },
+                    });
+                    await invalidateNodesCache();
+                    return false;
+                }
             }
         } else if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
             const ssh = new NodeSSH(node);
@@ -693,7 +708,7 @@ class SyncService {
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
             } catch (error) {
                 logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${error.message}`);
-                if (topologyManaged) {
+                if (topologyManaged || error.code === 'AGENT_HTTP_ERROR') {
                     await HyNode.updateOne({ _id: node._id }, {
                         $set: { status: 'error', lastSync: new Date(), lastError: `Agent user sync failed: ${error.message}`, healthFailures: 0 },
                     });
