@@ -67,6 +67,24 @@ function projectGroups(groups) {
     });
 }
 
+function activeRouteGroupUsingLink(snapshot, groups, linkId) {
+    const activeGroupIds = new Set((snapshot.activeRouteGroupIds || []).map(entityId));
+    return groups.find(group => activeGroupIds.has(entityId(group))
+        && (group.paths || []).some(path =>
+            (path.linkIds || []).some(pathLinkId => entityId(pathLinkId) === linkId)));
+}
+
+function assertLinkNotInInstalledRoute(snapshot, groups, linkId) {
+    const inUseGroup = activeRouteGroupUsingLink(snapshot, groups, linkId);
+    if (inUseGroup) {
+        throw new TopologyDraftError(
+            'CASCADE_LINK_IN_USE',
+            'An installed L2TP route group still uses this link',
+            { linkId, groupId: entityId(inUseGroup) },
+        );
+    }
+}
+
 function buildCandidate(snapshot, mutation) {
     let links = [...(snapshot.links || [])];
     let groups = [...(snapshot.groups || [])];
@@ -90,6 +108,9 @@ function buildCandidate(snapshot, mutation) {
                 linkId,
             });
         }
+        if (mutation.changes?.active === false) {
+            assertLinkNotInInstalledRoute(snapshot, groups, linkId);
+        }
         links[linkIndex] = {
             ...links[linkIndex],
             ...(mutation.changes || {}),
@@ -108,6 +129,7 @@ function buildCandidate(snapshot, mutation) {
         // left without any path are dropped unless active relay state still
         // references them (an active empty group is valid — it simply has no
         // egress path until the operator wires a new one).
+        assertLinkNotInInstalledRoute(snapshot, groups, linkId);
         const activeGroupIds = new Set((snapshot.activeRouteGroupIds || []).map(entityId));
         const groupUpdates = [];
         const groupDeletes = [];

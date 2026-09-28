@@ -195,32 +195,40 @@ test('deletes a link referenced by a route group, stripping its paths', async ()
     );
 });
 
-test('keeps an active route group when link deletion empties its paths', async () => {
+test('rejects deleting a link used by an installed L2TP route group before touching the draft', async () => {
     const snapshot = validSnapshot();
     snapshot.activeRouteGroupIds = ['group-1'];
-    let preparedCandidate;
+    let persisted = false;
     const repository = {
         async commitDraft({ prepare }) {
             await prepare(snapshot);
+            persisted = true;
             return { revision: 8, deployedRevision: 5 };
         },
     };
-    const service = new TopologyDraftWriteService({
-        repository,
-        validator: candidate => {
-            preparedCandidate = candidate;
-            return { valid: true, errors: [] };
+    const service = new TopologyDraftWriteService({ repository });
+    await assert.rejects(
+        service.deleteLink({ expectedTopologyRevision: 7, linkId: 'link-1' }),
+        error => error.code === 'CASCADE_LINK_IN_USE' && error.groupId === 'group-1',
+    );
+    assert.equal(persisted, false);
+    assert.deepEqual(snapshot.groups[0].paths[0].linkIds, ['link-1', 'link-2']);
+});
+
+test('rejects disabling an installed L2TP route link without a replacement path', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    const repository = {
+        async commitDraft({ prepare }) {
+            await prepare(snapshot);
+            assert.fail('disabled L2TP path must not persist');
         },
-        compiler: () => ({ valid: true, errors: [] }),
-    });
-
-    await service.deleteLink({
-        expectedTopologyRevision: 7,
-        linkId: 'link-1',
-    });
-
-    assert.equal(preparedCandidate.groups.length, 1);
-    assert.deepEqual(preparedCandidate.groups[0].paths, []);
+    };
+    const service = new TopologyDraftWriteService({ repository });
+    await assert.rejects(
+        service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-1', changes: { active: false } }),
+        error => error.code === 'CASCADE_LINK_IN_USE' && error.groupId === 'group-1',
+    );
 });
 
 test('link mutations never trigger automatic node role changes', async () => {
