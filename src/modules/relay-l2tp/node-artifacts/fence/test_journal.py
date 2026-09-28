@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import journal
@@ -21,6 +22,55 @@ class JournalTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name) / "private"
         self.store.mkdir(mode=0o700)
+
+    def test_refuses_ambiguous_real_and_effective_user_before_file_creation(self):
+        with mock.patch.object(journal.os, "geteuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(journal.JournalError, "identity"):
+                journal.initialize(self.store, GEN)
+        self.assertFalse((self.store / "journal.sqlite3").exists())
+
+    def test_rejects_foreign_owned_nonwritable_ancestor(self):
+        ancestor = Path(self.temp.name)
+        actual_lstat = Path.lstat
+
+        def foreign_ancestor(path):
+            info = actual_lstat(path)
+            if path == ancestor:
+                values = list(info)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(Path, "lstat", autospec=True, side_effect=foreign_ancestor):
+            with self.assertRaisesRegex(journal.JournalError, "ancestor"):
+                journal.initialize(self.store, GEN)
+        self.assertFalse((self.store / "journal.sqlite3").exists())
+
+    def test_rejects_foreign_owned_sticky_ancestor(self):
+        ancestor = Path(self.temp.name)
+        actual_lstat = Path.lstat
+
+        def foreign_sticky(path):
+            info = actual_lstat(path)
+            if path == ancestor:
+                values = list(info)
+                values[0] = (int(values[0]) & ~0o7777) | 0o1777
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(Path, "lstat", autospec=True, side_effect=foreign_sticky):
+            with self.assertRaisesRegex(journal.JournalError, "ancestor"):
+                journal.initialize(self.store, GEN)
+        self.assertFalse((self.store / "journal.sqlite3").exists())
+
+    def test_refuses_ambiguous_identity_when_reopening_and_gid_differs(self):
+        journal.initialize(self.store, GEN)
+        with mock.patch.object(journal.os, "getegid", return_value=os.getgid() + 1):
+            with self.assertRaisesRegex(journal.JournalError, "identity"):
+                journal.record_intent(self.store, GEN, "command-001", DIGEST)
+        with sqlite3.connect(self.store / "journal.sqlite3") as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM intents").fetchone()[0], 0)
 
     def test_first_intent_persists_blocked_before_return(self):
         journal.initialize(self.store, GEN)
@@ -55,6 +105,14 @@ class JournalTest(unittest.TestCase):
             journal.record_intent(self.store, GEN, "command-001", "b" * 64)
         with sqlite3.connect(self.store / "journal.sqlite3") as db:
             self.assertEqual(db.execute("SELECT count(*) FROM intents").fetchone()[0], 1)
+
+    def test_duplicate_rejects_corrupt_epoch_with_two_intents(self):
+        journal.initialize(self.store, GEN)
+        journal.record_intent(self.store, GEN, "command-001", DIGEST)
+        with sqlite3.connect(self.store / "journal.sqlite3") as db:
+            db.execute("INSERT INTO intents VALUES (?, ?, ?)", ("command-002", GEN, DIGEST))
+        with self.assertRaises(journal.JournalError):
+            journal.record_intent(self.store, GEN, "command-001", DIGEST)
 
     def test_concurrent_contenders_serialize_and_poison_epoch(self):
         journal.initialize(self.store, GEN)

@@ -37,6 +37,8 @@ def _digest(value):
 
 
 def _directory(path):
+    if os.getuid() != os.geteuid() or os.getgid() != os.getegid():
+        raise JournalError("ambiguous process identity")
     raw = os.fspath(path)
     if not isinstance(raw, str) or not raw.startswith("/") or ".." in Path(raw).parts:
         raise JournalError("store path must be absolute and cannot traverse")
@@ -46,6 +48,8 @@ def _directory(path):
         info = current.lstat()
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             raise JournalError("store path contains a non-directory or symlink")
+        if info.st_uid not in (0, os.getuid()):
+            raise JournalError("untrusted ancestor owner")
         # /tmp-style sticky directories are safe for a user-owned child.
         if info.st_mode & 0o022 and not (info.st_mode & stat.S_ISVTX):
             raise JournalError("writable non-sticky ancestor")
@@ -146,13 +150,16 @@ def record_intent(store, generation, command_id, digest):
             _token(active)
             if generation != active:
                 raise JournalError("generation mismatch; no epoch rotation")
+            intent_count = db.execute("SELECT count(*) FROM intents").fetchone()[0]
+            if intent_count > 1:
+                raise JournalError("invalid epoch with multiple intents")
             existing = db.execute("SELECT generation, digest FROM intents WHERE command_id=?",
                                   (command_id,)).fetchone()
             if existing is not None:
                 if existing != (generation, digest) or not blocked:
                     raise JournalError("conflicting or invalid intent")
                 return "blocked"
-            if blocked or db.execute("SELECT count(*) FROM intents").fetchone()[0] != 0:
+            if blocked or intent_count != 0:
                 raise BlockedError("no quiescence proof; epoch is blocked")
             db.execute("INSERT INTO intents VALUES (?, ?, ?)", (command_id, generation, digest))
             db.execute("UPDATE epoch SET blocked=1 WHERE singleton=1")
