@@ -179,9 +179,9 @@ func main() {
 		shipper.Stop()
 	}
 
-	// Stop the debounce loop and flush any pending config change synchronously.
-	persister.Stop()
-	if _, err := persister.Flush(); err != nil {
+	// Stop drains in-flight and pending config writes before returning. This
+	// does not drain independent UserStore.Save goroutines or startup work.
+	if err := persister.Stop(); err != nil {
 		log.Printf("[config] Final flush: %v", err)
 	}
 

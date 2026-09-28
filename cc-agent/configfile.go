@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,26 +23,38 @@ type ConfigPersister struct {
 	inbounds []InboundEntry
 	store    *UserStore
 
-	mu       sync.Mutex
-	dirty    chan struct{}
-	done     chan struct{}
-	debounce time.Duration
+	mu        sync.Mutex
+	dirty     chan struct{}
+	done      chan struct{}
+	loopDone  chan struct{}
+	stopOnce  sync.Once
+	stopped   bool
+	stopErr   error
+	debounce  time.Duration
+	writeFile func(string, []byte) error // test seam at the real atomic write boundary
 }
 
 func NewConfigPersister(path string, inbounds []InboundEntry, store *UserStore) *ConfigPersister {
 	return &ConfigPersister{
-		path:     path,
-		inbounds: inbounds,
-		store:    store,
-		dirty:    make(chan struct{}, 1),
-		done:     make(chan struct{}),
-		debounce: 1 * time.Second,
+		path:      path,
+		inbounds:  inbounds,
+		store:     store,
+		dirty:     make(chan struct{}, 1),
+		done:      make(chan struct{}),
+		loopDone:  make(chan struct{}),
+		debounce:  1 * time.Second,
+		writeFile: atomicWriteFile,
 	}
 }
 
 // MarkDirty schedules a debounced flush. Non-blocking and safe to call from any
 // request handler; bursts coalesce into a single write.
 func (p *ConfigPersister) MarkDirty() {
+	select {
+	case <-p.done:
+		return
+	default:
+	}
 	select {
 	case p.dirty <- struct{}{}:
 	default:
@@ -52,6 +65,7 @@ func (p *ConfigPersister) MarkDirty() {
 // change, bounding writes to at most one per debounce interval regardless of
 // churn. Stop() ends the loop.
 func (p *ConfigPersister) run() {
+	defer close(p.loopDone)
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	for {
@@ -79,11 +93,24 @@ func (p *ConfigPersister) run() {
 	}
 }
 
-// Stop terminates the debounce loop. Callers should perform a final synchronous
-// Flush afterwards to capture any pending change.
-func (p *ConfigPersister) Stop() {
-	close(p.done)
+// Stop closes admission, waits for the debounce loop and any in-flight Flush,
+// then flushes the latest user snapshot before acknowledging. It is idempotent.
+// All Flush calls after Stop are rejected; callers must not attempt a final Flush.
+func (p *ConfigPersister) Stop() error {
+	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		p.stopped = true
+		close(p.done)
+		p.mu.Unlock()
+		<-p.loopDone
+		p.mu.Lock()
+		_, p.stopErr = p.flushLocked()
+		p.mu.Unlock()
+	})
+	return p.stopErr
 }
+
+var errPersisterStopped = errors.New("config persister stopped")
 
 // Flush reads the on-disk config, replaces the clients of every managed inbound
 // with the current user list, and atomically writes the file back. It returns
@@ -93,7 +120,14 @@ func (p *ConfigPersister) Stop() {
 func (p *ConfigPersister) Flush() (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.stopped {
+		return false, errPersisterStopped
+	}
+	return p.flushLocked()
+}
 
+// flushLocked is also used by Stop for its final write after admission closes.
+func (p *ConfigPersister) flushLocked() (bool, error) {
 	data, err := os.ReadFile(p.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -157,7 +191,7 @@ func (p *ConfigPersister) Flush() (bool, error) {
 		return false, fmt.Errorf("marshal %s: %w", p.path, err)
 	}
 
-	if err := atomicWriteFile(p.path, out); err != nil {
+	if err := p.writeFile(p.path, out); err != nil {
 		return false, err
 	}
 	log.Printf("[config] Rewrote %s (%d users)", p.path, len(users))
