@@ -1225,11 +1225,13 @@
         if (el) el.remove();
     }
 
-    async function deployTopology() {
+    async function deployTopology(linkId) {
+        const payload = { expectedTopologyRevision: topologyRevision };
+        if (linkId) payload.linkId = linkId;
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
-            body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
+            body: JSON.stringify(payload),
         });
         const data = await res.json().catch(() => ({}));
         if (res.status === 409) {
@@ -1327,7 +1329,7 @@
         if (edge.length) edge.data('status', 'syncing');
 
         try {
-            const result = await deployTopology();
+            const result = await deployTopology(linkId);
             showToast(deployResultMessage(result));
             loadTopology();
             closeInfoModal();

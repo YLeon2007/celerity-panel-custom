@@ -54,7 +54,7 @@ function extractHandler(name) {
 
 function extractDeployPath(name) {
     // Deploy handlers delegate the network call to the shared deployTopology helper.
-    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology()');
+    const helperStart = NETWORK_SOURCE.indexOf('async function deployTopology(linkId)');
     assert.notStrictEqual(helperStart, -1, 'deployTopology helper must exist');
     const helperEnd = NETWORK_SOURCE.indexOf('\n    window.', helperStart);
     assert.notStrictEqual(helperEnd, -1, 'deployTopology helper must precede the handlers');
@@ -66,7 +66,7 @@ test('network UI deploy and chain sync use the revision-safe topology deploy end
         const handler = extractDeployPath(name);
         assert.match(
             handler,
-            /fetch\('\/api\/cascade\/topology\/deploy', \{[\s\S]*?method: 'POST',[\s\S]*?body: JSON\.stringify\(\{ expectedTopologyRevision: topologyRevision \}\)/,
+            /fetch\('\/api\/cascade\/topology\/deploy', \{[\s\S]*?method: 'POST',[\s\S]*?body: JSON\.stringify\(payload\)/,
             `${name} must POST to the revision-safe topology deploy endpoint`,
         );
         assert.doesNotMatch(
@@ -78,12 +78,15 @@ test('network UI deploy and chain sync use the revision-safe topology deploy end
 });
 
 test('network UI deploy surfaces typed error messages instead of stringified objects', () => {
+    assert.match(NETWORK_SOURCE, /function describeTopologyError\(payload, fallback\)/);
+    assert.match(NETWORK_SOURCE, /const err = payload && payload\.error;/);
+    assert.match(NETWORK_SOURCE, /const causeCode = [\s\S]*?\(err && err\.code\)/);
     for (const name of ['_cascadeDeploy', '_cascadeDeployChain']) {
         const handler = extractDeployPath(name);
         assert.match(
             handler,
-            /typeof errorValue === 'string'[\s\S]*?errorValue\?\.message/,
-            `${name} must surface typed error.message payloads`,
+            /describeTopologyError\(data, 'HTTP ' \+ res\.status\)/,
+            `${name} must map typed codes without showing free-form error messages`,
         );
         assert.doesNotMatch(
             handler,
@@ -115,9 +118,22 @@ test('network UI deploy never stringifies a bare error object', () => {
     const helper = extractDeployPath('_cascadeDeploy');
     assert.match(
         helper,
-        /typeof errorValue === 'string'[\s\S]*?errorValue\?\.message \|\| errorValue\?\.code/,
-        'deployTopology must fall back to error.code for object errors without message',
+        /throw new Error\(describeTopologyError\(data, 'HTTP ' \+ res\.status\)\)/,
+        'deployTopology must use the safe code-only error projection',
     );
+    const { describeTopologyError } = require('../../../public/js/network');
+    assert.equal(describeTopologyError({ error: { code: 'INVALID_TOPOLOGY', message: 'secret' } }, 'fallback'),
+        'Операция не выполнена (INVALID_TOPOLOGY)');
+});
+
+test('per-link deploy targets only selected link while chain Sync remains unscoped', () => {
+    const helper = extractDeployPath('_cascadeDeploy');
+    assert.match(helper, /async function deployTopology\(linkId\)/);
+    assert.match(helper, /const payload = \{ expectedTopologyRevision: topologyRevision \};/);
+    assert.match(helper, /if \(linkId\) payload\.linkId = linkId;/);
+    assert.match(helper, /body: JSON\.stringify\(payload\)/);
+    assert.match(extractHandler('_cascadeDeploy'), /deployTopology\(linkId\)/);
+    assert.match(extractHandler('_cascadeDeployChain'), /deployTopology\(\)/);
 });
 
 test('nodes view exposes the CSRF token for network module requests', () => {
