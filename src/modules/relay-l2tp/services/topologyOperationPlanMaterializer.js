@@ -272,7 +272,7 @@ class TopologyOperationPlanMaterializer {
         this.#CascadeLink = CascadeLink;
     }
 
-    async materialize({ target, hostIdentity, pinnedSnapshot, operationKind } = {}) {
+    async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session } = {}) {
         if (target !== TEST_TOPOLOGY_TARGET) {
             fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations are restricted to the test target');
         }
@@ -289,16 +289,31 @@ class TopologyOperationPlanMaterializer {
         let nodeRows;
         let linkRows;
         try {
-            [nodeRows, linkRows] = await Promise.all([
-                this.#HyNode.find({
-                    ...NODE_METADATA_FILTER,
-                    _id: { $in: nodeIds },
-                }).select(NODE_METADATA_SELECT).lean(),
-                this.#CascadeLink.find({
-                    ...LINK_METADATA_FILTER,
-                    _id: { $in: linkIds },
-                }).select(LINK_METADATA_SELECT).lean(),
-            ]);
+            const nodeQuery = this.#HyNode.find({
+                ...NODE_METADATA_FILTER,
+                _id: { $in: nodeIds },
+            }).select(NODE_METADATA_SELECT);
+            const linkQuery = this.#CascadeLink.find({
+                ...LINK_METADATA_FILTER,
+                _id: { $in: linkIds },
+            }).select(LINK_METADATA_SELECT);
+            if (session !== undefined) {
+                // MongoDB sessions cannot execute concurrent operations. Require
+                // both injected queries to support session binding before reading.
+                if (session === null || typeof nodeQuery.session !== 'function'
+                    || typeof linkQuery.session !== 'function') {
+                    throw new TypeError('Session-bound topology metadata reads are unavailable');
+                }
+                const sessionNodeQuery = nodeQuery.session(session);
+                const sessionLinkQuery = linkQuery.session(session);
+                nodeRows = await sessionNodeQuery.lean();
+                linkRows = await sessionLinkQuery.lean();
+            } else {
+                [nodeRows, linkRows] = await Promise.all([
+                    nodeQuery.lean(),
+                    linkQuery.lean(),
+                ]);
+            }
         } catch {
             fail(
                 'TOPOLOGY_METADATA_READ_FAILED',

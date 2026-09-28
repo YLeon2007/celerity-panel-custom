@@ -212,6 +212,52 @@ function createMaterializer(rows = metadataRows()) {
     };
 }
 
+function createSessionReadModel(rows, label, events, { failSession, failRead, omitSession } = {}) {
+    const calls = [];
+    return {
+        calls,
+        find(filter) {
+            calls.push({ method: 'find', filter });
+            events.push(`${label}.find`);
+            const query = {
+                select(paths) {
+                    calls.push({ method: 'select', paths });
+                    return this;
+                },
+                session(value) {
+                    calls.push({ method: 'session', session: value });
+                    events.push(`${label}.session`);
+                    if (failSession) throw new Error('database-password-canary');
+                    return this;
+                },
+                async lean() {
+                    calls.push({ method: 'lean' });
+                    events.push(`${label}.read-start`);
+                    await Promise.resolve();
+                    if (failRead) throw new Error('database-password-canary');
+                    events.push(`${label}.read-end`);
+                    return structuredClone(rows);
+                },
+            };
+            if (omitSession) delete query.session;
+            return query;
+        },
+    };
+}
+
+function createSessionMaterializer(nodeOptions, linkOptions) {
+    const events = [];
+    const rows = metadataRows();
+    const HyNode = createSessionReadModel(rows.nodes, 'node', events, nodeOptions);
+    const CascadeLink = createSessionReadModel(rows.links, 'link', events, linkOptions);
+    return {
+        events,
+        HyNode,
+        CascadeLink,
+        materializer: new TopologyOperationPlanMaterializer({ HyNode, CascadeLink }),
+    };
+}
+
 function isDeepFrozen(value) {
     if (value === null || typeof value !== 'object') return true;
     return Object.isFrozen(value) && Object.values(value).every(isDeepFrozen);
@@ -308,6 +354,102 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     assert.equal(HyNode.calls.filter(call => call.method === 'find').length, 1);
     assert.equal(CascadeLink.calls.filter(call => call.method === 'find').length, 1);
 });
+
+test('binds both allowlisted reads to the identical supplied session and executes sequentially', async () => {
+    const session = { id: 'same-transaction' };
+    const { events, HyNode, CascadeLink, materializer } = createSessionMaterializer();
+    const plan = await materializer.materialize({
+        target: TEST_TOPOLOGY_TARGET,
+        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+        pinnedSnapshot: pinnedSnapshot(),
+        session,
+    });
+
+    assert.equal(isDeepFrozen(plan), true);
+    assert.deepEqual(plan.nodes.map(node => node.nodeRef), ['portal', 'relay-1', 'bridge']);
+    assert.deepEqual(events.filter(event => event.endsWith('read-start') || event.endsWith('read-end')), [
+        'node.read-start', 'node.read-end', 'link.read-start', 'link.read-end',
+    ]);
+    assert.deepEqual(HyNode.calls, [
+        { method: 'find', filter: { ...NODE_METADATA_FILTER, _id: { $in: ['bridge-1', 'portal-1', 'relay-1'] } } },
+        { method: 'select', paths: NODE_METADATA_SELECT },
+        { method: 'session', session },
+        { method: 'lean' },
+    ]);
+    assert.deepEqual(CascadeLink.calls, [
+        { method: 'find', filter: { ...LINK_METADATA_FILTER, _id: { $in: ['portal-relay', 'relay-bridge'] } } },
+        { method: 'select', paths: LINK_METADATA_SELECT },
+        { method: 'session', session },
+        { method: 'lean' },
+    ]);
+    assert.strictEqual(HyNode.calls[2].session, session);
+    assert.strictEqual(CascadeLink.calls[2].session, session);
+});
+
+test('keeps no-session reads concurrent without invoking query.session', async () => {
+    const { events, HyNode, CascadeLink, materializer } = createSessionMaterializer();
+    const plan = await materializer.materialize({
+        target: TEST_TOPOLOGY_TARGET,
+        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+        pinnedSnapshot: pinnedSnapshot(),
+    });
+
+    assert.equal(isDeepFrozen(plan), true);
+    assert.deepEqual(events.filter(event => event.endsWith('read-start') || event.endsWith('read-end')), [
+        'node.read-start', 'link.read-start', 'node.read-end', 'link.read-end',
+    ]);
+    assert.equal(HyNode.calls.some(call => call.method === 'session'), false);
+    assert.equal(CascadeLink.calls.some(call => call.method === 'session'), false);
+});
+
+for (const [label, nodeOptions, linkOptions, expectedReads] of [
+    ['node read', { failRead: true }, {}, ['node.read-start']],
+    ['link read', {}, { failRead: true }, ['node.read-start', 'link.read-start']],
+    ['node session binding', { failSession: true }, {}, []],
+    ['link session binding', {}, { failSession: true }, []],
+]) {
+    test(`sanitizes supplied-session ${label} failures without leaking metadata`, async () => {
+        const { events, materializer } = createSessionMaterializer(nodeOptions, linkOptions);
+        await assert.rejects(
+            materializer.materialize({
+                target: TEST_TOPOLOGY_TARGET,
+                hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                pinnedSnapshot: pinnedSnapshot(),
+                session: { id: 'same-transaction' },
+            }),
+            error => {
+                assert.equal(error.name, 'TopologyOperationPlanMaterializerError');
+                assert.equal(error.code, 'TOPOLOGY_METADATA_READ_FAILED');
+                assert.equal(error.message, 'Pinned topology metadata could not be loaded');
+                assert.equal(Object.hasOwn(error, 'cause'), false);
+                assert.doesNotMatch(JSON.stringify(error), /database-password-canary/);
+                return true;
+            },
+        );
+        assert.deepEqual(events.filter(event => event.endsWith('read-start')), expectedReads);
+    });
+}
+
+for (const missing of ['node', 'link']) {
+    test(`rejects a supplied session when the ${missing} query cannot bind it`, async () => {
+        const { events, materializer } = createSessionMaterializer(
+            { omitSession: missing === 'node' },
+            { omitSession: missing === 'link' },
+        );
+        await assert.rejects(
+            materializer.materialize({
+                target: TEST_TOPOLOGY_TARGET,
+                hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                pinnedSnapshot: pinnedSnapshot(),
+                session: { id: 'same-transaction' },
+            }),
+            error => error.code === 'TOPOLOGY_METADATA_READ_FAILED'
+                && error.message === 'Pinned topology metadata could not be loaded'
+                && !Object.hasOwn(error, 'cause'),
+        );
+        assert.equal(events.some(event => event.endsWith('read-start')), false);
+    });
+}
 
 test('hydrates Reality tunnel security through the allowlisted projection', async () => {
     const rows = metadataRows();
