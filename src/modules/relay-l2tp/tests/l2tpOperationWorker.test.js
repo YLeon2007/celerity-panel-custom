@@ -1069,6 +1069,174 @@ test('expired rollback lease reports rolling_back without terminal mutation or l
     assert.deepEqual(releases, []);
 });
 
+test('keeps counted generation and distinct node UUID renewed through a long remote rollback', async () => {
+    const clock = createClock();
+    const timer = createTimer();
+    const rollbackStarted = createDeferred();
+    const finishRollback = createDeferred();
+    const lockRenewals = [];
+    const operationRepository = createOperationRepository([{
+        id: 'operation-long-rollback', node: 'relay-rollback', status: 'queued',
+        ownerGeneration: 7, plan: { steps: [{ type: 'verify' }] },
+    }]);
+    const renewClaimed = operationRepository.renewClaimed;
+    const renewalRequests = [];
+    operationRepository.renewClaimed = async function(request) {
+        renewalRequests.push(request);
+        return renewClaimed.call(this, request);
+    };
+    const worker = createWorker(operationRepository, {
+        clock, timer,
+        lockService: {
+            async acquire() { return { ok: true, lock: { generation: 'distinct-lock-uuid' } }; },
+            async renew(request) { lockRenewals.push(request); return { ok: true }; },
+            async release() { assert.fail('remote-uncertain lock cannot be released'); },
+        },
+        executor: {
+            async executeStep() { throw new Error('step failed'); },
+            async rollback() { rollbackStarted.resolve(); await finishRollback.promise; },
+        },
+    });
+    const run = worker.runOnce();
+    await rollbackStarted.promise;
+    assert.equal(operationRepository.operations[0].status, 'rolling_back');
+    for (const elapsed of [10_000, 10_000, 11_000]) {
+        clock.advance(elapsed);
+        await timer.tick();
+    }
+    finishRollback.resolve();
+    const result = await run;
+    assert.equal(result.status, 'rolled_back');
+    assert.ok(renewalRequests.some(request => request.expectedStatus === 'rolling_back'
+        && request.ownerGeneration === 7 && request.owner === 'worker-1'
+        && request.now.getTime() > NOW.getTime()));
+    assert.ok(lockRenewals.some(request => request.generation === 'distinct-lock-uuid'
+        && request.operationId === 'operation-long-rollback' && request.owner === 'worker-1'));
+    assert.equal(timer.activeCount(), 0);
+});
+
+test('refuses rollback dispatch after generation turnover at the rolling_back fence', async () => {
+    const operationRepository = createOperationRepository([{
+        id: 'operation-stale-rollback', node: 'relay-1', status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    const transition = operationRepository.transitionClaimed;
+    operationRepository.transitionClaimed = async function(request) {
+        const matched = await transition.call(this, request);
+        if (matched && request.status === 'rolling_back') this.operations[0].ownerGeneration++;
+        return matched;
+    };
+    let rollbackCalls = 0;
+    const worker = createWorker(operationRepository, {
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async release() { assert.fail('cannot release remote-uncertain lock'); },
+        },
+        executor: {
+            async executeStep() { throw new Error('step failed'); },
+            async rollback() { rollbackCalls++; },
+        },
+    });
+    assert.deepEqual(await worker.runOnce(), {
+        claimed: true, operationId: 'operation-stale-rollback', status: 'rolling_back',
+        stopped: true, errorCode: 'L2TP_OPERATION_LEASE_LOST',
+    });
+    assert.equal(rollbackCalls, 0);
+    assert.deepEqual(operationRepository.calls.filter(call => call.method === 'setStatus')
+        .map(call => call.request.status), ['rolling_back']);
+});
+
+test('node UUID renewal loss during rollback prevents terminal CAS and retains lock', async () => {
+    const timer = createTimer();
+    const started = createDeferred();
+    const finish = createDeferred();
+    const operationRepository = createOperationRepository([{
+        id: 'operation-rollback-lock-lost', node: 'relay-1', status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    let lockRenewals = 0;
+    const worker = createWorker(operationRepository, {
+        timer,
+        lockService: {
+            async acquire() { return { ok: true, lock: { generation: 'lock-uuid-7' } }; },
+            async renew(request) {
+                assert.equal(request.generation, 'lock-uuid-7');
+                lockRenewals++;
+                return lockRenewals > 3 ? { ok: false, error: { code: 'NODE_LOCK_STALE' } } : { ok: true };
+            },
+            async release() { assert.fail('cannot release remote-uncertain lock'); },
+        },
+        executor: {
+            async executeStep() { throw new Error('step failed'); },
+            async rollback() { started.resolve(); await finish.promise; },
+        },
+    });
+    const run = worker.runOnce();
+    await started.promise;
+    await timer.tick();
+    finish.resolve();
+    assert.deepEqual(await run, {
+        claimed: true, operationId: 'operation-rollback-lock-lost', status: 'rolling_back',
+        stopped: true, errorCode: 'NODE_LOCK_STALE',
+    });
+    assert.deepEqual(operationRepository.calls.filter(call => call.method === 'setStatus')
+        .map(call => call.request.status), ['rolling_back']);
+    assert.equal(timer.activeCount(), 0);
+});
+
+for (const cause of ['state reconciliation', 'user sync finalization']) {
+    test(`renews rolling_back lease through long ${cause} rollback`, async () => {
+        const clock = createClock();
+        const timer = createTimer();
+        const started = createDeferred();
+        const finish = createDeferred();
+        const isSync = cause === 'user sync finalization';
+        const operationRepository = createOperationRepository([isSync
+            ? createSyncUsersOperation('operation-sync-long-rollback')
+            : { id: 'operation-state-long-rollback', node: 'relay-1', status: 'queued',
+                plan: { steps: [{ type: 'verify' }] } }]);
+        const renewalRequests = [];
+        const renewClaimed = operationRepository.renewClaimed;
+        operationRepository.renewClaimed = async function(request) {
+            renewalRequests.push(request);
+            return renewClaimed.call(this, request);
+        };
+        const worker = createWorker(operationRepository, {
+            clock, timer,
+            stateReconciler: async () => { throw new Error('reconciliation failed'); },
+            userSnapshotResolver: async () => ({ credentialRevision: 9, users: [{
+                id: 'alice', relayNode: 'relay-1', login: 'alice', password: 'secret',
+                ip: '10.77.0.10', enabled: true, desiredRevision: 9,
+            }] }),
+            userSyncReconciler: { async finalizeVerifiedSync() { throw new Error('finalization failed'); } },
+            lockService: {
+                async acquire() { return { ok: true }; },
+                async release() { assert.fail('cannot release remote-uncertain lock'); },
+            },
+            executor: {
+                async executeStep({ step }) {
+                    if (step.type === 'verify_users') return {
+                        ok: true, credentialRevision: 9, enabledUserCount: 1,
+                        managedUserCount: 1, code: 'USERS_VERIFIED',
+                    };
+                },
+                async rollback() { started.resolve(); await finish.promise; },
+            },
+        });
+        const run = worker.runOnce();
+        await started.promise;
+        for (const elapsed of [10_000, 10_000, 11_000]) {
+            clock.advance(elapsed);
+            await timer.tick();
+        }
+        finish.resolve();
+        assert.equal((await run).status, 'rolled_back');
+        assert.ok(renewalRequests.some(request => request.expectedStatus === 'rolling_back'
+            && request.now.getTime() > NOW.getTime()));
+        assert.equal(timer.activeCount(), 0);
+    });
+}
+
 test('rejects invalid claimed install plans before resolving secrets or remote work', async () => {
     const { operation: validOperation } = createInstallOperation('operation-invalid-plan');
     const cases = [

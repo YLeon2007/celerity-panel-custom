@@ -319,6 +319,8 @@ class L2tpOperationWorker {
         let inFlight = null;
         let renewalError = null;
         let stopped = false;
+        let paused = false;
+        let activeClaim = claim;
 
         const clear = () => {
             if (intervalId === undefined) return;
@@ -327,7 +329,7 @@ class L2tpOperationWorker {
         };
         const renew = async () => {
             const operationRenewed = await this.operationRepository.renewClaimed({
-                ...claim,
+                ...activeClaim,
                 leaseMs: this.leaseMs,
                 now: this.clock.now(),
             });
@@ -347,7 +349,7 @@ class L2tpOperationWorker {
             }
         };
         const tick = () => {
-            if (stopped || renewalError) return inFlight || Promise.resolve();
+            if (stopped || paused || renewalError) return inFlight || Promise.resolve();
             if (inFlight) return inFlight;
 
             inFlight = renew()
@@ -365,6 +367,18 @@ class L2tpOperationWorker {
 
         return {
             renewNow: tick,
+            // Serialize the status CAS with renewals: no tick may use the
+            // running fence after the operation enters rolling_back.
+            async switchToRollback(transition) {
+                paused = true;
+                if (inFlight) await inFlight;
+                if (renewalError) return false;
+                await transition();
+                activeClaim = { ...claim, expectedStatus: 'rolling_back' };
+                paused = false;
+                await tick();
+                return !renewalError;
+            },
             async waitForIdle() {
                 if (inFlight) await inFlight;
             },
@@ -538,13 +552,25 @@ class L2tpOperationWorker {
             node: operation.node,
             lockGeneration,
         });
+        let currentStatus = 'running';
         const leaseLostResult = () => ({
             claimed: true,
             operationId,
-            status: 'running',
+            status: currentStatus,
             stopped: true,
             errorCode: heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED',
         });
+        const enterRollback = async fields => heartbeat.switchToRollback(async () => {
+            await this.writeClaimed('transitionClaimed', claim, fields);
+            currentStatus = 'rolling_back';
+            rememberClaim(operationId, 'rolling_back');
+        });
+        const rollbackLeaseValid = async () => {
+            await heartbeat.waitForIdle();
+            if (heartbeat.getError()) return false;
+            await heartbeat.renewNow();
+            return !heartbeat.getError();
+        };
         try {
             let executionSteps = preparedInstallPlan?.steps
                 ?? preparedSyncUsersPlan?.steps
@@ -640,11 +666,9 @@ class L2tpOperationWorker {
                 } catch (error) {
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
-                    await heartbeat.stop();
-
                     const errorCode = error.code || 'EXECUTOR_FAILED';
                     const errorMessage = error.message || 'L2TP operation executor failed';
-                    await this.writeClaimed('transitionClaimed', claim, {
+                    if (!await enterRollback({
                         operationId,
                         status: 'rolling_back',
                         step: stepType,
@@ -657,8 +681,7 @@ class L2tpOperationWorker {
                             code: 'L2TP_STEP_FAILED',
                             message: `L2TP operation step failed: ${stepType}`,
                         },
-                    });
-                    rememberClaim(operationId, 'rolling_back');
+                    })) return leaseLostResult();
 
                     try {
                         await this.executor.rollback({
@@ -668,6 +691,7 @@ class L2tpOperationWorker {
                             error,
                         });
                     } catch (rollbackError) {
+                        if (!await rollbackLeaseValid()) return leaseLostResult();
                         const rollbackErrorCode = rollbackError.code || 'ROLLBACK_FAILED';
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
@@ -691,6 +715,7 @@ class L2tpOperationWorker {
                         return { claimed: true, operationId, status: 'failed' };
                     }
 
+                    if (!await rollbackLeaseValid()) return leaseLostResult();
                     const finishedAt = this.clock.now();
                     await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
@@ -749,7 +774,7 @@ class L2tpOperationWorker {
                     const reconciliationError = Object.assign(new Error(errorMessage), {
                         code: errorCode,
                     });
-                    await this.writeClaimed('transitionClaimed', claim, {
+                    if (!await enterRollback({
                         operationId,
                         status: 'rolling_back',
                         step: finalStep,
@@ -762,8 +787,7 @@ class L2tpOperationWorker {
                             code: 'L2TP_STATE_RECONCILIATION_FAILED',
                             message: errorMessage,
                         },
-                    });
-                    rememberClaim(operationId, 'rolling_back');
+                    })) return leaseLostResult();
 
                     try {
                         await this.executor.rollback({
@@ -773,6 +797,7 @@ class L2tpOperationWorker {
                             error: reconciliationError,
                         });
                     } catch (rollbackError) {
+                        if (!await rollbackLeaseValid()) return leaseLostResult();
                         const rollbackErrorCode = rollbackError.code || 'ROLLBACK_FAILED';
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
@@ -795,6 +820,7 @@ class L2tpOperationWorker {
                         return { claimed: true, operationId, status: 'failed' };
                     }
 
+                    if (!await rollbackLeaseValid()) return leaseLostResult();
                     const rollbackFinishedAt = this.clock.now();
                     await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
@@ -841,8 +867,7 @@ class L2tpOperationWorker {
                     const finalizationError = Object.assign(new Error(errorMessage), {
                         code: errorCode,
                     });
-                    await heartbeat.stop();
-                    await this.writeClaimed('transitionClaimed', claim, {
+                    if (!await enterRollback({
                         operationId,
                         status: 'rolling_back',
                         step: finalStep,
@@ -855,8 +880,7 @@ class L2tpOperationWorker {
                             code: 'L2TP_USER_SYNC_FINALIZATION_FAILED',
                             message: errorMessage,
                         },
-                    });
-                    rememberClaim(operationId, 'rolling_back');
+                    })) return leaseLostResult();
 
                     try {
                         await this.executor.rollback({
@@ -866,6 +890,7 @@ class L2tpOperationWorker {
                             error: finalizationError,
                         });
                     } catch (rollbackError) {
+                        if (!await rollbackLeaseValid()) return leaseLostResult();
                         const rollbackErrorCode = rollbackError.code || 'ROLLBACK_FAILED';
                         const rollbackErrorMessage = rollbackError.message
                             || 'L2TP operation rollback failed';
@@ -888,6 +913,7 @@ class L2tpOperationWorker {
                         return { claimed: true, operationId, status: 'failed' };
                     }
 
+                    if (!await rollbackLeaseValid()) return leaseLostResult();
                     const rollbackFinishedAt = this.clock.now();
                     await this.writeClaimed('transitionClaimed', rollbackClaim, {
                         operationId,
