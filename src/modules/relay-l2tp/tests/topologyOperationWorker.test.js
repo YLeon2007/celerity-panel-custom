@@ -212,6 +212,7 @@ function createWorker({
     renewalIntervalMs,
     userResync,
     pppReadinessGate,
+    allowUnprovenTestExecution = true,
 } = {}) {
     const effectiveLockService = lockService || {
         async acquire() { return { ok: true }; },
@@ -240,8 +241,42 @@ function createWorker({
         renewalIntervalMs,
         userResync,
         pppReadinessGate,
+        ...(allowUnprovenTestExecution ? { allowUnprovenTestExecution: true } : {}),
     });
 }
+
+test('worker without test-only execution permission rejects before claim, lock, or executor', async () => {
+    const repository = createRepository();
+    const calls = [];
+    const executor = Object.fromEntries([
+        'prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback',
+    ].map(method => [method, async () => {
+        calls.push(`executor.${method}`);
+        throw new Error('executor must not run');
+    }]));
+    const worker = createWorker({
+        repository,
+        executor,
+        allowUnprovenTestExecution: false,
+        lockService: {
+            async acquire() { calls.push('lock.acquire'); },
+            async renew() { calls.push('lock.renew'); },
+            async release() { calls.push('lock.release'); },
+        },
+        clock: { now() { calls.push('clock.now'); return new Date(NOW); } },
+    });
+
+    assert.deepEqual(await worker.run('operation-1'), {
+        claimed: false,
+        operationId: 'operation-1',
+        stopped: true,
+        errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
+    });
+    assert.deepEqual(repository.calls, []);
+    assert.deepEqual(calls, []);
+    assert.equal(repository.operation.status, 'queued');
+    assert.equal(repository.operation.attempts, 0);
+});
 
 async function successfulLifecycleEvents(order) {
     const repository = createRepository(durableTopologyOperation(order));

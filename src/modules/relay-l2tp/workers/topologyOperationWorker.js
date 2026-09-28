@@ -200,6 +200,8 @@ function matchesFrozenMetadata(operation, plan, nodes) {
 }
 
 class TopologyOperationWorker {
+    #allowUnprovenTestExecution;
+
     constructor({
         operationRepository,
         executor,
@@ -212,6 +214,7 @@ class TopologyOperationWorker {
         renewalIntervalMs,
         userResync,
         pppReadinessGate,
+        allowUnprovenTestExecution = false,
     } = {}) {
         const repositoryMethods = [
             'claim',
@@ -270,6 +273,9 @@ class TopologyOperationWorker {
             throw new TypeError('Topology operation worker PPP gate requires verifyPlan');
         }
         this.pppReadinessGate = pppReadinessGate;
+        // TEST-only fake-executor seam. The composed runtime never grants this:
+        // lock generation and quiescence are not proven for real execution.
+        this.#allowUnprovenTestExecution = allowUnprovenTestExecution === true;
         this.running = new Set();
     }
 
@@ -692,6 +698,14 @@ class TopologyOperationWorker {
         const operationId = entityId(operationIdentity);
         if (!SAFE_ID_PATTERN.test(operationId)) {
             throw new TypeError('Topology operation worker requires an operation id');
+        }
+        if (!this.#allowUnprovenTestExecution) {
+            return {
+                claimed: false,
+                operationId,
+                stopped: true,
+                errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
+            };
         }
         if (this.running.has(operationId)) {
             return { claimed: false, operationId };

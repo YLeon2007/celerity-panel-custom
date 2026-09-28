@@ -221,6 +221,31 @@ test('enabled composition builds the real typed executor with the injected NodeS
     assert.deepEqual(calls, []);
 });
 
+test('flag-positive composed default worker stays unclaimed without quiescence proof', async () => {
+    const calls = [];
+    const service = createTopologyOperationRuntime({
+        ...compositionDependencies(calls),
+        // A caller-supplied runtime option cannot grant the unit-test-only seam.
+        allowUnprovenTestExecution: true,
+        NodeSSH: class ForbiddenSSH {
+            constructor() {
+                calls.push('ssh');
+                throw new Error('SSH must not start');
+            }
+        },
+    });
+
+    assert.ok(service instanceof TopologyOperationCoordinator);
+    assert.ok(service.operationWorker instanceof TopologyOperationWorker);
+    assert.deepEqual(await service.operationWorker.run('operation-1'), {
+        claimed: false,
+        operationId: 'operation-1',
+        stopped: true,
+        errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
+    });
+    assert.deepEqual(calls, []);
+});
+
 test('enabled composition rejects invalid typed executor factory overrides and fails closed', async () => {
     for (const createTopologyOperationExecutor of [
         null,
