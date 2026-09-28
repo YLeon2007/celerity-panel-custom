@@ -7,6 +7,27 @@ const OPERATION_ID = /^[a-f0-9]{24}$/i;
 const failed = verifiedRelayCount => ({ ok: false, verifiedRelayCount });
 const id = value => value == null ? '' : String(value);
 
+function stagedTerminalRelayRef(nodes) {
+    let portalCount = 0;
+    const relayNumbers = new Set();
+    for (const node of nodes) {
+        if (node?.role === 'portal' && node.nodeRef === 'portal') {
+            portalCount += 1;
+        } else if (node?.role === 'relay' && /^relay-[1-9]\d*$/.test(node.nodeRef)) {
+            const number = Number(node.nodeRef.slice('relay-'.length));
+            if (!Number.isSafeInteger(number) || relayNumbers.has(number)) return null;
+            relayNumbers.add(number);
+        } else {
+            return null;
+        }
+    }
+    if (portalCount !== 1 || relayNumbers.size === 0) return null;
+    for (let number = 1; number <= relayNumbers.size; number += 1) {
+        if (!relayNumbers.has(number)) return null;
+    }
+    return `relay-${relayNumbers.size}`;
+}
+
 class TopologyPppReadinessGate {
     constructor({ RelayL2tpState, L2tpUser, L2tpOperation, transportResolver } = {}) {
         if (typeof RelayL2tpState?.findOne !== 'function'
@@ -26,6 +47,8 @@ class TopologyPppReadinessGate {
         let skippedRelayCount = 0;
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
+            const terminalRelayRef = plan.staged === true ? stagedTerminalRelayRef(plan.nodes) : null;
+            if (plan.staged === true && !terminalRelayRef) return failed(0);
             for (const node of plan.nodes) {
                 if (node.role !== 'relay') continue;
                 const relayNode = id(node.node);
@@ -35,7 +58,7 @@ class TopologyPppReadinessGate {
                 // Only an explicitly staged topology may omit PPP installation.
                 // This is a skipped check, not evidence that the relay is ready.
                 if (!state || state.desiredState === 'absent') {
-                    if (plan.staged !== true) return failed(verifiedRelayCount);
+                    if (plan.staged !== true || node.nodeRef !== terminalRelayRef) return failed(verifiedRelayCount);
                     skippedRelayCount += 1;
                     continue;
                 }

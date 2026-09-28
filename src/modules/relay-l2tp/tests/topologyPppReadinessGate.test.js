@@ -42,8 +42,93 @@ test('installed relay is ready only after SSH artifact verification of persisted
 
 test('staged relay without installed PPP is skipped, never claimed node-verified', async () => {
     const { gate, calls } = fixture({ RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () => null }) }) } });
-    assert.deepEqual(await gate.verifyPlan({ ...plan, staged: true }),
+    assert.deepEqual(await gate.verifyPlan({ staged: true, nodes: [
+        { ...plan.nodes[0], nodeRef: 'portal' }, { ...plan.nodes[1], nodeRef: 'relay-1' },
+    ] }),
         { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1 });
+    assert.deepEqual(calls, []);
+});
+
+const stagedTwoRelayPlan = { staged: true, nodes: [
+    { role: 'relay', node: 'node-t', nodeRef: 'relay-2', checks: [] },
+    { role: 'portal', node: 'node-p', nodeRef: 'portal' },
+    { role: 'relay', node: 'node-r', nodeRef: 'relay-1', checks: [] },
+] };
+
+test('staged intermediate without PPP fails even without L2TP ingress and terminal PPP', async () => {
+    const { gate, calls } = fixture({ RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () => null }) }) } });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan), { ok: false, verifiedRelayCount: 0 });
+    assert.deepEqual(calls, []);
+});
+
+test('staged intermediate with desired-absent PPP fails despite a canonical terminal', async () => {
+    const { gate, calls } = fixture({ RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () => (
+        { node: 'node-r', desiredState: 'absent' }
+    ) }) }) } });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan), { ok: false, verifiedRelayCount: 0 });
+    assert.deepEqual(calls, []);
+});
+
+test('staged verified intermediate and absent terminal allows exactly one skip regardless of deployment order', async () => {
+    const { gate, calls } = fixture({ RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({
+        lean: async () => node === 'node-r'
+            ? { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
+            : { node, desiredState: 'absent' },
+    }) }) } });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+    assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
+        [['resolve', 'node-r'], ['verify', 'verify-users']]);
+});
+
+test('installed staged terminal still requires node-side verify-users', async () => {
+    const calls = [];
+    const { gate } = fixture({
+        RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => (
+            { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
+        ) }) }) },
+        L2tpUser: { find: ({ relayNode }) => ({ select: () => ({ lean: async () => ([{
+            relayNode, enabled: true, desiredRevision: 41, appliedRevision: 41,
+            syncStatus: 'synced', syncOperationId: 'abcdef012345abcdef012345',
+        }]) }) }) },
+        L2tpOperation: { findOne: ({ node }) => ({ sort: () => ({ select: () => ({ lean: async () => ({
+            _id: 'abcdef012345abcdef012345', node, kind: 'sync_users', status: 'succeeded',
+            plan: { operationId: 'abcdef012345abcdef012345', relayId: node,
+                desired: { credentialRevision: 41 } },
+        }) }) }) }) },
+        transportResolver: async ({ nodeId }) => ({ runArtifactCommand: async request => {
+            calls.push([nodeId, request.command]);
+            return nodeId === 'node-t' ? { ok: false } : {
+                ok: true, code: 'USERS_VERIFIED', credentialRevision: 41,
+                enabledUserCount: 1, managedUserCount: 1,
+            };
+        } }),
+    });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan), { ok: false, verifiedRelayCount: 0 });
+    assert.deepEqual(calls, [['node-t', 'verify-users']]);
+});
+
+test('malformed staged refs and extra roles fail before any PPP or remote verification', async () => {
+    const checkedNodes = [];
+    const { gate, calls } = fixture({ RelayL2tpState: { findOne: ({ node }) => {
+        checkedNodes.push(node);
+        throw new Error('must reject staged shape before readback');
+    } } });
+    const [terminal, portal, intermediate] = stagedTwoRelayPlan.nodes;
+    const invalidNodes = [
+        [terminal, portal, { ...intermediate, nodeRef: 'relay-2' }], // duplicate
+        [terminal, portal, { ...intermediate, nodeRef: 'relay-3' }], // gap
+        [terminal, portal, { ...intermediate, nodeRef: 'relay-01' }], // malformed
+        [terminal, portal, { ...intermediate, nodeRef: 'relay-9007199254740992' }],
+        [terminal, intermediate], // no portal
+        [terminal, portal, intermediate, { role: 'portal', nodeRef: 'portal' }],
+        [terminal, portal, intermediate, { role: 'bridge', nodeRef: 'bridge' }],
+    ];
+    for (const nodes of invalidNodes) {
+        assert.deepEqual(await gate.verifyPlan({ staged: true, nodes }),
+            { ok: false, verifiedRelayCount: 0 });
+    }
+    assert.deepEqual(checkedNodes, []);
     assert.deepEqual(calls, []);
 });
 
