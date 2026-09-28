@@ -23,6 +23,7 @@ const LINK_ONLINE_RELAY_TO_RELAY = '507f1f77bcf86cd799439043';
 const LINK_DISABLED_DEPLOYED = '507f1f77bcf86cd799439044';
 const LINK_FOREIGN_DEPLOYED = '507f1f77bcf86cd799439045';
 const LINK_STAGED_FIRST_HOP = '507f1f77bcf86cd799439046';
+const LINK_EDITED = '507f1f77bcf86cd799439047';
 
 function queryResult(result) {
     return {
@@ -124,11 +125,15 @@ function createAutoDeployHarness({
     links = componentLinks(),
     coordinator,
     maintenanceRevision = 9,
+    editedLink,
+    updateError,
 } = {}) {
     const calls = { queue: [] };
     let storedLinks = links.map(link => ({ ...link }));
+    if (editedLink) storedLinks.push({ ...editedLink });
     const Link = {
         find() { return queryResult(storedLinks); },
+        async findById(id) { return storedLinks.find(link => String(link._id) === String(id)) || null; },
         async findOne() { return null; },
     };
     const Node = {
@@ -140,6 +145,18 @@ function createAutoDeployHarness({
             // The draft write persists the new link with the model default
             // status 'pending'; it is NOT part of the deployed baseline.
             storedLinks = [...storedLinks, { ...input.link, status: 'pending' }];
+            return { revision: 8, deployedRevision: 5 };
+        },
+        async updateLink(input) {
+            calls.updateLink = input;
+            if (updateError) throw updateError;
+            const link = storedLinks.find(candidate => String(candidate._id) === String(input.linkId));
+            if (!link) {
+                const error = new Error('The cascade link was not found');
+                error.code = 'CASCADE_LINK_NOT_FOUND';
+                throw error;
+            }
+            Object.assign(link, input.changes);
             return { revision: 8, deployedRevision: 5 };
         },
     };
@@ -395,6 +412,142 @@ test('POST reports blocked when the coordinator resolves to a malformed queue re
     assert.equal(response.status, 201);
     assert.equal(response.body.autoDeployOperation, undefined,
         'a queue result without an operation id is not a success');
+    assert.equal(response.body.autoDeployStatus, 'blocked');
+    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+});
+
+function editedLink(overrides = {}) {
+    return {
+        _id: LINK_EDITED,
+        portalNode: nodeRef(RELAY_B),
+        bridgeNode: nodeRef(BRIDGE_A),
+        active: true,
+        autoDeploy: false,
+        status: 'pending',
+        ...overrides,
+    };
+}
+
+function editBody(overrides = {}) {
+    return { expectedTopologyRevision: 8, name: 'Edited hop', ...overrides };
+}
+
+async function putEdit(router, body = editBody()) {
+    return request(router, { method: 'PUT', path: `/${LINK_EDITED}`, body });
+}
+
+test('PUT explicit autoDeploy true queues only the edited enabled link and confirmed baseline after maintenance', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink() });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.updateLink.changes, { name: 'Edited hop', autoDeploy: true });
+    assert.equal(calls.queue.length, 1);
+    assert.deepEqual(calls.queue[0], {
+        expectedTopologyRevision: 9,
+        scope: {
+            kind: 'link.apply',
+            linkId: LINK_EDITED,
+            linkIds: [LINK_EDITED, LINK_DEPLOYED_PORTAL_TO_RELAY, LINK_ONLINE_RELAY_TO_RELAY],
+        },
+    });
+    assert.deepEqual(response.body.autoDeployOperation, {
+        operationId: 'op-auto-1', topologyRevision: 9, status: 'queued',
+    });
+    assert.equal(response.body.topologyRevision, 9);
+    assert.equal(response.body.deployedRevision, 5);
+    assert.ok(Array.isArray(response.body.links));
+});
+
+test('PUT without explicit autoDeploy never queues even when stored autoDeploy is true', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink({ autoDeploy: true }) });
+    const response = await putEdit(router);
+    assert.equal(response.status, 200);
+    assert.equal(calls.queue.length, 0);
+    assert.equal(response.body.autoDeployOperation, undefined);
+    assert.equal(response.body.autoDeployStatus, undefined);
+});
+
+test('PUT explicit autoDeploy false never queues even when stored autoDeploy is true', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink({ autoDeploy: true }) });
+    const response = await putEdit(router, editBody({ autoDeploy: false }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.updateLink.changes.autoDeploy, false);
+    assert.equal(calls.queue.length, 0);
+    assert.equal(response.body.autoDeployOperation, undefined);
+});
+
+test('PUT cannot auto-deploy a link explicitly disabled in the same mutation', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink() });
+    const response = await putEdit(router, editBody({ autoDeploy: true, active: false }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.queue.length, 0);
+    assert.equal(response.body.autoDeployOperation, undefined);
+    assert.equal(response.body.links.find(link => link._id === LINK_EDITED).active, false);
+});
+
+test('PUT cannot auto-deploy a previously disabled link without enabling it', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink({ active: false }) });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.queue.length, 0);
+    assert.equal(response.body.autoDeployOperation, undefined);
+});
+
+test('PUT explicit opt-in uses the draft revision when maintenance does not advance it', async () => {
+    const { calls, router } = createAutoDeployHarness({
+        editedLink: editedLink(), maintenanceRevision: null,
+    });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.queue[0].expectedTopologyRevision, 8);
+    assert.equal(response.body.autoDeployOperation.topologyRevision, 8);
+});
+
+test('PUT stale revision never mutates or queues despite explicit opt-in', async () => {
+    const error = new Error('Revision changed');
+    error.code = 'STALE_TOPOLOGY_REVISION';
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink(), updateError: error });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, 'STALE_TOPOLOGY_REVISION');
+    assert.equal(calls.queue.length, 0);
+});
+
+test('PUT rejects malformed opt-in before mutating or queuing', async () => {
+    const { calls, router } = createAutoDeployHarness({ editedLink: editedLink() });
+    const response = await putEdit(router, editBody({ autoDeploy: 'yes' }));
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, 'INVALID_AUTO_DEPLOY');
+    assert.equal(calls.updateLink, undefined);
+    assert.equal(calls.queue.length, 0);
+});
+
+test('PUT queue errors remain blocked with safe codes and preserve the edited snapshot', async () => {
+    const error = new Error('password=secret-value');
+    error.code = 'CREDENTIAL_SECRET';
+    const { router } = createAutoDeployHarness({
+        editedLink: editedLink(),
+        coordinator: { async queue() { throw error; } },
+    });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.equal(response.body.topologyRevision, 9);
+    assert.equal(response.body.links.find(link => link._id === LINK_EDITED).name, 'Edited hop');
+    assert.equal(response.body.autoDeployOperation, undefined);
+    assert.equal(response.body.autoDeployStatus, 'blocked');
+    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+    assert.doesNotMatch(JSON.stringify(response.body), /secret-value|CREDENTIAL_SECRET/);
+});
+
+test('PUT malformed queue result fails closed rather than claiming a queued operation', async () => {
+    const { router } = createAutoDeployHarness({
+        editedLink: editedLink(),
+        coordinator: { async queue() { return { operationId: 'op-wrong-revision', topologyRevision: 8, status: 'queued' }; } },
+    });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.equal(response.body.autoDeployOperation, undefined);
     assert.equal(response.body.autoDeployStatus, 'blocked');
     assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
 });

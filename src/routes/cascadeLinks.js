@@ -760,11 +760,27 @@ function createCascadeLinksRouter({
                 ? { ...revisions, revision: maintenance.revision }
                 : revisions;
             logger.info(`[Cascade Links API] Updated link ${req.params.id}`);
-            return res.json(await readLinkSnapshot({
+            const snapshot = await readLinkSnapshot({
                 Link,
                 TopologyState,
                 revisions: finalRevisions,
-            }));
+            });
+            const body = { ...snapshot };
+            // Only this PUT's explicit opt-in may queue; persisted metadata on
+            // another edit is never an instruction to activate the link.
+            if (changes.autoDeploy === true) {
+                const link = snapshot.links.find(candidate => String(candidate._id) === req.params.id);
+                if (link?.active === true) {
+                    Object.assign(body, await queueAutoDeploy({
+                        link,
+                        portalNodeId: link.portalNode,
+                        bridgeNodeId: link.bridgeNode,
+                        revision: finalRevisions.revision,
+                        links: snapshot.links,
+                    }));
+                }
+            }
+            return res.json(body);
         } catch (error) {
             return sendError(res, error, 'Update');
         }
