@@ -78,6 +78,80 @@ class L2tpOperationRepository {
         return result.matchedCount === 1;
     }
 
+    // Dormant generation-fenced API: legacy calls above/below are deliberately
+    // unchanged. A caller must explicitly opt into all five claim fences.
+    async _updateClaimed({ operationId, owner, ownerGeneration, expectedStatus, now }, update) {
+        if (!operationId || typeof owner !== 'string' || !owner.trim()
+            || !Number.isSafeInteger(ownerGeneration) || ownerGeneration < 1
+            || !['running', 'rolling_back'].includes(expectedStatus)
+            || !(now instanceof Date) || !Number.isFinite(now.getTime())) {
+            return false;
+        }
+        if (update.$push) {
+            const journal = update.$push.logs.$each[0];
+            if (!journal || typeof journal !== 'object') return false;
+            // Never pass arbitrary credential-bearing journal properties to Mongo.
+            update.$push.logs.$each = [{
+                at: journal.at,
+                level: journal.level,
+                code: journal.code,
+                message: journal.message,
+            }];
+        }
+        const result = await this.model.updateOne({
+            _id: operationId,
+            status: expectedStatus,
+            leaseOwner: owner,
+            ownerGeneration,
+            leaseUntil: { $gt: now },
+        }, update, { runValidators: true });
+        return result.matchedCount === 1;
+    }
+
+    async renewClaimed(input) {
+        const { now, leaseMs } = input;
+        if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || !(now instanceof Date)
+            || !Number.isFinite(now.getTime() + leaseMs)) return false;
+        return this._updateClaimed(input, {
+            $set: { leaseUntil: new Date(now.getTime() + leaseMs) },
+        });
+    }
+
+    async recordClaimedStep(input) {
+        const { step, progress, journal } = input;
+        return this._updateClaimed(input, {
+            $set: { step, progress },
+            $push: { logs: { $each: [journal], $slice: -100 } },
+        });
+    }
+
+    async transitionClaimed(input) {
+        const { status, step, progress, errorCode, errorMessage, finishedAt, journal } = input;
+        if (!['rolling_back', 'failed', 'rolled_back', 'cancelled'].includes(status)) return false;
+        const fields = { status };
+        if (step !== undefined) fields.step = step;
+        if (progress !== undefined) fields.progress = progress;
+        if (errorCode !== undefined) fields.errorCode = errorCode;
+        if (errorMessage !== undefined) fields.errorMessage = errorMessage;
+        if (finishedAt !== undefined) fields.finishedAt = finishedAt;
+        return this._updateClaimed(input, {
+            $set: fields,
+            $push: { logs: { $each: [journal], $slice: -100 } },
+        });
+    }
+
+    async succeedGenerationClaimed(input) {
+        const { now, step, journal } = input;
+        if (input.expectedStatus !== 'running') return false;
+        return this._updateClaimed(input, {
+            $set: {
+                status: 'succeeded', step, progress: 100,
+                errorCode: '', errorMessage: '', finishedAt: now,
+            },
+            $push: { logs: { $each: [journal], $slice: -100 } },
+        });
+    }
+
     async recordStep({ operationId, step, progress, journal }) {
         return this.model.updateOne({ _id: operationId }, {
             $set: { step, progress },
