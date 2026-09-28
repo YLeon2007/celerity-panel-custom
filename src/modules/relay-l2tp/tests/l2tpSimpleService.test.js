@@ -14,6 +14,7 @@ function chainable(rows) {
     const query = {
         select() { return query; },
         sort() { return query; },
+        session() { return query; },
         lean: async () => rows,
         then: resolve => resolve(rows),
     };
@@ -23,7 +24,8 @@ function chainable(rows) {
 function createModels({ nodes = [], states = [], users = [], groups = [], links = [] } = {}) {
     const stateStore = states.map(state => ({ ...state }));
     const userStore = users.map(user => ({ ...user }));
-    return {
+    const db = { transaction: work => work({}) };
+    const models = {
         HyNode: {
             find: filter => chainable(
                 nodes.filter(node => !filter?.cascadeRole || node.cascadeRole === filter.cascadeRole),
@@ -79,9 +81,15 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
         CascadeRouteGroup: {
             find: () => chainable(groups),
             findById: id => ({
+                session() { return this; },
                 lean: async () => groups.find(entry => String(entry._id) === String(id)) ?? null,
             }),
-            create: async document => ({ _id: 'group-auto', ...document }),
+            create: async documents => [{ _id: 'group-auto', ...documents[0] }],
+            updateOne: async (filter, update) => {
+                const group = groups.find(entry => String(entry._id) === String(filter._id));
+                if (group && update?.$set) Object.assign(group, update.$set);
+                return { matchedCount: group ? 1 : 0 };
+            },
             findByIdAndUpdate: async (id, update) => {
                 const group = groups.find(entry => String(entry._id) === String(id));
                 if (group && update?.$set) Object.assign(group, update.$set);
@@ -92,7 +100,13 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
         CascadeLink: {
             find: () => chainable(links),
         },
+        CascadeTopologyState: {
+            findById: () => chainable({ revision: 7 }),
+            findOneAndUpdate: () => chainable({ revision: 8 }),
+        },
     };
+    for (const model of Object.values(models)) model.db = db;
+    return models;
 }
 
 function createService(overrides = {}, models = createModels()) {
@@ -342,9 +356,9 @@ test('installRelay auto-creates a route group from a linear cascade chain', asyn
         return { lean: async () => node, then: resolve => resolve(node) };
     };
     let createdGroup;
-    models.CascadeRouteGroup.create = async document => {
-        createdGroup = document;
-        return { _id: 'group-auto' };
+    models.CascadeRouteGroup.create = async documents => {
+        createdGroup = documents[0];
+        return [{ _id: 'group-auto' }];
     };
     const service = createService({
         stateManagementService: {
@@ -420,9 +434,9 @@ test('installRelay follows the default hop past a geoRouting branch', async () =
         ],
     });
     let createdGroup;
-    models.CascadeRouteGroup.create = async document => {
-        createdGroup = document;
-        return { _id: 'group-auto' };
+    models.CascadeRouteGroup.create = async documents => {
+        createdGroup = documents[0];
+        return [{ _id: 'group-auto' }];
     };
     const service = createService({
         stateManagementService: {

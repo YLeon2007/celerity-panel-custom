@@ -19,6 +19,9 @@ const SUBNET_THIRD_OCTET_MAX = 239;
 const AUTO_GROUP_NAME = 'auto-l2tp';
 const AUTO_GROUP_PATH_KEY = 'main';
 const MAX_GROUP_WALK_HOPS = 8;
+const ACTIVE_RELAY_STATUSES = new Set([
+    'queued', 'preflight', 'installing', 'installed', 'degraded', 'drifted', 'removing',
+]);
 
 class L2tpSimpleError extends Error {
     constructor(code, message) {
@@ -213,6 +216,7 @@ class L2tpSimpleService {
         L2tpUser,
         CascadeRouteGroup,
         CascadeLink,
+        CascadeTopologyState,
         l2tpService,
         stateManagementService,
         userManagementService,
@@ -255,6 +259,7 @@ class L2tpSimpleService {
         this.L2tpUser = L2tpUser;
         this.CascadeRouteGroup = CascadeRouteGroup;
         this.CascadeLink = CascadeLink;
+        this.CascadeTopologyState = CascadeTopologyState;
         this.l2tpService = l2tpService;
         this.stateManagementService = stateManagementService;
         this.userManagementService = userManagementService;
@@ -372,15 +377,15 @@ class L2tpSimpleService {
 
     // Walks linear cascade links away from the relay until a bridge node is
     // reached; branches or loops reject automatic group creation.
-    async buildAutoGroupPaths(nodeId) {
+    async buildAutoGroupPaths(nodeId, session) {
         if (!this.CascadeLink || typeof this.CascadeLink.find !== 'function') {
             throw simpleError(
                 'ROUTE_GROUP_REQUIRED',
                 'No L2TP route group exists and cascade links are unavailable',
             );
         }
-        const links = await this.CascadeLink.find({}).lean();
-        const nodes = await this.HyNode.find({}).select('_id cascadeRole').lean();
+        const links = await this.CascadeLink.find({}).session(session).lean();
+        const nodes = await this.HyNode.find({}).select('_id cascadeRole').session(session).lean();
         const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
         let ordered;
         try {
@@ -405,20 +410,75 @@ class L2tpSimpleService {
         }];
     }
 
-    async ensureRouteGroup(nodeId) {
-        const groups = await this.CascadeRouteGroup.find({}).sort({ name: 1, _id: 1 }).lean();
-        if (Array.isArray(groups) && groups.length > 0) {
-            return entityId(groups[0]._id);
+    async withPathWriter(work) {
+        const models = [this.HyNode, this.CascadeLink, this.CascadeRouteGroup,
+            this.RelayL2tpState, this.CascadeTopologyState];
+        const connection = this.CascadeTopologyState?.db;
+        if (!connection || typeof connection.transaction !== 'function'
+            || models.some(model => model?.db !== connection)) {
+            throw new TypeError('L2TP simple path writer requires models on one transactional Mongo connection');
         }
-        const paths = await this.buildAutoGroupPaths(nodeId);
-        const created = await this.CascadeRouteGroup.create({
-            name: AUTO_GROUP_NAME,
-            mode: 'reverse',
-            strategy: 'priority-failover',
-            paths,
+        try {
+            return await connection.transaction(async session => {
+                const topology = await this.CascadeTopologyState.findById('singleton')
+                    .select('revision replacementReservation').session(session).lean();
+                if (topology?.replacementReservation) {
+                    throw simpleError('TOPOLOGY_REPLACEMENT_RESERVED', 'A topology replacement owns the path writer fence');
+                }
+                const expectedRevision = topology?.revision ?? 0;
+                const commit = async () => {
+                    const update = { $inc: { revision: 1 } };
+                    if (!topology) update.$setOnInsert = { deployedRevision: 0 };
+                    const result = await this.CascadeTopologyState.findOneAndUpdate(
+                        { _id: 'singleton', revision: expectedRevision,
+                            replacementReservation: { $exists: false } },
+                        update,
+                        { session, new: true, runValidators: true, upsert: !topology },
+                    ).select('revision').lean();
+                    if (!result) throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Topology changed during L2TP path write');
+                };
+                return work({ session, commit });
+            });
+        } catch (error) {
+            if (error?.code === 11000 || error?.code === 11001) {
+                throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Concurrent L2TP group or topology creation');
+            }
+            throw error;
+        }
+    }
+
+    async assertPathMutationSafe(nodeId, routeGroupId, session) {
+        const states = await this.RelayL2tpState.find({ $or: [
+            { node: nodeId }, { routeGroup: routeGroupId },
+        ] })
+            .session(session).lean();
+        // No route-group-specific ingress preparation occurs in this facade.
+        // Refuse any mutation to a group used by an installed/configured relay,
+        // including an absent or empty owned path and paths owned by peers.
+        if ((states || []).some(state =>
+            (entityId(state.node) === entityId(nodeId)
+                || (routeGroupId && entityId(state.routeGroup) === entityId(routeGroupId)))
+            && (state.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.has(state.status)))) {
+            throw simpleError('PREPARED_INGRESS_REQUIRED', 'Installed relay path changes require prepared ingress');
+        }
+    }
+
+    async ensureRouteGroup(nodeId) {
+        return this.withPathWriter(async ({ session, commit }) => {
+            const groups = await this.CascadeRouteGroup.find({}).sort({ name: 1, _id: 1 })
+                .session(session).lean();
+            if (Array.isArray(groups) && groups.length > 0) return entityId(groups[0]._id);
+            const paths = await this.buildAutoGroupPaths(nodeId, session);
+            await this.assertPathMutationSafe(nodeId, null, session);
+            const [created] = await this.CascadeRouteGroup.create([{
+                name: AUTO_GROUP_NAME,
+                mode: 'reverse',
+                strategy: 'priority-failover',
+                paths,
+            }], { session });
+            await commit();
+            return entityId(created?._id);
         });
-        await this.stateRepository.advanceTopologyRevision?.();
-        return entityId(created?._id);
     }
 
     async installRelay(nodeId) {
@@ -512,86 +572,77 @@ class L2tpSimpleService {
     // derives each relay's egress plan from the path whose first link starts
     // at that relay. A group auto-created for one relay therefore does not
     // serve another relay mid-chain until its suffix path is appended.
-    // Caveat: the compiler also derives *suffix* candidates, so one long path
-    // covers every downstream relay — overlapping paths at equal priority
-    // block selection with DUPLICATE_PRIORITY. Keep exactly one (longest)
-    // path covering each relay.
+    // A longer path may already cover this relay. Never implicitly remove
+    // overlapping paths: ownership and ingress readiness require an explicit edit.
     async ensureRelayGroupPath(nodeId, routeGroupId) {
-        const group = await this.CascadeRouteGroup.findById(routeGroupId).lean();
-        if (!group) return;
-        let wanted;
-        try {
-            [wanted] = await this.buildAutoGroupPaths(nodeId);
-        } catch (error) {
-            // No cascade chain currently leaves this relay — keep the group
-            // untouched instead of failing the install.
-            if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
-                return;
+        return this.withPathWriter(async ({ session, commit }) => {
+            const group = await this.CascadeRouteGroup.findById(routeGroupId).session(session).lean();
+            if (!group) return;
+            let wanted;
+            try {
+                [wanted] = await this.buildAutoGroupPaths(nodeId, session);
+            } catch (error) {
+                // No cascade chain currently leaves this relay — keep the group
+                // untouched instead of failing the install.
+                if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
+                    return;
+                }
+                throw error;
             }
-            throw error;
-        }
-        const wantedIds = (wanted?.linkIds || []).map(String);
-        if (wantedIds.length === 0
-            || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
-            return;
-        }
-        const existing = Array.isArray(group.paths) ? group.paths : [];
-        const linkIdsOf = path => (path?.linkIds || []).map(String);
+            const wantedIds = (wanted?.linkIds || []).map(String);
+            if (wantedIds.length === 0) return;
+            const existing = Array.isArray(group.paths) ? group.paths : [];
+            const linkIdsOf = path => (path?.linkIds || []).map(String);
 
-        const covering = existing.filter(path => linkIdsOf(path).includes(wantedIds[0]));
-        if (covering.length === 1 && existing.length === 1) return; // clean coverage
-        if (covering.length > 0) {
-            // The relay is covered, possibly by several overlapping paths —
-            // keep only the longest (most upstream) covering path.
-            const best = covering.reduce((a, b) => (
-                linkIdsOf(b).length > linkIdsOf(a).length ? b : a
-            ));
-            const finalPaths = existing.filter(path => !covering.includes(path) || path === best);
-            if (finalPaths.length !== existing.length) {
-                await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, {
-                    $set: { paths: finalPaths },
-                });
-                await this.stateRepository.advanceTopologyRevision?.();
+            const covering = existing.filter(path => linkIdsOf(path).includes(wantedIds[0]));
+            if (covering.length > 1) {
+                throw simpleError('SHARED_ROUTE_GROUP_PATH', 'Overlapping route group paths need an explicit owner-aware edit');
             }
-            return;
-        }
+            if (covering.length === 1) return; // already covered; zero writes
 
-        // No coverage: append this relay's path and drop any existing path
-        // that starts strictly inside it — those are now suffix-covered.
-        const kept = existing.filter(path => !wantedIds.slice(1).includes(linkIdsOf(path)[0]));
-        const usedKeys = new Set(kept.map(path => path?.pathKey));
-        const pathKey = usedKeys.has(wanted.pathKey)
-            ? `${wanted.pathKey}-${String(nodeId).slice(-6)}`
-            : wanted.pathKey;
-        await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, {
-            $set: { paths: [...kept, { ...wanted, pathKey }] },
+            if (existing.some(path => wantedIds.slice(1).includes(linkIdsOf(path)[0]))) {
+                throw simpleError('SHARED_ROUTE_GROUP_PATH', 'A downstream route group path cannot be removed implicitly');
+            }
+            const usedKeys = new Set(existing.map(path => path?.pathKey));
+            const pathKey = usedKeys.has(wanted.pathKey)
+                ? `${wanted.pathKey}-${String(nodeId).slice(-6)}`
+                : wanted.pathKey;
+            await this.assertPathMutationSafe(nodeId, routeGroupId, session);
+            const result = await this.CascadeRouteGroup.updateOne(
+                { _id: routeGroupId }, { $set: { paths: [...existing, { ...wanted, pathKey }] } },
+                { session, runValidators: true },
+            );
+            if (result.matchedCount !== 1) throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Route group disappeared');
+            await commit();
         });
-        await this.stateRepository.advanceTopologyRevision?.();
     }
 
     // Rebuilds the relay route group paths when a topology change (e.g. a
     // deleted cascade link stripped them) left the group empty and a chain
     // is available again.
     async refreshEmptyRouteGroup(nodeId, routeGroupId) {
-        const groups = await this.CascadeRouteGroup.find({}).lean();
-        const group = (groups || []).find(entry => entityId(entry) === routeGroupId);
-        if (!group || (group.paths || []).length > 0) return;
-        let paths;
-        try {
-            paths = await this.buildAutoGroupPaths(nodeId);
-        } catch (error) {
-            // No cascade chain currently leaves this relay — keep the group
-            // empty instead of failing the install.
-            if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
-                return;
+        return this.withPathWriter(async ({ session, commit }) => {
+            const group = await this.CascadeRouteGroup.findById(routeGroupId).session(session).lean();
+            if (!group || (group.paths || []).length > 0) return;
+            let paths;
+            try {
+                paths = await this.buildAutoGroupPaths(nodeId, session);
+            } catch (error) {
+                // No cascade chain currently leaves this relay — keep the group
+                // empty instead of failing the install.
+                if (error instanceof L2tpSimpleError && error.code === 'ROUTE_GROUP_REQUIRED') {
+                    return;
+                }
+                throw error;
             }
-            throw error;
-        }
-        if (!paths.length || typeof this.CascadeRouteGroup.findByIdAndUpdate !== 'function') {
-            return;
-        }
-        await this.CascadeRouteGroup.findByIdAndUpdate(routeGroupId, { $set: { paths } });
-        await this.stateRepository.advanceTopologyRevision?.();
+            if (!paths.length) return;
+            await this.assertPathMutationSafe(nodeId, routeGroupId, session);
+            const result = await this.CascadeRouteGroup.updateOne(
+                { _id: routeGroupId }, { $set: { paths } }, { session, runValidators: true },
+            );
+            if (result.matchedCount !== 1) throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Route group disappeared');
+            await commit();
+        });
     }
 
     // Returns the 10.255.N.x octet shared by every account already pinned to
