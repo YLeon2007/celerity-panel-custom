@@ -312,6 +312,7 @@ function createL2tpExecutionRuntime({
         HyNode,
         RelayL2tpState,
         CascadeRouteGroup,
+        CascadeTopologyState,
     });
     const managementService = new L2tpStateManagementService({
         repository: managementRepository,

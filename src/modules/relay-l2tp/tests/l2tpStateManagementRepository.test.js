@@ -10,6 +10,20 @@ const {
     VERIFIED_STATE_SAFE_SELECT,
 } = require('../repositories/l2tpStateManagementRepository');
 
+const TEST_SESSION = { id: 'test-session' };
+const TEST_DB = { transaction: async work => work(TEST_SESSION) };
+function createTopologyModel(result = { stateTransitionRevision: 0 }) {
+    return {
+        db: TEST_DB,
+        findById() {
+            return { select() { return this; }, session() { return this; }, lean: async () => result };
+        },
+        findOneAndUpdate() {
+            return { select() { return this; }, lean: async () => ({ stateTransitionRevision: 1 }) };
+        },
+    };
+}
+
 function createQueryModel(result = null) {
     const calls = [];
     const query = () => ({
@@ -24,6 +38,7 @@ function createQueryModel(result = null) {
     });
 
     return {
+        db: TEST_DB,
         calls,
         findById(id) {
             calls.push({ method: 'findById', id });
@@ -39,6 +54,113 @@ function createQueryModel(result = null) {
         },
     };
 }
+
+test('state transition fences a held replacement on the same singleton without changing topology revision', async () => {
+    const session = { id: 'transaction' };
+    const calls = [];
+    const db = { transaction: async work => work(session) };
+    const RelayL2tpState = {
+        db,
+        findOneAndUpdate(filter, update, options) {
+            calls.push({ kind: 'state', filter, update, options });
+            return { select() { return this; }, lean: async () => ({ node: 'relay-1' }) };
+        },
+    };
+    const CascadeTopologyState = {
+        db,
+        findById(id) {
+            calls.push({ kind: 'snapshot', id });
+            return { select() { return this; }, session(actual) {
+                assert.equal(actual, session); return this;
+            }, lean: async () => ({ stateTransitionRevision: 4, replacementReservation: { ownerToken: 'held' } }) };
+        },
+        findOneAndUpdate(filter, update, options) {
+            calls.push({ kind: 'fence', filter, update, options });
+            return { select() { return this; }, lean: async () => ({ stateTransitionRevision: 5 }) };
+        },
+    };
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState, CascadeTopologyState,
+    });
+    await assert.rejects(
+        repository.configureRelay({ node: 'relay-1', desiredState: 'installed' }),
+        { code: 'TOPOLOGY_REPLACEMENT_RESERVED' },
+    );
+    assert.deepEqual(calls.map(call => call.kind), ['snapshot']);
+    assert.equal(calls.some(call => call.kind === 'state' || call.kind === 'fence'), false);
+});
+
+test('reservation arriving after state snapshot aborts the state transaction', async () => {
+    let persisted = { status: 'not_installed' };
+    let reservationAcquired = false;
+    const db = { async transaction(work) {
+        const before = { ...persisted };
+        try { return await work({ id: 'race' }); }
+        catch (error) { persisted = before; throw error; }
+    } };
+    const RelayL2tpState = { db, findOneAndUpdate() {
+        persisted = { status: 'installed' };
+        return { select() { return this; }, lean: async () => persisted };
+    } };
+    const CascadeTopologyState = { db,
+        findById() { return { select() { return this; }, session() { return this; },
+            lean: async () => ({ stateTransitionRevision: 2 }) }; },
+        findOneAndUpdate: filter => {
+            assert.deepEqual(filter.replacementReservation, { $exists: false });
+            reservationAcquired = true;
+            return { select() { return this; }, lean: async () => reservationAcquired ? null : {} };
+        },
+    };
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState, CascadeTopologyState,
+    });
+    await assert.rejects(repository.markInstalledAfterVerification({ node: 'relay-1' }),
+        /topology singleton conflict/);
+    assert.deepEqual(persisted, { status: 'not_installed' });
+});
+
+test('missing singleton and split connections fail closed before configuration writes', async () => {
+    let writes = 0;
+    const db = { transaction: async work => work({}) };
+    const RelayL2tpState = { db, findOneAndUpdate() { writes++; throw Error('unexpected write'); } };
+    const CascadeTopologyState = createTopologyModel(null);
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState, CascadeTopologyState,
+    });
+    await assert.rejects(repository.configureRelay({ node: 'relay-1' }), /one transactional Mongo connection/);
+    CascadeTopologyState.db = db;
+    await assert.rejects(repository.configureRelay({ node: 'relay-1' }), /requires a topology singleton/);
+    assert.equal(writes, 0);
+});
+
+test('legacy singleton lacking counter uses absent-field CAS and marks no-match without a bump', async () => {
+    let bumps = 0;
+    const db = { transaction: async work => work({}) };
+    const RelayL2tpState = { db, findOneAndUpdate() {
+        return { select() { return this; }, lean: async () => null };
+    } };
+    const CascadeTopologyState = { db,
+        findById() { return { select() { return this; }, session() { return this; },
+            lean: async () => ({ revision: 7 }) }; },
+        findOneAndUpdate(filter) { bumps++;
+            assert.deepEqual(filter.stateTransitionRevision, { $exists: false });
+            assert.deepEqual(filter.replacementReservation, { $exists: false });
+            return { select() { return this; }, lean: async () => ({}) }; },
+    };
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState, CascadeTopologyState,
+    });
+    assert.equal(await repository.markInstalledAfterVerification({ node: 'relay-1' }), null);
+    assert.equal(bumps, 0);
+    RelayL2tpState.findOneAndUpdate = () => ({ select() { return this; },
+        lean: async () => ({ node: 'relay-1' }) });
+    assert.deepEqual(await repository.configureRelay({ node: 'relay-1' }), { node: 'relay-1' });
+    assert.equal(bumps, 1);
+});
 
 test('repository adapter writes an encrypted select:false PSK and returns only safe state', async () => {
     const HyNode = createQueryModel({ _id: 'relay-1', cascadeRole: 'relay' });
@@ -67,6 +189,7 @@ test('repository adapter writes an encrypted select:false PSK and returns only s
         HyNode,
         RelayL2tpState,
         CascadeRouteGroup,
+        CascadeTopologyState: createTopologyModel(),
     });
 
     assert.deepEqual(await repository.findNodeById('relay-1'), {
@@ -133,6 +256,7 @@ test('repository adapter writes an encrypted select:false PSK and returns only s
                 runValidators: true,
                 setDefaultsOnInsert: false,
                 upsert: true,
+                session: TEST_SESSION,
             },
         },
         { method: 'select', paths: STATE_MANAGEMENT_SAFE_SELECT },
@@ -170,6 +294,7 @@ test('execution lookup selects only matching state identity, revision, and encry
         HyNode: createQueryModel(),
         RelayL2tpState,
         CascadeRouteGroup: createQueryModel(),
+        CascadeTopologyState: createTopologyModel(),
     });
 
     assert.strictEqual(
@@ -205,6 +330,7 @@ test('verified install reconciliation atomically fences current desired state an
         HyNode: createQueryModel(),
         RelayL2tpState,
         CascadeRouteGroup: createQueryModel(),
+        CascadeTopologyState: createTopologyModel(),
     });
 
     const result = await repository.markInstalledAfterVerification({
@@ -241,6 +367,7 @@ test('verified install reconciliation atomically fences current desired state an
             options: {
                 new: true,
                 runValidators: true,
+                session: TEST_SESSION,
             },
         },
         { method: 'select', paths: VERIFIED_STATE_SAFE_SELECT },
@@ -268,6 +395,7 @@ test('verified install reconciliation preserves a rejected atomic fence as null'
         HyNode: createQueryModel(),
         RelayL2tpState,
         CascadeRouteGroup: createQueryModel(),
+        CascadeTopologyState: createTopologyModel(),
     });
 
     const result = await repository.markInstalledAfterVerification({

@@ -13,6 +13,8 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
         default: 0,
         min: 0,
     },
+    // State-only transactions conflict with path writers without changing topology revision.
+    stateTransitionRevision: { type: Number, default: 0, min: 0 },
     deployedRevision: {
         type: Number,
         default: 0,

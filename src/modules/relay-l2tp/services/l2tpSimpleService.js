@@ -1,6 +1,7 @@
 'use strict';
 
 const { createHash, randomBytes } = require('node:crypto');
+const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const {
     DefaultChainPathError,
     buildDefaultChainLinkIds,
@@ -728,10 +729,19 @@ class L2tpSimpleService {
             ssh.disconnect?.();
         }
 
-        await this.RelayL2tpState.findOneAndUpdate(
+        // The SSH teardown above is outside this DB fence; remote admission
+        // requires separate protection. Only the resulting state write is fenced.
+        const stateRepository = new L2tpStateManagementRepository({
+            HyNode: this.HyNode,
+            CascadeRouteGroup: this.CascadeRouteGroup,
+            RelayL2tpState: this.RelayL2tpState,
+            CascadeTopologyState: this.CascadeTopologyState,
+        });
+        await stateRepository.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
             { node: selectedNodeId },
             { $set: { desiredState: 'not_installed', status: 'not_installed' } },
-        );
+            { session },
+        ));
         return { ok: true };
     }
 

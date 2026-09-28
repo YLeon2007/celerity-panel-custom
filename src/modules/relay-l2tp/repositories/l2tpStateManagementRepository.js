@@ -60,13 +60,45 @@ function pickDefined(source, fields) {
 }
 
 class L2tpStateManagementRepository {
-    constructor({ HyNode, RelayL2tpState, CascadeRouteGroup }) {
+    constructor({ HyNode, RelayL2tpState, CascadeRouteGroup, CascadeTopologyState }) {
         if (!HyNode) throw new TypeError('HyNode model is required');
         if (!RelayL2tpState) throw new TypeError('RelayL2tpState model is required');
         if (!CascadeRouteGroup) throw new TypeError('CascadeRouteGroup model is required');
         this.HyNode = HyNode;
         this.RelayL2tpState = RelayL2tpState;
         this.CascadeRouteGroup = CascadeRouteGroup;
+        this.CascadeTopologyState = CascadeTopologyState;
+    }
+
+    async withStateTransition(write) {
+        const connection = this.RelayL2tpState.db;
+        if (!connection || typeof connection.transaction !== 'function'
+            || this.CascadeTopologyState?.db !== connection) {
+            throw new TypeError('L2TP state transition requires models on one transactional Mongo connection');
+        }
+        return connection.transaction(async session => {
+            const topology = await this.CascadeTopologyState.findById('singleton')
+                .select('stateTransitionRevision replacementReservation').session(session).lean();
+            // Never create a topology document as a side effect of configuring a relay.
+            if (!topology) throw new Error('L2TP state transition requires a topology singleton');
+            if (topology.replacementReservation) {
+                const error = new Error('A topology replacement owns the relay state transition fence');
+                error.code = 'TOPOLOGY_REPLACEMENT_RESERVED';
+                throw error;
+            }
+            const state = await write(session);
+            if (!state) return null;
+            const expected = topology.stateTransitionRevision;
+            const fenced = await this.CascadeTopologyState.findOneAndUpdate(
+                { _id: 'singleton', replacementReservation: { $exists: false },
+                    stateTransitionRevision: expected === undefined
+                        ? { $exists: false } : expected },
+                { $inc: { stateTransitionRevision: 1 } },
+                { session, new: true, upsert: false },
+            ).select('stateTransitionRevision').lean();
+            if (!fenced) throw new Error('L2TP state transition topology singleton conflict');
+            return state;
+        });
     }
 
     async findNodeById(nodeId) {
@@ -82,7 +114,7 @@ class L2tpStateManagementRepository {
     }
 
     async configureRelay(fields) {
-        const state = await this.RelayL2tpState.findOneAndUpdate(
+        const state = await this.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
             { node: fields.node },
             {
                 $set: pickDefined(fields, CONFIGURATION_WRITE_FIELDS),
@@ -94,10 +126,11 @@ class L2tpStateManagementRepository {
                 runValidators: true,
                 setDefaultsOnInsert: false,
                 upsert: true,
+                session,
             },
         )
             .select(STATE_MANAGEMENT_SAFE_SELECT)
-            .lean();
+            .lean());
         return pickDefined(state, STATE_MANAGEMENT_SAFE_FIELDS);
     }
 
@@ -115,7 +148,7 @@ class L2tpStateManagementRepository {
         activePathKey,
         verifiedAt,
     }) {
-        const state = await this.RelayL2tpState.findOneAndUpdate(
+        const state = await this.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
             {
                 node,
                 desiredState: 'installed',
@@ -135,10 +168,11 @@ class L2tpStateManagementRepository {
             {
                 new: true,
                 runValidators: true,
+                session,
             },
         )
             .select(VERIFIED_STATE_SAFE_SELECT)
-            .lean();
+            .lean());
         return state ? pickDefined(state, VERIFIED_STATE_SAFE_FIELDS) : null;
     }
 }

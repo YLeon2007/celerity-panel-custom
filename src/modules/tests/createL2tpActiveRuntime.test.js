@@ -40,6 +40,7 @@ function queryResult(result, calls, kind) {
             calls.push({ kind: `${kind}.sort`, order });
             return this;
         },
+        session() { return this; },
         lean() {
             calls.push({ kind: `${kind}.lean` });
             return Promise.resolve(result);
@@ -127,6 +128,9 @@ function createActiveHost(overrides = {}) {
             throw new Error('not used while listing users');
         },
     };
+    const testSession = { id: 'active-runtime-state-fence' };
+    const db = { transaction: work => work(testSession) };
+    RelayL2tpState.db = db;
     const models = {
         RelayL2tpState,
         L2tpUser,
@@ -136,7 +140,18 @@ function createActiveHost(overrides = {}) {
                 throw new Error('not used outside the simple facade');
             },
         },
-        CascadeTopologyState: { modelName: 'CascadeTopologyState' },
+        CascadeTopologyState: {
+            modelName: 'CascadeTopologyState',
+            db,
+            findById(id) {
+                calls.push({ kind: 'CascadeTopologyState.findById', id });
+                return queryResult({ stateTransitionRevision: 0 }, calls, 'CascadeTopologyState');
+            },
+            findOneAndUpdate(filter, update, options) {
+                calls.push({ kind: 'CascadeTopologyState.findOneAndUpdate', filter, update, options });
+                return queryResult({ stateTransitionRevision: 1 }, calls, 'CascadeTopologyState');
+            },
+        },
         L2tpOperation: { modelName: 'L2tpOperation' },
         NodeOperationLock: { modelName: 'NodeOperationLock' },
     };
@@ -293,6 +308,7 @@ function createActiveHost(overrides = {}) {
         host,
         preflightFactoryCalls,
         runtimeCalls,
+        testSession,
         userSnapshotFactoryCalls,
         userSyncFactoryCalls,
         userSyncReconciler,
@@ -496,7 +512,7 @@ test('active preflight resolves transport only on demand without operations, sec
 });
 
 test('active worker reconciler persists verified install state through the management service', async () => {
-    const { calls, host, runtimeCalls } = createActiveHost();
+    const { calls, host, runtimeCalls, testSession } = createActiveHost();
     const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
     const operation = {
         id: 'operation-17',
@@ -516,6 +532,9 @@ test('active worker reconciler persists verified install state through the manag
 
     assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
     assert.deepEqual(calls, [
+        { kind: 'CascadeTopologyState.findById', id: 'singleton' },
+        { kind: 'CascadeTopologyState.select', fields: 'stateTransitionRevision replacementReservation' },
+        { kind: 'CascadeTopologyState.lean' },
         {
             kind: 'RelayL2tpState.findOneAndUpdate',
             filter: {
@@ -534,10 +553,19 @@ test('active worker reconciler persists verified install state through the manag
                     lastError: '',
                 },
             },
-            options: { new: true, runValidators: true },
+            options: { new: true, runValidators: true, session: testSession },
         },
         { kind: 'RelayL2tpState.select', fields: VERIFIED_STATE_SAFE_SELECT },
         { kind: 'RelayL2tpState.lean' },
+        {
+            kind: 'CascadeTopologyState.findOneAndUpdate',
+            filter: { _id: 'singleton', stateTransitionRevision: 0,
+                replacementReservation: { $exists: false } },
+            update: { $inc: { stateTransitionRevision: 1 } },
+            options: { new: true, upsert: false, session: testSession },
+        },
+        { kind: 'CascadeTopologyState.select', fields: 'stateTransitionRevision' },
+        { kind: 'CascadeTopologyState.lean' },
     ]);
     assert.deepEqual(result, {
         node: 'node-a',
