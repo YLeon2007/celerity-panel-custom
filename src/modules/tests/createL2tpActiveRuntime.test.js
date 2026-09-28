@@ -1,6 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
+const { readFileSync } = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
@@ -13,6 +16,7 @@ const {
     VERIFIED_STATE_SAFE_SELECT,
 } = require('../relay-l2tp/repositories/l2tpStateManagementRepository');
 const { L2tpNodeTransport } = require('../relay-l2tp/services/l2tpNodeTransport');
+const { INSPECT_COMMAND } = require('../relay-l2tp/services/l2tpArtifactBootstrapper');
 const { materializeInstallOperation } = require('../relay-l2tp/services/l2tpOperationMaterializer');
 const { createL2tpPreflightRunner } = require('../relay-l2tp/services/l2tpPreflightRunner');
 const { L2tpRemoteExecutor } = require('../relay-l2tp/services/l2tpRemoteExecutor');
@@ -164,6 +168,16 @@ function createActiveHost(overrides = {}) {
 
         async exec(command, options) {
             calls.push({ kind: 'NodeSSH.exec', command, options });
+            if (command === INSPECT_COMMAND) {
+                const runner = readFileSync(path.join(
+                    __dirname, '../relay-l2tp/node-artifacts/l2tp/runner.sh',
+                ));
+                return {
+                    code: 0,
+                    stdout: `${createHash('sha256').update(runner).digest('hex')}  /usr/local/lib/celerity/relay-l2tp/runner.sh\n`,
+                    stderr: '',
+                };
+            }
             return { code: 0, stdout: '', stderr: '' };
         }
     }
@@ -388,6 +402,7 @@ test('explicit complete activation wires execution factories lazily and starts o
     }]);
     assert.deepEqual(calls, []);
     assert.equal(getScheduledTick(), undefined);
+    assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
     assert.equal(
         Object.prototype.propertyIsEnumerable.call(host.runtime.worker, 'secretResolver'),
         false,
@@ -401,6 +416,7 @@ test('explicit complete activation wires execution factories lazily and starts o
     });
     assert.deepEqual(calls, [{ kind: 'timer.setInterval', intervalMs: 2_500 }]);
     assert.equal(typeof getScheduledTick(), 'function');
+    assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
 
     const secrets = await host.runtime.worker.secretResolver({
         kind: 'install',
@@ -453,6 +469,7 @@ test('explicit complete activation wires execution factories lazily and starts o
         JSON.stringify(host.runtime),
         /resolved-alice-password|sealed-alice-password/,
     );
+    assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
 
     await host.runtime.worker.executor.executeStep({
         operation: { _id: 'operation-a', node: 'node-a' },
@@ -482,16 +499,26 @@ test('explicit complete activation wires execution factories lazily and starts o
             'HyNode.lean',
             'NodeSSH.construct',
             'NodeSSH.exec',
+            'NodeSSH.exec',
         ],
     );
     assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 1);
     assert.equal(calls.find(call => call.kind === 'HyNode.findById').nodeId, 'node-a');
+    assert.deepEqual(calls.filter(call => call.kind === 'NodeSSH.exec'), [
+        { kind: 'NodeSSH.exec', command: INSPECT_COMMAND, options: undefined },
+        {
+            kind: 'NodeSSH.exec',
+            command: '/usr/local/bin/celerity-l2tp-artifact-runner --operation-id operation-a --command commit',
+            options: { timeout: 120000 },
+        },
+    ]);
 });
 
 test('active preflight resolves transport only on demand without operations, secrets, or candidates', async () => {
     const { calls, host } = createActiveHost();
 
     assert.deepEqual(calls, []);
+    assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
 
     const result = await host.runtime.service.preflight('node-a', {
         routeGroupId: 'group-a',
@@ -504,7 +531,30 @@ test('active preflight resolves transport only on demand without operations, sec
         error: { code: 'PREFLIGHT_RESPONSE_INVALID' },
     });
     assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 1);
-    assert.equal(calls.filter(call => call.kind === 'NodeSSH.exec').length, 2);
+    const remoteCalls = calls.filter(call => call.kind === 'NodeSSH.exec');
+    assert.equal(remoteCalls.length, 3);
+    assert.deepEqual(remoteCalls[0], {
+        kind: 'NodeSSH.exec', command: INSPECT_COMMAND, options: undefined,
+    });
+    const upload = remoteCalls[1];
+    const match = upload.command.match(/^\/usr\/local\/bin\/celerity-l2tp-artifact-receiver --operation-id (preflight-[0-9a-f]{24}) --artifact-name desired\.json$/);
+    assert.ok(match, 'preflight uploads desired.json through the fixed receiver');
+    assert.equal(upload.options.stdin.endsWith('\n'), true);
+    assert.deepEqual(JSON.parse(upload.options.stdin), {
+        clientCidr: '10.77.0.0/24',
+        localAddress: '10.77.0.1',
+        poolStart: '10.77.0.10',
+        poolEnd: '10.77.0.200',
+        dnsServers: ['1.1.1.1'],
+        tproxyPort: 12345,
+        fwmark: 77,
+        routeTable: 177,
+    });
+    assert.deepEqual(remoteCalls[2], {
+        kind: 'NodeSSH.exec',
+        command: `/usr/local/bin/celerity-l2tp-artifact-runner --operation-id ${match[1]} --command preflight`,
+        options: { timeout: 120000 },
+    });
     assert.equal(calls.some(call => call.kind === 'operationRepository.create'), false);
     assert.equal(calls.some(call => call.kind === 'secretBox.decrypt'), false);
     assert.equal(calls.some(call => call.kind === 'candidateNodeResolver'), false);
