@@ -754,12 +754,14 @@ class CascadeService {
      *
      * @param {string|ObjectId} startNodeId
      * @param {Set<string>} [excludeSet]
+     * @param {Array<string>} [allowedStatuses] - Limit links when called by topology-enabled classic Sync
      * @returns {Promise<Array>}
      */
-    async _getForwardChainLinks(startNodeId, excludeSet = new Set()) {
+    async _getForwardChainLinks(startNodeId, excludeSet = new Set(), allowedStatuses) {
         const allForwardLinks = (await CascadeLink.find({
             mode: 'forward',
             active: true,
+            ...(allowedStatuses && { status: { $in: allowedStatuses } }),
         }).populate('bridgeNode')).filter(l => !excludeSet.has(String(l._id)));
 
         if (allForwardLinks.length === 0) return [];

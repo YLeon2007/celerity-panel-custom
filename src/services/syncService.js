@@ -425,9 +425,9 @@ class SyncService {
      * @param {string|ObjectId} startNodeId
      * @returns {Promise<Array>}
      */
-    async _getForwardChainLinks(startNodeId) {
+    async _getForwardChainLinks(startNodeId, allowedStatuses) {
         const cascadeService = require('./cascadeService');
-        return cascadeService._getForwardChainLinks(startNodeId);
+        return cascadeService._getForwardChainLinks(startNodeId, new Set(), allowedStatuses);
     }
 
     /**
@@ -532,8 +532,15 @@ class SyncService {
                 // Apply cascade settings (reverse-portal + forward-chain + forward-hop inbounds)
                 try {
                     const CascadeLink = require('../models/cascadeLinkModel');
-                    const allPortalLinks = await CascadeLink.find({ portalNode: node._id, active: true }).populate('bridgeNode');
-                    const forwardHopLinks = await CascadeLink.find({ bridgeNode: node._id, mode: 'forward', active: true });
+                    // Drafts have not been deployed. Keep the old all-active
+                    // classic behavior when topology execution is disabled.
+                    const topologyExecutionEnabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
+                        .every(flag => process.env[flag] === 'true')
+                        && ['portal', 'relay', 'bridge'].includes(node?.cascadeRole);
+                    const allowedStatuses = topologyExecutionEnabled ? ['staged', 'deployed', 'online'] : undefined;
+                    const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
+                    const allPortalLinks = await CascadeLink.find({ portalNode: node._id, active: true, ...statusFilter }).populate('bridgeNode');
+                    const forwardHopLinks = await CascadeLink.find({ bridgeNode: node._id, mode: 'forward', active: true, ...statusFilter });
 
                     if (allPortalLinks.length > 0 || forwardHopLinks.length > 0) {
                         const configObj = JSON.parse(configContent);
@@ -548,7 +555,7 @@ class SyncService {
                         ];
 
                         const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
-                        const forwardLinks = await this._getForwardChainLinks(node._id);
+                        const forwardLinks = await this._getForwardChainLinks(node._id, allowedStatuses);
 
                         if (reverseLinks.length > 0) {
                             configGenerator.applyReversePortal(configObj, reverseLinks, inboundTags);

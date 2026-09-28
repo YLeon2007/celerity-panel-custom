@@ -34,7 +34,7 @@ function node(role = 'portal') {
         ssh: { password: 'test' }, xray: { agentToken: 'test', transport: 'tcp', security: 'reality' } };
 }
 
-function stubSync(t, { connected = true, linkStatuses = ['deployed'] } = {}) {
+function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [] } = {}) {
     const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0 };
     t.mock.method(CascadeLink, 'exists', async query => {
         calls.queries.push(query);
@@ -42,7 +42,13 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'] } = {}) {
             ? { _id: 'link-1' } : null;
     });
     t.mock.method(HyNode, 'updateOne', async (_query, update) => { calls.updates.push(update); return {}; });
-    t.mock.method(CascadeLink, 'find', () => ({ populate: async () => [] }));
+    t.mock.method(CascadeLink, 'find', query => {
+        const found = links.filter(link => Object.entries(query).every(([key, value]) => {
+            if (key === 'status') return value.$in ? value.$in.includes(link.status) : value.$ne !== link.status;
+            return link[key] === value;
+        }));
+        return Object.assign(Promise.resolve(found), { populate: async () => found });
+    });
     t.mock.method(RelayL2tpState, 'exists', async () => null);
     t.mock.method(nodeSetup, 'reloadCcAgent', async () => {});
     t.mock.method(syncService, '_getUsersForNode', async () => [{ userId: 'u1', xrayUuid: 'uuid-1' }]);
@@ -126,11 +132,69 @@ test('pending-only prepared portal still receives its initial classic config', a
     assert.deepEqual(calls.agent.map(c => c.path), ['/restart', '/sync']);
 });
 
-test('a confirmed applied link protects config even with a pending sibling', async t => {
-    const calls = stubSync(t, { linkStatuses: ['pending', 'staged'] });
+test('pending-only links never add reverse, forward or hop topology to initial classic config', async t => {
+    const id = node()._id;
+    const links = [
+        { _id: 'reverse-draft', portalNode: id, bridgeNode: 'bridge-a', mode: 'reverse', active: true, status: 'pending' },
+        { _id: 'forward-draft', portalNode: id, bridgeNode: 'bridge-b', mode: 'forward', active: true, status: 'pending' },
+        { _id: 'hop-draft', portalNode: 'upstream', bridgeNode: id, mode: 'forward', active: true, status: 'pending' },
+    ];
+    const calls = stubSync(t, { linkStatuses: ['pending'], links });
+    const applied = [];
+    for (const method of ['applyReversePortal', 'applyForwardChain', 'applyForwardHopInbound']) {
+        t.mock.method(configGenerator, method, () => { applied.push(method); });
+    }
     await withFlags([true, true, true], async () => {
         assert.equal(await syncService.updateXrayNodeConfig(node()), true);
     });
+    assert.deepEqual(applied, []);
+    assert.equal(calls.uploads.length, 1);
+    assert.deepEqual(calls.agent.map(c => c.path), ['/restart', '/sync']);
+});
+
+test('legacy sync with a disabled topology flag still applies pending classic links', async t => {
+    const id = node()._id;
+    const links = [
+        { _id: 'reverse-draft', portalNode: id, bridgeNode: 'bridge-a', mode: 'reverse', active: true, status: 'pending' },
+        { _id: 'forward-draft', portalNode: id, bridgeNode: 'bridge-b', mode: 'forward', active: true, status: 'pending' },
+        { _id: 'hop-draft', portalNode: 'upstream', bridgeNode: id, mode: 'forward', active: true, status: 'pending' },
+    ];
+    const calls = stubSync(t, { links });
+    const applied = [];
+    for (const method of ['applyReversePortal', 'applyForwardChain', 'applyForwardHopInbound']) {
+        t.mock.method(configGenerator, method, () => { applied.push(method); });
+    }
+    await withFlags([true, true, false], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), true);
+    });
+    assert.deepEqual(applied, ['applyReversePortal', 'applyForwardChain', 'applyForwardHopInbound']);
+    assert.equal(calls.uploads.length, 1);
+});
+
+test('forward-chain resolver excludes draft downstream hops only when status-limited', async t => {
+    const id = node()._id;
+    stubSync(t, { links: [
+        { _id: 'first', portalNode: id, bridgeNode: 'mid', mode: 'forward', active: true, status: 'deployed' },
+        { _id: 'draft', portalNode: 'mid', bridgeNode: 'end', mode: 'forward', active: true, status: 'pending' },
+    ] });
+    assert.deepEqual((await syncService._getForwardChainLinks(id, ['staged', 'deployed', 'online'])).map(l => l._id), ['first']);
+    assert.deepEqual((await syncService._getForwardChainLinks(id)).map(l => l._id), ['first', 'draft']);
+});
+
+test('a confirmed applied link protects config even with a pending sibling', async t => {
+    const id = node()._id;
+    const calls = stubSync(t, { linkStatuses: ['pending', 'staged'], links: [
+        { _id: 'applied', portalNode: id, bridgeNode: 'bridge-a', mode: 'reverse', active: true, status: 'staged' },
+        { _id: 'draft', portalNode: id, bridgeNode: 'bridge-b', mode: 'forward', active: true, status: 'pending' },
+    ] });
+    const applied = [];
+    for (const method of ['applyReversePortal', 'applyForwardChain', 'applyForwardHopInbound']) {
+        t.mock.method(configGenerator, method, () => { applied.push(method); });
+    }
+    await withFlags([true, true, true], async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node()), true);
+    });
+    assert.deepEqual(applied, []);
     assert.equal(calls.generated, 0);
     assert.deepEqual(calls.uploads, []);
     assert.deepEqual(calls.agent.map(c => c.path), ['/sync']);
