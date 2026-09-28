@@ -100,7 +100,7 @@ function maintenanceModels({ links, groupPaths }) {
 }
 
 test('maintenance rebuilds the auto-l2tp path after link topology changed', async () => {
-    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' }];
+    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const models = maintenanceModels({ links, groupPaths: [] });
 
     const result = await maintainAutoL2tpPaths(models);
@@ -113,7 +113,7 @@ test('maintenance rebuilds the auto-l2tp path after link topology changed', asyn
 });
 
 test('maintenance leaves an already-correct path untouched', async () => {
-    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' }];
+    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const models = maintenanceModels({
         links,
         groupPaths: [{ pathKey: 'main', linkIds: ['l-new'], priority: 1, enabled: true }],
@@ -127,8 +127,8 @@ test('maintenance leaves an already-correct path untouched', async () => {
 
 test('maintenance skips ambiguous graphs without touching the group', async () => {
     const links = [
-        { _id: 'l2', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
-        { _id: 'l3', portalNode: 'relay-1', bridgeNode: 'bridge-2' },
+        { _id: 'l2', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
+        { _id: 'l3', portalNode: 'relay-1', bridgeNode: 'bridge-2', status: 'online' },
     ];
     const models = maintenanceModels({ links, groupPaths: [] });
     const warnings = [];
@@ -210,6 +210,110 @@ function installedState(node, routeGroup, activePathKey = 'main') {
     return { node, desiredState: 'installed', routeGroup, activePathKey };
 }
 
+test('pending replacement never displaces the installed path or foreign paths', async () => {
+    const oldPath = { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true };
+    const foreignPath = { pathKey: 'foreign', linkIds: ['l-foreign'], priority: 7, enabled: true };
+    const group = { _id: 'group-a', paths: [foreignPath, oldPath] };
+    const models = maintenanceHarness({
+        // Old installed path is still the published route, even if its link
+        // has disappeared from this draft graph during a replacement.
+        links: [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-2', active: true, status: 'pending' }],
+        states: [installedState('relay-1', 'group-a')],
+        groups: { 'group-a': group },
+    });
+
+    const result = await maintainAutoL2tpPaths(models);
+    assert.equal(result.updated, 0);
+    assert.deepEqual(group.paths, [foreignPath, oldPath]);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
+});
+
+for (const status of ['deployed', 'online']) {
+    test(`independently ${status} replacement without prepared ingress cannot displace an installed path`, async () => {
+        const oldPath = { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true };
+        const foreignPath = { pathKey: 'foreign', linkIds: ['l-foreign'], priority: 7, enabled: true };
+        const group = { _id: 'group-a', paths: [foreignPath, oldPath] };
+        const models = maintenanceHarness({
+            links: [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', active: true, status }],
+            states: [installedState('relay-1', 'group-a')],
+            groups: { 'group-a': group },
+        });
+
+        const result = await maintainAutoL2tpPaths(models);
+        assert.equal(result.updated, 0);
+        assert.equal(result.revision, null);
+        assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+        assert.deepEqual(group.paths, [foreignPath, oldPath]);
+        assert.equal(models.writes.length, 0);
+        assert.equal(models.topologyUpdates.length, 0);
+    });
+}
+
+for (const [label, link] of [
+    ['disabled', { status: 'deployed', active: false }],
+    ['errored', { status: 'error', active: true }],
+    ['staged', { status: 'staged', active: true }],
+    ['offline', { status: 'offline', active: true }],
+    ['unconfirmed', { active: true }],
+    ['pending', { status: 'pending', active: true }],
+]) {
+    test(`maintenance cannot publish a ${label} link into an empty owned path`, async () => {
+        const original = { pathKey: 'main', linkIds: [], priority: 1, enabled: true };
+        const foreign = { pathKey: 'foreign', linkIds: ['l-foreign'], priority: 7, enabled: true };
+        const group = { _id: 'group-a', paths: [foreign, original] };
+        const models = maintenanceHarness({
+            links: [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', ...link }],
+            states: [installedState('relay-1', 'group-a')],
+            groups: { 'group-a': group },
+        });
+
+        const result = await maintainAutoL2tpPaths(models);
+        assert.equal(result.updated, 0);
+        assert.equal(result.revision, null);
+        assert.equal(result.deferred[0]?.reason, 'CHAIN_INCOMPLETE');
+        assert.deepEqual(group.paths, [foreign, original]);
+        assert.equal(models.writes.length, 0);
+        assert.equal(models.topologyUpdates.length, 0);
+    });
+}
+
+test('one unconfirmed suffix hop cannot publish a partially ready chain', async () => {
+    const group = { _id: 'group-a', paths: [] };
+    const models = maintenanceHarness({
+        links: [
+            { _id: 'l-first', portalNode: 'relay-1', bridgeNode: 'relay-2', status: 'online' },
+            { _id: 'l-second', portalNode: 'relay-2', bridgeNode: 'bridge-1', status: 'pending' },
+        ],
+        states: [installedState('relay-1', 'group-a')],
+        groups: { 'group-a': group },
+    });
+    const result = await maintainAutoL2tpPaths(models);
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.reason, 'CHAIN_INCOMPLETE');
+    assert.deepEqual(group.paths, []);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
+});
+
+test('a valid installed path remains a no-op alongside a pending branch', async () => {
+    const main = { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true };
+    const group = { _id: 'group-a', paths: [main] };
+    const models = maintenanceHarness({
+        links: [
+            { _id: 'l-old', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
+            { _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-2', status: 'pending' },
+        ],
+        states: [installedState('relay-1', 'group-a')],
+        groups: { 'group-a': group },
+    });
+    const result = await maintainAutoL2tpPaths(models);
+    assert.deepEqual(result, { updated: 0, deferred: [], revision: null });
+    assert.deepEqual(group.paths, [main]);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
+});
+
 test('maintenance never publishes an empty path during a delete/recreate gap', async () => {
     const group = { _id: 'group-a', paths: [] };
     const states = [installedState('relay-1', 'group-a')];
@@ -231,7 +335,7 @@ test('maintenance never publishes an empty path during a delete/recreate gap', a
     assert.equal(gap.topologyUpdates.length, 0, 'no topology revision bump without a write');
 
     // Recreate: a fresh link with a new id completes the suffix to a bridge.
-    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' }];
+    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const healed = maintenanceHarness({ links, states, groups: { 'group-a': group } });
     const healedResult = await maintainAutoL2tpPaths({ ...healed, logger });
     assert.equal(healedResult.updated, 1);
@@ -271,19 +375,22 @@ test('maintenance never publishes a partial path that stops short of a bridge', 
     assert.equal(result.deferred[0]?.reason, 'CHAIN_INCOMPLETE');
 });
 
-test('maintenance replaces a stale main path after a link changes relay ownership', async () => {
+test('maintenance leaves a nonempty installed path alone after a link changes relay ownership', async () => {
     const links = [
-        { _id: 'l-old', portalNode: 'relay-2', bridgeNode: 'bridge-2' },
-        { _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+        { _id: 'l-old', portalNode: 'relay-2', bridgeNode: 'bridge-2', status: 'online' },
+        { _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
     ];
     const group = { _id: 'group-a', paths: [
         { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true },
     ] };
     const models = maintenanceHarness({ links, states: [installedState('relay-1', 'group-a')], groups: { 'group-a': group } });
     const result = await maintainAutoL2tpPaths(models);
-    assert.equal(result.updated, 1);
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
     assert.deepEqual(group.paths, [
-        { pathKey: 'main', linkIds: ['l-new'], priority: 1, enabled: true },
+        { pathKey: 'main', linkIds: ['l-old'], priority: 1, enabled: true },
     ]);
 });
 
@@ -292,8 +399,8 @@ test('maintenance rebuilds only the relay-owned path and preserves other relays 
     // already correct while relay-1 needs a rebuild after a link recreate.
     // Link ids are listed in adverse order (relay-2's link first).
     const links = [
-        { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2' },
-        { _id: 'l1', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+        { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2', status: 'online' },
+        { _id: 'l1', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
     ];
     const group = {
         _id: 'group-shared',
@@ -317,8 +424,8 @@ test('maintenance rebuilds only the relay-owned path and preserves other relays 
 
 test('maintenance refuses a shared route group with duplicate relay path keys', async () => {
     const links = [
-        { _id: 'l1', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
-        { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2' },
+        { _id: 'l1', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
+        { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2', status: 'online' },
     ];
     const group = { _id: 'group-shared', paths: [
         { pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true },
@@ -337,8 +444,8 @@ test('maintenance refuses a shared route group with duplicate relay path keys', 
 
 test('maintenance keeps geo branch links out of the published default path', async () => {
     const links = [
-        { _id: 'l-geo', portalNode: 'relay-1', bridgeNode: 'bridge-2', geoRouting: { enabled: true } },
-        { _id: 'l-main', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+        { _id: 'l-geo', portalNode: 'relay-1', bridgeNode: 'bridge-2', geoRouting: { enabled: true }, status: 'online' },
+        { _id: 'l-main', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
     ];
     const group = { _id: 'group-a', paths: [] };
     const models = maintenanceHarness({
@@ -376,7 +483,7 @@ test('maintenance with a geo-only downstream defers instead of publishing the ge
 });
 
 test('maintenance never mutates relay L2TP state or credentials', async () => {
-    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1' }];
+    const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const models = maintenanceHarness({
         links,
         states: [installedState('relay-1', 'group-a')],

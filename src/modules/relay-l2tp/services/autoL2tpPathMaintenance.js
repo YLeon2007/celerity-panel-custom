@@ -3,18 +3,17 @@
 // Keeps the L2TP auto route-group paths in sync with the live cascade graph.
 // Deleting a link strips the paths that used it (draft mutation), and without
 // this hook the group stayed empty until a full L2TP reinstall — silently
-// stranding every L2TP client (fail-closed block). After any link
-// create/update/delete the panel rebuilds the default-chain path for every
-// relay with an installed L2TP state, so a rebuilt topology heals the L2TP
-// path on the next topology sync instead of requiring a reinstall.
+// stranding every L2TP client (fail-closed block). Maintenance may populate
+// an empty owned path from a confirmed, client-ready chain. A nonempty
+// installed path is never switched here: replacement needs separate ingress
+// preparation and atomic finalization, even when the new links look deployed.
 //
 // Safety contract:
-// - Only a suffix that actually reaches a bridge-role node is published. A
-//   temporary delete/recreate gap or a partial chain defers the update: the
-//   last working path stays in the group and no empty/partial path is ever
-//   written ("no empty/partial path published").
-// - The write replaces only the path owned by this relay (first hop leaves
-//   the relay); paths of other relays sharing the group are preserved.
+// - Only active deployed/online suffixes reaching a bridge-role node are
+//   eligible. A delete/recreate gap or partial/unconfirmed chain defers the
+//   update: no empty, partial or pending path is ever written.
+// - The write populates only the recorded path key owned by this relay;
+//   paths of other relays sharing the group are preserved.
 // - RelayL2tpState, the route group identity and PPP credentials are never
 //   touched — the group update sets `paths` and nothing else.
 
@@ -98,7 +97,10 @@ async function maintainAutoL2tpPaths({
             return { updated: 0, deferred: [], revision: null };
         }
 
-        const links = await CascadeLink.find({}).session(session).lean();
+        // Draft links are not proof of a client-ready cascade. A pending,
+        // staged, offline, errored or disabled hop cannot be auto-published.
+        const links = (await CascadeLink.find({}).session(session).lean() || [])
+            .filter(link => link.active !== false && ['deployed', 'online'].includes(link.status));
         const nodes = await HyNode.find({}).select('_id cascadeRole').session(session).lean();
         const nodesById = new Map((nodes || []).map(node => [String(node._id), node]));
 
@@ -156,6 +158,16 @@ async function maintainAutoL2tpPaths({
                     .map((path, index) => (index === ownedIndexes[0] ? newPath : path))
                     .filter((path, index) => !ownedIndexes.includes(index) || index === ownedIndexes[0]);
             if (samePaths(existingPaths, wanted)) continue;
+
+            // A confirmed link alone does not prove that replacement ingress
+            // was prepared. Only the dedicated replacement operation can
+            // atomically switch an installed, nonempty path to different hops.
+            // Keep the old route even if its links vanished from the draft.
+            if (ownedIndexes.length && existingPaths[ownedIndexes[0]].linkIds?.length) {
+                logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: replacement requires prepared ingress`);
+                deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' });
+                continue;
+            }
 
             const result = await CascadeRouteGroup.updateOne(
                 { _id: groupId }, { $set: { paths: wanted } }, { runValidators: true, session },
