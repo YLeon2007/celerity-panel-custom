@@ -197,6 +197,22 @@ test('claimed wrapper fails closed on missing generation, missing protected meth
     assert.equal(calls, 0);
 });
 
+test('legacy finalizer refuses a counted operation even if caller omits generation', async () => {
+    let calls = 0;
+    const reconciler = new L2tpUserSyncReconciler({
+        repository: { async finalizeVerifiedSync() { calls += 1; return null; } },
+        clock: { now: () => NOW },
+    });
+    const result = await reconciler.finalizeVerifiedSync({
+        operation: runningOperation({ ownerGeneration: 2, admissionId: 'counted-admission' }),
+        resolvedUsers: resolvedUsers(),
+        verification: verifiedAttestation(),
+        workerId: 'worker-1',
+    });
+    assert.equal(result.error.code, 'L2TP_USER_SYNC_FINALIZE_REJECTED');
+    assert.equal(calls, 0);
+});
+
 test('returns one fixed sanitized failure for rejected or failed atomic finalization', async () => {
     const expectedFailure = {
         ok: false,

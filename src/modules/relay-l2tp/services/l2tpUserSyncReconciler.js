@@ -82,7 +82,9 @@ class L2tpUserSyncReconciler {
     }
 
     async finalizeVerifiedSync(request = {}) {
-        if (request && Object.hasOwn(request, 'ownerGeneration')) return finalizeRejected();
+        if (request && (Object.hasOwn(request, 'ownerGeneration')
+            || request.operation && (request.operation.ownerGeneration != null
+                || request.operation.admissionId != null))) return finalizeRejected();
         return this._finalizeVerifiedSync(request, false);
     }
 

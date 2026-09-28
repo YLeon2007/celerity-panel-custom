@@ -182,7 +182,9 @@ class L2tpUserSyncRepository {
                         status: 'running',
                         leaseOwner: workerId,
                         leaseUntil: { $gt: now },
-                        ...(ownerGeneration === null ? {} : { ownerGeneration }),
+                        ...(ownerGeneration === null
+                            ? { ownerGeneration: { $exists: false }, admissionId: { $exists: false } }
+                            : { ownerGeneration }),
                         'plan.operationId': operationId,
                         'plan.relayId': relayNode,
                         'plan.desired.credentialRevision': credentialRevision,

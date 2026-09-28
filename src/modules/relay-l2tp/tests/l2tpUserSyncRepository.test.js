@@ -182,6 +182,8 @@ test('atomically fences operation and relay state before reconciling enabled and
         status: 'running',
         leaseOwner: 'worker-1',
         leaseUntil: { $gt: NOW },
+        ownerGeneration: { $exists: false },
+        admissionId: { $exists: false },
         'plan.operationId': 'operation-17',
         'plan.relayId': 'relay-1',
         'plan.desired.credentialRevision': 9,
@@ -242,6 +244,22 @@ test('atomically fences operation and relay state before reconciling enabled and
             },
         },
     })));
+});
+
+test('legacy repository finalization excludes counted operations before state or user writes', async () => {
+    const { repository, trace } = createHarness({
+        L2tpOperation: {
+            findOneAndUpdate(filter, update, options) {
+                trace.push({ label: 'operation.cas', filter, update, options });
+                return queryReturning(null, trace, 'operation');
+            },
+        },
+    });
+    assert.equal(await repository.finalizeVerifiedSync(finalizeRequest()), null);
+    const guard = trace.find(entry => entry.label === 'operation.cas');
+    assert.deepEqual(guard.filter.ownerGeneration, { $exists: false });
+    assert.deepEqual(guard.filter.admissionId, { $exists: false });
+    assert.equal(trace.some(entry => entry.label === 'state.cas' || entry.label === 'users.bulkWrite'), false);
 });
 
 test('claimed finalization guards owner generation in the transactional operation CAS before state or user writes', async () => {
