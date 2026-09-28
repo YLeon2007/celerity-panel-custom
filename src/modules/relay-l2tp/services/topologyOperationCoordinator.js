@@ -128,6 +128,13 @@ function sanitizeValidationErrors(errors) {
 
 function safeQueueError(error, operationId, expectedTopologyRevision) {
     if (error instanceof TopologyOperationCoordinatorError) return error;
+    if (error?.code === 'TOPOLOGY_REPLACEMENT_RESERVED') {
+        return new TopologyOperationCoordinatorError(
+            'TOPOLOGY_REPLACEMENT_RESERVED',
+            'A topology replacement owns the deployment pin fence',
+            { operationId, expectedTopologyRevision },
+        );
+    }
     if (error?.code === 'STALE_TOPOLOGY_REVISION') {
         return new TopologyOperationCoordinatorError(
             'STALE_TOPOLOGY_REVISION',

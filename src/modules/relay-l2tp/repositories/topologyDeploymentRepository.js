@@ -61,12 +61,22 @@ class TopologyDeploymentRepository {
                 if (snapshot.revision !== expectedRevision) {
                     throw staleRevision(expectedRevision, snapshot.revision);
                 }
+                if (snapshot.replacementReservation) {
+                    throw new TopologyDeploymentRepositoryError(
+                        'TOPOLOGY_REPLACEMENT_RESERVED',
+                        'A topology replacement owns the deployment pin fence',
+                    );
+                }
                 const prepared = await prepare(snapshot);
                 const update = { $set: { revision: expectedRevision } };
                 if (expectedRevision === 0) update.$setOnInsert = { deployedRevision: 0 };
                 const state = await withSession(
                     this.CascadeTopologyState.findOneAndUpdate(
-                        { _id: 'singleton', revision: expectedRevision },
+                        {
+                            _id: 'singleton',
+                            revision: expectedRevision,
+                            replacementReservation: { $exists: false },
+                        },
                         update,
                         {
                             new: true,

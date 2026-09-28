@@ -15,6 +15,9 @@ const {
 const {
     TopologyOperationCoordinator,
 } = require('../services/topologyOperationCoordinator');
+const {
+    TopologyDeploymentRepository,
+} = require('../repositories/topologyDeploymentRepository');
 
 function deepFreeze(value) {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -230,6 +233,84 @@ test('stale revisions expose only safe revision context and do not materialize o
         },
     );
     assert.deepEqual(calls.map(call => call.method), ['pinTopology']);
+});
+
+test('held reservation returns a safe typed queue conflict without materialization or persistence', async () => {
+    const calls = [];
+    const topologyRepository = new TopologyDeploymentRepository({
+        snapshotReader: { async readDraft() {
+            calls.push('readDraft');
+            return { ...snapshot(), replacementReservation: { ownerToken: 'private-token' } };
+        } },
+        CascadeTopologyState: { findOneAndUpdate() { calls.push('pin.cas'); throw new Error('must not pin'); } },
+        transactionRunner: async work => work({ id: 'held-session' }),
+    });
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository,
+        planMaterializer: { async materialize() { calls.push('materialize'); } },
+        operationRepository: { async createFrozen() { calls.push('createFrozen'); } },
+        operationWorker: { async run() { calls.push('worker.run'); } },
+        idFactory: () => 'operation-held',
+    });
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
+        assert.equal(error.name, 'TopologyOperationCoordinatorError');
+        assert.equal(error.code, 'TOPOLOGY_REPLACEMENT_RESERVED');
+        assert.equal(error.operationId, 'operation-held');
+        assert.doesNotMatch(JSON.stringify(error), /private-token/);
+        return true;
+    });
+    assert.deepEqual(calls, ['readDraft']);
+});
+
+test('reservation injected between draft read and singleton CAS never queues an operation', async () => {
+    const calls = [];
+    const state = { revision: 7, deployedRevision: 5 };
+    const session = { id: 'race-session' };
+    const topologyRepository = new TopologyDeploymentRepository({
+        snapshotReader: { async readDraft(candidateSession) {
+            assert.strictEqual(candidateSession, session);
+            calls.push('readDraft');
+            return snapshot();
+        } },
+        CascadeTopologyState: { findOneAndUpdate(filter, update, options) {
+            assert.strictEqual(options.session, session);
+            calls.push('pin.cas');
+            // Simulate a concurrent reservation after the transaction's read.
+            state.replacementReservation = { ownerToken: 'private-token' };
+            const matches = filter._id === 'singleton' && filter.revision === state.revision
+                && (filter.replacementReservation?.$exists !== false
+                    || state.replacementReservation === undefined);
+            return { select() { return this; }, session(actual) {
+                assert.strictEqual(actual, session);
+                return this;
+            }, lean: async () => matches ? { ...state, ...update.$set } : null };
+        } },
+        transactionRunner: async work => work(session),
+    });
+    const operations = [];
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository,
+        planMaterializer: { async materialize() {
+            calls.push('materialize');
+            return materializedPlan();
+        } },
+        operationRepository: { async createFrozen(operation) {
+            operations.push(operation);
+            calls.push('createFrozen');
+        } },
+        operationWorker: { async run() { calls.push('worker.run'); } },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+        idFactory: () => 'operation-race',
+    });
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
+        assert.equal(error.name, 'TopologyOperationCoordinatorError');
+        assert.equal(error.code, 'STALE_TOPOLOGY_REVISION');
+        assert.doesNotMatch(JSON.stringify(error), /private-token/);
+        return true;
+    });
+    assert.deepEqual(calls, ['readDraft', 'materialize', 'pin.cas']);
+    assert.deepEqual(operations, []);
 });
 
 test('invalid pinned topology is sanitized before any plan or worker call', async () => {

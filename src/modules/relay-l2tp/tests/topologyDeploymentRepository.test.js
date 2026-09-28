@@ -41,10 +41,14 @@ test('pins and prepares one revision snapshot behind an atomic revision CAS fenc
             return snapshot;
         },
     };
+    const state = { _id: 'singleton', revision: 7, deployedRevision: 5 };
     const CascadeTopologyState = {
         findOneAndUpdate(filter, update, options) {
             trace.push({ method: 'pin.cas', filter, update, options });
-            return queryResult({ revision: 7, deployedRevision: 5 }, trace);
+            const matches = filter._id === state._id && filter.revision === state.revision
+                && (filter.replacementReservation?.$exists !== false
+                    || state.replacementReservation === undefined);
+            return queryResult(matches ? state : null, trace);
         },
     };
     const transactionRunner = async work => {
@@ -84,7 +88,11 @@ test('pins and prepares one revision snapshot behind an atomic revision CAS fenc
         'transaction.commit',
     ]);
     const cas = trace.find(entry => entry.method === 'pin.cas');
-    assert.deepEqual(cas.filter, { _id: 'singleton', revision: 7 });
+    assert.deepEqual(cas.filter, {
+        _id: 'singleton',
+        revision: 7,
+        replacementReservation: { $exists: false },
+    });
     assert.deepEqual(cas.update, { $set: { revision: 7 } });
     assert.deepEqual(cas.options, {
         new: true,
@@ -93,6 +101,31 @@ test('pins and prepares one revision snapshot behind an atomic revision CAS fenc
         timestamps: false,
         upsert: false,
     });
+});
+
+test('held replacement reservation rejects pin before prepare or singleton CAS', async () => {
+    const trace = [];
+    const session = { id: 'reserved-pin' };
+    const repository = new TopologyDeploymentRepository({
+        snapshotReader: { async readDraft(candidateSession) {
+            assert.strictEqual(candidateSession, session);
+            trace.push('readDraft');
+            return { revision: 7, replacementReservation: { ownerToken: 'private-token' } };
+        } },
+        CascadeTopologyState: { findOneAndUpdate() { trace.push('pin.cas'); throw new Error('must not pin'); } },
+        transactionRunner: async work => work(session),
+    });
+
+    await assert.rejects(repository.pinTopology({
+        expectedRevision: 7,
+        prepare: async () => { trace.push('prepare'); },
+    }), error => {
+        assert.equal(error.name, 'TopologyDeploymentRepositoryError');
+        assert.equal(error.code, 'TOPOLOGY_REPLACEMENT_RESERVED');
+        assert.doesNotMatch(JSON.stringify(error), /private-token/);
+        return true;
+    });
+    assert.deepEqual(trace, ['readDraft']);
 });
 
 test('marks exactly the pinned revision deployed with a revision and prior-state CAS fence', async () => {
