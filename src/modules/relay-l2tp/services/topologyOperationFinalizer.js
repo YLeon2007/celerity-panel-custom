@@ -36,18 +36,25 @@ function assertFinalizationInput(input) {
     }
 }
 
+const SCOPED_RESULT_KINDS = new Set(['link.apply', 'domain.reconcile']);
+
 function projectFinalized(result, input) {
+    const scoped = SCOPED_RESULT_KINDS.has(result?.scopeKind);
+    const expectedDeployedRevision = scoped
+        ? input.priorDeployedRevision
+        : input.topologyRevision;
     if (!result
+        || (result.scopeKind !== undefined && !scoped)
         || result.operationId !== input.operationId
         || result.topologyRevision !== input.topologyRevision
-        || result.deployedRevision !== input.topologyRevision
+        || result.deployedRevision !== expectedDeployedRevision
         || !validDate(result.finishedAt)) {
         return null;
     }
     return Object.freeze({
         operationId: input.operationId,
         topologyRevision: input.topologyRevision,
-        deployedRevision: input.topologyRevision,
+        deployedRevision: expectedDeployedRevision,
         finishedAt: result.finishedAt,
     });
 }

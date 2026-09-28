@@ -6,6 +6,7 @@ const test = require('node:test');
 const {
     TopologyOperationFinalizationRepository,
 } = require('../repositories/topologyOperationFinalizationRepository');
+const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 const LEASE_UNTIL = new Date('2026-09-22T10:00:30.000Z');
@@ -329,6 +330,7 @@ test('scoped domain.reconcile commit marks only its own links and keeps the glob
         operationId: 'operation-7',
         topologyRevision: 7,
         deployedRevision: 5,
+        scopeKind: 'domain.reconcile',
         finishedAt: NOW,
     });
     assert.equal(harness.store.operation.status, 'succeeded');
@@ -341,6 +343,23 @@ test('scoped domain.reconcile commit marks only its own links and keeps the glob
         update: { $set: { status: 'deployed' } },
         options: { runValidators: true, session: SESSION },
     }]);
+});
+
+test('real scoped repository and finalizer agree without advancing global deployedRevision', async () => {
+    const { harness, repository } = scopedHarness({ kind: 'link.apply', staged: false });
+    const finalizer = new TopologyOperationFinalizer({
+        repository,
+        clock: { now: () => NOW },
+    });
+    assert.deepEqual(await finalizer.finalizeSucceeded({
+        operationId: 'operation-7', owner: 'worker-1', leaseUntil: LEASE_UNTIL,
+        topologyRevision: 7, priorDeployedRevision: 5,
+    }), {
+        operationId: 'operation-7', topologyRevision: 7,
+        deployedRevision: 5, finishedAt: NOW,
+    });
+    assert.equal(harness.store.operation.status, 'succeeded');
+    assert.equal(harness.store.topology.deployedRevision, 5);
 });
 
 test('scoped link.apply commit is likewise confined to its own links', async () => {

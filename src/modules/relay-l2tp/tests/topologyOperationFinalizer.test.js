@@ -68,6 +68,38 @@ test('finalizes from fixed operation lease and revision inputs only', async () =
     assert.doesNotMatch(JSON.stringify(result), /candidate|bytes|secret/i);
 });
 
+test('scoped finalization accepts fenced prior deployed revision without claiming global Sync', async () => {
+    const finalizer = new TopologyOperationFinalizer({
+        repository: {
+            async finalizeSucceeded(input) {
+                return {
+                    operationId: input.operationId,
+                    topologyRevision: input.topologyRevision,
+                    deployedRevision: input.priorDeployedRevision,
+                    scopeKind: 'link.apply',
+                    finishedAt: input.now,
+                };
+            },
+        },
+        clock: { now: () => NOW },
+    });
+    assert.deepEqual(await finalizer.finalizeSucceeded(request()), {
+        operationId: 'operation-7', topologyRevision: 7,
+        deployedRevision: 5, finishedAt: NOW,
+    });
+});
+
+test('finalizer rejects a scoped result that falsely advances the global revision', async () => {
+    const finalizer = new TopologyOperationFinalizer({
+        repository: { finalizeSucceeded: async () => ({
+            operationId: 'operation-7', topologyRevision: 7,
+            deployedRevision: 7, scopeKind: 'domain.reconcile', finishedAt: NOW,
+        }) },
+        clock: { now: () => NOW },
+    });
+    assert.equal(await finalizer.finalizeSucceeded(request()), null);
+});
+
 test('rejects operation documents or extra candidate and secret inputs', async () => {
     const calls = [];
     const finalizer = new TopologyOperationFinalizer({

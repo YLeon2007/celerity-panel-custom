@@ -160,6 +160,7 @@ class TopologyOperationFinalizationRepository {
                     operationId,
                     topologyRevision,
                     deployedRevision: scope ? priorDeployedRevision : topologyRevision,
+                    ...(scope ? { scopeKind: scope.kind } : {}),
                     finishedAt: now,
                 };
             });
