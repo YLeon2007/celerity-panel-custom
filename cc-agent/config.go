@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 )
 
@@ -93,6 +94,10 @@ type Config struct {
 	// AccessLogs configures the opt-in access-log shipping module. Absent =
 	// disabled; older panels never write it, so downgrade stays safe.
 	AccessLogs AccessLogsConfig `json:"access_logs"`
+
+	// HTTPMutationPolicy is absent by default. "deny" blocks only the four
+	// authenticated mutation HTTP routes; it does not freeze other writers.
+	HTTPMutationPolicy string `json:"http_mutation_policy,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -110,6 +115,15 @@ func LoadConfig(path string) (*Config, error) {
 
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
+	}
+	// A present value must explicitly be "deny". In particular JSON null
+	// must not silently decode to the empty (allowing) string.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	if _, present := fields["http_mutation_policy"]; present && cfg.HTTPMutationPolicy != "deny" {
+		return nil, fmt.Errorf("http_mutation_policy must be \"deny\" when present")
 	}
 
 	// Backward compatibility: if the new Inbounds array is missing but the

@@ -26,12 +26,24 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", a.auth(a.handleHealth))
 	mux.HandleFunc("GET /info", a.auth(a.handleInfo))
 	mux.HandleFunc("POST /connect", a.auth(a.handleConnect))
-	mux.HandleFunc("POST /sync", a.auth(a.handleSync))
-	mux.HandleFunc("POST /users", a.auth(a.handleAddUser))
-	mux.HandleFunc("DELETE /users/{email}", a.auth(a.handleRemoveUser))
+	mux.HandleFunc("POST /sync", a.auth(a.denyHTTPMutation(a.handleSync)))
+	mux.HandleFunc("POST /users", a.auth(a.denyHTTPMutation(a.handleAddUser)))
+	mux.HandleFunc("DELETE /users/{email}", a.auth(a.denyHTTPMutation(a.handleRemoveUser)))
 	mux.HandleFunc("GET /stats", a.auth(a.handleStats))
 	mux.HandleFunc("GET /online", a.auth(a.handleOnline))
-	mux.HandleFunc("POST /restart", a.auth(a.handleRestart))
+	mux.HandleFunc("POST /restart", a.auth(a.denyHTTPMutation(a.handleRestart)))
+}
+
+// denyHTTPMutation runs after authentication and before any handler reads a
+// body or touches Xray, the user store, or the persister.
+func (a *API) denyHTTPMutation(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.HTTPMutationPolicy == "deny" {
+			jsonErr(w, http.StatusForbidden, "HTTP mutation denied by policy")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // auth middleware validates the Bearer token
