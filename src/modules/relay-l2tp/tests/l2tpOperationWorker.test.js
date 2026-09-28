@@ -13,22 +13,109 @@ const { NodeOperationLockService } = require('../services/nodeOperationLockServi
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 
+test('worker stays disabled before any claim or SSH even with a queued operation', async () => {
+    const calls = [];
+    const worker = new L2tpOperationWorker({
+        operationRepository: { async claimNext() { calls.push('generic claim'); } },
+        remoteAdmissionRepository: {
+            async claimQueuedInstall() { calls.push('install claim'); },
+            async claimQueuedSyncUsers() { calls.push('sync claim'); },
+        },
+        executor: { async executeStep() { calls.push('SSH'); } },
+        workerId: 'worker-1', leaseMs: 30_000, clock: createClock(),
+    });
+    assert.deepEqual(await worker.runOnce(), { claimed: false, unavailable: true });
+    assert.deepEqual(calls, []);
+});
+
+test('opted-in worker selects both counted kinds fairly, without generic claim', async () => {
+    const claims = [];
+    const operationRepository = { async claimNext() { throw new Error('uncounted claim'); },
+        async setStatus() {} };
+    const queued = { install: ['install-a', 'install-b'], sync_users: ['sync-a', 'sync-b'] };
+    const remoteAdmissionRepository = Object.fromEntries([
+        ['claimQueuedInstall', 'install'], ['claimQueuedSyncUsers', 'sync_users'],
+    ].map(([method, kind]) => [method, async request => {
+        claims.push(kind);
+        const id = queued[kind].shift();
+        return id && { id, kind, status: 'running', admissionId: `admission-${id}`,
+            leaseOwner: request.owner, ownerGeneration: 1, node: 'node-a',
+            plan: { steps: [] } };
+    }]));
+    const worker = new L2tpOperationWorker({ operationRepository, remoteAdmissionRepository,
+        enableUnsafeExecutionForTests: true, workerId: 'worker-1', leaseMs: 30_000,
+        clock: createClock() });
+    for (const id of ['install-a', 'sync-a', 'install-b', 'sync-b']) {
+        assert.deepEqual(await worker.runOnce(), { claimed: true, operationId: id, status: 'failed' });
+    }
+    assert.deepEqual(claims, ['install', 'sync_users', 'install', 'sync_users']);
+});
+
+test('opted-in worker refuses missing admission, unsupported kind, or incomplete claim before SSH', async () => {
+    for (const operation of [
+        { kind: 'uninstall', admissionId: 'a', ownerGeneration: 1 },
+        { kind: 'install', ownerGeneration: 1 },
+        { kind: 'sync_users', admissionId: 'a' },
+        { kind: 'install', admissionId: 'a', ownerGeneration: 1, status: 'queued' },
+    ]) {
+        let invoked = 0;
+        const worker = new L2tpOperationWorker({
+            operationRepository: { async claimNext() { throw new Error('generic claim'); } },
+            remoteAdmissionRepository: {
+                async claimQueuedInstall() { return { id: 'op', kind: 'install', status: 'running',
+                    leaseOwner: 'worker-1', ...operation }; },
+                async claimQueuedSyncUsers() { invoked++; return null; },
+            },
+            enableUnsafeExecutionForTests: true, workerId: 'worker-1', leaseMs: 30_000,
+            clock: createClock(), lockService: { async acquire() { invoked++; } },
+            executor: { async executeStep() { invoked++; } },
+        });
+        assert.deepEqual(await worker.runOnce(), { claimed: false, unavailable: true });
+        assert.equal(invoked, 0);
+    }
+});
+
+test('opted-in worker requires both transactional claims before touching generic repository', async () => {
+    for (const remoteAdmissionRepository of [undefined, {}, { async claimQueuedInstall() {} },
+        { async claimQueuedSyncUsers() {} }]) {
+        const worker = new L2tpOperationWorker({
+            operationRepository: { async claimNext() { throw new Error('generic claim'); } },
+            remoteAdmissionRepository, enableUnsafeExecutionForTests: true,
+        });
+        assert.deepEqual(await worker.runOnce(), { claimed: false, unavailable: true });
+    }
+});
+
+test('ambiguous counted claim aborts without trying another kind or executor', async () => {
+    const calls = [];
+    const worker = new L2tpOperationWorker({
+        operationRepository: { async claimNext() { calls.push('generic'); } },
+        remoteAdmissionRepository: {
+            async claimQueuedInstall() { calls.push('install'); throw new Error('uncertain commit'); },
+            async claimQueuedSyncUsers() { calls.push('sync'); },
+        },
+        executor: { async executeStep() { calls.push('SSH'); } },
+        enableUnsafeExecutionForTests: true, workerId: 'worker-1', leaseMs: 30_000,
+        clock: createClock(),
+    });
+    await assert.rejects(worker.runOnce(), /uncertain commit/);
+    assert.deepEqual(calls, ['install']);
+});
+
 function createOperationRepository(initialOperations = []) {
-    const operations = initialOperations.map(operation => ({ ...operation }));
+    const operations = initialOperations.map(operation => ({ ...operation,
+        // Old execution fixtures predate kind-scoped admission. Model them as
+        // counted install claims; production does not accept these shapes.
+        kind: operation.kind ?? 'install',
+        admissionId: operation.admissionId ?? `admission-${operation.id}`,
+        ownerGeneration: operation.ownerGeneration ?? 1,
+    }));
     const calls = [];
 
     return {
         calls,
         operations,
-        async claimNext(request) {
-            calls.push({ method: 'claimNext', request });
-            const operation = operations.find(candidate => candidate.status === 'queued');
-            if (!operation) return null;
-
-            operation.status = 'running';
-            operation.leaseOwner = request.owner;
-            return operation;
-        },
+        async claimNext() { throw new Error('Generic claim is forbidden'); },
         async renewLease(request) {
             calls.push({ method: 'renewLease', request });
             return true;
@@ -101,21 +188,48 @@ function createTimer() {
 }
 
 function createWorker(operationRepository, overrides = {}) {
+    const legacyExecutionFixture = operationRepository.operations?.some(
+        operation => operation.plan?.steps && !operation.plan.operationId);
     const lockService = {
         async renew() { return { ok: true }; },
         ...(overrides.lockService || {}),
     };
 
-    return new L2tpOperationWorker({
+    const worker = new L2tpOperationWorker({
         operationRepository,
+        remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
+            async claimQueuedInstall(request) {
+                const operation = operationRepository.operations?.find(candidate =>
+                    candidate.status === 'queued' && candidate.kind === 'install');
+                operationRepository.calls?.push({ method: 'claimQueuedInstall', request });
+                if (!operation) return null;
+                operation.status = 'running';
+                operation.leaseOwner = request.owner;
+                return operation;
+            },
+            async claimQueuedSyncUsers(request) {
+                const operation = operationRepository.operations?.find(candidate =>
+                    candidate.status === 'queued' && candidate.kind === 'sync_users');
+                operationRepository.calls?.push({ method: 'claimQueuedSyncUsers', request });
+                if (!operation) return null;
+                operation.status = 'running';
+                operation.leaseOwner = request.owner;
+                return operation;
+            },
+        },
+        enableUnsafeExecutionForTests: true,
         lockService,
         executor: overrides.executor || {},
-        secretResolver: overrides.secretResolver,
+        secretResolver: overrides.secretResolver ?? (legacyExecutionFixture
+            ? async () => ({ psk: 'fixture-secret' }) : undefined),
         userSnapshotResolver: overrides.userSnapshotResolver,
         userSyncReconciler: overrides.userSyncReconciler,
         stateReconciler: overrides.stateReconciler || (async () => ({ status: 'installed' })),
-        operationMaterializer: overrides.operationMaterializer,
-        candidateService: overrides.candidateService,
+        operationMaterializer: overrides.operationMaterializer ?? (legacyExecutionFixture
+            ? async ({ plan }) => ({ persistedPlan: plan, remoteArtifacts: [] }) : undefined),
+        candidateService: overrides.candidateService ?? (legacyExecutionFixture
+            ? { async buildCandidate({ plan }) { return { operationId: plan.operationId, content: '{}' }; } }
+            : undefined),
         afterInstallSucceeded: overrides.afterInstallSucceeded,
         workerId: 'worker-1',
         leaseMs: overrides.leaseMs || 30_000,
@@ -123,6 +237,13 @@ function createWorker(operationRepository, overrides = {}) {
         timer: overrides.timer || createTimer(),
         renewalIntervalMs: overrides.renewalIntervalMs,
     });
+    if (legacyExecutionFixture && !overrides.operationMaterializer) {
+        // These old step/lease fixtures have no compose_xray_fragment reference.
+        // Exercise their execution mechanics without bypassing artifact validation
+        // in the real materialization path (covered by full install-plan tests).
+        worker.materializeInstallSteps = async ({ plan }) => plan.steps;
+    }
+    return worker;
 }
 
 function createInstallOperation(id = 'operation-install') {
@@ -1125,7 +1246,14 @@ test('runOnce reports idle when no queued operation can be claimed', async () =>
 
     assert.deepEqual(result, { claimed: false });
     assert.deepEqual(operationRepository.calls, [{
-        method: 'claimNext',
+        method: 'claimQueuedInstall',
+        request: {
+            owner: 'worker-1',
+            leaseMs: 30_000,
+            now: NOW,
+        },
+    }, {
+        method: 'claimQueuedSyncUsers',
         request: {
             owner: 'worker-1',
             leaseMs: 30_000,
@@ -1154,12 +1282,10 @@ test('expired durable node lock blocks new L2TP claim before executor and repeat
         lockService: { acquire: request => lockService.acquire(request) },
         executor: { async executeStep() { dispatched += 1; } },
     });
-    assert.deepEqual(await worker.runOnce(), {
-        claimed: true, operationId: 'new-operation', status: 'failed',
-    });
+    assert.deepEqual(await worker.runOnce(), { claimed: false });
     assert.deepEqual(await worker.runOnce(), { claimed: false });
     assert.equal(dispatched, 0);
-    assert.equal(inserts, 1);
+    assert.equal(inserts, 0);
     assert.equal(held.generation, 'old-token');
 });
 
@@ -1428,13 +1554,15 @@ test('renews operation and node leases while a step runs longer than the lease',
     assert.deepEqual(
         operationRenewals.map(request => request.now),
         [
-            NOW,
+            NOW, // Before materialization.
+            NOW, // Immediately before the remote step.
             new Date('2026-09-22T10:00:10.000Z'),
             new Date('2026-09-22T10:00:20.000Z'),
             new Date('2026-09-22T10:00:31.000Z'),
+            new Date('2026-09-22T10:00:31.000Z'), // Terminal ownership check.
         ],
     );
-    assert.equal(lockRenewals.length, 4);
+    assert.equal(lockRenewals.length, 6);
     assert.ok(timer.calls[0].intervalMs < 30_000);
     assert.equal(timer.activeCount(), 0);
     assert.equal(timer.calls.filter(call => call.method === 'clearInterval').length, 1);
@@ -1457,7 +1585,7 @@ test('stops before a second step when operation lease renewal is rejected', asyn
     operationRepository.renewLease = async request => {
         operationRepository.calls.push({ method: 'renewLease', request });
         renewals += 1;
-        return renewals === 1;
+        return renewals <= 2; // Pre-materialization and pre-step checks pass.
     };
     const worker = createWorker(operationRepository, {
         timer,
@@ -1516,7 +1644,7 @@ test('stops before a second step when node lock renewal rejects', async () => {
             async acquire() { return { ok: true }; },
             async renew() {
                 lockRenewals += 1;
-                if (lockRenewals > 1) throw new Error('lock store unavailable');
+                if (lockRenewals > 2) throw new Error('lock store unavailable');
                 return { ok: true };
             },
             async release(request) { releases.push(request); return { ok: true }; },
@@ -1595,7 +1723,7 @@ test('does not overlap lease renewal calls when a renewal is still pending', asy
     operationRepository.renewLease = async request => {
         operationRepository.calls.push({ method: 'renewLease', request });
         renewals += 1;
-        if (renewals === 1) return true;
+        if (renewals <= 2) return true; // Enter the remote step before blocking a tick.
 
         activeRenewals += 1;
         maxActiveRenewals = Math.max(maxActiveRenewals, activeRenewals);
@@ -1625,7 +1753,7 @@ test('does not overlap lease renewal calls when a renewal is still pending', asy
     await renewalStarted.promise;
     const secondTick = timer.tick();
 
-    assert.equal(renewals, 2);
+    assert.equal(renewals, 3);
     assert.equal(maxActiveRenewals, 1);
 
     renewal.resolve();
@@ -1634,7 +1762,7 @@ test('does not overlap lease renewal calls when a renewal is still pending', asy
     const result = await run;
 
     assert.equal(result.status, 'succeeded');
-    assert.equal(renewals, 2);
+    assert.equal(renewals, 4); // Terminal ownership is rechecked after the step.
     assert.equal(maxActiveRenewals, 1);
     assert.equal(timer.activeCount(), 0);
 });

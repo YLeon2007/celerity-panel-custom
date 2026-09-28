@@ -75,7 +75,7 @@ function createDependencies() {
     };
 }
 
-test('composes the L2TP service, worker, router, and fragment registry', () => {
+test('composes the L2TP service, worker, router, and fragment registry', async () => {
     const dependencies = createDependencies();
 
     const runtime = createL2tpRuntime(dependencies);
@@ -108,6 +108,8 @@ test('composes the L2TP service, worker, router, and fragment registry', () => {
     assert.ok(runtime.worker instanceof L2tpOperationWorker);
     assert.ok(runtime.worker.operationRepository instanceof L2tpOperationRepository);
     assert.strictEqual(runtime.worker.operationRepository.model, dependencies.operationModel);
+    assert.strictEqual(runtime.worker.remoteAdmissionRepository, dependencies.remoteAdmissionRepository);
+    assert.deepEqual(await runtime.worker.runOnce(), { claimed: false, unavailable: true });
     assert.ok(runtime.worker.executor instanceof L2tpRemoteExecutor);
     assert.strictEqual(runtime.worker.executor.transport, dependencies.transport);
     assert.strictEqual(runtime.worker.lockService, dependencies.lockService);

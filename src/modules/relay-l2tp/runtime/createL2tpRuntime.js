@@ -121,6 +121,7 @@ function createL2tpRuntime(dependencies) {
     );
     const worker = new L2tpOperationWorker({
         operationRepository: workerOperationRepository,
+        remoteAdmissionRepository,
         lockService,
         executor,
         secretResolver,
@@ -157,6 +158,7 @@ function createL2tpRuntime(dependencies) {
     ]);
     hideInjectedDependencies(worker, [
         'operationRepository',
+        'remoteAdmissionRepository',
         'lockService',
         'executor',
         'secretResolver',

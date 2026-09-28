@@ -426,6 +426,11 @@ test('explicit complete activation wires execution factories lazily and starts o
     assert.ok(host.runtime.worker.lockService instanceof NodeOperationLockService);
     assert.ok(host.runtime.worker.lockService.repository instanceof NodeOperationLockRepository);
     assert.strictEqual(host.runtime.worker.candidateService, runtimeCalls[0].candidateService);
+    assert.strictEqual(runtimeCalls[0].remoteAdmissionRepository.L2tpOperation,
+        userManagementDependencies.L2tpOperation);
+    assert.strictEqual(host.runtime.worker.remoteAdmissionRepository,
+        runtimeCalls[0].remoteAdmissionRepository);
+    assert.deepEqual(await host.runtime.worker.runOnce(), { claimed: false, unavailable: true });
     assert.strictEqual(host.runtime.worker.userSyncReconciler, userSyncReconciler);
     assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
     assert.strictEqual(runtimeCalls[0].operationMaterializer, materializeInstallOperation);

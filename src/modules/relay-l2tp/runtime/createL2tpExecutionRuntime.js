@@ -375,6 +375,7 @@ function createL2tpExecutionRuntime({
     const remoteAdmissionRepository = new RemoteAdmissionRepository({
         CascadeTopologyState,
         RemoteAdmission,
+        L2tpOperation: operationModel,
     });
     const lockService = new NodeOperationLockService({
         repository: lockRepository,

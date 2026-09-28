@@ -129,6 +129,10 @@ function verifiedUsersAttestation(result, plan, resolvedUsers) {
 class L2tpOperationWorker {
     constructor({
         operationRepository,
+        remoteAdmissionRepository,
+        // Test-only opt-in. The active runtime never supplies this until the
+        // ownership/finalization and remote recovery protocols are complete.
+        enableUnsafeExecutionForTests = false,
         lockService,
         executor,
         secretResolver,
@@ -145,6 +149,9 @@ class L2tpOperationWorker {
         renewalIntervalMs,
     }) {
         this.operationRepository = operationRepository;
+        this.remoteAdmissionRepository = remoteAdmissionRepository;
+        this.enableUnsafeExecutionForTests = enableUnsafeExecutionForTests === true;
+        this.nextClaimKind = 'install';
         this.lockService = lockService;
         this.executor = executor;
         this.secretResolver = secretResolver;
@@ -365,13 +372,38 @@ class L2tpOperationWorker {
     }
 
     async runOnce() {
-        const operation = await this.operationRepository.claimNext({
+        // Never consume counted admission while execution/finalization is not
+        // fenced. Missing transactional claims are likewise not a reason to
+        // fall back to the generic (uncounted) operation repository.
+        if (!this.enableUnsafeExecutionForTests
+            || typeof this.remoteAdmissionRepository?.claimQueuedInstall !== 'function'
+            || typeof this.remoteAdmissionRepository?.claimQueuedSyncUsers !== 'function') {
+            return { claimed: false, unavailable: true };
+        }
+        const request = {
             owner: this.workerId,
             leaseMs: this.leaseMs,
             now: this.clock.now(),
-        });
+        };
+        const firstKind = this.nextClaimKind;
+        const secondKind = firstKind === 'install' ? 'sync_users' : 'install';
+        const claim = kind => kind === 'install'
+            ? this.remoteAdmissionRepository.claimQueuedInstall(request)
+            : this.remoteAdmissionRepository.claimQueuedSyncUsers(request);
+        const operation = await claim(firstKind) || await claim(secondKind);
 
         if (!operation) return { claimed: false };
+
+        // A malformed/injected claim must never reach lock acquisition or SSH.
+        if (!['install', 'sync_users'].includes(operation.kind)
+            || operation.status !== 'running'
+            || operation.leaseOwner !== this.workerId
+            || !operation.admissionId
+            || !Number.isSafeInteger(operation.ownerGeneration)
+            || operation.ownerGeneration < 1) {
+            return { claimed: false, unavailable: true };
+        }
+        this.nextClaimKind = operation.kind === 'install' ? 'sync_users' : 'install';
 
         const operationId = String(operation._id ?? operation.id);
         let preparedInstallPlan = null;
