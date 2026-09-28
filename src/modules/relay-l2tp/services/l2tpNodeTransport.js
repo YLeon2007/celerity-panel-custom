@@ -61,6 +61,7 @@ const VERIFY_USER_FAILURE_STATUSES = Object.freeze({
     MANAGED_USERS_DUPLICATE: new Set([65]),
     MANAGED_USERS_ALTERED: new Set([65]),
     DISABLED_USERS_PRESENT: new Set([65]),
+    UNMANAGED_USERS_COLLISION: new Set([65]),
     MANAGED_BLOCK_INVALID: new Set([65]),
     CHAP_SECRETS_INVALID: new Set([65, 66, 77]),
 });

@@ -82,6 +82,12 @@ invoke_verify success
 [[ "$result" == '{"ok":true,"credentialRevision":42,"enabledUserCount":2,"managedUserCount":2,"code":"USERS_VERIFIED"}' ]] \
     || fail "success returned the wrong strict result: $result"
 
+write_chap "foreign-user l2tpd foreign-secret *
+$expected_block"
+invoke_verify foreign-credential
+[[ "$status" -eq 0 && "$result" == '{"ok":true,"credentialRevision":42,"enabledUserCount":2,"managedUserCount":2,"code":"USERS_VERIFIED"}' ]] \
+    || fail 'unrelated unmanaged credential was rejected'
+
 write_chap "# BEGIN CELERITY MANAGED L2TP USERS
 \"alpha\" l2tpd \"$SECRET_CANARY\" 10.77.0.10
 # END CELERITY MANAGED L2TP USERS
@@ -118,6 +124,22 @@ write_chap "# BEGIN CELERITY MANAGED L2TP USERS
 # END CELERITY MANAGED L2TP USERS
 "
 expect_failure disabled DISABLED_USERS_PRESENT 3
+
+# All desired identities, including disabled ones, must be absent outside the block.
+# Unrelated local credentials remain valid and must not cause a collision.
+write_chap "foreign-user l2tpd foreign-secret 10.77.0.99
+ disabled-user  l2tpd  \"disabled-secret\" 10.77.0.12
+$expected_block"
+expect_failure outside-disabled UNMANAGED_USERS_COLLISION 2
+
+write_chap "$expected_block
+   \"alpha\"  l2tpd  \"other-secret\"  *
+"
+expect_failure outside-enabled-quoted UNMANAGED_USERS_COLLISION 2
+
+write_chap "alpha l2tpd \"unterminated
+$expected_block"
+expect_failure outside-malformed UNMANAGED_USERS_COLLISION 2
 
 write_chap "$expected_block"
 # chap-secrets missing or unreadable on the relay is a distinct drift class:

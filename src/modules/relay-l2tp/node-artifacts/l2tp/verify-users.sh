@@ -173,7 +173,23 @@ def managed_lines(content, revision, enabled_count):
             revision=revision,
             enabled=enabled_count,
         )
-    return lines[begins[0] + 1:ends[0]]
+    return lines[begins[0] + 1:ends[0]], lines[:begins[0]] + lines[ends[0] + 1:]
+
+
+def outside_collision(lines, logins):
+    for line in lines:
+        try:
+            tokens = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            # Broken quotes/escapes can obscure an entry: fail closed when a
+            # desired identity appears rather than attesting an ambiguous line.
+            if any(re.search(r'(?<![A-Za-z0-9._@-])' + re.escape(login)
+                             + r'(?![A-Za-z0-9._@-])', line) for login in logins):
+                return True
+            continue
+        if tokens and tokens[0] in logins:
+            return True
+    return False
 
 
 def quote(value):
@@ -276,8 +292,11 @@ def main():
                 raise
         finally:
             os.close(parent)
-        lines = managed_lines(content, revision, enabled_count)
+        lines, outside = managed_lines(content, revision, enabled_count)
         enabled_count, managed_count = verify_entries(lines, users, revision)
+        if outside_collision(outside, {login for login, _password, _address, _active in users}):
+            raise VerificationError('UNMANAGED_USERS_COLLISION', revision=revision,
+                                    enabled=enabled_count, managed=managed_count)
     finally:
         os.close(root)
         os.close(operation)

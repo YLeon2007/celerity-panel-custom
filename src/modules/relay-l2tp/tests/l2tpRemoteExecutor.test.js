@@ -273,13 +273,13 @@ test('verify_users maps to the fixed verifier command with the cached typed expe
     assert.doesNotMatch(JSON.stringify({ calls, result }), /verify-step-secret/);
 });
 
-test('verify_users returns a strict sanitized mismatch attestation', async () => {
+test('verify_users returns a strict sanitized unmanaged-collision attestation', async () => {
     const mismatch = {
         ok: false,
         credentialRevision: 42,
         enabledUserCount: 1,
-        managedUserCount: 2,
-        code: 'MANAGED_USERS_EXTRA',
+        managedUserCount: 1,
+        code: 'UNMANAGED_USERS_COLLISION',
     };
     const executor = new L2tpRemoteExecutor({
         transport: {

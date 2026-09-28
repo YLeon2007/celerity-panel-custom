@@ -65,6 +65,51 @@ invoke_sync idempotent "$TMP_DIR/operation"
 [[ "$(<"$output")" == '{"status":"ok","changed":0,"managedUsers":1,"disabledUsers":1}' ]] \
     || fail 'idempotent user sync returned the wrong result'
 
+printf '%s\n' 'foreign-user l2tpd local-foreign-secret *' \
+    '# BEGIN CELERITY MANAGED L2TP USERS' \
+    '"alpha" l2tpd "alpha-secret" 10.77.0.10' \
+    '# END CELERITY MANAGED L2TP USERS' >"$TMP_DIR/root/etc/ppp/chap-secrets"
+invoke_sync foreign-credential "$TMP_DIR/operation"
+[[ "$status" -eq 0 ]] || fail 'unrelated unmanaged credential was rejected'
+[[ "$(<"$TMP_DIR/root/etc/ppp/chap-secrets")" == "foreign-user l2tpd local-foreign-secret *
+# BEGIN CELERITY MANAGED L2TP USERS
+\"alpha\" l2tpd \"alpha-secret\" 10.77.0.10
+# END CELERITY MANAGED L2TP USERS" ]] || fail 'unrelated unmanaged credential changed'
+
+# A desired identity outside the managed block cannot be reconciled safely:
+# rejecting it must leave unrelated local credentials and file bytes untouched.
+for variant in disabled enabled-quoted malformed; do
+    case "$variant" in
+        disabled) collision='  zeta   l2tpd  "local-secret"  *' ;;
+        enabled-quoted) collision='  "alpha"  l2tpd  "local-secret"  *' ;;
+        malformed) collision='alpha l2tpd "unterminated' ;;
+    esac
+    printf '%s\n' 'foreign-user l2tpd local-foreign-secret *' \
+        '# BEGIN CELERITY MANAGED L2TP USERS' \
+        '"alpha" l2tpd "alpha-secret" 10.77.0.10' \
+        '# END CELERITY MANAGED L2TP USERS' "$collision" \
+        >"$TMP_DIR/root/etc/ppp/chap-secrets"
+    cp "$TMP_DIR/root/etc/ppp/chap-secrets" "$TMP_DIR/before-collision"
+    invoke_sync "outside-$variant" "$TMP_DIR/operation"
+    [[ "$status" -ne 0 ]] || fail "outside-$variant collision was accepted"
+    [[ "$(<"$output")" == '{"status":"error","code":"UNMANAGED_USERS_COLLISION"}' ]] \
+        || fail "outside-$variant returned the wrong strict error"
+    cmp -s "$TMP_DIR/root/etc/ppp/chap-secrets" "$TMP_DIR/before-collision" \
+        || fail "outside-$variant rewrote foreign credentials"
+    [[ ! -s "$TMP_DIR/mutation.log" ]] || fail "outside-$variant invoked a service or firewall command"
+done
+printf '%s\n' 'foreign-user l2tpd local-foreign-secret *' \
+    'zeta l2tpd local-secret *' >"$TMP_DIR/root/etc/ppp/chap-secrets"
+cp "$TMP_DIR/root/etc/ppp/chap-secrets" "$TMP_DIR/before-collision"
+invoke_sync outside-no-block "$TMP_DIR/operation"
+[[ "$status" -ne 0 && "$(<"$output")" == '{"status":"error","code":"UNMANAGED_USERS_COLLISION"}' ]] \
+    || fail 'preexisting collision without managed block was accepted'
+cmp -s "$TMP_DIR/root/etc/ppp/chap-secrets" "$TMP_DIR/before-collision" \
+    || fail 'preexisting collision rewrote foreign credentials'
+printf '%s\n' 'local line must survive' >"$TMP_DIR/root/etc/ppp/chap-secrets"
+invoke_sync restore "$TMP_DIR/operation"
+[[ "$status" -eq 0 ]] || fail 'restore after rejected collision failed'
+
 ROOT_DIR="$ROOT_DIR" node >"$TMP_DIR/operation/desired.json" <<'NODE'
 const { INSTALL_STEP_TYPES } = require(
     `${process.env.ROOT_DIR}/src/modules/relay-l2tp/services/l2tpProvisionPlanService`,

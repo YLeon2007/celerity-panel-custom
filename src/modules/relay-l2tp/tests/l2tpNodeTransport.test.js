@@ -271,14 +271,14 @@ test('verify-users returns only a strict result bound to the requested revision 
     assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
 });
 
-test('verify-users preserves strict mismatch results without exposing remote diagnostics', async () => {
+test('verify-users preserves strict unmanaged-collision results without exposing remote diagnostics', async () => {
     const secret = 'verify-mismatch-secret-canary';
     const strictResult = {
         ok: false,
         credentialRevision: 42,
         enabledUserCount: 2,
-        managedUserCount: 3,
-        code: 'DISABLED_USERS_PRESENT',
+        managedUserCount: 2,
+        code: 'UNMANAGED_USERS_COLLISION',
     };
     const transport = new L2tpNodeTransport({
         nodeSSH: {

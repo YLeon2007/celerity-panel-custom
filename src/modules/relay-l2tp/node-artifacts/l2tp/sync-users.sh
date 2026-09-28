@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 import sys
 
@@ -168,6 +169,22 @@ def inspect_block(content):
     return begins[0][0], ends[0][1]
 
 
+def outside_collision(lines, logins):
+    for line in lines:
+        try:
+            tokens = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            # Broken quotes/escapes can obscure an entry: fail closed when a
+            # desired identity appears rather than treating it as foreign.
+            if any(re.search(r'(?<![A-Za-z0-9._@-])' + re.escape(login)
+                             + r'(?![A-Za-z0-9._@-])', line) for login in logins):
+                return True
+            continue
+        if tokens and tokens[0] in logins:
+            return True
+    return False
+
+
 def quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
@@ -182,6 +199,10 @@ def reconcile(existing, users):
     lines.extend((END, ''))
     block = '\n'.join(lines)
     existing_block = inspect_block(existing)
+    outside = (existing[:existing_block[0]] + existing[existing_block[1]:]
+               if existing_block is not None else existing)
+    if outside_collision(outside.splitlines(), {user['login'] for user in users}):
+        raise SyncError('UNMANAGED_USERS_COLLISION')
     if existing_block is not None:
         start, end = existing_block
         return existing[:start] + block + existing[end:], enabled
