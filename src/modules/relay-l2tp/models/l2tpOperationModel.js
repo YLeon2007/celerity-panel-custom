@@ -179,6 +179,8 @@ const l2tpOperationSchema = new mongoose.Schema({
         required: true,
     },
     attempts: { type: Number, min: 0, default: 0, required: true },
+    // Set only by the counted queued-install handoff; legacy operations remain unversioned.
+    ownerGeneration: { type: Number, min: 1 },
     leaseOwner: { type: String, default: '', trim: true },
     leaseUntil: { type: Date, default: null },
     logs: { type: [operationLogEntrySchema], default: [] },

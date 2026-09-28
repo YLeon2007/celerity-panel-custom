@@ -10,6 +10,8 @@ const remoteAdmissionSchema = new mongoose.Schema({
     kind: { type: String, enum: ['standalone_preflight', 'install'], required: true },
     phase: { type: String, enum: ['running', 'queued', 'recovery_required', 'completed'], required: true },
     operationId: { type: String },
+    // Only populated by the queued-install claim; older running admissions stay valid.
+    leaseOwner: { type: String },
     ownerGeneration: { type: Number, required: true, min: 1 },
 }, { timestamps: true, strict: 'throw' });
 

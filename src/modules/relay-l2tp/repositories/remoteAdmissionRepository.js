@@ -8,6 +8,8 @@ function admissionError(code) {
     return error;
 }
 
+const CLAIM_CAS_MISS = new Error('Queued install claim CAS miss');
+
 function transactionRunnerFor(CascadeTopologyState, RemoteAdmission) {
     const connection = CascadeTopologyState?.db;
     if (!connection || RemoteAdmission?.db !== connection || typeof connection.startSession !== 'function') {
@@ -84,6 +86,77 @@ class RemoteAdmissionRepository {
             if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
         });
         return String(operationId);
+    }
+
+    /** Dormant DB-only claim: the worker is deliberately not wired to this path. */
+    async claimQueuedInstall({ owner, leaseMs, now } = {}) {
+        if (typeof owner !== 'string' || !owner.trim()
+            || !Number.isSafeInteger(leaseMs) || leaseMs <= 0
+            || !(now instanceof Date) || !Number.isFinite(now.getTime())
+            || !Number.isFinite(now.getTime() + leaseMs)) {
+            throw new TypeError('Invalid queued install claim');
+        }
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection || this.L2tpOperation?.db !== connection
+            || typeof this.CascadeTopologyState.findOne !== 'function'
+            || typeof this.RemoteAdmission.findOne !== 'function'
+            || typeof this.L2tpOperation?.findOne !== 'function'
+            || typeof this.L2tpOperation?.updateOne !== 'function') {
+            throw new TypeError('Queued install claim requires three models on one transactional Mongo connection');
+        }
+
+        const leaseUntil = new Date(now.getTime() + leaseMs);
+        try {
+            return await this.transactionRunner(async session => {
+                // Queued admissions are already counted. Neither this claim nor a
+                // failed CAS changes the gate; only a queued operation is eligible.
+                const gate = await this.CascadeTopologyState.findOne({
+                    _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+                    remoteDrain: { $exists: false }, replacementReservation: { $exists: false },
+                }).session(session).lean();
+                if (!gate) return null;
+                const candidate = await this.L2tpOperation.findOne({
+                    status: 'queued', kind: 'install', admissionId: { $type: 'string', $ne: '' },
+                }).sort({ createdAt: 1, _id: 1 }).session(session).lean();
+                if (!candidate) return null;
+                if (!Number.isSafeInteger(candidate.attempts) || candidate.attempts < 0
+                    || candidate.attempts >= Number.MAX_SAFE_INTEGER
+                    || candidate.ownerGeneration !== undefined) return null;
+                const admission = await this.RemoteAdmission.findOne({
+                    _id: candidate.admissionId, nodeId: String(candidate.node), kind: 'install',
+                    phase: 'queued', operationId: String(candidate._id),
+                    leaseOwner: { $exists: false },
+                }).session(session).lean();
+                if (!admission || !Number.isSafeInteger(admission.ownerGeneration)
+                    || admission.ownerGeneration < 1
+                    || admission.ownerGeneration >= Number.MAX_SAFE_INTEGER) return null;
+
+                const ownerGeneration = admission.ownerGeneration + 1;
+                const changed = await this.L2tpOperation.updateOne({
+                    _id: candidate._id, node: candidate.node, kind: 'install', status: 'queued',
+                    admissionId: candidate.admissionId, attempts: candidate.attempts,
+                    ownerGeneration: { $exists: false },
+                }, { $set: { status: 'running', leaseOwner: owner, leaseUntil, ownerGeneration },
+                    $inc: { attempts: 1 } }, { session, runValidators: true });
+                if (changed.matchedCount !== 1) throw CLAIM_CAS_MISS;
+                const handedOff = await this.RemoteAdmission.updateOne({
+                    _id: admission._id, nodeId: String(candidate.node), kind: 'install',
+                    phase: 'queued', operationId: String(candidate._id),
+                    leaseOwner: { $exists: false },
+                    ownerGeneration: admission.ownerGeneration,
+                }, { $set: { phase: 'running', leaseOwner: owner }, $inc: { ownerGeneration: 1 } },
+                { session, runValidators: true });
+                if (handedOff.matchedCount !== 1) throw CLAIM_CAS_MISS;
+                return { ...candidate, status: 'running', leaseOwner: owner, leaseUntil,
+                    attempts: candidate.attempts + 1, ownerGeneration };
+            });
+        } catch (error) {
+            // Throwing inside the transaction (rather than returning null) is
+            // essential: an admission CAS miss must roll back the operation write.
+            if (error === CLAIM_CAS_MISS) return null;
+            throw error;
+        }
     }
 
     async acquireInstall({ nodeId } = {}) {
