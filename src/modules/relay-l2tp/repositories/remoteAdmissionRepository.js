@@ -414,9 +414,13 @@ class RemoteAdmissionRepository {
 
     async release(id) {
         await this.transactionRunner(async session => {
-            // The record is the idempotency key. A second release cannot decrement twice.
+            // Only the unlinked prequeue owner may release. A worker's counted
+            // admission remains fenced even when its operation appears terminal.
+            // The record is the idempotency key: a second release cannot decrement twice.
             const changed = await this.RemoteAdmission.updateOne(
-                { _id: id, phase: 'running' },
+                { _id: id, phase: 'running', kind: { $in: ['standalone_preflight', 'install'] },
+                    operationId: { $exists: false }, leaseOwner: { $exists: false },
+                    ownerGeneration: 1 },
                 { $set: { phase: 'completed' } }, { session },
             );
             if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');

@@ -7,6 +7,18 @@ const { RemoteAdmissionRepository } = require('../repositories/remoteAdmissionRe
 const { L2tpService } = require('../services/l2tpService');
 const { createL2tpPreflightRunner } = require('../services/l2tpPreflightRunner');
 
+function matchesAdmission(record, filter) {
+    return record && Object.entries(filter).every(([key, expected]) => {
+        const value = record[key];
+        if (expected && typeof expected === 'object') {
+            if ('$exists' in expected) return (value !== undefined) === expected.$exists;
+            if ('$in' in expected) return expected.$in.includes(value);
+            throw new Error(`Unsupported admission filter: ${key}`);
+        }
+        return value === expected;
+    });
+}
+
 function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, remote = {} } = {}) {
     const calls = [];
     const state = gate === null ? null : { _id: 'singleton', remoteAdmissionCount: 0, ...gate };
@@ -47,7 +59,7 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
             assert.strictEqual(options.session, session);
             calls.push(['record', filter, update]);
             const record = records.get(filter._id);
-            if (!record || record.phase !== filter.phase) return { matchedCount: 0 };
+            if (!matchesAdmission(record, filter)) return { matchedCount: 0 };
             Object.assign(record, update.$set);
             return { matchedCount: 1 };
         },
@@ -176,4 +188,19 @@ test('release DB failure leaves admission counted and does not double decrement'
     assert.equal(record.phase, 'recovery_required');
     await assert.rejects(f.repository.release(record._id), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
     assert.equal(f.state.remoteAdmissionCount, 1);
+});
+
+test('legacy release refuses linked running install and sync worker admissions without touching the count', async () => {
+    for (const record of [
+        { kind: 'install', ownerGeneration: 2, operationId: 'install-op', leaseOwner: 'worker' },
+        { kind: 'sync_users', ownerGeneration: 1, operationId: 'sync-op', leaseOwner: 'worker' },
+        { kind: 'sync_users', ownerGeneration: 1 }, // A malformed unlinked sync is not prequeue work.
+    ]) {
+        const f = fixture({ gate: { remoteAdmissionCount: 1 } });
+        f.records.set('admission-1', { _id: 'admission-1', nodeId: 'relay-1', phase: 'running', ...record });
+        await assert.rejects(f.repository.release('admission-1'), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
+        assert.equal(f.state.remoteAdmissionCount, 1);
+        assert.equal(f.records.get('admission-1').phase, 'running');
+        assert.equal(f.calls.filter(([kind]) => kind === 'gate').length, 0);
+    }
 });

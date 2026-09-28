@@ -5,6 +5,18 @@ const test = require('node:test');
 
 const { RemoteAdmissionRepository } = require('../repositories/remoteAdmissionRepository');
 
+function matchesAdmission(record, filter) {
+    return record && Object.entries(filter).every(([key, expected]) => {
+        const value = record[key];
+        if (expected && typeof expected === 'object') {
+            if ('$exists' in expected) return (value !== undefined) === expected.$exists;
+            if ('$in' in expected) return expected.$in.includes(value);
+            throw new Error(`Unsupported admission filter: ${key}`);
+        }
+        return value === expected;
+    });
+}
+
 function fixture({ gate = {}, ambiguous = false, createFails = false, splitConnection = false,
     sessionUnavailable = false } = {}) {
     const state = gate === null ? null : { _id: 'singleton', remoteAdmissionCount: 0, ...gate };
@@ -44,7 +56,7 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
         async updateOne(filter, update, options) {
             assert.strictEqual(options.session, session);
             const record = records.get(filter._id);
-            if (!record || record.phase !== filter.phase) return { matchedCount: 0 };
+            if (!matchesAdmission(record, filter)) return { matchedCount: 0 };
             Object.assign(record, update.$set);
             return { matchedCount: 1 };
         },
@@ -156,6 +168,28 @@ test('queued install admission cannot be prematurely released by its former runn
     await assert.rejects(f.repository.release(id), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
     assert.equal(f.state.remoteAdmissionCount, 1);
     assert.equal(f.records.get(id).phase, 'queued');
+});
+
+test('install release refuses a running admission with only an operation link, lease, or stale generation', async () => {
+    for (const change of [{ operationId: 'install-op' }, { leaseOwner: 'worker' },
+        { ownerGeneration: 2 }]) {
+        const f = fixture();
+        const id = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+        Object.assign(f.records.get(id), change);
+        await assert.rejects(f.repository.release(id), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
+        assert.equal(f.state.remoteAdmissionCount, 1);
+        assert.equal(f.records.get(id).phase, 'running');
+        assert.deepEqual(f.calls, ['gate', 'record']);
+    }
+});
+
+test('release gate CAS miss rolls back a prequeue admission completion', async () => {
+    const f = fixture();
+    const id = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    f.state.remoteAdmissionCount = 0;
+    await assert.rejects(f.repository.release(id), { code: 'REMOTE_ADMISSION_GATE_MISSING' });
+    assert.equal(f.records.get(id).phase, 'running');
+    assert.equal(f.state.remoteAdmissionCount, 0);
 });
 
 test('install release decrements only its own running record once', async () => {
