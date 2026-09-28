@@ -16,6 +16,7 @@ const {
     requirePanelCsrf,
 } = require('./panel/csrf');
 const logger = require('../utils/logger');
+const { selectLinkApplyBaselineLinkIds } = require('./cascadeLinks');
 
 const DEFAULT_MODELS = Object.freeze({
     HyNode,
@@ -31,6 +32,9 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_REQUEST', 400],
     ['INVALID_TOPOLOGY_REVISION', 400],
     ['INVALID_OPERATION_ID', 400],
+    ['INVALID_LINK_ID', 400],
+    ['CASCADE_LINK_NOT_FOUND', 404],
+    ['CASCADE_LINK_DISABLED', 409],
     ['OPERATION_NOT_FOUND', 404],
     ['STALE_TOPOLOGY_REVISION', 409],
     ['INVALID_TOPOLOGY_DEPLOYMENT', 422],
@@ -72,11 +76,14 @@ function normalizeDeployRequest(body) {
         );
     }
     const keys = Object.keys(body);
-    if (keys.length !== 1 || keys[0] !== 'expectedTopologyRevision') {
+    if (keys.some(key => key !== 'expectedTopologyRevision' && key !== 'linkId')) {
         throw new TopologyDeployRequestError(
             'INVALID_REQUEST',
-            'Only expectedTopologyRevision is accepted',
+            'Only expectedTopologyRevision and an optional linkId are accepted',
         );
+    }
+    if (Object.hasOwn(body, 'linkId') && !/^[0-9a-fA-F]{24}$/.test(body.linkId)) {
+        throw new TopologyDeployRequestError('INVALID_LINK_ID', 'Link id must be a 24-character hex string');
     }
     const expectedTopologyRevision = body.expectedTopologyRevision;
     if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) {
@@ -85,7 +92,10 @@ function normalizeDeployRequest(body) {
             'expectedTopologyRevision must be a non-negative safe integer',
         );
     }
-    return { expectedTopologyRevision };
+    return {
+        expectedTopologyRevision,
+        ...(Object.hasOwn(body, 'linkId') ? { linkId: body.linkId } : {}),
+    };
 }
 
 const OPERATION_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
@@ -154,14 +164,22 @@ function publicError(error) {
 function sendError(res, error, routeLogger = logger) {
     const status = ERROR_STATUS_BY_CODE.get(error?.code);
     if (status) {
-        // 5xx bodies are sanitized before reaching the client, so the real
-        // message must always land in the log.
         if (status >= 500) {
-            routeLogger.error(`[Cascade Topology Deploy API] ${error?.code}: ${error?.message || 'Unknown error'}`);
+            // Backend errors can contain short credentials. Neither logs nor
+            // HTTP responses may echo free-form text or attached diagnostics.
+            routeLogger.error(`[Cascade Topology Deploy API] ${error.code}`);
+            return res.status(status).json({
+                error: {
+                    code: error.code,
+                    message: error.code === 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE'
+                        ? 'Topology deployment capabilities are unavailable'
+                        : 'Topology deployment failed',
+                },
+            });
         }
         return res.status(status).json(publicError(error));
     }
-    routeLogger.error(`[Cascade Topology Deploy API] ${error?.message || 'Unknown error'}`);
+    routeLogger.error('[Cascade Topology Deploy API] INTERNAL_ERROR');
     return res.status(500).json({
         error: {
             code: 'INTERNAL_ERROR',
@@ -272,9 +290,57 @@ function createCascadeTopologyDeployRouter({
         deployRateLimiter,
         async (req, res) => {
             try {
-                const result = await deploymentService.deploy(normalizeDeployRequest(req.body));
+                const input = normalizeDeployRequest(req.body);
+                let result;
+                if (input.linkId) {
+                    if (typeof deploymentService.queue !== 'function') {
+                        throw new TopologyDeployRequestError(
+                            'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+                            'Scoped topology deployment is unavailable',
+                        );
+                    }
+                    // The coordinator fences this revision and re-reads the
+                    // pinned snapshot before applying. This read only selects
+                    // candidate baseline ids; it cannot authorize a stale edge.
+                    const links = await models.CascadeLink.find({})
+                        .select('_id portalNode bridgeNode active status')
+                        .lean();
+                    const selected = links.find(link => String(link._id) === input.linkId);
+                    if (!selected) {
+                        throw new TopologyDeployRequestError('CASCADE_LINK_NOT_FOUND', 'Cascade link not found');
+                    }
+                    if (selected.active === false) {
+                        throw new TopologyDeployRequestError('CASCADE_LINK_DISABLED', 'Cascade link is disabled');
+                    }
+                    const baseline = selectLinkApplyBaselineLinkIds({
+                        links,
+                        linkId: input.linkId,
+                        portalNodeId: selected.portalNode,
+                        bridgeNodeId: selected.bridgeNode,
+                    });
+                    result = await deploymentService.queue({
+                        expectedTopologyRevision: input.expectedTopologyRevision,
+                        scope: {
+                            kind: 'link.apply',
+                            linkId: input.linkId,
+                            linkIds: [input.linkId, ...baseline],
+                        },
+                    });
+                    if (!result || result.topologyRevision !== input.expectedTopologyRevision
+                        || !['queued', 'succeeded'].includes(result.status)) {
+                        throw new TopologyDeployRequestError(
+                            'TOPOLOGY_OPERATION_QUEUE_FAILED',
+                            'Scoped topology deployment could not be queued',
+                        );
+                    }
+                } else {
+                    result = await deploymentService.deploy(input);
+                }
                 const status = result?.status === 'queued' ? 202 : 200;
-                return res.status(status).json(publicResult(result));
+                return res.status(status).json({
+                    ...publicResult(result),
+                    ...(input.linkId ? { kind: 'link.apply' } : {}),
+                });
             } catch (error) {
                 return sendError(res, error, routeLogger);
             }

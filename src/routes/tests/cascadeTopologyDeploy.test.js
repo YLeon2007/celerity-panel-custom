@@ -245,6 +245,106 @@ test('deployment API enforces authentication, nodes:write scope, session CSRF, a
     ]);
 });
 
+test('per-link deploy queues only the selected link and applied component, never an old pending edge', async () => {
+    const selectedId = '507f1f77bcf86cd799439011';
+    const appliedId = '507f1f77bcf86cd799439012';
+    const pendingId = '507f1f77bcf86cd799439013';
+    const calls = [];
+    const queueInputs = [];
+    const links = [
+        { _id: selectedId, portalNode: 'p2', bridgeNode: 'r', active: true, status: 'pending' },
+        { _id: appliedId, portalNode: 'r', bridgeNode: 'b', active: true, status: 'deployed' },
+        { _id: pendingId, portalNode: 'p3', bridgeNode: 'r', active: true, status: 'pending' },
+    ];
+    const router = createCascadeTopologyDeployRouter({
+        models: {
+            CascadeLink: {
+                find() { return { select() { return { lean: async () => links }; } }; },
+            },
+        },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('per-link request must not call global deploy'); },
+            async queue(input) {
+                queueInputs.push(input);
+                return { operationId: '507f1f77bcf86cd799439021', status: 'queued', topologyRevision: 7 };
+            },
+        },
+        ...guardHarness(calls),
+    });
+    const response = await request(router, {
+        body: { expectedTopologyRevision: 7, linkId: selectedId },
+        headers: { 'x-test-auth': 'api-write' },
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(queueInputs, [{
+        expectedTopologyRevision: 7,
+        scope: { kind: 'link.apply', linkId: selectedId, linkIds: [selectedId, appliedId] },
+    }]);
+    assert.equal(response.body.operationId, '507f1f77bcf86cd799439021');
+    assert.equal(response.body.status, 'queued');
+});
+
+test('per-link deploy does not expose backend failure text in response or log', async () => {
+    const selectedId = '507f1f77bcf86cd799439011';
+    const logged = [];
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: {
+            find() { return { select() { return { lean: async () => [
+                { _id: selectedId, portalNode: 'p', bridgeNode: 'r', active: true, status: 'pending' },
+            ] }; } }; },
+        } },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('global deploy must not run'); },
+            async queue() {
+                const error = new Error('password=short-secret');
+                error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+                throw error;
+            },
+        },
+        routeLogger: { error(message) { logged.push(message); } },
+        ...guardHarness([]),
+    });
+    const response = await request(router, {
+        body: { expectedTopologyRevision: 7, linkId: selectedId },
+        headers: { 'x-test-auth': 'api-write' },
+    });
+    assert.equal(response.status, 500);
+    assert.equal(response.body.error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+    assert.doesNotMatch(JSON.stringify(response.body) + logged.join(' '), /short-secret|password=/);
+});
+
+test('per-link deploy rejects malformed or disabled links without queueing', async () => {
+    const disabledId = '507f1f77bcf86cd799439019';
+    let reads = 0;
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: {
+            find() {
+                reads += 1;
+                return { select() { return { lean: async () => [
+                    { _id: disabledId, portalNode: 'p', bridgeNode: 'r', active: false, status: 'pending' },
+                ] }; } };
+            },
+        } },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('global deploy must not run'); },
+            async queue() { assert.fail('disabled link must not queue'); },
+        },
+        ...guardHarness([]),
+    });
+    const headers = { 'x-test-auth': 'api-write' };
+    const invalid = await request(router, {
+        body: { expectedTopologyRevision: 7, linkId: 'not-an-id' }, headers,
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.body.error.code, 'INVALID_LINK_ID');
+    assert.equal(reads, 0);
+    const disabled = await request(router, {
+        body: { expectedTopologyRevision: 7, linkId: disabledId }, headers,
+    });
+    assert.equal(disabled.status, 409);
+    assert.equal(disabled.body.error.code, 'CASCADE_LINK_DISABLED');
+});
+
 test('default deployment rate limiter caps the boundary at ten requests per minute', async () => {
     const calls = [];
     let serviceCalls = 0;
@@ -728,6 +828,7 @@ test('OpenAPI advertises only the revision-safe topology deployment endpoint', (
                     minimum: 0,
                     maximum: Number.MAX_SAFE_INTEGER,
                 },
+                linkId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' },
             },
         },
     );
@@ -745,6 +846,7 @@ test('OpenAPI advertises only the revision-safe topology deployment endpoint', (
                 operationId: { type: 'string' },
                 topologyRevision: { type: 'integer', minimum: 0 },
                 status: { type: 'string', enum: ['queued'] },
+                kind: { type: 'string', enum: ['link.apply'] },
             },
         },
     );
