@@ -903,6 +903,9 @@ class CascadeService {
                 logger.info(`[Cascade] Portal ${portalNode.name} restarted via agent`);
             } catch (err) {
                 logger.warn(`[Cascade] Portal agent restart: ${err.message}`);
+                // A deliberate agent HTTP refusal must not be overridden by SSH.
+                // The earlier config upload is separate; deployment still fails here.
+                if (err.code === 'AGENT_HTTP_ERROR') throw err;
                 if (portalNode.ssh?.password || portalNode.ssh?.privateKey) {
                     const ssh = new NodeSSH(portalNode);
                     try {
