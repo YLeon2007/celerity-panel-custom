@@ -143,10 +143,10 @@
                 </span>
                 ${relayBadge(relay)}
                 ${relay.ip
-                    ? `<span class="psk-chip" data-psk="${esc(relay.ip)}" title="${esc(L.copyIp)}">${esc(relay.ip)}</span>`
+                    ? `<span class="psk-chip" data-copy-value="${esc(relay.ip)}" title="${esc(L.copyIp)}">${esc(relay.ip)}</span>`
                     : ''}
                 ${relay.psk
-                    ? `<span class="psk-chip" data-psk="${esc(relay.psk)}" title="${esc(L.copyPsk)}">${esc(relay.psk)}</span>`
+                    ? `<span class="psk-chip" data-copy-value="${esc(relay.psk)}" title="${esc(L.copyPsk)}">${esc(relay.psk)}</span>`
                     : ''}
                 ${relayButton(relay)}
             </div>
@@ -161,14 +161,14 @@
         accountList.innerHTML = accounts.map(account => `
             <div class="l2tp-row" data-login="${esc(account.login)}">
                 <span class="l2tp-name grow">
-                    <button class="psk-chip" data-psk="${esc(account.login)}"
+                    <button class="psk-chip" data-copy-value="${esc(account.login)}"
                         title="${esc(L.copyLogin)}">${esc(account.login)}</button>
                     ${account.pending
                         ? `<span class="badge badge-warn">${esc(L.pendingSync)}</span>`
                         : `<span class="badge badge-ok">${esc(L.synced)}</span>`}
                 </span>
                 ${account.password
-                    ? `<button class="psk-chip" data-psk="${esc(account.password)}"
+                    ? `<button class="psk-chip" data-copy-value="${esc(account.password)}"
                         title="${esc(L.copyPassword)}">${esc(account.password)}</button>`
                     : '<span class="l2tp-empty">—</span>'}
                 <span class="relay-chips">${account.relays.map(relay =>
@@ -225,7 +225,7 @@
         const pskChip = event.target.closest('.psk-chip');
         if (pskChip) {
             try {
-                await navigator.clipboard.writeText(pskChip.dataset.psk);
+                await navigator.clipboard.writeText(pskChip.dataset.copyValue);
                 relayStatus.textContent = L.copied;
             } catch {
                 const range = document.createRange();
@@ -282,7 +282,7 @@
         const pskChip = event.target.closest('.psk-chip');
         if (pskChip) {
             try {
-                await navigator.clipboard.writeText(pskChip.dataset.psk);
+                await navigator.clipboard.writeText(pskChip.dataset.copyValue);
                 accountStatus.textContent = L.copied;
             } catch {
                 const range = document.createRange();

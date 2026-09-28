@@ -55,11 +55,14 @@ test('L2TP simple page inline script drives the simplified API surface', () => {
         '/panel/l2tp/simple/accounts',
         '/delete',
         'navigator.clipboard.writeText',
+        'data-copy-value=',
+        'pskChip.dataset.copyValue',
         '/panel/l2tp/operations/',
         'x-csrf-token',
     ]) {
         assert.ok(html.includes(marker), `missing ${marker}`);
     }
+    assert.ok(!html.includes('data-psk='), 'copy controls must not resemble static PSK assignments');
 });
 
 test('rendered L2TP inline script has valid JavaScript syntax', () => {
