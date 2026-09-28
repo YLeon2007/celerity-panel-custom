@@ -153,6 +153,35 @@ invoke main-prepare prepare "$main_operation" "$main_node" "$main_hash" "$main_b
 [[ "$(<"$TEST_ROOT/xray.log")" == 'xray asset='"$TEST_ROOT"'/usr/local/share/xray run -test -config '"$TEST_ROOT"'/var/lib/celerity/topology/operations/topology-operation-main/xray-main/candidate.json' ]] \
     || fail 'prepare did not bind the staged main config to the fixed Xray assets'
 
+# A contradictory backup cannot support deterministic rollback; refuse commit
+# before touching the active config or asking systemd to restart.
+main_backup_dir="$TEST_ROOT/var/lib/celerity/topology/backups/$main_backup/xray-main"
+: >"$main_backup_dir/config.absent"
+invoke ambiguous-backup-main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 ]] || fail 'commit accepted contradictory backup state'
+[[ "$errors" == '{"ok":false,"code":"BACKUP_INVALID"}' ]] \
+    || fail 'contradictory backup returned the wrong error'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'contradictory backup mutated active config'
+[[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'contradictory backup invoked systemctl'
+rm -f "$main_backup_dir/config.absent"
+
+# Missing or dangling rollback markers must also fail before side effects.
+rm -f "$main_backup_dir/config.json"
+invoke missing-backup-main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 && "$errors" == '{"ok":false,"code":"BACKUP_INVALID"}' ]] \
+    || fail 'commit accepted missing rollback snapshot'
+ln -s "$TMP_DIR/no-such-backup" "$main_backup_dir/config.json"
+: >"$main_backup_dir/config.absent"
+invoke dangling-backup-main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
+[[ "$status" -ne 0 && "$errors" == '{"ok":false,"code":"BACKUP_INVALID"}' ]] \
+    || fail 'commit accepted dangling backup symlink'
+/usr/bin/cmp -s "$TMP_DIR/main-config.before" "$TEST_ROOT/usr/local/etc/xray/config.json" \
+    || fail 'invalid backup mutated active config'
+[[ ! -e "$TEST_ROOT/systemctl.log" ]] || fail 'invalid backup invoked systemctl'
+rm -f "$main_backup_dir/config.json" "$main_backup_dir/config.absent"
+/usr/bin/install -m 0600 "$TMP_DIR/main-config.before" "$main_backup_dir/config.json"
+
 invoke main-commit commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main ''
 [[ "$status" -eq 0 ]] || fail 'xray-main commit failed'
 [[ "$output" == "$(receipt commit "$main_operation" "$main_node" "$main_hash" "$main_backup" xray-main)" ]] \
@@ -277,6 +306,22 @@ invoke bridge-rollback rollback "$bridge_operation" "$bridge_node" "$bridge_hash
 [[ "$status" -eq 0 ]] || fail 'xray-bridge rollback failed'
 /usr/bin/cmp -s "$TMP_DIR/bridge-config.before" "$TEST_ROOT/usr/local/etc/xray-bridge/config.json" \
     || fail 'bridge rollback did not restore its exact backup'
+
+# A legitimately absent target has exactly the absent marker, not config.json.
+rm -f "$TEST_ROOT/usr/local/etc/xray-bridge/config.json"
+absent_operation='topology-operation-absent'
+absent_backup='topology-backup-absent'
+invoke absent-prepare prepare "$absent_operation" "$bridge_node" "$bridge_hash" "$absent_backup" xray-bridge "$bridge_candidate"
+[[ "$status" -eq 0 ]] || fail 'prepare rejected a legitimately absent target'
+absent_backup_dir="$TEST_ROOT/var/lib/celerity/topology/backups/$absent_backup/xray-bridge"
+[[ -f "$absent_backup_dir/config.absent" && ! -e "$absent_backup_dir/config.json" ]] \
+    || fail 'prepare did not record an absent target'
+invoke absent-commit commit "$absent_operation" "$bridge_node" "$bridge_hash" "$absent_backup" xray-bridge ''
+[[ "$status" -eq 0 ]] || fail 'commit rejected a valid absent-target backup marker'
+invoke absent-rollback rollback "$absent_operation" "$bridge_node" "$bridge_hash" "$absent_backup" xray-bridge ''
+[[ "$status" -eq 0 && ! -e "$TEST_ROOT/usr/local/etc/xray-bridge/config.json" ]] \
+    || fail 'absent-target rollback did not remove the candidate'
+/usr/bin/install -m 0600 "$TMP_DIR/bridge-config.before" "$TEST_ROOT/usr/local/etc/xray-bridge/config.json"
 
 invoke extra-field prepare raw-operation raw-node "$main_hash" raw-backup xray-main "$main_candidate" --path /tmp/foreign
 [[ "$status" -ne 0 ]] || fail 'raw path field was accepted'

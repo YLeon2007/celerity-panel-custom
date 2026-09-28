@@ -325,6 +325,17 @@ assert_bound_state() {
 commit_candidate() {
     local target_parent temporary
     assert_bound_state
+    # Refuse activation when the prepared rollback snapshot is contradictory,
+    # absent, or a symlink; a later rollback must have one unambiguous source.
+    if [[ -f "$BACKUP_CONFIG" && ! -L "$BACKUP_CONFIG" ]]; then
+        [[ ! -e "$BACKUP_ABSENT" && ! -L "$BACKUP_ABSENT" ]] \
+            || fail 'BACKUP_INVALID' 65
+    elif [[ -f "$BACKUP_ABSENT" && ! -L "$BACKUP_ABSENT" ]]; then
+        [[ ! -e "$BACKUP_CONFIG" && ! -L "$BACKUP_CONFIG" ]] \
+            || fail 'BACKUP_INVALID' 65
+    else
+        fail 'BACKUP_INVALID' 65
+    fi
     file_hash_matches "$CANDIDATE_PATH" || fail 'CANDIDATE_HASH_MISMATCH' 65
     target_parent="${CONFIG_PATH%/*}"
     [[ -d "$target_parent" && ! -L "$target_parent" ]] || fail 'INVALID_TARGET' 73
