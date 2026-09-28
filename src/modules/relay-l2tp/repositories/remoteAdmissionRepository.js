@@ -26,7 +26,7 @@ function transactionRunnerFor(CascadeTopologyState, RemoteAdmission) {
 }
 
 class RemoteAdmissionRepository {
-    constructor({ CascadeTopologyState, RemoteAdmission, transactionRunner } = {}) {
+    constructor({ CascadeTopologyState, RemoteAdmission, L2tpOperation, transactionRunner } = {}) {
         if (typeof CascadeTopologyState?.updateOne !== 'function'
             || typeof RemoteAdmission?.create !== 'function'
             || typeof RemoteAdmission?.updateOne !== 'function') {
@@ -37,6 +37,53 @@ class RemoteAdmissionRepository {
         if (typeof this.transactionRunner !== 'function') throw new TypeError('Remote admission requires transactions');
         this.CascadeTopologyState = CascadeTopologyState;
         this.RemoteAdmission = RemoteAdmission;
+        // Optional until the install handoff is explicitly wired by a caller.
+        this.L2tpOperation = L2tpOperation;
+    }
+
+    async queueInstall({ admissionId, operationDocument } = {}) {
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection
+            || this.L2tpOperation?.db !== connection
+            || typeof this.CascadeTopologyState.findOne !== 'function'
+            || typeof this.L2tpOperation?.create !== 'function') {
+            throw new TypeError('Install handoff requires three models on one transactional Mongo connection');
+        }
+        const operationId = operationDocument?._id;
+        const nodeId = operationDocument?.node;
+        if (!admissionId || !operationId || !nodeId
+            || operationDocument.kind !== 'install' || operationDocument.status !== 'queued'
+            || String(operationDocument.plan?.operationId) !== String(operationId)
+            || String(operationDocument.plan?.relayId) !== String(nodeId)
+            || !Number.isSafeInteger(operationDocument.plan?.topologyRevision)
+            || operationDocument.plan.topologyRevision < 0
+            || operationDocument.idempotencyKey
+                !== `install:${nodeId}:revision-${operationDocument.plan.topologyRevision}`) {
+            throw admissionError('REMOTE_ADMISSION_INVALID_INSTALL');
+        }
+
+        await this.transactionRunner(async session => {
+            // Already counted before preflight: this handoff neither increments nor
+            // decrements the gate. A drain can only begin after the count reaches 0.
+            const gate = await this.CascadeTopologyState.findOne({
+                _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+                remoteDrain: { $exists: false }, replacementReservation: { $exists: false },
+            }).session(session).lean();
+            if (!gate) throw admissionError('REMOTE_ADMISSION_BLOCKED');
+
+            // The unique _id and idempotencyKey indexes reject duplicates; never
+            // reinterpret a duplicate as a successful handoff or delete a prior op.
+            await this.L2tpOperation.create([{
+                ...operationDocument, admissionId,
+            }], { session });
+            const changed = await this.RemoteAdmission.updateOne({
+                _id: admissionId, nodeId: String(nodeId), kind: 'install',
+                phase: 'running', operationId: { $exists: false },
+            }, { $set: { phase: 'queued', operationId: String(operationId) } }, { session });
+            if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
+        });
+        return String(operationId);
     }
 
     async acquire({ nodeId, kind = 'standalone_preflight' }) {

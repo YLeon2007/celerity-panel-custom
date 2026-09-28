@@ -143,6 +143,8 @@ const l2tpOperationSchema = new mongoose.Schema({
         enum: OPERATION_STATUSES,
         required: true,
     },
+    // Optional for operations created before the counted install handoff.
+    admissionId: { type: String },
     idempotencyKey: {
         type: String,
         required: true,

@@ -7,8 +7,9 @@ const mongoose = require('mongoose');
 const remoteAdmissionSchema = new mongoose.Schema({
     _id: { type: String, required: true },
     nodeId: { type: String, required: true },
-    kind: { type: String, enum: ['standalone_preflight'], required: true },
-    phase: { type: String, enum: ['running', 'recovery_required', 'completed'], required: true },
+    kind: { type: String, enum: ['standalone_preflight', 'install'], required: true },
+    phase: { type: String, enum: ['running', 'queued', 'recovery_required', 'completed'], required: true },
+    operationId: { type: String },
     ownerGeneration: { type: Number, required: true, min: 1 },
 }, { timestamps: true, strict: 'throw' });
 
