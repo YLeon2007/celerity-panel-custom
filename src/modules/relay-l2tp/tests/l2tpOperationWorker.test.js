@@ -1040,7 +1040,7 @@ test('secret resolution failure is sanitized and performs no remote command or r
         status: 'failed',
     });
     assert.deepEqual(transportCalls, []);
-    assert.equal(lockCalls.length, 1);
+    assert.deepEqual(lockCalls, [], 'only verified terminal success explicitly releases the lock');
     assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
     assert.equal(statuses[0].request.errorCode, 'SECRET_RESOLUTION_FAILED');
     assert.equal(
@@ -1102,7 +1102,7 @@ test('combined secret resolution failure is sanitized and uploads no user artifa
     });
     assert.equal(pskResolutions, 1);
     assert.deepEqual(transportCalls, []);
-    assert.equal(lockCalls.length, 1);
+    assert.deepEqual(lockCalls, [], 'only verified terminal success explicitly releases the lock');
     assert.deepEqual(statuses.map(call => call.request.status), ['failed']);
     assert.equal(statuses[0].request.errorCode, 'SECRET_RESOLUTION_FAILED');
     assert.equal(
@@ -1414,6 +1414,7 @@ test('stops before a second step when operation lease renewal is rejected', asyn
     const step = createDeferred();
     const started = createDeferred();
     const executed = [];
+    const releases = [];
     let renewals = 0;
     let rollbacks = 0;
     const operationRepository = createOperationRepository([{
@@ -1432,7 +1433,7 @@ test('stops before a second step when operation lease renewal is rejected', asyn
         lockService: {
             async acquire() { return { ok: true }; },
             async renew() { return { ok: true }; },
-            async release() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
         },
         executor: {
             async executeStep({ step: currentStep }) {
@@ -1462,6 +1463,7 @@ test('stops before a second step when operation lease renewal is rejected', asyn
         false,
     );
     assert.equal(timer.activeCount(), 0);
+    assert.deepEqual(releases, [], 'lost operation lease must retain the node lock');
 });
 
 test('stops before a second step when node lock renewal rejects', async () => {
@@ -1469,6 +1471,7 @@ test('stops before a second step when node lock renewal rejects', async () => {
     const step = createDeferred();
     const started = createDeferred();
     const executed = [];
+    const releases = [];
     let lockRenewals = 0;
     const operationRepository = createOperationRepository([{
         id: 'operation-lock-renew-rejected',
@@ -1485,7 +1488,7 @@ test('stops before a second step when node lock renewal rejects', async () => {
                 if (lockRenewals > 1) throw new Error('lock store unavailable');
                 return { ok: true };
             },
-            async release() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
         },
         executor: {
             async executeStep({ step: currentStep }) {
@@ -1509,6 +1512,38 @@ test('stops before a second step when node lock renewal rejects', async () => {
     assert.equal(result.status, 'running');
     assert.equal(result.errorCode, 'L2TP_LEASE_RENEWAL_FAILED');
     assert.equal(timer.activeCount(), 0);
+    assert.deepEqual(releases, [], 'failed lock renewal must not explicitly unlock the node');
+});
+
+test('retains the node lock after a transport timeout even when rollback succeeds', async () => {
+    const operationRepository = createOperationRepository([{
+        id: 'operation-transport-timeout',
+        node: 'node-transport-timeout',
+        status: 'queued',
+        plan: { steps: [{ type: 'verify' }] },
+    }]);
+    const releases = [];
+    const rollbacks = [];
+    const worker = createWorker(operationRepository, {
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
+        },
+        executor: {
+            async executeStep() {
+                // A local transport timeout does not prove the remote command stopped.
+                throw Object.assign(new Error('Transport timed out'), { code: 'SSH_TIMEOUT' });
+            },
+            async rollback() { rollbacks.push('completed'); },
+        },
+    });
+
+    const result = await worker.runOnce();
+
+    assert.equal(result.status, 'rolled_back');
+    assert.deepEqual(rollbacks, ['completed']);
+    assert.deepEqual(releases, []);
+    assert.equal(operationRepository.calls.some(call => call.method === 'succeedClaimed'), false);
 });
 
 test('does not overlap lease renewal calls when a renewal is still pending', async () => {
@@ -1916,10 +1951,11 @@ test('does not report success when the terminal owner-and-lease CAS rejects', as
         operationRepository.calls.push({ method: 'succeedClaimed', request });
         return false;
     };
+    const releases = [];
     const worker = createWorker(operationRepository, {
         lockService: {
             async acquire() { return { ok: true }; },
-            async release() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
         },
         executor: { async executeStep() {} },
     });
@@ -1939,6 +1975,51 @@ test('does not report success when the terminal owner-and-lease CAS rejects', as
         )),
         false,
     );
+    assert.deepEqual(releases, [], 'rejected terminal CAS must retain the lock');
+});
+
+test('retains the node lock if renewal fails after terminal CAS while the success hook is pending', async () => {
+    const timer = createTimer();
+    const hookStarted = createDeferred();
+    const finishHook = createDeferred();
+    const releases = [];
+    const operationRepository = createOperationRepository([
+        createInstallOperation('operation-post-cas-renewal').operation,
+    ]);
+    operationRepository.renewLease = async () => (
+        operationRepository.operations[0].status !== 'succeeded'
+    );
+    const worker = createWorker(operationRepository, {
+        timer,
+        operationMaterializer: materializeInstallOperation,
+        candidateService: {
+            async buildCandidate({ plan }) {
+                return { operationId: plan.operationId, content: '{}' };
+            },
+        },
+        secretResolver: async () => ({ psk: 'in-memory-only', users: [] }),
+        afterInstallSucceeded: async () => {
+            hookStarted.resolve();
+            await finishHook.promise;
+        },
+        lockService: {
+            async acquire() { return { ok: true }; },
+            async renew() { return { ok: true }; },
+            async release(request) { releases.push(request); return { ok: true }; },
+        },
+        executor: { async executeStep() {} },
+    });
+
+    const run = worker.runOnce();
+    await hookStarted.promise;
+    await timer.tick();
+    finishHook.resolve();
+    const result = await run;
+
+    assert.equal(result.status, 'succeeded');
+    assert.equal(operationRepository.calls.filter(call => call.method === 'succeedClaimed').length, 1);
+    assert.deepEqual(releases, [], 'late heartbeat loss must suppress explicit release');
+    assert.equal(timer.activeCount(), 0);
 });
 
 test('rechecks the lease at the actual terminal time after reconciliation or finalization', async t => {
@@ -2209,8 +2290,8 @@ test('reconciliation failure cannot mark success and rolls back the verified ins
     assert.equal(rollback.error.message, 'Failed to reconcile verified L2TP state');
     assert.ok(events.findIndex(event => event.method === 'reconcile')
         < events.findIndex(event => event.method === 'rollback'));
-    assert.ok(events.findIndex(event => event.method === 'rollback')
-        < events.findIndex(event => event.method === 'release'));
+    assert.equal(events.some(event => event.method === 'release'), false,
+        'rolled_back is not proof that earlier remote work stopped');
     assert.doesNotMatch(JSON.stringify({ result, events }), new RegExp(leakedFailure));
 });
 

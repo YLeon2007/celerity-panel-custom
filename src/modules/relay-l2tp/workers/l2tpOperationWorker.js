@@ -478,6 +478,7 @@ class L2tpOperationWorker {
             stopped: true,
             errorCode: heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED',
         });
+        let verifiedTerminalSuccess = false;
 
         try {
             let executionSteps = preparedInstallPlan?.steps
@@ -848,6 +849,7 @@ class L2tpOperationWorker {
                 },
             });
             if (succeeded !== true) return leaseLostResult();
+            verifiedTerminalSuccess = true;
 
             // The install may have advanced the topology revision (route-group
             // paths rebuilt for the relay). Queue a topology deploy right away
@@ -862,11 +864,16 @@ class L2tpOperationWorker {
             return { claimed: true, operationId, status: 'succeeded' };
         } finally {
             await heartbeat.stop();
-            await this.lockService.release({
-                node: operation.node,
-                owner: this.workerId,
-                operationId,
-            });
+            // Failure/rollback or lost renewal cannot prove earlier remote work ended.
+            // Retaining this lock is only a local mitigation: expiry may still allow
+            // another operation to acquire it while the remote command remains live.
+            if (verifiedTerminalSuccess && !heartbeat.getError()) {
+                await this.lockService.release({
+                    node: operation.node,
+                    owner: this.workerId,
+                    operationId,
+                });
+            }
             this.executor.releaseOperation?.(operation);
         }
     }
