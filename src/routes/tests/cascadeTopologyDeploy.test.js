@@ -517,6 +517,74 @@ test('deployment API rejects non-versioned or command-shaped requests before the
     assert.deepEqual(serviceCalls, []);
 });
 
+test('deployment API maps replacement reservation from the pinned coordinator to safe 409 for full and scoped requests', async () => {
+    const linkId = '507f1f77bcf86cd799439011';
+    const operationId = '507f1f77bcf86cd799439021';
+    const headers = { 'x-test-auth': 'api-write' };
+    for (const scope of [{}, { linkId }, { domainLinkId: linkId }]) {
+        let pinCalls = 0;
+        let materializeCalls = 0;
+        let createCalls = 0;
+        const coordinator = new TopologyOperationCoordinator({
+            topologyRepository: { async pinTopology({ expectedRevision }) {
+                pinCalls += 1;
+                assert.equal(expectedRevision, 7);
+                const error = new Error('reservation token=private-pin-secret');
+                error.code = 'TOPOLOGY_REPLACEMENT_RESERVED';
+                error.token = 'private-pin-secret';
+                error.body = { password: 'private-body-secret' };
+                error.diagnostic = 'private-diagnostic-secret';
+                throw error;
+            } },
+            planMaterializer: { async materialize() { materializeCalls += 1; } },
+            operationRepository: { async createFrozen() { createCalls += 1; } },
+            idFactory: () => operationId,
+        });
+        const router = createCascadeTopologyDeployRouter({
+            models: { CascadeLink: { find() { return { select() { return { lean: async () => [
+                { _id: linkId, portalNode: 'p', bridgeNode: 'b', active: true, status: 'deployed' },
+            ] }; } }; } } },
+            topologyDeploymentService: coordinator,
+            ...guardHarness([]),
+        });
+        const response = await request(router, {
+            body: { expectedTopologyRevision: 7, ...scope }, headers,
+        });
+        assert.equal(response.status, 409, JSON.stringify(scope));
+        assert.deepEqual(response.body, {
+            error: {
+                code: 'TOPOLOGY_REPLACEMENT_RESERVED',
+                message: 'A topology replacement owns the deployment pin fence',
+            },
+            operationId,
+            expectedTopologyRevision: 7,
+        });
+        assert.doesNotMatch(JSON.stringify(response.body), /token|body|password|diagnostic|private|queued|kind/i);
+        assert.equal(pinCalls, 1);
+        assert.equal(materializeCalls, 0);
+        assert.equal(createCalls, 0);
+    }
+});
+
+test('deployment API keeps unknown service errors generic 500', async () => {
+    const router = createCascadeTopologyDeployRouter({
+        topologyDeploymentService: { async deploy() {
+            const error = new Error('password=private-secret');
+            error.code = 'UNEXPECTED_BACKEND_ERROR';
+            error.token = 'private-token';
+            throw error;
+        } },
+        routeLogger: { error(message) { assert.equal(message, '[Cascade Topology Deploy API] INTERNAL_ERROR'); } },
+        ...guardHarness([]),
+    });
+    const response = await request(router, { headers: { 'x-test-auth': 'api-write' } });
+    assert.equal(response.status, 500);
+    assert.deepEqual(response.body, {
+        error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
+    });
+    assert.doesNotMatch(JSON.stringify(response.body), /private|password|token|UNEXPECTED_BACKEND_ERROR/);
+});
+
 test('deployment API maps stale revisions safely without leaking deployment internals', async () => {
     const calls = [];
     const router = createCascadeTopologyDeployRouter({
