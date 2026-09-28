@@ -3,17 +3,16 @@
 // Keeps the L2TP auto route-group paths in sync with the live cascade graph.
 // Deleting a link strips the paths that used it (draft mutation), and without
 // this hook the group stayed empty until a full L2TP reinstall — silently
-// stranding every L2TP client (fail-closed block). Maintenance may populate
-// an empty owned path from a confirmed, client-ready chain. A nonempty
-// installed path is never switched here: replacement needs separate ingress
-// preparation and atomic finalization, even when the new links look deployed.
+// stranding every L2TP client (fail-closed block). Maintenance cannot change
+// any installed group's owned path, including an absent or empty entry:
+// replacement needs separate ingress preparation and atomic finalization,
+// even when the new links look deployed.
 //
 // Safety contract:
 // - Only active deployed/online suffixes reaching a bridge-role node are
-//   eligible. A delete/recreate gap or partial/unconfirmed chain defers the
-//   update: no empty, partial or pending path is ever written.
-// - The write populates only the recorded path key owned by this relay;
-//   paths of other relays sharing the group are preserved.
+//   considered. A delete/recreate gap or partial/unconfirmed chain defers the
+//   update; even a complete chain cannot prove group-specific ingress readiness.
+// - Other relays' paths in a shared group are never changed.
 // - RelayL2tpState, the route group identity and PPP credentials are never
 //   touched — the group update sets `paths` and nothing else.
 
@@ -159,11 +158,12 @@ async function maintainAutoL2tpPaths({
                     .filter((path, index) => !ownedIndexes.includes(index) || index === ownedIndexes[0]);
             if (samePaths(existingPaths, wanted)) continue;
 
-            // A confirmed link alone does not prove that replacement ingress
-            // was prepared. Only the dedicated replacement operation can
-            // atomically switch an installed, nonempty path to different hops.
-            // Keep the old route even if its links vanished from the draft.
-            if (ownedIndexes.length && existingPaths[ownedIndexes[0]].linkIds?.length) {
+            // A confirmed link alone does not prove group-specific ingress is
+            // prepared, even if the owned entry is absent or empty. No separate
+            // ingress-readiness evidence is available to maintenance today.
+            // Keep the transactional writer/CAS fenced for a future proof path.
+            const ingressPrepared = false;
+            if (!ingressPrepared) {
                 logger?.warn?.(`[L2TP] auto path rebuild deferred for relay ${relayId}: replacement requires prepared ingress`);
                 deferred.push({ relayNode: relayId, routeGroup: groupId, reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' });
                 continue;

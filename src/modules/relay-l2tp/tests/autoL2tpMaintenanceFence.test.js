@@ -76,21 +76,28 @@ test('held replacement reservation prevents maintenance group path and revision 
     assert.equal(f.state.revision, 7);
 });
 
-test('reservation racing after snapshot makes CAS fail and rolls back group path', async () => {
-    const f = fixture({ beforeCas: state => { state.replacementReservation = { ownerToken: 'racer', epoch: 2 }; } });
-    await assert.rejects(maintainAutoL2tpPaths(f.models), { code: 'TOPOLOGY_MAINTENANCE_CONFLICT' });
-    assert.equal(f.groupWrites, 1, 'group path was staged before the failed CAS');
-    assert.equal(f.casCount, 1);
+test('unprepared installed path never stages a write or reaches the CAS', async () => {
+    const f = fixture({ beforeCas: () => { throw new Error('CAS must not run without a group write'); } });
+    const result = await maintainAutoL2tpPaths(f.models);
+    assert.deepEqual(result, {
+        updated: 0,
+        deferred: [{ relayNode: 'relay-1', routeGroup: 'group-a', reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' }],
+        revision: null,
+    });
+    assert.equal(f.groupWrites, 0);
+    assert.equal(f.casCount, 0);
     assert.deepEqual(f.group.paths.map(path => path.linkIds), [['foreign-link'], []]);
     assert.equal(f.state.revision, 7);
 });
 
-test('a concurrent topology revision change rolls back the staged maintenance path', async () => {
-    const f = fixture({ beforeCas: state => { state.revision += 1; } });
-    await assert.rejects(maintainAutoL2tpPaths(f.models), { code: 'TOPOLOGY_MAINTENANCE_CONFLICT' });
-    assert.equal(f.groupWrites, 1);
-    assert.deepEqual(f.group.paths.map(path => path.linkIds), [['foreign-link'], []]);
-    assert.equal(f.state.revision, 8, 'only the external revision change survives');
+test('already-correct installed path is a no-op without group or revision writes', async () => {
+    const f = fixture({ existingPath: ['new-link'] });
+    const result = await maintainAutoL2tpPaths(f.models);
+    assert.deepEqual(result, { updated: 0, deferred: [], revision: null });
+    assert.equal(f.groupWrites, 0);
+    assert.equal(f.casCount, 0);
+    assert.deepEqual(f.group.paths.map(path => path.linkIds), [['foreign-link'], ['new-link']]);
+    assert.equal(f.state.revision, 7);
 });
 
 test('missing transactional connection fails closed before any maintenance read or write', async () => {
@@ -101,13 +108,16 @@ test('missing transactional connection fails closed before any maintenance read 
     assert.equal(f.casCount, 0);
 });
 
-test('successful maintenance commits only owned path and one revision, then no-ops', async () => {
+test('repeated unprepared maintenance does not acquire a revision or publish owned path', async () => {
     const f = fixture();
     const result = await maintainAutoL2tpPaths(f.models);
-    assert.deepEqual(result, { updated: 1, deferred: [], revision: 8 });
-    assert.deepEqual(f.group.paths.map(path => path.linkIds), [['foreign-link'], ['new-link']]);
-    assert.equal(f.state.revision, 8);
+    const deferred = [{ relayNode: 'relay-1', routeGroup: 'group-a', reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' }];
+    assert.deepEqual(result, { updated: 0, deferred, revision: null });
+    assert.deepEqual(f.group.paths.map(path => path.linkIds), [['foreign-link'], []]);
+    assert.equal(f.state.revision, 7);
     const again = await maintainAutoL2tpPaths(f.models);
-    assert.deepEqual(again, { updated: 0, deferred: [], revision: null });
-    assert.equal(f.casCount, 1);
+    assert.deepEqual(again, { updated: 0, deferred, revision: null });
+    assert.equal(f.groupWrites, 0);
+    assert.equal(f.casCount, 0);
+    assert.equal(f.state.revision, 7);
 });

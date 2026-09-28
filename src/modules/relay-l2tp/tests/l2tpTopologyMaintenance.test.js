@@ -99,17 +99,17 @@ function maintenanceModels({ links, groupPaths }) {
     });
 }
 
-test('maintenance rebuilds the auto-l2tp path after link topology changed', async () => {
+test('maintenance defers an absent installed path after link topology changed', async () => {
     const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const models = maintenanceModels({ links, groupPaths: [] });
 
     const result = await maintainAutoL2tpPaths(models);
 
-    assert.equal(result.updated, 1);
-    assert.equal(models.writes.length, 1);
-    assert.deepEqual(models.writes[0].update.$set.paths, [
-        { pathKey: 'main', linkIds: ['l-new'], priority: 1, enabled: true },
-    ]);
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.equal(result.revision, null);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
 });
 
 test('maintenance leaves an already-correct path untouched', async () => {
@@ -250,6 +250,47 @@ for (const status of ['deployed', 'online']) {
     });
 }
 
+test('installed relay with absent owned key defers deployed link without prepared ingress', async () => {
+    const foreign = { pathKey: 'foreign', linkIds: ['l-foreign'], priority: 7, enabled: true };
+    const group = { _id: 'group-a', paths: [foreign] };
+    const models = maintenanceHarness({
+        links: [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }],
+        states: [installedState('relay-1', 'group-a')],
+        groups: { 'group-a': group },
+    });
+
+    const result = await maintainAutoL2tpPaths(models);
+    assert.deepEqual(result, {
+        updated: 0,
+        deferred: [{ relayNode: 'relay-1', routeGroup: 'group-a', reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' }],
+        revision: null,
+    });
+    assert.deepEqual(group.paths, [foreign]);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
+});
+
+test('installed relay with empty legacy owned entry defers online link without prepared ingress', async () => {
+    const foreign = { pathKey: 'foreign', linkIds: ['l-foreign'], priority: 7, enabled: true };
+    const empty = { pathKey: 'main', linkIds: [], priority: 1, enabled: true };
+    const group = { _id: 'group-a', paths: [foreign, empty] };
+    const models = maintenanceHarness({
+        links: [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' }],
+        states: [installedState('relay-1', 'group-a')],
+        groups: { 'group-a': group },
+    });
+
+    const result = await maintainAutoL2tpPaths(models);
+    assert.deepEqual(result, {
+        updated: 0,
+        deferred: [{ relayNode: 'relay-1', routeGroup: 'group-a', reason: 'REPLACEMENT_REQUIRES_PREPARED_INGRESS' }],
+        revision: null,
+    });
+    assert.deepEqual(group.paths, [foreign, empty]);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
+});
+
 for (const [label, link] of [
     ['disabled', { status: 'deployed', active: false }],
     ['errored', { status: 'error', active: true }],
@@ -314,7 +355,7 @@ test('a valid installed path remains a no-op alongside a pending branch', async 
     assert.equal(models.topologyUpdates.length, 0);
 });
 
-test('maintenance never publishes an empty path during a delete/recreate gap', async () => {
+test('maintenance defers an absent installed path during a delete/recreate gap', async () => {
     const group = { _id: 'group-a', paths: [] };
     const states = [installedState('relay-1', 'group-a')];
     const warnings = [];
@@ -322,8 +363,8 @@ test('maintenance never publishes an empty path during a delete/recreate gap', a
 
     // Gap: the only downstream link was deleted and the draft stripped the
     // group path. The old behaviour wrote paths: [] — an explicit empty
-    // publish. The maintenance hook must instead defer and leave the group
-    // untouched until a complete replacement suffix exists.
+    // publish. The maintenance hook must defer both the gap and unprepared
+    // recreated suffix, leaving the installed group's path untouched.
     const gap = maintenanceHarness({ links: [], states, groups: { 'group-a': group } });
     const gapResult = await maintainAutoL2tpPaths({ ...gap, logger });
     assert.equal(gapResult.updated, 0);
@@ -334,23 +375,25 @@ test('maintenance never publishes an empty path during a delete/recreate gap', a
     assert.equal(gapResult.deferred[0].reason, 'CHAIN_INCOMPLETE');
     assert.equal(gap.topologyUpdates.length, 0, 'no topology revision bump without a write');
 
-    // Recreate: a fresh link with a new id completes the suffix to a bridge.
+    // Recreate: a fresh link reaches a bridge, but ingress preparation for
+    // this route group is still unproven.
     const links = [{ _id: 'l-new', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'deployed' }];
     const healed = maintenanceHarness({ links, states, groups: { 'group-a': group } });
     const healedResult = await maintainAutoL2tpPaths({ ...healed, logger });
-    assert.equal(healedResult.updated, 1);
-    assert.equal(healedResult.deferred.length, 0);
-    assert.deepEqual(group.paths, [
-        { pathKey: 'main', linkIds: ['l-new'], priority: 1, enabled: true },
-    ]);
-    assert.equal(healedResult.revision, 113, 'post-maintenance topology revision is returned');
-    assert.equal(healed.topologyUpdates[0].options?.new, true);
+    assert.equal(healedResult.updated, 0);
+    assert.equal(healedResult.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.deepEqual(group.paths, []);
+    assert.equal(healedResult.revision, null);
+    assert.equal(healed.writes.length, 0);
+    assert.equal(healed.topologyUpdates.length, 0);
 
-    // Idempotent: a second pass over the same desired state changes nothing.
+    // A second pass still defers; it cannot infer ingress readiness from time.
     const again = maintenanceHarness({ links, states, groups: { 'group-a': group } });
     const againResult = await maintainAutoL2tpPaths({ ...again, logger });
     assert.equal(againResult.updated, 0);
+    assert.equal(againResult.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
     assert.equal(again.writes.length, 0);
+    assert.equal(again.topologyUpdates.length, 0);
     assert.equal(againResult.revision, null);
 });
 
@@ -394,9 +437,9 @@ test('maintenance leaves a nonempty installed path alone after a link changes re
     ]);
 });
 
-test('maintenance rebuilds only the relay-owned path and preserves other relays in a shared group', async () => {
+test('maintenance defers absent relay-owned path and preserves other relays in a shared group', async () => {
     // Two installed L2TP relays share one route group; relay-2's path is
-    // already correct while relay-1 needs a rebuild after a link recreate.
+    // already correct while relay-1 lacks a path after a link recreate.
     // Link ids are listed in adverse order (relay-2's link first).
     const links = [
         { _id: 'l2', portalNode: 'relay-2', bridgeNode: 'bridge-2', status: 'online' },
@@ -414,12 +457,15 @@ test('maintenance rebuilds only the relay-owned path and preserves other relays 
 
     const result = await maintainAutoL2tpPaths({ ...models, logger: { warn: () => {}, info: () => {} } });
 
-    assert.equal(result.updated, 1, 'only relay-1 needed a path write');
-    assert.equal(models.writes.length, 1);
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.relayNode, 'relay-1');
+    assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.equal(result.revision, null);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
     assert.deepEqual(group.paths, [
         { pathKey: 'main-relay-2', linkIds: ['l2'], priority: 1, enabled: true },
-        { pathKey: 'main-relay-1', linkIds: ['l1'], priority: 1, enabled: true },
-    ], 'the foreign relay path must survive the rebuild');
+    ], 'the foreign relay path must remain unchanged');
 });
 
 test('maintenance refuses a shared route group with duplicate relay path keys', async () => {
@@ -442,7 +488,7 @@ test('maintenance refuses a shared route group with duplicate relay path keys', 
     assert.deepEqual(group.paths, [{ pathKey: 'main', linkIds: ['l2'], priority: 1, enabled: true }]);
 });
 
-test('maintenance keeps geo branch links out of the published default path', async () => {
+test('maintenance defers an unprepared default path even with a geo branch', async () => {
     const links = [
         { _id: 'l-geo', portalNode: 'relay-1', bridgeNode: 'bridge-2', geoRouting: { enabled: true }, status: 'online' },
         { _id: 'l-main', portalNode: 'relay-1', bridgeNode: 'bridge-1', status: 'online' },
@@ -456,8 +502,12 @@ test('maintenance keeps geo branch links out of the published default path', asy
 
     const result = await maintainAutoL2tpPaths({ ...models, logger: { warn: () => {}, info: () => {} } });
 
-    assert.equal(result.updated, 1);
-    assert.deepEqual(group.paths[0].linkIds, ['l-main']);
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.deepEqual(group.paths, []);
+    assert.equal(result.revision, null);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
 });
 
 test('maintenance with a geo-only downstream defers instead of publishing the geo path', async () => {
@@ -500,13 +550,11 @@ test('maintenance never mutates relay L2TP state or credentials', async () => {
 
     const result = await maintainAutoL2tpPaths({ ...models, logger: { warn: () => {}, info: () => {} } });
 
-    assert.equal(result.updated, 1);
-    assert.equal(models.writes.length, 1);
-    assert.deepEqual(
-        Object.keys(models.writes[0].update.$set),
-        ['paths'],
-        'the route group write touches only paths — name/mode/strategy stay stable',
-    );
+    assert.equal(result.updated, 0);
+    assert.equal(result.deferred[0]?.reason, 'REPLACEMENT_REQUIRES_PREPARED_INGRESS');
+    assert.equal(result.revision, null);
+    assert.equal(models.writes.length, 0);
+    assert.equal(models.topologyUpdates.length, 0);
 });
 
 const L2TP_INBOUND = {
