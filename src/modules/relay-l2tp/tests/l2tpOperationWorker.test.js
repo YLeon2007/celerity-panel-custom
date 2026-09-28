@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const { materializeInstallOperation } = require('../services/l2tpOperationMaterializer');
+const { L2tpOperationRepository } = require('../services/l2tpOperationRepository');
 const { L2tpRemoteExecutor } = require('../services/l2tpRemoteExecutor');
 const { buildInstallPlan, INSTALL_STEP_TYPES } = require('../services/l2tpProvisionPlanService');
 const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
@@ -1129,6 +1130,54 @@ test('runOnce reports idle when no queued operation can be claimed', async () =>
             now: NOW,
         },
     }]);
+});
+
+test('runOnce does not redispatch SSH for a competing expired-running operation', async () => {
+    const operation = {
+        _id: 'competing-operation',
+        node: 'relay-1',
+        kind: 'uninstall',
+        status: 'running',
+        leaseOwner: 'worker-still-executing',
+        leaseUntil: new Date(NOW.getTime() - 1),
+        attempts: 1,
+        plan: { steps: [{ type: 'verify' }] },
+    };
+    const original = { ...operation };
+    const model = {
+        async findOneAndUpdate(query, update) {
+            const matches = candidate => {
+                if (candidate.$or) return candidate.$or.some(matches);
+                return (candidate.status === undefined || candidate.status === operation.status)
+                    && (candidate.leaseUntil === undefined
+                        || operation.leaseUntil <= candidate.leaseUntil.$lte);
+            };
+            if (!matches(query)) return null;
+            Object.assign(operation, update.$set);
+            operation.attempts += update.$inc.attempts;
+            return operation;
+        },
+        async updateOne() { return { matchedCount: 1 }; },
+    };
+    const sshCalls = [];
+    const lockCalls = [];
+    const worker = createWorker(new L2tpOperationRepository({ model }), {
+        executor: {
+            async executeStep(request) { sshCalls.push(request); },
+        },
+        lockService: {
+            async acquire(request) {
+                lockCalls.push(request);
+                return { ok: true };
+            },
+            async release() { return { ok: true }; },
+        },
+    });
+
+    assert.deepEqual(await worker.runOnce(), { claimed: false });
+    assert.deepEqual(sshCalls, []);
+    assert.deepEqual(lockCalls, []);
+    assert.deepEqual(operation, original);
 });
 
 test('runOnce refuses to succeed a plan without a verify step', async () => {

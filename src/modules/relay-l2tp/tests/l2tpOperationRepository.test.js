@@ -54,7 +54,7 @@ function createCasModel(operation) {
     };
 }
 
-test('claimNext query excludes running operations with unexpired foreign leases', async () => {
+test('claimNext query excludes every running operation, including expired leases', async () => {
     const claimedOperation = { _id: 'operation-1', status: 'running' };
     const model = createModel(claimedOperation);
     const repository = new L2tpOperationRepository({ model });
@@ -66,15 +66,7 @@ test('claimNext query excludes running operations with unexpired foreign leases'
     });
 
     assert.equal(result, claimedOperation);
-    assert.deepEqual(model.calls[0].query, {
-        $or: [
-            { status: 'queued' },
-            {
-                status: 'running',
-                leaseUntil: { $lte: NOW },
-            },
-        ],
-    });
+    assert.deepEqual(model.calls[0].query, { status: 'queued' });
 });
 
 test('claimNext starts a deterministic lease and returns the claimed operation', async () => {

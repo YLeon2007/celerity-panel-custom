@@ -8,15 +8,9 @@ class L2tpOperationRepository {
     async claimNext({ owner, leaseMs, now }) {
         const leaseUntil = new Date(now.getTime() + leaseMs);
 
-        return this.model.findOneAndUpdate({
-            $or: [
-                { status: 'queued' },
-                {
-                    status: 'running',
-                    leaseUntil: { $lte: now },
-                },
-            ],
-        }, {
+        // An expired running lease does not prove its SSH process has stopped.
+        // Leave it quarantined for authoritative remote reconciliation.
+        return this.model.findOneAndUpdate({ status: 'queued' }, {
             $set: {
                 status: 'running',
                 leaseOwner: owner,
