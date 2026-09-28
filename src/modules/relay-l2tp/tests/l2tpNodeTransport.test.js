@@ -701,6 +701,49 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
     }
 });
 
+test('uploadRootFile acknowledges only an explicit zero SSH exit code', async t => {
+    const secret = 'upload-exit-code-secret';
+    const responses = [
+        { label: 'no code', value: { stdout: secret, stderr: secret } },
+        { label: 'null', value: null },
+        { label: 'undefined code', value: { code: undefined, stdout: secret, stderr: secret } },
+        { label: 'nonzero code', value: { code: 73, stdout: secret, stderr: secret } },
+        { label: 'string zero', value: { code: '0', stdout: secret, stderr: secret } },
+        { label: 'zero code', value: { code: 0, stdout: '', stderr: '' }, succeeds: true },
+    ];
+    for (const { label, value, succeeds } of responses) {
+        await t.test(label, async () => {
+            const nodeSSH = createNodeSSHFacade(value);
+            const transport = new L2tpNodeTransport({ nodeSSH });
+            const upload = transport.uploadRootFile({
+                operationId: 'operation-exit-code',
+                type: 'desired',
+                path: 'desired.json',
+                content: secret,
+                owner: 'root',
+                group: 'root',
+                mode: 0o600,
+            });
+            if (succeeds) {
+                assert.deepEqual(await upload, {
+                    ok: true,
+                    path: '/var/lib/celerity/l2tp/operations/operation-exit-code/desired.json',
+                });
+            } else {
+                await assert.rejects(upload, error => {
+                    assert.equal(error.name, 'L2tpNodeTransportError');
+                    assert.equal(error.code, 'REMOTE_UPLOAD_FAILED');
+                    assert.equal(error.message, 'Failed to upload an L2TP operation artifact');
+                    assert.equal(Object.hasOwn(error, 'cause'), false);
+                    assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+                    return true;
+                });
+            }
+            assert.equal(nodeSSH.calls.length, 1);
+        });
+    }
+});
+
 test('sanitizes rejected and nonzero artifact runner failures', async () => {
     const secret = 'runner-transport-secret';
     const facades = [
@@ -728,6 +771,40 @@ test('sanitizes rejected and nonzero artifact runner failures', async () => {
                 return true;
             },
         );
+    }
+});
+
+test('ordinary artifact commands including commit acknowledge only explicit zero SSH exit', async t => {
+    const secret = 'runner-exit-code-secret';
+    const responses = [
+        { label: 'no code', value: { stdout: secret, stderr: secret } },
+        { label: 'null', value: null },
+        { label: 'undefined code', value: { code: undefined, stdout: secret, stderr: secret } },
+        { label: 'nonzero code', value: { code: 70, stdout: secret, stderr: secret } },
+        { label: 'string zero', value: { code: '0', stdout: secret, stderr: secret } },
+        { label: 'zero code', value: { code: 0, stdout: '', stderr: '' }, succeeds: true },
+    ];
+    for (const command of ['verify', 'commit']) {
+        for (const { label, value, succeeds } of responses) {
+            await t.test(`${command}: ${label}`, async () => {
+                const nodeSSH = createNodeSSHFacade(value);
+                const transport = new L2tpNodeTransport({ nodeSSH });
+                const run = transport.runArtifactCommand({ operationId: 'operation-exit-code', command });
+                if (succeeds) {
+                    assert.deepEqual(await run, { ok: true, operationId: 'operation-exit-code', command });
+                } else {
+                    await assert.rejects(run, error => {
+                        assert.equal(error.name, 'L2tpNodeTransportError');
+                        assert.equal(error.code, 'REMOTE_COMMAND_FAILED');
+                        assert.equal(error.message, 'Failed to run an L2TP artifact command');
+                        assert.equal(Object.hasOwn(error, 'cause'), false);
+                        assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+                        return true;
+                    });
+                }
+                assert.equal(nodeSSH.calls.length, 1);
+            });
+        }
     }
 });
 

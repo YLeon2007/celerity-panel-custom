@@ -263,8 +263,8 @@ function extractRunnerErrorCode(result) {
 }
 
 function assertSuccessfulExec(result) {
-    if (result && Object.hasOwn(result, 'code') && result.code !== 0) {
-        throw new Error('Remote command returned nonzero');
+    if (!result || result.code !== 0) {
+        throw new Error('Remote command did not return a successful exit code');
     }
 }
 
