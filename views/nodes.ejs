@@ -602,7 +602,7 @@ function nodeMetaFor(node) {
                 <div class="form-actions">
                     <label class="form-checkbox" style="margin-right:auto">
                         <input type="checkbox" name="autoDeploy" checked>
-                        <span><%= t('network.autoDeploy') %></span>
+                        <span id="linkAutoDeployLabel"><%= t('network.autoDeploy') %></span>
                     </label>
                     <button type="button" class="btn" id="modalCancel"><%= t('common.cancel') %></button>
                     <button type="submit" class="btn btn-primary" id="linkModalSubmit"><i class="ti ti-plus"></i> <%= t('network.createLink') %></button>
@@ -1233,6 +1233,9 @@ window._networkI18n = {
     undeploySuccess: <%- JSON.stringify(t('network.undeploySuccess')) %>,
     edit: <%- JSON.stringify(t('common.edit')) %>,
     save: <%- JSON.stringify(t('common.save')) %>,
+    autoDeploy: <%- JSON.stringify(t('network.autoDeploy')) %>,
+    deployAfterEdit: <%- JSON.stringify(t('network.deployAfterEdit')) %>,
+    saveAndDeploy: <%- JSON.stringify(t('network.saveAndDeploy')) %>,
     terminal: <%- JSON.stringify(t('nodes.terminal')) %>,
     sshNotConfigured: <%- JSON.stringify(t('nodes.sshNotConfigured')) %>,
     nodes: <%- JSON.stringify(t('network.nodes')) %>,

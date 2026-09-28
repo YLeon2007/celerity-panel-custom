@@ -1503,6 +1503,8 @@
     "realityShortIds": "Short IDs",
     "realityFingerprint": "指纹",
     "autoDeploy": "自动部署",
+    "deployAfterEdit": "保存后部署此链路",
+    "saveAndDeploy": "保存并部署",
     "advancedOptions": "高级选项",
     "priority": "优先级",
     "tunnelDomain": "隧道域名",

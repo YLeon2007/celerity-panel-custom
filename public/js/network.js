@@ -218,6 +218,7 @@
         document.getElementById('modalClose').addEventListener('click', closeModal);
         document.getElementById('modalCancel').addEventListener('click', closeModal);
         document.getElementById('addLinkForm').addEventListener('submit', onAddLinkSubmit);
+        document.querySelector('#addLinkForm [name="autoDeploy"]')?.addEventListener('change', updateLinkSubmitIntent);
 
         // Mode switcher
         initModeSwitcher('modeSwitcher', 'linkModeInput', 'modeHint');
@@ -957,6 +958,19 @@
 
     // ==================== ADD LINK MODAL ====================
 
+    function updateLinkSubmitIntent() {
+        const edit = linkModalMode === 'edit';
+        const form = document.getElementById('addLinkForm');
+        const label = document.getElementById('linkAutoDeployLabel');
+        const submit = document.getElementById('linkModalSubmit');
+        if (label) label.textContent = edit
+            ? (i18n.deployAfterEdit || 'Deploy this link after saving')
+            : (i18n.autoDeploy || 'Auto Deploy');
+        if (submit) submit.textContent = edit
+            ? (form.autoDeploy.checked ? (i18n.saveAndDeploy || 'Save & Deploy') : (i18n.save || 'Save'))
+            : (i18n.createLink || 'Create');
+    }
+
     function ensureFingerprintOption(select, value) {
         if (!select) return;
         const exists = Array.prototype.some.call(select.options, o => o.value === value);
@@ -982,6 +996,8 @@
         if (title) title.textContent = i18n.addLink || 'Add Link';
         if (submit) submit.textContent = i18n.createLink || 'Create';
         if (linkIdInput) linkIdInput.value = '';
+        document.getElementById('addLinkForm').autoDeploy.checked = true;
+        updateLinkSubmitIntent();
         // A brand-new link starts from the Random REALITY fingerprint, even if
         // the form still carries an injected option from a previous edit.
         var createFp = document.querySelector('#addLinkForm [name="realityFingerprint"]');
@@ -1042,7 +1058,9 @@
         form.muxEnabled.checked = !!link.muxEnabled;
         form.muxConcurrency.value = link.muxConcurrency || 8;
         form.priority.value = link.priority || 100;
+        // The saved preference is metadata, not consent to deploy on this edit.
         form.autoDeploy.checked = false;
+        updateLinkSubmitIntent();
 
         form.realityDest.value = link.realityDest || '';
         form.realitySni.value = Array.isArray(link.realitySni) ? link.realitySni.join(', ') : (link.realitySni || '');
@@ -1089,6 +1107,7 @@
         document.getElementById('addLinkModal').classList.remove('active');
         document.getElementById('addLinkForm').reset();
         linkModalMode = 'create';
+        updateLinkSubmitIntent();
         var title = document.getElementById('linkModalTitle');
         if (title) title.textContent = i18n.addLink || 'Add Link';
         var submit = document.getElementById('linkModalSubmit');
@@ -1120,7 +1139,7 @@
         if (domGroup) domGroup.style.display = '';
     }
 
-    function handleCreatedLinkAutoDeploy(snapshot, optedIn) {
+    function handleLinkAutoDeploy(snapshot, optedIn) {
         if (!optedIn) return;
         const operation = snapshot?.autoDeployOperation;
         if (operation?.status === 'queued' && operation.operationId) {
@@ -1128,7 +1147,7 @@
             showToast(deployResultMessage(operation));
             return;
         }
-        // Creating a draft is not evidence of physical deployment. In
+        // Saving a draft is not evidence of physical deployment. In
         // particular, never fall back to an unscoped full-topology deploy.
         const cause = snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus;
         showToast((i18n.deployFailed || 'Failed') + ': '
@@ -1150,7 +1169,10 @@
             tunnelProtocol: form.tunnelProtocol.value,
             tunnelTransport:form.tunnelTransport.value,
             tunnelSecurity: form.tunnelSecurity.value,
-            autoDeploy:     form.autoDeploy?.checked || false,
+            // PUT true is an activation command. Omit it on ordinary edits,
+            // regardless of the link's persisted autoDeploy preference.
+            autoDeploy:     linkId ? (form.autoDeploy?.checked ? true : undefined)
+                : !!form.autoDeploy?.checked,
             muxEnabled:     form.muxEnabled?.checked || false,
             muxConcurrency: parseInt(form.muxConcurrency?.value) || 8,
             priority:       parseInt(form.priority?.value) || 100,
@@ -1199,16 +1221,18 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data),
             });
-            const createdSnapshot = await handleDraftMutationResponse(res);
-            if (!createdSnapshot) return;
+            const savedSnapshot = await handleDraftMutationResponse(res);
+            if (!savedSnapshot) return;
             closeModal();
             await loadTopology();
-            if (!linkId) handleCreatedLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
+            handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {
             btn.disabled = false;
-            btn.innerHTML = (linkId ? '' : '<i class="ti ti-plus"></i> ') + (linkId ? (i18n.save || 'Save') : (i18n.createLink || 'Create'));
+            btn.innerHTML = (linkId ? '' : '<i class="ti ti-plus"></i> ') + (linkId
+                ? (data.autoDeploy === true ? (i18n.saveAndDeploy || 'Save & Deploy') : (i18n.save || 'Save'))
+                : (i18n.createLink || 'Create'));
         }
     }
 
@@ -1601,7 +1625,7 @@
             if (!createdSnapshot) return;
             closeQuickModal();
             await loadTopology();
-            handleCreatedLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
+            handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);
         } catch (err) {
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally {

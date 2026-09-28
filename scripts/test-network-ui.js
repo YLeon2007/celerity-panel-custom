@@ -137,7 +137,7 @@ for (const [start, end] of [
     assert(slice, `missing create handler ${start}`);
     assert(!slice.includes('await deployTopology()'),
         `${start} must not silently deploy unrelated active/pending links`);
-    assert(slice.includes('handleCreatedLinkAutoDeploy('),
+    assert(slice.includes('handleLinkAutoDeploy('),
         `${start} must consume only the scoped operation returned by create`);
 }
 assert(networkJs.includes('snapshot?.autoDeployOperation'),
