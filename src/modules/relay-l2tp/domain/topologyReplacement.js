@@ -157,6 +157,12 @@ function deriveReplacementTopology(snapshot, request) {
             }
         }
     }
+    if (![...connected].some(id => {
+        const node = nodesById.get(id);
+        return (node?.cascadeRole ?? node?.role) === 'portal';
+    })) {
+        fail('INCOMPLETE_PATH', 'The installed relay-root path requires a confirmed upstream portal');
+    }
     for (const link of snapshot.links) {
         if (link.active === false || link.status !== 'pending' || entityId(link) === request.newLinkId) continue;
         // Unrelated upstream drafts (for example a second portal entering the

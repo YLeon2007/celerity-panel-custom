@@ -93,15 +93,46 @@ test('installed L2TP relay-root path excludes unrelated upstream pending portal'
     input.snapshot.groups[0].paths.pop();
     input.snapshot.nodes[0].cascadeRole = 'relay';
     input.snapshot.installedRouteOwners = [{ groupId: 'group', nodeId: 'portal' }];
+    input.snapshot.nodes.push({ _id: 'ingress', cascadeRole: 'portal' });
     input.snapshot.nodes.push({ _id: 'portal2', cascadeRole: 'portal' });
+    input.snapshot.links.push({ _id: 'entrance', portalNode: 'ingress', bridgeNode: 'portal',
+        mode: 'reverse', active: true, status: 'deployed' });
     input.snapshot.links.push({ _id: 'pending-portal2', portalNode: 'portal2', bridgeNode: 'portal',
         mode: 'reverse', active: true, status: 'pending' });
     const { topology, compiled } = derive(input);
     assert.equal(validateTopology(topology).valid, true);
     assert.equal(compiled.valid, true);
-    assert.deepEqual(topology.links.map(link => link.id), ['new', 'upstream']);
+    assert.deepEqual(topology.links.map(link => link.id), ['entrance', 'new', 'upstream']);
     assert.deepEqual(topology.groups[0].paths[0].linkIds, ['upstream', 'new']);
+    const nodeMetadata = topology.nodes.map((node, i) => ({
+        id: node.id, role: node.role, type: 'xray', active: true,
+        ip: `192.0.2.${i + 1}`, domain: `${node.id}.example.test`, port: 24000 + i,
+        xray: { apiPort: 61000 + i, inboundTag: `client-${node.id}`, transport: 'tcp', security: 'none' },
+    }));
+    const linkMetadata = topology.links.map((link, i) => ({
+        id: link.id, source: link.source, target: link.target, mode: link.mode,
+        tunnelPort: 12000 + i, tunnelUuid: `uuid-${link.id}`, tunnelDomain: 'reverse.example.test',
+        tunnelProtocol: 'vless', tunnelSecurity: 'none', tunnelTransport: 'tcp',
+    }));
+    const plan = composeFrozenTopologyDeploymentPlan({ snapshot: topology, compiledTopology: compiled,
+        nodeMetadata, linkMetadata });
+    assert.equal(plan.nodes.length, 4);
+    const owner = plan.nodes.find(node => node.nodeRef === 'relay-1');
+    const ownerConfig = JSON.parse(Buffer.from(owner.candidate.bytes).toString('utf8'));
+    assert(ownerConfig.inbounds.some(inbound => inbound.tag === cascadePathIngressTag('main')),
+        JSON.stringify({ role: owner.role, ingressPorts: owner.checks?.filter(x => x.port).map(x => x.port),
+            nodes: topology.nodes, paths: topology.groups[0].paths,
+            tags: ownerConfig.inbounds.map(inbound => inbound.tag) }));
+    assert(!JSON.stringify(plan.nodes).includes('uuid-pending-portal2'));
     assert.equal(input.snapshot.links.at(-1).status, 'pending');
+});
+
+test('relay-root replacement without any confirmed upstream portal fails before queue', () => {
+    const input = fixture();
+    input.snapshot.groups[0].paths.pop();
+    input.snapshot.nodes[0].cascadeRole = 'relay';
+    input.snapshot.installedRouteOwners = [{ groupId: 'group', nodeId: 'portal' }];
+    expectRejected(input, 'INCOMPLETE_PATH');
 });
 
 test('relay-root replacement requires the installed L2TP owner on that relay', () => {
