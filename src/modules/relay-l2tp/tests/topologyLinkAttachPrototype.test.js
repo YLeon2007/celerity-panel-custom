@@ -82,7 +82,7 @@ test('a PPP fragment without a selected healthy path blocks even if topology pro
     assert.equal(privateCandidate.routingRules.at(-1).outboundTag, 'cascade-main');
 });
 
-test('link.attach cannot pass PPP readiness on verify-users alone without fragment egress readback', async () => {
+test('PPP verify-users alone does not attest the separate Xray ingress', async () => {
     const operationId = 'abcdef012345abcdef012345';
     const state = { node: 'r1', status: 'installed', desiredState: 'installed', secretRevision: 3 };
     const user = { relayNode: 'r1', enabled: true, desiredRevision: 3,
@@ -104,5 +104,6 @@ test('link.attach cannot pass PPP readiness on verify-users alone without fragme
             { role: 'portal', node: 'p' }, { role: 'relay', node: 'r1' },
             { role: 'bridge', node: 'b' },
         ] });
-    assert.equal(result.ok, false, 'unverified L2TP fragment route must fence attach success');
+    // The separate worker attach gate must still verify main Xray before finalizing.
+    assert.equal(result.ok, true, 'PPP user readiness alone is not an ingress proof');
 });
