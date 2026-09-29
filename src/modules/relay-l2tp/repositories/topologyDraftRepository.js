@@ -25,7 +25,7 @@ const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
 const NODE_SELECT = '_id cascadeRole';
 const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
-const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey';
+const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey appliedTopologyRevision secretRevision';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation';
 
 class TopologyDraftRepositoryError extends Error {
@@ -157,6 +157,12 @@ class TopologyDraftRepository {
                     groupId: relayState.routeGroup,
                     nodeId: relayState.node,
                     pathKey: relayState.activePathKey,
+                    ...(relayState.appliedTopologyRevision !== undefined ? {
+                        ownerTopologyRevision: relayState.appliedTopologyRevision,
+                    } : {}),
+                    ...(relayState.secretRevision !== undefined ? {
+                        ownerCredentialRevision: relayState.secretRevision,
+                    } : {}),
                 })),
         };
     }

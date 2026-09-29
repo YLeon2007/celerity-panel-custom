@@ -151,18 +151,21 @@ test('draft snapshot projects the installed L2TP owner active path without chang
     const trace = [];
     const models = createModels(trace, { id: 'read-session' });
     models.RelayL2tpState.find = () => queryResult([
-        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed', activePathKey: 'main' },
+        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed', activePathKey: 'main', appliedTopologyRevision: 111, secretRevision: 4 },
         { routeGroup: 'queued-group', node: 'queued-relay', status: 'queued', desiredState: 'installed', activePathKey: 'queued-path' },
     ], trace, 'states');
     const snapshot = await new TopologyDraftRepository(models).readDraft();
     assert.deepEqual(snapshot.activeRouteGroupIds, ['installed-group', 'queued-group']);
     assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
     assert.deepEqual(snapshot.installedRouteOwners,
-        [{ groupId: 'installed-group', nodeId: 'owner-relay', pathKey: 'main' }]);
+        [{ groupId: 'installed-group', nodeId: 'owner-relay', pathKey: 'main',
+            ownerTopologyRevision: 111, ownerCredentialRevision: 4 }]);
     const selected = trace.find(entry => entry.label === 'states.select').paths.split(/\s+/);
     assert(selected.includes('node'));
     assert(selected.includes('status'));
     assert(selected.includes('activePathKey'));
+    assert(selected.includes('appliedTopologyRevision'));
+    assert(selected.includes('secretRevision'));
 });
 
 test('missing installed owner active path stays missing instead of inventing main', async () => {
