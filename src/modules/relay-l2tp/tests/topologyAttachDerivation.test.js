@@ -78,6 +78,18 @@ test('R1 and R2 each receive the group-specific ingress listener in the private 
     }
 });
 
+test('accepts mixed forward/reverse per-link modes in the installed-owner chain', () => {
+    const snapshot = fixture();
+    snapshot.links[0].mode = 'forward';
+    snapshot.links[1].mode = 'reverse';
+    snapshot.links[2].mode = 'forward';
+    const result = deriveAttachTopology(snapshot, request);
+    assert.equal(result.compiled.valid, true);
+    assert.deepEqual(result.topology.links.map(link => link.mode),
+        ['forward', 'reverse', 'forward']);
+    assert.deepEqual(result.topology.groups[0].paths[0].linkIds, ['r1r2', 'r2b']);
+});
+
 test('accepts an existing empty owned path without changing the persisted path', () => {
     const snapshot = fixture();
     snapshot.groups[0].paths = [{ pathKey: 'main', linkIds: [], priority: 4, enabled: true }];

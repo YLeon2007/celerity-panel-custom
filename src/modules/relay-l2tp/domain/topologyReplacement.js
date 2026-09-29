@@ -332,7 +332,8 @@ function deriveAttachTopology(snapshot, request) {
         fail('AMBIGUOUS_CHAIN', 'Attach chain repeats a link');
     }
     for (const link of chain) {
-        if (link.mode !== group.mode) fail('REPLACEMENT_METADATA_MISMATCH', 'Attach link mode differs from its group');
+        // Link direction is per edge. Legacy route-group mode is not a
+        // whole-chain constraint: forward and reverse hops may coexist.
         if (entityId(link) === request.linkId ? link.status !== 'pending' : !APPLIED.has(link.status)) {
             fail('UNCONFIRMED_BASELINE', 'Only the requested final hop may be pending');
         }
