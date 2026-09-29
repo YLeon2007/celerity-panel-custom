@@ -17,7 +17,7 @@ const snapshot = {
     groups: [{ _id: 'group', mode: 'reverse', strategy: 'priority-failover', paths: [
         { pathKey: 'main', linkIds: ['upstream', 'old'], priority: 1, enabled: true },
     ] }],
-    activeRouteGroupIds: ['group'],
+    activeRouteGroupIds: ['group'], installedRouteGroupIds: ['group'],
 };
 
 test('queues a frozen replacement without mutating the installed path', async () => {
@@ -64,6 +64,31 @@ test('queues a frozen replacement without mutating the installed path', async ()
     assert.equal(frozen.pathKey,'main');
     assert.deepEqual(frozen.oldPathLinkIds, ['upstream', 'old']);
     assert.equal(frozen.heldTopologyAdmission,true);
+});
+
+test('replacement idempotency never acknowledges a different old path for the same new link', async () => {
+    let admissions = 0;
+    const session = { inTransaction: () => true };
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: { async admitTopology({ prepare, admit }) {
+            admissions += 1;
+            const prepared = await prepare(structuredClone(snapshot), session);
+            await admit({ revision: 7, deployedRevision: 5, ...prepared }, session);
+            return { revision: 7, deployedRevision: 5, ...prepared };
+        } },
+        planMaterializer: { async materialize() { return { nodes: [] }; } },
+        operationRepository: { async createFrozen() {} },
+        validator: () => ({ valid: true }),
+        idFactory: () => 'replacement-op',
+    });
+    const scope = { kind: 'link.replace', linkId: 'new',
+        linkIds: ['upstream', 'new'], oldLinkId: 'old',
+        groupId: 'group', pathKey: 'main' };
+    await coordinator.queue({ expectedTopologyRevision: 7, scope });
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7,
+        scope: { ...scope, pathKey: 'nonexistent' } }),
+    error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT');
+    assert.equal(admissions, 2);
 });
 
 test('durable replacement identity requires distinct source and target links', async () => {

@@ -142,7 +142,22 @@ test('reads the transactional topology snapshot without parallel session operati
         links: [],
         groups: [],
         activeRouteGroupIds: [],
+        installedRouteGroupIds: [],
     });
+});
+
+test('draft snapshot distinguishes installed L2TP groups from queued desired groups', async () => {
+    const trace = [];
+    const models = createModels(trace, { id: 'read-session' });
+    models.RelayL2tpState.find = () => queryResult([
+        { routeGroup: 'installed-group', status: 'installed' },
+        { routeGroup: 'queued-group', status: 'queued', desiredState: 'installed' },
+    ], trace, 'states');
+    const snapshot = await new TopologyDraftRepository(models).readDraft();
+    assert.deepEqual(snapshot.activeRouteGroupIds, ['installed-group', 'queued-group']);
+    assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
+    assert(trace.find(entry => entry.label === 'states.select')
+        .paths.split(/\s+/).includes('status'));
 });
 
 test('pinned link snapshot selects status for scoped pending-link guard', async () => {

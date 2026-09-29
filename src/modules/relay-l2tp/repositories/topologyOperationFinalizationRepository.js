@@ -93,7 +93,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
 
 class TopologyOperationFinalizationRepository {
     constructor({ TopologyOperation, CascadeTopologyState, CascadeLink,
-        CascadeRouteGroup, transactionRunner } = {}) {
+        CascadeRouteGroup, RelayL2tpState, transactionRunner } = {}) {
         if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function'
             || typeof TopologyOperation.findById !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
@@ -110,6 +110,7 @@ class TopologyOperationFinalizationRepository {
         this.CascadeTopologyState = CascadeTopologyState;
         this.CascadeLink = CascadeLink || null;
         this.CascadeRouteGroup = CascadeRouteGroup || null;
+        this.RelayL2tpState = RelayL2tpState || null;
         this.transactionRunner = runTransaction;
     }
 
@@ -158,7 +159,11 @@ class TopologyOperationFinalizationRepository {
                 if (scope && typeof this.CascadeLink?.updateMany !== 'function') rejectFinalization();
                 if (scope?.kind === 'link.replace'
                     && (!releasesAdmission || typeof this.CascadeRouteGroup?.updateOne !== 'function'
-                        || typeof this.CascadeLink?.updateOne !== 'function')) rejectFinalization();
+                        || typeof this.CascadeLink?.updateOne !== 'function'
+                        || typeof this.RelayL2tpState?.updateOne !== 'function'
+                        || (this.RelayL2tpState.db && this.RelayL2tpState.db !== this.CascadeTopologyState.db))) {
+                    rejectFinalization();
+                }
                 const topology = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton',
                     revision: topologyRevision,
@@ -179,6 +184,14 @@ class TopologyOperationFinalizationRepository {
                 if (topology?.matchedCount !== 1) rejectFinalization();
 
                 if (scope?.kind === 'link.replace') {
+                    // Write the installed owner's document in this transaction;
+                    // a concurrent L2TP uninstall/update must conflict rather
+                    // than slipping past a snapshot-only status read.
+                    const installed = await this.RelayL2tpState.updateOne({
+                        routeGroup: scope.groupId, status: 'installed',
+                        desiredState: 'installed',
+                    }, { $inc: { replacementFence: 1 } }, { session });
+                    if (installed?.matchedCount !== 1) rejectFinalization();
                     // The positional update changes one path, not the entire
                     // group. Match the exact installed sequence frozen at queue
                     // time; no partial or foreign path can become the new route.

@@ -43,6 +43,7 @@ function pathIds(path) {
 function deriveReplacementTopology(snapshot, request) {
     if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.links)
         || !Array.isArray(snapshot.groups) || !Array.isArray(snapshot.activeRouteGroupIds)
+        || !Array.isArray(snapshot.installedRouteGroupIds)
         || !request || typeof request !== 'object'
         || !['groupId', 'pathKey', 'oldLinkId', 'newLinkId'].every(key =>
             typeof request[key] === 'string' && request[key].length > 0)
@@ -64,7 +65,8 @@ function deriveReplacementTopology(snapshot, request) {
             fail('INVALID_FOREIGN_PATH', 'Every route group must have well-formed paths');
         }
     }
-    if (!group || !activeGroups.includes(request.groupId)) {
+    if (!group || !activeGroups.includes(request.groupId)
+        || !snapshot.installedRouteGroupIds.map(entityId).includes(request.groupId)) {
         fail('GROUP_NOT_INSTALLED', 'Replacement requires an installed route group');
     }
     if (!Array.isArray(group.paths)) fail('INCOMPLETE_PATH', 'The installed route group has no paths');

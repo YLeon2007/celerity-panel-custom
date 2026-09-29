@@ -63,6 +63,9 @@ const relayL2tpStateSchema = new mongoose.Schema({
         },
         default: null,
     },
+    // Transactional fence: cutover writes the installed L2TP owner so a
+    // concurrent state transition cannot commit unseen by the replacement.
+    replacementFence: { type: Number, default: 0 },
     appliedTopologyRevision: { type: Number, default: null },
     activePathKey: { type: String, default: '' },
 

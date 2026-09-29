@@ -445,6 +445,11 @@ class TopologyOperationCoordinator {
         // collapsed with (or satisfied by) a legacy full-sync operation.
         const idempotencyKey = scope
             ? `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}:${scope.kind}:${scope.linkId}`
+                + (scope.kind === 'link.replace'
+                    ? `:${createHash('sha256').update(JSON.stringify({
+                        groupId: scope.groupId, pathKey: scope.pathKey,
+                        oldLinkId: scope.oldLinkId, linkIds: scope.linkIds,
+                    })).digest('hex')}` : '')
             : `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
         const existing = this.operationsByIdempotencyKey.get(idempotencyKey);
         if (existing) {

@@ -518,7 +518,8 @@ test('an explicit domain.sync keeps the legacy global commit semantics', async (
     assert.deepEqual(linkCalls.map(call => call.filter), [{ active: true }]);
 });
 
-function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'], newStatus = 'pending' } = {}) {
+function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'],
+    newStatus = 'pending', relayStatus = 'installed' } = {}) {
     const h = createHarness({ operation: { heldTopologyAdmission: true },
         topology: { topologyAdmissionCount: 1, revision } });
     const group = { paths: [{ pathKey: 'main', linkIds: [...pathIds], enabled: true }] };
@@ -541,6 +542,16 @@ function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'], newSt
                 || filter.paths.$elemMatch.pathKey !== 'main') return { matchedCount: 0 };
             group.paths[0].linkIds = clone(update.$set['paths.$.linkIds']);
             return { matchedCount: 1 };
+        },
+    };
+    h.repository.RelayL2tpState = {
+        async updateOne(filter, update, options) {
+            assert.equal(filter.routeGroup, 'group');
+            assert.equal(filter.status, 'installed');
+            assert.equal(filter.desiredState, 'installed');
+            assert.deepEqual(update, { $inc: { replacementFence: 1 } });
+            assert.strictEqual(options.session, SESSION);
+            return { matchedCount: relayStatus === 'installed' ? 1 : 0 };
         },
     };
     h.repository.CascadeLink = {
@@ -591,10 +602,12 @@ test('verified replacement atomically swaps its path and retires only the old li
     assert.equal(h.store.topology.deployedRevision, 5);
     assert.equal(h.store.topology.topologyAdmissionCount, 0);
     assert.equal(h.store.operation.status, 'succeeded');
+    assert.deepEqual(pppSnapshot, pppBefore);
     assert.equal(await repository.finalizeSucceeded(request()), null);
 });
 
 for (const scenario of [
+    { name: 'L2TP group no longer installed', options: { relayStatus: 'queued' } },
     { name: 'stale topology revision', options: { revision: 8 } },
     { name: 'changed installed path', options: { pathIds: ['upstream', 'unrelated'] } },
     { name: 'new link already changed', options: { newStatus: 'offline' } },

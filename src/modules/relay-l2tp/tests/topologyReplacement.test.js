@@ -27,7 +27,8 @@ function fixture() {
         { pathKey: 'backup', linkIds: ['upstream', 'old'], priority: 2, enabled: false },
     ] }];
     return {
-        snapshot: { nodes, links, groups, activeRouteGroupIds: ['group'] },
+        snapshot: { nodes, links, groups, activeRouteGroupIds: ['group'],
+            installedRouteGroupIds: ['group'] },
         request: { groupId: 'group', pathKey: 'main', oldLinkId: 'old', newLinkId: 'new' },
     };
 }
@@ -84,6 +85,14 @@ test('effective graph composes a relay SOCKS ingress that routes to the new link
     assert(config.routing.rules.some(rule => rule.inboundTag?.includes(tag)
         && rule.outboundTag === 'portal-down-link-2'));
     assert(!JSON.stringify(config).includes('uuid-old'));
+});
+
+test('replacement never treats a queued L2TP group as installed', () => {
+    const input = fixture();
+    input.snapshot.groups[0].paths.pop();
+    input.snapshot.installedRouteGroupIds = [];
+    assert.throws(() => deriveReplacementTopology(input.snapshot, input.request),
+        { code: 'GROUP_NOT_INSTALLED' });
 });
 
 test('rejects incomplete installed path and endpoint mismatch', () => {
