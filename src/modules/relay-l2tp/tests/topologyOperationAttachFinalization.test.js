@@ -12,7 +12,8 @@ const INPUT = { operationId: 'op', owner: 'worker', leaseUntil: LEASE,
     topologyRevision: 7, priorDeployedRevision: 5 };
 const SCOPE = { kind: 'link.attach', groupId: 'group', pathKey: 'main',
     ownerNodeId: 'r1', ownerTopologyRevision: 5, ownerCredentialRevision: 11,
-    linkId: 'r2-bridge', linkIds: ['r1-r2', 'r2-bridge'] };
+    linkId: 'r2-bridge', linkIds: ['r2-bridge', 'p1-r1', 'r1-r2'],
+    newPathLinkIds: ['r1-r2', 'r2-bridge'] };
 
 function harness(changes = {}) {
     const state = {
@@ -26,9 +27,12 @@ function harness(changes = {}) {
             desiredState: 'installed', activePathKey: 'main',
             appliedTopologyRevision: 5, secretRevision: 11, replacementFence: 0,
             ...changes.owner },
-        links: [{ _id: 'r1-r2', active: true, status: 'staged' },
-            { _id: 'r2-bridge', active: true, status: 'pending' },
-            { _id: 'foreign', active: true, status: 'pending' }].map(link => ({
+        links: (changes.linkRows || [
+            { _id: 'p1-r1', portalNode: 'p1', bridgeNode: 'r1', active: true, status: 'staged' },
+            { _id: 'r1-r2', portalNode: 'r1', bridgeNode: 'r2', active: true, status: 'staged' },
+            { _id: 'r2-bridge', portalNode: 'r2', bridgeNode: 'bridge', active: true, status: 'pending' },
+            { _id: 'foreign', portalNode: 'other', bridgeNode: 'elsewhere', active: true, status: 'pending' },
+        ]).map(link => ({
                 ...link, ...(changes.links?.[link._id] || {}),
             })),
         users: [{ desiredRevision: 11, appliedRevision: 11, login: 'user' }],
@@ -78,7 +82,13 @@ function harness(changes = {}) {
     const RelayL2tpState = { db, async updateOne(filter, change, options) {
         return update('owner', state.owner, filter, change, options);
     } };
-    const CascadeLink = { db, async updateMany(filter, change, options) {
+    const CascadeLink = { db,
+        find(filter) { return {
+            select() { return this; },
+            session(session) { assert.strictEqual(session, SESSION); return this; },
+            async lean() { return structuredClone(state.links.filter(link => filter._id.$in.includes(link._id))); },
+        }; },
+        async updateMany(filter, change, options) {
         assert.strictEqual(options.session, SESSION);
         calls.push({ model: 'links', filter, change });
         const selected = state.links.filter(link => filter._id.$in.includes(link._id)
@@ -112,7 +122,7 @@ test('attach publishes no path until the terminal finalizer; then atomically pub
         deployedRevision: 5, finishedAt: NOW });
     assert.deepEqual(h.state.group.paths, [{ pathKey: 'main',
         linkIds: ['r1-r2', 'r2-bridge'], enabled: true, priority: 1 }]);
-    assert.deepEqual(h.state.links.map(l => l.status), ['deployed', 'deployed', 'pending']);
+    assert.deepEqual(h.state.links.map(l => l.status), ['deployed', 'deployed', 'deployed', 'pending']);
     assert.equal(h.state.operation.status, 'succeeded');
     assert.equal(h.state.operation.heldTopologyAdmission, false);
     assert.equal(h.state.topology.topologyAdmissionCount, 0);
@@ -122,6 +132,41 @@ test('attach publishes no path until the terminal finalizer; then atomically pub
     const snapshot = structuredClone(h.state);
     assert.equal(await h.finalizer.finalizeSucceeded(INPUT), null);
     assert.deepEqual(h.state, snapshot, 'replay cannot publish or release again');
+});
+
+test('lexically shuffled ObjectIds publish only the owner downstream suffix, activating the entire scoped chain', async () => {
+    const id = n => n.toString(16).padStart(24, '0');
+    const upstream = id(90), first = id(20), terminal = id(10);
+    const owner = id(80), relay = id(60);
+    const makeHarness = (operation = {}) => harness({
+        operation: { ownerNodeId: owner, linkId: terminal,
+            linkIds: [terminal, first, upstream], newPathLinkIds: [first, terminal],
+            ...operation },
+        owner: { node: owner },
+        linkRows: [
+            { _id: upstream, portalNode: id(70), bridgeNode: owner, active: true, status: 'staged' },
+            { _id: first, portalNode: owner, bridgeNode: relay, active: true, status: 'staged' },
+            { _id: terminal, portalNode: relay, bridgeNode: id(50), active: true, status: 'pending' },
+            { _id: id(99), portalNode: id(30), bridgeNode: id(40), active: true, status: 'pending' },
+        ],
+    });
+    const h = makeHarness();
+    assert.equal((await h.finalizer.finalizeSucceeded(INPUT))?.operationId, 'op');
+    assert.deepEqual(h.state.group.paths[0].linkIds, [first, terminal]);
+    assert.deepEqual(h.state.links.map(link => link.status), ['deployed', 'deployed', 'deployed', 'pending']);
+    assert.deepEqual(h.calls.filter(call => call.model === 'links').map(call => call.filter._id.$in),
+        [[terminal], [first, upstream]]);
+    for (const [name, operation] of [
+        ['spurious scoped link', { linkIds: [terminal, first, upstream, id(99)] }],
+        ['duplicate scoped link', { linkIds: [terminal, first, first, upstream] }],
+        ['wrong suffix order', { newPathLinkIds: [terminal, first] }],
+        ['duplicate suffix', { newPathLinkIds: [first, first, terminal] }],
+    ]) {
+        const invalid = makeHarness(operation);
+        const before = structuredClone(invalid.state);
+        assert.equal(await invalid.finalizer.finalizeSucceeded(INPUT), null, name);
+        assert.deepEqual(invalid.state, before, `${name} cannot publish or release admission`);
+    }
 });
 
 for (const [name, change] of [
@@ -144,8 +189,18 @@ for (const [name, change] of [
     ['missing owner dependency', { missingOwner: true }],
     ['changed new suffix', { links: { 'r2-bridge': { status: 'offline' } } }],
     ['changed staged prefix', { links: { 'r1-r2': { status: 'pending' } } }],
-    ['missing suffix link', { operation: { linkIds: ['r2-bridge'] } }],
-    ['duplicate prefix link', { operation: { linkIds: ['r1-r2', 'r1-r2', 'r2-bridge'] } }],
+    ['missing suffix link', { operation: { linkIds: ['p1-r1', 'r2-bridge'] } }],
+    ['duplicate prefix link', { operation: { linkIds: ['p1-r1', 'r1-r2', 'r1-r2', 'r2-bridge'] } }],
+    ['missing durable suffix', { operation: { newPathLinkIds: undefined } }],
+    ['duplicate suffix', { operation: { newPathLinkIds: ['r1-r2', 'r1-r2', 'r2-bridge'] } }],
+    ['wrong suffix order', { operation: { newPathLinkIds: ['r2-bridge', 'r1-r2'] } }],
+    ['spurious scoped link', { operation: { linkIds: ['p1-r1', 'r1-r2', 'r2-bridge', 'foreign'] } }],
+    ['spurious suffix link', { operation: { linkIds: ['p1-r1', 'r1-r2', 'r2-bridge', 'foreign'], newPathLinkIds: ['foreign', 'r2-bridge'] } }],
+    ['disconnected suffix', { links: { 'r1-r2': { portalNode: 'other' } } }],
+    ['wrong suffix adjacency', { links: { 'r2-bridge': { portalNode: 'other' } } }],
+    ['cyclic suffix', { links: { 'r2-bridge': { bridgeNode: 'r1' } } }],
+    ['upstream loops into suffix', { links: { 'p1-r1': { portalNode: 'r2' } } }],
+    ['disconnected scoped prefix', { links: { 'p1-r1': { bridgeNode: 'other' } } }],
     ['different path identity', { operation: { pathKey: 'fallback' } }],
     ['fake old link', { operation: { oldLinkId: 'old' } }],
     ['missing topology pin', { operation: { ownerTopologyRevision: undefined } }],
@@ -178,15 +233,23 @@ test('finalizer rejects a falsely global attach result at the wrapper boundary',
     assert.equal(await finalizer.finalizeSucceeded(INPUT), null);
 });
 
-test('attach schema accepts exact suffix identity without oldLinkId and rejects missing owner revision pin', async () => {
+test('attach schema accepts unordered scoped links and an ordered suffix without oldLinkId', async () => {
     const Model = require('../models/topologyOperationModel');
     const id = n => n.toString(16).padStart(24, '0');
     const fields = { topologyRevision: 7, priorDeployedRevision: 5,
-        status: 'queued', kind: 'link.attach', linkId: id(2), linkIds: [id(1), id(2)],
+        status: 'queued', kind: 'link.attach', linkId: id(1),
+        linkIds: [id(1), id(3), id(2)], newPathLinkIds: [id(2), id(1)],
         groupId: id(3), pathKey: 'main', ownerNodeId: id(4),
         ownerTopologyRevision: 5, ownerCredentialRevision: 11 };
     const valid = new Model(fields);
     await valid.validate();
     assert.equal(valid.oldLinkId, undefined);
     await assert.rejects(new Model({ ...fields, ownerCredentialRevision: undefined }).validate());
+    for (const change of [
+        { newPathLinkIds: undefined }, { newPathLinkIds: [id(2)] },
+        { newPathLinkIds: [id(2), id(2), id(1)] },
+        { newPathLinkIds: [id(1), id(2)] },
+        { newPathLinkIds: [id(5), id(1)] },
+        { linkIds: [id(1), id(3)] },
+    ]) await assert.rejects(new Model({ ...fields, ...change }).validate());
 });

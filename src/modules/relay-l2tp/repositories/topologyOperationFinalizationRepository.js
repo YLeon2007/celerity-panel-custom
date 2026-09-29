@@ -45,10 +45,52 @@ function rejectFinalization() {
     throw FINALIZATION_REJECTED;
 }
 
+async function verifyAttachChain(CascadeLink, scope, session) {
+    // Validate the frozen identity against the actual edges in the same
+    // transaction as publication. The scoped set has no route order of its own.
+    const edges = await CascadeLink.find({ _id: { $in: scope.linkIds } })
+        .select('_id portalNode bridgeNode').session(session).lean();
+    if (!Array.isArray(edges) || edges.length !== scope.linkIds.length) rejectFinalization();
+    const byId = new Map(edges.map(edge => [String(edge._id), edge]));
+    if (byId.size !== scope.linkIds.length) rejectFinalization();
+    const prefixIds = scope.linkIds.filter(id => !scope.newPathLinkIds.includes(id));
+    if (!prefixIds.length) rejectFinalization();
+    let node = scope.ownerNodeId;
+    const suffixNodes = new Set([node]);
+    for (const id of scope.newPathLinkIds) {
+        const edge = byId.get(id);
+        if (!edge || String(edge.portalNode) !== node || !edge.bridgeNode
+            || suffixNodes.has(String(edge.bridgeNode))) rejectFinalization();
+        node = String(edge.bridgeNode);
+        suffixNodes.add(node);
+    }
+    // Every other scoped edge must form one unbranched upstream path into
+    // the installed owner, with no unrelated or cyclic edge accepted.
+    const byTarget = new Map();
+    for (const id of prefixIds) {
+        const edge = byId.get(id);
+        if (!edge?.portalNode || !edge.bridgeNode) rejectFinalization();
+        const target = String(edge.bridgeNode);
+        if (byTarget.has(target) || String(edge.portalNode) === target) rejectFinalization();
+        byTarget.set(target, edge);
+    }
+    node = scope.ownerNodeId;
+    const seen = new Set();
+    while (byTarget.has(node)) {
+        const edge = byTarget.get(node);
+        const id = String(edge._id);
+        if (seen.has(id)) rejectFinalization();
+        seen.add(id);
+        node = String(edge.portalNode);
+        if (suffixNodes.has(node)) rejectFinalization();
+    }
+    if (seen.size !== prefixIds.length) rejectFinalization();
+}
+
 async function loadOperationScope(TopologyOperation, operationId, session) {
     if (typeof TopologyOperation.findById !== 'function') return null;
     const operation = await TopologyOperation.findById(operationId)
-        .select('kind linkId linkIds staged oldLinkId groupId pathKey ownerNodeId oldPathLinkIds ownerTopologyRevision ownerCredentialRevision')
+        .select('kind linkId linkIds newPathLinkIds staged oldLinkId groupId pathKey ownerNodeId oldPathLinkIds ownerTopologyRevision ownerCredentialRevision')
         .session(session)
         .lean();
     if (!operation) return { invalid: true };
@@ -59,6 +101,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
             && operation.ownerNodeId === undefined && operation.oldPathLinkIds === undefined
             && operation.ownerTopologyRevision === undefined
             && operation.ownerCredentialRevision === undefined
+            && operation.newPathLinkIds === undefined
             ? null : { invalid: true };
     }
     if (!SCOPED_OPERATION_KINDS.has(operation.kind)
@@ -76,12 +119,17 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
                 || operation.pathKey !== 'main'
                 || !['groupId', 'ownerNodeId'].every(key =>
                     typeof operation[key] === 'string' && operation[key].length > 0)
-                || operation.linkIds.length < 2
-                || operation.linkIds.at(-1) !== operation.linkId
+                || !Array.isArray(operation.newPathLinkIds)
+                || operation.newPathLinkIds.length < 2
+                || operation.newPathLinkIds.length >= operation.linkIds.length
+                || new Set(operation.newPathLinkIds).size !== operation.newPathLinkIds.length
+                || operation.newPathLinkIds.at(-1) !== operation.linkId
+                || !operation.newPathLinkIds.every(id => operation.linkIds.includes(id))
                 || !validRevision(operation.ownerTopologyRevision)
                 || !validRevision(operation.ownerCredentialRevision)
             : operation.ownerTopologyRevision !== undefined
-                || operation.ownerCredentialRevision !== undefined)
+                || operation.ownerCredentialRevision !== undefined
+                || operation.newPathLinkIds !== undefined)
         || (operation.kind === 'link.replace'
             ? !['oldLinkId', 'groupId', 'pathKey', 'ownerNodeId'].every(key =>
                 typeof operation[key] === 'string' && operation[key].length > 0)
@@ -109,6 +157,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
             ownerNodeId: operation.ownerNodeId,
             ownerTopologyRevision: operation.ownerTopologyRevision,
             ownerCredentialRevision: operation.ownerCredentialRevision,
+            newPathLinkIds: [...operation.newPathLinkIds],
         } : {}),
     };
 }
@@ -188,6 +237,7 @@ class TopologyOperationFinalizationRepository {
                 }
                 if (scope?.kind === 'link.attach'
                     && (!releasesAdmission || typeof this.CascadeRouteGroup?.updateOne !== 'function'
+                        || typeof this.CascadeLink?.find !== 'function'
                         || typeof this.RelayL2tpState?.updateOne !== 'function'
                         || (this.CascadeRouteGroup.db && this.CascadeRouteGroup.db !== this.CascadeTopologyState.db)
                         || (this.RelayL2tpState.db && this.RelayL2tpState.db !== this.CascadeTopologyState.db)
@@ -257,6 +307,7 @@ class TopologyOperationFinalizationRepository {
                 }
 
                 if (scope?.kind === 'link.attach') {
+                    await verifyAttachChain(this.CascadeLink, scope, session);
                     // A user edit reserves a new secretRevision on this same
                     // owner document. Writing the fence forces a transaction
                     // conflict with concurrent user or L2TP state changes.
@@ -273,7 +324,7 @@ class TopologyOperationFinalizationRepository {
                     const group = await this.CascadeRouteGroup.updateOne({
                         _id: scope.groupId, paths: [],
                     }, { $set: { paths: [{ pathKey: scope.pathKey,
-                        linkIds: scope.linkIds, priority: 1, enabled: true }] } },
+                        linkIds: scope.newPathLinkIds, priority: 1, enabled: true }] } },
                     { runValidators: true, session });
                     if (group?.matchedCount !== 1) rejectFinalization();
                     const suffix = await this.CascadeLink.updateMany({
@@ -281,7 +332,7 @@ class TopologyOperationFinalizationRepository {
                         status: { $in: ['pending'] },
                     }, { $set: { status: 'deployed' } }, { runValidators: true, session });
                     if (suffix?.matchedCount !== 1) rejectFinalization();
-                    const baseline = scope.linkIds.slice(0, -1);
+                    const baseline = scope.linkIds.filter(id => id !== scope.linkId);
                     const prefix = await this.CascadeLink.updateMany({
                         _id: { $in: baseline }, active: true,
                         status: { $in: ['deployed', 'online', 'staged'] },

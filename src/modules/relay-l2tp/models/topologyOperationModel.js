@@ -117,6 +117,8 @@ const topologyOperationSchema = new mongoose.Schema({
     kind: { type: String, enum: ['link.apply', 'domain.reconcile', 'link.replace', 'link.attach'] },
     linkId: { type: String, match: /^[a-f0-9]{24}$/i },
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
+    // Ordered route beginning at the installed owner; linkIds is the full scoped set.
+    newPathLinkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     oldLinkId: { type: String, match: /^[a-f0-9]{24}$/i },
     groupId: { type: String, match: /^[a-f0-9]{24}$/i },
     pathKey: { type: String, trim: true },
@@ -148,7 +150,7 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
         || this.oldLinkId !== undefined || this.groupId !== undefined
         || this.pathKey !== undefined || this.oldPathLinkIds !== undefined
         || this.ownerNodeId !== undefined || this.ownerTopologyRevision !== undefined
-        || this.ownerCredentialRevision !== undefined;
+        || this.ownerCredentialRevision !== undefined || this.newPathLinkIds !== undefined;
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
@@ -161,13 +163,19 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
                 || typeof this.groupId !== 'string' || !this.groupId
                 || this.pathKey !== 'main'
                 || typeof this.ownerNodeId !== 'string' || !this.ownerNodeId
-                || ids.length < 2 || ids.at(-1) !== this.linkId
+                || !Array.isArray(this.newPathLinkIds)
+                || this.newPathLinkIds.length < 2
+                || this.newPathLinkIds.length >= ids.length
+                || new Set(this.newPathLinkIds).size !== this.newPathLinkIds.length
+                || this.newPathLinkIds.at(-1) !== this.linkId
+                || !this.newPathLinkIds.every(id => ids.includes(id))
                 || !Number.isSafeInteger(this.ownerTopologyRevision)
                 || this.ownerTopologyRevision < 0
                 || !Number.isSafeInteger(this.ownerCredentialRevision)
                 || this.ownerCredentialRevision < 0
             : this.ownerTopologyRevision !== undefined
-                || this.ownerCredentialRevision !== undefined)
+                || this.ownerCredentialRevision !== undefined
+                || this.newPathLinkIds !== undefined)
         || (this.kind === 'link.replace'
             ? typeof this.oldLinkId !== 'string' || this.oldLinkId === this.linkId
                 || ids.includes(this.oldLinkId) || typeof this.groupId !== 'string'
