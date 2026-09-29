@@ -143,6 +143,7 @@ test('reads the transactional topology snapshot without parallel session operati
         groups: [],
         activeRouteGroupIds: [],
         installedRouteGroupIds: [],
+        installedRouteOwners: [],
     });
 });
 
@@ -150,12 +151,16 @@ test('draft snapshot distinguishes installed L2TP groups from queued desired gro
     const trace = [];
     const models = createModels(trace, { id: 'read-session' });
     models.RelayL2tpState.find = () => queryResult([
-        { routeGroup: 'installed-group', status: 'installed' },
-        { routeGroup: 'queued-group', status: 'queued', desiredState: 'installed' },
+        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed' },
+        { routeGroup: 'queued-group', node: 'queued-relay', status: 'queued', desiredState: 'installed' },
     ], trace, 'states');
     const snapshot = await new TopologyDraftRepository(models).readDraft();
     assert.deepEqual(snapshot.activeRouteGroupIds, ['installed-group', 'queued-group']);
     assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
+    assert.deepEqual(snapshot.installedRouteOwners,
+        [{ groupId: 'installed-group', nodeId: 'owner-relay' }]);
+    assert(trace.find(entry => entry.label === 'states.select')
+        .paths.split(/\s+/).includes('node'));
     assert(trace.find(entry => entry.label === 'states.select')
         .paths.split(/\s+/).includes('status'));
 });

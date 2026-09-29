@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { cascadePathIngressPort, cascadePathIngressTag } = require('../domain/cascadePathIngress');
 const { deriveReplacementTopology } = require('../domain/topologyReplacement');
+const { validateTopology } = require('../domain/topologyValidator');
 const { composeFrozenTopologyDeploymentPlan } = require('../services/frozenTopologyDeploymentPlanComposer');
 
 function fixture() {
@@ -85,6 +86,30 @@ test('effective graph composes a relay SOCKS ingress that routes to the new link
     assert(config.routing.rules.some(rule => rule.inboundTag?.includes(tag)
         && rule.outboundTag === 'portal-down-link-2'));
     assert(!JSON.stringify(config).includes('uuid-old'));
+});
+
+test('installed L2TP relay-root path excludes unrelated upstream pending portal', () => {
+    const input = fixture();
+    input.snapshot.groups[0].paths.pop();
+    input.snapshot.nodes[0].cascadeRole = 'relay';
+    input.snapshot.installedRouteOwners = [{ groupId: 'group', nodeId: 'portal' }];
+    input.snapshot.nodes.push({ _id: 'portal2', cascadeRole: 'portal' });
+    input.snapshot.links.push({ _id: 'pending-portal2', portalNode: 'portal2', bridgeNode: 'portal',
+        mode: 'reverse', active: true, status: 'pending' });
+    const { topology, compiled } = derive(input);
+    assert.equal(validateTopology(topology).valid, true);
+    assert.equal(compiled.valid, true);
+    assert.deepEqual(topology.links.map(link => link.id), ['new', 'upstream']);
+    assert.deepEqual(topology.groups[0].paths[0].linkIds, ['upstream', 'new']);
+    assert.equal(input.snapshot.links.at(-1).status, 'pending');
+});
+
+test('relay-root replacement requires the installed L2TP owner on that relay', () => {
+    const input = fixture();
+    input.snapshot.groups[0].paths.pop();
+    input.snapshot.nodes[0].cascadeRole = 'relay';
+    input.snapshot.installedRouteOwners = [{ groupId: 'group', nodeId: 'other-relay' }];
+    expectRejected(input, 'GROUP_NOT_INSTALLED');
 });
 
 test('replacement never treats a queued L2TP group as installed', () => {

@@ -25,7 +25,7 @@ const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
 const NODE_SELECT = '_id cascadeRole';
 const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
-const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status';
+const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation';
 
 class TopologyDraftRepositoryError extends Error {
@@ -150,6 +150,10 @@ class TopologyDraftRepository {
                 .filter(relayState => relayState.status === 'installed')
                 .map(relayState => relayState.routeGroup)
                 .filter(routeGroup => routeGroup !== undefined && routeGroup !== null),
+            installedRouteOwners: (activeRelayStates || [])
+                .filter(relayState => relayState.status === 'installed'
+                    && relayState.routeGroup != null && relayState.node != null)
+                .map(relayState => ({ groupId: relayState.routeGroup, nodeId: relayState.node })),
         };
     }
 

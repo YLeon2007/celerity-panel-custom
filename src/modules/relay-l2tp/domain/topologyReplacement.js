@@ -122,9 +122,18 @@ function deriveReplacementTopology(snapshot, request) {
             || (index > 0 && cursor !== from)) {
             fail('INCOMPLETE_PATH', 'The installed route path is discontinuous');
         }
-        if (index === 0 && nodesById.get(from).cascadeRole !== 'portal'
-            && nodesById.get(from).role !== 'portal') {
-            fail('INCOMPLETE_PATH', 'The installed route path must start at a portal');
+        if (index === 0) {
+            const role = nodesById.get(from).cascadeRole ?? nodesById.get(from).role;
+            if (role !== 'portal' && role !== 'relay') {
+                fail('INCOMPLETE_PATH', 'The installed route path must start at a portal or L2TP relay');
+            }
+            if (role === 'relay') {
+                const owners = (snapshot.installedRouteOwners || []).filter(owner =>
+                    entityId(owner.groupId) === request.groupId && entityId(owner.nodeId) === from);
+                if (owners.length !== 1) {
+                    fail('GROUP_NOT_INSTALLED', 'The installed L2TP route must start at its owner relay');
+                }
+            }
         }
         cursor = to;
     }
@@ -150,8 +159,12 @@ function deriveReplacementTopology(snapshot, request) {
     }
     for (const link of snapshot.links) {
         if (link.active === false || link.status !== 'pending' || entityId(link) === request.newLinkId) continue;
-        if (connected.has(source(link)) || connected.has(target(link))) {
-            fail('CONFLICTING_PENDING_LINK', 'Another pending link touches the replacement component');
+        // Unrelated upstream drafts (for example a second portal entering the
+        // installed L2TP relay) are deliberately omitted, never activated.
+        // A second pending exit from this relay or into the same bridge would
+        // make the downstream replacement ambiguous, so fail closed there.
+        if (source(link) === source(old) || target(link) === target(old)) {
+            fail('CONFLICTING_PENDING_LINK', 'Another pending link competes for the downstream hop');
         }
     }
     const included = eligible.filter(link => connected.has(source(link)) && connected.has(target(link)));
