@@ -12,7 +12,7 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
-const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -39,6 +39,14 @@ const CLAIM_PROJECTION = Object.freeze({
     priorDeployedRevision: 1,
     kind: 1,
     staged: 1,
+    linkId: 1,
+    linkIds: 1,
+    groupId: 1,
+    pathKey: 1,
+    ownerNodeId: 1,
+    ownerTopologyRevision: 1,
+    ownerCredentialRevision: 1,
+    newPathLinkIds: 1,
     status: 1,
     attempts: 1,
     leaseOwner: 1,
@@ -143,6 +151,9 @@ class TopologyOperationRepository {
         pathKey,
         ownerNodeId,
         oldPathLinkIds,
+        newPathLinkIds,
+        ownerTopologyRevision,
+        ownerCredentialRevision,
         heldTopologyAdmission,
         admissionFingerprint,
         session,
@@ -150,7 +161,9 @@ class TopologyOperationRepository {
         const scoped = kind !== undefined || linkId !== undefined
             || linkIds !== undefined || staged !== undefined
             || oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
-            || oldPathLinkIds !== undefined || ownerNodeId !== undefined;
+            || oldPathLinkIds !== undefined || newPathLinkIds !== undefined
+            || ownerNodeId !== undefined || ownerTopologyRevision !== undefined
+            || ownerCredentialRevision !== undefined;
         if (scoped && (!SCOPED_OPERATION_KINDS.has(kind)
             || typeof linkId !== 'string' || linkId.length === 0
             || !Array.isArray(linkIds) || linkIds.length === 0
@@ -166,8 +179,22 @@ class TopologyOperationRepository {
                     || !Array.isArray(oldPathLinkIds) || oldPathLinkIds.length < 2
                     || oldPathLinkIds.at(-1) !== oldLinkId
                     || new Set(oldPathLinkIds).size !== oldPathLinkIds.length
-                : oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
-                    || oldPathLinkIds !== undefined || ownerNodeId !== undefined))) {
+                : kind === 'link.attach'
+                    ? oldLinkId !== undefined || oldPathLinkIds !== undefined
+                        || typeof groupId !== 'string' || groupId.length === 0
+                        || pathKey !== 'main'
+                        || typeof ownerNodeId !== 'string' || ownerNodeId.length === 0
+                        || !Number.isSafeInteger(ownerTopologyRevision) || ownerTopologyRevision < 0
+                        || !Number.isSafeInteger(ownerCredentialRevision) || ownerCredentialRevision < 0
+                        || !Array.isArray(newPathLinkIds) || newPathLinkIds.length < 2
+                        || newPathLinkIds.length >= linkIds.length
+                        || newPathLinkIds.at(-1) !== linkId
+                        || new Set(newPathLinkIds).size !== newPathLinkIds.length
+                        || !newPathLinkIds.every(id => linkIds.includes(id))
+                    : oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
+                        || oldPathLinkIds !== undefined || ownerNodeId !== undefined)
+            || (kind !== 'link.attach' && (newPathLinkIds !== undefined
+                || ownerTopologyRevision !== undefined || ownerCredentialRevision !== undefined)))) {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
@@ -188,6 +215,9 @@ class TopologyOperationRepository {
                 ...(kind === 'link.apply' ? { staged } : {}),
                 ...(kind === 'link.replace' ? { oldLinkId, groupId, pathKey,
                     ownerNodeId, oldPathLinkIds: [...oldPathLinkIds] } : {}),
+                ...(kind === 'link.attach' ? { groupId, pathKey, ownerNodeId,
+                    ownerTopologyRevision, ownerCredentialRevision,
+                    newPathLinkIds: [...newPathLinkIds] } : {}),
             } : {}),
             status: 'queued',
             ...(heldTopologyAdmission === true

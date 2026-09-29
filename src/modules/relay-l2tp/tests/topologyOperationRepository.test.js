@@ -9,6 +9,139 @@ const {
 } = require('../repositories/topologyOperationRepository');
 const TopologyOperation = require('../models/topologyOperationModel');
 const ADMISSION_FINGERPRINT = 'a'.repeat(64);
+const ATTACH_IDS = Object.freeze({
+    portal: '000000000000000000000001',
+    relay: '000000000000000000000002',
+    bridge: '000000000000000000000003',
+    group: '000000000000000000000004',
+    owner: '000000000000000000000005',
+    old: '000000000000000000000006',
+});
+const ATTACH_SCOPE = Object.freeze({
+    kind: 'link.attach',
+    linkId: ATTACH_IDS.bridge,
+    // The scoped component is an unordered identity, not the ordered new suffix.
+    linkIds: [ATTACH_IDS.bridge, ATTACH_IDS.portal, ATTACH_IDS.relay],
+    groupId: ATTACH_IDS.group,
+    pathKey: 'main',
+    ownerNodeId: ATTACH_IDS.owner,
+    ownerTopologyRevision: 5,
+    ownerCredentialRevision: 11,
+    newPathLinkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge],
+});
+
+test('link.attach freezes owner epochs and ordered suffix in a transactional create', async () => {
+    const session = { inTransaction: () => true };
+    const calls = [];
+    const model = {
+        async create(documents, options) {
+            calls.push({ documents, options });
+            return documents;
+        },
+        async findOneAndUpdate() {},
+        async updateOne() {},
+    };
+    const repository = new TopologyOperationRepository({ model });
+    const created = await repository.createFrozen({
+        operationId: '000000000000000000000007',
+        topologyRevision: 7, priorDeployedRevision: 5, nodes: [],
+        ...ATTACH_SCOPE,
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+        session,
+    });
+    assert.equal(calls.length, 1);
+    assert.strictEqual(calls[0].options.session, session);
+    assert.deepEqual(created, calls[0].documents[0]);
+    assert.deepEqual(calls[0].documents[0], {
+        _id: '000000000000000000000007',
+        topologyRevision: 7, priorDeployedRevision: 5,
+        ...ATTACH_SCOPE,
+        status: 'queued', heldTopologyAdmission: true,
+        admissionFingerprint: ADMISSION_FINGERPRINT,
+        attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
+    });
+    assert.notStrictEqual(calls[0].documents[0].newPathLinkIds, ATTACH_SCOPE.newPathLinkIds);
+    assert.notStrictEqual(calls[0].documents[0].linkIds, ATTACH_SCOPE.linkIds);
+});
+
+test('attach-only fields cannot silently disappear from an unscoped create', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
+        nodes: [], newPathLinkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge],
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+        session: { inTransaction: () => true },
+    }), TypeError);
+    assert.deepEqual(model.calls, []);
+});
+
+test('link.attach rejects invalid ordered suffix and unrelated component links before writing', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    const invalid = [
+        { newPathLinkIds: undefined },
+        { newPathLinkIds: [] },
+        { newPathLinkIds: [ATTACH_IDS.bridge] },
+        { newPathLinkIds: [ATTACH_IDS.bridge, ATTACH_IDS.relay] },
+        { newPathLinkIds: [ATTACH_IDS.relay, ATTACH_IDS.relay, ATTACH_IDS.bridge] },
+        { newPathLinkIds: [ATTACH_IDS.old, ATTACH_IDS.bridge] },
+        { linkIds: [ATTACH_IDS.portal, ATTACH_IDS.bridge] },
+        // The suffix cannot stand in for the full scoped component (P1R1 is separate).
+        { linkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge] },
+    ];
+    for (const fields of invalid) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE, ...fields,
+            heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+            session: { inTransaction: () => true },
+        }), TypeError, JSON.stringify(fields));
+    }
+    assert.deepEqual(model.calls, []);
+});
+
+test('link.attach rejects missing or unknown owner pins and extra scoped fields', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    const invalid = [
+        { groupId: undefined }, { pathKey: undefined }, { pathKey: 'alternate' },
+        { ownerNodeId: undefined },
+        { ownerTopologyRevision: undefined }, { ownerCredentialRevision: undefined },
+        { ownerTopologyRevision: null }, { ownerCredentialRevision: null },
+        { ownerTopologyRevision: -1 }, { ownerCredentialRevision: -1 },
+        { ownerTopologyRevision: 1.5 }, { ownerCredentialRevision: '11' },
+        { oldLinkId: ATTACH_IDS.old }, { oldPathLinkIds: [ATTACH_IDS.old] },
+        { staged: false },
+    ];
+    for (const fields of invalid) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE, ...fields,
+            heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+            session: { inTransaction: () => true },
+        }), TypeError, JSON.stringify(fields));
+    }
+    assert.deepEqual(model.calls, []);
+});
+
+test('link.attach requires a held admission in an active Mongo session', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    for (const overrides of [
+        { session: undefined }, { session: null },
+        { session: { inTransaction: () => false } },
+        { heldTopologyAdmission: undefined }, { admissionFingerprint: undefined },
+    ]) {
+        await assert.rejects(repository.createFrozen({
+            operationId: 'operation-1', topologyRevision: 7,
+            priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE,
+            heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+            session: { inTransaction: () => true }, ...overrides,
+        }), TypeError);
+    }
+    assert.deepEqual(model.calls, []);
+});
 
 test('scoped operation identity survives session-bound repository creation and strict Mongo schema', async () => {
     let stored;
@@ -545,6 +678,14 @@ test('claim reads only durable candidates and never resets later active phases',
                 priorDeployedRevision: 1,
                 kind: 1,
                 staged: 1,
+                linkId: 1,
+                linkIds: 1,
+                groupId: 1,
+                pathKey: 1,
+                ownerNodeId: 1,
+                ownerTopologyRevision: 1,
+                ownerCredentialRevision: 1,
+                newPathLinkIds: 1,
                 status: 1,
                 attempts: 1,
                 leaseOwner: 1,
@@ -612,6 +753,14 @@ test('claim reacquires expired committing and rolling-back phases without resett
                 priorDeployedRevision: 1,
                 kind: 1,
                 staged: 1,
+                linkId: 1,
+                linkIds: 1,
+                groupId: 1,
+                pathKey: 1,
+                ownerNodeId: 1,
+                ownerTopologyRevision: 1,
+                ownerCredentialRevision: 1,
+                newPathLinkIds: 1,
                 status: 1,
                 attempts: 1,
                 leaseOwner: 1,
