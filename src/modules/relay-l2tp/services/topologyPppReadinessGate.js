@@ -55,11 +55,11 @@ class TopologyPppReadinessGate {
                 if (!relayNode) return failed(verifiedRelayCount);
                 const state = await this.RelayL2tpState.findOne({ node: relayNode })
                     .select('node status desiredState secretRevision').lean();
-                // A relay used only for transit has no PPP credentials to
-                // read back. Skip it only when explicit durable non-installation,
-                // zero users and no L2TP operation agree; an absent state is not
-                // equivalent to this evidence.
-                if (plan.staged !== true && state?.status === 'not_installed'
+                // An explicitly non-PPP relay can be transit in either a
+                // complete plan or a staged prefix; only the terminal staged
+                // relay is allowed the separate missing-PPP exception below.
+                if ((plan.staged !== true || node.nodeRef !== terminalRelayRef)
+                    && state?.status === 'not_installed'
                     && ['absent', 'not_installed'].includes(state.desiredState)) {
                     const users = await this.L2tpUser.find({ relayNode })
                         .select('_id').lean();

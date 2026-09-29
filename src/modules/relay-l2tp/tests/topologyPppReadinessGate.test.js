@@ -69,6 +69,40 @@ test('staged intermediate with desired-absent PPP fails despite a canonical term
     assert.deepEqual(calls, []);
 });
 
+test('staged explicit non-PPP transit with zero users allows an absent terminal relay', async () => {
+    const byNode = node => node === 'node-r'
+        ? { node, status: 'not_installed', desiredState: 'absent', secretRevision: 9 }
+        : { node, status: 'not_installed', desiredState: 'absent', secretRevision: 4 };
+    const { gate, calls } = fixture({
+        RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => byNode(node) }) }) },
+        L2tpUser: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
+    });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1 });
+    assert.deepEqual(calls, []);
+});
+
+test('staged non-PPP transit rejects users, active work and revision drift', async () => {
+    for (const failure of ['users', 'active', 'drift']) {
+        let reads = 0;
+        const { gate } = fixture({
+            RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => {
+                if (node === 'node-t') return { status: 'not_installed', desiredState: 'absent', secretRevision: 4 };
+                reads += 1;
+                return { status: 'not_installed', desiredState: 'absent',
+                    secretRevision: failure === 'drift' && reads > 1 ? 10 : 9 };
+            } }) }) },
+            L2tpUser: { find: () => ({ select: () => ({ lean: async () =>
+                failure === 'users' ? [{ relayNode: 'node-r' }] : [] }) }) },
+            L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () =>
+                failure === 'active' ? { _id: 'busy' } : null }) }) },
+        });
+        assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
+            { ok: false, verifiedRelayCount: 0 }, failure);
+    }
+});
+
 test('staged verified intermediate and absent terminal allows exactly one skip regardless of deployment order', async () => {
     const { gate, calls } = fixture({ RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({
         lean: async () => node === 'node-r'
