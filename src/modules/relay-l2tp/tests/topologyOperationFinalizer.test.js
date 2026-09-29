@@ -89,6 +89,21 @@ test('scoped finalization accepts fenced prior deployed revision without claimin
     });
 });
 
+test('replacement finalization returns scoped success without claiming global Sync', async () => {
+    const finalizer = new TopologyOperationFinalizer({
+        repository: { finalizeSucceeded: async input => ({
+            operationId: input.operationId, topologyRevision: input.topologyRevision,
+            deployedRevision: input.priorDeployedRevision,
+            scopeKind: 'link.replace', finishedAt: input.now,
+        }) },
+        clock: { now: () => NOW },
+    });
+    assert.deepEqual(await finalizer.finalizeSucceeded(request()), {
+        operationId: 'operation-7', topologyRevision: 7,
+        deployedRevision: 5, finishedAt: NOW,
+    });
+});
+
 test('finalizer rejects a scoped result that falsely advances the global revision', async () => {
     const finalizer = new TopologyOperationFinalizer({
         repository: { finalizeSucceeded: async () => ({

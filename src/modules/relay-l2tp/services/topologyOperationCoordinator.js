@@ -9,6 +9,7 @@ const {
 } = require('../domain/topologyDraft');
 const { validateTopology } = require('../domain/topologyValidator');
 const { computeTopologyDomains } = require('../domain/topologyDomains');
+const { deriveReplacementTopology } = require('../domain/topologyReplacement');
 const {
     TEST_TOPOLOGY_HOST_IDENTITY,
     TEST_TOPOLOGY_TARGET,
@@ -67,7 +68,7 @@ function idFromIdempotencyKey(idempotencyKey) {
     return createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
 }
 
-const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
 // Baseline members of a scoped operation must be physically applied already:
 // deployed/online are fully confirmed, staged means a link.apply finished
 // applying the link to its endpoints but the component is not client-ready
@@ -77,13 +78,20 @@ const CONFIRMED_BASELINE_LINK_STATUSES = new Set(['deployed', 'online', 'staged'
 function normalizeOperationScope(scope) {
     if (scope === undefined) return null;
     if (!scope || typeof scope !== 'object' || Array.isArray(scope)
-        || !Object.keys(scope).every(key => ['kind', 'linkId', 'linkIds'].includes(key))
+        || !Object.keys(scope).every(key => (scope.kind === 'link.replace'
+            ? ['kind', 'linkId', 'linkIds', 'oldLinkId', 'groupId', 'pathKey']
+            : ['kind', 'linkId', 'linkIds']).includes(key))
         || !SCOPED_OPERATION_KINDS.has(scope.kind)
         || typeof scope.linkId !== 'string' || scope.linkId.length === 0
         || !Array.isArray(scope.linkIds) || scope.linkIds.length === 0
         || scope.linkIds.some(linkId => typeof linkId !== 'string' || linkId.length === 0)
         || new Set(scope.linkIds).size !== scope.linkIds.length
-        || !scope.linkIds.includes(scope.linkId)) {
+        || !scope.linkIds.includes(scope.linkId)
+        || (scope.kind === 'link.replace' && (
+            !['oldLinkId', 'groupId', 'pathKey'].every(key =>
+                typeof scope[key] === 'string' && scope[key].length > 0)
+            || scope.oldLinkId === scope.linkId
+            || scope.linkIds.includes(scope.oldLinkId)))) {
         throw new TopologyOperationCoordinatorError(
             'INVALID_REQUEST',
             'A scoped topology operation requires kind, a linkId contained in unique linkIds',
@@ -93,6 +101,9 @@ function normalizeOperationScope(scope) {
         kind: scope.kind,
         linkId: scope.linkId,
         linkIds: [...scope.linkIds].sort((left, right) => left.localeCompare(right, 'en')),
+        ...(scope.kind === 'link.replace' ? {
+            oldLinkId: scope.oldLinkId, groupId: scope.groupId, pathKey: scope.pathKey,
+        } : {}),
     };
 }
 
@@ -146,6 +157,13 @@ function safeQueueError(error, operationId, expectedTopologyRevision) {
                     ? error.topologyRevision
                     : null,
             },
+        );
+    }
+    if (error?.name === 'TopologyReplacementError') {
+        return new TopologyOperationCoordinatorError(
+            'INVALID_TOPOLOGY_DEPLOYMENT',
+            'The pinned replacement is not a complete installed path',
+            { operationId, causeCode: error.code },
         );
     }
     // Plan validation failures (incomplete chain, bad roles, unsupported
@@ -502,9 +520,22 @@ class TopologyOperationCoordinator {
                     // component (deployed links + the requested link). This
                     // selects the scope of coordination only — it never marks
                     // a link physically applied by itself.
-                    const topology = scope
-                        ? applyScopeToTopology(projected, scope, operationId, snapshot.links)
-                        : projected;
+                    const replacement = scope?.kind === 'link.replace'
+                        ? deriveReplacementTopology(snapshot, {
+                            groupId: scope.groupId, pathKey: scope.pathKey,
+                            oldLinkId: scope.oldLinkId, newLinkId: scope.linkId,
+                        }) : null;
+                    const topology = replacement ? replacement.topology
+                        : scope ? applyScopeToTopology(projected, scope, operationId, snapshot.links)
+                            : projected;
+                    if (scope?.kind === 'link.replace'
+                        && (topology.links.length !== scope.linkIds.length
+                            || topology.links.some(link => !scope.linkIds.includes(link.id)))) {
+                        throw new TopologyOperationCoordinatorError(
+                            'INVALID_TOPOLOGY_DEPLOYMENT', 'Replacement scope differs from its pinned graph',
+                            { operationId, causeCode: 'SCOPE_DOMAIN_AMBIGUOUS' },
+                        );
+                    }
                     const validation = this.validator(topology);
                     if (validation?.valid !== true) {
                         throw new TopologyOperationCoordinatorError(
@@ -532,7 +563,8 @@ class TopologyOperationCoordinator {
                             compiled,
                         }),
                     });
-                    return { topology, frozenPlan };
+                    return { topology, frozenPlan,
+                        ...(replacement ? { oldPathLinkIds: replacement.oldPathLinkIds } : {}) };
                 },
                 admit: async (admitted, session) => {
                     admittedPriorDeployedRevision = admitted.deployedRevision;
@@ -546,7 +578,13 @@ class TopologyOperationCoordinator {
                     scopedIdentity = scope
                         ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds],
                             ...(scope.kind === 'link.apply'
-                                ? { staged: admitted.frozenPlan.staged === true } : {}) }
+                                ? { staged: admitted.frozenPlan.staged === true } : {}),
+                            ...(scope.kind === 'link.replace' ? {
+                                oldLinkId: scope.oldLinkId,
+                                groupId: scope.groupId,
+                                pathKey: scope.pathKey,
+                                oldPathLinkIds: [...admitted.oldPathLinkIds],
+                            } : {}) }
                         : {};
                     admissionFingerprint = createHash('sha256').update(JSON.stringify({
                         operationId,

@@ -205,7 +205,7 @@ function deriveReplacementTopology(snapshot, request) {
             }
         }
     }
-    return { topology, compiled };
+    return { topology, compiled, oldPathLinkIds: [...originalIds] };
 }
 
 module.exports = { TopologyReplacementError, deriveReplacementTopology };

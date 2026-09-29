@@ -29,6 +29,8 @@ function matches(document, filter) {
         if (expected && typeof expected === 'object' && !(expected instanceof Date)) {
             if (Object.hasOwn(expected, '$eq') && !equalValue(actual, expected.$eq)) return false;
             if (Object.hasOwn(expected, '$gt') && !(actual > expected.$gt)) return false;
+            if (Object.hasOwn(expected, '$exists')
+                && (actual !== undefined) !== expected.$exists) return false;
             return true;
         }
         return equalValue(actual, expected);
@@ -515,3 +517,92 @@ test('an explicit domain.sync keeps the legacy global commit semantics', async (
         'the optional full Sync must still advance the global deployed revision');
     assert.deepEqual(linkCalls.map(call => call.filter), [{ active: true }]);
 });
+
+function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'], newStatus = 'pending' } = {}) {
+    const h = createHarness({ operation: { heldTopologyAdmission: true },
+        topology: { topologyAdmissionCount: 1, revision } });
+    const group = { paths: [{ pathKey: 'main', linkIds: [...pathIds], enabled: true }] };
+    const links = [{ _id: 'upstream', active: true, status: 'deployed' },
+        { _id: 'old', active: true, status: 'online' },
+        { _id: 'new', active: true, status: newStatus },
+        { _id: 'unrelated', active: true, status: 'pending' }];
+    h.repository.TopologyOperation.findById = () => ({
+        select() { return this; }, session() { return this; },
+        async lean() { return { heldTopologyAdmission: h.store.operation.heldTopologyAdmission,
+            kind: 'link.replace', linkId: 'new', linkIds: ['new', 'upstream'],
+            oldLinkId: 'old', groupId: 'group', pathKey: 'main',
+            oldPathLinkIds: ['upstream', 'old'] }; },
+    });
+    h.repository.CascadeRouteGroup = {
+        async updateOne(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            if (filter._id !== 'group' || JSON.stringify(filter.paths.$elemMatch.linkIds)
+                !== JSON.stringify(group.paths[0].linkIds)
+                || filter.paths.$elemMatch.pathKey !== 'main') return { matchedCount: 0 };
+            group.paths[0].linkIds = clone(update.$set['paths.$.linkIds']);
+            return { matchedCount: 1 };
+        },
+    };
+    h.repository.CascadeLink = {
+        async updateMany(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            const selected = links.filter(link => filter._id.$in.includes(link._id)
+                && filter.active === link.active && filter.status.$in.includes(link.status));
+            for (const link of selected) Object.assign(link, update.$set);
+            return { matchedCount: selected.length };
+        },
+        async updateOne(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            const selected = links.find(link => link._id === filter._id
+                && link.active === filter.active && filter.status.$in.includes(link.status));
+            if (!selected) return { matchedCount: 0 };
+            Object.assign(selected, update.$set);
+            return { matchedCount: 1 };
+        },
+    };
+    const repository = h.repository;
+    const run = repository.transactionRunner;
+    repository.transactionRunner = async work => {
+        const before = clone({ group, links });
+        try { return await run(work); }
+        catch (error) {
+            Object.assign(group, before.group);
+            links.splice(0, links.length, ...before.links);
+            throw error;
+        }
+    };
+    return { h, group, links, repository };
+}
+
+test('verified replacement atomically swaps its path and retires only the old link', async () => {
+    const { h, group, links, repository } = replacementHarness();
+    // Neither the operation nor its transaction has a PPP/state writer.
+    const pppSnapshot = { relay: { status: 'installed', routeGroupId: 'group',
+        pskFingerprint: 'stable', clientCidr: '198.51.100.0/24' },
+    users: [{ login: 'existing', desiredRevision: 41, appliedRevision: 41,
+        encryptedPassword: 'unchanged' }] };
+    const pppBefore = clone(pppSnapshot);
+    const result = await repository.finalizeSucceeded(request());
+    assert.equal(result?.scopeKind, 'link.replace');
+    assert.deepEqual(group.paths[0].linkIds, ['upstream', 'new']);
+    assert.deepEqual(links.map(link => [link.active, link.status]), [
+        [true, 'deployed'], [false, 'offline'], [true, 'deployed'], [true, 'pending'],
+    ]);
+    assert.equal(h.store.topology.deployedRevision, 5);
+    assert.equal(h.store.topology.topologyAdmissionCount, 0);
+    assert.equal(h.store.operation.status, 'succeeded');
+    assert.equal(await repository.finalizeSucceeded(request()), null);
+});
+
+for (const scenario of [
+    { name: 'stale topology revision', options: { revision: 8 } },
+    { name: 'changed installed path', options: { pathIds: ['upstream', 'unrelated'] } },
+    { name: 'new link already changed', options: { newStatus: 'offline' } },
+]) {
+    test(`replacement rejects ${scenario.name} and rolls back the operation/admission`, async () => {
+        const { h, group, links, repository } = replacementHarness(scenario.options);
+        const before = clone({ store: h.store, group, links });
+        assert.equal(await repository.finalizeSucceeded(request()), null);
+        assert.deepEqual({ store: h.store, group, links }, before);
+    });
+}

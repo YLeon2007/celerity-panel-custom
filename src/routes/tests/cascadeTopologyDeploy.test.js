@@ -246,6 +246,42 @@ test('deployment API enforces authentication, nodes:write scope, session CSRF, a
     ]);
 });
 
+test('replacement API queues only an explicit scoped migration behind write guards', async () => {
+    const ids = ['a', 'b', 'c', 'd'].map(char => char.repeat(24));
+    const body = { expectedTopologyRevision: 7, groupId: ids[0], pathKey: 'main',
+        oldLinkId: ids[1], newLinkId: ids[2], linkIds: [ids[2], ids[3]] };
+    const calls = [];
+    const queueInputs = [];
+    const router = createCascadeTopologyDeployRouter({
+        ...guardHarness(calls),
+        topologyDeploymentService: {
+            async deploy() { assert.fail('replacement cannot run full Sync'); },
+            async queue(input) {
+                queueInputs.push(input);
+                return { operationId: ids[0], topologyRevision: 7, status: 'queued' };
+            },
+        },
+    });
+    assert.equal((await request(router, { pathname: '/replace', body })).status, 401);
+    assert.equal((await request(router, { pathname: '/replace', body,
+        headers: { 'x-test-auth': 'session' } })).status, 403);
+    assert.deepEqual(queueInputs, []);
+    const result = await request(router, { pathname: '/replace', body,
+        headers: { 'x-test-auth': 'session', 'x-test-csrf': 'valid' } });
+    assert.equal(result.status, 202);
+    assert.deepEqual(result.body, { operationId: ids[0], topologyRevision: 7,
+        status: 'queued', kind: 'link.replace' });
+    assert.deepEqual(queueInputs, [{ expectedTopologyRevision: 7, scope: {
+        kind: 'link.replace', linkId: ids[2], linkIds: [ids[2], ids[3]],
+        oldLinkId: ids[1], groupId: ids[0], pathKey: 'main',
+    } }]);
+    const malformed = await request(router, { pathname: '/replace',
+        body: { ...body, linkIds: [ids[2], ids[1]] },
+        headers: { 'x-test-auth': 'api-write' } });
+    assert.equal(malformed.status, 400);
+    assert.equal(queueInputs.length, 1);
+});
+
 test('per-link deploy queues only the selected link and applied component, never an old pending edge', async () => {
     const selectedId = '507f1f77bcf86cd799439011';
     const appliedId = '507f1f77bcf86cd799439012';

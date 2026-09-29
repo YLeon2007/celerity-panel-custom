@@ -105,6 +105,28 @@ function normalizeDeployRequest(body) {
 }
 
 const OPERATION_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
+
+function normalizeReplacementRequest(body) {
+    const keys = ['expectedTopologyRevision', 'groupId', 'pathKey',
+        'oldLinkId', 'newLinkId', 'linkIds'];
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== keys.length
+        || !Object.keys(body).every(key => keys.includes(key))
+        || !Number.isSafeInteger(body.expectedTopologyRevision)
+        || body.expectedTopologyRevision < 0
+        || !['groupId', 'oldLinkId', 'newLinkId'].every(key =>
+            typeof body[key] === 'string' && OPERATION_ID_PATTERN.test(body[key]))
+        || typeof body.pathKey !== 'string' || !body.pathKey.trim()
+        || !Array.isArray(body.linkIds) || body.linkIds.length < 2
+        || !body.linkIds.every(id => typeof id === 'string' && OPERATION_ID_PATTERN.test(id))
+        || new Set(body.linkIds).size !== body.linkIds.length
+        || !body.linkIds.includes(body.newLinkId)
+        || body.oldLinkId === body.newLinkId
+        || body.linkIds.includes(body.oldLinkId)) {
+        throw new TopologyDeployRequestError('INVALID_REQUEST', 'Invalid explicit replacement request');
+    }
+    return body;
+}
 // Status lifecycle mirrors TopologyOperation. No kind/causeCode/reason or any
 // freeform field ever leaves this boundary.
 const OPERATION_STATUS_VALUES = new Set([
@@ -361,6 +383,34 @@ function createCascadeTopologyDeployRouter({
         },
     );
 
+    router.post('/replace', requireAuth, writeScope, sessionWriteCsrf,
+        deployRateLimiter, async (req, res) => {
+            try {
+                const input = normalizeReplacementRequest(req.body);
+                if (typeof deploymentService.queue !== 'function') {
+                    throw new TopologyDeployRequestError(
+                        'TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 'Replacement queue is unavailable');
+                }
+                const result = await deploymentService.queue({
+                    expectedTopologyRevision: input.expectedTopologyRevision,
+                    scope: {
+                        kind: 'link.replace', linkId: input.newLinkId,
+                        linkIds: input.linkIds, oldLinkId: input.oldLinkId,
+                        groupId: input.groupId, pathKey: input.pathKey,
+                    },
+                });
+                if (!result || result.topologyRevision !== input.expectedTopologyRevision
+                    || !['queued', 'succeeded'].includes(result.status)) {
+                    throw new TopologyDeployRequestError(
+                        'TOPOLOGY_OPERATION_QUEUE_FAILED', 'Replacement could not be queued');
+                }
+                return res.status(result.status === 'queued' ? 202 : 200)
+                    .json({ ...publicResult(result), kind: 'link.replace' });
+            } catch (error) {
+                return sendError(res, error, routeLogger);
+            }
+        });
+
     return router;
 }
 
@@ -373,6 +423,7 @@ module.exports.PUBLIC_ERROR_FIELDS = PUBLIC_ERROR_FIELDS;
 module.exports.TopologyDeployRequestError = TopologyDeployRequestError;
 module.exports.createCascadeTopologyDeployRouter = createCascadeTopologyDeployRouter;
 module.exports.normalizeDeployRequest = normalizeDeployRequest;
+module.exports.normalizeReplacementRequest = normalizeReplacementRequest;
 module.exports.publicError = publicError;
 module.exports.publicOperationStatus = publicOperationStatus;
 module.exports.publicResult = publicResult;

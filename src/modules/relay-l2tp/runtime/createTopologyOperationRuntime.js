@@ -192,6 +192,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             TopologyOperation,
             CascadeTopologyState,
             CascadeLink,
+            CascadeRouteGroup,
             ...optional(transactionRunner, 'transactionRunner'),
         });
         const finalizer = new Finalizer({

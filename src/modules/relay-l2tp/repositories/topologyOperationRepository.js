@@ -12,7 +12,7 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
-const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -138,19 +138,35 @@ class TopologyOperationRepository {
         linkId,
         linkIds,
         staged,
+        oldLinkId,
+        groupId,
+        pathKey,
+        oldPathLinkIds,
         heldTopologyAdmission,
         admissionFingerprint,
         session,
     }) {
         const scoped = kind !== undefined || linkId !== undefined
-            || linkIds !== undefined || staged !== undefined;
+            || linkIds !== undefined || staged !== undefined
+            || oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
+            || oldPathLinkIds !== undefined;
         if (scoped && (!SCOPED_OPERATION_KINDS.has(kind)
             || typeof linkId !== 'string' || linkId.length === 0
             || !Array.isArray(linkIds) || linkIds.length === 0
             || !linkIds.every(id => typeof id === 'string' && id.length > 0)
             || new Set(linkIds).size !== linkIds.length
             || !linkIds.includes(linkId)
-            || (kind === 'link.apply' ? typeof staged !== 'boolean' : staged !== undefined))) {
+            || (kind === 'link.apply' ? typeof staged !== 'boolean' : staged !== undefined)
+            || (kind === 'link.replace'
+                ? !['oldLinkId', 'groupId', 'pathKey'].every(key =>
+                    typeof ({ oldLinkId, groupId, pathKey })[key] === 'string'
+                    && ({ oldLinkId, groupId, pathKey })[key].length > 0)
+                    || oldLinkId === linkId || linkIds.includes(oldLinkId)
+                    || !Array.isArray(oldPathLinkIds) || oldPathLinkIds.length < 2
+                    || oldPathLinkIds.at(-1) !== oldLinkId
+                    || new Set(oldPathLinkIds).size !== oldPathLinkIds.length
+                : oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
+                    || oldPathLinkIds !== undefined))) {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
@@ -168,7 +184,10 @@ class TopologyOperationRepository {
             topologyRevision,
             priorDeployedRevision,
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
-                ...(kind === 'link.apply' ? { staged } : {}) } : {}),
+                ...(kind === 'link.apply' ? { staged } : {}),
+                ...(kind === 'link.replace' ? { oldLinkId, groupId, pathKey,
+                    oldPathLinkIds: [...oldPathLinkIds] } : {}),
+            } : {}),
             status: 'queued',
             ...(heldTopologyAdmission === true
                 ? { heldTopologyAdmission: true, admissionFingerprint } : {}),

@@ -114,9 +114,13 @@ const topologyOperationSchema = new mongoose.Schema({
         min: 0,
     },
     // No default: legacy full-sync operations have no scoped identity.
-    kind: { type: String, enum: ['link.apply', 'domain.reconcile'] },
+    kind: { type: String, enum: ['link.apply', 'domain.reconcile', 'link.replace'] },
     linkId: { type: String, match: /^[a-f0-9]{24}$/i },
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
+    oldLinkId: { type: String, match: /^[a-f0-9]{24}$/i },
+    groupId: { type: String, match: /^[a-f0-9]{24}$/i },
+    pathKey: { type: String, trim: true },
+    oldPathLinkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     // Only link.apply records whether the frozen plan has a terminal relay.
     staged: { type: Boolean },
     // Remains held through failure/rollback until a proven-safe transactional release.
@@ -136,14 +140,25 @@ const topologyOperationSchema = new mongoose.Schema({
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     const scoped = this.kind !== undefined || this.linkId !== undefined
-        || this.linkIds !== undefined || this.staged !== undefined;
+        || this.linkIds !== undefined || this.staged !== undefined
+        || this.oldLinkId !== undefined || this.groupId !== undefined
+        || this.pathKey !== undefined || this.oldPathLinkIds !== undefined;
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
         || !Array.isArray(ids) || ids.length === 0
         || new Set(ids).size !== ids.length || !ids.includes(this.linkId)
         || (this.kind === 'link.apply' ? typeof this.staged !== 'boolean'
-            : this.staged !== undefined)) {
+            : this.staged !== undefined)
+        || (this.kind === 'link.replace'
+            ? typeof this.oldLinkId !== 'string' || this.oldLinkId === this.linkId
+                || ids.includes(this.oldLinkId) || typeof this.groupId !== 'string'
+                || typeof this.pathKey !== 'string' || !this.pathKey
+                || !Array.isArray(this.oldPathLinkIds) || this.oldPathLinkIds.length < 2
+                || this.oldPathLinkIds.at(-1) !== this.oldLinkId
+                || new Set(this.oldPathLinkIds).size !== this.oldPathLinkIds.length
+            : this.oldLinkId !== undefined || this.groupId !== undefined
+                || this.pathKey !== undefined || this.oldPathLinkIds !== undefined)) {
         throw new Error('Incomplete scoped topology operation identity');
     }
 });
