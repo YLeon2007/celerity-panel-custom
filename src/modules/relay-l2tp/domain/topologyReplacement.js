@@ -236,4 +236,141 @@ function deriveReplacementTopology(snapshot, request) {
     return { topology, compiled, oldPathLinkIds: [...originalIds], ownerNodeId };
 }
 
-module.exports = { TopologyReplacementError, deriveReplacementTopology };
+const APPLIED = new Set(['deployed', 'online', 'staged']);
+
+/** Build one private attach candidate from the installed owner, never from a caller-supplied path. */
+function deriveAttachTopology(snapshot, request) {
+    if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.links)
+        || !Array.isArray(snapshot.groups) || !Array.isArray(snapshot.activeRouteGroupIds)
+        || !Array.isArray(snapshot.installedRouteGroupIds)
+        || !Array.isArray(snapshot.installedRouteOwners)
+        || !request || !['groupId', 'pathKey', 'linkId'].every(key =>
+            typeof request[key] === 'string' && request[key].length > 0)) {
+        fail('INVALID_ATTACH_REQUEST', 'Attach requires a complete snapshot and group, path and link identities');
+    }
+    const nodes = unique(snapshot.nodes, 'AMBIGUOUS_NODE');
+    unique(snapshot.links, 'AMBIGUOUS_LINK');
+    const groups = unique(snapshot.groups, 'AMBIGUOUS_GROUP');
+    const activeIds = snapshot.activeRouteGroupIds.map(entityId);
+    const installedIds = snapshot.installedRouteGroupIds.map(entityId);
+    if (new Set(activeIds).size !== activeIds.length
+        || new Set(installedIds).size !== installedIds.length) {
+        fail('AMBIGUOUS_GROUP', 'Route group identities must be unique');
+    }
+    const group = groups.get(request.groupId);
+    if (!group || !activeIds.includes(request.groupId) || !installedIds.includes(request.groupId)) {
+        fail('GROUP_NOT_INSTALLED', 'Attach requires an installed route group');
+    }
+    const owners = snapshot.installedRouteOwners.filter(owner => entityId(owner.groupId) === request.groupId);
+    if (!owners.length) fail('GROUP_NOT_INSTALLED', 'Attach requires an installed L2TP owner');
+    // readDraft currently projects groupId/nodeId, but not activePathKey. Do not
+    // substitute the request pathKey for proof of the installed owner's key.
+    if (owners.some(owner => typeof owner.pathKey !== 'string' || !owner.pathKey)) {
+        fail('MISSING_OWNER_PATH_KEY', 'Installed owner projection must include its active path key');
+    }
+    if (owners.length !== 1 || new Set(owners.map(owner => owner.pathKey)).size !== owners.length) {
+        fail('AMBIGUOUS_PATH', 'Attach needs exactly one owner for the installed group');
+    }
+    const owner = owners[0];
+    const ownerId = entityId(owner.nodeId);
+    if (owner.pathKey !== request.pathKey || !ownerId ||
+        (nodes.get(ownerId)?.cascadeRole ?? nodes.get(ownerId)?.role) !== 'relay') {
+        fail('GROUP_NOT_INSTALLED', 'The installed relay does not own the requested path');
+    }
+    if (!Array.isArray(group.paths) || group.paths.some(path => !path
+        || typeof path.pathKey !== 'string' || !path.pathKey || !Array.isArray(path.linkIds)
+        || path.linkIds.some(id => !entityId(id)))
+        || new Set(group.paths.map(path => path.pathKey)).size !== group.paths.length) {
+        fail('AMBIGUOUS_PATH', 'The installed group needs unique, well-formed paths');
+    }
+    const existing = group.paths.find(path => path.pathKey === request.pathKey);
+    if (existing && (existing.enabled === false || existing.linkIds.length !== 0)) {
+        fail('INCOMPLETE_PATH', 'Attach requires an enabled empty owned path');
+    }
+    const source = link => entityId(link.portalNode ?? link.source);
+    const target = link => entityId(link.bridgeNode ?? link.target);
+    const eligible = snapshot.links.filter(link => link.active !== false
+        && (APPLIED.has(link.status) || link.status === 'pending')
+        && link.geoRouting?.enabled !== true);
+    const incoming = id => eligible.filter(link => target(link) === id);
+    const outgoing = id => eligible.filter(link => source(link) === id);
+    const walk = (start, direction) => {
+        const result = [];
+        const seen = new Set([start]);
+        let current = start;
+        for (let hop = 0; hop <= nodes.size; hop += 1) {
+            const role = nodes.get(current)?.cascadeRole ?? nodes.get(current)?.role;
+            if (direction === 'up' && role === 'portal') return result.reverse();
+            if (direction === 'down' && role === 'bridge') return result;
+            if (role !== 'relay') {
+                fail('INCOMPLETE_PATH', 'The attach chain has an invalid intermediate role');
+            }
+            const candidates = direction === 'up' ? incoming(current) : outgoing(current);
+            if (candidates.length > 1) fail('AMBIGUOUS_CHAIN', 'Attach chain has competing default links');
+            if (candidates.length === 0) fail('INCOMPLETE_PATH', 'Attach chain does not reach its endpoint');
+            const link = candidates[0];
+            const next = direction === 'up' ? source(link) : target(link);
+            if (!next || !nodes.has(next) || seen.has(next) || next === current) {
+                fail('INCOMPLETE_PATH', 'Attach chain has a missing node or a cycle');
+            }
+            if (direction === 'down' && incoming(next).length !== 1) {
+                fail('AMBIGUOUS_CHAIN', 'Attach suffix has an ambiguous incoming link');
+            }
+            result.push(link);
+            seen.add(next);
+            current = next;
+        }
+        fail('INCOMPLETE_PATH', 'Attach chain exceeds the snapshot node count');
+    };
+    const prefix = walk(ownerId, 'up');
+    const suffix = walk(ownerId, 'down');
+    if (suffix.length === 0 || entityId(suffix.at(-1)) !== request.linkId) {
+        fail('INCOMPLETE_PATH', 'Requested link must be the final bridge hop');
+    }
+    const chain = [...prefix, ...suffix];
+    if (new Set(chain.map(entityId)).size !== chain.length) {
+        fail('AMBIGUOUS_CHAIN', 'Attach chain repeats a link');
+    }
+    for (const link of chain) {
+        if (link.mode !== group.mode) fail('REPLACEMENT_METADATA_MISMATCH', 'Attach link mode differs from its group');
+        if (entityId(link) === request.linkId ? link.status !== 'pending' : !APPLIED.has(link.status)) {
+            fail('UNCONFIRMED_BASELINE', 'Only the requested final hop may be pending');
+        }
+    }
+    if (Array.isArray(request.linkIds) && (request.linkIds.length !== chain.length
+        || request.linkIds.some((id, index) => entityId(id) !== entityId(chain[index])))) {
+        fail('INCOMPLETE_PATH', 'Supplied links do not match the unique installed-owner chain');
+    }
+    const used = new Set(chain.map(entityId));
+    for (const candidateGroup of snapshot.groups) {
+        if (!Array.isArray(candidateGroup.paths)) fail('INVALID_FOREIGN_PATH', 'Every group must have paths');
+        for (const path of candidateGroup.paths) {
+            if (!path || !Array.isArray(path.linkIds)) fail('INVALID_FOREIGN_PATH', 'Every path needs link identities');
+            if (candidateGroup === group && path === existing) continue;
+            if (path.linkIds.some(id => used.has(entityId(id)))) {
+                fail('AMBIGUOUS_LINK_OWNERSHIP', 'Another path owns an attach chain link');
+            }
+        }
+    }
+    const projectedGroup = projectGroups([{ ...group, paths: existing
+        ? group.paths.map(path => path === existing
+            ? { ...path, linkIds: suffix.map(entityId) } : path)
+        : [...group.paths, { pathKey: request.pathKey, linkIds: suffix.map(entityId),
+            priority: 1, enabled: true }] }])[0];
+    const included = new Set(chain.flatMap(link => [source(link), target(link)]));
+    const topology = {
+        nodes: projectNodes(snapshot.nodes).filter(node => included.has(node.id))
+            .sort((a, b) => a.id.localeCompare(b.id, 'en')),
+        links: projectLinks(chain).sort((a, b) => a.id.localeCompare(b.id, 'en')),
+        groups: [projectedGroup],
+    };
+    const compiled = compileTopology(topology);
+    if (!compiled.valid || !compiled.relays.some(relay => relay.nodeId === ownerId
+        && relay.routeGroups.some(routeGroup => routeGroup.groupId === request.groupId
+            && routeGroup.candidates.some(candidate => candidate.pathKey === request.pathKey)))) {
+        fail('INVALID_EFFECTIVE_TOPOLOGY', 'The attach candidate cannot be compiled for its owner');
+    }
+    return { topology, compiled, ownerNodeId: ownerId };
+}
+
+module.exports = { TopologyReplacementError, deriveReplacementTopology, deriveAttachTopology };
