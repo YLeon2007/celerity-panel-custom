@@ -147,22 +147,38 @@ test('reads the transactional topology snapshot without parallel session operati
     });
 });
 
-test('draft snapshot distinguishes installed L2TP groups from queued desired groups', async () => {
+test('draft snapshot projects the installed L2TP owner active path without changing status membership', async () => {
     const trace = [];
     const models = createModels(trace, { id: 'read-session' });
     models.RelayL2tpState.find = () => queryResult([
-        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed' },
-        { routeGroup: 'queued-group', node: 'queued-relay', status: 'queued', desiredState: 'installed' },
+        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed', activePathKey: 'main' },
+        { routeGroup: 'queued-group', node: 'queued-relay', status: 'queued', desiredState: 'installed', activePathKey: 'queued-path' },
     ], trace, 'states');
     const snapshot = await new TopologyDraftRepository(models).readDraft();
     assert.deepEqual(snapshot.activeRouteGroupIds, ['installed-group', 'queued-group']);
     assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
     assert.deepEqual(snapshot.installedRouteOwners,
-        [{ groupId: 'installed-group', nodeId: 'owner-relay' }]);
-    assert(trace.find(entry => entry.label === 'states.select')
-        .paths.split(/\s+/).includes('node'));
-    assert(trace.find(entry => entry.label === 'states.select')
-        .paths.split(/\s+/).includes('status'));
+        [{ groupId: 'installed-group', nodeId: 'owner-relay', pathKey: 'main' }]);
+    const selected = trace.find(entry => entry.label === 'states.select').paths.split(/\s+/);
+    assert(selected.includes('node'));
+    assert(selected.includes('status'));
+    assert(selected.includes('activePathKey'));
+});
+
+test('missing installed owner active path stays missing instead of inventing main', async () => {
+    const trace = [];
+    const models = createModels(trace, { id: 'missing-path-session' });
+    models.CascadeRouteGroup.find = () => queryResult([
+        { _id: 'installed-group', paths: [{ pathKey: 'main', linkIds: [], enabled: true }] },
+    ], trace, 'groups');
+    models.RelayL2tpState.find = () => queryResult([
+        { routeGroup: 'installed-group', node: 'owner-relay', status: 'installed' },
+    ], trace, 'states');
+
+    const snapshot = await new TopologyDraftRepository(models).readDraft();
+    assert.deepEqual(snapshot.installedRouteOwners,
+        [{ groupId: 'installed-group', nodeId: 'owner-relay', pathKey: undefined }]);
+    assert.deepEqual(snapshot.installedRouteGroupIds, ['installed-group']);
 });
 
 test('pinned link snapshot selects status for scoped pending-link guard', async () => {
