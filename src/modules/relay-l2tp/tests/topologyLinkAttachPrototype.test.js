@@ -26,7 +26,8 @@ test('link.attach queues a private complete path for the uniquely installed owne
         ],
         groups: [{ _id: 'group', mode: 'reverse', strategy: 'priority-failover', paths: [] }],
         activeRouteGroupIds: ['group'], installedRouteGroupIds: ['group'],
-        installedRouteOwners: [{ groupId: 'group', nodeId: 'r1', pathKey: 'main' }],
+        installedRouteOwners: [{ groupId: 'group', nodeId: 'r1', pathKey: 'main',
+            ownerTopologyRevision: 1, ownerCredentialRevision: 3 }],
     };
     const before = structuredClone(snapshot);
     let frozen;
@@ -51,13 +52,14 @@ test('link.attach queues a private complete path for the uniquely installed owne
         idFactory: () => 'attach-operation',
     });
     const result = await coordinator.queue({ expectedTopologyRevision: 3, scope: {
-        kind: 'link.attach', linkId: 'r2b', linkIds: ['pr1', 'r1r2', 'r2b'],
-        groupId: 'group', pathKey: 'main',
+        kind: 'link.apply', linkId: 'r2b', linkIds: ['pr1', 'r1r2', 'r2b'],
     } });
     assert.equal(result.status, 'queued');
     assert.deepEqual(snapshot, before, 'the DB snapshot must remain unchanged at admission');
     assert(Object.isFrozen(candidate));
     assert.deepEqual(candidate.groups[0].paths[0].linkIds, ['r1r2', 'r2b']);
+    assert.equal(frozen.kind, 'link.attach');
+    assert.deepEqual(frozen.newPathLinkIds, ['r1r2', 'r2b']);
     assert.equal(frozen.ownerNodeId, 'r1');
     assert.equal(frozen.heldTopologyAdmission, true);
 });
