@@ -47,6 +47,7 @@ const {
 const {
     createTopologyPppReadinessGate,
 } = require('../services/topologyPppReadinessGate');
+const { TopologyAttachIngressGate } = require('../services/topologyAttachIngressGate');
 const {
     NodeOperationLockRepository,
 } = require('../services/nodeOperationLockRepository');
@@ -217,6 +218,14 @@ function createTopologyOperationRuntime(dependencies = {}) {
             HyNode,
             NodeSSH: NodeSSH ?? require('../../../services/nodeSSH'),
         });
+        const attachIngressGate = new TopologyAttachIngressGate({
+            nodeExecutionResolver: new TopologyNodeExecutionResolver({
+                HyNode,
+                NodeSSH: NodeSSH ?? require('../../../services/nodeSSH'),
+                target: TEST_TOPOLOGY_TARGET,
+                hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+            }),
+        });
         const operationWorker = new OperationWorker({
             operationRepository,
             executor,
@@ -227,6 +236,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             clock,
             ...optional(userResync, 'userResync'),
             pppReadinessGate,
+            attachIngressGate,
             allowUnprovenTestExecution: isTestWorkerExecutionAllowed(env),
         });
         return new Coordinator({

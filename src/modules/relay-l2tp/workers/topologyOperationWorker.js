@@ -145,10 +145,23 @@ function durablePlan(operation, operationId) {
     if (new Set(nodes.map(node => node.node)).size !== nodes.length) {
         throw new TypeError('Invalid durable topology operation');
     }
+    if (operation.kind === 'link.attach'
+        && (!SAFE_ID_PATTERN.test(operation.groupId)
+            || !SAFE_ID_PATTERN.test(operation.pathKey)
+            || !SAFE_ID_PATTERN.test(operation.ownerNodeId)
+            || nodes.filter(node => node.node === operation.ownerNodeId && node.role === 'relay').length !== 1)) {
+        throw new TypeError('Invalid durable attach identity');
+    }
     return deepFreeze({
         operationId,
         topologyRevision: operation.topologyRevision,
         priorDeployedRevision: operation.priorDeployedRevision,
+        ...(operation.kind === 'link.attach' ? {
+            kind: 'link.attach',
+            groupId: operation.groupId,
+            pathKey: operation.pathKey,
+            ownerNodeId: operation.ownerNodeId,
+        } : {}),
         // Only the durable scoped link.apply identity can authorize a PPP skip.
         ...(operation.kind === 'link.apply' && operation.staged === true ? { staged: true } : {}),
         nodes,
@@ -214,6 +227,7 @@ class TopologyOperationWorker {
         renewalIntervalMs,
         userResync,
         pppReadinessGate,
+        attachIngressGate,
         allowUnprovenTestExecution = false,
     } = {}) {
         const repositoryMethods = [
@@ -273,6 +287,11 @@ class TopologyOperationWorker {
             throw new TypeError('Topology operation worker PPP gate requires verifyPlan');
         }
         this.pppReadinessGate = pppReadinessGate;
+        if (attachIngressGate !== undefined
+            && typeof attachIngressGate?.verifyPlan !== 'function') {
+            throw new TypeError('Topology attach ingress gate requires verifyPlan');
+        }
+        this.attachIngressGate = attachIngressGate;
         // TEST-only fake-executor seam. The composed runtime never grants this:
         // lock generation and quiescence are not proven for real execution.
         this.#allowUnprovenTestExecution = allowUnprovenTestExecution === true;
@@ -898,6 +917,19 @@ class TopologyOperationWorker {
                     if (readiness?.ok !== true) {
                         throw new Error('Topology PPP node readback was not verified');
                     }
+                } catch (error) {
+                    if (error instanceof LeaseLostError) throw error;
+                    return await this.rollbackAfterCommitFailure(
+                        plan, operationId, prepared, changing, heartbeat,
+                    );
+                }
+            }
+            if (plan.kind === 'link.attach') {
+                try {
+                    if (!this.attachIngressGate) throw new Error('Attach ingress proof unavailable');
+                    await this.renew(operationId);
+                    const proof = await heartbeat.run(() => this.attachIngressGate.verifyPlan(plan));
+                    if (proof?.ok !== true) throw new Error('Attach ingress proof was not verified');
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
                     return await this.rollbackAfterCommitFailure(
