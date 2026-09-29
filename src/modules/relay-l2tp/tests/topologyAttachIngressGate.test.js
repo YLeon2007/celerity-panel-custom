@@ -95,6 +95,33 @@ test('matching installed main fragment, active service and candidate sidecar per
     ]);
 });
 
+test('reverse portal route is a valid attached ingress target', async () => {
+    const sidecar = relayNode({
+        inbounds: [ingress],
+        outbounds: [],
+        reverse: { portals: [{ tag: 'portal-downstream', domain: 'tunnel.internal' }] },
+        routing: { rules: [{ type: 'field', inboundTag: ['cascade-main'], outboundTag: 'portal-downstream' }] },
+    });
+    const { gate, plan } = probeFixture({ sidecar });
+    assert.deepEqual(await gate.verifyPlan(plan), { ok: true });
+});
+
+test('reverse portal target must exist exactly once across reverse and ordinary outbounds', async () => {
+    const make = (outbounds, portals) => relayNode({
+        inbounds: [ingress], outbounds,
+        reverse: { portals },
+        routing: { rules: [{ type: 'field', inboundTag: ['cascade-main'], outboundTag: 'portal-downstream' }] },
+    });
+    for (const sidecar of [
+        make([], []),
+        make([], [{ tag: 'portal-downstream' }, { tag: 'portal-downstream' }]),
+        make([{ tag: 'portal-downstream' }], [{ tag: 'portal-downstream' }]),
+    ]) {
+        const { gate, plan } = probeFixture({ sidecar });
+        assert.deepEqual(await gate.verifyPlan(plan), { ok: false });
+    }
+});
+
 test('wrong main port, routing, inactive service and ambiguous tags refuse attach', async () => {
     const variants = [
         { config: { ...baseConfig, outbounds: [{ ...baseConfig.outbounds[0], settings: { servers: [{ address: '127.0.0.1', port: port + 1 }] } }] } },

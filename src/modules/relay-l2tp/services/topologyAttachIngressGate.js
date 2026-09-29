@@ -32,7 +32,8 @@ function routeToIngress(candidate, tag, port) {
         && !['ip', 'domain', 'port', 'network', 'protocol'].some(key => key in selected[0])
         && typeof selected[0].outboundTag === 'string'
         && selected[0].outboundTag !== 'block'
-        && matchingTag(config.outbounds, selected[0].outboundTag).length === 1;
+        && matchingTag(config.outbounds, selected[0].outboundTag).length
+            + matchingTag(config.reverse?.portals, selected[0].outboundTag).length === 1;
 }
 
 // No shell interpolation, no artifact runner/bootstrap and no config/secret output.
