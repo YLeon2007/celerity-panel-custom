@@ -141,7 +141,7 @@ test('non-staged relay without installed PPP fails closed rather than claiming r
 test('explicit non-PPP transit relay with no users or active L2TP work does not block installed owner readback', async () => {
     const stateByNode = node => node === 'node-r'
         ? { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
-        : { node, status: 'not_installed', desiredState: 'not_installed' };
+        : { node, status: 'not_installed', desiredState: 'not_installed', secretRevision: 9 };
     const baseOperation = { _id: 'abcdef012345abcdef012345', node: 'node-r', kind: 'sync_users',
         status: 'succeeded', plan: { operationId: 'abcdef012345abcdef012345', relayId: 'node-r',
             desired: { credentialRevision: 41 } } };
@@ -151,10 +151,16 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
         { role: 'relay', node: 'node-t' }, { role: 'bridge', node: 'node-b' }] };
     const make = (options = {}) => {
         const { users = [], active = false } = options;
+        let transitReads = 0;
         return fixture({
-            RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () =>
-                node === 'node-t' && Object.prototype.hasOwnProperty.call(options, 'transitState')
-                    ? options.transitState : stateByNode(node) }) }) },
+            RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => {
+                if (node !== 'node-t') return stateByNode(node);
+                const state = Object.prototype.hasOwnProperty.call(options, 'transitState')
+                    ? options.transitState : stateByNode(node);
+                transitReads += 1;
+                return state && options.driftRevision && transitReads > 1
+                    ? { ...state, secretRevision: state.secretRevision + 1 } : state;
+            } }) }) },
             L2tpUser: { find: ({ relayNode }) => ({ select: () => ({ lean: async () =>
                 relayNode === 'node-t' ? users : [installedUser] }) }) },
             L2tpOperation: { findOne: filter => filter.status?.$in
@@ -167,9 +173,18 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
         { ok: true, verifiedRelayCount: 1 });
     assert.deepEqual(ready.calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
+    const stagedTransit = { staged: true, nodes: [
+        { ...plan.nodes[0], nodeRef: 'portal' },
+        { ...plan.nodes[1], nodeRef: 'relay-1' },
+        { role: 'relay', node: 'node-t', nodeRef: 'relay-2' },
+    ] };
+    assert.deepEqual(await make().gate.verifyPlan(stagedTransit),
+        { ok: false, verifiedRelayCount: 1 });
     for (const options of [
         { users: [{ relayNode: 'node-t' }] },
         { active: true },
+        { driftRevision: true },
+        { transitState: { status: 'not_installed', desiredState: 'not_installed' } },
         { transitState: { status: 'installed', desiredState: 'not_installed' } },
         { transitState: null },
     ]) {

@@ -66,17 +66,21 @@ class TopologyPppReadinessGate {
                 // read back. Skip it only when explicit durable non-installation,
                 // zero users and no L2TP operation agree; an absent state is not
                 // equivalent to this evidence.
-                if (state.status === 'not_installed' && state.desiredState === 'not_installed') {
+                if (plan.staged !== true && state.status === 'not_installed'
+                    && state.desiredState === 'not_installed') {
                     const users = await this.L2tpUser.find({ relayNode })
                         .select('_id').lean();
                     const activeOperation = await this.L2tpOperation.findOne({
                         node: relayNode, status: { $in: ['queued', 'running', 'rolling_back'] },
                     }).select('_id').lean();
                     const current = await this.RelayL2tpState.findOne({ node: relayNode })
-                        .select('status desiredState').lean();
-                    if (!Array.isArray(users) || users.length !== 0 || activeOperation
+                        .select('status desiredState secretRevision').lean();
+                    if (!Number.isSafeInteger(state.secretRevision)
+                        || state.secretRevision < 0
+                        || !Array.isArray(users) || users.length !== 0 || activeOperation
                         || current?.status !== 'not_installed'
-                        || current.desiredState !== 'not_installed') {
+                        || current.desiredState !== 'not_installed'
+                        || current.secretRevision !== state.secretRevision) {
                         return failed(verifiedRelayCount);
                     }
                     continue;
