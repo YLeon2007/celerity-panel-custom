@@ -9,7 +9,7 @@ const {
 } = require('../domain/topologyDraft');
 const { validateTopology } = require('../domain/topologyValidator');
 const { computeTopologyDomains } = require('../domain/topologyDomains');
-const { deriveReplacementTopology } = require('../domain/topologyReplacement');
+const { deriveReplacementTopology, deriveAttachTopology } = require('../domain/topologyReplacement');
 const {
     TEST_TOPOLOGY_HOST_IDENTITY,
     TEST_TOPOLOGY_TARGET,
@@ -276,6 +276,57 @@ function applyScopeToTopology(topology, scope, operationId, rawLinks = []) {
     return { nodes, links, groups };
 }
 
+// Select attach only from the transactional owner projection. A pending
+// foreign draft cannot join the scoped graph or impersonate the owned suffix.
+function deriveScopedAttach(snapshot, scope, scopedTopology, operationId) {
+    if (scope?.kind !== 'link.apply'
+        || !Array.isArray(snapshot.installedRouteGroupIds)
+        || !Array.isArray(snapshot.installedRouteOwners)
+        || !Array.isArray(snapshot.activeRouteGroupIds)) return null;
+    const requested = scopedTopology.links.find(link => link.id === scope.linkId);
+    const roles = new Map(scopedTopology.nodes.map(node => [node.id, node.role]));
+    if (!requested || roles.get(requested.target) !== 'bridge') return null;
+    const installed = new Set(snapshot.installedRouteGroupIds.map(entityId));
+    const active = new Set(snapshot.activeRouteGroupIds.map(entityId));
+    const candidates = snapshot.groups.filter(group => installed.has(entityId(group))
+        && active.has(entityId(group)) && Array.isArray(group.paths)
+        && (group.paths.length === 0 || group.paths.some(path => path?.linkIds?.length === 0)));
+    const scopedNodes = new Set(scopedTopology.nodes.map(node => node.id));
+    const owners = candidates.flatMap(group => snapshot.installedRouteOwners
+        .filter(owner => entityId(owner.groupId) === entityId(group)
+            && scopedNodes.has(entityId(owner.nodeId)))
+        .map(owner => ({ group, owner })));
+    if (owners.length === 0 && candidates.length === 0) return null;
+    if (owners.length !== 1 || typeof owners[0].owner.pathKey !== 'string'
+        || !owners[0].owner.pathKey
+        || !Number.isSafeInteger(owners[0].owner.ownerTopologyRevision)
+        || owners[0].owner.ownerTopologyRevision < 0
+        || !Number.isSafeInteger(owners[0].owner.ownerCredentialRevision)
+        || owners[0].owner.ownerCredentialRevision < 0) {
+        throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+            'The installed owner identity is ambiguous',
+            { operationId, causeCode: 'ATTACH_OWNER_AMBIGUOUS' });
+    }
+    const { group, owner } = owners[0];
+    const eligible = { ...snapshot, links: snapshot.links.filter(link =>
+        link.status !== 'pending' || entityId(link) === scope.linkId) };
+    const result = deriveAttachTopology(eligible, {
+        groupId: entityId(group), pathKey: owner.pathKey, linkId: scope.linkId,
+    });
+    if (result.topology.links.length !== scope.linkIds.length
+        || result.topology.links.some(link => !scope.linkIds.includes(link.id))) {
+        throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+            'Attach scope differs from its pinned graph',
+            { operationId, causeCode: 'SCOPE_DOMAIN_AMBIGUOUS' });
+    }
+    const newPathLinkIds = result.topology.groups[0].paths
+        .find(path => path.pathKey === owner.pathKey).linkIds;
+    return { ...result, groupId: entityId(group), pathKey: owner.pathKey,
+        ownerTopologyRevision: owner.ownerTopologyRevision,
+        ownerCredentialRevision: owner.ownerCredentialRevision,
+        newPathLinkIds: [...newPathLinkIds] };
+}
+
 function nodeIdsByRef(topology) {
     const nodes = new Map(topology.nodes.map(node => [node.id, node]));
     const outgoing = new Map();
@@ -488,7 +539,7 @@ class TopologyOperationCoordinator {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
         const runIdempotencyKey = `${idempotencyKey}:${randomUUID()}`;
-        const operationId = entityId(this.idFactory(runIdempotencyKey));
+        let operationId = entityId(this.idFactory(runIdempotencyKey));
         if (!operationId) {
             throw new TopologyOperationCoordinatorError(
                 'TOPOLOGY_OPERATION_QUEUE_FAILED',
@@ -499,6 +550,7 @@ class TopologyOperationCoordinator {
         let scopedIdentity;
         let admissionFingerprint;
         let admittedPriorDeployedRevision;
+        let effectiveRunIdempotencyKey = runIdempotencyKey;
         try {
             pinned = await this.topologyRepository.admitTopology({
                 expectedRevision: expectedTopologyRevision,
@@ -530,9 +582,28 @@ class TopologyOperationCoordinator {
                             groupId: scope.groupId, pathKey: scope.pathKey,
                             oldLinkId: scope.oldLinkId, newLinkId: scope.linkId,
                         }) : null;
+                    const scopedTopology = scope && !replacement
+                        ? applyScopeToTopology(projected, scope, operationId, snapshot.links) : null;
+                    const attach = scopedTopology
+                        ? deriveScopedAttach(snapshot, scope, scopedTopology, operationId) : null;
+                    if (attach) {
+                        const attachIdentity = createHash('sha256').update(JSON.stringify({
+                            groupId: attach.groupId, pathKey: attach.pathKey,
+                            ownerNodeId: attach.ownerNodeId,
+                            ownerTopologyRevision: attach.ownerTopologyRevision,
+                            ownerCredentialRevision: attach.ownerCredentialRevision,
+                            linkIds: scope.linkIds,
+                            newPathLinkIds: attach.newPathLinkIds,
+                        })).digest('hex');
+                        effectiveRunIdempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}:link.attach:${scope.linkId}:${attachIdentity}:${runIdempotencyKey.slice(-36)}`;
+                        operationId = entityId(this.idFactory(effectiveRunIdempotencyKey));
+                        if (!operationId) {
+                            throw new TopologyOperationCoordinatorError('TOPOLOGY_OPERATION_QUEUE_FAILED',
+                                'The topology operation could not be queued');
+                        }
+                    }
                     const topology = replacement ? replacement.topology
-                        : scope ? applyScopeToTopology(projected, scope, operationId, snapshot.links)
-                            : projected;
+                        : attach ? attach.topology : scopedTopology || projected;
                     if (scope?.kind === 'link.replace'
                         && (topology.links.length !== scope.linkIds.length
                             || topology.links.some(link => !scope.linkIds.includes(link.id)))) {
@@ -560,7 +631,7 @@ class TopologyOperationCoordinator {
                     const frozenPlan = await this.planMaterializer.materialize({
                         target: TEST_TOPOLOGY_TARGET,
                         hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
-                        operationKind: scope?.kind,
+                        operationKind: attach ? 'link.attach' : scope?.kind,
                         session,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,
@@ -569,6 +640,13 @@ class TopologyOperationCoordinator {
                         }),
                     });
                     return { topology, frozenPlan,
+                        ...(attach ? { attach: {
+                            groupId: attach.groupId, pathKey: attach.pathKey,
+                            ownerNodeId: attach.ownerNodeId,
+                            ownerTopologyRevision: attach.ownerTopologyRevision,
+                            ownerCredentialRevision: attach.ownerCredentialRevision,
+                            newPathLinkIds: [...attach.newPathLinkIds],
+                        } } : {}),
                         ...(replacement ? { oldPathLinkIds: replacement.oldPathLinkIds,
                             ownerNodeId: replacement.ownerNodeId } : {}) };
                 },
@@ -582,8 +660,9 @@ class TopologyOperationCoordinator {
                         plan: admitted.frozenPlan,
                     });
                     scopedIdentity = scope
-                        ? { kind: scope.kind, linkId: scope.linkId, linkIds: [...scope.linkIds],
-                            ...(scope.kind === 'link.apply'
+                        ? { kind: admitted.attach ? 'link.attach' : scope.kind,
+                            linkId: scope.linkId, linkIds: [...scope.linkIds],
+                            ...(scope.kind === 'link.apply' && !admitted.attach
                                 ? { staged: admitted.frozenPlan.staged === true } : {}),
                             ...(scope.kind === 'link.replace' ? {
                                 oldLinkId: scope.oldLinkId,
@@ -591,7 +670,8 @@ class TopologyOperationCoordinator {
                                 pathKey: scope.pathKey,
                                 ownerNodeId: admitted.ownerNodeId,
                                 oldPathLinkIds: [...admitted.oldPathLinkIds],
-                            } : {}) }
+                            } : {}),
+                            ...(admitted.attach ? { ...admitted.attach } : {}) }
                         : {};
                     admissionFingerprint = createHash('sha256').update(JSON.stringify({
                         operationId,
@@ -602,7 +682,7 @@ class TopologyOperationCoordinator {
                     })).digest('hex');
                     await this.operationRepository.createFrozen({
                         operationId,
-                        idempotencyKey: runIdempotencyKey,
+                        idempotencyKey: effectiveRunIdempotencyKey,
                         topologyRevision: admitted.revision,
                         priorDeployedRevision: admitted.deployedRevision,
                         nodes: plan.nodes,

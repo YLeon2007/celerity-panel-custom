@@ -18,6 +18,7 @@ const {
 const {
     TopologyDeploymentRepository,
 } = require('../repositories/topologyDeploymentRepository');
+const { TopologyOperationRepository } = require('../repositories/topologyOperationRepository');
 
 function deepFreeze(value) {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -1067,4 +1068,224 @@ test('groups fully outside the scope are dropped; mixed groups fail with SCOPE_G
             && error?.causeCode === 'SCOPE_GROUP_CONFLICT',
     );
     assert.equal(mixedCalls.filter(call => call.method === 'createFrozen').length, 0);
+});
+
+function attachSnapshot() {
+    return {
+        revision: 12, deployedRevision: 9,
+        nodes: ['p', 'r1', 'r2', 'b', 'foreign'].map((id, index) => ({
+            _id: id, cascadeRole: index === 0 || index === 4 ? 'portal'
+                : index === 3 ? 'bridge' : 'relay',
+        })),
+        links: [
+            { _id: 'zpr1', portalNode: 'p', bridgeNode: 'r1', mode: 'reverse', active: true, status: 'staged' },
+            { _id: 'yr1r2', portalNode: 'r1', bridgeNode: 'r2', mode: 'reverse', active: true, status: 'staged' },
+            { _id: 'ar2b', portalNode: 'r2', bridgeNode: 'b', mode: 'reverse', active: true, status: 'pending' },
+            { _id: 'foreignr1', portalNode: 'foreign', bridgeNode: 'r1', mode: 'reverse', active: true, status: 'pending' },
+        ],
+        groups: [{ _id: 'g', mode: 'reverse', strategy: 'priority-failover', paths: [] }],
+        activeRouteGroupIds: ['g'], installedRouteGroupIds: ['g'],
+        installedRouteOwners: [{ groupId: 'g', nodeId: 'r1', pathKey: 'main',
+            ownerTopologyRevision: 9, ownerCredentialRevision: 4 }],
+    };
+}
+
+const attachRequest = { expectedTopologyRevision: 12,
+    scope: { kind: 'link.apply', linkId: 'ar2b', linkIds: ['zpr1', 'yr1r2', 'ar2b'] } };
+
+function attachHarness(snapshotValue, calls) {
+    return {
+        ...scopedHarness(snapshotValue, calls),
+        planMaterializer: { async materialize(input) {
+            calls.push({ method: 'materialize', input });
+            return deepFreeze({ staged: false, nodes: [
+                { nodeRef: 'portal', role: 'portal', candidateHash: 'p' },
+                { nodeRef: 'relay-1', role: 'relay', candidateHash: 'r1' },
+                { nodeRef: 'relay-2', role: 'relay', candidateHash: 'r2' },
+                { nodeRef: 'bridge', role: 'bridge', candidateHash: 'b' },
+            ] });
+        } },
+    };
+}
+
+test('third POST attaches a private installed-owner path from the transactional snapshot', async () => {
+    const value = attachSnapshot();
+    const before = structuredClone(value);
+    const calls = [];
+    const result = await new TopologyOperationCoordinator(attachHarness(value, calls)).queue(attachRequest);
+    assert.deepEqual(value, before, 'queue must not publish the path in the group');
+    assert.equal(result.kind, 'link.attach');
+    assert.equal(result.ownerNodeId, 'r1');
+    assert.equal(result.ownerTopologyRevision, 9);
+    assert.equal(result.ownerCredentialRevision, 4);
+    assert.deepEqual(result.newPathLinkIds, ['yr1r2', 'ar2b']);
+    const materialize = calls.find(call => call.method === 'materialize').input;
+    assert.equal(materialize.operationKind, 'link.attach');
+    assert.deepEqual(materialize.pinnedSnapshot.topology.links.map(link => link.id), ['ar2b', 'yr1r2', 'zpr1']);
+    assert.deepEqual(materialize.pinnedSnapshot.topology.groups[0].paths[0].linkIds, ['yr1r2', 'ar2b']);
+    const frozen = calls.find(call => call.method === 'createFrozen').input;
+    for (const field of ['kind', 'linkId', 'groupId', 'pathKey', 'ownerNodeId']) {
+        assert.equal(frozen[field], result[field], field);
+    }
+    assert.deepEqual(frozen.linkIds, ['ar2b', 'yr1r2', 'zpr1']);
+    assert.deepEqual(frozen.newPathLinkIds, ['yr1r2', 'ar2b']);
+    assert.match(frozen.idempotencyKey, /:link\.attach:ar2b:/);
+    assert(calls.some(call => call.method === 'idFactory'
+        && call.idempotencyKey === frozen.idempotencyKey),
+    'the operation ID must be derived from the effective transactional scope');
+    assert.match(frozen.admissionFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(frozen.staged, undefined, 'attach is distinct from staged apply');
+    assert.equal(materialize.pinnedSnapshot.topology.links.some(link => link.id === 'foreignr1'), false);
+});
+
+test('first two staged POSTs remain link.apply even with an empty installed group', async () => {
+    for (const [linkId, linkIds] of [
+        ['zpr1', ['zpr1']], ['yr1r2', ['zpr1', 'yr1r2']],
+    ]) {
+        const value = attachSnapshot();
+        value.links = value.links.filter(link => linkIds.includes(link._id));
+        value.links.find(link => link._id === linkId).status = 'pending';
+        const calls = [];
+        const harness = scopedHarness(value, calls);
+        harness.planMaterializer = { async materialize(input) {
+            calls.push({ method: 'materialize', input });
+            return { staged: true, nodes: [
+                { nodeRef: 'portal', role: 'portal', candidateHash: 'p' },
+                { nodeRef: 'relay-1', role: 'relay', candidateHash: 'r1' },
+                ...(linkId === 'yr1r2'
+                    ? [{ nodeRef: 'relay-2', role: 'relay', candidateHash: 'r2' }] : []),
+            ] };
+        } };
+        const result = await new TopologyOperationCoordinator(harness)
+            .queue({ expectedTopologyRevision: 12, scope: { kind: 'link.apply', linkId, linkIds } });
+        assert.equal(result.kind, 'link.apply');
+        assert.equal(calls.find(call => call.method === 'materialize').input.operationKind, 'link.apply');
+        assert.equal(calls.find(call => call.method === 'createFrozen').input.kind, 'link.apply');
+        assert.equal(calls.find(call => call.method === 'createFrozen').input.staged, true);
+    }
+});
+
+test('attach fails closed on missing or ambiguous transactional owner identity', async () => {
+    for (const change of [
+        value => { delete value.installedRouteOwners[0].pathKey; },
+        value => { delete value.installedRouteOwners[0].ownerTopologyRevision; },
+        value => { delete value.installedRouteOwners[0].ownerCredentialRevision; },
+        value => { value.installedRouteOwners.push({ ...value.installedRouteOwners[0] }); },
+        value => { value.installedRouteOwners[0].nodeId = 'foreign'; },
+    ]) {
+        const value = attachSnapshot();
+        change(value);
+        const calls = [];
+        await assert.rejects(new TopologyOperationCoordinator(attachHarness(value, calls))
+            .queue(attachRequest), error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT');
+        assert.equal(calls.some(call => call.method === 'createFrozen'), false);
+        assert.equal(calls.some(call => call.method === 'worker.run'), false);
+    }
+});
+
+test('attach rejects competing confirmed exits and foreign path ownership before admission', async () => {
+    for (const change of [
+        value => { value.links.push({ _id: 'competing', portalNode: 'r1', bridgeNode: 'b',
+            mode: 'reverse', active: true, status: 'staged' }); },
+        value => { value.groups.push({ _id: 'foreign-group', mode: 'reverse',
+            paths: [{ pathKey: 'other', linkIds: ['yr1r2'], enabled: false }] }); },
+    ]) {
+        const value = attachSnapshot();
+        change(value);
+        const calls = [];
+        await assert.rejects(new TopologyOperationCoordinator(attachHarness(value, calls))
+            .queue(attachRequest), error => error.code === 'INVALID_TOPOLOGY_DEPLOYMENT');
+        assert.equal(calls.some(call => call.method === 'createFrozen'), false);
+    }
+});
+
+test('attach rejects a stale revision and caller-supplied owner/body fields', async () => {
+    const calls = [];
+    const harness = attachHarness(attachSnapshot(), calls);
+    harness.topologyRepository = { async admitTopology() {
+        const stale = new Error('private database detail');
+        stale.code = 'STALE_TOPOLOGY_REVISION';
+        stale.topologyRevision = 13;
+        throw stale;
+    } };
+    await assert.rejects(new TopologyOperationCoordinator(harness).queue(attachRequest),
+        error => error.code === 'STALE_TOPOLOGY_REVISION' && error.topologyRevision === 13);
+    assert.equal(calls.some(call => call.method === 'createFrozen'), false);
+    const valid = new TopologyOperationCoordinator(attachHarness(attachSnapshot(), calls));
+    for (const input of [
+        { ...attachRequest, groupId: 'g' },
+        { ...attachRequest, scope: { ...attachRequest.scope, ownerNodeId: 'foreign' } },
+        { ...attachRequest, scope: { ...attachRequest.scope, newPathLinkIds: ['ar2b'] } },
+    ]) {
+        await assert.rejects(valid.queue(input), error => error.code === 'INVALID_REQUEST');
+    }
+    assert.equal(calls.some(call => call.method === 'admitTopology'), false);
+});
+
+test('attach admission fingerprint and persisted key bind owner revisions and ordered suffix', async () => {
+    const identities = [];
+    for (const credentialRevision of [4, 5]) {
+        const value = attachSnapshot();
+        value.installedRouteOwners[0].ownerCredentialRevision = credentialRevision;
+        const calls = [];
+        await new TopologyOperationCoordinator(attachHarness(value, calls)).queue(attachRequest);
+        identities.push(calls.find(call => call.method === 'createFrozen').input);
+    }
+    assert.notEqual(identities[0].admissionFingerprint, identities[1].admissionFingerprint);
+    assert.notEqual(identities[0].idempotencyKey.slice(0, -36),
+        identities[1].idempotencyKey.slice(0, -36));
+    assert.deepEqual(identities[0].newPathLinkIds, ['yr1r2', 'ar2b']);
+});
+
+test('ambiguous attach commit acknowledges only the effective operation fingerprint', async () => {
+    for (const matches of [true, false]) {
+        const calls = [];
+        const harness = attachHarness(attachSnapshot(), calls);
+        const original = harness.topologyRepository;
+        harness.topologyRepository = { async admitTopology(input) {
+            await original.admitTopology(input);
+            const error = new Error('private commit detail');
+            error.hasErrorLabel = label => label === 'UnknownTransactionCommitResult';
+            throw error;
+        } };
+        harness.operationRepository.findAdmissionById = async operationId => {
+            const frozen = calls.find(call => call.method === 'createFrozen').input;
+            assert.equal(operationId, frozen.operationId);
+            return { _id: operationId, topologyRevision: 12, priorDeployedRevision: 9,
+                heldTopologyAdmission: true, status: 'queued',
+                admissionFingerprint: matches ? frozen.admissionFingerprint : '0'.repeat(64) };
+        };
+        const coordinator = new TopologyOperationCoordinator(harness);
+        if (matches) {
+            const result = await coordinator.queue(attachRequest);
+            assert.equal(result.kind, 'link.attach');
+            assert.deepEqual(result.newPathLinkIds, ['yr1r2', 'ar2b']);
+        } else {
+            await assert.rejects(coordinator.queue(attachRequest),
+                error => error.code === 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+        }
+        assert.equal(calls.some(call => call.method === 'worker.run'), false);
+    }
+});
+
+test('attach admission requires durable repository support for ordered suffix and owner fence', async () => {
+    let document;
+    const repository = new TopologyOperationRepository({ model: {
+        async create([input]) { document = input; return [{ _id: input._id }]; },
+        findOneAndUpdate() {}, updateOne() {},
+    } });
+    await repository.createFrozen({
+        operationId: 'a'.repeat(24), topologyRevision: 12, priorDeployedRevision: 9,
+        nodes: [], kind: 'link.attach', linkId: 'a'.repeat(24),
+        linkIds: ['a'.repeat(24), 'b'.repeat(24), 'c'.repeat(24)],
+        groupId: 'd'.repeat(24), pathKey: 'main', ownerNodeId: 'e'.repeat(24),
+        ownerTopologyRevision: 111, ownerCredentialRevision: 41,
+        newPathLinkIds: ['b'.repeat(24), 'a'.repeat(24)],
+        heldTopologyAdmission: true, admissionFingerprint: 'f'.repeat(64),
+        session: fakeSession,
+    });
+    assert.equal(document.kind, 'link.attach');
+    assert.equal(document.ownerTopologyRevision, 111);
+    assert.equal(document.ownerCredentialRevision, 41);
+    assert.deepEqual(document.newPathLinkIds, ['b'.repeat(24), 'a'.repeat(24)]);
 });
