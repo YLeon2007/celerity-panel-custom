@@ -36,7 +36,7 @@ function assertFinalizationInput(input) {
     }
 }
 
-const SCOPED_RESULT_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
+const SCOPED_RESULT_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']);
 
 function projectFinalized(result, input) {
     const scoped = SCOPED_RESULT_KINDS.has(result?.scopeKind);

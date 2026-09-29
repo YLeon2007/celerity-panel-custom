@@ -114,13 +114,16 @@ const topologyOperationSchema = new mongoose.Schema({
         min: 0,
     },
     // No default: legacy full-sync operations have no scoped identity.
-    kind: { type: String, enum: ['link.apply', 'domain.reconcile', 'link.replace'] },
+    kind: { type: String, enum: ['link.apply', 'domain.reconcile', 'link.replace', 'link.attach'] },
     linkId: { type: String, match: /^[a-f0-9]{24}$/i },
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     oldLinkId: { type: String, match: /^[a-f0-9]{24}$/i },
     groupId: { type: String, match: /^[a-f0-9]{24}$/i },
     pathKey: { type: String, trim: true },
     ownerNodeId: { type: String, match: /^[a-f0-9]{24}$/i },
+    // Frozen installed-owner and PPP credential epochs for an unpublished attach.
+    ownerTopologyRevision: { type: Number, min: 0 },
+    ownerCredentialRevision: { type: Number, min: 0 },
     oldPathLinkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     // Only link.apply records whether the frozen plan has a terminal relay.
     staged: { type: Boolean },
@@ -144,7 +147,8 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
         || this.linkIds !== undefined || this.staged !== undefined
         || this.oldLinkId !== undefined || this.groupId !== undefined
         || this.pathKey !== undefined || this.oldPathLinkIds !== undefined
-        || this.ownerNodeId !== undefined;
+        || this.ownerNodeId !== undefined || this.ownerTopologyRevision !== undefined
+        || this.ownerCredentialRevision !== undefined;
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
@@ -152,6 +156,18 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
         || new Set(ids).size !== ids.length || !ids.includes(this.linkId)
         || (this.kind === 'link.apply' ? typeof this.staged !== 'boolean'
             : this.staged !== undefined)
+        || (this.kind === 'link.attach'
+            ? this.oldLinkId !== undefined || this.oldPathLinkIds !== undefined
+                || typeof this.groupId !== 'string' || !this.groupId
+                || this.pathKey !== 'main'
+                || typeof this.ownerNodeId !== 'string' || !this.ownerNodeId
+                || ids.length < 2 || ids.at(-1) !== this.linkId
+                || !Number.isSafeInteger(this.ownerTopologyRevision)
+                || this.ownerTopologyRevision < 0
+                || !Number.isSafeInteger(this.ownerCredentialRevision)
+                || this.ownerCredentialRevision < 0
+            : this.ownerTopologyRevision !== undefined
+                || this.ownerCredentialRevision !== undefined)
         || (this.kind === 'link.replace'
             ? typeof this.oldLinkId !== 'string' || this.oldLinkId === this.linkId
                 || ids.includes(this.oldLinkId) || typeof this.groupId !== 'string'
@@ -160,7 +176,8 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
                 || !Array.isArray(this.oldPathLinkIds) || this.oldPathLinkIds.length < 2
                 || this.oldPathLinkIds.at(-1) !== this.oldLinkId
                 || new Set(this.oldPathLinkIds).size !== this.oldPathLinkIds.length
-            : this.oldLinkId !== undefined || this.groupId !== undefined
+            : this.kind === 'link.attach' ? false
+                : this.oldLinkId !== undefined || this.groupId !== undefined
                 || this.pathKey !== undefined || this.oldPathLinkIds !== undefined
                 || this.ownerNodeId !== undefined)) {
         throw new Error('Incomplete scoped topology operation identity');
