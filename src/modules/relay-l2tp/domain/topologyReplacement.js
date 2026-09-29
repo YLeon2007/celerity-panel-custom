@@ -141,6 +141,13 @@ function deriveReplacementTopology(snapshot, request) {
         || (nodesById.get(cursor).cascadeRole ?? nodesById.get(cursor).role) !== 'bridge') {
         fail('INCOMPLETE_PATH', 'The old downstream hop must go from relay to bridge');
     }
+    const owners = (snapshot.installedRouteOwners || []).filter(owner =>
+        entityId(owner.groupId) === request.groupId);
+    const ownerNodeId = owners.length === 1 ? entityId(owners[0].nodeId) : null;
+    if (!ownerNodeId || !originalIds.some(id => source(linksById.get(id)) === ownerNodeId)
+        || (nodesById.get(ownerNodeId)?.cascadeRole ?? nodesById.get(ownerNodeId)?.role) !== 'relay') {
+        fail('GROUP_NOT_INSTALLED', 'Replacement requires one installed L2TP owner on the route path');
+    }
     // Confirmed links in the same connected component are retained; unrelated
     // domains and pending staged drafts cannot be pulled into this candidate.
     const confirmed = snapshot.links.filter(link => link.active !== false
@@ -226,7 +233,7 @@ function deriveReplacementTopology(snapshot, request) {
             }
         }
     }
-    return { topology, compiled, oldPathLinkIds: [...originalIds] };
+    return { topology, compiled, oldPathLinkIds: [...originalIds], ownerNodeId };
 }
 
 module.exports = { TopologyReplacementError, deriveReplacementTopology };

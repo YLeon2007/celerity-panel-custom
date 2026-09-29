@@ -29,7 +29,8 @@ function fixture() {
     ] }];
     return {
         snapshot: { nodes, links, groups, activeRouteGroupIds: ['group'],
-            installedRouteGroupIds: ['group'] },
+            installedRouteGroupIds: ['group'],
+            installedRouteOwners: [{ groupId: 'group', nodeId: 'relay' }] },
         request: { groupId: 'group', pathKey: 'main', oldLinkId: 'old', newLinkId: 'new' },
     };
 }
@@ -50,7 +51,8 @@ test('derives a private complete replacement path without mutating the installed
     input.snapshot.groups[0].paths[1].linkIds = ['upstream'];
     input.snapshot.groups[0].paths[1].enabled = false;
     const before = structuredClone(input.snapshot);
-    const { topology, compiled } = derive(input);
+    const { topology, compiled, ownerNodeId } = derive(input);
+    assert.equal(ownerNodeId, 'relay');
     assert.deepEqual(input.snapshot, before);
     assert.equal(compiled.valid, true);
     assert.deepEqual(topology.links.map(link => link.id), ['new', 'upstream']);
@@ -125,6 +127,16 @@ test('installed L2TP relay-root path excludes unrelated upstream pending portal'
             tags: ownerConfig.inbounds.map(inbound => inbound.tag) }));
     assert(!JSON.stringify(plan.nodes).includes('uuid-pending-portal2'));
     assert.equal(input.snapshot.links.at(-1).status, 'pending');
+});
+
+test('replacement rejects an installed group without one pinned L2TP owner on its path', () => {
+    const input = fixture();
+    input.snapshot.groups[0].paths.pop();
+    input.snapshot.installedRouteOwners = [];
+    expectRejected(input, 'GROUP_NOT_INSTALLED');
+    input.snapshot.installedRouteOwners = [{ groupId: 'group', nodeId: 'relay' },
+        { groupId: 'group', nodeId: 'relay' }];
+    expectRejected(input, 'GROUP_NOT_INSTALLED');
 });
 
 test('relay-root replacement without any confirmed upstream portal fails before queue', () => {

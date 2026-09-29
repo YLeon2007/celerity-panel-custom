@@ -18,6 +18,7 @@ const snapshot = {
         { pathKey: 'main', linkIds: ['upstream', 'old'], priority: 1, enabled: true },
     ] }],
     activeRouteGroupIds: ['group'], installedRouteGroupIds: ['group'],
+    installedRouteOwners: [{ groupId: 'group', nodeId: 'relay' }],
 };
 
 test('queues a frozen replacement without mutating the installed path', async () => {
@@ -62,6 +63,7 @@ test('queues a frozen replacement without mutating the installed path', async ()
     assert.equal(frozen.oldLinkId,'old');
     assert.equal(frozen.groupId,'group');
     assert.equal(frozen.pathKey,'main');
+    assert.equal(frozen.ownerNodeId,'relay');
     assert.deepEqual(frozen.oldPathLinkIds, ['upstream', 'old']);
     assert.equal(frozen.heldTopologyAdmission,true);
 });
@@ -95,12 +97,13 @@ test('durable replacement identity requires distinct source and target links', a
     const ids = ['a','b','c','d'].map(char => char.repeat(24));
     const base = { topologyRevision:7, priorDeployedRevision:5,
         kind:'link.replace', linkId:ids[0], linkIds:[ids[0],ids[1]],
-        oldLinkId:ids[2], groupId:ids[3], pathKey:'main',
+        oldLinkId:ids[2], groupId:ids[3], pathKey:'main', ownerNodeId:ids[1],
         oldPathLinkIds:[ids[1], ids[2]],
         status:'queued', nodes:[] };
     await new TopologyOperation(base).validate();
     await assert.rejects(new TopologyOperation({...base, oldLinkId:ids[0]}).validate());
     await assert.rejects(new TopologyOperation({...base, groupId:undefined}).validate());
+    await assert.rejects(new TopologyOperation({...base, ownerNodeId:undefined}).validate());
 });
 
 test('frozen insertion retains replacement path identity in the same session', async () => {
@@ -113,11 +116,12 @@ test('frozen insertion retains replacement path identity in the same session', a
     }});
     const input = {operationId:ids[0],topologyRevision:7,priorDeployedRevision:5,
         kind:'link.replace',linkId:ids[1],linkIds:[ids[1]],
-        oldLinkId:ids[2],groupId:ids[3],pathKey:'main',
+        oldLinkId:ids[2],groupId:ids[3],pathKey:'main',ownerNodeId:ids[1],
         oldPathLinkIds:[ids[1],ids[2]],nodes:[],
         heldTopologyAdmission:true,admissionFingerprint:'f'.repeat(64),
         session:{inTransaction:()=>true}};
     await repository.createFrozen(input);
     assert.equal(stored.oldLinkId,ids[2]);
     assert.equal(stored.pathKey,'main');
+    assert.equal(stored.ownerNodeId,ids[1]);
 });

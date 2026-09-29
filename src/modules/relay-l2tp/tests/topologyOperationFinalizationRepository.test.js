@@ -519,7 +519,8 @@ test('an explicit domain.sync keeps the legacy global commit semantics', async (
 });
 
 function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'],
-    newStatus = 'pending', relayStatus = 'installed' } = {}) {
+    newStatus = 'pending', relayStatus = 'installed', relayNode = 'owner',
+    activePathKey = 'main' } = {}) {
     const h = createHarness({ operation: { heldTopologyAdmission: true },
         topology: { topologyAdmissionCount: 1, revision } });
     const group = { paths: [{ pathKey: 'main', linkIds: [...pathIds], enabled: true }] };
@@ -532,7 +533,7 @@ function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'],
         async lean() { return { heldTopologyAdmission: h.store.operation.heldTopologyAdmission,
             kind: 'link.replace', linkId: 'new', linkIds: ['new', 'upstream'],
             oldLinkId: 'old', groupId: 'group', pathKey: 'main',
-            oldPathLinkIds: ['upstream', 'old'] }; },
+            ownerNodeId: 'owner', oldPathLinkIds: ['upstream', 'old'] }; },
     });
     h.repository.CascadeRouteGroup = {
         async updateOne(filter, update, options) {
@@ -551,7 +552,10 @@ function replacementHarness({ revision = 7, pathIds = ['upstream', 'old'],
             assert.equal(filter.desiredState, 'installed');
             assert.deepEqual(update, { $inc: { replacementFence: 1 } });
             assert.strictEqual(options.session, SESSION);
-            return { matchedCount: relayStatus === 'installed' ? 1 : 0 };
+            return { matchedCount: relayStatus === 'installed'
+                && (filter.node === undefined || filter.node === relayNode)
+                && (filter.activePathKey === undefined || filter.activePathKey === activePathKey)
+                ? 1 : 0 };
         },
     };
     h.repository.CascadeLink = {
@@ -608,6 +612,8 @@ test('verified replacement atomically swaps its path and retires only the old li
 
 for (const scenario of [
     { name: 'L2TP group no longer installed', options: { relayStatus: 'queued' } },
+    { name: 'different L2TP owner took over the same group', options: { relayNode: 'other-owner' } },
+    { name: 'installed L2TP owner changed its active path', options: { activePathKey: 'other-path' } },
     { name: 'stale topology revision', options: { revision: 8 } },
     { name: 'changed installed path', options: { pathIds: ['upstream', 'unrelated'] } },
     { name: 'new link already changed', options: { newStatus: 'offline' } },

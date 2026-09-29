@@ -120,6 +120,7 @@ const topologyOperationSchema = new mongoose.Schema({
     oldLinkId: { type: String, match: /^[a-f0-9]{24}$/i },
     groupId: { type: String, match: /^[a-f0-9]{24}$/i },
     pathKey: { type: String, trim: true },
+    ownerNodeId: { type: String, match: /^[a-f0-9]{24}$/i },
     oldPathLinkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     // Only link.apply records whether the frozen plan has a terminal relay.
     staged: { type: Boolean },
@@ -142,7 +143,8 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     const scoped = this.kind !== undefined || this.linkId !== undefined
         || this.linkIds !== undefined || this.staged !== undefined
         || this.oldLinkId !== undefined || this.groupId !== undefined
-        || this.pathKey !== undefined || this.oldPathLinkIds !== undefined;
+        || this.pathKey !== undefined || this.oldPathLinkIds !== undefined
+        || this.ownerNodeId !== undefined;
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
@@ -154,11 +156,13 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
             ? typeof this.oldLinkId !== 'string' || this.oldLinkId === this.linkId
                 || ids.includes(this.oldLinkId) || typeof this.groupId !== 'string'
                 || typeof this.pathKey !== 'string' || !this.pathKey
+                || typeof this.ownerNodeId !== 'string' || !this.ownerNodeId
                 || !Array.isArray(this.oldPathLinkIds) || this.oldPathLinkIds.length < 2
                 || this.oldPathLinkIds.at(-1) !== this.oldLinkId
                 || new Set(this.oldPathLinkIds).size !== this.oldPathLinkIds.length
             : this.oldLinkId !== undefined || this.groupId !== undefined
-                || this.pathKey !== undefined || this.oldPathLinkIds !== undefined)) {
+                || this.pathKey !== undefined || this.oldPathLinkIds !== undefined
+                || this.ownerNodeId !== undefined)) {
         throw new Error('Incomplete scoped topology operation identity');
     }
 });

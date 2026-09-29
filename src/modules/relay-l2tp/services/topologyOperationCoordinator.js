@@ -569,7 +569,8 @@ class TopologyOperationCoordinator {
                         }),
                     });
                     return { topology, frozenPlan,
-                        ...(replacement ? { oldPathLinkIds: replacement.oldPathLinkIds } : {}) };
+                        ...(replacement ? { oldPathLinkIds: replacement.oldPathLinkIds,
+                            ownerNodeId: replacement.ownerNodeId } : {}) };
                 },
                 admit: async (admitted, session) => {
                     admittedPriorDeployedRevision = admitted.deployedRevision;
@@ -588,6 +589,7 @@ class TopologyOperationCoordinator {
                                 oldLinkId: scope.oldLinkId,
                                 groupId: scope.groupId,
                                 pathKey: scope.pathKey,
+                                ownerNodeId: admitted.ownerNodeId,
                                 oldPathLinkIds: [...admitted.oldPathLinkIds],
                             } : {}) }
                         : {};

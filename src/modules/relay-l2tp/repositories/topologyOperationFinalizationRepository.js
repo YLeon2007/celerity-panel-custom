@@ -48,7 +48,7 @@ function rejectFinalization() {
 async function loadOperationScope(TopologyOperation, operationId, session) {
     if (typeof TopologyOperation.findById !== 'function') return null;
     const operation = await TopologyOperation.findById(operationId)
-        .select('kind linkId linkIds staged oldLinkId groupId pathKey oldPathLinkIds')
+        .select('kind linkId linkIds staged oldLinkId groupId pathKey ownerNodeId oldPathLinkIds')
         .session(session)
         .lean();
     if (!operation) return { invalid: true };
@@ -56,7 +56,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
         return operation.linkId === undefined && operation.linkIds === undefined
             && operation.staged === undefined && operation.oldLinkId === undefined
             && operation.groupId === undefined && operation.pathKey === undefined
-            && operation.oldPathLinkIds === undefined
+            && operation.ownerNodeId === undefined && operation.oldPathLinkIds === undefined
             ? null : { invalid: true };
     }
     if (!SCOPED_OPERATION_KINDS.has(operation.kind)
@@ -70,7 +70,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
             ? typeof operation.staged !== 'boolean'
             : operation.staged !== undefined)
         || (operation.kind === 'link.replace'
-            ? !['oldLinkId', 'groupId', 'pathKey'].every(key =>
+            ? !['oldLinkId', 'groupId', 'pathKey', 'ownerNodeId'].every(key =>
                 typeof operation[key] === 'string' && operation[key].length > 0)
                 || operation.oldLinkId === operation.linkId
                 || operation.linkIds.includes(operation.oldLinkId)
@@ -79,14 +79,16 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
                 || operation.oldPathLinkIds.at(-1) !== operation.oldLinkId
                 || new Set(operation.oldPathLinkIds).size !== operation.oldPathLinkIds.length
             : operation.oldLinkId !== undefined || operation.groupId !== undefined
-                || operation.pathKey !== undefined || operation.oldPathLinkIds !== undefined)) {
+                || operation.pathKey !== undefined || operation.ownerNodeId !== undefined
+                || operation.oldPathLinkIds !== undefined)) {
         return { invalid: true };
     }
     return { kind: operation.kind, linkId: operation.linkId,
         linkIds: [...operation.linkIds], staged: operation.staged,
         ...(operation.kind === 'link.replace' ? {
             oldLinkId: operation.oldLinkId, groupId: operation.groupId,
-            pathKey: operation.pathKey, oldPathLinkIds: [...operation.oldPathLinkIds],
+            pathKey: operation.pathKey, ownerNodeId: operation.ownerNodeId,
+            oldPathLinkIds: [...operation.oldPathLinkIds],
         } : {}),
     };
 }
@@ -188,7 +190,8 @@ class TopologyOperationFinalizationRepository {
                     // a concurrent L2TP uninstall/update must conflict rather
                     // than slipping past a snapshot-only status read.
                     const installed = await this.RelayL2tpState.updateOne({
-                        routeGroup: scope.groupId, status: 'installed',
+                        routeGroup: scope.groupId, node: scope.ownerNodeId,
+                        activePathKey: scope.pathKey, status: 'installed',
                         desiredState: 'installed',
                     }, { $inc: { replacementFence: 1 } }, { session });
                     if (installed?.matchedCount !== 1) rejectFinalization();
