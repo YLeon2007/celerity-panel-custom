@@ -115,6 +115,33 @@ test('staged verified intermediate and absent terminal allows exactly one skip r
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
 });
 
+test('staged installed owner accepts verified legacy non-PPP terminal without direct egress', async () => {
+    const { gate, calls } = fixture({
+        RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () =>
+            node === 'node-r'
+                ? { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
+                : { node, status: 'not_installed', desiredState: 'not_installed', secretRevision: 9 }
+        }) }) },
+        L2tpUser: { find: ({ relayNode }) => ({ select: () => ({ lean: async () =>
+            relayNode === 'node-r' ? [{ relayNode, enabled: true, desiredRevision: 41,
+                appliedRevision: 41, syncStatus: 'synced', syncOperationId: 'abcdef012345abcdef012345' }] : []
+        }) }) },
+        L2tpOperation: { findOne: filter => {
+            if (filter.status?.$in) return { select: () => ({ lean: async () => null }) };
+            const operation = { _id: 'abcdef012345abcdef012345', node: 'node-r',
+                kind: 'sync_users', status: 'succeeded', plan: {
+                    operationId: 'abcdef012345abcdef012345', relayId: 'node-r',
+                    desired: { credentialRevision: 41 },
+                } };
+            return { sort: () => ({ select: () => ({ lean: async () => operation }) }) };
+        } },
+    });
+    assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+    assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
+        [['resolve', 'node-r'], ['verify', 'verify-users']]);
+});
+
 test('installed staged terminal still requires node-side verify-users', async () => {
     const calls = [];
     const { gate } = fixture({
@@ -216,7 +243,15 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
         { role: 'relay', node: 'node-t', nodeRef: 'relay-2' },
     ] };
     assert.deepEqual(await make().gate.verifyPlan(stagedTransit),
-        { ok: false, verifiedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+    for (const options of [
+        { users: [{ relayNode: 'node-t' }] },
+        { active: true },
+        { driftRevision: true },
+    ]) {
+        assert.deepEqual(await make(options).gate.verifyPlan(stagedTransit),
+            { ok: false, verifiedRelayCount: 1 });
+    }
     for (const options of [
         { users: [{ relayNode: 'node-t' }] },
         { active: true },
