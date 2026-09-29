@@ -138,6 +138,47 @@ test('non-staged relay without installed PPP fails closed rather than claiming r
     assert.deepEqual(calls, []);
 });
 
+test('explicit non-PPP transit relay with no users or active L2TP work does not block installed owner readback', async () => {
+    const stateByNode = node => node === 'node-r'
+        ? { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
+        : { node, status: 'not_installed', desiredState: 'not_installed' };
+    const baseOperation = { _id: 'abcdef012345abcdef012345', node: 'node-r', kind: 'sync_users',
+        status: 'succeeded', plan: { operationId: 'abcdef012345abcdef012345', relayId: 'node-r',
+            desired: { credentialRevision: 41 } } };
+    const installedUser = { relayNode: 'node-r', enabled: true, desiredRevision: 41,
+        appliedRevision: 41, syncStatus: 'synced', syncOperationId: 'abcdef012345abcdef012345' };
+    const transitPlan = { nodes: [plan.nodes[0], plan.nodes[1],
+        { role: 'relay', node: 'node-t' }, { role: 'bridge', node: 'node-b' }] };
+    const make = (options = {}) => {
+        const { users = [], active = false } = options;
+        return fixture({
+            RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () =>
+                node === 'node-t' && Object.prototype.hasOwnProperty.call(options, 'transitState')
+                    ? options.transitState : stateByNode(node) }) }) },
+            L2tpUser: { find: ({ relayNode }) => ({ select: () => ({ lean: async () =>
+                relayNode === 'node-t' ? users : [installedUser] }) }) },
+            L2tpOperation: { findOne: filter => filter.status?.$in
+                ? { select: () => ({ lean: async () => active ? { _id: 'busy' } : null }) }
+                : { sort: () => ({ select: () => ({ lean: async () => baseOperation }) }) } },
+        });
+    };
+    const ready = make();
+    assert.deepEqual(await ready.gate.verifyPlan(transitPlan),
+        { ok: true, verifiedRelayCount: 1 });
+    assert.deepEqual(ready.calls.map(([action, value]) => [action, value?.command ?? value]),
+        [['resolve', 'node-r'], ['verify', 'verify-users']]);
+    for (const options of [
+        { users: [{ relayNode: 'node-t' }] },
+        { active: true },
+        { transitState: { status: 'installed', desiredState: 'not_installed' } },
+        { transitState: null },
+    ]) {
+        const { gate } = make(options);
+        assert.deepEqual(await gate.verifyPlan(transitPlan),
+            { ok: false, verifiedRelayCount: 1 });
+    }
+});
+
 test('runner unavailable fails closed without leaking remote diagnostics', async () => {
     const { gate } = fixture({ transportResolver: async () => ({ runArtifactCommand: async () => {
         throw new Error('private-ppp-password');
