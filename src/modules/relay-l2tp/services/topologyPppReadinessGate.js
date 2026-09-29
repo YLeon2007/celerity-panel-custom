@@ -55,19 +55,12 @@ class TopologyPppReadinessGate {
                 if (!relayNode) return failed(verifiedRelayCount);
                 const state = await this.RelayL2tpState.findOne({ node: relayNode })
                     .select('node status desiredState secretRevision').lean();
-                // Only an explicitly staged topology may omit PPP installation.
-                // This is a skipped check, not evidence that the relay is ready.
-                if (!state || state.desiredState === 'absent') {
-                    if (plan.staged !== true || node.nodeRef !== terminalRelayRef) return failed(verifiedRelayCount);
-                    skippedRelayCount += 1;
-                    continue;
-                }
                 // A relay used only for transit has no PPP credentials to
                 // read back. Skip it only when explicit durable non-installation,
                 // zero users and no L2TP operation agree; an absent state is not
                 // equivalent to this evidence.
-                if (plan.staged !== true && state.status === 'not_installed'
-                    && state.desiredState === 'not_installed') {
+                if (plan.staged !== true && state?.status === 'not_installed'
+                    && ['absent', 'not_installed'].includes(state.desiredState)) {
                     const users = await this.L2tpUser.find({ relayNode })
                         .select('_id').lean();
                     const activeOperation = await this.L2tpOperation.findOne({
@@ -79,10 +72,17 @@ class TopologyPppReadinessGate {
                         || state.secretRevision < 0
                         || !Array.isArray(users) || users.length !== 0 || activeOperation
                         || current?.status !== 'not_installed'
-                        || current.desiredState !== 'not_installed'
+                        || current.desiredState !== state.desiredState
                         || current.secretRevision !== state.secretRevision) {
                         return failed(verifiedRelayCount);
                     }
+                    continue;
+                }
+                // Missing or desired-absent PPP is tolerated only at the
+                // terminal relay of an explicitly staged chain.
+                if (!state || state.desiredState === 'absent') {
+                    if (plan.staged !== true || node.nodeRef !== terminalRelayRef) return failed(verifiedRelayCount);
+                    skippedRelayCount += 1;
                     continue;
                 }
                 const revision = state.secretRevision;

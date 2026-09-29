@@ -173,6 +173,9 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
         { ok: true, verifiedRelayCount: 1 });
     assert.deepEqual(ready.calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
+    assert.deepEqual(await make({ transitState: {
+        status: 'not_installed', desiredState: 'absent', secretRevision: 9,
+    } }).gate.verifyPlan(transitPlan), { ok: true, verifiedRelayCount: 1 });
     const stagedTransit = { staged: true, nodes: [
         { ...plan.nodes[0], nodeRef: 'portal' },
         { ...plan.nodes[1], nodeRef: 'relay-1' },
