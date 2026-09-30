@@ -82,6 +82,10 @@ services:
       # yet forwarded to ClickHouse live here).
       - ./data:/app/data
       - caddy_data:/caddy_data:ro
+      # TEST synthetic client probe: the host must already have a compatible
+      # executable at this path (verified on TEST). Read-only file bind, no
+      # Docker socket or host namespace; check the host path before `up`.
+      - /usr/local/bin/xray:/usr/local/bin/xray:ro
     env_file:
       - .env
     environment:
