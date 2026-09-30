@@ -862,6 +862,10 @@ test('recovered PPP wait reacquires fresh locks and re-reads revision before pub
         } },
         pppDriftSync: { async enqueue() { throw new Error('already queued'); } },
         finalizer: { async finalizeSucceeded(request) {
+            assert.deepEqual(Object.keys(request).sort(), [
+                'leaseUntil', 'operationId', 'owner', 'pppProof',
+                'priorDeployedRevision', 'topologyRevision',
+            ].sort());
             assert.deepEqual(request.pppProof,
                 [{ relayNode: 'node-b', credentialRevision: 8 }]);
             assert.equal(operation.heldTopologyAdmission, true);

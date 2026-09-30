@@ -24,14 +24,23 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function assertFinalizationInput(input) {
-    if (!hasExactKeys(input, FINALIZATION_INPUT_KEYS)
+    const hasPppProof = Boolean(input) && Object.hasOwn(input, 'pppProof');
+    const expectedKeys = hasPppProof
+        ? [...FINALIZATION_INPUT_KEYS, 'pppProof'].sort()
+        : FINALIZATION_INPUT_KEYS;
+    if (!hasExactKeys(input, expectedKeys)
         || typeof input.operationId !== 'string'
         || input.operationId.length === 0
         || typeof input.owner !== 'string'
         || input.owner.length === 0
         || !validDate(input.leaseUntil)
         || !validRevision(input.topologyRevision)
-        || !validRevision(input.priorDeployedRevision)) {
+        || !validRevision(input.priorDeployedRevision)
+        || (hasPppProof && (!Array.isArray(input.pppProof)
+            || input.pppProof.length === 0
+            || input.pppProof.some(item => !hasExactKeys(item, ['credentialRevision', 'relayNode'])
+                || typeof item.relayNode !== 'string' || item.relayNode.length === 0
+                || !validRevision(item.credentialRevision) || item.credentialRevision < 1)))) {
         throw new TypeError('Invalid topology operation finalization input');
     }
 }

@@ -634,7 +634,7 @@ class TopologyOperationWorker {
                         operationId, owner: this.workerId, leaseUntil,
                         topologyRevision: plan.topologyRevision,
                         priorDeployedRevision: plan.priorDeployedRevision,
-                        now: this.clock.now(), pppProof: proof,
+                        pppProof: proof,
                     });
                     if (finalized) return { claimed: true, operationId, status: 'succeeded' };
                 } catch (error) {

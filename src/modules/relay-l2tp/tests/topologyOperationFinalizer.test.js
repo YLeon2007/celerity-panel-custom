@@ -115,6 +115,25 @@ test('finalizer rejects a scoped result that falsely advances the global revisio
     assert.equal(await finalizer.finalizeSucceeded(request()), null);
 });
 
+test('durable PPP resume forwards only revision proof and obtains now from its own clock', async () => {
+    const calls = [];
+    const proof = [{ relayNode: 'aaaaaaaaaaaaaaaaaaaaaaaa', credentialRevision: 8 }];
+    const finalizer = new TopologyOperationFinalizer({
+        repository: { finalizeSucceeded: async input => {
+            calls.push(input);
+            return { operationId: input.operationId, topologyRevision: input.topologyRevision,
+                deployedRevision: input.priorDeployedRevision, scopeKind: 'link.apply', finishedAt: input.now };
+        } },
+        clock: { now: () => NOW },
+    });
+    assert.deepEqual(await finalizer.finalizeSucceeded(request({ pppProof: proof })), {
+        operationId: 'operation-7', topologyRevision: 7, deployedRevision: 5, finishedAt: NOW,
+    });
+    assert.deepEqual(calls, [{ ...request(), pppProof: proof, now: NOW }]);
+    await assert.rejects(finalizer.finalizeSucceeded(request({ now: NOW, pppProof: proof })),
+        { name: 'TypeError' });
+});
+
 test('rejects operation documents or extra candidate and secret inputs', async () => {
     const calls = [];
     const finalizer = new TopologyOperationFinalizer({
