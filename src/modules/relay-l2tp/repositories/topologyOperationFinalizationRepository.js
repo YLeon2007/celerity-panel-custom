@@ -319,14 +319,24 @@ class TopologyOperationFinalizationRepository {
                         secretRevision: scope.ownerCredentialRevision,
                     }, { $inc: { replacementFence: 1 } }, { session });
                     if (installed?.matchedCount !== 1) rejectFinalization();
-                    // Never append or replace a route: only the exact empty
-                    // group can become the sole, enabled main path.
+                    // Only an empty group or its sole enabled empty main path
+                    // may be published. Keep the existing path's metadata when
+                    // filling it; both alternatives CAS within this transaction.
                     const group = await this.CascadeRouteGroup.updateOne({
                         _id: scope.groupId, paths: [],
                     }, { $set: { paths: [{ pathKey: scope.pathKey,
                         linkIds: scope.newPathLinkIds, priority: 1, enabled: true }] } },
                     { runValidators: true, session });
-                    if (group?.matchedCount !== 1) rejectFinalization();
+                    if (group?.matchedCount !== 1) {
+                        const existing = await this.CascadeRouteGroup.updateOne({
+                            _id: scope.groupId, paths: { $size: 1 },
+                            'paths.0.pathKey': scope.pathKey,
+                            'paths.0.linkIds': [],
+                            'paths.0.enabled': { $ne: false },
+                        }, { $set: { 'paths.0.linkIds': scope.newPathLinkIds } },
+                        { runValidators: true, session });
+                        if (existing?.matchedCount !== 1) rejectFinalization();
+                    }
                     const suffix = await this.CascadeLink.updateMany({
                         _id: { $in: [scope.linkId] }, active: true,
                         status: { $in: ['pending'] },

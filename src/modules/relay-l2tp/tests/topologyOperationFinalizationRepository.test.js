@@ -625,3 +625,125 @@ for (const scenario of [
         assert.deepEqual({ store: h.store, group, links }, before);
     });
 }
+
+function emptyMainAttachHarness(paths, { terminalStatus = 'pending' } = {}) {
+    const h = createHarness({ operation: { heldTopologyAdmission: true },
+        topology: { topologyAdmissionCount: 1 } });
+    const group = { _id: 'group', paths: clone(paths) };
+    const owner = { routeGroup: 'group', node: 'relay', activePathKey: 'main',
+        status: 'installed', desiredState: 'installed', appliedTopologyRevision: 5,
+        secretRevision: 11, replacementFence: 0 };
+    const links = [
+        { _id: 'portal-relay', portalNode: 'portal', bridgeNode: 'relay', active: true, status: 'staged' },
+        { _id: 'relay-next', portalNode: 'relay', bridgeNode: 'next', active: true, status: 'staged' },
+        { _id: 'next-bridge', portalNode: 'next', bridgeNode: 'bridge', active: true, status: terminalStatus },
+        { _id: 'foreign', portalNode: 'other', bridgeNode: 'elsewhere', active: true, status: 'pending' },
+    ];
+    const groupWrites = [];
+    h.repository.TopologyOperation.findById = () => ({
+        select() { return this; }, session(session) { assert.strictEqual(session, SESSION); return this; },
+        async lean() { return { heldTopologyAdmission: h.store.operation.heldTopologyAdmission,
+            kind: 'link.attach', linkId: 'next-bridge',
+            linkIds: ['next-bridge', 'portal-relay', 'relay-next'],
+            newPathLinkIds: ['relay-next', 'next-bridge'],
+            groupId: 'group', pathKey: 'main', ownerNodeId: 'relay',
+            ownerTopologyRevision: 5, ownerCredentialRevision: 11 }; },
+    });
+    h.repository.RelayL2tpState = {
+        async updateOne(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            if (!matches(owner, filter)) return { matchedCount: 0 };
+            applySet(owner, update);
+            return { matchedCount: 1 };
+        },
+    };
+    h.repository.CascadeRouteGroup = {
+        async updateOne(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            groupWrites.push({ filter, update, options });
+            if (filter._id !== group._id) return { matchedCount: 0 };
+            if (Array.isArray(filter.paths) && filter.paths.length === 0) {
+                if (group.paths.length !== 0) return { matchedCount: 0 };
+                group.paths = clone(update.$set.paths);
+                return { matchedCount: 1 };
+            }
+            assert.deepEqual(filter, { _id: 'group', paths: { $size: 1 },
+                'paths.0.pathKey': 'main', 'paths.0.linkIds': [],
+                'paths.0.enabled': { $ne: false } });
+            if (group.paths.length !== 1 || group.paths[0].pathKey !== 'main'
+                || group.paths[0].enabled === false || group.paths[0].linkIds.length !== 0) {
+                return { matchedCount: 0 };
+            }
+            assert.deepEqual(Object.keys(update.$set), ['paths.0.linkIds']);
+            group.paths[0].linkIds = clone(update.$set['paths.0.linkIds']);
+            return { matchedCount: 1 };
+        },
+    };
+    h.repository.CascadeLink = {
+        find(filter) { return {
+            select() { return this; }, session(session) { assert.strictEqual(session, SESSION); return this; },
+            async lean() { return clone(links.filter(link => filter._id.$in.includes(link._id))); },
+        }; },
+        async updateMany(filter, update, options) {
+            assert.strictEqual(options.session, SESSION);
+            const selected = links.filter(link => filter._id.$in.includes(link._id)
+                && link.active === filter.active && filter.status.$in.includes(link.status));
+            for (const link of selected) Object.assign(link, clone(update.$set));
+            return { matchedCount: selected.length };
+        },
+    };
+    const run = h.repository.transactionRunner;
+    h.repository.transactionRunner = async work => {
+        const before = clone({ group, owner, links });
+        try { return await run(work); }
+        catch (error) {
+            Object.assign(group, before.group);
+            Object.assign(owner, before.owner);
+            links.splice(0, links.length, ...before.links);
+            throw error;
+        }
+    };
+    return { h, group, owner, links, groupWrites };
+}
+
+test('attach atomically fills the sole enabled empty main path without replacing its metadata or unrelated state', async () => {
+    const original = { pathKey: 'main', linkIds: [], priority: 4, enabled: true };
+    const { h, group, owner, links, groupWrites } = emptyMainAttachHarness([original]);
+    const result = await h.repository.finalizeSucceeded(request());
+    assert.equal(result?.scopeKind, 'link.attach');
+    assert.deepEqual(group.paths, [{ ...original, linkIds: ['relay-next', 'next-bridge'] }]);
+    assert.equal(owner.replacementFence, 1);
+    assert.deepEqual(links.map(link => link.status), ['deployed', 'deployed', 'deployed', 'pending']);
+    assert.equal(h.store.operation.status, 'succeeded');
+    assert.equal(h.store.operation.heldTopologyAdmission, false);
+    assert.equal(h.store.topology.topologyAdmissionCount, 0);
+    assert.equal(h.store.topology.deployedRevision, 5);
+    assert.equal(groupWrites.length, 2, 'CAS must try only the empty group and the sole empty main path');
+    assert.equal(await h.repository.finalizeSucceeded(request()), null, 'replay cannot publish twice');
+});
+
+test('attach rolls back filling an empty main path if the terminal link changes', async () => {
+    const { h, group, owner, links, groupWrites } = emptyMainAttachHarness(
+        [{ pathKey: 'main', linkIds: [], priority: 4, enabled: true }],
+        { terminalStatus: 'offline' },
+    );
+    const before = clone({ store: h.store, group, owner, links });
+    assert.equal(await h.repository.finalizeSucceeded(request()), null);
+    assert.equal(groupWrites.length, 2, 'the path was filled before link CAS failed');
+    assert.deepEqual({ store: h.store, group, owner, links }, before);
+});
+
+for (const [name, paths] of [
+    ['nonempty main path', [{ pathKey: 'main', linkIds: ['foreign'], priority: 4, enabled: true }]],
+    ['extra path', [{ pathKey: 'main', linkIds: [], priority: 4, enabled: true },
+        { pathKey: 'other', linkIds: ['foreign'], priority: 5, enabled: true }]],
+    ['disabled main path', [{ pathKey: 'main', linkIds: [], priority: 4, enabled: false }]],
+    ['different empty path', [{ pathKey: 'other', linkIds: [], priority: 4, enabled: true }]],
+]) {
+    test(`attach rejects ${name} without partial publication`, async () => {
+        const { h, group, owner, links } = emptyMainAttachHarness(paths);
+        const before = clone({ store: h.store, group, owner, links });
+        assert.equal(await h.repository.finalizeSucceeded(request()), null);
+        assert.deepEqual({ store: h.store, group, owner, links }, before);
+    });
+}
