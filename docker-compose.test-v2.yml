@@ -1,0 +1,12 @@
+# TEST-only opt-in: combine with docker-compose.yml; never use on PROD.
+services:
+  backend:
+    volumes:
+      - type: bind
+        source: /usr/local/bin/xray
+        target: /usr/local/bin/xray
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      TOPOLOGY_PROBE_USER_ID: ${TOPOLOGY_PROBE_USER_ID:-}
