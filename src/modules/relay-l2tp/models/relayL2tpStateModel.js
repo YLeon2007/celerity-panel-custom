@@ -38,6 +38,9 @@ const relayL2tpStateSchema = new mongoose.Schema({
     pskEncrypted: { type: String, default: '', select: false },
     pskHint: { type: String, default: '' },
     secretRevision: { type: Number, default: 0 },
+    // Written with a PPP drift operation in one transaction. User credential
+    // edits write this document too, so MongoDB detects concurrent changes.
+    pppDriftQueueFence: { type: Number, default: 0 },
 
     clientCidr: { type: String, default: '10.66.0.0/24' },
     localAddress: { type: String, default: '10.66.0.1' },

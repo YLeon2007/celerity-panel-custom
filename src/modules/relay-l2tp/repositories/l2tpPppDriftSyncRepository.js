@@ -22,8 +22,9 @@ function syncPlan(operationId, relayNode, credentialRevision) {
 
 class L2tpPppDriftSyncRepository {
     constructor({ RelayL2tpState, L2tpOperation,
-        operationIdFactory = () => randomBytes(12).toString('hex') } = {}) {
+        operationIdFactory = () => randomBytes(12).toString('hex'), transactionRunner } = {}) {
         if (typeof RelayL2tpState?.findOne !== 'function'
+            || typeof RelayL2tpState?.findOneAndUpdate !== 'function'
             || typeof L2tpOperation?.findOne !== 'function'
             || typeof L2tpOperation?.countDocuments !== 'function'
             || typeof L2tpOperation?.create !== 'function'
@@ -33,6 +34,9 @@ class L2tpPppDriftSyncRepository {
         this.RelayL2tpState = RelayL2tpState;
         this.L2tpOperation = L2tpOperation;
         this.operationIdFactory = operationIdFactory;
+        this.transactionRunner = transactionRunner
+            ?? (typeof RelayL2tpState.db?.transaction === 'function'
+                ? work => RelayL2tpState.db.transaction(work) : null);
     }
 
     /**
@@ -48,6 +52,9 @@ class L2tpPppDriftSyncRepository {
             || !Number.isSafeInteger(retryIntervalMs) || retryIntervalMs < 0) {
             throw new TypeError('Invalid PPP drift SYNC request');
         }
+        // A nontransactional fallback would allow a user edit between the
+        // revision check and insertion. Fail closed on standalone MongoDB.
+        if (typeof this.transactionRunner !== 'function') return { status: 'unavailable' };
         const state = await this.RelayL2tpState.findOne({ node: relayNode })
             .select('node status desiredState secretRevision').lean();
         const revision = state?.secretRevision;
@@ -90,25 +97,33 @@ class L2tpPppDriftSyncRepository {
                 return { status: 'cooldown', attempts };
             }
         }
-        // Refuse a snapshot already superseded while reading durable history.
-        // This does not replace a transaction fence against subsequent edits.
-        const current = await this.RelayL2tpState.findOne({ node: relayNode })
-            .select('status desiredState secretRevision').lean();
-        if (current?.status !== 'installed' || current.desiredState !== 'installed'
-            || current.secretRevision !== revision) return { status: 'unavailable' };
         const operationId = this.operationIdFactory();
         const idempotencyKey = `${prefix}${attempts + 1}`;
         try {
-            await this.L2tpOperation.create([{
-                _id: operationId,
-                node: relayNode,
-                kind: 'sync_users',
-                status: 'queued',
-                idempotencyKey,
-                progress: 0,
-                attempts: 0,
-                plan: syncPlan(operationId, relayNode, revision),
-            }]);
+            return await this.transactionRunner(async session => {
+                if (!session) throw new Error('PPP drift SYNC requires a MongoDB transaction session');
+                // Every credential edit increments secretRevision on this same
+                // document. This write conflicts if an edit committed first,
+                // and locks the document until the operation insert commits.
+                const fenced = await this.RelayL2tpState.findOneAndUpdate({
+                    node: relayNode, status: 'installed', desiredState: 'installed',
+                    secretRevision: revision,
+                }, { $inc: { pppDriftQueueFence: 1 } },
+                { session, new: true, upsert: false })
+                    .select('secretRevision').lean();
+                if (!fenced) return { status: 'unavailable' };
+                await this.L2tpOperation.create([{
+                    _id: operationId,
+                    node: relayNode,
+                    kind: 'sync_users',
+                    status: 'queued',
+                    idempotencyKey,
+                    progress: 0,
+                    attempts: 0,
+                    plan: syncPlan(operationId, relayNode, revision),
+                }], { session });
+                return { status: 'queued', operationId, attempts: attempts + 1 };
+            });
         } catch (error) {
             // The unique idempotency index is the cross-process CAS. Only a
             // duplicate of *our* key is an idempotent race; other errors fail.
@@ -119,7 +134,6 @@ class L2tpPppDriftSyncRepository {
             if (!winner) throw error;
             return { status: 'active', operationId: String(winner._id), attempts: attempts + 1 };
         }
-        return { status: 'queued', operationId, attempts: attempts + 1 };
     }
 }
 

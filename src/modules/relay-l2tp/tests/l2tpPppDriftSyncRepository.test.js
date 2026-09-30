@@ -12,11 +12,25 @@ const now = new Date('2026-09-30T12:00:00.000Z');
 function fixture() {
     const operations = [];
     const calls = [];
-    const state = { node: relayNode, status: 'installed', desiredState: 'installed', secretRevision: revision };
+    const state = { node: relayNode, status: 'installed', desiredState: 'installed', secretRevision: revision,
+        pppDriftQueueFence: 0 };
     const RelayL2tpState = {
         findOne(filter) {
             calls.push({ method: 'state.findOne', filter });
             return { select() { return this; }, lean: async () => ({ ...state }) };
+        },
+        findOneAndUpdate(filter, update, options) {
+            calls.push({ method: 'state.findOneAndUpdate', filter, update, options });
+            return { select() { return this; }, lean: async () => {
+                assert.ok(options.session?.active);
+                assert.deepEqual(update, { $inc: { pppDriftQueueFence: 1 } });
+                if (state.node !== filter.node || state.status !== filter.status
+                    || state.desiredState !== filter.desiredState
+                    || state.secretRevision !== filter.secretRevision) return null;
+                options.session.revision = state.secretRevision;
+                options.session.fence = 1;
+                return { secretRevision: state.secretRevision };
+            } };
         },
     };
     const L2tpOperation = {
@@ -32,25 +46,48 @@ function fixture() {
             return Promise.resolve(operations.filter(op => op.node === filter.node
                 && op.kind === filter.kind && filter.idempotencyKey.test(op.idempotencyKey)).length);
         },
-        async create(documents) {
-            calls.push({ method: 'operation.create', documents });
+        async create(documents, options) {
+            calls.push({ method: 'operation.create', documents, options });
+            assert.ok(options.session?.active);
+            assert.equal(options.session.fence, 1, 'state write precedes insert in the same session');
             for (const document of documents) {
                 const op = new L2tpOperationModel(document);
                 await op.validate();
-                if (operations.some(existing => existing.idempotencyKey === document.idempotencyKey)) {
-                    throw Object.assign(new Error('duplicate key'), { code: 11000, keyPattern: { idempotencyKey: 1 } });
-                }
-                operations.push({ ...document, createdAt: now });
+                options.session.pending.push({ ...document, createdAt: now });
             }
             return documents;
         },
     };
+    async function transactionRunner(work) {
+        for (let retry = 0; retry < 2; retry += 1) {
+            const session = { active: true, pending: [], fence: 0 };
+            try {
+                const result = await work(session);
+                if (session.fence && state.secretRevision !== session.revision) {
+                    throw Object.assign(new Error('write conflict'), { code: 112 });
+                }
+                for (const op of session.pending) {
+                    if (operations.some(existing => existing.idempotencyKey === op.idempotencyKey)) {
+                        throw Object.assign(new Error('duplicate key'),
+                            { code: 11000, keyPattern: { idempotencyKey: 1 } });
+                    }
+                }
+                state.pppDriftQueueFence += session.fence;
+                operations.push(...session.pending);
+                return result;
+            } catch (error) {
+                if (error.code !== 112 || retry === 1) throw error;
+            } finally {
+                session.active = false;
+            }
+        }
+    }
     let nextId = 12;
     function makeRepository() {
-        return new L2tpPppDriftSyncRepository({ RelayL2tpState, L2tpOperation,
+        return new L2tpPppDriftSyncRepository({ RelayL2tpState, L2tpOperation, transactionRunner,
             operationIdFactory: () => `507f1f77bcf86cd7994390${nextId++}` });
     }
-    return { operations, calls, state, L2tpOperation, makeRepository };
+    return { operations, calls, state, RelayL2tpState, L2tpOperation, makeRepository };
 }
 
 test('enqueues a model-valid revision-keyed drift SYNC without credential material', async () => {
@@ -113,6 +150,64 @@ test('rejects a revision superseded during durable attempt lookup', async () => 
     };
     assert.deepEqual(await makeRepository().enqueue({ relayNode, now }), { status: 'unavailable' });
     assert.equal(operations.length, 0);
+});
+
+test('user edit between last state read and queue insert cannot enqueue stale PPP credentials', async () => {
+    const { operations, state, RelayL2tpState, makeRepository } = fixture();
+    const fence = RelayL2tpState.findOneAndUpdate;
+    RelayL2tpState.findOneAndUpdate = (...args) => {
+        // A user edit commits after the history read but before the
+        // transactional CAS. A stale operation must not be inserted.
+        state.secretRevision += 1;
+        return fence(...args);
+    };
+    const result = await makeRepository().enqueue({ relayNode, now });
+    assert.deepEqual(result, { status: 'unavailable' });
+    assert.equal(operations.length, 0);
+    assert.equal(state.pppDriftQueueFence, 0);
+});
+
+test('a conflicting user edit during the transaction rolls back the operation and fence', async () => {
+    const { operations, state, L2tpOperation, makeRepository } = fixture();
+    const create = L2tpOperation.create;
+    let edited = false;
+    L2tpOperation.create = async (...args) => {
+        if (!edited) {
+            // A separate writer attempts to change the same state document.
+            // The transaction runner models the resulting write conflict and
+            // retries against the now-superseded revision.
+            state.secretRevision += 1;
+            edited = true;
+        }
+        return create(...args);
+    };
+    assert.deepEqual(await makeRepository().enqueue({ relayNode, now }), { status: 'unavailable' });
+    assert.equal(operations.length, 0);
+    assert.equal(state.pppDriftQueueFence, 0);
+});
+
+test('insert failure aborts the state fence and a new instance can retry', async () => {
+    const { operations, state, L2tpOperation, makeRepository } = fixture();
+    const create = L2tpOperation.create;
+    L2tpOperation.create = async (...args) => {
+        await create(...args);
+        throw new Error('insert interrupted');
+    };
+    await assert.rejects(makeRepository().enqueue({ relayNode, now }), /insert interrupted/);
+    assert.equal(operations.length, 0);
+    assert.equal(state.pppDriftQueueFence, 0);
+    L2tpOperation.create = create;
+    assert.equal((await makeRepository().enqueue({ relayNode, now })).status, 'queued');
+    assert.equal(operations.length, 1);
+    assert.equal(state.pppDriftQueueFence, 1);
+});
+
+test('without a transaction runner no state or operation is written', async () => {
+    const { operations, state, RelayL2tpState, L2tpOperation } = fixture();
+    const repository = new L2tpPppDriftSyncRepository({ RelayL2tpState, L2tpOperation });
+    assert.deepEqual(await repository.enqueue({ relayNode, now }), { status: 'unavailable' });
+    assert.equal(operations.length, 0);
+    assert.equal(state.pppDriftQueueFence, 0);
 });
 
 test('a new credential revision has a fresh durable retry budget', async () => {
