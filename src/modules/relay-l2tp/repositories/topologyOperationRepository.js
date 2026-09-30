@@ -128,13 +128,14 @@ function durableNodeMetadata(node) {
 }
 
 class TopologyOperationRepository {
-    constructor({ model } = {}) {
+    constructor({ model, topologyStateModel } = {}) {
         if (!model || typeof model.create !== 'function'
             || typeof model.findOneAndUpdate !== 'function'
             || typeof model.updateOne !== 'function') {
             throw new TypeError('Topology operation repository requires a durable model');
         }
         this.model = model;
+        this.topologyStateModel = topologyStateModel;
     }
 
     async createFrozen({
@@ -221,6 +222,11 @@ class TopologyOperationRepository {
             } : {}),
             status: 'queued',
             clientReadiness: 'unverified',
+            clientProofAttempts: 0,
+            clientProofRetryAfter: null,
+            clientProofLeaseOwner: '',
+            clientProofLeaseUntil: null,
+            clientProofState: 'active_unverified',
             ...(heldTopologyAdmission === true
                 ? { heldTopologyAdmission: true, admissionFingerprint } : {}),
             attempts: 0,
@@ -253,16 +259,94 @@ class TopologyOperationRepository {
 
     async findPublicById(operationId) {
         const operation = await this.model.findById(operationId)
-            .select('status topologyRevision clientReadiness')
+            .select('status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason')
             .lean();
         if (!operation) return null;
+        const verified = operation.status === 'succeeded'
+            && operation.clientReadiness === 'verified'
+            && Number.isSafeInteger(operation.clientProofRevision)
+            && operation.clientProofRevision === operation.topologyRevision
+            && await this.isLiveRevision(operation.topologyRevision);
         // A missing legacy field (or unexpected persisted value) is never a
         // client-ready claim; status:succeeded remains execution-only.
         return {
-            ...operation,
-            clientReadiness: operation.status === 'succeeded'
-                && operation.clientReadiness === 'verified' ? 'verified' : 'unverified',
+            status: operation.status,
+            topologyRevision: operation.topologyRevision,
+            clientReadiness: verified ? 'verified' : 'unverified',
+            ...(operation.status === 'succeeded' && operation.clientProofState
+                && !verified ? { clientProofState: operation.clientProofState,
+                    ...(!operation.clientProofReason ? {} : { clientProofReason: operation.clientProofReason }) }
+                : {}),
         };
+    }
+
+    async isLiveRevision(revision) {
+        if (!Number.isSafeInteger(revision) || !this.topologyStateModel?.findById) return false;
+        try {
+            const live = await this.topologyStateModel.findById('singleton')
+                .select('revision deployedRevision').lean();
+            return live?.revision === revision && live?.deployedRevision === revision;
+        } catch (_) {
+            return false; // Missing or unreadable state cannot attest a client path.
+        }
+    }
+
+    async claimNextClientProof({ owner, now, leaseMs = 120000, maxAttempts = 3 }) {
+        if (!owner || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3
+            || !Number.isSafeInteger(leaseMs) || leaseMs < 1000) {
+            throw new TypeError('Invalid client proof claim');
+        }
+        const leaseUntil = new Date(now.getTime() + leaseMs);
+        return this.model.findOneAndUpdate({
+            status: 'succeeded',
+            clientReadiness: 'unverified',
+            clientProofAttempts: { $exists: true, $gte: 0, $lt: maxAttempts },
+            $and: [
+                { $or: [{ clientProofRetryAfter: { $lte: now } }, { clientProofRetryAfter: null }] },
+                { $or: [{ clientProofLeaseUntil: { $lte: now } }, { clientProofLeaseUntil: null }] },
+            ],
+        }, {
+            $set: { clientProofLeaseOwner: owner,
+                clientProofLeaseUntil: leaseUntil,
+                // Skip leased rows in the due-time index; after a crash both
+                // retry time and lease become eligible together.
+                clientProofRetryAfter: leaseUntil },
+            $inc: { clientProofAttempts: 1 },
+        }, {
+            new: true, lean: true, runValidators: true, sort: { clientProofRetryAfter: 1 },
+            projection: { _id: 1, status: 1, topologyRevision: 1, kind: 1,
+                linkId: 1, linkIds: 1, clientProofAttempts: 1,
+                clientProofLeaseOwner: 1, clientProofLeaseUntil: 1 },
+        });
+    }
+
+    async completeClientProof({ operation, owner, now, passed, reason, retryMs = 60000,
+        maxAttempts = 3 }) {
+        if (passed !== true && !['probe_failed', 'probe_unavailable', 'revision_stale'].includes(reason)) {
+            throw new TypeError('Client proof requires a safe reason code');
+        }
+        // Check immediately before CAS. Public reads independently recheck live state.
+        const live = passed === true && await this.isLiveRevision(operation.topologyRevision);
+        const verified = passed === true && live;
+        const safeReason = verified ? undefined : passed === true ? 'revision_stale' : reason;
+        const exhausted = operation.clientProofAttempts >= maxAttempts;
+        const result = await this.model.updateOne({
+            _id: operation._id, status: 'succeeded', clientReadiness: 'unverified',
+            topologyRevision: operation.topologyRevision,
+            clientProofAttempts: operation.clientProofAttempts,
+            clientProofLeaseOwner: owner,
+            clientProofLeaseUntil: { $gt: now },
+        }, verified ? { $set: {
+            clientReadiness: 'verified', clientProofRevision: operation.topologyRevision,
+            clientProofLeaseOwner: '', clientProofLeaseUntil: null,
+            clientProofRetryAfter: null,
+        }, $unset: { clientProofState: 1, clientProofReason: 1 } } : { $set: {
+            clientReadiness: 'unverified', clientProofState: exhausted ? 'degraded' : 'active_unverified',
+            clientProofReason: exhausted ? 'retry_exhausted' : safeReason,
+            clientProofRetryAfter: new Date(now.getTime() + retryMs),
+            clientProofLeaseOwner: '', clientProofLeaseUntil: null,
+        } }, { runValidators: true });
+        return result.matchedCount === 1 ? (verified ? 'verified' : 'unverified') : null;
     }
 
     async claim({ operationId: id, owner, leaseMs, now }) {

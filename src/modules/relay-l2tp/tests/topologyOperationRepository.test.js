@@ -9,6 +9,11 @@ const {
 } = require('../repositories/topologyOperationRepository');
 const TopologyOperation = require('../models/topologyOperationModel');
 const ADMISSION_FINGERPRINT = 'a'.repeat(64);
+const PROOF_INITIAL = Object.freeze({
+    clientProofAttempts: 0, clientProofRetryAfter: null,
+    clientProofLeaseOwner: '', clientProofLeaseUntil: null,
+    clientProofState: 'active_unverified',
+});
 const ATTACH_IDS = Object.freeze({
     portal: '000000000000000000000001',
     relay: '000000000000000000000002',
@@ -57,6 +62,7 @@ test('link.attach freezes owner epochs and ordered suffix in a transactional cre
         topologyRevision: 7, priorDeployedRevision: 5,
         ...ATTACH_SCOPE,
         status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
+        ...PROOF_INITIAL,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
     });
@@ -214,6 +220,18 @@ test('client readiness is durable and separate from execution status', async () 
     }
 });
 
+test('legacy model defaults never synthesize proof eligibility or a verified revision', async () => {
+    const legacy = new TopologyOperation({ topologyRevision: 7,
+        priorDeployedRevision: 5, status: 'succeeded', nodes: [] });
+    assert.equal(legacy.clientProofAttempts, undefined);
+    assert.equal(legacy.clientProofRevision, undefined);
+    legacy.clientReadiness = 'verified';
+    await assert.rejects(legacy.validate(), /proof for frozen topology revision/);
+    const [proofIndex] = TopologyOperation.schema.indexes().filter(([, options]) =>
+        options.partialFilterExpression?.clientProofAttempts);
+    assert.deepEqual(proofIndex[1].partialFilterExpression.clientProofAttempts, { $lt: 3 });
+});
+
 test('public operation read fails closed on legacy missing or malformed readiness', async () => {
     let projection;
     let stored;
@@ -234,9 +252,11 @@ test('public operation read fails closed on legacy missing or malformed readines
             status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified',
         });
     }
-    assert.equal(projection, 'status topologyRevision clientReadiness');
+    assert.equal(projection, 'status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason');
     stored = { status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified' };
-    assert.deepEqual(await repository.findPublicById('operation-1'), stored);
+    assert.deepEqual(await repository.findPublicById('operation-1'), {
+        ...stored, clientReadiness: 'unverified',
+    });
     stored = { status: 'committing', topologyRevision: 7, clientReadiness: 'verified' };
     assert.deepEqual(await repository.findPublicById('operation-1'), {
         status: 'committing', topologyRevision: 7, clientReadiness: 'unverified',
@@ -282,7 +302,7 @@ test('findPublicById returns only the public status projection', async () => {
     };
     const repository = new TopologyOperationRepository({ model });
     const result = await repository.findPublicById('operation-dup');
-    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision clientReadiness' });
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason' });
     assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified' });
 });
 
@@ -439,6 +459,7 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
         staged: true,
         status: 'queued',
         clientReadiness: 'unverified',
+        ...PROOF_INITIAL,
         heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,
@@ -511,6 +532,7 @@ test('createFrozen propagates session insert rejection without an unscoped fallb
     assert.deepEqual(model.calls[0], [[{
         _id: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
         status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
+        ...PROOF_INITIAL,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
     }], { session }]);
@@ -578,6 +600,7 @@ test('createFrozen durably preserves composer deployment order without sorting b
         priorDeployedRevision: 5,
         status: 'queued',
         clientReadiness: 'unverified',
+        ...PROOF_INITIAL,
         heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,

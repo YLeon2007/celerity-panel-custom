@@ -145,6 +145,14 @@ const topologyOperationSchema = new mongoose.Schema({
         default: 'unverified',
         required: true,
     },
+    // Explicit only on new operations; legacy rows are not scheduled for proof.
+    clientProofAttempts: { type: Number, min: 0, max: 3 },
+    clientProofRetryAfter: { type: Date, default: undefined },
+    clientProofLeaseOwner: { type: String, default: undefined },
+    clientProofLeaseUntil: { type: Date, default: undefined },
+    clientProofRevision: { type: Number, min: 0 },
+    clientProofState: { type: String, enum: ['active_unverified', 'degraded'] },
+    clientProofReason: { type: String, enum: ['probe_unavailable', 'probe_failed', 'revision_stale', 'retry_exhausted'] },
     attempts: { type: Number, min: 0, default: 0, required: true },
     leaseOwner: { type: String, default: '', trim: true },
     leaseUntil: { type: Date, default: null },
@@ -155,6 +163,11 @@ const topologyOperationSchema = new mongoose.Schema({
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     if (this.clientReadiness === 'verified' && this.status !== 'succeeded') {
         throw new Error('Client readiness requires successful execution');
+    }
+    if (this.clientReadiness === 'verified'
+        && (!Number.isSafeInteger(this.clientProofRevision)
+            || this.clientProofRevision !== this.topologyRevision)) {
+        throw new Error('Client readiness requires proof for frozen topology revision');
     }
     const scoped = this.kind !== undefined || this.linkId !== undefined
         || this.linkIds !== undefined || this.staged !== undefined
@@ -202,5 +215,11 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
         throw new Error('Incomplete scoped topology operation identity');
     }
 });
+
+topologyOperationSchema.index(
+    { status: 1, clientReadiness: 1, clientProofRetryAfter: 1, clientProofLeaseUntil: 1 },
+    { partialFilterExpression: { status: 'succeeded', clientReadiness: 'unverified',
+        clientProofAttempts: { $lt: 3 } } },
+);
 
 module.exports = mongoose.model('TopologyOperation', topologyOperationSchema);
