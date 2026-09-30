@@ -93,12 +93,36 @@
         return !['succeeded', 'failed', 'rolled_back'].includes(state.status);
     }
 
+    const CLIENT_READINESS_UNVERIFIED = 'Готовность клиента не подтверждена';
+
+    // Optional UI projection only: an applied topology or green edge is not
+    // client evidence. Until the API supplies a revision-bound successful
+    // probe, the drawer explicitly reports unknown rather than inferring ready.
+    function clientReadinessMessage(proof, topologyRevision, deployedRevision) {
+        if (Number.isSafeInteger(topologyRevision) && topologyRevision >= 0
+            && topologyRevision === deployedRevision
+            && proof?.topologyRevision === topologyRevision
+            && proof.status === 'ready' && proof.clientProbe === 'passed') {
+            return 'Готовность подтверждена проверкой клиента';
+        }
+        return CLIENT_READINESS_UNVERIFIED;
+    }
+
+    function deployResultMessage(result, labels = {}) {
+        const outcome = result.status === 'succeeded'
+            ? (labels.deployAlreadyDeployed || 'Topology already deployed')
+            : (labels.deployQueued || 'Deployment queued');
+        return outcome + ' — ' + (labels.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED);
+    }
+
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             CREATE_DEFAULT_FINGERPRINT,
             OPERATION_POLL_INTERVAL_MS,
             OPERATION_POLL_MAX_ATTEMPTS,
             TOPOLOGY_CAUSE_TEXT_RU,
+            clientReadinessMessage,
+            deployResultMessage,
             describeTopologyError,
             fingerprintForLinkEdit,
             resolveRealityFingerprint,
@@ -335,6 +359,7 @@
                     if (ele.length) {
                         ele.data('status', e.data.status);
                         ele.data('latencyMs', e.data.latencyMs);
+                        ele.data('clientReadiness', e.data.clientReadiness);
                     }
                 }
             });
@@ -846,6 +871,8 @@
             '</div>' +
             field(i18n.drawerStatus || 'Status',
                 '<div class="info-status ' + sc + '">\u25CF ' + (d.status || 'pending') + '</div>') +
+            field('ti-shield-check', 'Готовность клиента',
+                escHtml(clientReadinessMessage(d.clientReadiness, topologyRevision, deployedRevision))) +
             field(i18n.linkMode || 'Mode', modeLabel) +
             field('ti-plug',           i18n.drawerTunnelPort        || 'Tunnel Port',         d.tunnelPort || '—') +
             field('ti-arrows-exchange',i18n.drawerProtocolTransport || 'Protocol / Transport',
@@ -1342,19 +1369,13 @@
         showToast(
             applied
                 ? state.kind === 'link.apply'
-                    ? 'Связь установлена; готовность полной цепочки ещё не подтверждена'
-                    : (i18n.operationApplied || 'Деплой завершён: топология применена')
+                    ? 'Связь установлена; готовность полной цепочки ещё не подтверждена; готовность клиента не подтверждена'
+                    : (i18n.operationApplied || 'Деплой завершён: топология применена') + ' — готовность клиента не подтверждена'
                 : status === 'failed' || status === 'rolled_back'
                     ? (i18n.deployFailed || 'Деплой не выполнен') + ': ' + status
                     : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
             applied ? 'success' : 'error',
         );
-    }
-
-    function deployResultMessage(result) {
-        return result.status === 'succeeded'
-            ? (i18n.deployAlreadyDeployed || 'Topology already deployed')
-            : (i18n.deployQueued || 'Deployment queued');
     }
 
     window._cascadeDeploy = async function (linkId) {
@@ -1367,7 +1388,7 @@
 
         try {
             const result = await deployTopology(linkId);
-            showToast(deployResultMessage(result));
+            showToast(deployResultMessage(result, i18n));
             loadTopology();
             closeInfoModal();
         } catch (err) {
@@ -1385,7 +1406,7 @@
 
         try {
             const result = await deployTopology(null, linkId);
-            showToast(deployResultMessage(result));
+            showToast(deployResultMessage(result, i18n));
             loadTopology();
             closeInfoModal();
         } catch (err) {
@@ -1401,7 +1422,7 @@
         setActionLoading(i18n.syncingChain || 'Syncing topology...');
         try {
             const result = await deployTopology();
-            showToast(deployResultMessage(result));
+            showToast(deployResultMessage(result, i18n));
             loadTopology();
         } catch (err) {
             showToast((i18n.chainDeployFailed || 'Full sync failed') + ': ' + err.message, 'error');

@@ -160,8 +160,10 @@ test('nodes view exposes the CSRF token for network module requests', () => {
 
 test('network UI deploy maps coordinator statuses to distinct user messages', () => {
     const helper = extractDeployPath('_cascadeDeploy');
-    assert.match(helper, /result\.status === 'succeeded'[\s\S]*?deployAlreadyDeployed/);
+    const { deployResultMessage } = require('../../../public/js/network');
     assert.match(helper, /deploymentEndedWithStatus/);
+    assert.match(helper, /deployResultMessage\(result, i18n\)/);
+    assert.notEqual(deployResultMessage({ status: 'succeeded' }), deployResultMessage({ status: 'queued' }));
     assert.match(NODES_VIEW_SOURCE, /deployAlreadyDeployed: <%- JSON\.stringify\(t\('network\.deployAlreadyDeployed'\)\) %>/);
     assert.match(NODES_VIEW_SOURCE, /deploymentEndedWithStatus: <%- JSON\.stringify\(t\('network\.deploymentEndedWithStatus'\)\) %>/);
 });
