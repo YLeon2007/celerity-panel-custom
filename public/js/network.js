@@ -90,7 +90,10 @@
             ? state.maxAttempts
             : OPERATION_POLL_MAX_ATTEMPTS;
         if (attempt >= maxAttempts) return false;
-        return !['succeeded', 'failed', 'rolled_back'].includes(state.status);
+        if (state.status === 'succeeded') {
+            return state.clientReadiness !== 'verified' && state.clientProofState !== 'degraded';
+        }
+        return !['failed', 'rolled_back'].includes(state.status);
     }
 
     const CLIENT_READINESS_UNVERIFIED = 'Готовность клиента не подтверждена';
@@ -100,8 +103,9 @@
     // probe, the drawer explicitly reports unknown rather than inferring ready.
     function clientReadinessMessage(proof, topologyRevision, deployedRevision) {
         if (Number.isSafeInteger(topologyRevision) && topologyRevision >= 0
-            && topologyRevision === deployedRevision
+            && Number.isSafeInteger(deployedRevision) && deployedRevision >= 0
             && proof?.topologyRevision === topologyRevision
+            && proof.priorDeployedRevision === deployedRevision
             && proof.status === 'ready' && proof.clientProbe === 'passed') {
             return 'Готовность подтверждена проверкой клиента';
         }
@@ -1359,6 +1363,8 @@
             attempt,
             maxAttempts: OPERATION_POLL_MAX_ATTEMPTS,
             status,
+            clientReadiness: operation?.clientReadiness,
+            clientProofState: operation?.clientProofState,
         })) {
             scheduleOperationPollStep(state, attempt + 1, generation);
             return;
@@ -1366,15 +1372,19 @@
         await loadTopology();
         if (generation !== operationPollGeneration) return;
         const applied = status === 'succeeded';
+        const verified = applied && operation?.clientReadiness === 'verified';
+        const degraded = applied && operation?.clientProofState === 'degraded';
         showToast(
-            applied
-                ? state.kind === 'link.apply'
-                    ? 'Связь установлена; готовность полной цепочки ещё не подтверждена; готовность клиента не подтверждена'
-                    : (i18n.operationApplied || 'Деплой завершён: топология применена') + ' — готовность клиента не подтверждена'
-                : status === 'failed' || status === 'rolled_back'
-                    ? (i18n.deployFailed || 'Деплой не выполнен') + ': ' + status
-                    : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
-            applied ? 'success' : 'error',
+            verified
+                ? (i18n.operationApplied || 'Деплой завершён: топология применена') + ' — готовность подтверждена проверкой клиента'
+                : applied
+                    ? state.kind === 'link.apply'
+                        ? 'Связь установлена; готовность полной цепочки ещё не подтверждена; готовность клиента не подтверждена'
+                        : (i18n.operationApplied || 'Деплой завершён: топология применена') + ' — готовность клиента не подтверждена'
+                    : status === 'failed' || status === 'rolled_back'
+                        ? (i18n.deployFailed || 'Деплой не выполнен') + ': ' + status
+                        : (i18n.operationStillRunning || 'Операция всё ещё выполняется в фоне'),
+            applied && !degraded ? 'success' : 'error',
         );
     }
 
