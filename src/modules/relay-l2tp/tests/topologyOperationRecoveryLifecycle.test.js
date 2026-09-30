@@ -482,3 +482,131 @@ test('panel host lazily registers opted-in topology recovery and stops it before
         'execution.stop',
     ]);
 });
+
+test('assembled TEST host claims one durable client proof per tick and stop waits for it', async () => {
+    const timer = createFakeTimer();
+    const now = new Date('2026-09-30T12:00:00.000Z');
+    const operation = {
+        _id: 'proof-op', status: 'succeeded', topologyRevision: 7,
+        clientReadiness: 'unverified', clientProofAttempts: 0,
+        clientProofLeaseUntil: null, clientProofRetryAfter: null,
+        nodes: [], linkIds: [],
+    };
+    let releaseClaim;
+    let claimStarted;
+    const claiming = new Promise(resolve => { claimStarted = resolve; });
+    const blockedClaim = new Promise(resolve => { releaseClaim = resolve; });
+    const claims = [];
+    const updates = [];
+    const TopologyOperation = {
+        async create() {},
+        find() { return createScanModel([]).find(); },
+        async findOneAndUpdate(filter, update) {
+            claims.push(filter);
+            claimStarted();
+            await blockedClaim;
+            if (operation.clientProofRetryAfter) return null;
+            Object.assign(operation, update.$set);
+            operation.clientProofAttempts += update.$inc.clientProofAttempts;
+            return { ...operation };
+        },
+        async updateOne(filter, update) {
+            updates.push({ filter, update });
+            Object.assign(operation, update.$set);
+            return { matchedCount: 1 };
+        },
+    };
+    const models = {
+        TopologyOperation, CascadeTopologyState: { findById() { throw Error('no positive proof'); } },
+        RelayL2tpState: { find() { throw Error('no live graph for invalid operation'); } },
+        CascadeRouteGroup: { find() { throw Error('no live graph for invalid operation'); } },
+        L2tpOperation: {}, NodeOperationLock: {},
+    };
+    const host = createL2tpPanelHost({
+        env: { ...ENABLED_ENV, TOPOLOGY_PROBE_USER_ID: 'test-probe-user' },
+        moduleEntry: {
+            registerModels: () => models,
+            createTopologyDeploymentService: () => ({ operationWorker: { async run() {} } }),
+        },
+        HyNode: { find() { throw Error('no live graph for invalid operation'); } },
+        CascadeLink: { find() { throw Error('no live graph for invalid operation'); } },
+        NodeSSH: class {},
+        topologyRuntime: {},
+        Repository: class {},
+        createRepositoryAdapters: () => ({ nodeRepository: {}, stateRepository: {}, operationRepository: {} }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start() {}, async stop() {} }),
+        workerLifecycle: { timer, logger: { error() {} }, intervalMs: 1000 },
+        clock: { now: () => now },
+    });
+    host.start();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(claims.length, 1, 'startup tick must claim a proof');
+    await claiming;
+    await timer.schedules[0].callback(); // overlapping tick cannot start a second proof
+    assert.equal(claims.length, 1);
+    let stopped = false;
+    const stopping = host.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    assert.equal(stopped, false);
+    releaseClaim();
+    await stopping;
+    assert.equal(claims.length, 1);
+    assert.equal(claims[0].status, 'succeeded');
+    assert.equal(claims[0].clientReadiness, 'unverified');
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].update.$set.clientProofReason, 'probe_failed');
+    assert.equal(operation.clientReadiness, 'unverified');
+    assert.equal(operation.clientProofAttempts, 1);
+});
+
+test('non-TEST host with a probe user cannot construct or run client proof', async () => {
+    let topologyCreates = 0;
+    let proofClaims = 0;
+    const host = createL2tpPanelHost({
+        env: { TOPOLOGY_PROBE_USER_ID: 'probe-user' },
+        moduleEntry: {
+            registerModels: () => ({ RelayL2tpState: {}, CascadeTopologyState: {},
+                CascadeRouteGroup: {}, L2tpOperation: {}, NodeOperationLock: {},
+                TopologyOperation: { async findOneAndUpdate() { proofClaims += 1; } } }),
+            createTopologyDeploymentService() { topologyCreates += 1; throw Error('non-TEST'); },
+        },
+        topologyRuntime: {},
+        Repository: class {},
+        createRepositoryAdapters: () => ({ nodeRepository: {}, stateRepository: {}, operationRepository: {} }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start() {}, async stop() {} }),
+    });
+    host.start();
+    await host.stop();
+    assert.equal(topologyCreates, 0);
+    assert.equal(proofClaims, 0);
+});
+
+test('TEST host without probe user leaves proof unclaimed while topology recovery still runs', async () => {
+    const timer = createFakeTimer();
+    let topologyRuns = 0;
+    let proofClaims = 0;
+    const TopologyOperation = {
+        find: () => createScanModel([{ _id: 'queued', status: 'queued' }]).find(),
+        async findOneAndUpdate() { proofClaims += 1; throw Error('must not claim'); },
+    };
+    const host = createL2tpPanelHost({
+        env: ENABLED_ENV,
+        moduleEntry: {
+            registerModels: () => ({ TopologyOperation, RelayL2tpState: {}, CascadeTopologyState: {},
+                CascadeRouteGroup: {}, L2tpOperation: {}, NodeOperationLock: {} }),
+            createTopologyDeploymentService: () => ({ operationWorker: { async run() { topologyRuns += 1; } } }),
+        },
+        topologyRuntime: {},
+        Repository: class {},
+        createRepositoryAdapters: () => ({ nodeRepository: {}, stateRepository: {}, operationRepository: {} }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start() {}, async stop() {} }),
+        workerLifecycle: { timer, logger: { error() {} } },
+    });
+    host.start();
+    await host.stop();
+    assert.equal(topologyRuns, 1);
+    assert.equal(proofClaims, 0);
+});

@@ -185,6 +185,32 @@ function createL2tpPanelHost({
         if (typeof topologyDeploymentService?.operationWorker?.run !== 'function') {
             throw new TypeError('Opted-in topology recovery requires an operation worker');
         }
+        // An explicit TEST probe identity is required; never fall back to
+        // process.env when this host's env does not authorize client proof.
+        let clientProofWorker;
+        if (typeof env.TOPOLOGY_PROBE_USER_ID === 'string'
+            && env.TOPOLOGY_PROBE_USER_ID.trim()) {
+            const { TopologyOperationRepository } = require('./relay-l2tp/repositories/topologyOperationRepository');
+            const { TopologyClientReadinessWorker } = require('./relay-l2tp/workers/topologyClientReadinessWorker');
+            const { TopologyClientProofExecutor } = require('./relay-l2tp/services/topologyClientProofExecutor');
+            const { TopologyPublishedProfileSource } = require('./relay-l2tp/services/topologyPublishedProfileSource');
+            const proofExecutor = new TopologyClientProofExecutor({
+                HyNode: injectedHyNode,
+                CascadeLink: injectedCascadeLink,
+                CascadeRouteGroup: models.CascadeRouteGroup,
+                RelayL2tpState: models.RelayL2tpState,
+                NodeSSH: NodeSSH ?? require('../services/nodeSSH'),
+                profileSource: new TopologyPublishedProfileSource({ probeUserId: env.TOPOLOGY_PROBE_USER_ID }),
+            });
+            clientProofWorker = new TopologyClientReadinessWorker({
+                repository: new TopologyOperationRepository({
+                    model: models.TopologyOperation,
+                    topologyStateModel: models.CascadeTopologyState,
+                }),
+                probeOperation: operation => proofExecutor.probeOperation(operation),
+                now: () => clock.now(),
+            });
+        }
         const recoveryFactory = createTopologyRecoveryLifecycle
             ?? require('./relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle')
                 .createTopologyOperationRecoveryLifecycle;
@@ -192,6 +218,7 @@ function createL2tpPanelHost({
             env,
             operationModel: models.TopologyOperation,
             worker: topologyDeploymentService.operationWorker,
+            ...(clientProofWorker ? { clientProofWorker } : {}),
             clock,
             intervalMs: workerLifecycle?.intervalMs,
             timer: workerLifecycle?.timer,
