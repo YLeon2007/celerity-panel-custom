@@ -220,6 +220,38 @@ test('client readiness is durable and separate from execution status', async () 
     }
 });
 
+test('client proof claim skips staged link.apply and claims an eligible nonstaged operation', async () => {
+    const staged = { _id: 'staged', kind: 'link.apply', staged: true,
+        status: 'succeeded', clientReadiness: 'unverified',
+        clientProofAttempts: 0, clientProofRetryAfter: null, clientProofLeaseUntil: null };
+    const published = { ...staged, _id: 'published', staged: false };
+    const operations = [staged, published];
+    const model = {
+        async create() {}, async updateOne() {},
+        async findOneAndUpdate(query, update) {
+            const eligible = operations.find(op =>
+                op.status === query.status && op.clientReadiness === query.clientReadiness
+                && op.clientProofAttempts >= query.clientProofAttempts.$gte
+                && op.clientProofAttempts < query.clientProofAttempts.$lt
+                && (op.clientProofRetryAfter === null || op.clientProofRetryAfter <= query.$and[0].$or[0].clientProofRetryAfter.$lte)
+                && (op.clientProofLeaseUntil === null || op.clientProofLeaseUntil <= query.$and[1].$or[0].clientProofLeaseUntil.$lte)
+                && !(query.$nor || []).some(excluded =>
+                    Object.entries(excluded).every(([key, value]) => op[key] === value)));
+            if (!eligible) return null;
+            Object.assign(eligible, update.$set);
+            eligible.clientProofAttempts += update.$inc.clientProofAttempts;
+            return { ...eligible };
+        },
+    };
+    const repository = new TopologyOperationRepository({ model });
+    const first = await repository.claimNextClientProof({ owner: 'worker', now: NOW });
+    assert.equal(first?._id, 'published');
+    assert.equal(published.clientProofAttempts, 1);
+    assert.equal(await repository.claimNextClientProof({ owner: 'worker', now: NOW }), null);
+    assert.equal(staged.clientProofAttempts, 0);
+    assert.equal(staged.clientProofLeaseUntil, null);
+});
+
 test('legacy model defaults never synthesize proof eligibility or a verified revision', async () => {
     const legacy = new TopologyOperation({ topologyRevision: 7,
         priorDeployedRevision: 5, status: 'succeeded', nodes: [] });

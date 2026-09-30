@@ -303,6 +303,7 @@ class TopologyOperationRepository {
         return this.model.findOneAndUpdate({
             status: 'succeeded',
             clientReadiness: 'unverified',
+            $nor: [{ kind: 'link.apply', staged: true }],
             clientProofAttempts: { $exists: true, $gte: 0, $lt: maxAttempts },
             $and: [
                 { $or: [{ clientProofRetryAfter: { $lte: now } }, { clientProofRetryAfter: null }] },
