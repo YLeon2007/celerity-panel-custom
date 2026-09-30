@@ -150,6 +150,15 @@ test('finalizeSucceeded marks active cascade links deployed in the same transact
     }]);
 });
 
+test('successful finalization records execution success without implying client readiness', async () => {
+    const harness = createHarness(); // legacy document has no readiness field
+    const result = await harness.repository.finalizeSucceeded(request());
+    assert.equal(result?.operationId, 'operation-7');
+    assert.equal(harness.store.operation.status, 'succeeded');
+    assert.equal(harness.store.operation.clientReadiness, 'unverified');
+    assert.equal(harness.calls.at(-1).transaction, 'commit');
+});
+
 test('atomically marks the leased committing operation succeeded and advances deployedRevision', async () => {
     const harness = createHarness();
 
@@ -166,6 +175,7 @@ test('atomically marks the leased committing operation succeeded and advances de
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'succeeded',
+        clientReadiness: 'unverified',
         leaseOwner: 'worker-1',
         leaseUntil: null,
         finishedAt: NOW,
@@ -191,6 +201,7 @@ test('atomically marks the leased committing operation succeeded and advances de
             update: {
                 $set: {
                     status: 'succeeded',
+                    clientReadiness: 'unverified',
                     finishedAt: NOW,
                     leaseUntil: null,
                 },

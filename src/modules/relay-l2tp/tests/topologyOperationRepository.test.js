@@ -56,7 +56,7 @@ test('link.attach freezes owner epochs and ordered suffix in a transactional cre
         _id: '000000000000000000000007',
         topologyRevision: 7, priorDeployedRevision: 5,
         ...ATTACH_SCOPE,
-        status: 'queued', heldTopologyAdmission: true,
+        status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
     });
@@ -193,6 +193,58 @@ test('strict Mongo schema refuses partially scoped operation identity', async ()
     }
 });
 
+test('client readiness is durable and separate from execution status', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    const created = await repository.createFrozen({
+        operationId: '507f1f77bcf86cd799439011',
+        topologyRevision: 7, priorDeployedRevision: 5, nodes: [],
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+        session: { inTransaction: () => true },
+    });
+    assert.equal(created.clientReadiness, 'unverified');
+    const durable = new TopologyOperation({ ...created, status: 'succeeded' });
+    await durable.validate();
+    assert.equal(durable.toObject().clientReadiness, 'unverified');
+    const premature = new TopologyOperation({ ...created, clientReadiness: 'verified' });
+    await assert.rejects(premature.validate(), /Client readiness requires successful execution/);
+    for (const invalid of ['ready', 'failed', true]) {
+        const forged = new TopologyOperation({ ...created, clientReadiness: invalid });
+        await assert.rejects(forged.validate(), undefined, String(invalid));
+    }
+});
+
+test('public operation read fails closed on legacy missing or malformed readiness', async () => {
+    let projection;
+    let stored;
+    const repository = new TopologyOperationRepository({ model: {
+        async create() {}, async findOneAndUpdate() {}, async updateOne() {},
+        findById() {
+            return { select(value) {
+                projection = value;
+                return { lean: async () => stored };
+            } };
+        },
+    } });
+    for (stored of [
+        { status: 'succeeded', topologyRevision: 7 },
+        { status: 'succeeded', topologyRevision: 7, clientReadiness: 'ready' },
+    ]) {
+        assert.deepEqual(await repository.findPublicById('operation-1'), {
+            status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified',
+        });
+    }
+    assert.equal(projection, 'status topologyRevision clientReadiness');
+    stored = { status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified' };
+    assert.deepEqual(await repository.findPublicById('operation-1'), stored);
+    stored = { status: 'committing', topologyRevision: 7, clientReadiness: 'verified' };
+    assert.deepEqual(await repository.findPublicById('operation-1'), {
+        status: 'committing', topologyRevision: 7, clientReadiness: 'unverified',
+    });
+    stored = null;
+    assert.equal(await repository.findPublicById('operation-1'), null);
+});
+
 test('scoped operation rejects missing or inconsistent link identity before creating', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
@@ -230,8 +282,8 @@ test('findPublicById returns only the public status projection', async () => {
     };
     const repository = new TopologyOperationRepository({ model });
     const result = await repository.findPublicById('operation-dup');
-    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision' });
-    assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7 });
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision clientReadiness' });
+    assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified' });
 });
 
 const NOW = new Date('2026-09-22T10:00:00.000Z');
@@ -386,6 +438,7 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
         linkIds: ['link-a'],
         staged: true,
         status: 'queued',
+        clientReadiness: 'unverified',
         heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,
@@ -457,7 +510,7 @@ test('createFrozen propagates session insert rejection without an unscoped fallb
     assert.equal(model.calls.length, 1);
     assert.deepEqual(model.calls[0], [[{
         _id: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
-        status: 'queued', heldTopologyAdmission: true,
+        status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0, leaseOwner: '', leaseUntil: null, nodes: [],
     }], { session }]);
@@ -524,6 +577,7 @@ test('createFrozen durably preserves composer deployment order without sorting b
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'queued',
+        clientReadiness: 'unverified',
         heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
         attempts: 0,

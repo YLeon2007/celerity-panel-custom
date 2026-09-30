@@ -213,6 +213,7 @@ class TopologyOperationFinalizationRepository {
                 }, {
                     $set: {
                         status: 'succeeded',
+                        clientReadiness: 'unverified',
                         finishedAt: now,
                         leaseUntil: null,
                         ...(releasesAdmission ? { heldTopologyAdmission: false } : {}),

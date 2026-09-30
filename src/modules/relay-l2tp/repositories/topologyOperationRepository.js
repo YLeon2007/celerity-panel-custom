@@ -220,6 +220,7 @@ class TopologyOperationRepository {
                     newPathLinkIds: [...newPathLinkIds] } : {}),
             } : {}),
             status: 'queued',
+            clientReadiness: 'unverified',
             ...(heldTopologyAdmission === true
                 ? { heldTopologyAdmission: true, admissionFingerprint } : {}),
             attempts: 0,
@@ -251,9 +252,17 @@ class TopologyOperationRepository {
     }
 
     async findPublicById(operationId) {
-        return this.model.findById(operationId)
-            .select('status topologyRevision')
+        const operation = await this.model.findById(operationId)
+            .select('status topologyRevision clientReadiness')
             .lean();
+        if (!operation) return null;
+        // A missing legacy field (or unexpected persisted value) is never a
+        // client-ready claim; status:succeeded remains execution-only.
+        return {
+            ...operation,
+            clientReadiness: operation.status === 'succeeded'
+                && operation.clientReadiness === 'verified' ? 'verified' : 'unverified',
+        };
     }
 
     async claim({ operationId: id, owner, leaseMs, now }) {

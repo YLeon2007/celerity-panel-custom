@@ -137,6 +137,14 @@ const topologyOperationSchema = new mongoose.Schema({
         enum: OPERATION_STATUSES,
         required: true,
     },
+    // Execution succeeded does not establish client-visible ingress/egress.
+    // Legacy documents without this field must also be treated as unverified.
+    clientReadiness: {
+        type: String,
+        enum: ['unverified', 'verified'],
+        default: 'unverified',
+        required: true,
+    },
     attempts: { type: Number, min: 0, default: 0, required: true },
     leaseOwner: { type: String, default: '', trim: true },
     leaseUntil: { type: Date, default: null },
@@ -145,6 +153,9 @@ const topologyOperationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
+    if (this.clientReadiness === 'verified' && this.status !== 'succeeded') {
+        throw new Error('Client readiness requires successful execution');
+    }
     const scoped = this.kind !== undefined || this.linkId !== undefined
         || this.linkIds !== undefined || this.staged !== undefined
         || this.oldLinkId !== undefined || this.groupId !== undefined
