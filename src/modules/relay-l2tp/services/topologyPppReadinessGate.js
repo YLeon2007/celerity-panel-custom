@@ -4,7 +4,18 @@ const { createL2tpNodeTransportResolver } = require('./l2tpNodeTransportFactory'
 const { L2tpNodeExecutionResolver } = require('./l2tpNodeExecutionResolver');
 
 const OPERATION_ID = /^[a-f0-9]{24}$/i;
-const failed = verifiedRelayCount => ({ ok: false, verifiedRelayCount });
+// Only PPP_DRIFT is safe for a caller to use as a sync trigger.
+const REASON = Object.freeze({
+    DRIFT: 'PPP_DRIFT',
+    UNAVAILABLE: 'PPP_UNAVAILABLE',
+    NOT_INSTALLED: 'PPP_NOT_INSTALLED',
+    UNKNOWN: 'PPP_UNKNOWN',
+});
+const SYNCABLE_USER_FAILURES = new Set([
+    'MANAGED_USERS_MISSING', 'MANAGED_USERS_EXTRA', 'MANAGED_USERS_DUPLICATE',
+    'MANAGED_USERS_ALTERED', 'DISABLED_USERS_PRESENT',
+]);
+const failed = (verifiedRelayCount, reason = REASON.UNKNOWN) => ({ ok: false, verifiedRelayCount, reason });
 const id = value => value == null ? '' : String(value);
 
 function stagedTerminalRelayRef(nodes) {
@@ -83,18 +94,38 @@ class TopologyPppReadinessGate {
                 // Missing or desired-absent PPP is tolerated only at the
                 // terminal relay of an explicitly staged chain.
                 if (!state || state.desiredState === 'absent') {
-                    if (plan.staged !== true || node.nodeRef !== terminalRelayRef) return failed(verifiedRelayCount);
+                    if (plan.staged !== true || node.nodeRef !== terminalRelayRef) {
+                        return failed(verifiedRelayCount, REASON.NOT_INSTALLED);
+                    }
                     skippedRelayCount += 1;
                     continue;
                 }
                 const revision = state.secretRevision;
                 if (state.status !== 'installed' || state.desiredState !== 'installed'
                     || !Number.isSafeInteger(revision) || revision < 1) {
-                    return failed(verifiedRelayCount);
+                    return failed(verifiedRelayCount,
+                        state.status === 'not_installed' || state.desiredState === 'not_installed'
+                            ? REASON.NOT_INSTALLED : REASON.UNKNOWN);
                 }
                 const users = await this.L2tpUser.find({ relayNode })
                     .select('relayNode enabled desiredRevision appliedRevision syncStatus syncOperationId').lean();
                 if (!Array.isArray(users)) return failed(verifiedRelayCount);
+                // A typed, locally persisted desired/applied mismatch is drift;
+                // malformed rows and unsynced statuses alone are not proof.
+                const validUser = user => id(user.relayNode) === relayNode
+                    && typeof user.enabled === 'boolean'
+                    && Number.isSafeInteger(user.desiredRevision)
+                    && user.desiredRevision >= 1 && user.desiredRevision <= revision
+                    && Number.isSafeInteger(user.appliedRevision)
+                    && user.appliedRevision >= 0;
+                if (users.every(validUser)
+                    && users.some(user => user.appliedRevision !== user.desiredRevision)) {
+                    const current = await this.RelayL2tpState.findOne({ node: relayNode })
+                        .select('status desiredState secretRevision').lean();
+                    if (current?.status !== 'installed' || current.desiredState !== 'installed'
+                        || current.secretRevision !== revision) return failed(verifiedRelayCount);
+                    return failed(verifiedRelayCount, REASON.DRIFT);
+                }
                 const operation = await this.L2tpOperation.findOne({
                     node: relayNode,
                     kind: 'sync_users',
@@ -121,18 +152,34 @@ class TopologyPppReadinessGate {
                     return failed(verifiedRelayCount);
                 }
                 const expectedEnabledUserCount = users.filter(user => user.enabled).length;
-                const transport = await this.transportResolver({ nodeId: relayNode });
-                const actual = await transport.runArtifactCommand({
-                    operationId,
-                    command: 'verify-users',
-                    expectedCredentialRevision: revision,
-                    expectedEnabledUserCount,
-                });
+                let actual;
+                try {
+                    const transport = await this.transportResolver({ nodeId: relayNode });
+                    actual = await transport.runArtifactCommand({
+                        operationId,
+                        command: 'verify-users',
+                        expectedCredentialRevision: revision,
+                        expectedEnabledUserCount,
+                    });
+                } catch {
+                    return failed(verifiedRelayCount, REASON.UNAVAILABLE);
+                }
                 if (actual?.ok !== true || actual.code !== 'USERS_VERIFIED'
                     || actual.credentialRevision !== revision
                     || actual.enabledUserCount !== expectedEnabledUserCount
                     || actual.managedUserCount !== expectedEnabledUserCount) {
-                    return failed(verifiedRelayCount);
+                    const provenDrift = actual?.ok === false
+                        && SYNCABLE_USER_FAILURES.has(actual.code)
+                        && actual.credentialRevision === revision
+                        && actual.enabledUserCount === expectedEnabledUserCount
+                        && Number.isSafeInteger(actual.managedUserCount)
+                        && actual.managedUserCount >= 0;
+                    if (!provenDrift) return failed(verifiedRelayCount);
+                    const current = await this.RelayL2tpState.findOne({ node: relayNode })
+                        .select('status desiredState secretRevision').lean();
+                    return failed(verifiedRelayCount,
+                        current?.status === 'installed' && current.desiredState === 'installed'
+                            && current.secretRevision === revision ? REASON.DRIFT : REASON.UNKNOWN);
                 }
                 // Concurrent user edits increment the state revision. Never accept
                 // a readback against a snapshot already superseded in Mongo.
