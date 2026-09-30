@@ -320,7 +320,8 @@ class TopologyOperationRepository {
             new: true, lean: true, runValidators: true, sort: { clientProofRetryAfter: 1 },
             projection: { _id: 1, status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1,
                 linkId: 1, linkIds: 1, clientProofAttempts: 1,
-                clientProofLeaseOwner: 1, clientProofLeaseUntil: 1 },
+                clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
+                'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1 },
         });
     }
 

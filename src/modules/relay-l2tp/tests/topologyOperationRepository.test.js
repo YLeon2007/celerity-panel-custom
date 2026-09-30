@@ -252,6 +252,26 @@ test('client proof claim skips staged link.apply and claims an eligible nonstage
     assert.equal(staged.clientProofLeaseUntil, null);
 });
 
+test('client proof claim projects only probe node fields, not candidate or backup secrets', async () => {
+    let projection;
+    const repository = new TopologyOperationRepository({ model: {
+        async create() {}, async updateOne() {},
+        async findOneAndUpdate(_query, _update, options) {
+            projection = options.projection;
+            return null;
+        },
+    } });
+    await repository.claimNextClientProof({ owner: 'worker', now: NOW });
+    assert.deepEqual(projection, {
+        _id: 1, status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1,
+        linkId: 1, linkIds: 1, clientProofAttempts: 1,
+        clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
+        'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1,
+    });
+    assert.equal(Object.keys(projection).some(key =>
+        /candidate|backup|secret/i.test(key)), false);
+});
+
 test('legacy model defaults never synthesize proof eligibility or a verified revision', async () => {
     const legacy = new TopologyOperation({ topologyRevision: 7,
         priorDeployedRevision: 5, status: 'succeeded', nodes: [] });
