@@ -90,7 +90,7 @@ class TopologyClientProofExecutor {
                     if (mainSuffix && mainSuffix.shift() !== id(nextLink._id)) return fail();
                     current = id(nextLink.bridgeNode);
                 }
-                if (!mainSuffix || mainSuffix.length || !roles.has(current)) return fail();
+                if (mainSuffix?.length || !roles.has(current)) return fail();
                 bridgeIds.add(current);
             }
             if (bridgeIds.size !== 1) return fail();

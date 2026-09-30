@@ -49,6 +49,39 @@ test('published profiles for every operation portal are client-probed against in
     assert.equal(calls.curl.length, 2);
     assert(calls.curl.every(args => args.at(-1) === 'https://api.ipify.org'));
 });
+test('portal joining downstream of the L2TP owner still proves its unambiguous default exit', async () => {
+    const nodeRows = [...nodes, { _id: 'r2', type: 'xray', active: true, cascadeRole: 'relay' }];
+    const linkRows = links.map(link => link._id === 'l2'
+        ? { ...link, bridgeNode: 'r2' }
+        : link._id === 'main' || link._id === 'geolink'
+            ? { ...link, portalNode: 'r2' } : link);
+    linkRows.push({ _id: 'middle', portalNode: 'r', bridgeNode: 'r2', active: true, status: 'online' });
+    const operation = { ...op, linkIds: [...op.linkIds, 'middle'], nodes: [
+        ...op.nodes, { node: 'r2', role: 'relay', state: 'committed' },
+    ] };
+    const { executor, calls } = fixture({ operation, nodeRows, linkRows,
+        groups: [{ ...group, paths: [{ ...group.paths[0], linkIds: ['middle', 'main'] }] }] });
+    assert.deepEqual(await executor.probeOperation(operation), { passed: true });
+    assert.equal(calls.curl.length, 2);
+});
+
+test('scoped portal path without an L2TP owner still proves its actual published exit', async () => {
+    const nodeRows = [nodes[1], { _id: 'r2', type: 'xray', active: true, cascadeRole: 'relay' }, nodes[3]];
+    const linkRows = [
+        { ...links[1], bridgeNode: 'r2' },
+        { ...links[2], portalNode: 'r2' },
+    ];
+    const operation = { ...op, linkIds: ['l2', 'main'], nodes: [
+        { node: PORTAL_IDS[1], role: 'portal', state: 'committed' },
+        { node: 'r2', role: 'relay', state: 'committed' },
+        { node: 'b', role: 'bridge', state: 'committed' },
+    ] };
+    const { executor, calls } = fixture({ operation, nodeRows, linkRows, groups: [], states: [],
+        profiles: [profile(nodes[1])] });
+    assert.deepEqual(await executor.probeOperation(operation), { passed: true });
+    assert.equal(calls.curl.length, 1);
+});
+
 test('ObjectId-like HyNode portal IDs are normalized before published profile validation', async () => {
     const nodeRows = nodes.map((node, i) => i < PORTAL_IDS.length
         ? { ...node, _id: { toHexString: () => PORTAL_IDS[i] } } : node);
@@ -81,7 +114,9 @@ test('portal ObjectId normalization never bypasses graph identity or canonical-I
 });
 test('staged, missing, disabled, ambiguous and unconfirmed main routes fail closed before probing', async () => {
     for (const overrides of [
-        { operation: { ...op, staged: true } }, { states: [] }, { groups: [{ ...group, paths: [{ ...group.paths[0], enabled: false }] }] },
+        { operation: { ...op, staged: true } },
+        { states: [{ node: 'r', desiredState: 'installed', status: 'installed', routeGroup: 'missing', activePathKey: 'main' }] },
+        { groups: [{ ...group, paths: [{ ...group.paths[0], enabled: false }] }] },
         { groups: [{ ...group, paths: [...group.paths, { ...group.paths[0], pathKey: 'main' }] }] },
         { linkRows: links.map(l => l._id === 'main' ? { ...l, status: 'pending' } : l) },
         { linkRows: links.concat({ _id: 'other', portalNode: 'r', bridgeNode: 'geo', active: true, status: 'online' }), operation: { ...op, linkIds: [...op.linkIds, 'other'] } },
