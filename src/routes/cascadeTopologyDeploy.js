@@ -7,6 +7,7 @@ const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const requireAuthMiddleware = require('../middleware/auth');
 const relayL2tpModule = require('../modules/relay-l2tp');
+const { TopologyOperationRepository } = require('../modules/relay-l2tp/repositories/topologyOperationRepository');
 const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
 const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
@@ -152,6 +153,13 @@ function publicOperationStatus(operation = {}) {
     if (Number.isSafeInteger(operation.topologyRevision) && operation.topologyRevision >= 0) {
         body.topologyRevision = operation.topologyRevision;
     }
+    if (['verified', 'unverified'].includes(operation.clientReadiness)) {
+        body.clientReadiness = operation.clientReadiness;
+    }
+    if (operation.clientReadiness === 'unverified'
+        && ['active_unverified', 'degraded'].includes(operation.clientProofState)) {
+        body.clientProofState = operation.clientProofState;
+    }
     return body;
 }
 
@@ -293,9 +301,10 @@ function createCascadeTopologyDeployRouter({
                         'Operation id must be a 24-character hex string',
                     );
                 }
-                const operation = await models.TopologyOperation.findById(operationId)
-                    .select('_id status topologyRevision')
-                    .lean();
+                const operation = await new TopologyOperationRepository({
+                    model: models.TopologyOperation,
+                    topologyStateModel: models.CascadeTopologyState,
+                }).findPublicById(operationId);
                 if (!operation) {
                     throw new TopologyDeployRequestError(
                         'OPERATION_NOT_FOUND',
@@ -303,7 +312,7 @@ function createCascadeTopologyDeployRouter({
                     );
                 }
                 res.set('Cache-Control', 'no-store');
-                return res.status(200).json(publicOperationStatus(operation));
+                return res.status(200).json(publicOperationStatus({ ...operation, operationId }));
             } catch (error) {
                 return sendError(res, error, routeLogger);
             }

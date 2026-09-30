@@ -145,15 +145,27 @@ async function requestOperationStatus(router, { id = '507f1f77bcf86cd799439021',
     }
 }
 
-function operationStatusHarness({ document = null, calls = [], projections = [] } = {}) {
+function operationStatusHarness({ document = null, live = null, calls = [], projections = [], stateCalls = [] } = {}) {
     return {
         models: {
             TopologyOperation: {
+                async create() {},
+                async findOneAndUpdate() {},
+                async updateOne() {},
                 findById(id) {
                     calls.push(id);
                     return {
                         select(fields) { projections.push(fields); return this; },
                         lean: async () => document,
+                    };
+                },
+            },
+            CascadeTopologyState: {
+                findById(id) {
+                    stateCalls.push(id);
+                    return {
+                        select(fields) { stateCalls.push(fields); return this; },
+                        lean: async () => live,
                     };
                 },
             },
@@ -980,16 +992,131 @@ test('operation status endpoint returns only the strict public projection', asyn
 
     const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
     assert.equal(response.status, 200);
-    assert.deepEqual(projections, ['_id status topologyRevision']);
+    assert.deepEqual(projections, [
+        'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason',
+    ]);
     assert.deepEqual(response.body, {
         operationId: '507f1f77bcf86cd799439021',
         status: 'committing',
         topologyRevision: 7,
+        clientReadiness: 'unverified',
     });
+    assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.doesNotMatch(
         JSON.stringify(response.body),
         /plan|candidate|reality|user|credential|password|logs|leaseOwner|idempotency|must-not-leak|secret/i,
     );
+});
+
+test('operation status exposes verified client proof only for a live scoped revision', async () => {
+    const stateCalls = [];
+    const projections = [];
+    const id = '507f1f77bcf86cd799439021';
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness({
+            document: {
+                _id: id, status: 'succeeded', topologyRevision: 7, priorDeployedRevision: 6,
+                kind: 'link.apply', clientReadiness: 'verified', clientProofRevision: 7,
+                nodes: [{ candidate: { bytes: 'secret' } }],
+                clientProofReason: 'password=secret',
+            },
+            live: { revision: 7, deployedRevision: 6 }, stateCalls, projections,
+        }),
+        ...guardHarness([]),
+    });
+    const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+        operationId: id, status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified',
+    });
+    assert.deepEqual(stateCalls, ['singleton', 'revision deployedRevision']);
+    assert.deepEqual(projections, [
+        'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason',
+    ]);
+    assert.doesNotMatch(JSON.stringify(response.body), /secret|candidate|nodes|clientProofReason/);
+});
+
+test('operation status does not claim verified proof for stale, absent, or inconsistent state', async () => {
+    const id = '507f1f77bcf86cd799439021';
+    const headers = { 'x-test-auth': 'api-read' };
+    for (const [live, proofRevision] of [
+        [{ revision: 8, deployedRevision: 6 }, 7],
+        [{ revision: 7, deployedRevision: 7 }, 7],
+        [null, 7],
+        [{ revision: 7, deployedRevision: 6 }, 5],
+    ]) {
+        const router = createCascadeTopologyDeployRouter({
+            ...operationStatusHarness({
+                document: { _id: id, status: 'succeeded', topologyRevision: 7,
+                    priorDeployedRevision: 6, kind: 'link.apply', clientReadiness: 'verified',
+                    clientProofRevision: proofRevision },
+                live,
+            }),
+            ...guardHarness([]),
+        });
+        const response = await requestOperationStatus(router, { headers });
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
+            topologyRevision: 7, clientReadiness: 'unverified' });
+    }
+});
+
+test('operation status exposes only allowlisted unverified proof state, not arbitrary reasons', async () => {
+    const id = '507f1f77bcf86cd799439021';
+    const headers = { 'x-test-auth': 'api-read' };
+    for (const [clientProofState, expected] of [
+        ['active_unverified', 'active_unverified'],
+        ['degraded', 'degraded'],
+        ['password=secret', undefined],
+    ]) {
+        const router = createCascadeTopologyDeployRouter({
+            ...operationStatusHarness({ document: {
+                _id: id, status: 'succeeded', topologyRevision: 7,
+                clientReadiness: 'unverified', clientProofState,
+                clientProofReason: 'ssh password=secret', nodes: [{ candidate: 'secret' }],
+            } }), ...guardHarness([]),
+        });
+        const response = await requestOperationStatus(router, { headers });
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
+            topologyRevision: 7, clientReadiness: 'unverified',
+            ...(expected ? { clientProofState: expected } : {}) });
+        assert.doesNotMatch(JSON.stringify(response.body), /secret|candidate|nodes|clientProofReason/);
+    }
+});
+
+test('operation status requires deployed revision for global proof', async () => {
+    const id = '507f1f77bcf86cd799439021';
+    const headers = { 'x-test-auth': 'api-read' };
+    for (const [deployedRevision, readiness] of [[6, 'unverified'], [7, 'verified']]) {
+        const router = createCascadeTopologyDeployRouter({
+            ...operationStatusHarness({
+                document: { _id: id, status: 'succeeded', topologyRevision: 7,
+                    clientReadiness: 'verified', clientProofRevision: 7 },
+                live: { revision: 7, deployedRevision },
+            }), ...guardHarness([]),
+        });
+        const response = await requestOperationStatus(router, { headers });
+        assert.equal(response.status, 200);
+        assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
+            topologyRevision: 7, clientReadiness: readiness });
+    }
+});
+
+test('operation status keeps internal model errors generic without logging secrets', async () => {
+    const logged = [];
+    const router = createCascadeTopologyDeployRouter({
+        ...operationStatusHarness(), ...guardHarness([]),
+        models: { TopologyOperation: {
+            async create() {}, async findOneAndUpdate() {}, async updateOne() {},
+            findById() { throw new Error('password=must-not-leak'); },
+        } },
+        routeLogger: { error(message) { logged.push(message); } },
+    });
+    const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
+    assert.equal(response.status, 500);
+    assert.deepEqual(response.body, { error: { code: 'INTERNAL_ERROR', message: 'Internal server error' } });
+    assert.doesNotMatch(JSON.stringify(response.body) + logged.join(' '), /password|must-not-leak/);
 });
 
 test('operation status endpoint covers the full status lifecycle', async () => {
@@ -1027,6 +1154,7 @@ test('operation status endpoint drops non-enum status, kind, causeCode, and reas
     assert.deepEqual(response.body, {
         operationId: '507f1f77bcf86cd799439021',
         topologyRevision: 7,
+        clientReadiness: 'unverified',
     });
 });
 
