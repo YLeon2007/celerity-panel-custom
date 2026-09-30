@@ -3,9 +3,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Install only runtime tools required for Mongo backup/restore.
+# Install runtime tools for Mongo backup/restore and TEST client proof.
 # Git, Bash and Docker CLI/Compose intentionally live only in the isolated updater image.
-RUN apk add --no-cache mongodb-tools libstdc++ libgcc
+RUN apk add --no-cache mongodb-tools libstdc++ libgcc curl
 
 # Копируем зависимости
 COPY package*.json ./
