@@ -9,17 +9,18 @@ const { spawn } = require('node:child_process');
 const IP = '198.51.100.10';
 const UUID = '11111111-1111-4111-8111-111111111111';
 const TOKEN = 'secretSubscriptionToken';
+const PORTAL_IDS = ['0123456789abcdef01234567', 'fedcba9876543210fedcba98'];
 const portal = id => ({ _id: id, name: id, type: 'xray', active: true, cascadeRole: 'portal', domain: `${id}.example`, port: 443, xray: { transport: 'tcp', security: 'reality', realityPublicKey: 'public-key', realitySni: ['front.example'], realityShortIds: ['01234567'] } });
-const nodes = [portal('p1'), portal('p2'), { _id: 'r', type: 'xray', active: true, cascadeRole: 'relay' }, { _id: 'b', type: 'xray', active: true, cascadeRole: 'bridge', ip: IP, ssh: { port: 22, username: 'root', password: 'ENCRYPTED' } }, { _id: 'geo', type: 'xray', active: true, cascadeRole: 'bridge', ip: '203.0.113.20' }];
+const nodes = [portal(PORTAL_IDS[0]), portal(PORTAL_IDS[1]), { _id: 'r', type: 'xray', active: true, cascadeRole: 'relay' }, { _id: 'b', type: 'xray', active: true, cascadeRole: 'bridge', ip: IP, ssh: { port: 22, username: 'root', password: 'ENCRYPTED' } }, { _id: 'geo', type: 'xray', active: true, cascadeRole: 'bridge', ip: '203.0.113.20' }];
 const links = [
-    { _id: 'l1', portalNode: 'p1', bridgeNode: 'r', active: true, status: 'online' },
-    { _id: 'l2', portalNode: 'p2', bridgeNode: 'r', active: true, status: 'online' },
+    { _id: 'l1', portalNode: PORTAL_IDS[0], bridgeNode: 'r', active: true, status: 'online' },
+    { _id: 'l2', portalNode: PORTAL_IDS[1], bridgeNode: 'r', active: true, status: 'online' },
     { _id: 'main', portalNode: 'r', bridgeNode: 'b', active: true, status: 'online' },
     { _id: 'geolink', portalNode: 'r', bridgeNode: 'geo', active: true, status: 'online', geoRouting: { enabled: true } },
 ];
 const group = { _id: 'g', paths: [{ pathKey: 'main', enabled: true, linkIds: ['main'], priority: 1 }] };
 const op = { status: 'succeeded', staged: false, linkIds: ['l1', 'l2', 'main', 'geolink'], nodes: [
-    { node: 'p1', role: 'portal', state: 'committed' }, { node: 'p2', role: 'portal', state: 'committed' },
+    { node: PORTAL_IDS[0], role: 'portal', state: 'committed' }, { node: PORTAL_IDS[1], role: 'portal', state: 'committed' },
     { node: 'r', role: 'relay', state: 'committed' }, { node: 'b', role: 'bridge', state: 'committed' },
     { node: 'geo', role: 'bridge', state: 'committed' },
 ] };
@@ -47,6 +48,36 @@ test('published profiles for every operation portal are client-probed against in
     assert.deepEqual(calls.ssh.filter(c => c.node).map(c => c.node), ['b']);
     assert.equal(calls.curl.length, 2);
     assert(calls.curl.every(args => args.at(-1) === 'https://api.ipify.org'));
+});
+test('ObjectId-like HyNode portal IDs are normalized before published profile validation', async () => {
+    const nodeRows = nodes.map((node, i) => i < PORTAL_IDS.length
+        ? { ...node, _id: { toHexString: () => PORTAL_IDS[i] } } : node);
+    const { executor, calls } = fixture({ nodeRows });
+    const result = await executor.probeOperation(op);
+    assert(calls.ssh.some(call => call.connect === true), 'graph reaches bridge SSH before source loading');
+    assert.deepEqual(result, { passed: true });
+    assert.equal(calls.curl.length, 2);
+});
+test('portal ObjectId normalization never bypasses graph identity or canonical-ID fences', async () => {
+    const wrongRows = nodes.map((node, i) => i === 0
+        ? { ...node, _id: { toHexString: () => 'aaaaaaaaaaaaaaaaaaaaaaaa' } } : node);
+    const wrong = fixture({ nodeRows: wrongRows });
+    assert.deepEqual(await wrong.executor.probeOperation(op), { passed: false });
+    assert.equal(wrong.calls.ssh.length, 0);
+    assert.equal(wrong.calls.curl.length, 0);
+
+    const uppercaseId = PORTAL_IDS[1].toUpperCase();
+    const uppercase = fixture({
+        nodeRows: nodes.map((node, i) => i === 1
+            ? { ...node, _id: { toHexString: () => uppercaseId } } : node),
+        linkRows: links.map(link => link.portalNode === PORTAL_IDS[1]
+            ? { ...link, portalNode: uppercaseId } : link),
+        operation: { ...op, nodes: op.nodes.map(entry => entry.node === PORTAL_IDS[1]
+            ? { ...entry, node: uppercaseId } : entry) },
+    });
+    assert.deepEqual(await uppercase.executor.probeOperation(uppercase.operation), { passed: false });
+    assert(uppercase.calls.ssh.some(call => call.connect === true));
+    assert.equal(uppercase.calls.curl.length, 0);
 });
 test('staged, missing, disabled, ambiguous and unconfirmed main routes fail closed before probing', async () => {
     for (const overrides of [

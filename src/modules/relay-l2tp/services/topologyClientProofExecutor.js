@@ -109,7 +109,10 @@ class TopologyClientProofExecutor {
                 } finally { ssh.disconnect(); }
             }, this.timeoutMs);
             if (!expectedEgressIp) return fail();
-            const portalNodes = portalIds.map(nodeId => nodes.get(nodeId));
+            // Graph lookup already proved each row's _id equals this operation ID.
+            // The published source needs a canonical string, not lean()'s ObjectId.
+            if (portalIds.some(nodeId => !/^[0-9a-f]{24}$/.test(nodeId))) return fail();
+            const portalNodes = portalIds.map(nodeId => ({ ...nodes.get(nodeId), _id: nodeId }));
             const observed = new Set();
             const loaded = await bounded(() => this.profileSource.load({ portalNodes, consumeProfile: async (nodeId, profile) => {
                 if (!portalIds.includes(nodeId) || observed.has(nodeId)) return { ok: false };
