@@ -621,7 +621,8 @@ class TopologyOperationWorker {
         if (readiness?.ok === true) {
             const proof = readiness.relayRevisions;
             const relayIds = nodes.filter(node => node.role === 'relay').map(node => node.node);
-            if (Array.isArray(proof) && proof.length === relayIds.length
+            if (Array.isArray(proof) && proof.length > 0 && proof.length <= relayIds.length
+                && proof.some(item => item.relayNode === wait.relayNode)
                 && new Set(proof.map(item => item.relayNode)).size === proof.length
                 && proof.every(item => relayIds.includes(item.relayNode)
                     && Number.isSafeInteger(item.credentialRevision)

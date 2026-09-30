@@ -826,12 +826,13 @@ test('failed exact-generation wait handoff never enqueues PPP sync or rolls back
 
 test('recovered PPP wait reacquires fresh locks and re-reads revision before publication', async () => {
     const operation = durableThreeNodeOperation();
+    operation.nodes.push(durableNode(frozenNode('node-d', 'relay', 'relay-2')));
     operation.status = 'committing';
     operation.heldTopologyAdmission = true;
     operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = `backup-${node.node}`; });
     operation.pppWait = { lockOwner: 'original-worker', relayNode: 'node-b', credentialRevision: 7,
-        locks: ['node-a', 'node-b', 'node-c'].map(node => ({ node, generation: `old-${node}` })),
-        releasedNodes: ['node-a', 'node-b', 'node-c'] };
+        locks: ['node-a', 'node-b', 'node-c', 'node-d'].map(node => ({ node, generation: `old-${node}` })),
+        releasedNodes: ['node-a', 'node-b', 'node-c', 'node-d'] };
     const events = [];
     const repository = createRepository(operation, {
         async claim({ owner, now, leaseMs }) {
@@ -871,9 +872,9 @@ test('recovered PPP wait reacquires fresh locks and re-reads revision before pub
     });
     const result = await worker.run('operation-1');
     assert.equal(result.status, 'succeeded');
-    assert.deepEqual(events.slice(0, 4), ['acquire:node-a', 'acquire:node-b',
-        'acquire:node-c', 'fresh-ppp-readback']);
-    assert.equal(events.filter(event => event === 'release').length, 3);
+    assert.deepEqual(events.slice(0, 5), ['acquire:node-a', 'acquire:node-b',
+        'acquire:node-c', 'acquire:node-d', 'fresh-ppp-readback']);
+    assert.equal(events.filter(event => event === 'release').length, 4);
     assert.equal(events.at(-1), 'publish');
 });
 

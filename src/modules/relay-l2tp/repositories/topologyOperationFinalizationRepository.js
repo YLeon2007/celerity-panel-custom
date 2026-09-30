@@ -220,10 +220,13 @@ class TopologyOperationFinalizationRepository {
                         || !Array.isArray(relayNodes)
                         || !relayNodes.includes(wait.relayNode)
                         || new Set(relayNodes).size !== relayNodes.length
-                        || proof.length !== relayNodes.length
+                        || proof.length > relayNodes.length
+                        || !proof.some(item => item.relayNode === wait.relayNode)
                         || new Set(proof.map(item => item.relayNode)).size !== proof.length
                         || proof.some(item => !relayNodes.includes(item.relayNode)
                             || !validRevision(item.credentialRevision) || item.credentialRevision < 1)
+                        || (proof.length < relayNodes.length
+                            && typeof this.RelayL2tpState?.findOne !== 'function')
                         || typeof this.RelayL2tpState?.updateOne !== 'function'
                         || this.RelayL2tpState.db !== this.CascadeTopologyState.db) {
                         rejectFinalization();
@@ -233,6 +236,25 @@ class TopologyOperationFinalizationRepository {
                         const fenced = await this.RelayL2tpState.updateOne({
                             node: relayNode, status: 'installed', desiredState: 'installed',
                             secretRevision: credentialRevision,
+                        }, { $inc: { replacementFence: 1 } }, { session });
+                        if (fenced?.matchedCount !== 1) rejectFinalization();
+                    }
+                    const provedRelays = new Set(proof.map(item => item.relayNode));
+                    for (const relayNode of relayNodes) {
+                        if (provedRelays.has(relayNode)) continue;
+                        // The gate already checked zero users and no active sync for
+                        // this transit relay. Fence its explicit non-PPP state in
+                        // the same transaction as topology publication; a user
+                        // edit/install changes this document and cannot slip in.
+                        const skipped = await this.RelayL2tpState.findOne({ node: relayNode })
+                            .select('status desiredState secretRevision').session(session).lean();
+                        if (skipped?.status !== 'not_installed'
+                            || !['absent', 'not_installed'].includes(skipped.desiredState)
+                            || !validRevision(skipped.secretRevision)) rejectFinalization();
+                        const fenced = await this.RelayL2tpState.updateOne({
+                            node: relayNode, status: 'not_installed',
+                            desiredState: skipped.desiredState,
+                            secretRevision: skipped.secretRevision,
                         }, { $inc: { replacementFence: 1 } }, { session });
                         if (fenced?.matchedCount !== 1) rejectFinalization();
                     }

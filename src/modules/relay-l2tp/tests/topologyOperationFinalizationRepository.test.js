@@ -258,6 +258,46 @@ test('fresh PPP proof fences relay revision and releases admission on success', 
     update: { $inc: { replacementFence: 1 } }, options: { session: SESSION } }]);
 });
 
+test('PPP finalization accepts one installed relay and fences an explicit non-PPP transit relay', async () => {
+    const installed = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const transit = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+    const harness = createHarness({ operation: {
+        heldTopologyAdmission: true,
+        pppWait: { lockOwner: 'worker-1', relayNode: installed, credentialRevision: 7,
+            locks: [{ node: installed, generation: 'old-a' },
+                { node: transit, generation: 'old-b' }],
+            releasedNodes: [installed, transit], probeLocks: [] },
+        nodes: [{ node: installed, role: 'relay' }, { node: transit, role: 'relay' }],
+    }, topology: { topologyAdmissionCount: 1 } });
+    const db = {};
+    const writes = [];
+    harness.repository.CascadeTopologyState.db = db;
+    harness.repository.RelayL2tpState = { db,
+        findOne(filter) {
+            assert.deepEqual(filter, { node: transit });
+            return { select() { return this; }, session(value) {
+                assert.strictEqual(value, SESSION); return this;
+            }, async lean() {
+                return { status: 'not_installed', desiredState: 'not_installed', secretRevision: 0 };
+            } };
+        },
+        async updateOne(filter, update, options) {
+            writes.push({ filter, update, options });
+            return { matchedCount: 1 };
+        },
+    };
+    const result = await harness.repository.finalizeSucceeded(request({
+        pppProof: [{ relayNode: installed, credentialRevision: 8 }],
+    }));
+    assert.equal(result?.operationId, 'operation-7');
+    assert.equal(harness.store.operation.status, 'succeeded');
+    assert.equal(harness.store.topology.topologyAdmissionCount, 0);
+    assert.equal(writes.length, 2);
+    assert.deepEqual(writes[1].filter, { node: transit, status: 'not_installed',
+        desiredState: 'not_installed', secretRevision: 0 });
+    assert.strictEqual(writes[1].options.session, SESSION);
+});
+
 test('PPP wait with unreleased fresh probe generation cannot finalize', async () => {
     const relayNode = 'aaaaaaaaaaaaaaaaaaaaaaaa';
     const harness = createHarness({ operation: { heldTopologyAdmission: true,
