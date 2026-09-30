@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const test = require('node:test');
 
-const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+const { TopologyOperationWorker, LeaseLostError } = require('../workers/topologyOperationWorker');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
@@ -198,6 +198,16 @@ function createRepository(operation = durableOperation(), overrides = {}) {
             operation.status = request.status;
             return true;
         },
+        async recordPppProbeLock({ node, generation, owner }) {
+            operation.pppWait.probeLocks ||= [];
+            operation.pppWait.probeLocks.push({ node, generation, owner });
+            return true;
+        },
+        async acknowledgePppProbeLockRelease({ node, generation }) {
+            operation.pppWait.probeLocks = operation.pppWait.probeLocks.filter(lock =>
+                lock.node !== node || lock.generation !== generation);
+            return true;
+        },
         ...overrides,
     };
 }
@@ -212,6 +222,8 @@ function createWorker({
     renewalIntervalMs,
     userResync,
     pppReadinessGate,
+    pppResumeReadinessGate,
+    pppDriftSync,
     allowUnprovenTestExecution = true,
 } = {}) {
     const suppliedLockService = lockService || {
@@ -260,6 +272,8 @@ function createWorker({
         renewalIntervalMs,
         userResync,
         pppReadinessGate,
+        pppResumeReadinessGate,
+        pppDriftSync,
         ...(allowUnprovenTestExecution ? { allowUnprovenTestExecution: true } : {}),
     });
 }
@@ -710,6 +724,354 @@ test('PPP node readback failure rolls back changed nodes before terminal success
             assert.equal(events.filter(event => event.startsWith('rollback:')).length, 3);
         });
     }
+});
+
+test('verified PPP drift persists a wait before a quiescent lock handoff and sync enqueue', async () => {
+    const events = [];
+    const operation = durableThreeNodeOperation();
+    operation.heldTopologyAdmission = true;
+    const repository = createRepository(operation, {
+        async beginPppWait(request) {
+            events.push('persist-wait');
+            assert.equal(operation.status, 'committing');
+            assert.equal(operation.heldTopologyAdmission, true);
+            assert.deepEqual(request.locks.map(lock => lock.node).sort(), ['node-a', 'node-b', 'node-c']);
+            operation.pppWait = { lockOwner: request.lockOwner,
+                relayNode: request.relayNode, credentialRevision: request.credentialRevision,
+                locks: request.locks, releasedNodes: [] };
+            return true;
+        },
+        async acknowledgePppLockRelease({ node }) {
+            operation.pppWait.releasedNodes.push(node);
+            return true;
+        },
+    });
+    const worker = createWorker({
+        repository,
+        lockService: {
+            async acquire({ node }) { return { ok: true, lock: { generation: `gen-${node}` } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified({ node }) {
+                assert.ok(operation.pppWait, 'wait must be durable before lock release');
+                events.push(`release:${node}`);
+                return { ok: true };
+            },
+        },
+        executor: {
+            async prepare({ node }) { return { backupId: `backup-${node.node}`, prepared: {} }; },
+            async commit() { return { ok: true }; },
+            async verify() { return { ok: true }; },
+            async cleanupPrepared() { return { ok: true }; },
+            async rollback() { events.push('rollback'); return { ok: true }; },
+        },
+        pppReadinessGate: { async verifyPlan() {
+            return { ok: false, reason: 'PPP_DRIFT', relayNode: 'node-b', credentialRevision: 7 };
+        } },
+        pppDriftSync: { async enqueue({ relayNode }) {
+            assert.equal(relayNode, 'node-b');
+            assert.equal(events.filter(event => event.startsWith('release:')).length, 3);
+            events.push('enqueue');
+            return { status: 'queued' };
+        } },
+        finalizer: { async finalizeSucceeded() { events.push('publish'); return { ok: true }; } },
+    });
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'awaiting_ppp');
+    assert.deepEqual(events, ['persist-wait', 'release:node-c', 'release:node-b',
+        'release:node-a', 'enqueue']);
+    assert.equal(events.includes('publish'), false);
+    assert.equal(events.includes('rollback'), false);
+    assert.equal(operation.heldTopologyAdmission, true);
+});
+
+test('failed exact-generation wait handoff never enqueues PPP sync or rolls back', async () => {
+    const operation = durableThreeNodeOperation();
+    operation.heldTopologyAdmission = true;
+    const repository = createRepository(operation, {
+        async beginPppWait({ locks, relayNode, credentialRevision, lockOwner }) {
+            operation.pppWait = { locks, relayNode, credentialRevision, lockOwner,
+                releasedNodes: [] };
+            return true;
+        },
+        async acknowledgePppLockRelease() { throw new Error('must not acknowledge failed release'); },
+    });
+    let queued = 0;
+    let rolledBack = 0;
+    const worker = createWorker({
+        repository,
+        executor: {
+            async prepare({ node }) { return { backupId: `backup-${node.node}`, prepared: {} }; },
+            async commit() { return { ok: true }; },
+            async verify() { return { ok: true }; },
+            async cleanupPrepared() { return { ok: true }; },
+            async rollback() { rolledBack += 1; return { ok: true }; },
+        },
+        lockService: {
+            async acquire({ node }) { return { ok: true, lock: { generation: `gen-${node}` } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified() { return { ok: false }; },
+        },
+        pppReadinessGate: { async verifyPlan() {
+            return { ok: false, reason: 'PPP_DRIFT', relayNode: 'node-b', credentialRevision: 7 };
+        } },
+        pppDriftSync: { async enqueue() { queued += 1; } },
+        finalizer: { async finalizeSucceeded() { throw new Error('not ready'); } },
+    });
+    assert.equal((await worker.run('operation-1')).status, 'awaiting_ppp');
+    assert.equal(operation.status, 'committing');
+    assert.equal(operation.heldTopologyAdmission, true);
+    assert.equal(queued, 0);
+    assert.equal(rolledBack, 0);
+});
+
+test('recovered PPP wait reacquires fresh locks and re-reads revision before publication', async () => {
+    const operation = durableThreeNodeOperation();
+    operation.status = 'committing';
+    operation.heldTopologyAdmission = true;
+    operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = `backup-${node.node}`; });
+    operation.pppWait = { lockOwner: 'original-worker', relayNode: 'node-b', credentialRevision: 7,
+        locks: ['node-a', 'node-b', 'node-c'].map(node => ({ node, generation: `old-${node}` })),
+        releasedNodes: ['node-a', 'node-b', 'node-c'] };
+    const events = [];
+    const repository = createRepository(operation, {
+        async claim({ owner, now, leaseMs }) {
+            if (operation.leaseUntil && operation.leaseUntil > now) return null;
+            operation.leaseOwner = owner;
+            operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        },
+        async renewLease() { return true; },
+    });
+    const worker = createWorker({
+        repository,
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => { throw new Error(`no ${method} on resume`); }])),
+        lockService: {
+            async acquire({ node }) { events.push(`acquire:${node}`);
+                return { ok: true, lock: { generation: `fresh-${node}` } }; },
+            async renew({ generation }) { assert.ok(generation.startsWith('fresh-')); return { ok: true }; },
+            async releaseVerified({ generation }) { assert.ok(generation.startsWith('fresh-'));
+                events.push('release'); return { ok: true }; },
+        },
+        pppReadinessGate: { async verifyPlan() { throw new Error('bootstrap gate on resume'); } },
+        pppResumeReadinessGate: { readOnly: true, async verifyPlan() {
+            events.push('fresh-ppp-readback');
+            return { ok: true, verifiedRelayCount: 1,
+                relayRevisions: [{ relayNode: 'node-b', credentialRevision: 8 }] };
+        } },
+        pppDriftSync: { async enqueue() { throw new Error('already queued'); } },
+        finalizer: { async finalizeSucceeded(request) {
+            assert.deepEqual(request.pppProof,
+                [{ relayNode: 'node-b', credentialRevision: 8 }]);
+            assert.equal(operation.heldTopologyAdmission, true);
+            events.push('publish');
+            operation.status = 'succeeded';
+            return { ok: true };
+        } },
+    });
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'succeeded');
+    assert.deepEqual(events.slice(0, 4), ['acquire:node-a', 'acquire:node-b',
+        'acquire:node-c', 'fresh-ppp-readback']);
+    assert.equal(events.filter(event => event === 'release').length, 3);
+    assert.equal(events.at(-1), 'publish');
+});
+
+test('crash after read-only lock acquisition reclaims durable generations without bootstrap', async () => {
+    const operation = durableThreeNodeOperation();
+    operation.status = 'committing';
+    operation.heldTopologyAdmission = true;
+    operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = `backup-${node.node}`; });
+    operation.pppWait = { lockOwner: 'old-worker', relayNode: 'node-b',
+        credentialRevision: 7, locks: ['node-a', 'node-b', 'node-c'].map(node =>
+            ({ node, generation: `old-${node}` })),
+        releasedNodes: ['node-b', 'node-c'], probeLocks: [] };
+    const repository = createRepository(operation, {
+        async claim({ owner, now, leaseMs }) {
+            operation.leaseOwner = owner;
+            operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        },
+        async acknowledgePppLockRelease({ node }) {
+            operation.pppWait.releasedNodes.push(node);
+            return true;
+        },
+    });
+    const held = new Map();
+    const releases = [];
+    let sequence = 0;
+    let probes = 0;
+    const lockService = {
+        repository: { async findByNode(node) { return held.get(node) || null; } },
+        async acquire({ node, owner, operationId }) {
+            assert.equal(held.has(node), false, `orphan lock on ${node}`);
+            const lock = { node, owner, operationId, generation: `fresh-${++sequence}` };
+            held.set(node, lock);
+            return { ok: true, lock };
+        },
+        async renew() { return { ok: true }; },
+        async releaseVerified({ node, owner, operationId, generation }) {
+            const lock = held.get(node);
+            if (!lock || lock.owner !== owner || lock.operationId !== operationId
+                || lock.generation !== generation) return { ok: false };
+            held.delete(node);
+            releases.push(generation);
+            return { ok: true };
+        },
+    };
+    const worker = createWorker({
+        repository, lockService,
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => { throw new Error(`mutating ${method}`); }])),
+        pppReadinessGate: { async verifyPlan() { throw new Error('bootstrap'); } },
+        pppResumeReadinessGate: { readOnly: true, async verifyPlan() {
+            probes += 1;
+            if (probes === 1) {
+                assert.equal(operation.pppWait.probeLocks.length, 3,
+                    'every newly acquired generation must be durable before probing');
+                throw new LeaseLostError();
+            }
+            return { ok: false, reason: 'PPP_UNAVAILABLE' };
+        } },
+        pppDriftSync: { async enqueue() { throw new Error('unknown is not drift'); } },
+        finalizer: { async finalizeSucceeded() { throw new Error('unknown is not success'); } },
+    });
+    assert.equal((await worker.run('operation-1')).errorCode, 'TOPOLOGY_OPERATION_LEASE_LOST');
+    assert.equal(operation.pppWait.releasedNodes.length, 3,
+        'readback of absent old generation must be ACKed');
+    assert.equal(held.size, 3);
+    assert.deepEqual(operation.pppWait.probeLocks.map(lock => lock.generation),
+        ['fresh-1', 'fresh-2', 'fresh-3']);
+    assert.equal((await worker.run('operation-1')).status, 'awaiting_ppp');
+    assert.equal(probes, 2);
+    assert.deepEqual(releases.slice(0, 3), ['fresh-3', 'fresh-2', 'fresh-1']);
+    assert.equal(held.size, 0);
+    assert.deepEqual(operation.pppWait.probeLocks, []);
+    assert.equal(operation.status, 'committing');
+    assert.equal(operation.heldTopologyAdmission, true);
+});
+
+test('resume rejects a bootstrap-capable PPP gate even when supplied separately', () => {
+    assert.throws(() => createWorker({
+        repository: createRepository(),
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => ({ ok: true })])),
+        pppResumeReadinessGate: { readOnly: false, async verifyPlan() { return { ok: true }; } },
+    }), /read.only/i);
+    const sharedGate = { readOnly: true, async verifyPlan() { return { ok: true }; } };
+    assert.throws(() => createWorker({
+        repository: createRepository(),
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => ({ ok: true })])),
+        pppReadinessGate: sharedGate,
+        pppResumeReadinessGate: sharedGate,
+    }), /separate/i);
+});
+
+test('post-resume PPP timeout releases fresh locks and retries without bootstrap', async () => {
+    const operation = durableThreeNodeOperation();
+    operation.status = 'committing';
+    operation.heldTopologyAdmission = true;
+    operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = `backup-${node.node}`; });
+    operation.pppWait = { lockOwner: 'original-worker', relayNode: 'node-b', credentialRevision: 7,
+        locks: ['node-a', 'node-b', 'node-c'].map(node => ({ node, generation: `old-${node}` })),
+        releasedNodes: ['node-a', 'node-b', 'node-c'] };
+    const repository = createRepository(operation, {
+        async claim({ owner, now, leaseMs }) {
+            operation.leaseOwner = owner;
+            operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        },
+    });
+    const held = new Map();
+    let checks = 0;
+    let finalized = 0;
+    let releaseAttempts = 0;
+    const worker = createWorker({
+        repository,
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => { throw new Error(`no ${method}`); }])),
+        lockService: {
+            repository: { async findByNode(node) {
+                return held.has(node) ? { node, generation: held.get(node), operationId: 'operation-1' }
+                    : null;
+            } },
+            async acquire({ node }) {
+                if (held.has(node)) return { ok: false, error: { code: 'NODE_OPERATION_LOCK_CONFLICT' } };
+                held.set(node, `fresh-${node}`);
+                return { ok: true, lock: { generation: `fresh-${node}` } };
+            },
+            async renew() { return { ok: true }; },
+            async releaseVerified({ node, generation }) {
+                assert.equal(held.get(node), generation);
+                if (++releaseAttempts === 1) return { ok: false }; // uncertain DB delete
+                held.delete(node);
+                return { ok: true };
+            },
+        },
+        pppReadinessGate: { async verifyPlan() { throw new Error('bootstrap gate on resume'); } },
+        pppResumeReadinessGate: { readOnly: true, async verifyPlan() { checks += 1;
+            return { ok: false, reason: 'PPP_UNAVAILABLE' }; } },
+        pppDriftSync: { async enqueue() { throw new Error('not proven drift'); } },
+        finalizer: { async finalizeSucceeded() { finalized += 1; return { ok: true }; } },
+    });
+    assert.equal((await worker.run('operation-1')).status, 'awaiting_ppp');
+    assert.equal(held.size, 3, 'uncertain release must keep exact fresh generations');
+    assert.equal(operation.pppWait.probeLocks.length, 3);
+    assert.equal(finalized, 0);
+    assert.equal((await worker.run('operation-1')).status, 'awaiting_ppp');
+    assert.equal(checks, 2, 'a recovered wait retries using fresh read-only locks');
+    assert.equal(finalized, 0);
+    assert.equal(operation.heldTopologyAdmission, true);
+    assert.equal(held.size, 0);
+});
+
+test('post-resume verified PPP drift hands off fresh lock generations before retry enqueue', async () => {
+    const operation = durableThreeNodeOperation();
+    operation.status = 'committing';
+    operation.heldTopologyAdmission = true;
+    operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = `backup-${node.node}`; });
+    operation.pppWait = { lockOwner: 'original-worker', relayNode: 'node-b', credentialRevision: 7,
+        locks: ['node-a', 'node-b', 'node-c'].map(node => ({ node, generation: `old-${node}` })),
+        releasedNodes: ['node-a', 'node-b', 'node-c'] };
+    const repository = createRepository(operation, {
+        async claim({ owner, now, leaseMs }) {
+            operation.leaseOwner = owner;
+            operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        },
+    });
+    const held = new Map();
+    let enqueued = 0;
+    const worker = createWorker({
+        repository,
+        executor: Object.fromEntries(['prepare', 'commit', 'verify', 'cleanupPrepared', 'rollback']
+            .map(method => [method, async () => { throw new Error(`no ${method}`); }])),
+        lockService: {
+            async acquire({ node }) { held.set(node, `fresh-${node}`);
+                return { ok: true, lock: { generation: `fresh-${node}` } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified({ node, generation }) {
+                assert.equal(held.get(node), generation);
+                held.delete(node);
+                return { ok: true };
+            },
+        },
+        pppReadinessGate: { async verifyPlan() { throw new Error('bootstrap gate on resume'); } },
+        pppResumeReadinessGate: { readOnly: true, async verifyPlan() {
+            return { ok: false, reason: 'PPP_DRIFT', relayNode: 'node-b', credentialRevision: 8 };
+        } },
+        pppDriftSync: { async enqueue() {
+            assert.equal(held.size, 0, 'sync_users must receive the relay only after quiescent release');
+            enqueued += 1;
+            return { status: 'queued' };
+        } },
+        finalizer: { async finalizeSucceeded() { throw new Error('drift is not success'); } },
+    });
+    assert.equal((await worker.run('operation-1')).status, 'awaiting_ppp');
+    assert.equal(enqueued, 1);
+    assert.equal(held.size, 0);
+    assert.equal(operation.heldTopologyAdmission, true);
 });
 
 test('persistent user sync failure after rollback cannot be reported as recovered', async () => {
@@ -1283,6 +1645,7 @@ test('delegates terminal success to the atomic finalizer with only operation lea
         leaseUntil: repository.operation.leaseUntil,
         topologyRevision: 7,
         priorDeployedRevision: 5,
+        now: new Date(NOW),
     }]);
     assert.deepEqual(
         repository.calls.filter(call => (

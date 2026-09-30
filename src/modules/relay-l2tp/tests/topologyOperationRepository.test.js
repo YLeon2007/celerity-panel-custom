@@ -819,6 +819,8 @@ test('claim reads only durable candidates and never resets later active phases',
                 attempts: 1,
                 leaseOwner: 1,
                 leaseUntil: 1,
+                heldTopologyAdmission: 1,
+                pppWait: 1,
                 'nodes.node': 1,
                 'nodes.nodeRef': 1,
                 'nodes.role': 1,
@@ -894,6 +896,8 @@ test('claim reacquires expired committing and rolling-back phases without resett
                 attempts: 1,
                 leaseOwner: 1,
                 leaseUntil: 1,
+                heldTopologyAdmission: 1,
+                pppWait: 1,
                 'nodes.node': 1,
                 'nodes.nodeRef': 1,
                 'nodes.role': 1,
@@ -908,6 +912,71 @@ test('claim reacquires expired committing and rolling-back phases without resett
             },
         },
     });
+});
+
+test('PPP wait CAS keeps committing admission and reclaims the expired durable wait', async () => {
+    const model = createModel();
+    const wait = { lockOwner: 'worker-1', relayNode: 'relay-a', credentialRevision: 7,
+        locks: [{ node: 'relay-a', generation: 'generation-1' }], releasedNodes: [],
+        probeLocks: [] };
+    let stored = { _id: 'operation-1', status: 'committing', heldTopologyAdmission: true,
+        leaseOwner: 'worker-1', leaseUntil: new Date(NOW.getTime() + 30_000) };
+    model.updateOne = async (filter, update, options) => {
+        assert.equal(filter.status, 'committing');
+        assert.equal(filter.heldTopologyAdmission, true);
+        assert.equal(options.runValidators, true);
+        if (update.$set?.pppWait) {
+            assert.deepEqual(update.$set.pppWait, wait);
+            stored.pppWait = structuredClone(wait);
+        } else {
+            assert.equal(filter['pppWait.lockOwner'], 'worker-1');
+            assert.deepEqual(filter['pppWait.locks'].$elemMatch,
+                { node: 'relay-a', generation: 'generation-1' });
+            stored.pppWait.releasedNodes.push(update.$addToSet['pppWait.releasedNodes']);
+        }
+        return { matchedCount: 1 };
+    };
+    model.findOneAndUpdate = async (filter, update, options) => {
+        if (filter.$or) return null;
+        assert.deepEqual(filter.status.$in, ['preparing', 'committing', 'rolling_back']);
+        assert.equal(options.projection.pppWait, 1);
+        assert.equal(options.projection.heldTopologyAdmission, 1);
+        stored = { ...stored, ...update.$set };
+        return structuredClone(stored);
+    };
+    const repository = new TopologyOperationRepository({ model });
+    assert.equal(await repository.beginPppWait({ operationId: 'operation-1', owner: 'worker-1',
+        now: NOW, relayNode: 'relay-a', credentialRevision: 7, locks: wait.locks }), true);
+    assert.equal(await repository.acknowledgePppLockRelease({ operationId: 'operation-1',
+        owner: 'worker-1', now: NOW, node: 'relay-a', generation: 'generation-1',
+        lockOwner: 'worker-1' }), true);
+    const reclaimed = await repository.claim({ operationId: 'operation-1',
+        owner: 'worker-2', now: new Date(NOW.getTime() + 30_000), leaseMs: 30_000 });
+    assert.equal(reclaimed.status, 'committing');
+    assert.equal(reclaimed.heldTopologyAdmission, true);
+    assert.deepEqual(reclaimed.pppWait.releasedNodes, ['relay-a']);
+    assert.equal(reclaimed.leaseOwner, 'worker-2');
+});
+
+test('PPP probe generations are recorded and ACKed under the committing lease', async () => {
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    assert.equal(await repository.recordPppProbeLock({ operationId: 'operation-1',
+        owner: 'worker-2', now: NOW, node: 'relay-a', generation: 'fresh-1' }), true);
+    assert.equal(await repository.acknowledgePppProbeLockRelease({ operationId: 'operation-1',
+        owner: 'worker-2', now: NOW, node: 'relay-a', generation: 'fresh-1',
+        lockOwner: 'worker-2' }), true);
+    const [record, ack] = model.calls;
+    assert.equal(record.query.status, 'committing');
+    assert.equal(record.query.heldTopologyAdmission, true);
+    assert.equal(record.query['pppWait.releasedNodes'], 'relay-a');
+    assert.deepEqual(record.update.$push['pppWait.probeLocks'],
+        { node: 'relay-a', owner: 'worker-2', generation: 'fresh-1' });
+    assert.equal(ack.query.leaseOwner, 'worker-2');
+    assert.deepEqual(ack.query['pppWait.probeLocks'].$elemMatch,
+        { node: 'relay-a', owner: 'worker-2', generation: 'fresh-1' });
+    assert.deepEqual(ack.update.$pull['pppWait.probeLocks'],
+        { node: 'relay-a', owner: 'worker-2', generation: 'fresh-1' });
 });
 
 test('renewLease extends only an active unexpired lease owned by the worker', async () => {

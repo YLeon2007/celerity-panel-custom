@@ -198,10 +198,45 @@ class TopologyOperationFinalizationRepository {
         try {
             return await this.transactionRunner(async session => {
                 const admission = await this.TopologyOperation.findById(operationId)
-                    .select('heldTopologyAdmission')
+                    .select('heldTopologyAdmission pppWait nodes')
                     .session(session)
                     .lean();
                 if (!admission) rejectFinalization();
+                const wait = admission.pppWait;
+                if (wait || request.pppProof !== undefined) {
+                    const proof = request.pppProof;
+                    const relayNodes = admission.nodes?.filter(node => node.role === 'relay')
+                        .map(node => String(node.node));
+                    if (!wait || admission.heldTopologyAdmission !== true
+                        || typeof wait.relayNode !== 'string'
+                        || !Array.isArray(wait.locks) || !wait.locks.length
+                        || wait.locks.some(lock => typeof lock.generation !== 'string'
+                            || !lock.generation)
+                        || !Array.isArray(wait.releasedNodes)
+                        || (wait.probeLocks !== undefined
+                            && (!Array.isArray(wait.probeLocks) || wait.probeLocks.length !== 0))
+                        || wait.locks.some(lock => !wait.releasedNodes.includes(String(lock.node)))
+                        || !Array.isArray(proof) || !proof.length
+                        || !Array.isArray(relayNodes)
+                        || !relayNodes.includes(wait.relayNode)
+                        || new Set(relayNodes).size !== relayNodes.length
+                        || proof.length !== relayNodes.length
+                        || new Set(proof.map(item => item.relayNode)).size !== proof.length
+                        || proof.some(item => !relayNodes.includes(item.relayNode)
+                            || !validRevision(item.credentialRevision) || item.credentialRevision < 1)
+                        || typeof this.RelayL2tpState?.updateOne !== 'function'
+                        || this.RelayL2tpState.db !== this.CascadeTopologyState.db) {
+                        rejectFinalization();
+                    }
+                    for (const { relayNode, credentialRevision } of proof) {
+                        // A write conflicts with concurrent user edits in this transaction.
+                        const fenced = await this.RelayL2tpState.updateOne({
+                            node: relayNode, status: 'installed', desiredState: 'installed',
+                            secretRevision: credentialRevision,
+                        }, { $inc: { replacementFence: 1 } }, { session });
+                        if (fenced?.matchedCount !== 1) rejectFinalization();
+                    }
+                }
                 const releasesAdmission = admission.heldTopologyAdmission === true;
                 const operation = await this.TopologyOperation.updateOne({
                     _id: operationId,
@@ -218,6 +253,7 @@ class TopologyOperationFinalizationRepository {
                         leaseUntil: null,
                         ...(releasesAdmission ? { heldTopologyAdmission: false } : {}),
                     },
+                    ...(wait ? { $unset: { pppWait: 1 } } : {}),
                 }, { runValidators: true, session });
                 if (operation?.matchedCount !== 1) rejectFinalization();
 

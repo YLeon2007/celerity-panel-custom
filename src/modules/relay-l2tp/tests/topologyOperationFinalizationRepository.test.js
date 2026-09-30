@@ -25,7 +25,7 @@ function equalValue(left, right) {
 
 function matches(document, filter) {
     return Object.entries(filter).every(([key, expected]) => {
-        const actual = document[key];
+        const actual = key.split('.').reduce((value, segment) => value?.[segment], document);
         if (expected && typeof expected === 'object' && !(expected instanceof Date)) {
             if (Object.hasOwn(expected, '$eq') && !equalValue(actual, expected.$eq)) return false;
             if (Object.hasOwn(expected, '$gt') && !(actual > expected.$gt)) return false;
@@ -39,6 +39,7 @@ function matches(document, filter) {
 
 function applySet(document, update) {
     Object.assign(document, clone(update.$set || {}));
+    for (const field of Object.keys(update.$unset || {})) delete document[field];
     for (const [field, increment] of Object.entries(update.$inc || {})) {
         document[field] += increment;
     }
@@ -71,7 +72,9 @@ function createHarness(overrides = {}) {
                 select() { return this; },
                 session(value) { assert.strictEqual(value, SESSION); return this; },
                 async lean() { return id === store.operation._id
-                    ? { heldTopologyAdmission: store.operation.heldTopologyAdmission } : null; },
+                    ? { heldTopologyAdmission: store.operation.heldTopologyAdmission,
+                        ...(store.operation.pppWait ? { pppWait: clone(store.operation.pppWait),
+                            nodes: clone(store.operation.nodes) } : {}) } : null; },
             };
         },
         updateOne(filter, update, options) {
@@ -225,6 +228,79 @@ test('atomically marks the leased committing operation succeeded and advances de
         { transaction: 'commit', session: SESSION },
     ]);
     assert.doesNotMatch(JSON.stringify(harness.calls), /candidate|bytes|secret/i);
+});
+
+test('fresh PPP proof fences relay revision and releases admission on success', async () => {
+    const relayNode = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const wait = { lockOwner: 'worker-1', relayNode, credentialRevision: 7,
+        locks: [{ node: relayNode, generation: 'old-generation' }],
+        releasedNodes: [relayNode] };
+    const harness = createHarness({ operation: {
+        heldTopologyAdmission: true, pppWait: wait,
+        nodes: [{ node: relayNode, role: 'relay' }],
+    }, topology: { topologyAdmissionCount: 1 } });
+    const stateWrites = [];
+    const db = {};
+    harness.repository.CascadeTopologyState.db = db;
+    harness.repository.RelayL2tpState = { db, async updateOne(filter, update, options) {
+        stateWrites.push({ filter, update, options });
+        return { matchedCount: 1 };
+    } };
+    const proof = [{ relayNode, credentialRevision: 8 }];
+    assert.equal((await harness.repository.finalizeSucceeded(request({ pppProof: proof })))?.operationId,
+        'operation-7');
+    assert.equal(harness.store.operation.status, 'succeeded');
+    assert.equal(harness.store.operation.pppWait, undefined);
+    assert.equal(harness.store.operation.heldTopologyAdmission, false);
+    assert.equal(harness.store.topology.topologyAdmissionCount, 0);
+    assert.deepEqual(stateWrites, [{ filter: { node: relayNode, status: 'installed',
+        desiredState: 'installed', secretRevision: 8 },
+    update: { $inc: { replacementFence: 1 } }, options: { session: SESSION } }]);
+});
+
+test('PPP wait with unreleased fresh probe generation cannot finalize', async () => {
+    const relayNode = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const harness = createHarness({ operation: { heldTopologyAdmission: true,
+        nodes: [{ node: relayNode, role: 'relay' }],
+        pppWait: { lockOwner: 'worker-1', relayNode, credentialRevision: 7,
+            locks: [{ node: relayNode, generation: 'old' }], releasedNodes: [relayNode],
+            probeLocks: [{ node: relayNode, owner: 'worker-2', generation: 'fresh' }] },
+    }, topology: { topologyAdmissionCount: 1 } });
+    let writes = 0;
+    harness.repository.RelayL2tpState = { async updateOne() { writes += 1; return { matchedCount: 1 }; } };
+    const before = clone(harness.store);
+    assert.equal(await harness.repository.finalizeSucceeded(request({
+        pppProof: [{ relayNode, credentialRevision: 8 }],
+    })), null);
+    assert.deepEqual(harness.store, before);
+    assert.equal(writes, 0);
+});
+
+test('PPP wait finalization fences a concurrent user edit and preserves topology admission', async () => {
+    const relayNode = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+    const wait = { relayNode, credentialRevision: 7, locks: [
+        { node: relayNode, generation: 'prior-generation' }], releasedNodes: [relayNode] };
+    const harness = createHarness({
+        operation: { heldTopologyAdmission: true, pppWait: wait,
+            nodes: [{ node: relayNode, role: 'relay' }] },
+        topology: { topologyAdmissionCount: 1 },
+    });
+    const stateWrites = [];
+    harness.repository.RelayL2tpState = {
+        db: harness.repository.CascadeTopologyState.db,
+        async updateOne(filter, update, options) {
+            stateWrites.push({ filter, update, options });
+            return { matchedCount: 0 }; // concurrent user edit incremented secretRevision
+        },
+    };
+    const before = clone(harness.store);
+    const proof = [{ relayNode, credentialRevision: 7 }];
+    assert.equal(await harness.repository.finalizeSucceeded(request({ pppProof: proof })), null);
+    assert.deepEqual(harness.store, before);
+    assert.equal(harness.calls.at(-1).transaction, 'abort');
+    assert.equal(stateWrites.length, 1);
+    assert.equal(stateWrites[0].filter.secretRevision, 7);
+    assert.equal(stateWrites[0].options.session, SESSION);
 });
 
 test('successful admitted operation releases its slot in the same transaction so a second link can queue', async () => {

@@ -227,6 +227,8 @@ class TopologyOperationWorker {
         renewalIntervalMs,
         userResync,
         pppReadinessGate,
+        pppResumeReadinessGate,
+        pppDriftSync,
         attachIngressGate,
         allowUnprovenTestExecution = false,
     } = {}) {
@@ -287,6 +289,17 @@ class TopologyOperationWorker {
             throw new TypeError('Topology operation worker PPP gate requires verifyPlan');
         }
         this.pppReadinessGate = pppReadinessGate;
+        if (pppResumeReadinessGate !== undefined
+            && (pppResumeReadinessGate === pppReadinessGate
+                || pppResumeReadinessGate?.readOnly !== true
+                || typeof pppResumeReadinessGate.verifyPlan !== 'function')) {
+            throw new TypeError('Topology PPP resume requires a separate read-only gate');
+        }
+        this.pppResumeReadinessGate = pppResumeReadinessGate;
+        if (pppDriftSync !== undefined && typeof pppDriftSync?.enqueue !== 'function') {
+            throw new TypeError('Topology PPP drift sync requires enqueue');
+        }
+        this.pppDriftSync = pppDriftSync;
         if (attachIngressGate !== undefined
             && typeof attachIngressGate?.verifyPlan !== 'function') {
             throw new TypeError('Topology attach ingress gate requires verifyPlan');
@@ -425,6 +438,236 @@ class TopologyOperationWorker {
                 // Failed release leaves this node blocked for TEST rollback.
             }
         }
+    }
+
+    async releasePppWaitLocks(operationId, wait, acquiredNodeIds) {
+        if (!Array.isArray(wait?.locks) || !Array.isArray(wait.releasedNodes)
+            || typeof wait.lockOwner !== 'string' || !wait.lockOwner) return false;
+        for (const { node, generation } of [...wait.locks].reverse()) {
+            if (wait.releasedNodes.includes(node)) continue;
+            await this.renew(operationId);
+            let released;
+            try {
+                released = await this.lockService.releaseVerified({
+                    node, owner: wait.lockOwner, operationId, generation,
+                });
+            } catch {
+                return false;
+            }
+            if (released?.ok !== true) {
+                // A crash can occur after deletion but before the durable ACK.
+                // Only an empty readback proves this generation is gone; never
+                // delete a foreign generation or ACK an uncertain lock.
+                if (!await this.isNodeLockAbsent(node)) return false;
+            }
+            const index = acquiredNodeIds.findIndex(lock => lock.node === node
+                && lock.generation === generation);
+            if (index >= 0) acquiredNodeIds.splice(index, 1);
+            const acknowledged = await this.operationRepository.acknowledgePppLockRelease({
+                operationId, owner: this.workerId, now: this.clock.now(),
+                node, generation, lockOwner: wait.lockOwner,
+            });
+            if (acknowledged !== true) throw new LeaseLostError();
+            wait.releasedNodes.push(node);
+        }
+        return true;
+    }
+
+    async isNodeLockAbsent(node) {
+        if (typeof this.lockService.repository?.findByNode !== 'function') return false;
+        try {
+            return await this.lockService.repository.findByNode(node) === null;
+        } catch {
+            return false;
+        }
+    }
+
+    async releasePppProbeLocks(operationId, wait, acquiredNodeIds) {
+        for (const { node, owner, generation } of [...(wait.probeLocks || [])].reverse()) {
+            await this.renew(operationId);
+            let released;
+            try {
+                released = await this.lockService.releaseVerified({
+                    node, owner, operationId, generation,
+                });
+            } catch {
+                return false;
+            }
+            if (released?.ok !== true && !await this.isNodeLockAbsent(node)) return false;
+            const index = acquiredNodeIds.findIndex(lock => lock.node === node
+                && lock.generation === generation);
+            if (index >= 0) acquiredNodeIds.splice(index, 1);
+            const acknowledged = await this.operationRepository.acknowledgePppProbeLockRelease({
+                operationId, owner: this.workerId, now: this.clock.now(),
+                node, lockOwner: owner, generation,
+            });
+            if (acknowledged !== true) throw new LeaseLostError();
+            wait.probeLocks = wait.probeLocks.filter(lock => lock.node !== node
+                || lock.generation !== generation);
+        }
+        return true;
+    }
+
+    async releaseOrphanProbeLocks(operationId, wait) {
+        const read = this.lockService.repository?.findByNode;
+        if (typeof read !== 'function') return true; // Exact recorded generations remain recoverable.
+        for (const { node } of wait.locks) {
+            let current;
+            try {
+                current = await read.call(this.lockService.repository, node);
+            } catch {
+                return false;
+            }
+            if (!current || String(current.operationId) !== operationId) continue;
+            if (wait.probeLocks?.some(lock => lock.node === node
+                && lock.generation === current.generation)) return false;
+            // All original generations have been released. An unrecorded
+            // generation from this operation can only be a read-only probe.
+            if (wait.locks.some(lock => lock.node === node
+                && lock.generation === current.generation)) return false;
+            let released;
+            try {
+                released = await this.lockService.releaseVerified({
+                    node, owner: current.owner, operationId, generation: current.generation,
+                });
+            } catch {
+                return false;
+            }
+            if (released?.ok !== true && !await this.isNodeLockAbsent(node)) return false;
+        }
+        return true;
+    }
+
+    async acquirePppProbeLocks(operationId, nodes, wait, acquiredNodeIds) {
+        const ids = nodes.map(node => node.node).sort((a, b) => a.localeCompare(b));
+        for (const node of ids) {
+            let acquired;
+            try {
+                acquired = await this.lockService.acquire({
+                    node, owner: this.workerId, operationId, leaseMs: this.leaseMs,
+                });
+            } catch {
+                return false;
+            }
+            if (acquired?.ok !== true || typeof acquired.lock?.generation !== 'string'
+                || !acquired.lock.generation) return false;
+            const generation = acquired.lock.generation;
+            acquiredNodeIds.push({ node, generation });
+            const recorded = await this.operationRepository.recordPppProbeLock({
+                operationId, owner: this.workerId, now: this.clock.now(), node, generation,
+            });
+            if (recorded !== true) throw new LeaseLostError();
+            wait.probeLocks.push({ node, owner: this.workerId, generation });
+        }
+        return true;
+    }
+
+    async releaseUnrecordedProbeLocks(operationId, wait, acquiredNodeIds) {
+        // A persistence failure between acquire and record must not turn into
+        // a lost exact generation. Try the known local generation; a crash in
+        // this gap is recovered by releaseOrphanProbeLocks on the next claim.
+        const recorded = new Set((wait.probeLocks || []).map(lock => `${lock.node}:${lock.generation}`));
+        for (const lock of [...acquiredNodeIds].reverse()) {
+            if (recorded.has(`${lock.node}:${lock.generation}`)) continue;
+            try {
+                const released = await this.lockService.releaseVerified({
+                    ...lock, owner: this.workerId, operationId,
+                });
+                if (released?.ok !== true && !await this.isNodeLockAbsent(lock.node)) continue;
+                acquiredNodeIds.splice(acquiredNodeIds.indexOf(lock), 1);
+            } catch {
+                // Recovery reads the inserted lock's exact generation.
+            }
+        }
+    }
+
+    async resumePppWait(plan, operation, operationId, nodes, heartbeat, acquiredNodeIds) {
+        const waiting = () => ({ claimed: true, operationId, status: 'awaiting_ppp' });
+        const wait = operation.pppWait;
+        if (operation.status !== 'committing' || operation.heldTopologyAdmission !== true
+            || !wait || typeof wait.relayNode !== 'string'
+            || !nodes.some(node => node.role === 'relay' && node.node === wait.relayNode)
+            || !this.pppResumeReadinessGate || !this.pppDriftSync) return waiting();
+        // Recover a crash between exact-generation release and acknowledgement
+        // before attempting a new read-only probe. Never call a bootstrap gate.
+        if (!await this.releasePppWaitLocks(operationId, wait, acquiredNodeIds)) return waiting();
+        if (!await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds)) return waiting();
+        if (!await this.releaseOrphanProbeLocks(operationId, wait)) return waiting();
+        if (typeof this.operationRepository.recordPppProbeLock !== 'function'
+            || typeof this.operationRepository.acknowledgePppProbeLockRelease !== 'function') {
+            return waiting();
+        }
+        wait.probeLocks ||= [];
+        const lockError = await this.acquirePppProbeLocks(operationId, nodes, wait, acquiredNodeIds);
+        if (!lockError) {
+            await heartbeat.stop();
+            await this.releaseUnrecordedProbeLocks(operationId, wait, acquiredNodeIds);
+            await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds);
+            return waiting();
+        }
+        let readiness;
+        try {
+            readiness = await heartbeat.run(() => this.pppResumeReadinessGate.verifyPlan(plan));
+        } catch (error) {
+            if (error instanceof LeaseLostError) throw error;
+            await heartbeat.stop();
+            await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds);
+            return waiting();
+        }
+        // No read-only probe or remote mutation remains in flight. Stop lock
+        // renewal before releasing generations; keep the operation lease fresh
+        // with explicit fenced renewals during release/finalization.
+        await heartbeat.stop();
+        if (readiness?.ok === true) {
+            const proof = readiness.relayRevisions;
+            const relayIds = nodes.filter(node => node.role === 'relay').map(node => node.node);
+            if (Array.isArray(proof) && proof.length === relayIds.length
+                && new Set(proof.map(item => item.relayNode)).size === proof.length
+                && proof.every(item => relayIds.includes(item.relayNode)
+                    && Number.isSafeInteger(item.credentialRevision)
+                    && item.credentialRevision > 0)) {
+                if (!await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds)) return waiting();
+                const leaseUntil = await this.renew(operationId);
+                try {
+                    const finalized = await this.finalizer.finalizeSucceeded({
+                        operationId, owner: this.workerId, leaseUntil,
+                        topologyRevision: plan.topologyRevision,
+                        priorDeployedRevision: plan.priorDeployedRevision,
+                        now: this.clock.now(), pppProof: proof,
+                    });
+                    if (finalized) return { claimed: true, operationId, status: 'succeeded' };
+                } catch (error) {
+                    if (error instanceof LeaseLostError
+                        || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') throw new LeaseLostError();
+                    // Transaction rejection is not permission to roll back a
+                    // completed topology; retry a fresh read-only proof later.
+                }
+            }
+            await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds);
+            return waiting();
+        }
+        let releasedDuringDrift = false;
+        if (readiness?.reason === 'PPP_DRIFT'
+            && readiness.relayNode === wait.relayNode
+            && Number.isSafeInteger(readiness.credentialRevision)
+            && readiness.credentialRevision > 0) {
+            // Release the entire read-only lock set before queueing sync_users.
+            const released = await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds);
+            releasedDuringDrift = true;
+            if (released) {
+                try {
+                    await this.pppDriftSync.enqueue({
+                        relayNode: readiness.relayNode, now: this.clock.now(),
+                    });
+                } catch {
+                    // The durable wait remains claimable for a bounded retry.
+                }
+            }
+        }
+        if (!releasedDuringDrift) {
+            await this.releasePppProbeLocks(operationId, wait, acquiredNodeIds);
+        }
+        return waiting();
     }
 
     context(plan, node, prepared, backupId) {
@@ -737,6 +980,8 @@ class TopologyOperationWorker {
         this.running.add(operationId);
         let heartbeat;
         let terminalSuccess = false;
+        let resumeWait;
+        let durablePppWait = false;
         const acquiredNodeIds = [];
         try {
             const operation = await this.operationRepository.claim({
@@ -754,6 +999,9 @@ class TopologyOperationWorker {
                 nodes = orderedPlanNodes(plan);
                 entries = this.durableEntries(operation, nodes);
             } catch {
+                if (operation.pppWait) {
+                    return { claimed: true, operationId, status: 'awaiting_ppp', stopped: true };
+                }
                 const failed = await this.operationRepository.finishClaimed({
                     operationId,
                     owner: this.workerId,
@@ -765,6 +1013,12 @@ class TopologyOperationWorker {
             }
 
             heartbeat = this.createLeaseHeartbeat(operationId, acquiredNodeIds);
+            if (operation.pppWait) {
+                resumeWait = operation.pppWait;
+                return await this.resumePppWait(
+                    plan, operation, operationId, nodes, heartbeat, acquiredNodeIds,
+                );
+            }
             const lockErrorCode = await this.acquireLocks(operationId, nodes, acquiredNodeIds);
             if (lockErrorCode) {
                 return {
@@ -915,10 +1169,48 @@ class TopologyOperationWorker {
                     await this.renew(operationId);
                     const readiness = await heartbeat.run(() => this.pppReadinessGate.verifyPlan(plan));
                     if (readiness?.ok !== true) {
+                        if (readiness?.reason === 'PPP_DRIFT'
+                            && operation.heldTopologyAdmission === true
+                            && typeof readiness.relayNode === 'string'
+                            && nodes.some(node => node.role === 'relay'
+                                && node.node === readiness.relayNode)
+                            && Number.isSafeInteger(readiness.credentialRevision)
+                            && readiness.credentialRevision > 0
+                            && this.pppDriftSync
+                            && typeof this.operationRepository.beginPppWait === 'function'
+                            && typeof this.operationRepository.acknowledgePppLockRelease === 'function') {
+                            const locks = acquiredNodeIds.map(lock => ({ ...lock }));
+                            const persisted = await this.operationRepository.beginPppWait({
+                                operationId, owner: this.workerId, now: this.clock.now(),
+                                relayNode: readiness.relayNode,
+                                credentialRevision: readiness.credentialRevision, locks,
+                            });
+                            if (persisted !== true) throw new LeaseLostError();
+                            durablePppWait = true;
+                            // Do not roll back after the wait is persisted. Only
+                            // exact owned generations can be handed to sync_users.
+                            await heartbeat.stop();
+                            const released = await this.releasePppWaitLocks(operationId, {
+                                lockOwner: this.workerId, locks, releasedNodes: [],
+                            }, acquiredNodeIds);
+                            if (released) {
+                                try {
+                                    await this.pppDriftSync.enqueue({
+                                        relayNode: readiness.relayNode, now: this.clock.now(),
+                                    });
+                                } catch {
+                                    // Durable wait remains for the next claim.
+                                }
+                            }
+                            return { claimed: true, operationId, status: 'awaiting_ppp' };
+                        }
                         throw new Error('Topology PPP node readback was not verified');
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
+                    if (durablePppWait) {
+                        return { claimed: true, operationId, status: 'awaiting_ppp' };
+                    }
                     return await this.rollbackAfterCommitFailure(
                         plan, operationId, prepared, changing, heartbeat,
                     );
@@ -945,6 +1237,7 @@ class TopologyOperationWorker {
                     leaseUntil,
                     topologyRevision: plan.topologyRevision,
                     priorDeployedRevision: plan.priorDeployedRevision,
+                    now: this.clock.now(),
                 });
                 if (!finalized) throw new Error('Topology operation finalization was rejected');
             } catch (error) {
@@ -976,6 +1269,9 @@ class TopologyOperationWorker {
             throw error;
         } finally {
             if (heartbeat) await heartbeat.stop();
+            if (resumeWait) await this.releaseUnrecordedProbeLocks(
+                operationId, resumeWait, acquiredNodeIds,
+            );
             if (terminalSuccess) await this.releaseVerifiedLocks(operationId, acquiredNodeIds);
             this.running.delete(operationId);
         }

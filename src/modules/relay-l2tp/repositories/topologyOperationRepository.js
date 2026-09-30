@@ -51,6 +51,8 @@ const CLAIM_PROJECTION = Object.freeze({
     attempts: 1,
     leaseOwner: 1,
     leaseUntil: 1,
+    heldTopologyAdmission: 1,
+    pppWait: 1,
     'nodes.node': 1,
     'nodes.nodeRef': 1,
     'nodes.role': 1,
@@ -402,6 +404,58 @@ class TopologyOperationRepository {
             },
             $inc: { attempts: 1 },
         }, options);
+    }
+
+    async beginPppWait({ operationId: id, owner, now, relayNode, credentialRevision, locks }) {
+        if (typeof relayNode !== 'string' || !relayNode
+            || !Number.isSafeInteger(credentialRevision) || credentialRevision < 1
+            || !Array.isArray(locks) || !locks.length
+            || new Set(locks.map(lock => lock.node)).size !== locks.length
+            || locks.some(lock => typeof lock.node !== 'string' || !lock.node
+                || typeof lock.generation !== 'string' || !lock.generation)) {
+            throw new TypeError('Invalid PPP wait identity');
+        }
+        const result = await this.model.updateOne({
+            _id: id, status: 'committing', heldTopologyAdmission: true,
+            pppWait: { $exists: false }, leaseOwner: owner, leaseUntil: { $gt: now },
+            'nodes.node': relayNode,
+        }, { $set: { pppWait: { lockOwner: owner, relayNode, credentialRevision,
+            locks: locks.map(lock => ({ node: lock.node, generation: lock.generation })),
+            releasedNodes: [], probeLocks: [] } } }, { runValidators: true });
+        return result.matchedCount === 1;
+    }
+
+    async acknowledgePppLockRelease({ operationId: id, owner, now, node, generation, lockOwner }) {
+        const result = await this.model.updateOne({
+            _id: id, status: 'committing', heldTopologyAdmission: true,
+            leaseOwner: owner, leaseUntil: { $gt: now },
+            'pppWait.lockOwner': lockOwner,
+            'pppWait.locks': { $elemMatch: { node, generation } },
+        }, { $addToSet: { 'pppWait.releasedNodes': node } }, { runValidators: true });
+        return result.matchedCount === 1;
+    }
+
+    async recordPppProbeLock({ operationId: id, owner, now, node, generation }) {
+        if (typeof generation !== 'string' || !generation) throw new TypeError('Invalid probe lock');
+        const result = await this.model.updateOne({
+            _id: id, status: 'committing', heldTopologyAdmission: true,
+            leaseOwner: owner, leaseUntil: { $gt: now },
+            'pppWait.releasedNodes': node,
+            'pppWait.probeLocks.node': { $ne: node },
+        }, { $push: { 'pppWait.probeLocks': { node, owner, generation } } },
+        { runValidators: true });
+        return result.matchedCount === 1;
+    }
+
+    async acknowledgePppProbeLockRelease({ operationId: id, owner, now,
+        node, generation, lockOwner }) {
+        const result = await this.model.updateOne({
+            _id: id, status: 'committing', heldTopologyAdmission: true,
+            leaseOwner: owner, leaseUntil: { $gt: now },
+            'pppWait.probeLocks': { $elemMatch: { node, owner: lockOwner, generation } },
+        }, { $pull: { 'pppWait.probeLocks': { node, owner: lockOwner, generation } } },
+        { runValidators: true });
+        return result.matchedCount === 1;
     }
 
     async renewLease({ operationId: id, owner, leaseMs, now }) {

@@ -102,6 +102,25 @@ const topologyNodeSchema = new mongoose.Schema({
     backupId: { type: String, default: '', trim: true },
 }, { _id: false, strict: true });
 
+const pppLockSchema = new mongoose.Schema({
+    node: { type: String, required: true },
+    generation: { type: String, required: true },
+}, { _id: false, strict: true });
+const pppProbeLockSchema = new mongoose.Schema({
+    node: { type: String, required: true },
+    owner: { type: String, required: true },
+    generation: { type: String, required: true },
+}, { _id: false, strict: true });
+const pppWaitSchema = new mongoose.Schema({
+    lockOwner: { type: String, required: true },
+    relayNode: { type: String, required: true },
+    credentialRevision: { type: Number, required: true, min: 1 },
+    locks: { type: [pppLockSchema], required: true },
+    releasedNodes: { type: [String], required: true, default: [] },
+    // Fresh read-only probe generations, recoverable after worker death.
+    probeLocks: { type: [pppProbeLockSchema], required: true, default: [] },
+}, { _id: false, strict: true });
+
 const topologyOperationSchema = new mongoose.Schema({
     topologyRevision: {
         type: Number,
@@ -132,6 +151,8 @@ const topologyOperationSchema = new mongoose.Schema({
     // Remains held through failure/rollback until a proven-safe transactional release.
     heldTopologyAdmission: { type: Boolean },
     admissionFingerprint: { type: String, match: DIGEST_PATTERN },
+    // Committing but unpublished; topology admission stays held during PPP sync.
+    pppWait: { type: pppWaitSchema, default: undefined },
     status: {
         type: String,
         enum: OPERATION_STATUSES,
