@@ -61,6 +61,7 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
     const {
         operationModel,
         worker,
+        clientProofWorker,
         clock = DEFAULT_CLOCK,
         intervalMs = DEFAULT_INTERVAL_MS,
         scanLimit = DEFAULT_SCAN_LIMIT,
@@ -72,6 +73,9 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
     }
     if (!worker || typeof worker.run !== 'function') {
         throw new TypeError('Topology recovery lifecycle requires worker.run');
+    }
+    if (clientProofWorker !== undefined && typeof clientProofWorker?.runOnce !== 'function') {
+        throw new TypeError('Topology recovery lifecycle clientProofWorker requires runOnce');
     }
     if (!clock || typeof clock.now !== 'function') {
         throw new TypeError('Topology recovery lifecycle requires clock.now');
@@ -137,12 +141,24 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
         }
     }
 
+    async function recoverTick() {
+        try {
+            await scan();
+        } catch {
+            logFailure('TOPOLOGY_OPERATION_RECOVERY_SCAN_FAILED');
+        }
+        if (clientProofWorker !== undefined) {
+            try {
+                await clientProofWorker.runOnce();
+            } catch {
+                logFailure('TOPOLOGY_CLIENT_PROOF_RECOVERY_RUN_FAILED');
+            }
+        }
+    }
+
     function runTick() {
         if (schedule === null || inFlight !== null) return Promise.resolve();
-        const run = Promise.resolve().then(scan);
-        inFlight = run.catch(() => {
-            logFailure('TOPOLOGY_OPERATION_RECOVERY_SCAN_FAILED');
-        }).finally(() => {
+        inFlight = Promise.resolve().then(recoverTick).finally(() => {
             inFlight = null;
         });
         return inFlight;

@@ -110,6 +110,107 @@ test('enabled lifecycle recovers queued and expired operation ids at startup', a
     assert.deepEqual(timer.cleared, [timer.schedules[0]]);
 });
 
+test('TEST ticks run one client proof after the topology scan', async () => {
+    const calls = [];
+    const timer = createFakeTimer();
+    const lifecycle = createTopologyOperationRecoveryLifecycle({
+        env: ENABLED_ENV,
+        operationModel: createScanModel([{ _id: 'queued', status: 'queued' }], calls),
+        worker: { async run(id) { calls.push({ method: 'run', id }); } },
+        clientProofWorker: { async runOnce() { calls.push({ method: 'proof' }); } },
+        timer,
+    });
+
+    lifecycle.start();
+    await lifecycle.stop();
+    assert.deepEqual(calls.map(call => call.method), [
+        'find', 'select', 'sort', 'limit', 'lean', 'run', 'proof',
+    ]);
+});
+
+test('proof failures log a safe code and do not prevent subsequent topology ticks', async () => {
+    const calls = [];
+    const logs = [];
+    const timer = createFakeTimer();
+    const lifecycle = createTopologyOperationRecoveryLifecycle({
+        env: ENABLED_ENV,
+        operationModel: createScanModel([{ _id: 'queued', status: 'queued' }]),
+        worker: { async run(id) { calls.push(id); } },
+        clientProofWorker: {
+            async runOnce() {
+                calls.push('proof');
+                throw new Error('sensitive client data');
+            },
+        },
+        timer,
+        logger: { error(...args) { logs.push(args); } },
+    });
+
+    lifecycle.start();
+    await new Promise(resolve => setImmediate(resolve));
+    await timer.schedules[0].callback();
+    await lifecycle.stop();
+
+    assert.deepEqual(calls, ['queued', 'proof', 'queued', 'proof']);
+    assert.deepEqual(logs, [
+        ['Topology operation recovery failed', { code: 'TOPOLOGY_CLIENT_PROOF_RECOVERY_RUN_FAILED' }],
+        ['Topology operation recovery failed', { code: 'TOPOLOGY_CLIENT_PROOF_RECOVERY_RUN_FAILED' }],
+    ]);
+});
+
+test('failed topology scan still gives the proof worker one attempt', async () => {
+    const codes = [];
+    let proofCalls = 0;
+    const lifecycle = createTopologyOperationRecoveryLifecycle({
+        env: ENABLED_ENV,
+        operationModel: createScanModel(null),
+        worker: { async run() {} },
+        clientProofWorker: { async runOnce() { proofCalls += 1; } },
+        timer: createFakeTimer(),
+        logger: { error(_message, { code }) { codes.push(code); } },
+    });
+
+    lifecycle.start();
+    await lifecycle.stop();
+    assert.equal(proofCalls, 1);
+    assert.deepEqual(codes, ['TOPOLOGY_OPERATION_RECOVERY_SCAN_FAILED']);
+});
+
+test('stop waits for an in-flight proof and skips overlapping ticks', async () => {
+    const timer = createFakeTimer();
+    let releaseProof;
+    let proofStarted;
+    const started = new Promise(resolve => { proofStarted = resolve; });
+    const blocked = new Promise(resolve => { releaseProof = resolve; });
+    let proofCalls = 0;
+    const lifecycle = createTopologyOperationRecoveryLifecycle({
+        env: ENABLED_ENV,
+        operationModel: createScanModel([]),
+        worker: { async run() {} },
+        clientProofWorker: {
+            async runOnce() {
+                proofCalls += 1;
+                proofStarted();
+                await blocked;
+            },
+        },
+        timer,
+    });
+
+    lifecycle.start();
+    await started;
+    await timer.schedules[0].callback();
+    assert.equal(proofCalls, 1);
+    let stopped = false;
+    const stopping = lifecycle.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    assert.equal(stopped, false);
+    releaseProof();
+    await stopping;
+    assert.equal(stopped, true);
+    assert.equal(proofCalls, 1);
+});
+
 test('missing any exact topology test flag leaves recovery dormant without scanning', async () => {
     for (const flagName of Object.keys(ENABLED_ENV)) {
         const env = { ...ENABLED_ENV };
@@ -124,6 +225,10 @@ test('missing any exact topology test flag leaves recovery dormant without scann
             get worker() {
                 dependencyReads += 1;
                 throw new Error('disabled recovery must not inspect the worker');
+            },
+            get clientProofWorker() {
+                dependencyReads += 1;
+                throw new Error('disabled recovery must not inspect the proof worker');
             },
             timer: {
                 setInterval() {
