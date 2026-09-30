@@ -112,7 +112,8 @@ test('explicit edit-and-deploy PUT consumes scoped operation without claiming re
     h.timers[0].fn();
     await new Promise(resolve => setImmediate(resolve));
     assert(h.requests.some(r => r.url === '/api/cascade/topology/operations/' + OP_ID));
-    assert(h.toasts.some(([message]) => /полной цепочки.*не подтверждена/i.test(message)));
+    assert.equal(h.timers.length, 2, 'applied topology must keep polling for client proof');
+    assert(!h.toasts.some(([message]) => /готовность подтверждена|ready/i.test(message)));
 });
 
 test('create retains checkbox opt-in and never starts unscoped deploy', async () => {
