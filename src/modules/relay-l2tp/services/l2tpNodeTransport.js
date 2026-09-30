@@ -361,11 +361,9 @@ class L2tpNodeTransport {
                         COMMAND_EXEC_TIMEOUT_MS.default);
                 }),
             ]);
-            const parsed = parseVerifyUsersExecResult(
+            return parseVerifyUsersExecResult(
                 result, expectedCredentialRevision, expectedEnabledUserCount,
             );
-            if (!parsed.ok) throw new Error('User verification failed');
-            return parsed;
         } catch {
             throw new L2tpNodeTransportError(
                 'REMOTE_COMMAND_FAILED',

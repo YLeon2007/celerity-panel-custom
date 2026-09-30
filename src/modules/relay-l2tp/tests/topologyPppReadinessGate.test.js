@@ -85,6 +85,28 @@ test('factory read-only gate uses pre-installed verifier without runner or boots
     }]);
 });
 
+test('read-only installed verifier preserves a proven PPP drift for retry', async () => {
+    const { deps } = fixture();
+    const gate = createTopologyPppReadinessGate({
+        ...deps, readOnly: true,
+        HyNode: { findById: () => ({ select: () => ({ lean: async () => ({
+            _id: 'node-r', active: true, type: 'xray', cascadeRole: 'relay', ssh: {},
+        }) }) }) },
+        NodeSSH: class {
+            async exec() {
+                return { code: 65, stderr: '', stdout: `${JSON.stringify({
+                    ok: false, code: 'MANAGED_USERS_MISSING', credentialRevision: 41,
+                    enabledUserCount: 1, managedUserCount: 0,
+                })}\n` };
+            }
+        },
+    });
+    assert.deepEqual(await gate.verifyPlan(plan), {
+        ok: false, verifiedRelayCount: 0, reason: 'PPP_DRIFT',
+        relayNode: 'node-r', credentialRevision: 41,
+    });
+});
+
 test('installed relay is ready only after SSH artifact verification of persisted synced snapshot', async () => {
     const { gate, calls } = fixture();
     assert.deepEqual(await gate.verifyPlan(plan), { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });

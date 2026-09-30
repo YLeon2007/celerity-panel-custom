@@ -74,8 +74,6 @@ test('read-only verifier fails closed when precheck, execution or strict parsing
         { code: 1, stdout: '', stderr: '' }, // directory or script absent
         { code: 0, stdout: 'invalid\n', stderr: '' },
         { code: 0, stdout: `${JSON.stringify({ ...readOnlySuccess, ok: false })}\n`, stderr: '' },
-        { code: 65, stdout: `${JSON.stringify({ ...readOnlySuccess, ok: false,
-            code: 'MANAGED_USERS_MISSING', managedUserCount: 0 })}\n`, stderr: '' },
     ];
     for (const response of invalid) {
         const transport = new L2tpNodeTransport({ nodeSSH: { async exec() { return response; } } });
@@ -87,6 +85,15 @@ test('read-only verifier fails closed when precheck, execution or strict parsing
     } } });
     await assert.rejects(transport.verifyUsersReadOnly(readOnlyRequest),
         error => error.code === 'REMOTE_COMMAND_FAILED' && !JSON.stringify(error).includes('secret'));
+});
+
+test('read-only verifier returns only validated explicit drift as a negative result', async () => {
+    const negative = { ok: false, code: 'MANAGED_USERS_MISSING',
+        credentialRevision: 41, enabledUserCount: 1, managedUserCount: 0 };
+    const transport = new L2tpNodeTransport({ nodeSSH: { async exec() {
+        return { code: 65, stdout: `${JSON.stringify(negative)}\n`, stderr: '' };
+    } } });
+    assert.deepEqual(await transport.verifyUsersReadOnly(readOnlyRequest), negative);
 });
 
 test('read-only verifier fails closed on an unresolved SSH execution deadline', async t => {
