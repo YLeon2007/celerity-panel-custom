@@ -36,6 +36,9 @@ const {
     TopologyOperationFinalizationRepository,
 } = require('../repositories/topologyOperationFinalizationRepository');
 const {
+    L2tpPppDriftSyncRepository,
+} = require('../repositories/l2tpPppDriftSyncRepository');
+const {
     TopologyOperationFinalizer,
 } = require('../services/topologyOperationFinalizer');
 const {
@@ -76,9 +79,9 @@ function compositionDependencies(calls = []) {
         CascadeLink: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeRouteGroup: modelWith(['find', 'create', 'updateOne', 'deleteOne'], calls),
         CascadeTopologyState: modelWith(['findById', 'findOneAndUpdate', 'updateOne'], calls),
-        RelayL2tpState: modelWith(['find', 'findOne'], calls),
+        RelayL2tpState: modelWith(['find', 'findOne', 'findOneAndUpdate'], calls),
         L2tpUser: modelWith(['find'], calls),
-        L2tpOperation: modelWith(['findOne'], calls),
+        L2tpOperation: modelWith(['findOne', 'countDocuments', 'create'], calls),
         NodeSSH: class FakeNodeSSH {},
         TopologyOperation: modelWith(['create', 'findById', 'findOneAndUpdate', 'updateOne'], calls),
         NodeOperationLock: modelWith(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'], calls),
@@ -226,18 +229,49 @@ test('only the TEST host enables topology execution', () => {
     class CaptureWorker extends TopologyOperationWorker {
         constructor(options) {
             super(options);
-            captured.push(options.allowUnprovenTestExecution);
+            captured.push(options);
         }
     }
     for (const domain of ['other.invalid', TEST_TOPOLOGY_HOST_IDENTITY]) {
+        const dependencies = compositionDependencies();
         const service = createTopologyOperationRuntime({
-            ...compositionDependencies(),
+            ...dependencies,
             env: { ...ENABLED_ENV, PANEL_DOMAIN: domain },
             OperationWorker: CaptureWorker,
         });
         assert.ok(service instanceof TopologyOperationCoordinator);
     }
-    assert.deepEqual(captured, [false, true]);
+    assert.deepEqual(captured.map(options => options.allowUnprovenTestExecution), [false, true]);
+    assert.equal(Object.hasOwn(captured[0], 'pppDriftSync'), false);
+    assert.equal(Object.hasOwn(captured[0], 'pppResumeReadinessGate'), false);
+    assert.equal(captured[0].pppReadinessGate.readOnly, false);
+    assert.ok(captured[1].pppDriftSync instanceof L2tpPppDriftSyncRepository);
+    assert.equal(captured[1].pppReadinessGate.readOnly, false);
+    assert.equal(captured[1].pppResumeReadinessGate.readOnly, true);
+    assert.notStrictEqual(captured[1].pppReadinessGate, captured[1].pppResumeReadinessGate);
+});
+
+test('non-TEST host never constructs a drift queue or read-only probe', () => {
+    const dependencies = compositionDependencies();
+    let queueCapabilityReads = 0;
+    for (const [model, method] of [
+        [dependencies.RelayL2tpState, 'findOneAndUpdate'],
+        [dependencies.L2tpOperation, 'countDocuments'],
+    ]) {
+        Object.defineProperty(model, method, {
+            get() {
+                queueCapabilityReads += 1;
+                throw new Error('non-TEST host must not construct PPP drift queue');
+            },
+        });
+    }
+    const service = createTopologyOperationRuntime({
+        ...dependencies,
+        env: { ...ENABLED_ENV, PANEL_DOMAIN: 'other.invalid' },
+    });
+    assert.ok(service instanceof TopologyOperationCoordinator);
+    assert.equal(queueCapabilityReads, 0);
+    assert.equal(service.operationWorker.pppReadinessGate.readOnly, false);
 });
 
 test('flag-positive composed default worker stays unclaimed without quiescence proof', async () => {

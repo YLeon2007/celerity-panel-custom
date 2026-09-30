@@ -6,6 +6,8 @@ const express = require('express');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
 const { createTopologyOperationRuntime } = require('../relay-l2tp/runtime/createTopologyOperationRuntime');
+const { L2tpPppDriftSyncRepository } = require('../relay-l2tp/repositories/l2tpPppDriftSyncRepository');
+const { TopologyOperationWorker } = require('../relay-l2tp/workers/topologyOperationWorker');
 
 const TOPOLOGY_ENABLED_ENV = Object.freeze({
     L2TP_EXECUTION_ENABLED: 'true',
@@ -253,6 +255,8 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
 
     assert.equal(topologyDependencies.length, 1);
     assert.strictEqual(topologyDependencies[0].NodeOperationLock, models.NodeOperationLock);
+    assert.strictEqual(topologyDependencies[0].L2tpOperation, models.L2tpOperation);
+    assert.strictEqual(topologyDependencies[0].L2tpUser, models.L2tpUser);
     assert.equal(l2tpWorkerAllowed, true);
     assert.equal(recoveryStarts, 1);
 });
@@ -587,5 +591,76 @@ test('assembled flag-positive host cannot claim or SSH through topology recovery
         stopped: true,
         errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
     });
+    assert.deepEqual(calls, []);
+});
+
+test('assembled TEST host injects transactional PPP drift queue and distinct read-only resume gate', () => {
+    const calls = [];
+    const db = { transaction: async work => work({ id: 'test-session' }) };
+    const model = methods => ({
+        db,
+        ...Object.fromEntries(methods.map(method => [method, () => {
+            calls.push(method);
+            throw new Error(`unexpected model call: ${method}`);
+        }])),
+    });
+    const models = {
+        RelayL2tpState: model(['find', 'findOne', 'findOneAndUpdate']),
+        CascadeRouteGroup: model(['find', 'create', 'updateOne', 'deleteOne']),
+        CascadeTopologyState: model(['findById', 'findOneAndUpdate', 'updateOne']),
+        L2tpOperation: model(['findOne', 'countDocuments', 'create']),
+        L2tpUser: model(['find']),
+        TopologyOperation: model(['create', 'findById', 'findOneAndUpdate', 'updateOne']),
+        NodeOperationLock: model(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne']),
+    };
+    let workerOptions;
+    class CaptureWorker extends TopologyOperationWorker {
+        constructor(options) {
+            super(options);
+            workerOptions = options;
+        }
+    }
+    const host = createL2tpPanelHost({
+        env: { ...TOPOLOGY_ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' },
+        HyNode: model(['find', 'findById']),
+        CascadeLink: model(['find', 'create', 'updateOne', 'deleteOne']),
+        NodeSSH: class ForbiddenSSH {
+            constructor() { throw new Error('composition must not SSH'); }
+        },
+        moduleEntry: {
+            registerModels: () => models,
+            createTopologyDeploymentService(dependencies) {
+                return createTopologyOperationRuntime({
+                    ...dependencies,
+                    OperationWorker: CaptureWorker,
+                    transactionRunner: db.transaction,
+                });
+            },
+        },
+        topologyRuntime: {},
+        Repository: class FakeRepository {},
+        createRepositoryAdapters: () => ({
+            nodeRepository: {}, stateRepository: {}, operationRepository: {},
+        }),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({
+            runtime: { stateManagementService: {} },
+            start: () => ({}),
+            async stop() {},
+        }),
+        createTopologyRecoveryLifecycle: () => ({ start() {}, async stop() {} }),
+    });
+    assert.ok(host);
+    assert.ok(workerOptions.pppDriftSync instanceof L2tpPppDriftSyncRepository);
+    assert.strictEqual(workerOptions.pppDriftSync.RelayL2tpState, models.RelayL2tpState);
+    assert.strictEqual(workerOptions.pppDriftSync.L2tpOperation, models.L2tpOperation);
+    assert.strictEqual(workerOptions.pppDriftSync.transactionRunner, db.transaction);
+    assert.equal(workerOptions.pppReadinessGate.readOnly, false);
+    assert.equal(workerOptions.pppResumeReadinessGate.readOnly, true);
+    assert.notStrictEqual(workerOptions.pppResumeReadinessGate, workerOptions.pppReadinessGate);
+    assert.strictEqual(workerOptions.pppResumeReadinessGate.RelayL2tpState, models.RelayL2tpState);
+    assert.strictEqual(workerOptions.pppResumeReadinessGate.L2tpOperation, models.L2tpOperation);
+    assert.equal(typeof workerOptions.pppResumeReadinessGate.verifyPlan, 'function');
+    assert.equal(workerOptions.allowUnprovenTestExecution, true);
     assert.deepEqual(calls, []);
 });

@@ -13,6 +13,9 @@ const {
     TopologyOperationFinalizationRepository,
 } = require('../repositories/topologyOperationFinalizationRepository');
 const {
+    L2tpPppDriftSyncRepository,
+} = require('../repositories/l2tpPppDriftSyncRepository');
+const {
     TopologyNodeExecutionResolver,
 } = require('../services/topologyNodeExecutionResolver');
 const {
@@ -211,13 +214,27 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const userResync = new TopologyUserResync({ HyNode });
         // The TEST runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
-        const pppReadinessGate = createTopologyPppReadinessGate({
+        const pppGateDependencies = {
             RelayL2tpState,
             L2tpUser: L2tpUser ?? require('../models/l2tpUserModel'),
             L2tpOperation: L2tpOperation ?? require('../models/l2tpOperationModel'),
             HyNode,
             NodeSSH: NodeSSH ?? require('../../../services/nodeSSH'),
-        });
+        };
+        const pppReadinessGate = createTopologyPppReadinessGate(pppGateDependencies);
+        // The drift queue and read-only resume probe are only available on the
+        // opt-in TEST host; the existing readiness check retains its behavior.
+        const testHostAllowed = isTestWorkerExecutionAllowed(env);
+        const pppDriftSync = testHostAllowed
+            ? new L2tpPppDriftSyncRepository({
+                RelayL2tpState,
+                L2tpOperation,
+                ...optional(transactionRunner, 'transactionRunner'),
+            })
+            : undefined;
+        const pppResumeReadinessGate = testHostAllowed
+            ? createTopologyPppReadinessGate({ ...pppGateDependencies, readOnly: true })
+            : undefined;
         const attachIngressGate = new TopologyAttachIngressGate({
             nodeExecutionResolver: new TopologyNodeExecutionResolver({
                 HyNode,
@@ -236,8 +253,10 @@ function createTopologyOperationRuntime(dependencies = {}) {
             clock,
             ...optional(userResync, 'userResync'),
             pppReadinessGate,
+            ...optional(pppDriftSync, 'pppDriftSync'),
+            ...optional(pppResumeReadinessGate, 'pppResumeReadinessGate'),
             attachIngressGate,
-            allowUnprovenTestExecution: isTestWorkerExecutionAllowed(env),
+            allowUnprovenTestExecution: testHostAllowed,
         });
         return new Coordinator({
             topologyRepository,
