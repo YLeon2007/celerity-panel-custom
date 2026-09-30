@@ -61,6 +61,20 @@ test('successful explicit client proof becomes verified only for live deployed r
     assert.equal((await f.repository.findPublicById('op')).clientReadiness, 'verified');
 });
 
+test('scoped autoDeploy proof stays verified when global deployed revision trails the draft', async () => {
+    const f = fixture({ topologyRevision: 123, priorDeployedRevision: 111,
+        kind: 'link.apply', linkId: 'link-1', linkIds: ['link-1'], staged: false });
+    f.live.revision = 123;
+    f.live.deployedRevision = 111;
+    assert.equal(await worker(f.repository, async () => ({ passed: true })).runOnce(), 'verified');
+    assert.equal((await f.repository.findPublicById('op')).clientReadiness, 'verified');
+    f.live.deployedRevision = 112;
+    assert.equal((await f.repository.findPublicById('op')).clientReadiness, 'unverified');
+    f.live.deployedRevision = 111;
+    f.live.revision = 124;
+    assert.equal((await f.repository.findPublicById('op')).clientReadiness, 'unverified');
+});
+
 test('failed and unavailable probes retry after delay across worker restart without storing secrets', async () => {
     const f = fixture();
     const secret = 'secret-credential';

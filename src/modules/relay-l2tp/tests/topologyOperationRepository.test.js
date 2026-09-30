@@ -252,7 +252,7 @@ test('public operation read fails closed on legacy missing or malformed readines
             status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified',
         });
     }
-    assert.equal(projection, 'status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason');
+    assert.equal(projection, 'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason');
     stored = { status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified' };
     assert.deepEqual(await repository.findPublicById('operation-1'), {
         ...stored, clientReadiness: 'unverified',
@@ -302,7 +302,7 @@ test('findPublicById returns only the public status projection', async () => {
     };
     const repository = new TopologyOperationRepository({ model });
     const result = await repository.findPublicById('operation-dup');
-    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason' });
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason' });
     assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified' });
 });
 

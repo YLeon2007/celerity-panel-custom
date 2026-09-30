@@ -259,14 +259,14 @@ class TopologyOperationRepository {
 
     async findPublicById(operationId) {
         const operation = await this.model.findById(operationId)
-            .select('status topologyRevision clientReadiness clientProofRevision clientProofState clientProofReason')
+            .select('status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason')
             .lean();
         if (!operation) return null;
         const verified = operation.status === 'succeeded'
             && operation.clientReadiness === 'verified'
             && Number.isSafeInteger(operation.clientProofRevision)
             && operation.clientProofRevision === operation.topologyRevision
-            && await this.isLiveRevision(operation.topologyRevision);
+            && await this.isLiveRevision(operation);
         // A missing legacy field (or unexpected persisted value) is never a
         // client-ready claim; status:succeeded remains execution-only.
         return {
@@ -280,12 +280,15 @@ class TopologyOperationRepository {
         };
     }
 
-    async isLiveRevision(revision) {
-        if (!Number.isSafeInteger(revision) || !this.topologyStateModel?.findById) return false;
+    async isLiveRevision(operation) {
+        if (!Number.isSafeInteger(operation?.topologyRevision) || !this.topologyStateModel?.findById) return false;
         try {
             const live = await this.topologyStateModel.findById('singleton')
                 .select('revision deployedRevision').lean();
-            return live?.revision === revision && live?.deployedRevision === revision;
+            return live?.revision === operation.topologyRevision
+                && (SCOPED_OPERATION_KINDS.has(operation.kind)
+                    ? live.deployedRevision === operation.priorDeployedRevision
+                    : live.deployedRevision === operation.topologyRevision);
         } catch (_) {
             return false; // Missing or unreadable state cannot attest a client path.
         }
@@ -314,7 +317,7 @@ class TopologyOperationRepository {
             $inc: { clientProofAttempts: 1 },
         }, {
             new: true, lean: true, runValidators: true, sort: { clientProofRetryAfter: 1 },
-            projection: { _id: 1, status: 1, topologyRevision: 1, kind: 1,
+            projection: { _id: 1, status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1,
                 linkId: 1, linkIds: 1, clientProofAttempts: 1,
                 clientProofLeaseOwner: 1, clientProofLeaseUntil: 1 },
         });
@@ -326,7 +329,7 @@ class TopologyOperationRepository {
             throw new TypeError('Client proof requires a safe reason code');
         }
         // Check immediately before CAS. Public reads independently recheck live state.
-        const live = passed === true && await this.isLiveRevision(operation.topologyRevision);
+        const live = passed === true && await this.isLiveRevision(operation);
         const verified = passed === true && live;
         const safeReason = verified ? undefined : passed === true ? 'revision_stale' : reason;
         const exhausted = operation.clientProofAttempts >= maxAttempts;
