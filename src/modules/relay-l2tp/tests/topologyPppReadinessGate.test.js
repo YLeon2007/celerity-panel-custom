@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { TopologyPppReadinessGate } = require('../services/topologyPppReadinessGate');
+const { TopologyPppReadinessGate, createTopologyPppReadinessGate } = require('../services/topologyPppReadinessGate');
 
 function fixture(overrides = {}) {
     const calls = [];
@@ -25,14 +25,69 @@ function fixture(overrides = {}) {
             } };
         },
     };
-    return { gate: new TopologyPppReadinessGate({ ...deps, ...overrides }), calls };
+    return { gate: new TopologyPppReadinessGate({ ...deps, ...overrides }), calls, deps };
 }
 
 const plan = { nodes: [{ role: 'portal', node: 'node-p' }, { role: 'relay', node: 'node-r' }] };
 
+test('read-only gate selects only direct verifier and never falls back to runner', async () => {
+    const calls = [];
+    const { gate } = fixture({
+        readOnly: true,
+        transportResolver: async () => ({
+            runArtifactCommand() { throw new Error('runner must not be called'); },
+            async verifyUsersReadOnly(request) {
+                calls.push(request);
+                throw new Error('missing pre-installed verifier');
+            },
+        }),
+    });
+    assert.deepEqual(await gate.verifyPlan(plan),
+        { ok: false, verifiedRelayCount: 0, reason: 'PPP_UNAVAILABLE' });
+    assert.deepEqual(calls, [{ operationId: 'abcdef012345abcdef012345',
+        expectedCredentialRevision: 41, expectedEnabledUserCount: 1 }]);
+});
+
+test('factory opts in to read-only mode without changing default mode', () => {
+    const deps = { RelayL2tpState: { findOne() {} }, L2tpUser: { find() {} },
+        L2tpOperation: { findOne() {} }, HyNode: { findById() {} }, NodeSSH: class {} };
+    assert.equal(createTopologyPppReadinessGate(deps).readOnly, false);
+    assert.equal(createTopologyPppReadinessGate({ ...deps, readOnly: true }).readOnly, true);
+});
+
+test('factory read-only gate uses pre-installed verifier without runner or bootstrap', async () => {
+    const { deps } = fixture();
+    const calls = [];
+    const gate = createTopologyPppReadinessGate({
+        ...deps,
+        readOnly: true,
+        HyNode: { findById: () => ({ select: () => ({ lean: async () => ({
+            _id: 'node-r', active: true, type: 'xray', cascadeRole: 'relay', ssh: {},
+        }) }) }) },
+        NodeSSH: class {
+            async exec(command, options) {
+                calls.push({ command, options });
+                return { code: 0, stderr: '', stdout: `${JSON.stringify({
+                    ok: true, code: 'USERS_VERIFIED', credentialRevision: 41,
+                    enabledUserCount: 1, managedUserCount: 1,
+                })}\n` };
+            }
+        },
+    });
+    assert.deepEqual(await gate.verifyPlan(plan), { ok: true, verifiedRelayCount: 1,
+        relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+    assert.deepEqual(calls, [{
+        command: 'test -d /var/lib/celerity/l2tp/operations/abcdef012345abcdef012345'
+            + ' && test -f /usr/local/lib/celerity/relay-l2tp/verify-users.sh'
+            + ' && test -x /usr/local/lib/celerity/relay-l2tp/verify-users.sh'
+            + ' && /usr/local/lib/celerity/relay-l2tp/verify-users.sh /var/lib/celerity/l2tp/operations/abcdef012345abcdef012345',
+        options: { timeout: 120000 },
+    }]);
+});
+
 test('installed relay is ready only after SSH artifact verification of persisted synced snapshot', async () => {
     const { gate, calls } = fixture();
-    assert.deepEqual(await gate.verifyPlan(plan), { ok: true, verifiedRelayCount: 1 });
+    assert.deepEqual(await gate.verifyPlan(plan), { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     assert.deepEqual(calls, [
         ['resolve', 'node-r'],
         ['verify', { operationId: 'abcdef012345abcdef012345', command: 'verify-users',
@@ -45,7 +100,7 @@ test('staged relay without installed PPP is skipped, never claimed node-verified
     assert.deepEqual(await gate.verifyPlan({ staged: true, nodes: [
         { ...plan.nodes[0], nodeRef: 'portal' }, { ...plan.nodes[1], nodeRef: 'relay-1' },
     ] }),
-        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
     assert.deepEqual(calls, []);
 });
 
@@ -79,7 +134,7 @@ test('staged explicit non-PPP transit with zero users allows an absent terminal 
         L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
     });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
-        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
     assert.deepEqual(calls, []);
 });
 
@@ -110,7 +165,8 @@ test('staged verified intermediate and absent terminal allows exactly one skip r
             : { node, desiredState: 'absent' },
     }) }) } });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
-        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
 });
@@ -137,7 +193,8 @@ test('staged installed owner accepts verified legacy non-PPP terminal without di
         } },
     });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
-        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
 });
@@ -231,19 +288,20 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
     };
     const ready = make();
     assert.deepEqual(await ready.gate.verifyPlan(transitPlan),
-        { ok: true, verifiedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     assert.deepEqual(ready.calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
     assert.deepEqual(await make({ transitState: {
         status: 'not_installed', desiredState: 'absent', secretRevision: 9,
-    } }).gate.verifyPlan(transitPlan), { ok: true, verifiedRelayCount: 1 });
+    } }).gate.verifyPlan(transitPlan), { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     const stagedTransit = { staged: true, nodes: [
         { ...plan.nodes[0], nodeRef: 'portal' },
         { ...plan.nodes[1], nodeRef: 'relay-1' },
         { role: 'relay', node: 'node-t', nodeRef: 'relay-2' },
     ] };
     assert.deepEqual(await make().gate.verifyPlan(stagedTransit),
-        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1 });
+        { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
     for (const options of [
         { users: [{ relayNode: 'node-t' }] },
         { active: true },
@@ -296,7 +354,8 @@ test('verified node-side managed-user drift alone is sync eligible', async () =>
         enabledUserCount: 1, managedUserCount: 1,
     }) }) });
     assert.deepEqual(await gate.verifyPlan(plan),
-        { ok: false, verifiedRelayCount: 0, reason: 'PPP_DRIFT' });
+        { ok: false, verifiedRelayCount: 0, reason: 'PPP_DRIFT',
+            relayNode: 'node-r', credentialRevision: 41 });
 });
 
 test('node-side drift against a superseded state snapshot is not sync eligible', async () => {
@@ -366,12 +425,46 @@ test('ambiguous remote failures, malformed replies and missing sync proof stay u
         { ok: false, verifiedRelayCount: 0, reason: 'PPP_UNKNOWN' });
 });
 
+test('freshly verified relays expose ordered revision proof, excluding staged skip', async () => {
+    const byNode = node => node === 'node-r'
+        ? { node, status: 'installed', desiredState: 'installed', secretRevision: 41 }
+        : node === 'node-s'
+            ? { node, status: 'installed', desiredState: 'installed', secretRevision: 42 }
+            : { node, desiredState: 'absent' };
+    const operationId = 'abcdef012345abcdef012345';
+    const { gate } = fixture({
+        RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => byNode(node) }) }) },
+        L2tpUser: { find: ({ relayNode }) => ({ select: () => ({ lean: async () => [{
+            relayNode, enabled: true, desiredRevision: byNode(relayNode).secretRevision,
+            appliedRevision: byNode(relayNode).secretRevision, syncStatus: 'synced', syncOperationId: operationId,
+        }] }) }) },
+        L2tpOperation: { findOne: ({ node }) => ({ sort: () => ({ select: () => ({ lean: async () => ({
+            _id: operationId, node, kind: 'sync_users', status: 'succeeded', plan: {
+                operationId, relayId: node, desired: { credentialRevision: byNode(node).secretRevision },
+            },
+        }) }) }) }) },
+        transportResolver: async ({ nodeId }) => ({ async runArtifactCommand() {
+            return { ok: true, code: 'USERS_VERIFIED', credentialRevision: byNode(nodeId).secretRevision,
+                enabledUserCount: 1, managedUserCount: 1 };
+        } }),
+    });
+    assert.deepEqual(await gate.verifyPlan({ staged: true, nodes: [
+        { role: 'portal', node: 'node-p', nodeRef: 'portal' },
+        { role: 'relay', node: 'node-r', nodeRef: 'relay-1' },
+        { role: 'relay', node: 'node-s', nodeRef: 'relay-2' },
+        { role: 'relay', node: 'node-t', nodeRef: 'relay-3' },
+    ] }), { ok: true, verifiedRelayCount: 2, skippedRelayCount: 1,
+        relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 },
+            { relayNode: 'node-s', credentialRevision: 42 }] });
+});
+
 test('persisted desired/applied credential revision mismatch is drift', async () => {
     const { gate, calls } = fixture({ L2tpUser: { find: () => ({ select: () => ({ lean: async () => ([{
         relayNode: 'node-r', enabled: true, desiredRevision: 41, appliedRevision: 40,
         syncStatus: 'synced', syncOperationId: 'abcdef012345abcdef012345',
     }]) }) }) } });
     assert.deepEqual(await gate.verifyPlan(plan),
-        { ok: false, verifiedRelayCount: 0, reason: 'PPP_DRIFT' });
+        { ok: false, verifiedRelayCount: 0, reason: 'PPP_DRIFT',
+            relayNode: 'node-r', credentialRevision: 41 });
     assert.deepEqual(calls, []);
 });

@@ -5,6 +5,7 @@ const { parsePreflightExecResult } = require('./l2tpPreflightResult');
 const REMOTE_OPERATIONS_ROOT = '/var/lib/celerity/l2tp/operations';
 const ARTIFACT_RUNNER_PATH = '/usr/local/bin/celerity-l2tp-artifact-runner';
 const ARTIFACT_RECEIVER_PATH = '/usr/local/bin/celerity-l2tp-artifact-receiver';
+const VERIFY_USERS_PATH = '/usr/local/lib/celerity/relay-l2tp/verify-users.sh';
 const ARTIFACT_COMMANDS = Object.freeze([
     'preflight',
     'install_runtime',
@@ -324,6 +325,55 @@ class L2tpNodeTransport {
         }
 
         return { ok: true, path: remotePath };
+    }
+
+    async verifyUsersReadOnly(request) {
+        if (!request || typeof request !== 'object' || Array.isArray(request)) {
+            throw new L2tpNodeTransportError(
+                'INVALID_COMMAND_EXPECTATION',
+                'Invalid L2TP artifact command expectation',
+            );
+        }
+        const { operationId, expectedCredentialRevision, expectedEnabledUserCount } = request;
+        assertOperationId(operationId);
+        if (JSON.stringify(Object.keys(request).sort()) !== JSON.stringify([
+            'expectedCredentialRevision', 'expectedEnabledUserCount', 'operationId',
+        ])) {
+            throw new L2tpNodeTransportError(
+                'INVALID_COMMAND_EXPECTATION',
+                'Invalid L2TP artifact command expectation',
+            );
+        }
+        // Reuse the runner's numeric expectation contract without invoking it.
+        assertCommandExpectation({ ...request, command: 'verify-users' });
+
+        const operationDir = `${REMOTE_OPERATIONS_ROOT}/${operationId}`;
+        // A validated path component is the only interpolation. The guards cannot
+        // create the directory or install a missing verifier; the script opens read-only.
+        const command = `test -d ${operationDir} && test -f ${VERIFY_USERS_PATH}`
+            + ` && test -x ${VERIFY_USERS_PATH} && ${VERIFY_USERS_PATH} ${operationDir}`;
+        let timeoutHandle;
+        try {
+            const result = await Promise.race([
+                this.nodeSSH.exec(command, { timeout: COMMAND_EXEC_TIMEOUT_MS.default }),
+                new Promise((_, reject) => {
+                    timeoutHandle = setTimeout(() => reject(new Error('Verifier timed out')),
+                        COMMAND_EXEC_TIMEOUT_MS.default);
+                }),
+            ]);
+            const parsed = parseVerifyUsersExecResult(
+                result, expectedCredentialRevision, expectedEnabledUserCount,
+            );
+            if (!parsed.ok) throw new Error('User verification failed');
+            return parsed;
+        } catch {
+            throw new L2tpNodeTransportError(
+                'REMOTE_COMMAND_FAILED',
+                'Failed to run an L2TP artifact command',
+            );
+        } finally {
+            clearTimeout(timeoutHandle);
+        }
     }
 
     async runArtifactCommand(request) {

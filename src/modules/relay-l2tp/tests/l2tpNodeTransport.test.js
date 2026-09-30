@@ -22,14 +22,79 @@ function createNodeSSHFacade(response = { code: 0, stdout: '', stderr: '' }) {
     };
 }
 
-test('exposes only the two typed remote executor transport methods', () => {
+test('exposes only the typed remote executor transport methods', () => {
     const transport = new L2tpNodeTransport({ nodeSSH: createNodeSSHFacade() });
 
     assert.deepEqual(
         Object.getOwnPropertyNames(Object.getPrototypeOf(transport)),
-        ['constructor', 'uploadRootFile', 'runArtifactCommand'],
+        ['constructor', 'uploadRootFile', 'verifyUsersReadOnly', 'runArtifactCommand'],
     );
     assert.equal(transport.exec, undefined);
+});
+
+const readOnlyRequest = { operationId: 'abcdef012345abcdef012345',
+    expectedCredentialRevision: 41, expectedEnabledUserCount: 1 };
+const readOnlySuccess = { ok: true, code: 'USERS_VERIFIED', credentialRevision: 41,
+    enabledUserCount: 1, managedUserCount: 1 };
+const readOnlyCommand = 'test -d /var/lib/celerity/l2tp/operations/abcdef012345abcdef012345'
+    + ' && test -f /usr/local/lib/celerity/relay-l2tp/verify-users.sh'
+    + ' && test -x /usr/local/lib/celerity/relay-l2tp/verify-users.sh'
+    + ' && /usr/local/lib/celerity/relay-l2tp/verify-users.sh /var/lib/celerity/l2tp/operations/abcdef012345abcdef012345';
+
+test('read-only verifier checks the existing directory and installed script then executes directly without bootstrapping', async () => {
+    const calls = [];
+    const nodeSSH = { async exec(command, options) {
+        calls.push({ command, options });
+        return { code: 0, stdout: `${JSON.stringify(readOnlySuccess)}\n`, stderr: '' };
+    } };
+    const bootstrapper = { async ensureArtifact() { throw new Error('must never bootstrap'); } };
+    const transport = new L2tpNodeTransport({ nodeSSH, artifactBootstrapper: bootstrapper });
+    assert.deepEqual(await transport.verifyUsersReadOnly(readOnlyRequest), readOnlySuccess);
+    assert.deepEqual(calls, [{ command: readOnlyCommand, options: { timeout: 120000 } }]);
+});
+
+test('read-only verifier rejects invalid exact requests without SSH or bootstrap', async () => {
+    const calls = [];
+    const transport = new L2tpNodeTransport({
+        nodeSSH: { async exec() { calls.push('ssh'); } },
+        artifactBootstrapper: { async ensureArtifact() { calls.push('bootstrap'); } },
+    });
+    for (const request of [null, {}, { ...readOnlyRequest, operationId: 'id;touch /tmp/x' },
+        { ...readOnlyRequest, expectedCredentialRevision: 0 },
+        { ...readOnlyRequest, expectedEnabledUserCount: -1 },
+        { ...readOnlyRequest, expectedEnabledUserCount: 1.5 },
+        { ...readOnlyRequest, command: 'verify-users' }]) {
+        await assert.rejects(transport.verifyUsersReadOnly(request));
+    }
+    assert.deepEqual(calls, []);
+});
+
+test('read-only verifier fails closed when precheck, execution or strict parsing fails', async () => {
+    const invalid = [
+        { code: 1, stdout: '', stderr: '' }, // directory or script absent
+        { code: 0, stdout: 'invalid\n', stderr: '' },
+        { code: 0, stdout: `${JSON.stringify({ ...readOnlySuccess, ok: false })}\n`, stderr: '' },
+        { code: 65, stdout: `${JSON.stringify({ ...readOnlySuccess, ok: false,
+            code: 'MANAGED_USERS_MISSING', managedUserCount: 0 })}\n`, stderr: '' },
+    ];
+    for (const response of invalid) {
+        const transport = new L2tpNodeTransport({ nodeSSH: { async exec() { return response; } } });
+        await assert.rejects(transport.verifyUsersReadOnly(readOnlyRequest),
+            error => error.code === 'REMOTE_COMMAND_FAILED');
+    }
+    const transport = new L2tpNodeTransport({ nodeSSH: { async exec() {
+        throw new Error('timeout secret');
+    } } });
+    await assert.rejects(transport.verifyUsersReadOnly(readOnlyRequest),
+        error => error.code === 'REMOTE_COMMAND_FAILED' && !JSON.stringify(error).includes('secret'));
+});
+
+test('read-only verifier fails closed on an unresolved SSH execution deadline', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const transport = new L2tpNodeTransport({ nodeSSH: { exec: () => new Promise(() => {}) } });
+    const pending = transport.verifyUsersReadOnly(readOnlyRequest);
+    t.mock.timers.tick(120000);
+    await assert.rejects(pending, error => error.code === 'REMOTE_COMMAND_FAILED');
 });
 
 test('uploadRootFile sends an exact typed artifact to the fixed receiver over stdin', async () => {

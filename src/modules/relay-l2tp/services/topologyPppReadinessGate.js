@@ -16,6 +16,9 @@ const SYNCABLE_USER_FAILURES = new Set([
     'MANAGED_USERS_ALTERED', 'DISABLED_USERS_PRESENT',
 ]);
 const failed = (verifiedRelayCount, reason = REASON.UNKNOWN) => ({ ok: false, verifiedRelayCount, reason });
+const drift = (verifiedRelayCount, relayNode, credentialRevision) => ({
+    ...failed(verifiedRelayCount, REASON.DRIFT), relayNode, credentialRevision,
+});
 const id = value => value == null ? '' : String(value);
 
 function stagedTerminalRelayRef(nodes) {
@@ -40,7 +43,7 @@ function stagedTerminalRelayRef(nodes) {
 }
 
 class TopologyPppReadinessGate {
-    constructor({ RelayL2tpState, L2tpUser, L2tpOperation, transportResolver } = {}) {
+    constructor({ RelayL2tpState, L2tpUser, L2tpOperation, transportResolver, readOnly = false } = {}) {
         if (typeof RelayL2tpState?.findOne !== 'function'
             || typeof L2tpUser?.find !== 'function'
             || typeof L2tpOperation?.findOne !== 'function'
@@ -51,11 +54,13 @@ class TopologyPppReadinessGate {
         this.L2tpUser = L2tpUser;
         this.L2tpOperation = L2tpOperation;
         this.transportResolver = transportResolver;
+        this.readOnly = readOnly === true;
     }
 
     async verifyPlan(plan) {
         let verifiedRelayCount = 0;
         let skippedRelayCount = 0;
+        const relayRevisions = [];
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
             const terminalRelayRef = plan.staged === true ? stagedTerminalRelayRef(plan.nodes) : null;
@@ -124,7 +129,7 @@ class TopologyPppReadinessGate {
                         .select('status desiredState secretRevision').lean();
                     if (current?.status !== 'installed' || current.desiredState !== 'installed'
                         || current.secretRevision !== revision) return failed(verifiedRelayCount);
-                    return failed(verifiedRelayCount, REASON.DRIFT);
+                    return drift(verifiedRelayCount, relayNode, revision);
                 }
                 const operation = await this.L2tpOperation.findOne({
                     node: relayNode,
@@ -155,12 +160,14 @@ class TopologyPppReadinessGate {
                 let actual;
                 try {
                     const transport = await this.transportResolver({ nodeId: relayNode });
-                    actual = await transport.runArtifactCommand({
+                    const expectation = {
                         operationId,
-                        command: 'verify-users',
                         expectedCredentialRevision: revision,
                         expectedEnabledUserCount,
-                    });
+                    };
+                    actual = this.readOnly
+                        ? await transport.verifyUsersReadOnly(expectation)
+                        : await transport.runArtifactCommand({ ...expectation, command: 'verify-users' });
                 } catch {
                     return failed(verifiedRelayCount, REASON.UNAVAILABLE);
                 }
@@ -177,9 +184,10 @@ class TopologyPppReadinessGate {
                     if (!provenDrift) return failed(verifiedRelayCount);
                     const current = await this.RelayL2tpState.findOne({ node: relayNode })
                         .select('status desiredState secretRevision').lean();
-                    return failed(verifiedRelayCount,
-                        current?.status === 'installed' && current.desiredState === 'installed'
-                            && current.secretRevision === revision ? REASON.DRIFT : REASON.UNKNOWN);
+                    return current?.status === 'installed' && current.desiredState === 'installed'
+                        && current.secretRevision === revision
+                        ? drift(verifiedRelayCount, relayNode, revision)
+                        : failed(verifiedRelayCount);
                 }
                 // Concurrent user edits increment the state revision. Never accept
                 // a readback against a snapshot already superseded in Mongo.
@@ -188,10 +196,11 @@ class TopologyPppReadinessGate {
                 if (current?.status !== 'installed' || current.desiredState !== 'installed'
                     || current.secretRevision !== revision) return failed(verifiedRelayCount);
                 verifiedRelayCount += 1;
+                relayRevisions.push({ relayNode, credentialRevision: revision });
             }
             return skippedRelayCount > 0
-                ? { ok: true, verifiedRelayCount, skippedRelayCount }
-                : { ok: true, verifiedRelayCount };
+                ? { ok: true, verifiedRelayCount, skippedRelayCount, relayRevisions }
+                : { ok: true, verifiedRelayCount, relayRevisions };
         } catch {
             // Includes SSH/runner, malformed result and database failures. Never
             // propagate stderr or credentials into topology operation logs.
@@ -200,12 +209,13 @@ class TopologyPppReadinessGate {
     }
 }
 
-function createTopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, HyNode, NodeSSH }) {
+function createTopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, HyNode, NodeSSH, readOnly = false }) {
     const resolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH });
     return new TopologyPppReadinessGate({
         RelayL2tpState,
         L2tpUser,
         L2tpOperation,
+        readOnly,
         transportResolver: createL2tpNodeTransportResolver({ nodeExecutionResolver: resolver }),
     });
 }
