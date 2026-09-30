@@ -111,11 +111,20 @@ assert.strictEqual(ui.shouldContinueOperationPolling({
 assert.strictEqual(ui.shouldContinueOperationPolling({
     attempt: 0, maxAttempts: 5, status: 'committing',
 }), true, 'polling continues while the operation is committing');
-for (const status of ['succeeded', 'failed', 'rolled_back']) {
+for (const status of ['failed', 'rolled_back']) {
     assert.strictEqual(ui.shouldContinueOperationPolling({
         attempt: 0, maxAttempts: 5, status,
     }), false, `polling stops on terminal ${status}`);
 }
+assert.strictEqual(ui.shouldContinueOperationPolling({
+    attempt: 0, maxAttempts: 5, status: 'succeeded', clientReadiness: 'unverified',
+}), true, 'applied operation keeps polling for client proof');
+assert.strictEqual(ui.shouldContinueOperationPolling({
+    attempt: 0, maxAttempts: 5, status: 'succeeded', clientReadiness: 'verified',
+}), false, 'verified operation stops polling');
+assert.strictEqual(ui.shouldContinueOperationPolling({
+    attempt: 0, maxAttempts: 5, status: 'succeeded', clientProofState: 'degraded',
+}), false, 'degraded proof stops polling');
 assert.strictEqual(ui.shouldContinueOperationPolling({
     attempt: 5, maxAttempts: 5, status: 'queued',
 }), false, 'polling stops at the attempt budget even if the operation is unresolved');
