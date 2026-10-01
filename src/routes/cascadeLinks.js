@@ -209,7 +209,8 @@ async function listLinks(Link, filter = {}) {
         .lean();
 }
 
-async function readLinkSnapshot({ Link, TopologyState, revisions, filter = {} }) {
+async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
+    revisions, filter = {}, includeClientReadiness = false }) {
     const linksPromise = listLinks(Link, filter);
     let topologyRevision;
     let deployedRevision;
@@ -223,11 +224,54 @@ async function readLinkSnapshot({ Link, TopologyState, revisions, filter = {} })
         topologyRevision = state?.revision ?? 0;
         deployedRevision = state?.deployedRevision ?? 0;
     }
-    return {
-        topologyRevision,
-        deployedRevision,
-        links: (await linksPromise) || [],
-    };
+    let links = (await linksPromise) || [];
+    if (includeClientReadiness) {
+        // Never trust a link-local/legacy ready flag. Only a durable, successful
+        // client probe scoped to this exact live revision pair can paint green.
+        links = links.map(({ clientReadiness, ...link }) => link);
+        const onlineIds = links.filter(link => link.active === true && link.status === 'online')
+            .map(link => String(link._id));
+        if (onlineIds.length > 0 && ClientProofOperation?.find) {
+            try {
+                const operations = await ClientProofOperation.find({
+                    topologyRevision,
+                    linkIds: { $in: onlineIds },
+                }).select('status clientReadiness kind topologyRevision priorDeployedRevision clientProofRevision linkIds')
+                    .sort({ createdAt: -1, _id: -1 }).lean();
+                const verifiedIds = new Set();
+                const seenIds = new Set();
+                const online = new Set(onlineIds);
+                for (const operation of operations || []) {
+                    const relevant = Array.isArray(operation.linkIds)
+                        ? operation.linkIds.map(String).filter(linkId => online.has(linkId)
+                            && !seenIds.has(linkId))
+                        : [];
+                    for (const linkId of relevant) seenIds.add(linkId);
+                    if (operation.status !== 'succeeded' || operation.clientReadiness !== 'verified'
+                        || operation.topologyRevision !== topologyRevision
+                        || operation.clientProofRevision !== topologyRevision) continue;
+                    // Scoped success deliberately leaves deployedRevision at its
+                    // previous value. Legacy full sync has no kind and advances it.
+                    const liveScope = operation.kind == null
+                        ? deployedRevision === topologyRevision
+                        : ['link.apply', 'domain.reconcile', 'link.replace', 'link.attach'].includes(operation.kind)
+                            && operation.priorDeployedRevision === deployedRevision;
+                    if (!liveScope) continue;
+                    for (const linkId of relevant) verifiedIds.add(linkId);
+                }
+                links = links.map(link => verifiedIds.has(String(link._id))
+                    ? { ...link, clientReadiness: {
+                        status: 'ready', clientProbe: 'passed',
+                        topologyRevision, priorDeployedRevision: deployedRevision,
+                    } }
+                    : link);
+            } catch (_) {
+                logger.warn('[Cascade Links API] Client proof projection unavailable');
+                // The snapshot remains readable, but never becomes client-ready.
+            }
+        }
+    }
+    return { topologyRevision, deployedRevision, links };
 }
 
 function sendError(res, error, operation) {
@@ -272,6 +316,7 @@ function createCascadeLinksRouter({
     RouteGroup = CascadeRouteGroup,
     TopologyState = CascadeTopologyState,
     RelayState = RelayL2tpState,
+    ClientProofOperation = TopologyOperation,
     topologyDraftWriteService,
     createDraftWriteService = createTopologyDraftWriteService,
     maintainAutoL2tpPathsFn = maintainAutoL2tpPaths,
@@ -415,7 +460,9 @@ function createCascadeLinksRouter({
                     { bridgeNode: req.query.nodeId },
                 ];
             }
-            return res.json(await readLinkSnapshot({ Link, TopologyState, filter }));
+            return res.json(await readLinkSnapshot({
+                Link, TopologyState, ClientProofOperation, filter, includeClientReadiness: true,
+            }));
         } catch (error) {
             return sendError(res, error, 'List');
         }

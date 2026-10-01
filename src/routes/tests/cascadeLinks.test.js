@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const mongoose = require('mongoose');
 const CascadeLink = require('../../models/cascadeLinkModel');
+const { clientReadinessMessage } = require('../../../public/js/network');
 
 const {
     createCascadeLinksRouter,
@@ -139,6 +140,112 @@ test('GET returns the versioned link snapshot used by network clients', async ()
     });
     assert.deepEqual(calls.filter, {});
     assert.equal(calls.topologyId, 'singleton');
+});
+
+test('GET projects only revision-bound verified client proof onto online links in its operation scope', async () => {
+    const links = [
+        { _id: LINK_A, active: true, status: 'online', name: 'verified portal' },
+        { _id: '507f1f77bcf86cd799439022', active: true, status: 'online', name: 'other domain' },
+    ];
+    const operation = {
+        status: 'succeeded', clientReadiness: 'verified', kind: 'link.apply',
+        topologyRevision: 21, priorDeployedRevision: 18, clientProofRevision: 21,
+        linkIds: [LINK_A],
+    };
+    const Link = { find() { return queryResult(links); } };
+    const TopologyState = { findById() { return queryResult({ revision: 21, deployedRevision: 18 }); } };
+    const ClientProofOperation = { find() { return queryResult([operation]); } };
+    const router = createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation });
+    const response = await request(router);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.links[0].clientReadiness, {
+        status: 'ready', clientProbe: 'passed',
+        topologyRevision: 21, priorDeployedRevision: 18,
+    });
+    assert.equal(clientReadinessMessage(response.body.links[0].clientReadiness, 21, 18),
+        'Готовность подтверждена проверкой клиента');
+    assert.equal(response.body.links[1].clientReadiness, undefined);
+});
+
+test('GET refuses stale, unverified, and offline operation proof rather than painting a green link', async () => {
+    const links = [{ _id: LINK_A, active: true, status: 'online' }];
+    const Link = { find() { return queryResult(links); } };
+    const TopologyState = { findById() { return queryResult({ revision: 21, deployedRevision: 18 }); } };
+    for (const change of [
+        { topologyRevision: 20, clientProofRevision: 20 },
+        { clientProofRevision: 20 },
+        { clientReadiness: 'unverified' },
+        { status: 'failed' },
+        { linkIds: ['507f1f77bcf86cd799439022'] },
+    ]) {
+        const operation = {
+            status: 'succeeded', clientReadiness: 'verified', kind: 'link.apply',
+            topologyRevision: 21, priorDeployedRevision: 18, clientProofRevision: 21,
+            linkIds: [LINK_A], ...change,
+        };
+        const ClientProofOperation = { find() { return queryResult([operation]); } };
+        const router = createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation });
+        const response = await request(router);
+        assert.equal(response.status, 200);
+        assert.equal(response.body.links[0].clientReadiness, undefined);
+    }
+    links[0].status = 'offline';
+    const ClientProofOperation = { find() { return queryResult([{
+        status: 'succeeded', clientReadiness: 'verified', kind: 'link.apply',
+        topologyRevision: 21, priorDeployedRevision: 18, clientProofRevision: 21,
+        linkIds: [LINK_A],
+    }]); } };
+    const response = await request(createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation }));
+    assert.equal(response.status, 200);
+    assert.equal(response.body.links[0].clientReadiness, undefined);
+});
+
+test('GET never reuses an older ready proof after a newer queued operation for that link', async () => {
+    const otherLink = '507f1f77bcf86cd799439022';
+    const links = [LINK_A, otherLink].map(_id => ({ _id, active: true, status: 'online' }));
+    const Link = { find() { return queryResult(links); } };
+    const TopologyState = { findById() { return queryResult({ revision: 21, deployedRevision: 18 }); } };
+    const calls = {};
+    const ClientProofOperation = { find() { return queryResult([
+        { status: 'queued', clientReadiness: 'unverified', kind: 'link.apply',
+            topologyRevision: 21, priorDeployedRevision: 18, linkIds: [LINK_A] },
+        { status: 'succeeded', clientReadiness: 'verified', kind: 'link.apply',
+            topologyRevision: 21, priorDeployedRevision: 18, clientProofRevision: 21,
+            linkIds: [LINK_A, otherLink] },
+    ], calls, 'proof'); } };
+    const response = await request(createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls.proofsort, { createdAt: -1, _id: -1 });
+    assert.equal(response.body.links[0].clientReadiness, undefined);
+    assert.equal(clientReadinessMessage(response.body.links[1].clientReadiness, 21, 18),
+        'Готовность подтверждена проверкой клиента');
+});
+
+test('GET proof lookup failure stays readable but strips legacy ready flags', async () => {
+    const Link = { find() { return queryResult([{
+        _id: LINK_A, active: true, status: 'online',
+        clientReadiness: { status: 'ready', clientProbe: 'passed', topologyRevision: 21,
+            priorDeployedRevision: 18 },
+    }]); } };
+    const TopologyState = { findById() { return queryResult({ revision: 21, deployedRevision: 18 }); } };
+    const ClientProofOperation = { find() { throw new Error('read unavailable'); } };
+    const response = await request(createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation }));
+    assert.equal(response.status, 200);
+    assert.equal(response.body.links[0].clientReadiness, undefined);
+});
+
+test('GET accepts legacy full-sync proof only after the deployed revision catches up', async () => {
+    const Link = { find() { return queryResult([{ _id: LINK_A, active: true, status: 'online' }]); } };
+    const TopologyState = { findById() { return queryResult({ revision: 21, deployedRevision: 21 }); } };
+    const ClientProofOperation = { find() { return queryResult([{
+        status: 'succeeded', clientReadiness: 'verified',
+        topologyRevision: 21, priorDeployedRevision: 18, clientProofRevision: 21,
+        linkIds: [LINK_A],
+    }]); } };
+    const response = await request(createCascadeLinksRouter({ Link, TopologyState, ClientProofOperation }));
+    assert.equal(response.status, 200);
+    assert.equal(clientReadinessMessage(response.body.links[0].clientReadiness, 21, 21),
+        'Готовность подтверждена проверкой клиента');
 });
 
 test('GET by id preserves the populated cascade link contract', async () => {
