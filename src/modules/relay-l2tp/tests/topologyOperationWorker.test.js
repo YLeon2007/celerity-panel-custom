@@ -5,6 +5,7 @@ const { createHash } = require('node:crypto');
 const test = require('node:test');
 
 const { TopologyOperationWorker, LeaseLostError } = require('../workers/topologyOperationWorker');
+const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
@@ -346,6 +347,31 @@ async function successfulLifecycleEvents(order, lockService) {
     assert.equal(result.status, 'succeeded');
     return events;
 }
+
+test('normal worker finalization accepts the strict finalizer interface without rolling back', async () => {
+    const repository = createRepository();
+    let rollbackCount = 0;
+    const finalizer = new TopologyOperationFinalizer({
+        repository: { async finalizeSucceeded(input) {
+            return { operationId: input.operationId, topologyRevision: input.topologyRevision,
+                deployedRevision: input.topologyRevision, finishedAt: input.now };
+        } },
+        clock: { now: () => new Date(NOW) },
+    });
+    const worker = createWorker({
+        repository,
+        finalizer,
+        executor: {
+            async prepare() { return { backupId: 'backup', prepared: { opaque: true } }; },
+            async commit() { return { ok: true }; },
+            async verify() { return { ok: true }; },
+            async rollback() { rollbackCount += 1; return { ok: true }; },
+            async cleanupPrepared() { return { ok: true }; },
+        },
+    });
+    assert.equal((await worker.run('operation-1')).status, 'succeeded');
+    assert.equal(rollbackCount, 0);
+});
 
 test('a verified topology success renews and releases exact-generation node locks for the next link', async () => {
     const held = new Set();
@@ -1650,7 +1676,6 @@ test('delegates terminal success to the atomic finalizer with only operation lea
         leaseUntil: repository.operation.leaseUntil,
         topologyRevision: 7,
         priorDeployedRevision: 5,
-        now: new Date(NOW),
     }]);
     assert.deepEqual(
         repository.calls.filter(call => (

@@ -1238,7 +1238,6 @@ class TopologyOperationWorker {
                     leaseUntil,
                     topologyRevision: plan.topologyRevision,
                     priorDeployedRevision: plan.priorDeployedRevision,
-                    now: this.clock.now(),
                 });
                 if (!finalized) throw new Error('Topology operation finalization was rejected');
             } catch (error) {
