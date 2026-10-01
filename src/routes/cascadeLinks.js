@@ -8,6 +8,11 @@ const HyNode = require('../models/hyNodeModel');
 const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
 const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+const L2tpUser = require('../modules/relay-l2tp/models/l2tpUserModel');
+const L2tpOperation = require('../modules/relay-l2tp/models/l2tpOperationModel');
+const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
+const NodeOperationLock = require('../modules/relay-l2tp/models/nodeOperationLockModel');
+const NodeSSH = require('../services/nodeSSH');
 const {
     createTopologyDraftWriteService,
 } = require('../modules/relay-l2tp/services/topologyDraftWriteService');
@@ -273,13 +278,17 @@ function createCascadeLinksRouter({
     topologyCoordinator,
     createTopologyCoordinator = () => require('../modules/relay-l2tp')
         .createTopologyDeploymentService({
+            env: process.env,
             HyNode: Node,
             CascadeLink: Link,
             CascadeRouteGroup: RouteGroup,
             CascadeTopologyState: TopologyState,
             RelayL2tpState: RelayState,
-            TopologyOperation: require('../modules/relay-l2tp/models/topologyOperationModel'),
-            NodeOperationLock: require('../modules/relay-l2tp/models/nodeOperationLockModel'),
+            L2tpUser,
+            L2tpOperation,
+            TopologyOperation,
+            NodeOperationLock,
+            NodeSSH,
         }),
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
