@@ -185,6 +185,40 @@ class TopologyOperationFinalizationRepository {
         this.transactionRunner = runTransaction;
     }
 
+    async finalizeRolledBack({ operationId, topologyRevision, priorDeployedRevision, now }) {
+        if (typeof operationId !== 'string' || !operationId
+            || !validRevision(topologyRevision) || !validRevision(priorDeployedRevision)
+            || !validDate(now)) {
+            throw new TypeError('Invalid rolled-back topology finalization request');
+        }
+        return this.transactionRunner(async session => {
+            const operation = await this.TopologyOperation.updateOne({
+                _id: operationId,
+                topologyRevision,
+                priorDeployedRevision,
+                status: 'rolled_back',
+                heldTopologyAdmission: true,
+            }, {
+                $set: { heldTopologyAdmission: false },
+            }, { runValidators: true, session });
+            if (operation?.matchedCount !== 1) rejectFinalization();
+            const topology = await this.CascadeTopologyState.updateOne({
+                _id: 'singleton',
+                deployedRevision: priorDeployedRevision,
+                topologyAdmissionCount: 1,
+            }, {
+                $inc: { topologyAdmissionCount: -1 },
+            }, { runValidators: true, session, timestamps: false });
+            if (topology?.matchedCount !== 1) rejectFinalization();
+            return {
+                operationId,
+                topologyRevision,
+                deployedRevision: priorDeployedRevision,
+                finishedAt: now,
+            };
+        });
+    }
+
     async finalizeSucceeded(request) {
         assertFinalizationRequest(request);
         const {

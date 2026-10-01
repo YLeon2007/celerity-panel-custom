@@ -426,17 +426,49 @@ class TopologyOperationWorker {
     }
 
     async releaseVerifiedLocks(operationId, acquiredNodeIds) {
+        let released = true;
         for (const { node, generation } of [...acquiredNodeIds].reverse()) {
             try {
-                await this.lockService.releaseVerified({
+                const result = await this.lockService.releaseVerified({
                     node,
                     owner: this.workerId,
                     operationId,
                     generation,
                 });
+                if (result?.ok !== true) released = false;
             } catch {
-                // Failed release leaves this node blocked for TEST rollback.
+                released = false;
             }
+        }
+        return released;
+    }
+
+    async releaseRollbackFence(plan, operationId, status, acquiredNodeIds) {
+        if (status !== 'rolled_back'
+            || typeof this.finalizer.finalizeRolledBack !== 'function'
+            || !Array.isArray(acquiredNodeIds)) {
+            return false;
+        }
+        const locksReleased = await this.releaseVerifiedLocks(operationId, acquiredNodeIds);
+        if (!locksReleased || typeof this.finalizer.finalizeRolledBack !== 'function') {
+            logger.warn?.(`[TopologyWorker] rollback fence remains held for operation ${operationId}`);
+            return false;
+        }
+        try {
+            const released = await this.finalizer.finalizeRolledBack({
+                operationId,
+                topologyRevision: plan.topologyRevision,
+                priorDeployedRevision: plan.priorDeployedRevision,
+            });
+            if (!released) {
+                logger.warn?.(`[TopologyWorker] rollback admission release was rejected for operation ${operationId}`);
+                return false;
+            }
+            acquiredNodeIds.length = 0;
+            return true;
+        } catch {
+            logger.warn?.(`[TopologyWorker] rollback admission release failed for operation ${operationId}`);
+            return false;
         }
     }
 
@@ -767,7 +799,7 @@ class TopologyOperationWorker {
         return true;
     }
 
-    async rollbackDurableOperation(plan, operation, operationId, entries, heartbeat) {
+    async rollbackDurableOperation(plan, operation, operationId, entries, heartbeat, acquiredNodeIds) {
         if (operation.status === 'committing') {
             const rollingBack = await this.operationRepository.setPhase({
                 operationId,
@@ -819,10 +851,11 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
+        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
         return { claimed: true, operationId, status };
     }
 
-    async cleanupAfterPrepareFailure(plan, operationId, prepared, heartbeat) {
+    async cleanupAfterPrepareFailure(plan, operationId, prepared, heartbeat, acquiredNodeIds) {
         const rollingBack = await this.operationRepository.setPhase({
             operationId,
             owner: this.workerId,
@@ -866,6 +899,7 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
+        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
         return { claimed: true, operationId, status };
     }
 
@@ -885,7 +919,7 @@ class TopologyOperationWorker {
         }
     }
 
-    async rollbackAfterCommitFailure(plan, operationId, prepared, changing, heartbeat) {
+    async rollbackAfterCommitFailure(plan, operationId, prepared, changing, heartbeat, acquiredNodeIds) {
         const rollingBack = await this.operationRepository.setPhase({
             operationId,
             owner: this.workerId,
@@ -959,6 +993,7 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
+        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
         return { claimed: true, operationId, status };
     }
 
@@ -1038,6 +1073,7 @@ class TopologyOperationWorker {
                     operationId,
                     entries,
                     heartbeat,
+                    acquiredNodeIds,
                 );
             }
 
@@ -1081,6 +1117,7 @@ class TopologyOperationWorker {
                     operationId,
                     prepared,
                     heartbeat,
+                    acquiredNodeIds,
                 );
             }
 
@@ -1113,6 +1150,7 @@ class TopologyOperationWorker {
                         prepared,
                         changing,
                         heartbeat,
+                        acquiredNodeIds,
                     );
                 }
                 const recorded = await this.operationRepository.recordNode({
@@ -1139,6 +1177,7 @@ class TopologyOperationWorker {
                         prepared,
                         changing,
                         heartbeat,
+                        acquiredNodeIds,
                     );
                 }
             }
@@ -1162,6 +1201,7 @@ class TopologyOperationWorker {
                         prepared,
                         changing,
                         heartbeat,
+                        acquiredNodeIds,
                     );
                 }
             }
@@ -1213,7 +1253,7 @@ class TopologyOperationWorker {
                         return { claimed: true, operationId, status: 'awaiting_ppp' };
                     }
                     return await this.rollbackAfterCommitFailure(
-                        plan, operationId, prepared, changing, heartbeat,
+                        plan, operationId, prepared, changing, heartbeat, acquiredNodeIds,
                     );
                 }
             }
@@ -1226,7 +1266,7 @@ class TopologyOperationWorker {
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
                     return await this.rollbackAfterCommitFailure(
-                        plan, operationId, prepared, changing, heartbeat,
+                        plan, operationId, prepared, changing, heartbeat, acquiredNodeIds,
                     );
                 }
             }
@@ -1251,6 +1291,7 @@ class TopologyOperationWorker {
                     prepared,
                     changing,
                     heartbeat,
+                    acquiredNodeIds,
                 );
             }
             terminalSuccess = true;

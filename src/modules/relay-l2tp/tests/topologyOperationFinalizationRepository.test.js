@@ -153,6 +153,32 @@ test('finalizeSucceeded marks active cascade links deployed in the same transact
     }]);
 });
 
+test('rolled-back finalization releases exactly one held admission after rollback', async () => {
+    const harness = createHarness({
+        operation: {
+            status: 'rolled_back',
+            heldTopologyAdmission: true,
+            leaseOwner: '',
+            leaseUntil: null,
+        },
+        topology: { revision: 9, topologyAdmissionCount: 1 },
+    });
+    const released = await harness.repository.finalizeRolledBack({
+        operationId: 'operation-7',
+        topologyRevision: 7,
+        priorDeployedRevision: 5,
+        now: NOW,
+    });
+    assert.deepEqual(released, {
+        operationId: 'operation-7',
+        topologyRevision: 7,
+        deployedRevision: 5,
+        finishedAt: NOW,
+    });
+    assert.equal(harness.store.operation.heldTopologyAdmission, false);
+    assert.equal(harness.store.topology.topologyAdmissionCount, 0);
+});
+
 test('successful finalization records execution success without implying client readiness', async () => {
     const harness = createHarness(); // legacy document has no readiness field
     const result = await harness.repository.finalizeSucceeded(request());

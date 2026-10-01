@@ -80,6 +80,19 @@ class TopologyOperationFinalizer {
         this.clock = clock;
     }
 
+    async finalizeRolledBack(input) {
+        const expectedKeys = ['operationId', 'priorDeployedRevision', 'topologyRevision'];
+        if (!hasExactKeys(input, expectedKeys.sort())
+            || typeof input.operationId !== 'string' || !input.operationId
+            || !validRevision(input.topologyRevision)
+            || !validRevision(input.priorDeployedRevision)) {
+            throw new TypeError('Invalid rolled-back topology finalization input');
+        }
+        const now = this.clock.now();
+        if (!validDate(now)) throw new TypeError('Topology operation finalizer clock returned an invalid date');
+        return this.repository.finalizeRolledBack({ ...input, now });
+    }
+
     async finalizeSucceeded(input) {
         assertFinalizationInput(input);
         const now = this.clock.now();
