@@ -11,6 +11,8 @@ const { TopologyOperationRepository } = require('../modules/relay-l2tp/repositor
 const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
 const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+const L2tpUser = require('../modules/relay-l2tp/models/l2tpUserModel');
+const L2tpOperation = require('../modules/relay-l2tp/models/l2tpOperationModel');
 const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
 const NodeOperationLock = require('../modules/relay-l2tp/models/nodeOperationLockModel');
 const {
@@ -25,6 +27,8 @@ const DEFAULT_MODELS = Object.freeze({
     CascadeRouteGroup,
     CascadeTopologyState,
     RelayL2tpState,
+    L2tpUser,
+    L2tpOperation,
     TopologyOperation,
     NodeOperationLock,
 });
