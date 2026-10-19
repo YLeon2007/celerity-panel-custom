@@ -37,37 +37,49 @@ const INSTALL_COMMAND = Object.freeze([
 const CLEANUP_COMMAND = Object.freeze(
     `/usr/bin/rm -f -- ${TOPOLOGY_RUNNER_UPLOAD_PATH} ${TOPOLOGY_RUNNER_NEXT_PATH}`,
 );
-// The node runner's strict prepare requires the target profile's config
-// parent (e.g. /usr/local/etc/xray-bridge) to exist as a real directory,
-// and commit/verify drive the xray-bridge.service unit. Fresh relay nodes
-// only have the main xray profile, so ensure the dirs and the unit upfront.
-// The unit content is static: always rewrite it so a stale or corrupted
-// unit (e.g. written by an older printf %s revision with literal '\n'
-// sequences) self-heals on the next bootstrap instead of lingering forever.
-const ENSURE_CONFIG_DIRS_COMMAND = Object.freeze([
-    '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge',
-    `&& /usr/bin/printf '%b\\n' '${[
-        '[Unit]',
-        'Description=Xray Bridge (Cascade Tunnel)',
-        'After=network.target nss-lookup.target',
-        '',
-        '[Service]',
-        'User=nobody',
-        'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
-        'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
-        'NoNewPrivileges=true',
-        'Type=simple',
-        'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray-bridge/config.json',
-        'Restart=on-failure',
-        'RestartSec=5',
-        'LimitNOFILE=1048576',
-        '',
-        '[Install]',
-        'WantedBy=multi-user.target',
-        '',
-    ].join('\\n')}' > /etc/systemd/system/xray-bridge.service`,
+// Only relay/bridge roles own this profile. A portal must never touch it.
+// The runner backs up config only: a differing unit cannot be safely replaced.
+const BRIDGE_UNIT_PATH = '/etc/systemd/system/xray-bridge.service';
+const BRIDGE_UNIT_SOURCE = [
+    '[Unit]',
+    'Description=Xray Bridge (Cascade Tunnel)',
+    'After=network.target nss-lookup.target',
+    '',
+    '[Service]',
+    'User=nobody',
+    'CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
+    'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE',
+    'NoNewPrivileges=true',
+    'Type=simple',
+    'ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray-bridge/config.json',
+    'Restart=on-failure',
+    'RestartSec=5',
+    'LimitNOFILE=1048576',
+    '',
+    '[Install]',
+    'WantedBy=multi-user.target',
+    '',
+    '',
+].join('\n');
+const BRIDGE_UNIT_DIGEST = createHash('sha256').update(BRIDGE_UNIT_SOURCE).digest('hex');
+const INSPECT_BRIDGE_UNIT_COMMAND = [
+    '/usr/bin/systemctl show --property=FragmentPath --property=DropInPaths -- xray-bridge.service',
+    `&& if /usr/bin/test -f ${BRIDGE_UNIT_PATH} && /usr/bin/test ! -L ${BRIDGE_UNIT_PATH}; then`,
+    `/usr/bin/sha256sum -- ${BRIDGE_UNIT_PATH};`,
+    `elif /usr/bin/test -e ${BRIDGE_UNIT_PATH} || /usr/bin/test -L ${BRIDGE_UNIT_PATH}; then`,
+    "/usr/bin/printf '%s\\n' unsafe;",
+    'else',
+    "/usr/bin/printf '%s\\n' missing;",
+    'fi',
+].join(' ');
+// noclobber is deliberate: a unit appearing after inspection is not ours.
+const INSTALL_BRIDGE_UNIT_COMMAND = [
+    `(/usr/bin/test ! -e ${BRIDGE_UNIT_PATH} && /usr/bin/test ! -L ${BRIDGE_UNIT_PATH}`,
+    `&& set -C && umask 022 && /usr/bin/printf '%s' '${BRIDGE_UNIT_SOURCE}' > ${BRIDGE_UNIT_PATH})`,
     '&& /usr/bin/systemctl daemon-reload',
-].join(' '));
+].join(' ');
+const ENSURE_PORTAL_CONFIG_DIR_COMMAND = '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray';
+const ENSURE_CONFIG_DIRS_COMMAND = '/usr/bin/install -d -m 0755 -o root -g root /usr/local/etc/xray /usr/local/etc/xray-bridge';
 
 /**
  * @typedef {Readonly<{code: number, stdout: string, stderr: string}>} NodeSSHResult
@@ -113,6 +125,23 @@ function parseInspection(result) {
     return Object.freeze({ digest: match[1], mode: match[2].padStart(4, '0') });
 }
 
+function parseBridgeUnitInspection(result) {
+    if (!result || result.code !== 0 || result.stderr !== '' || typeof result.stdout !== 'string') {
+        throw new TopologyRunnerBootstrapperError();
+    }
+    // Reject vendor units, masks, drop-ins and uncertain/malformed observations.
+    // Their replacement needs a separate durable unit backup/rollback contract.
+    const lines = result.stdout.split('\n');
+    const properties = lines.slice(0, 2).sort().join('\n');
+    const state = lines.slice(2).join('\n');
+    if (properties === 'DropInPaths=\nFragmentPath=' && state === 'missing\n') return false;
+    if (properties === `DropInPaths=\nFragmentPath=${BRIDGE_UNIT_PATH}`
+        && state === `${BRIDGE_UNIT_DIGEST}  ${BRIDGE_UNIT_PATH}\n`) {
+        return true;
+    }
+    throw new TopologyRunnerBootstrapperError();
+}
+
 function isSilentSuccess(result) {
     return Boolean(result)
         && typeof result === 'object'
@@ -133,10 +162,15 @@ function success(changed) {
 class TopologyRunnerBootstrapper {
     /** @type {TopologyRunnerNodeSSH} */
     #nodeSSH;
+    #role;
 
+    // The caller must forward the authorized panel pair and the resolved/frozen
+    // node role. Do not infer either from a transport facade or default to TEST.
     constructor(options) {
-        if (!hasExactKeys(options, ['nodeSSH', 'target'])
-            || options.target !== 'test'
+        if (!hasExactKeys(options, ['hostIdentity', 'nodeSSH', 'role', 'target'])
+            || !((options.target === 'test' && options.hostIdentity === 'test.infograd.online')
+                || (options.target === 'production' && options.hostIdentity === 'lm1.infograd.online'))
+            || !['portal', 'relay', 'bridge'].includes(options.role)
             || !options.nodeSSH
             || typeof options.nodeSSH !== 'object'
             || typeof options.nodeSSH.exec !== 'function'
@@ -144,6 +178,7 @@ class TopologyRunnerBootstrapper {
             throw new TopologyRunnerBootstrapperError();
         }
         this.#nodeSSH = options.nodeSSH;
+        this.#role = options.role;
     }
 
     /** @returns {Promise<EnsureRunnerResult>} */
@@ -153,12 +188,23 @@ class TopologyRunnerBootstrapper {
         let transferStarted = false;
         try {
             const current = parseInspection(await this.#nodeSSH.exec(INSPECT_COMMAND));
-            if (!isSilentSuccess(await this.#nodeSSH.exec(ENSURE_CONFIG_DIRS_COMMAND))) {
+            // Decide ownership and reject incompatible units before even mkdir/upload.
+            const unitMissing = this.#role !== 'portal'
+                && !parseBridgeUnitInspection(await this.#nodeSSH.exec(INSPECT_BRIDGE_UNIT_COMMAND));
+            const dirsCommand = this.#role === 'portal'
+                ? ENSURE_PORTAL_CONFIG_DIR_COMMAND : ENSURE_CONFIG_DIRS_COMMAND;
+            if (!isSilentSuccess(await this.#nodeSSH.exec(dirsCommand))) {
                 throw new TopologyRunnerBootstrapperError();
+            }
+            if (unitMissing) {
+                if (!isSilentSuccess(await this.#nodeSSH.exec(INSTALL_BRIDGE_UNIT_COMMAND))
+                    || !parseBridgeUnitInspection(await this.#nodeSSH.exec(INSPECT_BRIDGE_UNIT_COMMAND))) {
+                    throw new TopologyRunnerBootstrapperError();
+                }
             }
             if (current?.digest === TOPOLOGY_RUNNER_DIGEST
                 && current.mode === TOPOLOGY_RUNNER_MODE) {
-                return success(false);
+                return success(unitMissing);
             }
 
             transferStarted = true;
