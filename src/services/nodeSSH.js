@@ -57,7 +57,11 @@ function getDirectMaxRetries() {
 }
 
 class NodeSSH {
-    constructor(node) {
+    #hostKeyOptions;
+    #verifiedDirectClient = null;
+
+    constructor(node, options) {
+        this.#hostKeyOptions = sshPool.hostKeyOptions(node, options);
         this.node = node;
         this.usePool = true;
         this.directClient = null;
@@ -67,11 +71,16 @@ class NodeSSH {
      * Connect to node via SSH (via pool or direct)
      */
     async connect() {
+        sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
         if (this.usePool) {
             try {
-                await sshPool.getConnection(this.node);
+                await sshPool.getConnection(this.node, this.#hostKeyOptions);
                 return;
             } catch (error) {
+                // A failed pinned pool handshake must never downgrade or silently
+                // try another transport. Only an explicitly disabled pool may use
+                // the equally pinned direct path. Legacy callers retain fallback.
+                if (this.#hostKeyOptions && error?.message !== 'SSH Pool disabled') throw error;
                 if (error && error.message === 'SSH Pool disabled') {
                     logger.debug(`[SSH] Pool disabled, using direct for ${this.node.name}`);
                 } else {
@@ -90,9 +99,12 @@ class NodeSSH {
      * cannot saturate CPU during network instability.
      */
     async connectDirect() {
+        sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
+        if (this.#hostKeyOptions) this.disconnect();
         await NodeSSH._acquireDirectSlot();
         try {
             this.directClient = await this._connectDirectWithRetry();
+            this.#verifiedDirectClient = this.directClient;
         } finally {
             NodeSSH._releaseDirectSlot();
         }
@@ -130,6 +142,7 @@ class NodeSSH {
                 port: this.node.ssh?.port || 22,
                 username: this.node.ssh?.username || 'root',
                 readyTimeout: getDirectReadyTimeoutMs(),
+                ...sshPool.hostKeyConfig(this.node, this.#hostKeyOptions),
             };
 
             if (this.node.ssh?.privateKey) {
@@ -188,6 +201,7 @@ class NodeSSH {
      * Close connection
      */
     disconnect() {
+        this.#verifiedDirectClient = null;
         if (this.directClient) {
             this.directClient.end();
             this.directClient = null;
@@ -195,12 +209,21 @@ class NodeSSH {
         // Pool connections are NOT closed - they are reused
     }
 
+    #assertPinnedEndpoint() {
+        sshPool.hostKeyOptions(this.node, this.#hostKeyOptions);
+        if (this.#hostKeyOptions && !this.usePool
+            && (!this.directClient || this.directClient !== this.#verifiedDirectClient)) {
+            throw new Error('SSH pinned connection is not verified');
+        }
+    }
+
     /**
      * Execute command on remote server
      */
     async exec(command, options = {}) {
+        this.#assertPinnedEndpoint();
         if (this.usePool) {
-            return sshPool.exec(this.node, command, options);
+            return sshPool.exec(this.node, command, options, this.#hostKeyOptions);
         }
 
         const includesStdin = hasExecStdin(options);
@@ -274,8 +297,9 @@ class NodeSSH {
      * Write file to remote server
      */
     async writeFile(remotePath, content) {
+        this.#assertPinnedEndpoint();
         if (this.usePool) {
-            return sshPool.writeFile(this.node, remotePath, content);
+            return sshPool.writeFile(this.node, remotePath, content, this.#hostKeyOptions);
         }
         
         // Legacy direct write
@@ -329,8 +353,9 @@ class NodeSSH {
      * Read file from remote server
      */
     async readFile(remotePath) {
+        this.#assertPinnedEndpoint();
         if (this.usePool) {
-            return sshPool.readFile(this.node, remotePath);
+            return sshPool.readFile(this.node, remotePath, this.#hostKeyOptions);
         }
         
         // Legacy direct read

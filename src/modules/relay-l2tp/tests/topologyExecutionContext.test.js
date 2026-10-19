@@ -206,7 +206,7 @@ test('assembled production runtime carries its context through coordinator and a
     await assert.rejects(service.operationWorker.attachIngressGate.nodeExecutionResolver.resolve({
         nodeId: 'relay-1', role: 'relay',
     }), { code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE' });
-    assert.equal(lookups, 1, 'production attach resolver must pass the context fence before lookup');
+    assert.equal(lookups, 0, 'production attach resolver refuses before lookup until server authority supplies a host-key pin');
     for (const field of ['target', 'hostIdentity', 'executionContext']) {
         await assert.rejects(service.queue({ expectedTopologyRevision: 7, [field]: PROD[field] ?? PROD }), {
             code: 'INVALID_REQUEST',

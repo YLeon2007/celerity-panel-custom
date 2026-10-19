@@ -86,6 +86,25 @@ function hasUsableConnection(node, nodeId, role) {
         );
 }
 
+function trustedPinSnapshot(pin) {
+    if (pin === undefined) return undefined;
+    const endpoint = pin?.expectedEndpoint;
+    if (!pin || typeof pin !== 'object'
+        || JSON.stringify(Object.keys(pin).sort()) !== JSON.stringify(['expectedEndpoint', 'expectedHostKeySha256'])
+        || typeof pin.expectedHostKeySha256 !== 'string' || !/^[a-f0-9]{64}$/.test(pin.expectedHostKeySha256)
+        || !endpoint || typeof endpoint !== 'object'
+        || JSON.stringify(Object.keys(endpoint).sort()) !== JSON.stringify(['ip', 'port', 'username'])
+        || typeof endpoint.ip !== 'string' || !endpoint.ip
+        || !Number.isSafeInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535
+        || typeof endpoint.username !== 'string' || !endpoint.username) {
+        throw new TopologyNodeExecutionResolverError();
+    }
+    return Object.freeze({
+        expectedHostKeySha256: pin.expectedHostKeySha256,
+        expectedEndpoint: Object.freeze({ ip: endpoint.ip, port: endpoint.port, username: endpoint.username }),
+    });
+}
+
 class TopologyNodeExecutionResolver {
     #HyNode;
     #NodeSSH;
@@ -103,11 +122,19 @@ class TopologyNodeExecutionResolver {
         this.#executionContext = topologyExecutionContext(target, hostIdentity);
     }
 
-    async resolve(request) {
+    // Second argument is ONLY for the internal executor after server-authority
+    // binding lookup. Request/DB node fields never supply trust. PROD remains
+    // closed while its executor does not pass this explicit physical-key pin.
+    async resolve(request, trustedConnection) {
         if (
             !this.#executionContext
             || !isExactResolutionRequest(request)
         ) {
+            throw new TopologyNodeExecutionResolverError();
+        }
+
+        const pin = trustedPinSnapshot(trustedConnection);
+        if (this.#executionContext.target === 'production' && !pin) {
             throw new TopologyNodeExecutionResolverError();
         }
 
@@ -123,8 +150,19 @@ class TopologyNodeExecutionResolver {
             throw new TopologyNodeExecutionResolverError();
         }
 
+        if (pin && (node.ip !== pin.expectedEndpoint.ip
+            || node.ssh.port !== pin.expectedEndpoint.port
+            || node.ssh.username !== pin.expectedEndpoint.username)) {
+            throw new TopologyNodeExecutionResolverError();
+        }
+
         try {
-            return new this.#NodeSSH(executionNode(node));
+            const selected = executionNode(node);
+            if (pin) {
+                Object.freeze(selected.ssh);
+                Object.freeze(selected);
+            }
+            return pin ? new this.#NodeSSH(selected, pin) : new this.#NodeSSH(selected);
         } catch {
             throw new TopologyNodeExecutionResolverError();
         }

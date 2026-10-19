@@ -51,13 +51,29 @@ function executionNode(nodeId, role) {
     };
 }
 
+test('production refuses resolution without explicit server-authority pin before lookup', async () => {
+    const HyNode = createHyNode(new Map([['portal-node', executionNode('portal-node', 'portal')]]));
+    let constructions = 0;
+    const resolver = new TopologyNodeExecutionResolver({ HyNode,
+        NodeSSH: class { constructor() { constructions++; } },
+        target: 'production', hostIdentity: 'lm1.infograd.online' });
+    await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal' }), {
+        code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE',
+    });
+    assert.equal(constructions, 0);
+    assert.deepEqual(HyNode.calls, []);
+});
+
 test('resolves the exact production pair without accepting a request-supplied target', async () => {
     const HyNode = createHyNode(new Map([['portal-node', executionNode('portal-node', 'portal')]]));
     class FakeNodeSSH { constructor(node) { this.node = node; } }
     const configuration = { target: 'production', hostIdentity: 'lm1.infograd.online' };
     const resolver = new TopologyNodeExecutionResolver({ HyNode, NodeSSH: FakeNodeSSH, ...configuration });
     configuration.target = 'test';
-    const nodeSSH = await resolver.resolve({ nodeId: 'portal-node', role: 'portal' });
+    const nodeSSH = await resolver.resolve({ nodeId: 'portal-node', role: 'portal' }, {
+        expectedHostKeySha256: 'a'.repeat(64),
+        expectedEndpoint: { ip: '192.0.2.10', port: 2222, username: 'celerity' },
+    });
     assert.ok(nodeSSH instanceof FakeNodeSSH);
     HyNode.calls.length = 0;
     await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal', target: 'test' }), {
@@ -153,6 +169,79 @@ test('refuses missing or non-allowlisted contour identity before lookup with a s
         );
         assert.deepEqual(HyNode.calls, []);
     }
+});
+
+test('rejects missing/malformed authority and request-supplied pin without NodeSSH construction', async () => {
+    const node = executionNode('portal-node', 'portal');
+    node.sshHostKeySha256 = 'a'.repeat(64);
+    node.ssh.hostKeySha256 = 'a'.repeat(64);
+    const pin = { expectedHostKeySha256: 'a'.repeat(64),
+        expectedEndpoint: { ip: node.ip, port: node.ssh.port, username: node.ssh.username } };
+    const malformed = [undefined, null, {}, { ...pin, expectedHostKeySha256: undefined },
+        { ...pin, expectedHostKeySha256: 'A'.repeat(64) },
+        { ...pin, expectedHostKeySha256: `SHA256:${'a'.repeat(43)}` },
+        { ...pin, expectedHostKeySha256: 'a'.repeat(63) },
+        { ...pin, expectedHostKeySha256: `${'a'.repeat(64)} ` },
+        { ...pin, expectedHostKeySha256: `${'a'.repeat(64)}\n` },
+        { expectedHostKeySha256: 'a'.repeat(64) },
+        { ...pin, expectedEndpoint: { ...pin.expectedEndpoint, port: '2222' } },
+        { ...pin, nodeId: 'portal-node' }];
+    for (const authority of malformed) {
+        const HyNode = createHyNode(new Map([['portal-node', node]]));
+        const resolver = new TopologyNodeExecutionResolver({ HyNode,
+            NodeSSH: class { constructor() { assert.fail('must not construct transport'); } },
+            target: 'production', hostIdentity: 'lm1.infograd.online' });
+        await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal' }, authority), {
+            code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE',
+        });
+        assert.deepEqual(HyNode.calls, []);
+        await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal', ...pin }), {
+            code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE',
+        });
+        assert.deepEqual(HyNode.calls, []);
+    }
+});
+
+test('trusted pin must match every selected endpoint field before transport construction', async () => {
+    for (const changed of [{ ip: '192.0.2.99' }, { port: 22 }, { username: 'root' }]) {
+        const node = executionNode('portal-node', 'portal');
+        const HyNode = createHyNode(new Map([['portal-node', node]]));
+        const resolver = new TopologyNodeExecutionResolver({ HyNode,
+            NodeSSH: class { constructor() { assert.fail('must not construct transport'); } },
+            ...TEST_CONTOUR });
+        const pin = { expectedHostKeySha256: 'a'.repeat(64),
+            expectedEndpoint: { ip: node.ip, port: node.ssh.port, username: node.ssh.username, ...changed } };
+        await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal' }, pin), {
+            code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE',
+        });
+        assert.equal(HyNode.calls.filter(call => call.method === 'lean').length, 1);
+    }
+});
+
+test('snapshots authority before DB await and freezes the selected physical endpoint', async () => {
+    const node = executionNode('portal-node', 'portal');
+    node.sshHostKeySha256 = 'f'.repeat(64); // Persisted node fields cannot replace authority.
+    const pin = { expectedHostKeySha256: 'a'.repeat(64),
+        expectedEndpoint: { ip: node.ip, port: node.ssh.port, username: node.ssh.username } };
+    const HyNode = { findById() { return { select() { return { async lean() {
+        pin.expectedHostKeySha256 = 'b'.repeat(64);
+        pin.expectedEndpoint.ip = '192.0.2.99';
+        return node;
+    } }; } }; } };
+    class SelectedSSH { constructor(selected, options) { this.node = selected; this.options = options; } }
+    const resolver = new TopologyNodeExecutionResolver({ HyNode, NodeSSH: SelectedSSH,
+        target: 'production', hostIdentity: 'lm1.infograd.online' });
+    const selected = await resolver.resolve({ nodeId: 'portal-node', role: 'portal' }, pin);
+    assert.equal(selected.options.expectedHostKeySha256, 'a'.repeat(64));
+    assert.equal(selected.options.expectedEndpoint.ip, '192.0.2.10');
+    assert.ok(Object.isFrozen(selected.options));
+    assert.ok(Object.isFrozen(selected.options.expectedEndpoint));
+    assert.ok(Object.isFrozen(selected.node));
+    assert.ok(Object.isFrozen(selected.node.ssh));
+    node.ip = '192.0.2.88';
+    node.ssh.port = 22;
+    assert.equal(selected.node.ip, '192.0.2.10');
+    assert.equal(selected.node.ssh.port, 2222);
 });
 
 test('rejects unknown roles, raw connection fields, and unusable stored nodes before NodeSSH use', async () => {

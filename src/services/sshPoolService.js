@@ -11,6 +11,44 @@
  */
 
 const { Client } = require('ssh2');
+const { createHash, timingSafeEqual } = require('node:crypto');
+
+function pinError() {
+    const error = new Error('SSH host-key pin or selected endpoint is invalid');
+    error.code = 'SSH_HOST_KEY_PIN_INVALID';
+    return error;
+}
+
+// This is an internal server-authority option, never a field read from node/DB.
+// Canonical digest: lowercase 64-character hex SHA-256 of the raw SSH public
+// key blob (ssh2 hostVerifier receives a Buffer when hostHash is not set).
+function hostKeyOptions(node, options) {
+    if (options === undefined) return undefined;
+    const endpoint = options?.expectedEndpoint;
+    if (!/^[a-f0-9]{64}$/.test(options?.expectedHostKeySha256)
+        || typeof options.expectedHostKeySha256 !== 'string'
+        || !endpoint || typeof endpoint.ip !== 'string' || !endpoint.ip
+        || !Number.isSafeInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535
+        || typeof endpoint.username !== 'string' || !endpoint.username
+        || node?.ip !== endpoint.ip || node.ssh?.port !== endpoint.port
+        || node.ssh?.username !== endpoint.username) throw pinError();
+    return Object.freeze({
+        expectedHostKeySha256: options.expectedHostKeySha256,
+        expectedEndpoint: Object.freeze({ ip: endpoint.ip, port: endpoint.port, username: endpoint.username }),
+    });
+}
+
+function hostKeyConfig(node, options) {
+    const pin = hostKeyOptions(node, options);
+    if (!pin) return {};
+    const expected = Buffer.from(pin.expectedHostKeySha256, 'hex');
+    return {
+        hostVerifier(key) {
+            return Buffer.isBuffer(key)
+                && timingSafeEqual(createHash('sha256').update(key).digest(), expected);
+        },
+    };
+}
 const logger = require('../utils/logger');
 const cryptoService = require('./cryptoService');
 const {
@@ -82,7 +120,15 @@ class SSHPool {
      * @param {Object} node - node object with ssh credentials
      * @returns {Client} - SSH client
      */
-    async getConnection(node) {
+    connectionKey(node, options) {
+        const nodeId = node._id?.toString() || node.id;
+        const pin = hostKeyOptions(node, options);
+        return pin ? `pinned:${JSON.stringify([nodeId, pin.expectedEndpoint, pin.expectedHostKeySha256])}` : nodeId;
+    }
+
+    async getConnection(node, options) {
+        // Snapshot authority before any await; never adopt fields from the node.
+        const pin = hostKeyOptions(node, options);
         // Load settings on first request
         if (!this.settingsLoaded) {
             await this.loadSettings();
@@ -93,8 +139,12 @@ class SSHPool {
             throw new Error('SSH Pool disabled');
         }
         
-        const nodeId = node._id?.toString() || node.id;
+        const nodeId = this.connectionKey(node, pin);
         const existing = this.connections.get(nodeId);
+        if (pin && existing && (existing.pin?.expectedHostKeySha256 !== pin.expectedHostKeySha256
+            || JSON.stringify(existing.pin?.expectedEndpoint) !== JSON.stringify(pin.expectedEndpoint))) {
+            throw pinError();
+        }
         
         // 1. Handshake in progress for this node - reuse the same promise
         //    (issue #70: prevents parallel handshakes during the race window
@@ -117,7 +167,7 @@ class SSHPool {
         
         // createConnection registers its own placeholder (with client identity)
         // so all event handlers can verify they are still the active attempt.
-        return this.createConnection(node);
+        return this.createConnection(node, 0, pin);
     }
     
     /**
@@ -130,8 +180,9 @@ class SSHPool {
      * (already-terminated) connection from clobbering a newly-registered
      * placeholder for the same nodeId.
      */
-    createConnection(node, retryCount = 0) {
-        const nodeId = node._id?.toString() || node.id;
+    createConnection(node, retryCount = 0, options) {
+        const pin = hostKeyOptions(node, options);
+        const nodeId = this.connectionKey(node, pin);
         const nodeName = node.name || nodeId;
         
         let resolveOuter;
@@ -156,6 +207,7 @@ class SSHPool {
             readyTimeout: this.config.connectTimeout,
             keepaliveInterval: this.config.keepAliveInterval,
             keepaliveCountMax: 3,
+            ...hostKeyConfig(node, pin),
         };
         
         if (node.ssh?.privateKey) {
@@ -172,6 +224,7 @@ class SSHPool {
         // can verify ownership before mutating this.connections.
         this.connections.set(nodeId, {
             connecting: true,
+            pin,
             client,
             promise: outerPromise,
             lastUsed: Date.now(),
@@ -187,6 +240,7 @@ class SSHPool {
                 if (!cur || cur.client === client) {
                     this.connections.set(nodeId, {
                         client,
+                        pin,
                         nodeId,
                         nodeName,
                         host: node.ip,
@@ -215,7 +269,7 @@ class SSHPool {
                     await new Promise(r => setTimeout(r, delay));
                     
                     try {
-                        const newClient = await this.createConnection(node, retryCount + 1);
+                        const newClient = await this.createConnection(node, retryCount + 1, pin);
                         resolveOuter(newClient);
                     } catch (retryErr) {
                         rejectOuter(retryErr);
@@ -274,15 +328,16 @@ class SSHPool {
     /**
      * Execute command with auto-reconnect
      */
-    async exec(node, command, options = {}) {
+    async exec(node, command, options = {}, connectionOptions) {
+        const pin = hostKeyOptions(node, connectionOptions);
         const includesStdin = hasExecStdin(options);
         let client;
         try {
-            client = await this.getConnection(node);
+            client = await this.getConnection(node, pin);
         } catch (error) {
             throw includesStdin ? createExecStdinError() : error;
         }
-        const nodeId = node._id?.toString() || node.id;
+        const nodeId = this.connectionKey(node, pin);
         
         return new Promise((resolve, reject) => {
             const execTimeout = options.timeout || 30000;
@@ -357,9 +412,10 @@ class SSHPool {
     /**
      * Write file via SFTP
      */
-    async writeFile(node, remotePath, content) {
-        const client = await this.getConnection(node);
-        const nodeId = node._id?.toString() || node.id;
+    async writeFile(node, remotePath, content, connectionOptions) {
+        const pin = hostKeyOptions(node, connectionOptions);
+        const client = await this.getConnection(node, pin);
+        const nodeId = this.connectionKey(node, pin);
         
         return new Promise((resolve, reject) => {
             client.sftp((err, sftp) => {
@@ -406,9 +462,10 @@ class SSHPool {
     /**
      * Read file via SFTP
      */
-    async readFile(node, remotePath) {
-        const client = await this.getConnection(node);
-        const nodeId = node._id?.toString() || node.id;
+    async readFile(node, remotePath, connectionOptions) {
+        const pin = hostKeyOptions(node, connectionOptions);
+        const client = await this.getConnection(node, pin);
+        const nodeId = this.connectionKey(node, pin);
         
         return new Promise((resolve, reject) => {
             client.sftp((err, sftp) => {
@@ -540,4 +597,6 @@ class SSHPool {
 
 // Singleton (settings loaded from DB on first use)
 module.exports = new SSHPool();
+module.exports.hostKeyOptions = hostKeyOptions;
+module.exports.hostKeyConfig = hostKeyConfig;
 
