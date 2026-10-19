@@ -1,6 +1,7 @@
 'use strict';
 
 const TOPOLOGY_NODE_EXECUTION_SELECT = '_id name ip type active cascadeRole ssh.port ssh.username ssh.privateKey ssh.password';
+const { topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const TOPOLOGY_TEST_TARGET = 'test';
 const TOPOLOGY_TEST_HOST_IDENTITY = 'test.infograd.online';
 const TOPOLOGY_EXECUTION_ROLES = new Set(['portal', 'relay', 'bridge']);
@@ -88,8 +89,7 @@ function hasUsableConnection(node, nodeId, role) {
 class TopologyNodeExecutionResolver {
     #HyNode;
     #NodeSSH;
-    #target;
-    #hostIdentity;
+    #executionContext;
 
     constructor({ HyNode, NodeSSH, target, hostIdentity } = {}) {
         if (!HyNode || typeof HyNode.findById !== 'function') {
@@ -100,14 +100,12 @@ class TopologyNodeExecutionResolver {
         }
         this.#HyNode = HyNode;
         this.#NodeSSH = NodeSSH;
-        this.#target = target;
-        this.#hostIdentity = hostIdentity;
+        this.#executionContext = topologyExecutionContext(target, hostIdentity);
     }
 
     async resolve(request) {
         if (
-            this.#target !== TOPOLOGY_TEST_TARGET
-            || this.#hostIdentity !== TOPOLOGY_TEST_HOST_IDENTITY
+            !this.#executionContext
             || !isExactResolutionRequest(request)
         ) {
             throw new TopologyNodeExecutionResolverError();

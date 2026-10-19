@@ -13,6 +13,7 @@ const {
 } = require('./topologyXrayCandidate');
 
 const TEST_TARGET = 'test';
+const { topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CONTEXT_KEYS = Object.freeze([
     'node',
@@ -241,6 +242,7 @@ class TopologyOperationExecutor {
             'RunnerBootstrapper',
             'nodeExecutionResolver',
             'target',
+            'hostIdentity',
         ]);
         if (!options || typeof options !== 'object' || Array.isArray(options)
             || Object.keys(options).some(key => !allowedKeys.has(key))) {
@@ -251,14 +253,15 @@ class TopologyOperationExecutor {
         }
         const {
             target,
+            hostIdentity,
             nodeExecutionResolver,
             RunnerBootstrapper = TopologyRunnerBootstrapper,
             NodeTransportFactory = TopologyNodeTransportFactory,
         } = options;
-        if (target !== TEST_TARGET) {
+        if (!topologyExecutionContext(target, hostIdentity)) {
             throw new TopologyOperationExecutorError(
                 'UNSAFE_TOPOLOGY_TARGET',
-                'Topology execution is restricted to the test target',
+                'Topology execution requires an exact server execution context',
             );
         }
         if (!nodeExecutionResolver || typeof nodeExecutionResolver.resolve !== 'function') {

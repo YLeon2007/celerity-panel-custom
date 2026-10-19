@@ -113,7 +113,8 @@ function lifecycleContext(preparedResult, node = frozenNode()) {
     };
 }
 
-function executorFixture({ responseOverrides = {} } = {}) {
+function executorFixture({ responseOverrides = {},
+    contour = { target: 'test', hostIdentity: 'test.infograd.online' } } = {}) {
     const events = [];
     const nodeSSH = {
         async exec(command, options) {
@@ -142,12 +143,41 @@ function executorFixture({ responseOverrides = {} } = {}) {
     return {
         events,
         executor: new TopologyOperationExecutor({
-            target: 'test',
+            ...contour,
             nodeExecutionResolver,
             RunnerBootstrapper: FakeBootstrapper,
         }),
     };
 }
+
+test('production lifecycle seam sends the actual target to the injected bootstrapper', async () => {
+    const { executor, events } = executorFixture({
+        contour: { target: 'production', hostIdentity: 'lm1.infograd.online' },
+    });
+    const prepared = await executor.prepare(prepareContext());
+    await executor.commit(lifecycleContext(prepared));
+    await executor.verify(lifecycleContext(prepared));
+    await executor.rollback(lifecycleContext(prepared));
+    assert.equal(events.find(event => event.method === 'bootstrapper').target, 'production');
+    assert.deepEqual(events.filter(event => event.method === 'transport').map(event => event.request.command),
+        ['prepare', 'commit', 'verify', 'rollback']);
+});
+
+test('production default bootstrap remains an explicit integration prerequisite with zero remote calls', async () => {
+    const calls = [];
+    const executor = new TopologyOperationExecutor({
+        target: 'production', hostIdentity: 'lm1.infograd.online',
+        nodeExecutionResolver: { async resolve() { return {
+            async exec() { calls.push('exec'); assert.fail('must not execute remotely'); },
+            async writeFile() { calls.push('upload'); assert.fail('must not upload'); },
+        }; } },
+    });
+    await assert.rejects(executor.prepare(prepareContext()), error => {
+        assert.equal(error.cause?.code, 'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE');
+        return true;
+    });
+    assert.deepEqual(calls, []);
+});
 
 test('resolves one frozen test node, bootstraps first, and prepares through the role-bound transport', async () => {
     const events = [];
@@ -183,7 +213,7 @@ test('resolves one frozen test node, bootstraps first, and prepares through the 
             return { ok: true };
         }
     }
-    const executor = new TopologyOperationExecutor({
+    const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online',
         target: 'test',
         nodeExecutionResolver,
         RunnerBootstrapper: FakeBootstrapper,
@@ -347,7 +377,7 @@ test('cleanupPrepared uses only the fixed rollback for a prepare-only artifact',
     );
 });
 
-test('fails closed outside test and rejects non-frozen, role-mismatched, or expanded plans before lookup', async () => {
+test('fails closed on cross-paired context and rejects non-frozen, role-mismatched, or expanded plans before lookup', async () => {
     let resolverCalls = 0;
     const nodeExecutionResolver = {
         async resolve() {
@@ -357,14 +387,14 @@ test('fails closed outside test and rejects non-frozen, role-mismatched, or expa
     };
 
     assert.throws(
-        () => new TopologyOperationExecutor({
+        () => new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online',
             target: 'production',
             nodeExecutionResolver,
         }),
         error => error?.code === 'UNSAFE_TOPOLOGY_TARGET',
     );
     assert.throws(
-        () => new TopologyOperationExecutor({
+        () => new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online',
             target: 'test',
             nodeExecutionResolver,
             topologyRepository: { find: 'live-topology-lookup' },
@@ -413,7 +443,7 @@ test('fails closed outside test and rejects non-frozen, role-mismatched, or expa
         })),
     ];
 
-    const executor = new TopologyOperationExecutor({
+    const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online',
         target: 'test',
         nodeExecutionResolver,
     });
@@ -481,7 +511,7 @@ test('transport exceptions cannot claim a commit was locally rejected before dis
                 async commit() { commits++; throw transportError; },
             }; }
         }
-        const executor = new TopologyOperationExecutor({ target: 'test',
+        const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
             nodeExecutionResolver: { async resolve() { return {}; } },
             RunnerBootstrapper: class { async ensureRunner() {} }, NodeTransportFactory });
         const prepared = await executor.prepare(prepareContext());
@@ -584,7 +614,7 @@ test('prepare timeout exposes uncertainty and never races a cleanup command', as
             async rollback() { calls.push('rollback'); throw new Error('cleanup unavailable'); },
         }; }
     }
-    const executor = new TopologyOperationExecutor({ target: 'test',
+    const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
         nodeExecutionResolver: { async resolve() { return {}; } },
         RunnerBootstrapper, NodeTransportFactory });
     await assert.rejects(executor.prepare(prepareContext()), error => {
@@ -596,7 +626,7 @@ test('prepare timeout exposes uncertainty and never races a cleanup command', as
 });
 
 test('runner bootstrap timeout is uncertain even before prepare dispatch', async () => {
-    const executor = new TopologyOperationExecutor({ target: 'test',
+    const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
         nodeExecutionResolver: { async resolve() { return {}; } },
         RunnerBootstrapper: class { async ensureRunner() { throw new Error('upload timeout'); } },
     });

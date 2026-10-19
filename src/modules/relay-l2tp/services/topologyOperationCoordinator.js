@@ -11,9 +11,9 @@ const { validateTopology } = require('../domain/topologyValidator');
 const { computeTopologyDomains } = require('../domain/topologyDomains');
 const { deriveReplacementTopology, deriveAttachTopology } = require('../domain/topologyReplacement');
 const {
-    TEST_TOPOLOGY_HOST_IDENTITY,
-    TEST_TOPOLOGY_TARGET,
-} = require('./topologyOperationPlanMaterializer');
+    TEST_TOPOLOGY_EXECUTION_CONTEXT,
+    topologyExecutionContext,
+} = require('../domain/topologyExecutionContext');
 
 const ACTIVE_OPERATION_STATUSES = new Set([
     'queued',
@@ -462,7 +462,13 @@ function projectTopologyOperationStatus(operation = {}) {
 }
 
 class TopologyOperationCoordinator {
+    #executionContext;
+
     constructor({
+        // Retain the fixed TEST-only seam for existing server-side callers
+        // (including the separately gated intent consumer). Runtime always
+        // supplies its validated context; request input cannot override it.
+        executionContext = TEST_TOPOLOGY_EXECUTION_CONTEXT,
         topologyRepository,
         planMaterializer,
         operationRepository,
@@ -488,6 +494,12 @@ class TopologyOperationCoordinator {
             || typeof idFactory !== 'function' || typeof onWorkerError !== 'function') {
             throw new TypeError('Topology operation coordinator requires callable policies');
         }
+        this.#executionContext = topologyExecutionContext(
+            executionContext?.target, executionContext?.hostIdentity,
+        );
+        if (!this.#executionContext) {
+            throw new TypeError('Topology operation coordinator requires an exact server execution context');
+        }
         this.topologyRepository = topologyRepository;
         this.planMaterializer = planMaterializer;
         this.operationRepository = operationRepository;
@@ -509,13 +521,13 @@ class TopologyOperationCoordinator {
         // A scoped reconcile gets its own idempotency key so it can never be
         // collapsed with (or satisfied by) a legacy full-sync operation.
         const idempotencyKey = scope
-            ? `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}:${scope.kind}:${scope.linkId}`
+            ? `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:${scope.kind}:${scope.linkId}`
                 + (scope.kind === 'link.replace'
                     ? `:${createHash('sha256').update(JSON.stringify({
                         groupId: scope.groupId, pathKey: scope.pathKey,
                         oldLinkId: scope.oldLinkId, linkIds: scope.linkIds,
                     })).digest('hex')}` : '')
-            : `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}`;
+            : `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}`;
         const existing = this.operationsByIdempotencyKey.get(idempotencyKey);
         if (existing) {
             const settled = await existing.then(operation => operation, () => null);
@@ -609,7 +621,7 @@ class TopologyOperationCoordinator {
                             linkIds: scope.linkIds,
                             newPathLinkIds: attach.newPathLinkIds,
                         })).digest('hex');
-                        effectiveRunIdempotencyKey = `topology:${TEST_TOPOLOGY_TARGET}:revision-${expectedTopologyRevision}:link.attach:${scope.linkId}:${attachIdentity}:${runIdempotencyKey.slice(-36)}`;
+                        effectiveRunIdempotencyKey = `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:link.attach:${scope.linkId}:${attachIdentity}:${runIdempotencyKey.slice(-36)}`;
                         operationId = entityId(this.idFactory(effectiveRunIdempotencyKey));
                         if (!operationId) {
                             throw new TopologyOperationCoordinatorError('TOPOLOGY_OPERATION_QUEUE_FAILED',
@@ -643,8 +655,7 @@ class TopologyOperationCoordinator {
                         );
                     }
                     const frozenPlan = await this.planMaterializer.materialize({
-                        target: TEST_TOPOLOGY_TARGET,
-                        hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                        ...this.#executionContext,
                         operationKind: attach ? 'link.attach' : scope?.kind,
                         session,
                         pinnedSnapshot: deepFreeze({

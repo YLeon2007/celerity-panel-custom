@@ -26,7 +26,6 @@ const {
 } = require('../services/topologyOperationExecutor');
 const {
     TEST_TOPOLOGY_HOST_IDENTITY,
-    TEST_TOPOLOGY_TARGET,
     TopologyOperationPlanMaterializer,
 } = require('../services/topologyOperationPlanMaterializer');
 const {
@@ -58,11 +57,28 @@ const {
     NodeOperationLockService,
 } = require('../services/nodeOperationLockService');
 
+const { topologyExecutionContext, TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
+
 const REQUIRED_TEST_RUNTIME_FLAGS = Object.freeze([
     'L2TP_EXECUTION_ENABLED',
     'L2TP_MIGRATIONS_ENABLED',
     'TOPOLOGY_TEST_EXECUTION_ENABLED',
 ]);
+const REQUIRED_PRODUCTION_RUNTIME_FLAGS = Object.freeze([
+    'L2TP_EXECUTION_ENABLED',
+    'L2TP_MIGRATIONS_ENABLED',
+    'TOPOLOGY_PRODUCTION_EXECUTION_ENABLED',
+]);
+
+function resolveTopologyExecutionContext(env) {
+    if (!env || typeof env !== 'object' || Array.isArray(env)) return undefined;
+    const context = TOPOLOGY_EXECUTION_CONTEXTS.find(pair => pair.hostIdentity === env.PANEL_DOMAIN);
+    if (!context) return undefined;
+    const flags = context.target === 'test'
+        ? REQUIRED_TEST_RUNTIME_FLAGS : REQUIRED_PRODUCTION_RUNTIME_FLAGS;
+    return flags.every(flag => env[flag] === 'true') ? context : undefined;
+}
+
 const EXECUTOR_METHODS = Object.freeze([
     'prepare',
     'commit',
@@ -101,8 +117,7 @@ function createTopologyOperationExecutor({
     hostIdentity,
     target,
 } = {}) {
-    if (target !== TEST_TOPOLOGY_TARGET
-        || hostIdentity !== TEST_TOPOLOGY_HOST_IDENTITY) {
+    if (!topologyExecutionContext(target, hostIdentity)) {
         return undefined;
     }
     const NodeSSHAdapter = NodeSSH === undefined
@@ -116,6 +131,7 @@ function createTopologyOperationExecutor({
     });
     return new TopologyOperationExecutor({
         target,
+        hostIdentity,
         nodeExecutionResolver,
         NodeTransportFactory: TopologyNodeTransportFactory,
         RunnerBootstrapper: TopologyRunnerBootstrapper,
@@ -163,8 +179,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
             NodeSSH,
         })
         : executorFactoryOverride;
-    if (!isTopologyTestExecutionEnabled(env)
-        || typeof executorFactory !== 'function') {
+    const executionContext = resolveTopologyExecutionContext(env);
+    if (!executionContext || typeof executorFactory !== 'function') {
         return unavailableTopologyDeploymentService;
     }
 
@@ -206,13 +222,12 @@ function createTopologyOperationRuntime(dependencies = {}) {
         });
         const executor = executorFactory(Object.freeze({
             HyNode,
-            hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
-            target: TEST_TOPOLOGY_TARGET,
+            ...executionContext,
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
         const userResync = new TopologyUserResync({ HyNode });
-        // The TEST runtime always wires the real node runner verifier. Missing
+        // The runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
         const pppGateDependencies = {
             RelayL2tpState,
@@ -224,7 +239,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const pppReadinessGate = createTopologyPppReadinessGate(pppGateDependencies);
         // The drift queue and read-only resume probe are only available on the
         // opt-in TEST host; the existing readiness check retains its behavior.
-        const testHostAllowed = isTestWorkerExecutionAllowed(env);
+        const testHostAllowed = executionContext.target === 'test';
         const pppDriftSync = testHostAllowed
             ? new L2tpPppDriftSyncRepository({
                 RelayL2tpState,
@@ -239,8 +254,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             nodeExecutionResolver: new TopologyNodeExecutionResolver({
                 HyNode,
                 NodeSSH: NodeSSH ?? require('../../../services/nodeSSH'),
-                target: TEST_TOPOLOGY_TARGET,
-                hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY,
+                ...executionContext,
             }),
         });
         const operationWorker = new OperationWorker({
@@ -259,6 +273,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             allowUnprovenTestExecution: testHostAllowed,
         });
         return new Coordinator({
+            executionContext,
             topologyRepository,
             planMaterializer,
             operationRepository,
@@ -277,6 +292,8 @@ module.exports = {
     DEFAULT_LEASE_MS,
     EXECUTOR_METHODS,
     REQUIRED_TEST_RUNTIME_FLAGS,
+    REQUIRED_PRODUCTION_RUNTIME_FLAGS,
+    resolveTopologyExecutionContext,
     createTopologyOperationExecutor,
     createTopologyOperationRuntime,
     isTopologyTestExecutionEnabled,

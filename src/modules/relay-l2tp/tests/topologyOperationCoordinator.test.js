@@ -75,6 +75,42 @@ async function admitFakeSnapshot(value, { expectedRevision, prepare, admit }, de
     return pinned;
 }
 
+test('coordinator rejects incomplete or cross-paired explicit server contexts before admission', () => {
+    for (const executionContext of [null, {}, { target: 'production' },
+        { hostIdentity: 'lm1.infograd.online' },
+        { target: 'test', hostIdentity: 'lm1.infograd.online' },
+        { target: 'production', hostIdentity: 'test.infograd.online' }]) {
+        assert.throws(() => new TopologyOperationCoordinator({
+            executionContext,
+            topologyRepository: { admitTopology() { assert.fail('must not admit'); } },
+            planMaterializer: { materialize() { assert.fail('must not materialize'); } },
+            operationRepository: { createFrozen() { assert.fail('must not insert'); } },
+        }), /requires an exact server execution context/);
+    }
+});
+
+test('production coordinator snapshots server context for materialization and idempotency', async () => {
+    const context = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+    let materialized;
+    let inserted;
+    const coordinator = new TopologyOperationCoordinator({
+        executionContext: context,
+        topologyRepository: { async admitTopology(input) { return admitFakeSnapshot(snapshot(), input); } },
+        planMaterializer: { async materialize(input) { materialized = input; return materializedPlan(); } },
+        operationRepository: { async createFrozen(input) { inserted = input; return { _id: input.operationId }; } },
+        validator: () => ({ valid: true }), compiler: () => ({ valid: true }),
+    });
+    context.target = 'test';
+    context.hostIdentity = 'test.infograd.online';
+    await coordinator.queue({ expectedTopologyRevision: 7 });
+    assert.equal(materialized.target, 'production');
+    assert.equal(materialized.hostIdentity, 'lm1.infograd.online');
+    assert.match(inserted.idempotencyKey, /^topology:production:revision-7:/);
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7, target: 'test' }), {
+        code: 'INVALID_REQUEST',
+    });
+});
+
 test('legacy full deploy refuses pending links before composing or marking all links', async () => {
     const currentSnapshot = snapshot();
     currentSnapshot.links[0].status = 'deployed';

@@ -529,7 +529,7 @@ test('passes explicitly injected execution factories and candidate resolvers int
     assert.strictEqual(executionDependencies.fragmentProvider, fragmentProvider);
 });
 
-test('assembled flag-positive host cannot claim or SSH through topology recovery worker', async () => {
+test('assembled flag-positive host without an exact identity fails closed before recovery or SSH', () => {
     const calls = [];
     const db = { transaction: async work => work({ id: 'test-session' }) };
     const model = methods => ({
@@ -550,7 +550,7 @@ test('assembled flag-positive host cannot claim or SSH through topology recovery
     };
     let recoveredWorker;
     let assembledService;
-    const host = createL2tpPanelHost({
+    assert.throws(() => createL2tpPanelHost({
         env: TOPOLOGY_ENABLED_ENV,
         HyNode: model(['find', 'findById']),
         CascadeLink: model(['find', 'create', 'updateOne', 'deleteOne']),
@@ -585,16 +585,10 @@ test('assembled flag-positive host cannot claim or SSH through topology recovery
             recoveredWorker = worker;
             return { start() {}, async stop() {} };
         },
-    });
+    }), /Opted-in topology recovery requires an operation worker/);
 
-    assert.ok(host);
-    assert.strictEqual(recoveredWorker, assembledService.operationWorker);
-    assert.deepEqual(await recoveredWorker.run('operation-1'), {
-        claimed: false,
-        operationId: 'operation-1',
-        stopped: true,
-        errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
-    });
+    assert.equal(assembledService.operationWorker, undefined);
+    assert.equal(recoveredWorker, undefined);
     assert.deepEqual(calls, []);
 });
 

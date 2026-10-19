@@ -5,6 +5,7 @@ const {
 } = require('./frozenTopologyDeploymentPlanComposer');
 const { projectGroups } = require('../domain/topologyDraft');
 
+const { topologyExecutionContext, TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
 const TEST_TOPOLOGY_TARGET = 'test';
 const TEST_TOPOLOGY_HOST_IDENTITY = 'test.infograd.online';
 const SUPPORTED_ROLES = Object.freeze(['portal', 'relay', 'bridge']);
@@ -273,13 +274,13 @@ class TopologyOperationPlanMaterializer {
     }
 
     async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session } = {}) {
-        if (target !== TEST_TOPOLOGY_TARGET) {
-            fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations are restricted to the test target');
+        if (!TOPOLOGY_EXECUTION_CONTEXTS.some(context => context.target === target)) {
+            fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations require an allowlisted server target');
         }
-        if (hostIdentity !== TEST_TOPOLOGY_HOST_IDENTITY) {
+        if (!topologyExecutionContext(target, hostIdentity)) {
             fail(
                 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
-                'Topology operations are restricted to the fixed test host identity',
+                'Topology operations require an exact allowlisted server host identity',
             );
         }
 

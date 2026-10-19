@@ -52,6 +52,7 @@ const ENABLED_ENV = Object.freeze({
     L2TP_EXECUTION_ENABLED: 'true',
     L2TP_MIGRATIONS_ENABLED: 'true',
     TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+    PANEL_DOMAIN: TEST_TOPOLOGY_HOST_IDENTITY,
 });
 
 async function assertUnavailable(service) {
@@ -182,7 +183,7 @@ test('test topology runtime requires all three exact opt-in flags', async () => 
     }
 });
 
-test('default typed executor factory only constructs the fixed test contour', () => {
+test('default typed executor factory constructs TEST and rejects invalid pairs', () => {
     const HyNode = modelWith(['findById'], []);
     class FakeNodeSSH {}
 
@@ -224,7 +225,7 @@ test('enabled composition builds the real typed executor with the injected NodeS
     assert.deepEqual(calls, []);
 });
 
-test('only the TEST host enables topology execution', () => {
+test('only the exact TEST host enables TEST topology execution', async () => {
     const captured = [];
     class CaptureWorker extends TopologyOperationWorker {
         constructor(options) {
@@ -239,19 +240,20 @@ test('only the TEST host enables topology execution', () => {
             env: { ...ENABLED_ENV, PANEL_DOMAIN: domain },
             OperationWorker: CaptureWorker,
         });
-        assert.ok(service instanceof TopologyOperationCoordinator);
+        if (domain === TEST_TOPOLOGY_HOST_IDENTITY) {
+            assert.ok(service instanceof TopologyOperationCoordinator);
+        } else {
+            await assertUnavailable(service);
+        }
     }
-    assert.deepEqual(captured.map(options => options.allowUnprovenTestExecution), [false, true]);
-    assert.equal(Object.hasOwn(captured[0], 'pppDriftSync'), false);
-    assert.equal(Object.hasOwn(captured[0], 'pppResumeReadinessGate'), false);
+    assert.deepEqual(captured.map(options => options.allowUnprovenTestExecution), [true]);
+    assert.ok(captured[0].pppDriftSync instanceof L2tpPppDriftSyncRepository);
     assert.equal(captured[0].pppReadinessGate.readOnly, false);
-    assert.ok(captured[1].pppDriftSync instanceof L2tpPppDriftSyncRepository);
-    assert.equal(captured[1].pppReadinessGate.readOnly, false);
-    assert.equal(captured[1].pppResumeReadinessGate.readOnly, true);
-    assert.notStrictEqual(captured[1].pppReadinessGate, captured[1].pppResumeReadinessGate);
+    assert.equal(captured[0].pppResumeReadinessGate.readOnly, true);
+    assert.notStrictEqual(captured[0].pppReadinessGate, captured[0].pppResumeReadinessGate);
 });
 
-test('non-TEST host never constructs a drift queue or read-only probe', () => {
+test('unknown host never constructs a runtime, drift queue or read-only probe', async () => {
     const dependencies = compositionDependencies();
     let queueCapabilityReads = 0;
     for (const [model, method] of [
@@ -269,15 +271,15 @@ test('non-TEST host never constructs a drift queue or read-only probe', () => {
         ...dependencies,
         env: { ...ENABLED_ENV, PANEL_DOMAIN: 'other.invalid' },
     });
-    assert.ok(service instanceof TopologyOperationCoordinator);
+    await assertUnavailable(service);
     assert.equal(queueCapabilityReads, 0);
-    assert.equal(service.operationWorker.pppReadinessGate.readOnly, false);
 });
 
 test('flag-positive composed default worker stays unclaimed without quiescence proof', async () => {
     const calls = [];
     const service = createTopologyOperationRuntime({
         ...compositionDependencies(calls),
+        env: { ...ENABLED_ENV, PANEL_DOMAIN: 'lm1.infograd.online', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' },
         // A caller-supplied runtime option cannot grant the unit-test-only seam.
         allowUnprovenTestExecution: true,
         NodeSSH: class ForbiddenSSH {

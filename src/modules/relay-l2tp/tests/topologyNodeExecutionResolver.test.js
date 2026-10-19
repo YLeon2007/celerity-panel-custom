@@ -51,6 +51,21 @@ function executionNode(nodeId, role) {
     };
 }
 
+test('resolves the exact production pair without accepting a request-supplied target', async () => {
+    const HyNode = createHyNode(new Map([['portal-node', executionNode('portal-node', 'portal')]]));
+    class FakeNodeSSH { constructor(node) { this.node = node; } }
+    const configuration = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+    const resolver = new TopologyNodeExecutionResolver({ HyNode, NodeSSH: FakeNodeSSH, ...configuration });
+    configuration.target = 'test';
+    const nodeSSH = await resolver.resolve({ nodeId: 'portal-node', role: 'portal' });
+    assert.ok(nodeSSH instanceof FakeNodeSSH);
+    HyNode.calls.length = 0;
+    await assert.rejects(resolver.resolve({ nodeId: 'portal-node', role: 'portal', target: 'test' }), {
+        code: 'TOPOLOGY_NODE_EXECUTION_UNAVAILABLE',
+    });
+    assert.deepEqual(HyNode.calls, []);
+});
+
 test('resolves each test topology role from only allowlisted stored node connection fields', async () => {
     const nodes = new Map([
         ['portal-node', executionNode('portal-node', 'portal')],
@@ -105,8 +120,11 @@ test('resolves each test topology role from only allowlisted stored node connect
     assert.doesNotMatch(JSON.stringify({ resolver }), /private-key-secret|password-secret/);
 });
 
-test('refuses non-test contour identity before lookup with a sanitized error', async () => {
+test('refuses missing or non-allowlisted contour identity before lookup with a sanitized error', async () => {
     const configurations = [
+        {}, { target: 'production' }, { hostIdentity: 'lm1.infograd.online' },
+        { target: 'test', hostIdentity: 'lm1.infograd.online' },
+        { target: 'production', hostIdentity: 'lm1.infograd.online.' },
         { target: 'production', hostIdentity: 'test.infograd.online' },
         { target: 'staging', hostIdentity: 'test.infograd.online' },
         { target: 'test', hostIdentity: 'panel.infograd.online' },

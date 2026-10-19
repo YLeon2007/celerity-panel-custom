@@ -477,9 +477,9 @@ test('root deployment factory exposes only the exact opted-in queued composition
         CascadeLink: {},
         CascadeRouteGroup: {},
         CascadeTopologyState: { updateOne() {} },
-        RelayL2tpState: { findOne() {} },
+        RelayL2tpState: { findOne() {}, findOneAndUpdate() {} },
         L2tpUser: { find() {} },
-        L2tpOperation: { findOne() {} },
+        L2tpOperation: { findOne() {}, countDocuments() {}, create() {} },
         NodeSSH: class FakeNodeSSH {},
         TopologyOperation: { updateOne() {}, findById() {} },
         NodeOperationLock: {},
@@ -494,6 +494,7 @@ test('root deployment factory exposes only the exact opted-in queued composition
             L2TP_EXECUTION_ENABLED: 'true',
             L2TP_MIGRATIONS_ENABLED: 'true',
             TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+            PANEL_DOMAIN: 'test.infograd.online',
         },
         createTopologyOperationExecutor(dependencies) {
             calls.push({ kind: 'executor', dependencies });

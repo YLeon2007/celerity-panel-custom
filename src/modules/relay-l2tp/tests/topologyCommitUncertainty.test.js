@@ -115,7 +115,7 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
             },
         } }),
     });
-    const executor = new TopologyOperationExecutor({ target: 'test',
+    const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
         RunnerBootstrapper: class { async ensureRunner() {} },
         nodeExecutionResolver: { async resolve() { return {
             async writeFile() {},

@@ -263,6 +263,18 @@ function isDeepFrozen(value) {
     return Object.isFrozen(value) && Object.values(value).every(isDeepFrozen);
 }
 
+test('materializes the exact production pair through the real frozen plan composer', async () => {
+    const { materializer } = createMaterializer();
+    const productionPlan = await materializer.materialize({
+        target: 'production', hostIdentity: 'lm1.infograd.online', pinnedSnapshot: pinnedSnapshot(),
+    });
+    const testPlan = await materializer.materialize({
+        target: 'test', hostIdentity: 'test.infograd.online', pinnedSnapshot: pinnedSnapshot(),
+    });
+    assert.equal(isDeepFrozen(productionPlan), true);
+    assert.deepEqual(productionPlan, testPlan);
+});
+
 test('materializes one deterministic frozen test plan from allowlisted snapshot reads', async () => {
     const { HyNode, CascadeLink, materializer } = createMaterializer();
 
@@ -550,17 +562,27 @@ test('sanitizes metadata read failures without returning database or secret deta
     assert.deepEqual(HyNode.writes, []);
 });
 
-test('rejects missing, unsafe, non-test, and invalid role identities before metadata reads', async () => {
+test('rejects missing, unsafe, cross-paired, and invalid role identities before metadata reads', async () => {
     const cases = [
+        {
+            name: 'production missing host identity',
+            input: { target: 'production' },
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
+        },
+        {
+            name: 'cross-paired TEST target and production host',
+            input: { target: 'test', hostIdentity: 'lm1.infograd.online' },
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
+        },
         {
             name: 'missing target',
             input: { target: undefined, hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
             code: 'UNSAFE_TOPOLOGY_TARGET',
         },
         {
-            name: 'non-test target',
+            name: 'cross-paired production target and TEST host',
             input: { target: 'production', hostIdentity: TEST_TOPOLOGY_HOST_IDENTITY },
-            code: 'UNSAFE_TOPOLOGY_TARGET',
+            code: 'UNSAFE_TOPOLOGY_HOST_IDENTITY',
         },
         {
             name: 'missing host identity',

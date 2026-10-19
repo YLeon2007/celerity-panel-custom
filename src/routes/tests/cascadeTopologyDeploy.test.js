@@ -717,6 +717,7 @@ test('default models satisfy the topology runtime wiring contract', () => {
             L2TP_EXECUTION_ENABLED: 'true',
             L2TP_MIGRATIONS_ENABLED: 'true',
             TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
+            PANEL_DOMAIN: 'test.infograd.online',
         },
     });
     assert.notStrictEqual(service, unavailableTopologyDeploymentService);
