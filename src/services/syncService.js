@@ -17,6 +17,7 @@ const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
 const { mergePreservedL2tpConfig } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
+const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
@@ -439,20 +440,12 @@ class SyncService {
     }
 
     /**
-     * Only a confirmed, physically applied link gives topology ownership of
-     * this node's config. A pending draft must not suppress initial Sync;
-     * staged links were applied by the topology runner but are not client-ready.
+     * Share config ownership with the cascade writer. Durable server operation
+     * evidence vetoes classic rewrites independently of execution flags; only
+     * the paired TEST installation retains applied-link compatibility.
      */
     async _topologyManagesNode(node) {
-        const enabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
-            .every(flag => process.env[flag] === 'true');
-        if (!enabled || !['portal', 'relay', 'bridge'].includes(node?.cascadeRole)) return false;
-        const CascadeLink = require('../models/cascadeLinkModel');
-        return !!(await CascadeLink.exists({
-            active: true,
-            status: { $in: ['staged', 'deployed', 'online'] },
-            $or: [{ portalNode: node._id }, { bridgeNode: node._id }],
-        }));
+        return topologyManagesNodeConfig(node);
     }
 
     /**
@@ -491,11 +484,14 @@ class SyncService {
      */
     async updateXrayNodeConfig(node) {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
+        const allowedStatuses = usesTestTopologyConfig(node) ? APPLIED_LINK_STATUSES : undefined;
+        // Select the server policy before the first async boundary. A failed
+        // ownership read must not authorize a classic rewrite.
+        const topologyManaged = await this._topologyManagesNode(node);
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
         // Resolve ownership before generation: topology config may use a
         // different certificate and must never be rebuilt by classic Sync.
-        const topologyManaged = await this._topologyManagesNode(node);
         if (!topologyManaged) await ensureManualKeyLoaded(node);
 
         const users = await this._getUsersForNode(node);
@@ -542,10 +538,6 @@ class SyncService {
                     const CascadeLink = require('../models/cascadeLinkModel');
                     // Drafts have not been deployed. Keep the old all-active
                     // classic behavior when topology execution is disabled.
-                    const topologyExecutionEnabled = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
-                        .every(flag => process.env[flag] === 'true')
-                        && ['portal', 'relay', 'bridge'].includes(node?.cascadeRole);
-                    const allowedStatuses = topologyExecutionEnabled ? ['staged', 'deployed', 'online'] : undefined;
                     const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
                     const allPortalLinks = await CascadeLink.find({ portalNode: node._id, active: true, ...statusFilter }).populate('bridgeNode');
                     const forwardHopLinks = await CascadeLink.find({ bridgeNode: node._id, mode: 'forward', active: true, ...statusFilter });

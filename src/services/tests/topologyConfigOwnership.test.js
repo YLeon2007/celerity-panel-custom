@@ -11,6 +11,9 @@ const syncService = require('../syncService');
 const sshPool = require('../sshPoolService');
 const HyNode = require('../../models/hyNodeModel');
 const CascadeLink = require('../../models/cascadeLinkModel');
+const TopologyOperation = require('../../modules/relay-l2tp/models/topologyOperationModel');
+const cascadeService = require('../cascadeService');
+const sift = require('sift').default;
 const NodeSSH = require('../nodeSSH');
 const configGenerator = require('../configGenerator');
 const nodeSetup = require('../nodeSetup');
@@ -19,14 +22,23 @@ const cache = require('../cacheService');
 after(() => sshPool.closeAll());
 
 const FLAGS = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED'];
-async function withFlags(values, fn) {
-    const prior = FLAGS.map(k => process.env[k]);
+async function withEnv(values, fn) {
+    const prior = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
     try {
-        FLAGS.forEach((k, i) => { if (values[i]) process.env[k] = 'true'; else delete process.env[k]; });
+        for (const [key, value] of Object.entries(values)) {
+            if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
         return await fn();
     } finally {
-        FLAGS.forEach((k, i) => { if (prior[i] === undefined) delete process.env[k]; else process.env[k] = prior[i]; });
+        for (const [key, value] of Object.entries(prior)) {
+            if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
     }
+}
+async function withFlags(values, fn) {
+    return withEnv({ PANEL_DOMAIN: 'test.infograd.online',
+        ...Object.fromEntries(FLAGS.map((key, i) => [key, values[i] ? 'true' : undefined])),
+    }, fn);
 }
 
 function node(role = 'portal') {
@@ -34,8 +46,9 @@ function node(role = 'portal') {
         ssh: { password: 'test' }, xray: { agentToken: 'test', transport: 'tcp', security: 'reality' } };
 }
 
-function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [] } = {}) {
+function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [], operations = [] } = {}) {
     const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0 };
+    t.mock.method(TopologyOperation, 'exists', async query => operations.find(sift(query)) || null);
     t.mock.method(CascadeLink, 'exists', async query => {
         calls.queries.push(query);
         return connected && linkStatuses.some(status => !query.status || query.status.$in?.includes(status))
@@ -251,3 +264,167 @@ test('each disabled topology flag and non-topology role retain classic sync', as
     assert.deepEqual(calls.agent.map(c => c.path), ['/restart', '/sync', '/restart', '/sync', '/restart', '/sync', '/restart', '/sync']);
     assert.deepEqual(calls.queries, []);
 });
+
+test('PROD with all TEST flags preserves legacy config even when production execution is opted in', async t => {
+    const calls = stubSync(t);
+    await withFlags([true, true, true], () => withEnv({
+        PANEL_DOMAIN: 'lm1.infograd.online', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    }, async () => {
+        assert.equal(await syncService.updateXrayNodeConfig(node('relay')), true);
+    }));
+    assert.equal(calls.generated, 1, 'execution flags are not per-node adoption evidence');
+    assert.equal(calls.uploads.length, 1);
+    assert.deepEqual(calls.agent.map(call => call.path), ['/restart', '/sync']);
+});
+
+function legacyLinks(status) {
+    const id = node()._id;
+    return [
+        ...Array.from({ length: 8 }, (_, i) => ({ _id: `reverse-${i}`, portalNode: id,
+            bridgeNode: `exit-${i}`, mode: 'reverse', tunnelPort: 11000 + i,
+            tunnelUuid: `legacy-reverse-${i}`, active: true, status })),
+        { _id: 'forward-out', portalNode: id, bridgeNode: 'downstream', mode: 'forward',
+            tunnelPort: 12000, tunnelUuid: 'legacy-forward', active: true, status },
+        { _id: 'forward-in', portalNode: 'upstream', bridgeNode: id, mode: 'forward',
+            tunnelPort: 13000, tunnelUuid: 'legacy-hop', active: true, status },
+    ];
+}
+
+for (const writer of ['sync', 'cascade']) {
+    test(`${writer}: enabled TEST excludes pending reverse/forward listeners from initial config`, async t => {
+        const calls = stubSync(t, { linkStatuses: ['pending'], links: legacyLinks('pending') });
+        await withFlags([true, true, true], async () => {
+            if (writer === 'sync') await syncService.updateXrayNodeConfig(node('relay'));
+            else await cascadeService._deployPortalConfig(node('relay'));
+        });
+        assert.equal(calls.uploads.length, 1);
+        const config = JSON.parse(calls.uploads[0].content);
+        assert.deepEqual(config.inbounds, []);
+        assert.deepEqual(config.outbounds, []);
+    });
+
+    test(`${writer}: PROD TEST flags do not strip pending legacy reverse/forward listeners`, async t => {
+        const calls = stubSync(t, { linkStatuses: ['pending'], links: legacyLinks('pending') });
+        await withFlags([true, true, true], () => withEnv({ PANEL_DOMAIN: 'lm1.infograd.online' }, async () => {
+            if (writer === 'sync') await syncService.updateXrayNodeConfig(node('relay'));
+            else await cascadeService._deployPortalConfig(node('relay'));
+        }));
+        assert.equal(calls.uploads.length, 1);
+        const config = JSON.parse(calls.uploads[0].content);
+        assert.deepEqual(config.inbounds.map(inbound => inbound.port), [11000, 11001, 11002, 11003, 11004, 11005, 11006, 11007, 13000]);
+        assert.equal(config.inbounds.at(-1).settings.clients[0].id, 'legacy-hop');
+        assert.equal(config.outbounds[0].settings.vnext[0].users[0].id, 'legacy-forward');
+    });
+
+    test(`${writer}: changing panel identity cannot hand back a recorded topology node to classic`, async t => {
+        const calls = stubSync(t, { connected: false, operations: [{ status: 'succeeded',
+            nodes: [{ node: node()._id, state: 'committed' }] }] });
+        await withEnv({ PANEL_DOMAIN: undefined }, async () => {
+            if (writer === 'sync') await syncService.updateXrayNodeConfig(node());
+            else await cascadeService._deployPortalConfig(node());
+        });
+        assert.equal(calls.generated, 0);
+        assert.deepEqual(calls.uploads, []);
+    });
+
+    test(`${writer}: durable node execution evidence protects a new PROD topology config with flags disabled`, async t => {
+        const calls = stubSync(t, { connected: false, operations: [{ status: 'succeeded',
+            nodes: [{ node: node()._id, state: 'committed' }] }] });
+        await withFlags([false, false, false], () => withEnv({ PANEL_DOMAIN: 'lm1.infograd.online',
+            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' }, async () => {
+            if (writer === 'sync') await syncService.updateXrayNodeConfig(node('standalone'));
+            else await cascadeService._deployPortalConfig(node('standalone'));
+        }));
+        assert.equal(calls.generated, 0);
+        assert.deepEqual(calls.uploads, []);
+        assert.equal(calls.sshConnections, 0);
+        assert.deepEqual(calls.agent.map(call => call.path), writer === 'sync' ? ['/sync'] : []);
+    });
+}
+
+for (const writer of ['sync', 'cascade']) {
+    for (const host of ['test.infograd.online', 'lm1.infograd.online', 'unknown.invalid']) {
+        for (const enabled of [true, false]) {
+            for (const productionOptIn of ['true', 'false']) {
+                for (const status of ['pending', 'deployed']) {
+                    test(`${writer}: ownership matrix ${host} TEST=${enabled} PROD=${productionOptIn} ${status}`, async t => {
+                        const calls = stubSync(t, { linkStatuses: [status], links: legacyLinks(status) });
+                        await withFlags([enabled, enabled, enabled], () => withEnv({ PANEL_DOMAIN: host,
+                            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: productionOptIn }, async () => {
+                            if (writer === 'sync') await syncService.updateXrayNodeConfig(node('relay'));
+                            else await cascadeService._deployPortalConfig(node('relay'));
+                        }));
+                        const testTopology = enabled && host === 'test.infograd.online';
+                        if (testTopology && status === 'deployed') {
+                            assert.equal(calls.generated, 0);
+                            assert.deepEqual(calls.uploads, []);
+                            assert.equal(calls.sshConnections, 0);
+                        } else {
+                            assert.equal(calls.generated, 1);
+                            assert.equal(calls.uploads.length, 1);
+                            const config = JSON.parse(calls.uploads[0].content);
+                            assert.equal(config.inbounds.length, testTopology ? 0 : 9);
+                            assert.equal(config.outbounds.length, testTopology ? 0 : 1);
+                            if (!testTopology) {
+                                assert.equal(config.inbounds[0].settings.clients[0].id, 'legacy-reverse-0');
+                                assert.equal(config.inbounds.at(-1).settings.clients[0].id, 'legacy-hop');
+                                assert.equal(config.outbounds[0].settings.vnext[0].users[0].id, 'legacy-forward');
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+for (const [name, operation, expected] of [
+    ['queued plan', { status: 'queued', nodes: [{ node: node()._id, state: 'pending' }] }, true],
+    ['preparing plan', { status: 'preparing', nodes: [{ node: node()._id, state: 'pending' }] }, true],
+    ['uncertain failure', { status: 'failed', nodes: [{ node: node()._id, state: 'failed' }] }, true],
+    ['retained terminal admission', { status: 'failed', heldTopologyAdmission: true,
+        nodes: [{ node: node()._id, state: 'pending' }] }, true],
+    ['prepared node', { status: 'failed', nodes: [{ node: node()._id, state: 'prepared' }] }, true],
+    ['rolled-back node', { status: 'rolled_back', nodes: [{ node: node()._id, state: 'rolled_back' }] }, false],
+    ['unexecuted failure', { status: 'failed', nodes: [{ node: node()._id, state: 'pending' }] }, false],
+    ['foreign committed node', { status: 'succeeded', nodes: [{ node: 'foreign', state: 'committed' }] }, false],
+    ['foreign state cannot join local node', { status: 'failed', nodes: [
+        { node: node()._id, state: 'pending' }, { node: 'foreign', state: 'committed' }] }, false],
+]) {
+    test(`PROD operation evidence: ${name}`, async t => {
+        stubSync(t, { connected: false, operations: [operation] });
+        await withEnv({ PANEL_DOMAIN: 'lm1.infograd.online', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' }, async () => {
+            assert.equal(await syncService._topologyManagesNode(node()), expected);
+        });
+    });
+}
+
+for (const writer of ['sync', 'cascade']) {
+    test(`${writer}: selected PROD legacy policy survives a later environment change`, async t => {
+        const calls = stubSync(t, { linkStatuses: ['pending'], links: legacyLinks('pending') });
+        t.mock.method(syncService, '_getUsersForNode', async () => {
+            process.env.PANEL_DOMAIN = 'test.infograd.online';
+            return [];
+        });
+        await withFlags([true, true, true], () => withEnv({ PANEL_DOMAIN: 'lm1.infograd.online' }, async () => {
+            if (writer === 'sync') await syncService.updateXrayNodeConfig(node('relay'));
+            else await cascadeService._deployPortalConfig(node('relay'));
+        }));
+        assert.equal(calls.uploads.length, 1);
+        assert.equal(JSON.parse(calls.uploads[0].content).inbounds.length, 9);
+    });
+
+    test(`${writer}: unreadable durable ownership fails closed before generation or transport`, async t => {
+        const calls = stubSync(t);
+        t.mock.method(TopologyOperation, 'exists', async () => { throw new Error('ownership unavailable'); });
+        await withEnv({ PANEL_DOMAIN: 'lm1.infograd.online' }, async () => {
+            await assert.rejects(writer === 'sync'
+                ? syncService.updateXrayNodeConfig(node())
+                : cascadeService._deployPortalConfig(node()), /ownership unavailable/);
+        });
+        assert.equal(calls.generated, 0);
+        assert.deepEqual(calls.uploads, []);
+        assert.equal(calls.sshConnections, 0);
+        assert.deepEqual(calls.agent, []);
+    });
+}

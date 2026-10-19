@@ -11,6 +11,7 @@ const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const NodeSSH = require('./nodeSSH');
 const cache = require('./cacheService');
 const logger = require('../utils/logger');
@@ -862,9 +863,9 @@ class CascadeService {
         // deployment; the classic cascade writer would clobber it and uses
         // the persisted link.tunnelUuid, which mismatches the deterministic
         // tunnel credentials the topology composer derives for the other end.
-        const topologyManaged = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
-            .every(flag => process.env[flag] === 'true')
-            && ['portal', 'relay', 'bridge'].includes(portalNode?.cascadeRole);
+        const allowedStatuses = usesTestTopologyConfig(portalNode) ? APPLIED_LINK_STATUSES : undefined;
+        const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
+        const topologyManaged = await topologyManagesNodeConfig(portalNode);
         if (topologyManaged) {
             if (opts.requireCompletion) throw undeployUncertain('Topology-managed config cannot be removed by the classic writer');
             logger.info(`[Cascade] Node ${portalNode.name}: classic config deploy skipped (topology-managed node)`);
@@ -889,10 +890,11 @@ class CascadeService {
         const allPortalLinks = (await CascadeLink.find({
             portalNode: portalNode._id,
             active: true,
+            ...statusFilter,
         }).populate('bridgeNode')).filter(l => !excludeSet.has(String(l._id)));
 
         const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
-        const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet);
+        const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet, allowedStatuses);
 
         // Cascade routing applies to ALL client-facing inbounds (main + extras).
         const inboundTags = [
@@ -913,15 +915,11 @@ class CascadeService {
             bridgeNode: portalNode._id,
             mode: 'forward',
             active: true,
+            ...statusFilter,
         })).filter(l => !excludeSet.has(String(l._id)));
-        // On relay/bridge nodes the topology deployment owns hop listeners via
-        // the separate xray-bridge service; adding them to xray-main too would
-        // bind the same ports twice (SO_REUSEPORT splits REALITY handshakes
-        // between two xray processes).
-        const topologyOwnsHopListeners = ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']
-            .every(flag => process.env[flag] === 'true')
-            && ['relay', 'bridge'].includes(portalNode?.cascadeRole);
-        if (forwardHopLinks.length > 0 && !topologyOwnsHopListeners) {
+        // This path is classic-owned; topology-owned nodes returned before
+        // generation. Keep legacy forward listeners in the main config.
+        if (forwardHopLinks.length > 0) {
             configGenerator.applyForwardHopInbound(config, forwardHopLinks);
         }
 

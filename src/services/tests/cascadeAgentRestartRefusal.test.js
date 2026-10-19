@@ -11,6 +11,7 @@ process.env.SESSION_SECRET ||= 'b'.repeat(32);
 const cascadeService = require('../cascadeService');
 const syncService = require('../syncService');
 const CascadeLink = require('../../models/cascadeLinkModel');
+const TopologyOperation = require('../../modules/relay-l2tp/models/topologyOperationModel');
 const configGenerator = require('../configGenerator');
 const NodeSSH = require('../nodeSSH');
 const sshPool = require('../sshPoolService');
@@ -18,6 +19,7 @@ test.after(() => sshPool.closeAll());
 
 function stubPortalDeployment(t, agentError) {
     const calls = { uploads: [], execs: [], agent: [], statuses: [], connections: 0 };
+    t.mock.method(TopologyOperation, 'exists', async () => null);
     t.mock.method(syncService, '_getUsersForNode', async () => []);
     t.mock.method(configGenerator, 'generateXrayConfigWithApi', () => JSON.stringify({
         inbounds: [], outbounds: [], routing: { rules: [] },

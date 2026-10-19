@@ -147,6 +147,10 @@ for (const reason of ['missing portal', 'missing bridge', 'no portal credentials
         if (reason === 'no bridge credentials') delete f.nodes.bridge.ssh;
         if (reason === 'agent acknowledgement') f.nodes.portal.xray = { agentToken: 'local-only' };
         if (reason === 'topology skip') {
+            const domain = process.env.PANEL_DOMAIN;
+            process.env.PANEL_DOMAIN = 'test.infograd.online';
+            t.after(() => { if (domain === undefined) delete process.env.PANEL_DOMAIN; else process.env.PANEL_DOMAIN = domain; });
+            t.mock.method(Link, 'exists', async () => ({ _id: 'applied-test-link' }));
             for (const flag of ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']) {
                 const old = process.env[flag]; process.env[flag] = 'true';
                 t.after(() => { if (old === undefined) delete process.env[flag]; else process.env[flag] = old; });
