@@ -8,6 +8,18 @@ const test = require('node:test');
 
 const { createL2tpPanelHost } = require('../createL2tpPanelHost');
 const {
+    TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST,
+    PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD,
+} = require('../relay-l2tp/domain/topologyExecutionContext');
+
+// Activate only L2TP here; topology recovery has its own independent opt-in.
+const PROD_ENV = Object.freeze({
+    PANEL_DOMAIN: PROD.hostIdentity,
+    L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true',
+    L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
+});
+const {
     L2tpUserManagementRepository,
     SAFE_USER_SELECT,
 } = require('../relay-l2tp/repositories/l2tpUserManagementRepository');
@@ -348,6 +360,7 @@ function createActiveHost(overrides = {}) {
     };
 
     const host = createL2tpPanelHost({
+        env: PROD_ENV,
         requireAuth: passThrough,
         requireOnboarding: passThrough,
         csrf: passThrough,
@@ -475,7 +488,17 @@ test('explicit complete activation wires execution factories lazily and starts o
         userManagementDependencies.L2tpOperation);
     assert.strictEqual(host.runtime.worker.remoteAdmissionRepository,
         runtimeCalls[0].remoteAdmissionRepository);
-    assert.deepEqual(await host.runtime.worker.runOnce(), { claimed: false, unavailable: true });
+    assert.strictEqual(runtimeCalls[0].executionContext, PROD);
+    assert.equal(runtimeCalls[0].enableProductionExecution, true);
+    assert.equal(runtimeCalls[0].enableUnsafeExecutionForTests, false);
+    assert.equal(runtimeCalls[0].enableInstallAdmission, true);
+    for (const component of [host.runtime.service, host.runtime.worker,
+        host.runtime.worker.executor, preflightFactoryCalls[0]]) {
+        assert.strictEqual(component.executionContext, PROD);
+        assert.equal(component.enableProductionExecution, true);
+        assert.equal(Object.isFrozen(component.executionContext), true);
+    }
+    assert.throws(() => { host.runtime.worker.executionContext = TEST; }, TypeError);
     assert.strictEqual(host.runtime.worker.userSyncReconciler, userSyncReconciler);
     assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
     assert.strictEqual(runtimeCalls[0].operationMaterializer, materializeInstallOperation);
@@ -558,10 +581,24 @@ test('explicit complete activation wires execution factories lazily and starts o
     );
     assert.equal(calls.some(call => call.kind.startsWith('NodeSSH.')), false);
 
-    await host.runtime.worker.executor.executeStep({
-        operation: { _id: 'operation-a', node: 'node-a' },
-        step: { type: 'commit' },
+    const callsBeforeExecution = calls.slice();
+    for (const executionContext of [undefined, TEST,
+        { target: PROD.target, hostIdentity: TEST.hostIdentity }]) {
+        await assert.rejects(host.runtime.worker.executor.executeStep({
+            operation: { _id: 'operation-a', node: 'node-a', executionContext },
+            step: { type: 'commit' },
+        }), { code: 'L2TP_EXECUTION_NOT_AUTHORIZED' });
+    }
+    assert.deepEqual(calls, callsBeforeExecution);
+
+    const operation = Object.freeze({
+        _id: 'operation-a', node: 'node-a', executionContext: PROD,
     });
+    assert.equal(Object.isFrozen(operation.executionContext), true);
+    assert.deepEqual(await host.runtime.worker.executor.executeStep({
+        operation,
+        step: { type: 'commit' },
+    }), { ok: true, operationId: 'operation-a', step: 'commit' });
 
     assert.deepEqual(
         calls.map(call => call.kind),
@@ -601,15 +638,26 @@ test('explicit complete activation wires execution factories lazily and starts o
     ]);
 });
 
-test('active host install remains disabled without explicit TEST admission opt-in', async () => {
-    const { host, calls, admissionGate } = createActiveHost({ admissionReady: true });
-    await assert.rejects(host.runtime.service.install('node-a', {
-        routeGroupId: 'group-a', expectedTopologyRevision: 17,
-    }), { code: 'REMOTE_ADMISSION_UNAVAILABLE' });
-    assert.equal(admissionGate.remoteAdmissionCount, 0);
-    assert.equal(calls.some(call => call.kind === 'NodeSSH.construct'
-        || call.kind === 'CascadeTopologyState.updateOne'
-        || call.kind === 'operationRepository.create'), false);
+test('host without server authorization rejects install and preflight before persistence or transport', async () => {
+    for (const env of [
+        {},
+        { ...PROD_ENV, PANEL_DOMAIN: TEST.hostIdentity },
+        { ...PROD_ENV, L2TP_PRODUCTION_EXECUTION_ENABLED: undefined },
+    ]) {
+        const { host, calls, admissionGate, preflightFactoryCalls, candidateFactoryCalls } =
+            createActiveHost({ admissionReady: true, env });
+        for (const method of ['install', 'preflight']) {
+            await assert.rejects(host.runtime.service[method]('node-a', {
+                routeGroupId: 'group-a', expectedTopologyRevision: 17,
+            }), { code: 'L2TP_EXECUTION_NOT_AUTHORIZED' });
+        }
+        assert.deepEqual(await host.runtime.worker.runOnce(), { claimed: false, unavailable: true });
+        assert.deepEqual(host.start(), { enabled: false, running: false, inFlight: false });
+        assert.equal(admissionGate.remoteAdmissionCount, 0);
+        assert.deepEqual(preflightFactoryCalls, []);
+        assert.deepEqual(candidateFactoryCalls, []);
+        assert.deepEqual(calls, []);
+    }
 });
 
 test('active preflight fails closed at admission before transport on a missing singleton', async () => {
