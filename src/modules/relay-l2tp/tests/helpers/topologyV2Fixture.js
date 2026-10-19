@@ -37,9 +37,24 @@ function bindingRecord(context, hostIdentity = 'test.infograd.online') {
         )),
     });
 }
+// Explicit simulated external enrollment. Never read endpoints/key trust from
+// request fields or mutable node documents. These values authorize LOCAL seams
+// only, and are not a production enrollment/maintenance implementation.
+const SIMULATED_TRUSTED_CONNECTION = freeze({
+    expectedEndpoint: { ip: '192.0.2.17', port: 22, username: 'synthetic' },
+    expectedHostKeySha256: '2'.repeat(64),
+});
+function simulatedConnectionAuthority(binding, connection = SIMULATED_TRUSTED_CONNECTION) {
+    return freeze({ binding, connection });
+}
 function bindingReader(records) {
     const rows = new Map(records.map(row => [row.nodeId, row]));
-    return { rows, async readVerified(expected) { return rows.get(expected.nodeId) ?? null; } };
+    return { rows,
+        async readVerified(expected) { return rows.get(expected.nodeId) ?? null; },
+        async readVerifiedConnection(expected) {
+            return simulatedConnectionAuthority(rows.get(expected.nodeId));
+        },
+    };
 }
 function runnerRequest(command) {
     const request = Object.fromEntries([
@@ -64,4 +79,5 @@ function v2Receipt(request, overrides = {}) {
         serviceState: request.command === 'prepare' ? 'not-applicable' : 'active:running',
         ...overrides };
 }
-module.exports = { executionFence, bindingRecord, bindingReader, runnerRequest, v2Receipt, freeze };
+module.exports = { executionFence, bindingRecord, bindingReader, runnerRequest, v2Receipt, freeze,
+    SIMULATED_TRUSTED_CONNECTION, simulatedConnectionAuthority };

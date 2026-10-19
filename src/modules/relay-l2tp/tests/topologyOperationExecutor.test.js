@@ -162,6 +162,130 @@ test('missing durable execution authority refuses before node lookup or bootstra
     assert.deepEqual(events, []);
 });
 
+test('binding authority without explicit trusted connection reader cannot resolve or bootstrap', async () => {
+    const { executor, events, reader } = executorFixture();
+    delete reader.readVerifiedConnection;
+    await assert.rejects(executor.prepare(prepareContext()), {
+        code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+    });
+    assert.deepEqual(events, []);
+});
+
+test('trusted connection authority is read after binding and only its exact pin is passed as resolver second argument', async () => {
+    const { SIMULATED_TRUSTED_CONNECTION: pin } = require('./helpers/topologyV2Fixture');
+    const reader = fixtureReader('lm1.infograd.online');
+    const order = [];
+    const read = reader.readVerified.bind(reader);
+    reader.readVerified = async expected => { order.push('binding'); return read(expected); };
+    const connection = reader.readVerifiedConnection.bind(reader);
+    reader.readVerifiedConnection = async (expected, durable) => {
+        assert.deepEqual(durable, await read(expected));
+        order.push('pin');
+        return connection(expected);
+    };
+    const executor = new TopologyOperationExecutor({ target: 'production', hostIdentity: 'lm1.infograd.online',
+        executionBindingReader: reader,
+        nodeExecutionResolver: { async resolve(request, trustedConnection) {
+            order.push('resolve');
+            assert.deepEqual(request, { nodeId: 'portal-node', role: 'portal' });
+            assert.equal(trustedConnection, pin);
+            assert.equal(Object.isFrozen(trustedConnection.expectedEndpoint), true);
+            return {};
+        } },
+        RunnerBootstrapper: class { async ensureRunner() { order.push('bootstrap'); } },
+        NodeTransportFactory: class { async create() { return { async prepare({ artifact: _, ...request }) {
+            order.push('prepare'); return v2Receipt({ ...request, command: 'prepare' });
+        } }; } },
+    });
+    await executor.prepare(prepareContext());
+    assert.deepEqual(order, ['binding', 'pin', 'resolve', 'binding', 'pin', 'bootstrap', 'binding', 'pin', 'prepare']);
+});
+
+test('connection authority rejects missing malformed mutable and cross-binding proof before resolution', async t => {
+    const { SIMULATED_TRUSTED_CONNECTION: pin, simulatedConnectionAuthority } = require('./helpers/topologyV2Fixture');
+    const cases = {
+        missing: () => undefined,
+        noPin: row => freeze({ binding: row, connection: undefined }),
+        callerShape: () => pin,
+        extra: row => freeze({ ...simulatedConnectionAuthority(row), forged: true }),
+        mutable: row => ({ binding: row, connection: pin }),
+        mutableEndpoint: row => Object.freeze({ binding: row, connection: Object.freeze({
+            ...pin, expectedEndpoint: { ...pin.expectedEndpoint },
+        }) }),
+        invalidHash: row => simulatedConnectionAuthority(row, freeze({ ...pin, expectedHostKeySha256: 'SHA256:forged' })),
+        extraEndpoint: row => simulatedConnectionAuthority(row, freeze({ ...pin,
+            expectedEndpoint: { ...pin.expectedEndpoint, privateKey: 'request-secret' } })),
+        invalidPort: row => simulatedConnectionAuthority(row, freeze({ ...pin,
+            expectedEndpoint: { ...pin.expectedEndpoint, port: '22' } })),
+        ...Object.fromEntries(['operationId', 'nodeId', 'targetProfile', 'executionContext', 'maintenanceId',
+            'generation', 'attemptId', 'bootId', 'owner', 'candidateHash', 'backupId'].map(key => [key,
+            row => simulatedConnectionAuthority(freeze({ ...row, [key]: 'foreign' }))])),
+        changedCommands: row => simulatedConnectionAuthority(freeze({ ...row,
+            commandIds: { ...row.commandIds, close: 'foreign' } })),
+    };
+    for (const [name, change] of Object.entries(cases)) await t.test(name, async () => {
+        const { executor, events, reader } = executorFixture();
+        reader.readVerifiedConnection = async () => change(reader.rows.get('portal-node'));
+        await assert.rejects(executor.prepare(prepareContext()), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+        });
+        assert.deepEqual(events, []);
+    });
+});
+
+test('connection authority is revalidated after resolution/bootstrap and before every prepared dispatch', async t => {
+    const { SIMULATED_TRUSTED_CONNECTION: pin, simulatedConnectionAuthority } = require('./helpers/topologyV2Fixture');
+    for (const boundary of ['resolution', 'bootstrap', 'commit', 'verify', 'rollback', 'cleanupPrepared']) {
+        await t.test(boundary, async () => {
+            const revoke = reader => { reader.readVerifiedConnection = async expected => simulatedConnectionAuthority(
+                reader.rows.get(expected.nodeId), freeze({ ...pin, expectedHostKeySha256: '3'.repeat(64) })); };
+            const { executor, reader, events } = executorFixture({
+                ...(boundary === 'resolution' ? { onResolve: revoke } : {}),
+                ...(boundary === 'bootstrap' ? { onEnsureRunner: revoke } : {}),
+            });
+            if (['resolution', 'bootstrap'].includes(boundary)) {
+                await assert.rejects(executor.prepare(prepareContext()));
+                assert.equal(events.some(e => e.method === 'transport'), false);
+                if (boundary === 'resolution') assert.equal(events.some(e => e.method === 'bootstrapper'), false);
+            } else {
+                const prepared = await executor.prepare(prepareContext());
+                revoke(reader);
+                await assert.rejects(executor[boundary](lifecycleContext(prepared)), {
+                    code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+                });
+                assert.deepEqual(events.filter(e => e.method === 'transport').map(e => e.request.command), ['prepare']);
+            }
+        });
+    }
+});
+
+test('terminal status cannot dispatch after trusted connection authority is revoked by close', async () => {
+    const reader = fixtureReader();
+    reader.withVerifiedBinding = async (expected, work) => work(await reader.readVerified(expected), async () => {});
+    let statuses = 0;
+    const terminalReceipt = (request, command) => v2Receipt({ ...request, command }, {
+        phase: 'closed', terminal: true, terminalOutcome: 'verified', completedCommand: 'close',
+    });
+    const executor = new TopologyOperationExecutor({ target: 'test', hostIdentity: 'test.infograd.online',
+        executionBindingReader: reader, nodeExecutionResolver: { async resolve() { return {}; } },
+        RunnerBootstrapper: class { async ensureRunner() {} },
+        NodeTransportFactory: class { async create() { return {
+            async prepare({ artifact: _, ...request }) { return v2Receipt({ ...request, command: 'prepare' }); },
+            async verify(request) { return v2Receipt({ ...request, command: 'verify' }); },
+            async close(request) {
+                reader.readVerifiedConnection = async () => { throw new Error('maintenance pin revoked'); };
+                return terminalReceipt(request, 'close');
+            },
+            async status({ completedCommand: _, ...request }) { statuses++; return terminalReceipt(request, 'status'); },
+        }; } },
+    });
+    const prepared = await executor.prepare(prepareContext());
+    const context = lifecycleContext(prepared);
+    await executor.verify(context);
+    await assert.rejects(executor.close(context), { remoteOutcomeUncertain: true });
+    assert.equal(statuses, 0);
+});
+
 test('production lifecycle seam sends the full server pair and frozen role to bootstrapper', async () => {
     const { executor, events } = executorFixture({
         contour: { target: 'production', hostIdentity: 'lm1.infograd.online' },

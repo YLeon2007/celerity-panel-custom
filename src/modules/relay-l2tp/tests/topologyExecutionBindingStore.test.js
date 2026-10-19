@@ -101,7 +101,7 @@ const missingInstanceAuthority = async (challenge, work) => {
 function newStore(authority = goodAuthority) {
     return new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
 }
-async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand } = {}) {
+async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand, acceptedBinding } = {}) {
     const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
     const { TopologyNodeExecutionResolver } = require('../services/topologyNodeExecutionResolver');
     const { runnerRequest, v2Receipt } = require('./helpers/topologyV2Fixture');
@@ -114,7 +114,13 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
     await Node.create({ _id: NODE, ip: '192.0.2.17', name: 'local-only', type: 'xray', active: true,
         cascadeRole: 'portal', ssh: { port: 22, username: 'synthetic', privateKey: 'synthetic-local-fixture-not-a-key' } });
     class LocalSSH {
-        constructor() { events.push('ssh-adapter'); }
+        constructor(node, trustedConnection) {
+            const { SIMULATED_TRUSTED_CONNECTION } = require('./helpers/topologyV2Fixture');
+            assert.deepEqual(trustedConnection, SIMULATED_TRUSTED_CONNECTION);
+            assert.deepEqual({ ip: node.ip, port: node.ssh.port, username: node.ssh.username },
+                SIMULATED_TRUSTED_CONNECTION.expectedEndpoint);
+            events.push('ssh-adapter');
+        }
         async writeFile() { events.push('local-upload'); }
         async exec(command, options) {
             const request = runnerRequest(command);
@@ -127,10 +133,41 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
     class LocalBootstrapper { async ensureRunner() { events.push('local-bootstrap'); await onBootstrap?.(); } }
     const resolver = new TopologyNodeExecutionResolver({ ...PROD, NodeSSH: LocalSSH,
         HyNode: { findById(id) { events.push('node-read'); return Node.findById(id); } } });
+    // Explicit LOCAL simulated authority, not a store capability and never
+    // composed in the production host. Endpoint/key enrollment comes from this
+    // independently fixed test fixture, not the mutable HyNode DB or request.
+    let reader = store;
+    if (store && acceptedBinding) {
+        const accepted = acceptedBinding;
+        let scoped;
+        reader = {
+            readVerified: expected => store.readVerified(expected),
+            async readVerifiedConnection(expected, durable) {
+                const { simulatedConnectionAuthority } = require('./helpers/topologyV2Fixture');
+                const current = scoped ? (await scoped.assertCurrent(), scoped.durable) : await store.readVerified(expected);
+                assert.deepEqual(current, accepted, 'simulated authority rejects changed accepted binding');
+                assert.deepEqual(durable, accepted);
+                assert.equal(current.maintenanceId, MAINTENANCE);
+                return simulatedConnectionAuthority(accepted);
+            },
+            get withVerifiedBinding() {
+                if (typeof store.withVerifiedBinding !== 'function') return undefined;
+                return (expected, work) => store.withVerifiedBinding(expected, async (durable, assertCurrent) => {
+                    scoped = { durable, assertCurrent };
+                    try { return await work(durable, assertCurrent); } finally { scoped = undefined; }
+                });
+            },
+        };
+    }
     const executor = new TopologyOperationExecutor({ ...PROD, nodeExecutionResolver: {
-        async resolve(request) { const ssh = await resolver.resolve(request); await onResolved?.(); return ssh; },
+        async resolve(request, trustedConnection) {
+            const { SIMULATED_TRUSTED_CONNECTION } = require('./helpers/topologyV2Fixture');
+            assert.deepEqual(trustedConnection, SIMULATED_TRUSTED_CONNECTION);
+            assert.deepEqual(Object.keys(request).sort(), ['nodeId', 'role']);
+            const ssh = await resolver.resolve(request, trustedConnection); await onResolved?.(); return ssh;
+        },
     },
-        RunnerBootstrapper: LocalBootstrapper, ...(store ? { executionBindingReader: store } : {}) });
+        RunnerBootstrapper: LocalBootstrapper, ...(reader ? { executionBindingReader: reader } : {}) });
     return { executor, events, Node };
 }
 async function setup(authority = goodAuthority) {
@@ -313,7 +350,7 @@ test('real resolver/executor/transport seam consumes only majority-confirmed dur
     const { store, expected, enrollment, context } = await setup();
     await store.preEnroll(enrollment);
     const row = await store.createBinding(expected);
-    const { executor, events } = await assembled(store);
+    const { executor, events } = await assembled(store, { acceptedBinding: row });
     const prepared = await executor.prepare(context);
     const lifecycle = { ...context, ...prepared };
     delete lifecycle.ok;
@@ -335,6 +372,32 @@ test('real resolver/executor/transport seam consumes only majority-confirmed dur
     const normal = await assembled();
     await assert.rejects(normal.executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
     assert.deepEqual(normal.events, []);
+});
+
+test('real store alone has no trusted endpoint authority and remains unable to dispatch', async () => {
+    const { store, expected, enrollment, context } = await setup();
+    await store.preEnroll(enrollment); await store.createBinding(expected);
+    assert.equal(store.readVerifiedConnection, undefined, 'production endpoint authority is deliberately not installed');
+    const { executor, events } = await assembled(store);
+    await assert.rejects(executor.prepare(context), {
+        code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+    });
+    assert.deepEqual(events, []);
+});
+
+test('real resolver refuses mutable DB endpoint changes instead of adopting them as pin authority', async t => {
+    for (const [field, value] of [['ip', '192.0.2.99'], ['ssh.port', 2222], ['ssh.username', 'foreign-user']]) {
+        await t.test(field, async () => {
+            const { store, expected, enrollment, context } = await setup();
+            await store.preEnroll(enrollment); const row = await store.createBinding(expected);
+            const { executor, events, Node } = await assembled(store, { acceptedBinding: row });
+            await Node.updateOne({ _id: NODE }, { $set: { [field]: value } });
+            await assert.rejects(executor.prepare(context));
+            assert.deepEqual(events, ['node-read']);
+            assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+            assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        });
+    }
 });
 
 test('persisted binding cannot be read under a replacement claim, acquired generation or ownership identity', async t => {
@@ -530,9 +593,9 @@ test('authority callback cannot outlive held scope or run later, and incomplete 
 test('actual binding reader rechecks ownership lost during real resolution or local bootstrap before dispatch', async t => {
     for (const hook of ['onResolved', 'onBootstrap']) await t.test(hook, async () => {
         const { store, expected, enrollment, context } = await setup();
-        await store.preEnroll(enrollment); await store.createBinding(expected);
+        await store.preEnroll(enrollment); const row = await store.createBinding(expected);
         const winner = randomUUID();
-        const { executor, events } = await assembled(store, {
+        const { executor, events } = await assembled(store, { acceptedBinding: row,
             [hook]: async () => models.Lock.collection.updateOne({}, { $set: { generation: winner, owner: 'winner' } }),
         });
         await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true });
@@ -612,7 +675,7 @@ async function terminalFixture(t, { authority = goodAuthority, onCommand } = {})
     const localRunner = fakeRunner(t, BOOT);
     const prefix = `runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${expected.candidateHash} --backup-id previous --target-profile xray-main --execution-context ${PROD.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`;
     assert.equal(localRunner.execute(prefix).code, 0);
-    const assembledState = await assembled(store, { localRunner, onCommand });
+    const assembledState = await assembled(store, { localRunner, onCommand, acceptedBinding: row });
     const { executor } = assembledState;
     const prepared = await executor.prepare(context);
     const lifecycle = { ...context, backupId: prepared.backupId, prepared: prepared.prepared };

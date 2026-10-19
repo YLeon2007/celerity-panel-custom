@@ -203,6 +203,27 @@ function unprovenBinding() {
         'Durable topology execution binding is unproven',
     );
 }
+function sameRecord(left, right) {
+    return hasExactKeys(left, RECORD_KEYS) && RECORD_KEYS.every(key => key === 'commandIds'
+        ? hasExactKeys(left.commandIds, [...COMMANDS].sort())
+            && COMMANDS.every(command => left.commandIds[command] === right.commandIds[command])
+        : left[key] === right[key]);
+}
+function validTrustedConnection(pin) {
+    return hasExactKeys(pin, ['expectedEndpoint', 'expectedHostKeySha256'])
+        && isDeepFrozen(pin)
+        && typeof pin.expectedHostKeySha256 === 'string'
+        && /^[a-f0-9]{64}$/.test(pin.expectedHostKeySha256)
+        && hasExactKeys(pin.expectedEndpoint, ['ip', 'port', 'username'])
+        && typeof pin.expectedEndpoint.ip === 'string' && pin.expectedEndpoint.ip.length > 0
+        && Number.isSafeInteger(pin.expectedEndpoint.port)
+        && pin.expectedEndpoint.port >= 1 && pin.expectedEndpoint.port <= 65535
+        && typeof pin.expectedEndpoint.username === 'string' && pin.expectedEndpoint.username.length > 0;
+}
+function sameConnection(left, right) {
+    return left.expectedHostKeySha256 === right.expectedHostKeySha256
+        && ['ip', 'port', 'username'].every(key => left.expectedEndpoint[key] === right.expectedEndpoint[key]);
+}
 function safeToken(value) {
     return typeof value === 'string' && SAFE_ID_PATTERN.test(value) && !['.', '..'].includes(value);
 }
@@ -362,14 +383,28 @@ class TopologyOperationExecutor {
             || (previous && RECORD_KEYS.some(key => key === 'commandIds'
                 ? COMMANDS.some(command => durable.commandIds[command] !== previous.commandIds[command])
                 : durable[key] !== previous[key]))) throw unprovenBinding();
-        return Object.freeze({ ...binding, durable, expected });
+        let authority;
+        try {
+            // Separate server-authority capability: never synthesize trust from
+            // the plan, request, node credentials, or mutable DB endpoint fields.
+            // It must freshly verify this accepted binding and its still-held
+            // maintenance scope, including endpoint + physical SSH-key enrollment.
+            authority = await this.#executionBindingReader.readVerifiedConnection(expected, durable);
+        } catch { throw unprovenBinding(); }
+        if (!hasExactKeys(authority, ['binding', 'connection']) || !isDeepFrozen(authority)
+            || !sameRecord(authority.binding, durable)
+            || !validTrustedConnection(authority.connection)
+            || (binding.trustedConnection && !sameConnection(authority.connection, binding.trustedConnection))) {
+            throw unprovenBinding();
+        }
+        return Object.freeze({ ...binding, durable, expected, trustedConnection: authority.connection });
     }
 
     async #createTransport(binding, context) {
         const nodeSSH = await this.#nodeExecutionResolver.resolve({
             nodeId: binding.nodeId,
             role: binding.role,
-        });
+        }, binding.trustedConnection);
         await this.#proveBinding(context, binding, binding.durable);
         const bootstrapper = new this.#RunnerBootstrapper({
             nodeSSH,
@@ -555,6 +590,9 @@ class TopologyOperationExecutor {
                     const closed = assertTerminalReceipt(await state.transport.close(
                         transportRequest(binding, 'close')), 'close', binding, outcome);
                     await assertCurrent();
+                    await this.#proveBinding(context, binding, binding.durable, {
+                        readVerified: async () => durable,
+                    });
                     // Status queries the exact durable close ID, not a newly minted command.
                     const status = assertTerminalReceipt(await state.transport.status({
                         ...transportRequest(binding, 'close'), completedCommand: 'close',
