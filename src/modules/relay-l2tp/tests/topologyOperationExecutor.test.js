@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const test = require('node:test');
+const { executionFence, bindingRecord, bindingReader, runnerRequest, v2Receipt, freeze } = require('./helpers/topologyV2Fixture');
 
 const {
     TopologyOperationExecutor,
@@ -76,31 +77,16 @@ function prepareContext(node = frozenNode()) {
         operationId: 'topology-operation-17',
         topologyRevision: 17,
         priorDeployedRevision: 16,
+        executionFence,
         node,
     };
-}
-
-function runnerRequest(command) {
-    const fields = Object.fromEntries([
-        ['operationId', '--operation-id'],
-        ['nodeId', '--node-id'],
-        ['candidateHash', '--candidate-hash'],
-        ['backupId', '--backup-id'],
-        ['targetProfile', '--target-profile'],
-    ].map(([field, flag]) => [field, command.match(new RegExp(`${flag} ([A-Za-z0-9._:-]+)`))?.[1]]));
-    fields.command = command.match(/--command ([a-z]+)/)?.[1];
-    const checksToken = command.match(/--checks ([A-Za-z0-9_-]+)/)?.[1];
-    if (checksToken) {
-        fields.checks = JSON.parse(Buffer.from(checksToken, 'base64url').toString('utf8'));
-    }
-    return fields;
 }
 
 function execResult(request, overrides = {}) {
     const { checks: _checks, ...receiptRequest } = request;
     return {
         code: 0,
-        stdout: `${JSON.stringify({ ok: true, ...receiptRequest, ...overrides })}\n`,
+        stdout: `${JSON.stringify(v2Receipt(receiptRequest, overrides))}\n`,
         stderr: '',
     };
 }
@@ -113,9 +99,16 @@ function lifecycleContext(preparedResult, node = frozenNode()) {
     };
 }
 
+function fixtureReader(host = 'test.infograd.online', backupId) {
+    return bindingReader(['portal', 'relay', 'bridge'].map(role => bindingRecord({
+        ...prepareContext(frozenNode({ role })), ...(backupId ? { backupId } : {}),
+    }, host)));
+}
+
 function executorFixture({ responseOverrides = {},
-    contour = { target: 'test', hostIdentity: 'test.infograd.online' } } = {}) {
+    contour = { target: 'test', hostIdentity: 'test.infograd.online' }, backupId, onEnsureRunner, onResolve } = {}) {
     const events = [];
+    const reader = fixtureReader(contour.hostIdentity, backupId);
     const nodeSSH = {
         async exec(command, options) {
             const request = runnerRequest(command);
@@ -127,6 +120,7 @@ function executorFixture({ responseOverrides = {},
     const nodeExecutionResolver = {
         async resolve(request) {
             events.push({ method: 'resolve', request });
+            onResolve?.(reader);
             return nodeSSH;
         },
     };
@@ -138,18 +132,35 @@ function executorFixture({ responseOverrides = {},
 
         async ensureRunner() {
             events.push({ method: 'ensureRunner' });
+            onEnsureRunner?.(reader);
             return { ok: true };
         }
     }
     return {
-        events,
+        events, reader,
         executor: new TopologyOperationExecutor({
             ...contour,
+            executionBindingReader: reader,
             nodeExecutionResolver,
             RunnerBootstrapper: FakeBootstrapper,
         }),
     };
 }
+
+test('missing durable execution authority refuses before node lookup or bootstrap', async () => {
+    const events = [];
+    const executor = new TopologyOperationExecutor({
+        target: 'test', hostIdentity: 'test.infograd.online',
+        nodeExecutionResolver: { async resolve() { events.push('resolve'); return {}; } },
+        RunnerBootstrapper: class { async ensureRunner() { events.push('bootstrap'); } },
+    });
+    await assert.rejects(executor.prepare(prepareContext()), error => {
+        assert.equal(error.code, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+        assert.equal(error.remoteOutcomeUncertain, false);
+        return true;
+    });
+    assert.deepEqual(events, []);
+});
 
 test('production lifecycle seam sends the full server pair and frozen role to bootstrapper', async () => {
     const { executor, events } = executorFixture({
@@ -171,6 +182,7 @@ test('production default bootstrap enters the paired portal preflight before any
     const calls = [];
     const executor = new TopologyOperationExecutor({
         target: 'production', hostIdentity: 'lm1.infograd.online',
+        executionBindingReader: fixtureReader('lm1.infograd.online'),
         nodeExecutionResolver: { async resolve() { return {
             async exec(command) { calls.push(command); return { code: 1, stdout: '', stderr: '' }; },
             async writeFile() { calls.push('upload'); assert.fail('must not upload'); },
@@ -220,6 +232,7 @@ test('resolves one frozen test node, bootstraps first, and prepares through the 
     }
     const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online',
         target: 'test',
+        executionBindingReader: fixtureReader(),
         nodeExecutionResolver,
         RunnerBootstrapper: FakeBootstrapper,
     });
@@ -245,6 +258,8 @@ test('resolves one frozen test node, bootstraps first, and prepares through the 
         backupId: events[3].request.backupId,
         targetProfile: 'xray-main',
         command: 'prepare',
+        executionContext: 'test.infograd.online', attemptId: 'attempt-1',
+        generation: executionFence.generation, predecessorGeneration: 'none', commandId: 'prepare-portal-node',
     });
     assert.match(events[3].request.backupId, /^topology-[a-f0-9]{64}$/);
     assert.deepEqual(events[3].options, { stdin: CANDIDATE_CONTENT });
@@ -511,12 +526,13 @@ test('transport exceptions cannot claim a commit was locally rejected before dis
         class NodeTransportFactory {
             async create() { return {
                 async prepare({ artifact: _artifact, ...request }) {
-                    return { ok: true, command: 'prepare', ...request };
+                    return v2Receipt({ command: 'prepare', ...request });
                 },
                 async commit() { commits++; throw transportError; },
             }; }
         }
         const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
+            executionBindingReader: fixtureReader(),
             nodeExecutionResolver: { async resolve() { return {}; } },
             RunnerBootstrapper: class { async ensureRunner() {} }, NodeTransportFactory });
         const prepared = await executor.prepare(prepareContext());
@@ -554,7 +570,7 @@ test('a malformed prepare receipt retains uncertainty and exposes no prepared bi
 });
 
 test('rehydrates a durable prepared binding without preparing or reading current topology', async () => {
-    const { events, executor } = executorFixture();
+    const { events, executor } = executorFixture({ backupId: 'topology-durable-backup-bridge' });
     const node = frozenNode({
         role: 'bridge',
         node: 'bridge-node',
@@ -605,6 +621,8 @@ test('rehydrates a durable prepared binding without preparing or reading current
         backupId,
         targetProfile: 'xray-bridge',
         command: 'rollback',
+        executionContext: 'test.infograd.online', attemptId: 'attempt-1',
+        generation: executionFence.generation, predecessorGeneration: 'none', commandId: 'rollback-bridge-node',
     }]);
     assert.doesNotMatch(JSON.stringify({ executor, rehydrated }), /secret|privateKey|topology-lookup/);
 });
@@ -620,7 +638,8 @@ test('prepare timeout exposes uncertainty and never races a cleanup command', as
         }; }
     }
     const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
-        nodeExecutionResolver: { async resolve() { return {}; } },
+        executionBindingReader: fixtureReader(),
+            nodeExecutionResolver: { async resolve() { return {}; } },
         RunnerBootstrapper, NodeTransportFactory });
     await assert.rejects(executor.prepare(prepareContext()), error => {
         assert.equal(error.remoteOutcomeUncertain, true);
@@ -632,7 +651,8 @@ test('prepare timeout exposes uncertainty and never races a cleanup command', as
 
 test('runner bootstrap timeout is uncertain even before prepare dispatch', async () => {
     const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
-        nodeExecutionResolver: { async resolve() { return {}; } },
+        executionBindingReader: fixtureReader(),
+            nodeExecutionResolver: { async resolve() { return {}; } },
         RunnerBootstrapper: class { async ensureRunner() { throw new Error('upload timeout'); } },
     });
     await assert.rejects(executor.prepare(prepareContext()), error => {
@@ -640,4 +660,80 @@ test('runner bootstrap timeout is uncertain even before prepare dispatch', async
         assert.match(error.backupId, /^topology-[a-f0-9]{64}$/);
         return true;
     });
+});
+test('durable proof precedes bootstrap and binds every V2 command to the canonical host', async () => {
+    const { executor, events } = executorFixture();
+    const prepared = await executor.prepare(prepareContext());
+    for (const command of ['commit', 'verify', 'rollback']) await executor[command](lifecycleContext(prepared));
+    for (const event of events.filter(event => event.method === 'transport')) {
+        assert.equal(event.request.executionContext, 'test.infograd.online');
+        assert.equal(event.request.generation, executionFence.generation);
+        assert.equal(event.request.attemptId, 'attempt-1');
+        assert.equal(event.request.predecessorGeneration, 'none');
+        assert.equal(event.request.commandId, `${event.request.command}-portal-node`);
+    }
+});
+
+test('ownership lost during bootstrap refuses the prepare command', async () => {
+    const { executor, events } = executorFixture({ onEnsureRunner(reader) { reader.rows.clear(); } });
+    await assert.rejects(executor.prepare(prepareContext()), error => {
+        assert.equal(error.cause?.code, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+        assert.equal(error.remoteOutcomeUncertain, true, 'bootstrap is already a remote boundary');
+        return true;
+    });
+    assert.equal(events.some(event => event.method === 'transport'), false);
+});
+
+test('missing foreign stale mutable or incomplete durable bindings fail closed before every external boundary', async t => {
+    const cases = {
+        missing: () => null,
+        foreignHost: row => freeze({ ...row, executionContext: 'lm1.infograd.online' }),
+        foreignOperation: row => freeze({ ...row, operationId: 'foreign-operation' }),
+        foreignNode: row => freeze({ ...row, nodeId: 'foreign-node' }),
+        foreignOwner: row => freeze({ ...row, owner: 'foreign-worker' }),
+        staleAttempt: row => freeze({ ...row, attempt: 0 }),
+        staleGeneration: row => freeze({ ...row, generation: '00000000-0000-4000-8000-000000000018' }),
+        changedCandidate: row => freeze({ ...row, candidateHash: `sha256:${'0'.repeat(64)}` }),
+        changedRevision: row => freeze({ ...row, topologyRevision: 18 }),
+        mutable: row => ({ ...row }),
+        missingPredecessor: row => { const { predecessorGeneration: _old, ...rest } = row; return freeze(rest); },
+        reusedCommand: row => freeze({ ...row, commandIds: { ...row.commandIds, commit: row.commandIds.prepare } }),
+    };
+    for (const [name, change] of Object.entries(cases)) await t.test(name, async () => {
+        const { executor, events, reader } = executorFixture();
+        reader.rows.set('portal-node', change(reader.rows.get('portal-node')));
+        await assert.rejects(executor.prepare(prepareContext()), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false });
+        assert.deepEqual(events, []);
+    });
+});
+
+test('lifecycle rereads durable authority and rejects changed IDs without dispatch', async t => {
+    for (const command of ['commit', 'verify', 'rollback', 'cleanupPrepared']) await t.test(command, async () => {
+        const { executor, events, reader } = executorFixture();
+        const prepared = await executor.prepare(prepareContext());
+        const original = reader.rows.get('portal-node');
+        reader.rows.set('portal-node', freeze({ ...original,
+            predecessorGeneration: 'foreign-predecessor',
+            commandIds: { ...original.commandIds, commit: 'replaced-command' },
+        }));
+        await assert.rejects(executor[command](lifecycleContext(prepared)), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+        });
+        assert.deepEqual(events.filter(event => event.method === 'transport').map(event => event.request.command), ['prepare']);
+    });
+});
+
+test('recovery cannot adopt a fresh acquired generation or request-supplied predecessor', async () => {
+    const { executor, events } = executorFixture({ backupId: 'durable-backup' });
+    await assert.rejects(executor.rehydrate({ ...prepareContext(), backupId: 'durable-backup',
+        executionFence: Object.freeze({ ...executionFence, generation: '00000000-0000-4000-8000-000000000018' }),
+    }), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    await assert.rejects(executor.prepare({ ...prepareContext(), predecessorGeneration: 'none' }), { code: 'INVALID_FROZEN_NODE_PLAN' });
+    assert.deepEqual(events, []);
+});
+
+test('ownership lost during node resolution cannot enter bootstrap', async () => {
+    const { executor, events } = executorFixture({ onResolve(reader) { reader.rows.clear(); } });
+    await assert.rejects(executor.prepare(prepareContext()));
+    assert.deepEqual(events.map(event => event.method), ['resolve']);
 });

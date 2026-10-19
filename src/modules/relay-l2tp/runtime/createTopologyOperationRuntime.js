@@ -129,6 +129,10 @@ function createTopologyOperationExecutor({
         target,
         hostIdentity,
     });
+    // No durable V2 execution binding reader is installed by this runtime.
+    // Until paired binding persistence/current-lock readback and recovery exist,
+    // the real executor refuses before node lookup/bootstrap on both hosts.
+    // Do not turn request fields or a generated predecessor into authority here.
     return new TopologyOperationExecutor({
         target,
         hostIdentity,

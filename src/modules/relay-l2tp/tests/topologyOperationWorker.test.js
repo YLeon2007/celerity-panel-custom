@@ -2454,3 +2454,69 @@ test('crash after recording an uncertain failed node cannot resume remote work',
         assert.deepEqual(calls, []);
     });
 });
+
+test('worker forwards the exact acquired generation and claimed attempt through every lifecycle call', async () => {
+    const repository = createRepository();
+    const seen = [];
+    const generations = new Map();
+    const check = context => {
+        assert.deepEqual(context.executionFence, {
+            owner: repository.operation.leaseOwner,
+            attempt: repository.operation.attempts,
+            generation: generations.get(context.node.node),
+        });
+        assert.equal(Object.isFrozen(context.executionFence), true);
+        seen.push(context);
+    };
+    const worker = createWorker({ repository,
+        lockService: { async acquire({ node }) {
+            const generation = `exact-acquired-${node}`; generations.set(node, generation);
+            return { ok: true, lock: { generation } };
+        }, async renew() { return { ok: true }; }, async releaseVerified() { return { ok: true }; } },
+        executor: safetyExecutor({
+            async prepare(context) { check(context); return { backupId: `backup-${context.node.node}`, prepared: Object.freeze({}) }; },
+            async commit(context) { check(context); return { ok: true }; },
+            async verify(context) { check(context); return { ok: true }; },
+        }),
+    });
+    assert.equal((await worker.run('operation-1')).status, 'succeeded');
+    assert.equal(seen.length, 6);
+    for (const context of seen) assert.strictEqual(context.executionFence,
+        seen.find(item => item.node.node === context.node.node).executionFence);
+});
+
+test('V2 completion retains exact locks and admission instead of authorizing classic writers or terminal publication', async t => {
+    for (const outcome of ['verified', 'rollback', 'verify-unknown']) await t.test(outcome, async () => {
+        const operation = durableOperation(); operation.heldTopologyAdmission = true;
+        const repository = createRepository(operation);
+        const events = [];
+        const worker = createWorker({ repository,
+            executor: safetyExecutor({ executionProtocolVersion: 2,
+                async commit(context) {
+                    if (outcome === 'rollback' && context.node.node === 'node-b') {
+                        throw Object.assign(new Error('local rejection'), { remoteOutcomeUncertain: false });
+                    }
+                    return { ok: true };
+                },
+                async verify() {
+                    if (outcome === 'verify-unknown') throw Object.assign(new Error('unknown'), { remoteOutcomeUncertain: true });
+                    return { ok: true };
+                },
+                async rollback(context) { assert.ok(context.executionFence); events.push('rollback'); return { ok: true }; },
+            }),
+            userResync: { async resyncPlan() { events.push('classic-users'); return { ok: true }; } },
+            lockService: { async acquire({ node }) { return { ok: true, lock: { generation: 'exact-' + node } }; },
+                async renew() { return { ok: true }; }, async releaseVerified() { events.push('release'); return { ok: true }; } },
+            finalizer: { async finalizeSucceeded() { events.push('publish'); return true; },
+                async finalizeRolledBack() { events.push('admission-release'); return true; } },
+        });
+        const result = await worker.run('operation-1');
+        assert.equal(result.drainUncertain, true);
+        assert.equal(operation.heldTopologyAdmission, true);
+        assert.equal(events.includes('release'), false);
+        assert.equal(events.includes('publish'), false);
+        assert.equal(events.includes('admission-release'), false);
+        if (outcome !== 'rollback') assert.deepEqual(events, []);
+        else assert.equal(events.filter(event => event === 'rollback').length, 2);
+    });
+});

@@ -386,3 +386,39 @@ test('enabled composition wires the queued topology runtime without starting its
     });
     assert.deepEqual(calls, ['createTopologyOperationExecutor']);
 });
+
+test('default assembled TEST and PROD executors cannot bootstrap without durable V2 authority', async () => {
+    const { createHash } = require('node:crypto');
+    const { executionFence, freeze } = require('./helpers/topologyV2Fixture');
+    const content = '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}\n';
+    const candidateHash = createHash('sha256').update(content).digest('hex');
+    const context = {
+        operationId: 'runtime-proof-17', topologyRevision: 17, priorDeployedRevision: 16,
+        executionFence,
+        node: freeze({ node: 'portal-node', nodeRef: 'portal', role: 'portal',
+            targetProfile: 'xray-main', serviceUnit: 'xray.service',
+            serviceUnitPath: '/etc/systemd/system/xray.service',
+            configPath: '/usr/local/etc/xray/config.json', checks: [], candidateHash,
+            candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
+                bytes: [...Buffer.from(content)], sha256: candidateHash },
+        }),
+    };
+    for (const hostIdentity of ['test.infograd.online', 'lm1.infograd.online']) {
+        const calls = [];
+        const env = { ...ENABLED_ENV, PANEL_DOMAIN: hostIdentity, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' };
+        const service = createTopologyOperationRuntime({ ...compositionDependencies(calls), env });
+        assert.ok(service instanceof TopologyOperationCoordinator);
+        assert.equal(service.operationWorker.executionContext.hostIdentity, hostIdentity);
+        env.PANEL_DOMAIN = 'foreign.invalid';
+        assert.equal(service.operationWorker.executor.executionProtocolVersion, 2);
+        await assert.rejects(service.operationWorker.executor.prepare(context), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+        });
+        assert.deepEqual(calls, [], 'no node lookup, SSH, bootstrap or persistence');
+        if (hostIdentity === 'lm1.infograd.online') {
+            assert.equal((await service.operationWorker.run(context.operationId)).errorCode,
+                'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN');
+            assert.deepEqual(calls, [], 'production gate remains before claim');
+        }
+    }
+});

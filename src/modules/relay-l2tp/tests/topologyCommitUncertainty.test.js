@@ -13,6 +13,7 @@ const { NodeOperationLockRepository } = require('../services/nodeOperationLockRe
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
 const { QUEUE_ID } = require('../services/topologyIntentService');
+const { bindingRecord, bindingReader, runnerRequest, v2Receipt } = require('./helpers/topologyV2Fixture');
 
 const NOW = new Date('2026-10-19T12:00:00Z');
 function query(value) {
@@ -41,17 +42,12 @@ function node(nodeId, role, nodeRef) {
             bytes: [...Buffer.from(content)], sha256 },
         candidateHash: sha256, state: 'pending', backupId: '' };
 }
-function requestFrom(command) {
-    return Object.fromEntries([['command', 'command'], ['operationId', 'operation-id'],
-        ['nodeId', 'node-id'], ['candidateHash', 'candidate-hash'], ['backupId', 'backup-id'],
-        ['targetProfile', 'target-profile']].map(([key, flag]) =>
-        [key, command.match(new RegExp(`--${flag} ([A-Za-z0-9._:-]+)`))?.[1]]));
-}
-function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure = false } = {}) {
+function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure = false, persistBinding = true } = {}) {
     let now = new Date(NOW);
     let remoteCommitAlive = false;
     const commands = [], released = [], finalizations = [];
     const held = new Map();
+    const executionBindingReader = bindingReader([]);
     const executionContext = { target: 'test', hostIdentity: 'test.infograd.online' };
     const idempotencyKey = 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000';
     const operation = { executionContext, idempotencyKey, _id: 'operation-uncertain', topologyRevision: 7, priorDeployedRevision: 5,
@@ -106,7 +102,16 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
         repository: new NodeOperationLockRepository({ model: {
             async create(row) {
                 if (held.has(row.node)) throw Object.assign(new Error('duplicate'), { code: 11000 });
-                held.set(row.node, structuredClone(row)); return row;
+                held.set(row.node, structuredClone(row));
+                // Simulate a separately persisted immutable binding at exact lock
+                // acquisition, not a predecessor synthesized during dispatch.
+                if (persistBinding) executionBindingReader.rows.set(row.node, bindingRecord({
+                    operationId: operation._id, topologyRevision: operation.topologyRevision,
+                    priorDeployedRevision: operation.priorDeployedRevision,
+                    node: operation.nodes.find(node => node.node === row.node),
+                    executionFence: { owner: row.owner, attempt: operation.attempts, generation: row.generation },
+                }));
+                return row;
             },
             findOne: ({ node }) => query(held.get(node) || null),
             async updateOne(filter, change) { return update(held.get(filter.node), filter, change); },
@@ -118,11 +123,12 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
         } }),
     });
     const executor = new TopologyOperationExecutor({ hostIdentity: 'test.infograd.online', target: 'test',
+        executionBindingReader,
         RunnerBootstrapper: class { async ensureRunner() {} },
         nodeExecutionResolver: { async resolve() { return {
             async writeFile() {},
             async exec(command) {
-                const request = requestFrom(command);
+                const request = runnerRequest(command);
                 commands.push(request);
                 if (request.command === 'commit' && request.nodeId === failingNode) {
                     remoteCommitAlive = true;
@@ -130,11 +136,12 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
                     if (outcome === 'nonzero') return { code: 1, stdout: '', stderr: 'disconnected' };
                     return { code: 0, stdout: `${JSON.stringify({ ok: true, ...request, backupId: 'wrong-backup' })}\n`, stderr: '' };
                 }
-                return { code: 0, stdout: `${JSON.stringify({ ok: true, ...request })}\n`, stderr: '' };
+                return { code: 0, stdout: `${JSON.stringify(v2Receipt(request))}\n`, stderr: '' };
             },
         }; } },
     });
     const effectiveExecutor = safeLocalFailure ? {
+        executionProtocolVersion: 2,
         prepare: context => executor.prepare(context),
         commit: context => executor.commit(context.node.node === failingNode
             ? { ...context, backupId: 'wrong-local-binding' } : context),
@@ -245,17 +252,44 @@ test('expired commit recovery has no quiescence proof even when node locks are a
     }
 });
 
-test('real local commit binding rejection safely rolls back completed predecessors and clears admission', async () => {
+test('real local commit binding rejection cleans completed predecessors but V2 retains admission', async () => {
     const f = fixture({ safeLocalFailure: true });
     const result = await f.worker.run(f.operation._id);
-    assert.equal(result.status, 'rolled_back');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.drainUncertain, true);
     assert.equal(f.remoteCommitAlive, false);
     assert.deepEqual(f.commands.filter(row => row.command === 'commit').map(row => row.nodeId), ['node-a']);
     assert.deepEqual(f.commands.filter(row => row.command === 'rollback').map(row => row.nodeId),
         ['node-b', 'node-a', 'node-c']);
-    assert.equal(f.operation.heldTopologyAdmission, false);
-    assert.equal(f.topology.topologyAdmissionCount, 0);
-    assert.equal(f.held.size, 0);
-    assert.equal(await f.consumer.settle(f.intent), true);
-    assert.equal(f.queue.outstanding, 1);
+    assert.equal(f.operation.heldTopologyAdmission, true);
+    assert.equal(f.topology.topologyAdmissionCount, 1);
+    assert.equal(f.held.size, 3);
+    for (const request of f.commands) {
+        assert.equal(request.generation, f.held.get(request.nodeId).generation);
+        assert.equal(request.executionContext, 'test.infograd.online');
+        assert.equal(request.attemptId, 'attempt-1');
+        assert.equal(request.commandId, `${request.command}-${request.nodeId}`);
+        assert.equal(request.predecessorGeneration, 'none');
+    }
+    assert.deepEqual(f.released, []);
+    assert.equal(await f.consumer.settle(f.intent), false);
+    assert.equal(f.queue.outstanding, 2);
+});
+
+test('assembled worker without persisted binding retains ownership without dispatch or terminal fiction', async () => {
+    const f = fixture({ persistBinding: false });
+    const result = await f.worker.run(f.operation._id);
+    assert.equal(result.status, 'preparing');
+    assert.equal(result.stopped, true);
+    assert.equal(result.errorCode, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+    assert.equal(result.drainUncertain, true);
+    assert.deepEqual(f.commands, []);
+    assert.deepEqual(f.released, []);
+    assert.deepEqual(f.finalizations, []);
+    assert.equal(f.held.size, 3);
+    assert.equal(f.operation.heldTopologyAdmission, true);
+    assert.equal(f.topology.topologyAdmissionCount, 1);
+    assert.equal(f.operation.status, 'preparing');
+    assert.equal(await f.consumer.settle(f.intent), false);
+    assert.equal(f.queue.outstanding, 2);
 });

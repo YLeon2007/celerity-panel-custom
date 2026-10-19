@@ -224,6 +224,8 @@ function matchesFrozenMetadata(operation, plan, nodes) {
 
 class TopologyOperationWorker {
     #allowUnprovenTestExecution;
+    #executionFences = new WeakMap();
+    #retainExecutionOwnership;
 
     constructor({
         executionContext,
@@ -284,6 +286,7 @@ class TopologyOperationWorker {
         }
         this.operationRepository = operationRepository;
         this.executor = executor;
+        this.#retainExecutionOwnership = executor.executionProtocolVersion === 2;
         this.finalizer = finalizer;
         this.lockService = lockService;
         this.workerId = workerId;
@@ -443,6 +446,7 @@ class TopologyOperationWorker {
     }
 
     async releaseVerifiedLocks(operationId, acquiredNodeIds) {
+        if (this.#retainExecutionOwnership) return false;
         let released = true;
         for (const { node, generation } of [...acquiredNodeIds].reverse()) {
             try {
@@ -490,6 +494,7 @@ class TopologyOperationWorker {
     }
 
     async releasePppWaitLocks(operationId, wait, acquiredNodeIds) {
+        if (this.#retainExecutionOwnership) return false;
         if (!Array.isArray(wait?.locks) || !Array.isArray(wait.releasedNodes)
             || typeof wait.lockOwner !== 'string' || !wait.lockOwner) return false;
         for (const { node, generation } of [...wait.locks].reverse()) {
@@ -532,6 +537,7 @@ class TopologyOperationWorker {
     }
 
     async releasePppProbeLocks(operationId, wait, acquiredNodeIds) {
+        if (this.#retainExecutionOwnership) return false;
         for (const { node, owner, generation } of [...(wait.probeLocks || [])].reverse()) {
             await this.renew(operationId);
             let released;
@@ -558,6 +564,7 @@ class TopologyOperationWorker {
     }
 
     async releaseOrphanProbeLocks(operationId, wait) {
+        if (this.#retainExecutionOwnership) return false;
         const read = this.lockService.repository?.findByNode;
         if (typeof read !== 'function') return true; // Exact recorded generations remain recoverable.
         for (const { node } of wait.locks) {
@@ -612,6 +619,7 @@ class TopologyOperationWorker {
     }
 
     async releaseUnrecordedProbeLocks(operationId, wait, acquiredNodeIds) {
+        if (this.#retainExecutionOwnership) return;
         // A persistence failure between acquire and record must not turn into
         // a lost exact generation. Try the known local generation; a crash in
         // this gap is recovered by releaseOrphanProbeLocks on the next claim.
@@ -731,6 +739,8 @@ class TopologyOperationWorker {
             topologyRevision: plan.topologyRevision,
             priorDeployedRevision: plan.priorDeployedRevision,
             node,
+            ...(this.#executionFences.get(plan)?.has(node.node)
+                ? { executionFence: this.#executionFences.get(plan).get(node.node) } : {}),
             ...(prepared === undefined ? {} : { prepared }),
             ...(backupId === undefined ? {} : { backupId }),
         };
@@ -933,6 +943,7 @@ class TopologyOperationWorker {
 
 
     async restoreUsersAfterRollback(plan, operationId, heartbeat) {
+        if (this.#retainExecutionOwnership) return false;
         if (!this.userResync) return true;
         await this.renew(operationId);
         try {
@@ -1124,6 +1135,13 @@ class TopologyOperationWorker {
                 };
             }
 
+            // Expected ownership comes only from this claim and locks we just
+            // acquired. Attempt/command IDs and predecessor must instead come
+            // from a separately verified immutable durable execution record.
+            this.#executionFences.set(plan, new Map(acquiredNodeIds.map(({ node, generation }) => [
+                node, Object.freeze({ owner: this.workerId, attempt: operation.attempts, generation }),
+            ])));
+
             if (entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
                 const cleaned = await this.cleanupExpiredPreparation(
                     plan,
@@ -1162,6 +1180,14 @@ class TopologyOperationWorker {
                 if (error instanceof LeaseLostError) throw error;
                 logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
                 traceWorkerFailure(plan, operationId, 'worker.prepare', error);
+                if (this.#retainExecutionOwnership
+                    && error?.code === 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN') {
+                    // Missing durable binding authority is not permission to dispatch,
+                    // recover, or claim a terminal rollback. Preserve the claim,
+                    // exact generations and counted admission for explicit repair.
+                    return { claimed: true, operationId, status: 'preparing', stopped: true,
+                        drainUncertain: true, errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+                }
                 // Only the typed executor's explicit pre-dispatch failure may
                 // enter cleanup. Unknown errors are not proof of quiescence.
                 if (error?.remoteOutcomeUncertain !== false) {
@@ -1258,6 +1284,10 @@ class TopologyOperationWorker {
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
                     traceWorkerFailure(plan, operationId, 'worker.verify', error, entry.node.node);
+                    if (this.#retainExecutionOwnership && error?.remoteOutcomeUncertain !== false) {
+                        return { claimed: true, operationId, status: 'committing', stopped: true,
+                            drainUncertain: true, errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                    }
                     return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
@@ -1267,6 +1297,15 @@ class TopologyOperationWorker {
                         acquiredNodeIds,
                     );
                 }
+            }
+
+            // V2 command completion is not terminal readback and cannot prove
+            // bootstrap/classic writer exclusion or handback. This bounded slice
+            // has no such authority: retain locks/admission, and do not invoke
+            // auxiliary classic writers or publish success from these receipts.
+            if (this.#retainExecutionOwnership) {
+                return { claimed: true, operationId, status: 'committing', stopped: true,
+                    drainUncertain: true, errorCode: 'TOPOLOGY_V2_HANDOFF_UNPROVEN' };
             }
 
             // The candidate restart clears dynamic Xray users. Reconcile and
