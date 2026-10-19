@@ -353,11 +353,12 @@ class RemoteAdmissionRepository {
                 }).session(session).lean();
                 if (unresolved) return null;
 
-                // The singleton CAS serializes concurrent admissions and excludes
-                // drain/reservation. A later CAS/insert failure aborts the count.
+                // The singleton CAS excludes topology work and drain/reservation.
+                // Missing legacy counters are not zero; a later failure aborts the count.
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
+                    topologyAdmissionCount: 0,
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) return null;
@@ -453,6 +454,8 @@ class RemoteAdmissionRepository {
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
+                    // Share install/sync exclusion; never adopt a missing legacy counter.
+                    topologyAdmissionCount: 0,
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_BLOCKED');

@@ -17,7 +17,7 @@ function fixture({ operations = [op()], gate = {}, admissions = [], split,
     commitError = null } = {}) {
     const db = { startSession: async () => session };
     const session = { token: 'one' };
-    const state = { _id: 'singleton', remoteAdmissionCount: 0, ...gate };
+    const state = { _id: 'singleton', topologyAdmissionCount: 0, remoteAdmissionCount: 0, ...gate };
     const ops = new Map(operations.map(item => [String(item._id), { ...item }]));
     const records = new Map(admissions.map(item => [item._id, { ...item }]));
     const calls = [];
@@ -34,7 +34,8 @@ function fixture({ operations = [op()], gate = {}, admissions = [], split,
             assert.strictEqual(options.session, session);
             calls.push(['gateCAS', filter, update]);
             if (gateCasMiss || state._id !== filter._id || !Number.isInteger(state.remoteAdmissionCount)
-                || state.remoteAdmissionCount < 0 || state.remoteDrain !== undefined
+                || state.remoteAdmissionCount < 0 || state.topologyAdmissionCount !== filter.topologyAdmissionCount
+                || state.remoteDrain !== undefined
                 || state.replacementReservation !== undefined) return { matchedCount: 0 };
             state.remoteAdmissionCount += update.$inc.remoteAdmissionCount;
             return { matchedCount: 1 };
@@ -133,7 +134,7 @@ test('claims oldest legacy queued sync_users, increments gate and creates exactl
         ownerGeneration: 1, leaseOwner: 'worker-one' });
     assert.deepEqual(f.calls.map(([type]) => type), ['select', 'admissionSelect', 'gateCAS', 'operationCAS', 'create']);
     assert.deepEqual(f.calls[2][1], { _id: 'singleton', remoteDrain: { $exists: false },
-        replacementReservation: { $exists: false }, remoteAdmissionCount: { $gte: 0 } });
+        replacementReservation: { $exists: false }, topologyAdmissionCount: 0, remoteAdmissionCount: { $gte: 0 } });
     assert.equal(f.ops.get(laterId).status, 'queued');
 });
 
@@ -167,7 +168,9 @@ test('running and rolling_back sync users never reclaim, including expired lease
 
 test('missing, draining, reserved or malformed gate blocks claim without an admission', async () => {
     for (const gate of [{ _id: 'missing' }, { remoteAdmissionCount: undefined },
-        { remoteAdmissionCount: -1 }, { remoteDrain: {} }, { replacementReservation: {} }]) {
+        { remoteAdmissionCount: -1 }, { topologyAdmissionCount: undefined },
+        { topologyAdmissionCount: 1 }, { topologyAdmissionCount: -1 },
+        { remoteDrain: {} }, { replacementReservation: {} }]) {
         const f = fixture({ gate });
         assert.equal(await claim(f), null);
         assert.deepEqual(f.ops.get(operationId), op());
