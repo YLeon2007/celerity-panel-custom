@@ -711,7 +711,8 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
         };
         const { store, expected, enrollment, context } = await setup(authority);
         await store.preEnroll(enrollment); await store.createBinding(expected);
-        const execution = boundary === 'executor' ? await assembled(store) : null;
+        const execution = boundary === 'executor'
+            ? await assembled(store, { acceptedBinding: await store.readVerified(expected) }) : null;
         untilDate = new Date(Date.now() + 1200);
         await models.Operation.updateOne({}, { $set: { leaseUntil: untilDate } });
         await models.Lock.updateOne({}, { $set: { leaseUntil: untilDate } });
