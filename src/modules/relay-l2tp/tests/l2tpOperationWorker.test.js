@@ -2076,7 +2076,16 @@ test('retains counted admission and lock without rollback after an uncertain SSH
         },
     });
 
-    const result = await worker.runOnce();
+    const { createL2tpWorkerLifecycle } = require('../runtime/createL2tpWorkerLifecycle');
+    let tick;
+    let result;
+    const lifecycle = createL2tpWorkerLifecycle({ enabled: true,
+        worker: { async runOnce() { result = await worker.runOnce(); return result; } },
+        timer: { setInterval(fn) { tick = fn; return {}; }, clearInterval() {} },
+    });
+    lifecycle.start(); const running = tick();
+    assert.equal((await lifecycle.stop()).drainUncertain, true);
+    await running;
 
     assert.equal(result.status, 'running');
     assert.equal(result.stopped, true);
@@ -2284,6 +2293,7 @@ test('rollback failure leaves the claimed operation terminally failed', async ()
         claimed: true,
         operationId: 'operation-rollback-failed',
         status: 'failed',
+        drainUncertain: true,
     });
     assert.deepEqual(
         operationRepository.calls.filter(call => call.method === 'setStatus'),

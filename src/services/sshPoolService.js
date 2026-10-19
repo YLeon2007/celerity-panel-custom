@@ -35,14 +35,13 @@ class SSHPool {
         };
         
         this.settingsLoaded = false;
+        this.draining = false;
         
         // Cleanup timer
         this.cleanupTimer = setInterval(() => this.cleanup(), this.config.cleanupInterval);
         
-        // Graceful shutdown
-        const shutdown = () => this.closeAll();
-        process.once('SIGTERM', shutdown);
-        process.once('SIGINT', shutdown);
+        // The application owns signal handling. Closing here would run before
+        // index.js can fence admission and join supervised remote invocations.
         
         logger.info('[SSHPool] Initialized');
     }
@@ -435,9 +434,17 @@ class SSHPool {
     }
     
     /**
-     * Cleanup idle connections
+     * Preserve worker dependencies while the application fences and joins work.
      */
+    beginDrain() {
+        // Admission is fenced by the application lifecycle. Existing admitted
+        // workers may still need more connections/commands to finish their job.
+        this.draining = true;
+        clearInterval(this.cleanupTimer);
+    }
+
     cleanup() {
+        if (this.draining) return;
         const now = Date.now();
         let cleaned = 0;
         

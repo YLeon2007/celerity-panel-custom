@@ -864,8 +864,9 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
-        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
-        return { claimed: true, operationId, status };
+        const fenceReleased = await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
+        return { claimed: true, operationId, status,
+            ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
     async cleanupAfterPrepareFailure(plan, operationId, prepared, heartbeat, acquiredNodeIds) {
@@ -916,8 +917,9 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
-        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
-        return { claimed: true, operationId, status };
+        const fenceReleased = await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
+        return { claimed: true, operationId, status,
+            ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
 
@@ -1010,8 +1012,9 @@ class TopologyOperationWorker {
             status,
         });
         if (finished !== true) throw new LeaseLostError();
-        await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
-        return { claimed: true, operationId, status };
+        const fenceReleased = await this.releaseRollbackFence(plan, operationId, status, acquiredNodeIds);
+        return { claimed: true, operationId, status,
+            ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
     async run(operationIdentity) {
@@ -1111,7 +1114,7 @@ class TopologyOperationWorker {
                     entries,
                     heartbeat,
                 );
-                if (!cleaned) return { claimed: true, operationId, status: 'failed' };
+                if (!cleaned) return { claimed: true, operationId, status: 'failed', drainUncertain: true };
             }
 
             const prepared = [];

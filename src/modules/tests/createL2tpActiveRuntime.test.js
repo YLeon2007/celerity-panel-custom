@@ -633,6 +633,14 @@ test('active preflight fails closed at admission before transport on a missing s
     assert.equal(calls.some(call => call.kind === 'operationRepository.create'), false);
 });
 
+test('assembled active host preserves uncertain worker drain results', async () => {
+    const { host, getScheduledTick } = createActiveHost();
+    host.runtime.worker.runOnce = async () => ({ claimed: true, status: 'failed', stopped: true,
+        errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' });
+    host.start(); await getScheduledTick()();
+    assert.equal((await host.stop()).drainUncertain, true);
+});
+
 test('active preflight with admission reaches upload and retains an uncertain response', async () => {
     const { calls, host, admissionRecords, admissionGate } = createActiveHost({ admissionReady: true });
     const result = await host.runtime.service.preflight('node-a', {

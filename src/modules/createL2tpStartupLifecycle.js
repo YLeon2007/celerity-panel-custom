@@ -196,7 +196,10 @@ function createL2tpStartupLifecycle({
                 stopped = true;
                 activeHostProvider?.clearActiveHost(host);
                 stopPromise = Promise.resolve(enabled ? host.stop() : undefined)
-                    .then(() => lifecycleState({ enabled, started, stopped }));
+                    .then(state => ({
+                        ...lifecycleState({ enabled, started, stopped }),
+                        ...(state?.drainUncertain === true ? { drainUncertain: true } : {}),
+                    }));
             }
             return stopPromise;
         },

@@ -36,6 +36,15 @@ function createEnabledHostDependencies() {
     };
 }
 
+test('startup lifecycle propagates joined uncertain ownership to its caller', async () => {
+    const lifecycle = createL2tpStartupLifecycle({ config: { enabled: true },
+        hostDependencies: createEnabledHostDependencies(),
+        createPanelHost: () => ({ start() {}, async stop() { return { drainUncertain: true }; } }),
+    });
+    lifecycle.start();
+    assert.equal((await lifecycle.stop()).drainUncertain, true);
+});
+
 test('false or missing enable flag constructs no host and startup never starts it', () => {
     for (const config of [undefined, { enabled: false }]) {
         const calls = [];

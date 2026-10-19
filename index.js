@@ -22,6 +22,7 @@ const { requireScope } = requireAuth;
 const { i18nMiddleware, LANGUAGE_OPTIONS, normalizeLanguage } = require('./src/middleware/i18n');
 const { countRequest } = require('./src/middleware/rpsCounter');
 const syncService = require('./src/services/syncService');
+const sshPool = require('./src/services/sshPoolService');
 const expireScheduler = require('./src/services/expireScheduler');
 const cacheService = require('./src/services/cacheService');
 const statsService = require('./src/services/statsService');
@@ -1198,6 +1199,7 @@ function shutdown(signal) {
     // Keep this deadline referenced: an unresolved Promise is not an event-loop
     // handle, and must not permit a silent successful exit before the drain.
     shutdownPromise = Promise.resolve().then(async () => {
+        sshPool.beginDrain();
         const serversClosed = Promise.all(activeServers.map(server => new Promise((resolve, reject) => {
             const grace = setTimeout(() => {
                 shutdownExitCode = 1;
@@ -1220,8 +1222,15 @@ function shutdown(signal) {
         // clients close. Keep Mongo/Redis open until the supervised drain joins.
         const drains = await Promise.allSettled([serversClosed, l2tpRootLifecycle.stop()]);
         if (expired) return;
+        // SSH is a dependency of the worker drain, not an independent signal
+        // subscriber. A joined failed drain still must never report success.
+        sshPool.closeAll();
         const failedDrain = drains.find(result => result.status === 'rejected');
         if (failedDrain) throw failedDrain.reason;
+        if (drains[1].value?.drainUncertain === true) {
+            shutdownExitCode = 1;
+            logger.error('[Server] Worker drain joined with unresolved ownership; retain durable admissions/locks for authoritative recovery.');
+        }
         if (cacheService.isConnected()) await cacheService.redis.quit();
         await mongoose.disconnect();
         clearTimeout(deadline);

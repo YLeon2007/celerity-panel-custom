@@ -1629,6 +1629,29 @@ test('executes reverse topology Portal to Relay to Bridge through prepare commit
     );
 });
 
+test('rolled-back label without confirmed fence release remains an uncertain drain', async () => {
+    const repository = createRepository();
+    repository.operation.status = 'preparing';
+    const worker = createWorker({ repository, executor: {
+        async prepare() {}, async commit() {}, async verify() {}, async rollback() {}, async cleanupPrepared() {},
+    } });
+    const result = await worker.cleanupAfterPrepareFailure({}, 'operation-1', [], { run: fn => fn() }, []);
+    assert.equal(result.status, 'rolled_back');
+    assert.equal(result.drainUncertain, true);
+});
+
+test('confirmed rollback fence release remains a clean drain', async () => {
+    const repository = createRepository();
+    repository.operation.status = 'preparing';
+    const worker = createWorker({ repository,
+        finalizer: { async finalizeSucceeded() {}, async finalizeRolledBack() { return true; } },
+        executor: { async prepare() {}, async commit() {}, async verify() {}, async rollback() {}, async cleanupPrepared() {} },
+    });
+    const result = await worker.cleanupAfterPrepareFailure({}, 'operation-1', [], { run: fn => fn() }, []);
+    assert.equal(result.status, 'rolled_back');
+    assert.notEqual(result.drainUncertain, true);
+});
+
 test('rolls back forward and reverse topology changes in exact reverse deployment order', async () => {
     assert.deepEqual(
         await rollbackRolesAfterFinalVerifyFailure(['bridge', 'relay', 'portal']),
@@ -1829,6 +1852,7 @@ test('prepare failure cleans only prepared nodes and performs no commits', async
         claimed: true,
         operationId: 'operation-1',
         status: 'rolled_back',
+        drainUncertain: true, // This fixture has no rollback-admission finalizer.
     });
     assert.deepEqual(events, [
         { method: 'prepare', node: 'node-a' },
@@ -1971,6 +1995,7 @@ test('verify failure continues reverse rollback and fails terminally when one ro
     const result = await worker.run('operation-1');
 
     assert.equal(result.status, 'failed');
+    assert.equal(result.drainUncertain, true);
     assert.deepEqual(events.filter(event => event.method === 'rollback'), [
         { method: 'rollback', node: 'node-b' },
         { method: 'rollback', node: 'node-a' },
@@ -2017,6 +2042,24 @@ test('terminal metadata failure is fenced by the current owner and fresh lease',
         errorCode: 'TOPOLOGY_OPERATION_LEASE_LOST',
     });
     assert.equal(operation.status, 'preparing');
+});
+
+test('failed expired preparation cleanup reports retained ownership to shutdown', async () => {
+    const operation = durableOperation();
+    Object.assign(operation, { status: 'preparing', leaseOwner: 'stopped-process',
+        leaseUntil: new Date(NOW.getTime() - 1) });
+    Object.assign(operation.nodes[0], { state: 'prepared', backupId: 'topology-backup-node-a' });
+    const worker = createWorker({ repository: createRepository(operation), executor: {
+        async prepare() { throw new Error('must not prepare'); },
+        async commit() { throw new Error('must not commit'); },
+        async verify() { throw new Error('must not verify'); },
+        async rollback() { throw new Error('must not rollback'); },
+        async rehydrate(request) { return { ok: true, backupId: request.backupId, prepared: Object.freeze({}) }; },
+        async cleanupPrepared() { throw new Error('remote cleanup outcome unknown'); },
+    } });
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.drainUncertain, true);
 });
 
 test('expired partial preparation is rehydrated, cleaned, and retried from fresh prepare state', async () => {

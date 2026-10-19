@@ -58,6 +58,49 @@ function createScanModel(rows, calls = []) {
     };
 }
 
+test('topology recovery retains uncertain ownership evidence across idle ticks', async () => {
+    let rows = [{ _id: 'queued', status: 'queued' }];
+    const timer = createFakeTimer();
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
+        operationModel: { find() { return createScanModel(rows).find(); } },
+        worker: { async run() { return { claimed: true, stopped: true, status: 'failed',
+            errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' }; } }, timer,
+    });
+    lifecycle.start();
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    rows = [];
+    await timer.schedules[0].callback();
+    assert.equal((await lifecycle.stop()).drainUncertain, true);
+});
+
+test('topology supervised failures are logged but cannot become a successful drain', async () => {
+    for (const boundary of ['worker', 'scan', 'intent', 'proof']) {
+        const fail = async () => { throw new Error('unconfirmed outcome'); };
+        const model = createScanModel([{ _id: 'queued', status: 'queued' }]);
+        if (boundary === 'scan') model.find = () => { throw new Error('read failed'); };
+        const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
+            operationModel: model,
+            worker: { run: boundary === 'worker' ? fail : async () => ({ claimed: false }) },
+            ...(boundary === 'intent' ? { intentConsumer: { runOnce: fail } } : {}),
+            ...(boundary === 'proof' ? { clientProofWorker: { runOnce: fail } } : {}),
+            timer: createFakeTimer(),
+        });
+        lifecycle.start();
+        assert.equal((await lifecycle.stop()).drainUncertain, true, boundary);
+    }
+});
+
+test('topology refusal and a settled failed operation remain clean drains', async () => {
+    for (const result of [{ claimed: false, stopped: true }, { claimed: true, status: 'failed' }]) {
+        const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
+            operationModel: createScanModel([{ _id: 'queued', status: 'queued' }]),
+            worker: { async run() { return result; } }, timer: createFakeTimer(),
+        });
+        lifecycle.start();
+        assert.notEqual((await lifecycle.stop()).drainUncertain, true);
+    }
+});
+
 test('enabled lifecycle recovers queued and expired operation ids at startup', async () => {
     const modelCalls = [];
     const workerCalls = [];
@@ -364,6 +407,27 @@ test('duplicate lifecycle registration is blocked before and after stop', async 
     assert.equal(timer.schedules.length, 1);
     assert.equal(timer.cleared.length, 1);
     assert.equal(modelCalls.filter(call => call.method === 'find').length, 1);
+});
+
+test('host closes both admissions before joining either drain and preserves topology uncertainty', async () => {
+    let finishRecovery;
+    const recoveryDrain = new Promise(resolve => { finishRecovery = resolve; });
+    const calls = [];
+    const host = createL2tpPanelHost({ env: ENABLED_ENV, HyNode: {}, CascadeLink: {},
+        moduleEntry: { registerModels: () => ({}),
+            createTopologyDeploymentService: () => ({ operationWorker: { async run() {} } }) },
+        topologyRuntime: {}, Repository: class {}, createRepositoryAdapters: () => ({}),
+        createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({ runtime: {}, start() {},
+            async stop() { calls.push('execution-stop'); return { enabled: true, running: false, inFlight: false }; } }),
+        createTopologyRecoveryLifecycle: () => ({ start() {},
+            stop() { calls.push('recovery-stop'); return recoveryDrain; } }),
+    });
+    const stopping = host.stop();
+    try {
+        assert.deepEqual(calls, ['recovery-stop', 'execution-stop']);
+    } finally { finishRecovery({ drainUncertain: true }); }
+    assert.equal((await stopping).drainUncertain, true);
 });
 
 test('panel host lazily registers opted-in topology recovery and stops it before shutdown', async () => {

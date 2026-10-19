@@ -258,15 +258,20 @@ function createL2tpPanelHost({
             return executionState;
         },
         async stop() {
-            let recoveryError;
-            try {
-                await topologyRecoveryLifecycle?.stop();
-            } catch (error) {
-                recoveryError = error;
-            }
-            const executionState = await executionRuntime.stop();
-            if (recoveryError) throw recoveryError;
-            return executionState;
+            // Fence BOTH schedules before waiting for either remote invocation.
+            // A failing lifecycle must not abandon the other dependency drain.
+            const stop = lifecycle => {
+                try { return lifecycle?.stop(); }
+                catch (error) { return Promise.reject(error); }
+            };
+            const [recovery, execution] = await Promise.allSettled([
+                stop(topologyRecoveryLifecycle), stop(executionRuntime),
+            ]);
+            if (recovery.status === 'rejected') throw recovery.reason;
+            if (execution.status === 'rejected') throw execution.reason;
+            return recovery.value?.drainUncertain === true
+                ? { ...execution.value, drainUncertain: true }
+                : execution.value;
         },
     };
 }

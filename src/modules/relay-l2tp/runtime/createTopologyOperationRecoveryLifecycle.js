@@ -101,16 +101,26 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
     let schedule = null;
     let inFlight = null;
     let stopped = false;
+    let drainUncertain = false;
+
+    function observeResult(result) {
+        if (result?.drainUncertain === true
+            || (result?.claimed === true && result.stopped === true)) drainUncertain = true;
+    }
 
     function state() {
         return {
             enabled: true,
             running: schedule !== null,
             inFlight: inFlight !== null,
+            ...(drainUncertain ? { drainUncertain: true } : {}),
         };
     }
 
     function logFailure(code) {
+        // Supervision may log-and-continue, but it cannot attest that a failed
+        // invocation/persistence handoff relinquished its durable ownership.
+        drainUncertain = true;
         try {
             logger.error('Topology operation recovery failed', { code });
         } catch {
@@ -138,7 +148,7 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
             if (operationId.length === 0 || seen.has(operationId)) continue;
             seen.add(operationId);
             try {
-                await worker.run(operationId);
+                observeResult(await worker.run(operationId));
             } catch {
                 logFailure('TOPOLOGY_OPERATION_RECOVERY_RUN_FAILED');
             }
@@ -147,7 +157,7 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
 
     async function recoverTick() {
         if (intentConsumer !== undefined) {
-            try { await intentConsumer.runOnce(); }
+            try { observeResult(await intentConsumer.runOnce()); }
             catch { logFailure('TOPOLOGY_INTENT_RECOVERY_RUN_FAILED'); }
         }
         try {
@@ -157,7 +167,7 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
         }
         if (clientProofWorker !== undefined) {
             try {
-                await clientProofWorker.runOnce();
+                observeResult(await clientProofWorker.runOnce());
             } catch {
                 logFailure('TOPOLOGY_CLIENT_PROOF_RECOVERY_RUN_FAILED');
             }

@@ -28,12 +28,16 @@ function createL2tpWorkerLifecycle({
 
     let schedule = null;
     let inFlight = null;
+    // Sticky for this process lifetime: an idle/later successful tick cannot
+    // attest completion or release ownership retained by an earlier invocation.
+    let drainUncertain = false;
 
     function state() {
         return {
             enabled,
             running: schedule !== null,
             inFlight: inFlight !== null,
+            ...(drainUncertain ? { drainUncertain: true } : {}),
         };
     }
 
@@ -41,7 +45,11 @@ function createL2tpWorkerLifecycle({
         if (schedule === null || inFlight !== null) return Promise.resolve();
 
         const run = Promise.resolve().then(() => worker.runOnce());
-        inFlight = run.catch(() => {
+        inFlight = run.then(result => {
+            if (result?.drainUncertain === true
+                || (result?.claimed === true && result.stopped === true)) drainUncertain = true;
+        }).catch(() => {
+            drainUncertain = true;
             try {
                 logger.error('L2TP worker run failed', {
                     code: 'L2TP_WORKER_RUN_FAILED',

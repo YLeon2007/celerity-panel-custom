@@ -134,6 +134,7 @@ function lifecycleSummary(state) {
         enabled: state?.enabled === true,
         running: state?.running === true,
         inFlight: state?.inFlight === true,
+        ...(state?.drainUncertain === true ? { drainUncertain: true } : {}),
     };
 }
 

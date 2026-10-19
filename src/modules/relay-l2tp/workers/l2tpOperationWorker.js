@@ -850,6 +850,7 @@ class L2tpOperationWorker {
                             claimed: true,
                             operationId,
                             status: 'failed',
+                            drainUncertain: true,
                             ...(retained ? {} : {
                                 stopped: true,
                                 errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
@@ -979,6 +980,7 @@ class L2tpOperationWorker {
                             claimed: true,
                             operationId,
                             status: 'failed',
+                            drainUncertain: true,
                             ...(retained ? {} : {
                                 stopped: true,
                                 errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
@@ -1091,6 +1093,7 @@ class L2tpOperationWorker {
                             claimed: true,
                             operationId,
                             status: 'failed',
+                            drainUncertain: true,
                             ...(retained ? {} : {
                                 stopped: true,
                                 errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
