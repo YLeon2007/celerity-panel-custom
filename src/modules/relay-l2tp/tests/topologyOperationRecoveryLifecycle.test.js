@@ -7,8 +7,10 @@ const {
     createTopologyOperationRecoveryLifecycle,
 } = require('../runtime/createTopologyOperationRecoveryLifecycle');
 const { createL2tpPanelHost } = require('../../createL2tpPanelHost');
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const ENABLED_ENV = Object.freeze({
+    PANEL_DOMAIN: TEST.hostIdentity,
     L2TP_EXECUTION_ENABLED: 'true',
     L2TP_MIGRATIONS_ENABLED: 'true',
     TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
@@ -59,9 +61,9 @@ function createScanModel(rows, calls = []) {
 }
 
 test('topology recovery retains uncertain ownership evidence across idle ticks', async () => {
-    let rows = [{ _id: 'queued', status: 'queued' }];
+    let rows = [{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }];
     const timer = createFakeTimer();
-    const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST, env: ENABLED_ENV,
         operationModel: { find() { return createScanModel(rows).find(); } },
         worker: { async run() { return { claimed: true, stopped: true, status: 'failed',
             errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' }; } }, timer,
@@ -76,9 +78,9 @@ test('topology recovery retains uncertain ownership evidence across idle ticks',
 test('topology supervised failures are logged but cannot become a successful drain', async () => {
     for (const boundary of ['worker', 'scan', 'intent', 'proof']) {
         const fail = async () => { throw new Error('unconfirmed outcome'); };
-        const model = createScanModel([{ _id: 'queued', status: 'queued' }]);
+        const model = createScanModel([{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }]);
         if (boundary === 'scan') model.find = () => { throw new Error('read failed'); };
-        const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
+        const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST, env: ENABLED_ENV,
             operationModel: model,
             worker: { run: boundary === 'worker' ? fail : async () => ({ claimed: false }) },
             ...(boundary === 'intent' ? { intentConsumer: { runOnce: fail } } : {}),
@@ -92,8 +94,8 @@ test('topology supervised failures are logged but cannot become a successful dra
 
 test('topology refusal and a settled failed operation remain clean drains', async () => {
     for (const result of [{ claimed: false, stopped: true }, { claimed: true, status: 'failed' }]) {
-        const lifecycle = createTopologyOperationRecoveryLifecycle({ env: ENABLED_ENV,
-            operationModel: createScanModel([{ _id: 'queued', status: 'queued' }]),
+        const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST, env: ENABLED_ENV,
+            operationModel: createScanModel([{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }]),
             worker: { async run() { return result; } }, timer: createFakeTimer(),
         });
         lifecycle.start();
@@ -105,19 +107,19 @@ test('enabled lifecycle recovers queued and expired operation ids at startup', a
     const modelCalls = [];
     const workerCalls = [];
     const timer = createFakeTimer();
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel([
             {
                 _id: 'queued-operation',
-                status: 'queued',
+                executionContext: { ...TEST }, status: 'queued',
                 leaseOwner: '',
                 leaseUntil: null,
                 nodes: [{ state: 'pending', backupId: '' }],
             },
             {
                 _id: 'expired-operation',
-                status: 'preparing',
+                executionContext: { ...TEST }, status: 'preparing',
                 leaseOwner: 'stopped-worker',
                 leaseUntil: new Date('2026-09-23T11:59:59.999Z'),
                 nodes: [{ state: 'pending', backupId: '' }],
@@ -156,9 +158,9 @@ test('enabled lifecycle recovers queued and expired operation ids at startup', a
 test('TEST ticks run one client proof after the topology scan', async () => {
     const calls = [];
     const timer = createFakeTimer();
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
-        operationModel: createScanModel([{ _id: 'queued', status: 'queued' }], calls),
+        operationModel: createScanModel([{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }], calls),
         worker: { async run(id) { calls.push({ method: 'run', id }); } },
         clientProofWorker: { async runOnce() { calls.push({ method: 'proof' }); } },
         timer,
@@ -175,9 +177,9 @@ test('proof failures log a safe code and do not prevent subsequent topology tick
     const calls = [];
     const logs = [];
     const timer = createFakeTimer();
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
-        operationModel: createScanModel([{ _id: 'queued', status: 'queued' }]),
+        operationModel: createScanModel([{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }]),
         worker: { async run(id) { calls.push(id); } },
         clientProofWorker: {
             async runOnce() {
@@ -204,7 +206,7 @@ test('proof failures log a safe code and do not prevent subsequent topology tick
 test('failed topology scan still gives the proof worker one attempt', async () => {
     const codes = [];
     let proofCalls = 0;
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel(null),
         worker: { async run() {} },
@@ -226,7 +228,7 @@ test('stop waits for an in-flight proof and skips overlapping ticks', async () =
     const started = new Promise(resolve => { proofStarted = resolve; });
     const blocked = new Promise(resolve => { releaseProof = resolve; });
     let proofCalls = 0;
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel([]),
         worker: { async run() {} },
@@ -259,7 +261,7 @@ test('missing any exact topology test flag leaves recovery dormant without scann
         const env = { ...ENABLED_ENV };
         delete env[flagName];
         let dependencyReads = 0;
-        const lifecycle = createTopologyOperationRecoveryLifecycle({
+        const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
             env,
             get operationModel() {
                 dependencyReads += 1;
@@ -300,26 +302,26 @@ test('missing any exact topology test flag leaves recovery dormant without scann
 test('scan never invokes the worker for an active unexpired foreign lease', async () => {
     const workerCalls = [];
     const now = new Date('2026-09-23T12:00:00.000Z');
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel([
             {
                 _id: 'queued-operation',
-                status: 'queued',
+                executionContext: { ...TEST }, status: 'queued',
                 leaseOwner: '',
                 leaseUntil: null,
                 nodes: [{ state: 'pending', backupId: '' }],
             },
             {
                 _id: 'expired-operation',
-                status: 'preparing',
+                executionContext: { ...TEST }, status: 'preparing',
                 leaseOwner: 'stopped-worker',
                 leaseUntil: new Date(now.getTime() - 1),
                 nodes: [{ state: 'pending', backupId: '' }],
             },
             {
                 _id: 'active-foreign-operation',
-                status: 'preparing',
+                executionContext: { ...TEST }, status: 'preparing',
                 leaseOwner: 'foreign-worker',
                 leaseUntil: new Date(now.getTime() + 60_000),
                 nodes: [{ state: 'pending', backupId: '' }],
@@ -344,19 +346,19 @@ test('scan never invokes the worker for an active unexpired foreign lease', asyn
 test('startup scan recovers expired committing and rolling-back operations', async () => {
     const now = new Date('2026-09-23T12:00:00.000Z');
     const workerCalls = [];
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel([
             {
                 _id: 'expired-committing-operation',
-                status: 'committing',
+                executionContext: { ...TEST }, status: 'committing',
                 leaseOwner: 'stopped-worker',
                 leaseUntil: new Date(now.getTime() - 1),
                 nodes: [{ state: 'committed', backupId: 'backup-a' }],
             },
             {
                 _id: 'expired-rolling-back-operation',
-                status: 'rolling_back',
+                executionContext: { ...TEST }, status: 'rolling_back',
                 leaseOwner: 'stopped-worker',
                 leaseUntil: new Date(now.getTime() - 1),
                 nodes: [{ state: 'failed', backupId: 'backup-b' }],
@@ -384,7 +386,7 @@ test('startup scan recovers expired committing and rolling-back operations', asy
 test('duplicate lifecycle registration is blocked before and after stop', async () => {
     const modelCalls = [];
     const timer = createFakeTimer();
-    const lifecycle = createTopologyOperationRecoveryLifecycle({
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ executionContext: TEST,
         env: ENABLED_ENV,
         operationModel: createScanModel([], modelCalls),
         worker: { async run() {} },
@@ -528,6 +530,7 @@ test('panel host lazily registers opted-in topology recovery and stops it before
     assert.deepEqual(deploymentDependencies.env, { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' });
     assert.strictEqual(deploymentDependencies.TopologyOperation, TopologyOperation);
     assert.strictEqual(recoveryDependencies.env, deploymentDependencies.env);
+    assert.strictEqual(recoveryDependencies.executionContext, TEST);
     assert.strictEqual(recoveryDependencies.operationModel, TopologyOperation);
     assert.strictEqual(recoveryDependencies.worker, topologyWorker);
     assert.strictEqual(recoveryDependencies.clock, clock);
@@ -654,7 +657,7 @@ test('TEST host without probe user leaves proof unclaimed while topology recover
     let topologyRuns = 0;
     let proofClaims = 0;
     const TopologyOperation = {
-        find: () => createScanModel([{ _id: 'queued', status: 'queued' }]).find(),
+        find: () => createScanModel([{ _id: 'queued', executionContext: { ...TEST }, status: 'queued' }]).find(),
         async findOneAndUpdate() { proofClaims += 1; throw Error('must not claim'); },
     };
     const host = createL2tpPanelHost({

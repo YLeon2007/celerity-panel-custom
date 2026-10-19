@@ -1,8 +1,9 @@
 'use strict';
 
 const {
-    isTopologyTestExecutionEnabled,
+    resolveTopologyExecutionContext,
 } = require('./createTopologyOperationRuntime');
+const { TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
 
 const DEFAULT_CLOCK = Object.freeze({ now: () => new Date() });
 const DEFAULT_INTERVAL_MS = 30_000;
@@ -32,8 +33,14 @@ const RECOVERABLE_STATUSES = Object.freeze([
     'rolling_back',
 ]);
 
-function recoveryFilter(now) {
+function recoveryFilter(now, executionContext) {
+    if (!TOPOLOGY_EXECUTION_CONTEXTS.includes(executionContext)) {
+        throw new TypeError('Topology recovery filter requires a canonical execution context');
+    }
     return {
+        // Exact persisted binding is mandatory, including for queued rows and
+        // expired PPP waits. An absent binding is not permission to adopt a row.
+        executionContext: { ...executionContext },
         $or: [
             { status: 'queued' },
             {
@@ -56,7 +63,13 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
         return createDormantLifecycle();
     }
     const env = options.env === undefined ? process.env : options.env;
-    if (!isTopologyTestExecutionEnabled(env)) return createDormantLifecycle();
+    // Identity is selected by the host, not reconstructed from a caller's pair
+    // or reselected from a mutable environment during later recovery ticks.
+    const executionContext = options.executionContext;
+    if (!TOPOLOGY_EXECUTION_CONTEXTS.includes(executionContext)
+        || resolveTopologyExecutionContext(env) !== executionContext) {
+        return createDormantLifecycle();
+    }
 
     const {
         operationModel,
@@ -130,8 +143,8 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
 
     async function scan() {
         const now = clock.now();
-        const operations = await operationModel.find(recoveryFilter(now))
-            .select('_id status leaseOwner leaseUntil nodes.state nodes.backupId')
+        const operations = await operationModel.find(recoveryFilter(now, executionContext))
+            .select('_id executionContext status leaseOwner leaseUntil nodes.state nodes.backupId')
             .sort({ createdAt: 1, _id: 1 })
             .limit(scanLimit)
             .lean();
@@ -141,6 +154,13 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
 
         const seen = new Set();
         for (const operation of operations) {
+            // Defense in depth for adapters returning rows outside the query.
+            // Persisted contexts are values, unlike the canonical host object.
+            const binding = operation?.executionContext;
+            if (!binding || typeof binding !== 'object' || Array.isArray(binding)
+                || Object.keys(binding).length !== 2
+                || binding.target !== executionContext.target
+                || binding.hostIdentity !== executionContext.hostIdentity) continue;
             if (!isRecoveryCandidate(operation, now)) continue;
             const operationId = operation?._id === null || operation?._id === undefined
                 ? ''
@@ -165,7 +185,10 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
         } catch {
             logFailure('TOPOLOGY_OPERATION_RECOVERY_SCAN_FAILED');
         }
-        if (clientProofWorker !== undefined) {
+        // The independent proof queue claims its own rows without an execution
+        // identity predicate. Preserve its existing TEST-only contract; never
+        // let a production opt-in authorize this unfenced claim/write path.
+        if (executionContext.target === 'test' && clientProofWorker !== undefined) {
             try {
                 observeResult(await clientProofWorker.runOnce());
             } catch {

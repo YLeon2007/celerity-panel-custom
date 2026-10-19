@@ -2,7 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createTopologyOperationRecoveryLifecycle } = require('../runtime/createTopologyOperationRecoveryLifecycle');
-const TEST_CONTEXT = Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' });
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT } = require('../domain/topologyExecutionContext');
+const TEST_CONTEXT = TEST_TOPOLOGY_EXECUTION_CONTEXT;
 test('intent admission and consumption reject missing or cross-paired server contexts before persistence', () => {
     const { TopologyIntentService } = require('../services/topologyIntentService');
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
@@ -17,7 +18,8 @@ test('intent admission and consumption reject missing or cross-paired server con
         }
     }
 });
-const env = { L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
+const env = { PANEL_DOMAIN: TEST_TOPOLOGY_EXECUTION_CONTEXT.hostIdentity,
+    L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
 test('intent transactions explicitly require primary snapshot reads and majority commit acknowledgement', async () => {
     const { TopologyIntentService } = require('../services/topologyIntentService');
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
@@ -63,7 +65,7 @@ test('ambiguous intent acceptance explicitly confirms on the primary outside the
 test('the opt-in supervised startup consumes intents before scanning operations and stop joins its admitted transaction', async () => {
     let unblock; const gate = new Promise(resolve => { unblock = resolve; });
     const trace = []; let tick; let scheduled = 0;
-    const lifecycle = createTopologyOperationRecoveryLifecycle({ env,
+    const lifecycle = createTopologyOperationRecoveryLifecycle({ env, executionContext: TEST_TOPOLOGY_EXECUTION_CONTEXT,
         timer: { setInterval(fn) { scheduled++; tick = fn; return 1; }, clearInterval() { trace.push('timer.stop'); } },
         intentConsumer: { async runOnce() { trace.push('intent.begin'); await gate; trace.push('intent.end'); } },
         operationModel: { find() { trace.push('operation.scan'); return { select() { return this; }, sort() { return this; }, limit() { return this; }, lean: async () => [] }; } },
