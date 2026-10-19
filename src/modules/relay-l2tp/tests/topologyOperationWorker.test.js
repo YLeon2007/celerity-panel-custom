@@ -225,6 +225,7 @@ function createWorker({
     pppReadinessGate,
     pppResumeReadinessGate,
     pppDriftSync,
+    attachIngressGate,
     allowUnprovenTestExecution = true,
 } = {}) {
     const suppliedLockService = lockService || {
@@ -275,6 +276,7 @@ function createWorker({
         pppReadinessGate,
         pppResumeReadinessGate,
         pppDriftSync,
+    attachIngressGate,
         ...(allowUnprovenTestExecution ? { allowUnprovenTestExecution: true } : {}),
     });
 }
@@ -472,7 +474,8 @@ function createSlowPhaseHarness(phase) {
             async prepare(request) {
                 prepareCalls += 1;
                 if (phase === 'cleanupPrepared' && prepareCalls === 2) {
-                    throw new Error('start prepared-node cleanup');
+                    throw Object.assign(new Error('start prepared-node cleanup'),
+                        { remoteOutcomeUncertain: false });
                 }
                 await pause('prepare');
                 return {
@@ -1685,7 +1688,7 @@ test('delegates terminal success to the atomic finalizer with only operation lea
     );
 });
 
-test('atomic finalizer failure rolls back committed nodes and cannot report success', async () => {
+test('atomic finalizer failure leaves committing work recoverable without unlocked rollback', async () => {
     const repository = createRepository();
     const rollbackNodes = [];
     const executor = {
@@ -1717,9 +1720,9 @@ test('atomic finalizer failure rolls back committed nodes and cannot report succ
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'rolled_back');
-    assert.deepEqual(rollbackNodes, ['node-b', 'node-a']);
-    assert.equal(repository.operation.status, 'rolled_back');
+    assert.equal(result.status, 'committing');
+    assert.deepEqual(rollbackNodes, []);
+    assert.equal(repository.operation.status, 'committing');
     assert.equal(
         repository.calls.some(call => (
             call.method === 'finishClaimed' && call.request.status === 'succeeded'
@@ -1790,7 +1793,8 @@ test('prepare failure cleans only prepared nodes and performs no commits', async
     const executor = {
         async prepare(request) {
             events.push({ method: 'prepare', node: request.node.node });
-            if (request.node.node === 'node-b') throw new Error('prepare failed');
+            if (request.node.node === 'node-b') throw Object.assign(new Error('pre-dispatch prepare failed'),
+                { remoteOutcomeUncertain: false });
             return {
                 backupId: `backup-${request.node.node}`,
                 prepared: { opaque: request.node.node },
@@ -1884,7 +1888,7 @@ test('commit failure rolls back the current and prior committed nodes in reverse
     ]);
 });
 
-test('atomic finalizer failure rolls back every changed node and cannot succeed', async () => {
+test('atomic finalizer rejection defers rollback until recovery reacquires all locks', async () => {
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -1920,12 +1924,9 @@ test('atomic finalizer failure rolls back every changed node and cannot succeed'
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'rolled_back');
-    assert.deepEqual(events, [
-        { method: 'rollback', node: 'node-b' },
-        { method: 'rollback', node: 'node-a' },
-    ]);
-    assert.equal(repository.operation.status, 'rolled_back');
+    assert.equal(result.status, 'committing');
+    assert.deepEqual(events, []);
+    assert.equal(repository.operation.status, 'committing');
     assert.equal(
         repository.calls.some(call => (
             call.method === 'finishClaimed' && call.request.status === 'succeeded'
@@ -2187,4 +2188,228 @@ test('expired rollback resumes after a crash point and preserves failed rollback
     assert.equal(operation.status, 'failed');
     assert.equal(operation.nodes.find(node => node.node === 'node-a').state, 'failed');
     assert.equal(operation.nodes.find(node => node.node === 'node-b').state, 'rolled_back');
+});
+
+function safetyExecutor(overrides = {}) {
+    return {
+        async prepare({ node }) { return { backupId: 'backup-' + node.node,
+            prepared: Object.freeze({ node: node.node }) }; },
+        async commit() { return { ok: true }; },
+        async verify() { return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; },
+        async rollback() { return { ok: true }; },
+        ...overrides,
+    };
+}
+
+test('uncertain prepare retains admission and every lock without claiming rollback', async () => {
+    const operation = durableOperation();
+    operation.heldTopologyAdmission = true;
+    const repository = createRepository(operation);
+    const events = [];
+    const worker = createWorker({ repository,
+        executor: safetyExecutor({ async prepare({ node }) {
+            if (node.node === 'node-b') throw Object.assign(new Error('timeout'),
+                { remoteOutcomeUncertain: true, backupId: 'backup-node-b' });
+            return { backupId: 'backup-node-a', prepared: Object.freeze({}) };
+        }, async cleanupPrepared() { events.push('cleanup'); return { ok: true }; } }),
+        lockService: { async acquire({ node }) { return { ok: true, lock: { generation: node } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified() { events.push('release'); return { ok: true }; } },
+        finalizer: { async finalizeSucceeded() { events.push('success'); },
+            async finalizeRolledBack() { events.push('rollback-admission'); return true; } },
+    });
+    const result = await worker.run('operation-1');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.equal(operation.heldTopologyAdmission, true);
+    assert.equal(operation.nodes[1].state, 'failed');
+    assert.equal(operation.nodes[1].backupId, 'backup-node-b');
+    assert.deepEqual(events, []);
+});
+
+test('prepare cleanup restores dynamic users before releasing rollback admission', async t => {
+    for (const outcome of ['ok', 'false', 'throw']) await t.test(outcome, async () => {
+        const operation = durableOperation();
+        operation.heldTopologyAdmission = true;
+        const repository = createRepository(operation);
+        const events = [];
+        const worker = createWorker({ repository, executor: safetyExecutor({
+            async prepare({ node }) {
+                if (node.node === 'node-b') throw Object.assign(new Error('resolver failed'),
+                    { remoteOutcomeUncertain: false });
+                return { backupId: 'backup-node-a', prepared: Object.freeze({}) };
+            },
+            async cleanupPrepared() { events.push('cleanup'); return { ok: true }; },
+        }),
+        userResync: { async resyncPlan() {
+            events.push('restore');
+            if (outcome === 'throw') throw new Error('user sync unavailable');
+            return { ok: outcome === 'ok' };
+        } },
+        lockService: { async acquire({ node }) { return { ok: true, lock: { generation: node } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified() { events.push('release'); return { ok: true }; } },
+        finalizer: { async finalizeSucceeded() { throw new Error('not success'); },
+            async finalizeRolledBack() { events.push('admission'); return true; } },
+        });
+        const result = await worker.run('operation-1');
+        assert.equal(result.status, outcome === 'ok' ? 'rolled_back' : 'failed');
+        assert.deepEqual(events, outcome === 'ok'
+            ? ['cleanup', 'restore', 'release', 'release', 'admission'] : ['cleanup', 'restore']);
+    });
+});
+
+test('attach PPP resume requires a fresh ingress proof before publication', async t => {
+    for (const outcome of ['missing', 'false', 'throw', 'ok']) await t.test(outcome, async () => {
+        const operation = durableThreeNodeOperation();
+        Object.assign(operation, { kind: 'link.attach', groupId: 'group-1', pathKey: 'main',
+            ownerNodeId: 'node-b', status: 'committing', heldTopologyAdmission: true });
+        operation.nodes.forEach(node => { node.state = 'committed'; node.backupId = 'backup-' + node.node; });
+        operation.pppWait = { lockOwner: 'old-worker', relayNode: 'node-b', credentialRevision: 7,
+            locks: operation.nodes.map(({ node }) => ({ node, generation: 'old-' + node })),
+            releasedNodes: operation.nodes.map(({ node }) => node), probeLocks: [] };
+        const events = [];
+        const held = new Set();
+        const repository = createRepository(operation, { async claim({ owner, now, leaseMs }) {
+            operation.leaseOwner = owner; operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        } });
+        const worker = createWorker({ repository, executor: safetyExecutor(),
+            lockService: { async acquire({ node }) { held.add(node);
+                return { ok: true, lock: { generation: 'fresh-' + node } }; },
+                async renew() { return { ok: true }; },
+                async releaseVerified({ node }) { held.delete(node); events.push('release'); return { ok: true }; } },
+            pppResumeReadinessGate: { readOnly: true, async verifyPlan() { events.push('ppp');
+                return { ok: true, relayRevisions: [{ relayNode: 'node-b', credentialRevision: 8 }] }; } },
+            pppDriftSync: { async enqueue() { throw new Error('not drift'); } },
+            attachIngressGate: outcome === 'missing' ? undefined : { async verifyPlan(plan) {
+                assert.equal(plan.kind, 'link.attach');
+                assert.equal(held.size, 3, 'ingress proof must hold every probe generation');
+                events.push('ingress');
+                if (outcome === 'throw') throw new Error('ingress unavailable');
+                return { ok: outcome === 'ok' };
+            } },
+            finalizer: { async finalizeSucceeded() { assert.equal(held.size, 0); events.push('publish'); return true; } },
+        });
+        const result = await worker.run('operation-1');
+        assert.equal(result.status, outcome === 'ok' ? 'succeeded' : 'awaiting_ppp');
+        assert.equal(events.includes('publish'), outcome === 'ok');
+        if (outcome === 'ok') assert.deepEqual(events, ['ppp', 'ingress', 'release', 'release', 'release', 'publish']);
+        else assert.equal(operation.heldTopologyAdmission, true);
+    });
+});
+
+test('success publication waits for confirmed exact lock release', async t => {
+    for (const outcome of ['false', 'throw', 'ok', 'finalize-error']) await t.test(outcome, async () => {
+        const operation = durableOperation();
+        operation.heldTopologyAdmission = true;
+        const repository = createRepository(operation);
+        const events = [];
+        const worker = createWorker({ repository, executor: safetyExecutor({
+            async rollback() { events.push('rollback'); return { ok: true }; },
+        }),
+        lockService: { async acquire({ node }) { return { ok: true, lock: { generation: 'exact-' + node } }; },
+            async renew() { assert.equal(events.includes('release'), false, 'stop heartbeat before release');
+                return { ok: true }; },
+            async releaseVerified({ generation }) { assert.match(generation, /^exact-/); events.push('release');
+                if (outcome === 'throw') throw new Error('delete unavailable');
+                return { ok: outcome !== 'false' }; } },
+        finalizer: { async finalizeSucceeded() {
+            assert.equal(events.filter(e => e === 'release').length, 2);
+            events.push('finalize');
+            if (outcome === 'finalize-error') throw new Error('transaction unavailable');
+            operation.status = 'succeeded'; operation.heldTopologyAdmission = false; return true;
+        } },
+        });
+        const result = await worker.run('operation-1');
+        assert.equal(result.status, outcome === 'ok' ? 'succeeded' : 'committing');
+        assert.equal(events.includes('rollback'), false, 'no remote mutation after releasing locks');
+        assert.equal(events.includes('finalize'), ['ok', 'finalize-error'].includes(outcome));
+        assert.equal(operation.heldTopologyAdmission, outcome !== 'ok');
+        if (outcome !== 'ok') assert.equal(result.stopped, true);
+    });
+});
+
+test('failed publication is recovered only after reacquiring every node lock', async () => {
+    const operation = durableOperation();
+    operation.heldTopologyAdmission = true;
+    const held = new Set();
+    const events = [];
+    let recovery = false;
+    const repository = createRepository(operation, {
+        async claim({ owner, now, leaseMs }) {
+            if (operation.status !== 'queued'
+                && !(operation.status === 'committing' && operation.leaseUntil <= now)) return null;
+            if (operation.status === 'queued') operation.status = 'preparing';
+            operation.leaseOwner = owner;
+            operation.leaseUntil = new Date(now.getTime() + leaseMs);
+            return structuredClone(operation);
+        },
+    });
+    const worker = createWorker({ repository,
+        clock: { now: () => new Date(NOW.getTime() + (recovery ? 60_000 : 0)) },
+        executor: safetyExecutor({
+            async rehydrate({ backupId }) {
+                assert.equal(held.size, 2);
+                return { ok: true, backupId, prepared: Object.freeze({}) };
+            },
+            async rollback({ node }) {
+                assert.equal(held.size, 2, 'never roll back with released/partial locks');
+                events.push('rollback:' + node.node);
+                return { ok: true };
+            },
+        }),
+        lockService: {
+            async acquire({ node }) { held.add(node); events.push('acquire:' + node);
+                return { ok: true, lock: { generation: 'exact-' + node } }; },
+            async renew() { return { ok: true }; },
+            async releaseVerified({ node }) { held.delete(node); return { ok: true }; },
+        },
+        finalizer: {
+            async finalizeSucceeded() { throw new Error('publication rejected'); },
+            async finalizeRolledBack() {
+                assert.equal(held.size, 0);
+                operation.heldTopologyAdmission = false;
+                return true;
+            },
+        },
+    });
+    assert.equal((await worker.run('operation-1')).status, 'committing');
+    assert.equal(operation.heldTopologyAdmission, true);
+    assert.equal(held.size, 0);
+    events.length = 0;
+    recovery = true;
+    assert.equal((await worker.run('operation-1')).status, 'rolled_back');
+    assert.deepEqual(events, ['acquire:node-a', 'acquire:node-b', 'rollback:node-b', 'rollback:node-a']);
+    assert.equal(operation.heldTopologyAdmission, false);
+});
+
+test('crash after recording an uncertain failed node cannot resume remote work', async t => {
+    for (const status of ['preparing', 'committing', 'rolling_back']) await t.test(status, async () => {
+        const operation = durableOperation();
+        operation.status = status;
+        operation.heldTopologyAdmission = true;
+        operation.nodes[0].state = 'failed';
+        operation.nodes[0].backupId = 'backup-unknown';
+        const repository = createRepository(operation, {
+            async claim() { return structuredClone(operation); },
+        });
+        const calls = [];
+        const worker = createWorker({ repository,
+            executor: safetyExecutor({
+                async rehydrate({ backupId }) { calls.push('rehydrate');
+                    return { ok: true, backupId, prepared: Object.freeze({}) }; },
+            }),
+            lockService: { async acquire({ node }) { calls.push('acquire');
+                return { ok: true, lock: { generation: node } }; },
+                async renew() { return { ok: true }; },
+                async releaseVerified() { calls.push('release'); return { ok: true }; } },
+        });
+        const result = await worker.run('operation-1');
+        assert.equal(result.status, 'failed');
+        assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+        assert.equal(operation.heldTopologyAdmission, true);
+        assert.deepEqual(calls, []);
+    });
 });

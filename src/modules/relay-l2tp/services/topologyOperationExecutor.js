@@ -295,10 +295,16 @@ class TopologyOperationExecutor {
     }
 
     async prepare(context) {
-        const binding = projectFrozenNode(context);
-        let transport;
+        let binding;
         try {
-            transport = await this.#createTransport(binding);
+            binding = projectFrozenNode(context);
+        } catch (error) {
+            // Local validation is the only failure before any remote adapter.
+            error.remoteOutcomeUncertain = false;
+            throw error;
+        }
+        try {
+            const transport = await this.#createTransport(binding);
             const receipt = assertReceipt(await transport.prepare({
                 ...transportRequest(binding),
                 artifact: {
@@ -313,18 +319,13 @@ class TopologyOperationExecutor {
                 prepared: receipt,
             });
         } catch (error) {
-            if (transport) {
-                try {
-                    await transport.rollback(transportRequest(binding));
-                } catch {
-                    // Fixed rollback is the only cleanup fallback after prepare starts.
-                }
-            }
-            if (error instanceof TopologyOperationExecutorError
-                && error.code === 'INVALID_FROZEN_NODE_PLAN') {
-                throw error;
-            }
+            // A rejected/malformed prepare response cannot prove the remote
+            // process has exited. Do not race it with rollback or infer safety
+            // from a later rollback receipt; retain the exact backup identity.
             const wrapped = executionFailed();
+            // Runner bootstrap can itself time out with a remote writer alive.
+            wrapped.remoteOutcomeUncertain = true;
+            wrapped.backupId = binding.backupId;
             wrapped.cause = error;
             throw wrapped;
         }

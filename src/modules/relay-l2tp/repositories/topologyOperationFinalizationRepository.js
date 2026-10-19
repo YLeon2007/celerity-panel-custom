@@ -192,6 +192,14 @@ class TopologyOperationFinalizationRepository {
             throw new TypeError('Invalid rolled-back topology finalization request');
         }
         return this.transactionRunner(async session => {
+            const durable = await this.TopologyOperation.findById(operationId)
+                .select('nodes.state nodes.backupId').session(session).lean();
+            // Terminal labels alone are not rollback proof. A failed or still
+            // prepared/committed node must retain the topology admission.
+            if (!Array.isArray(durable?.nodes) || !durable.nodes.length
+                || durable.nodes.some(node => !['pending', 'rolled_back'].includes(node.state)
+                    || (node.state === 'pending' ? node.backupId !== ''
+                        : typeof node.backupId !== 'string' || !node.backupId))) return null;
             const operation = await this.TopologyOperation.updateOne({
                 _id: operationId,
                 topologyRevision,

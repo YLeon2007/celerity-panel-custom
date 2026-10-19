@@ -73,6 +73,7 @@ function createHarness(overrides = {}) {
                 session(value) { assert.strictEqual(value, SESSION); return this; },
                 async lean() { return id === store.operation._id
                     ? { heldTopologyAdmission: store.operation.heldTopologyAdmission,
+                        nodes: clone(store.operation.nodes),
                         ...(store.operation.pppWait ? { pppWait: clone(store.operation.pppWait),
                             nodes: clone(store.operation.nodes) } : {}) } : null; },
             };
@@ -157,6 +158,7 @@ test('rolled-back finalization releases exactly one held admission after rollbac
     const harness = createHarness({
         operation: {
             status: 'rolled_back',
+            nodes: [{ state: 'rolled_back', backupId: 'backup-1' }],
             heldTopologyAdmission: true,
             leaseOwner: '',
             leaseUntil: null,
@@ -900,3 +902,14 @@ for (const [name, paths] of [
         assert.deepEqual({ store: h.store, group, owner, links }, before);
     });
 }
+
+test('rollback admission cannot be released with an unresolved failed node', async () => {
+    const harness = createHarness({ operation: { status: 'rolled_back',
+        heldTopologyAdmission: true, nodes: [{ state: 'failed', backupId: 'backup-unknown' }] },
+        topology: { topologyAdmissionCount: 1 } });
+    const result = await harness.repository.finalizeRolledBack({ operationId: 'operation-7',
+        topologyRevision: 7, priorDeployedRevision: 5, now: NOW });
+    assert.equal(result, null);
+    assert.equal(harness.store.operation.heldTopologyAdmission, true);
+    assert.equal(harness.store.topology.topologyAdmissionCount, 1);
+});

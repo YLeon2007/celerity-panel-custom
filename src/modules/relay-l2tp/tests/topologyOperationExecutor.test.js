@@ -420,6 +420,7 @@ test('fails closed outside test and rejects non-frozen, role-mismatched, or expa
         await assert.rejects(executor.prepare(context), error => {
             assert.equal(error.name, 'TopologyOperationExecutorError');
             assert.equal(error.code, 'INVALID_FROZEN_NODE_PLAN');
+            assert.equal(error.remoteOutcomeUncertain, false);
             assert.equal(error.message, 'Invalid frozen topology node plan');
             assert.doesNotMatch(
                 JSON.stringify(error),
@@ -465,7 +466,7 @@ test('sanitizes hash-bound transport failures and retains only the binding neede
     assert.doesNotMatch(JSON.stringify({ executor, rolledBack }), new RegExp(remoteSecret));
 });
 
-test('a malformed prepare receipt triggers only fixed rollback and exposes no prepared binding', async () => {
+test('a malformed prepare receipt retains uncertainty and exposes no prepared binding', async () => {
     const remoteSecret = 'malformed-prepare-secret-canary';
     const { events, executor } = executorFixture({
         responseOverrides: {
@@ -475,13 +476,14 @@ test('a malformed prepare receipt triggers only fixed rollback and exposes no pr
 
     await assert.rejects(executor.prepare(prepareContext()), error => {
         assert.equal(error.code, 'TOPOLOGY_OPERATION_EXECUTION_FAILED');
+        assert.equal(error.remoteOutcomeUncertain, true);
         assert.doesNotMatch(JSON.stringify(error), new RegExp(remoteSecret));
         return true;
     });
     assert.deepEqual(
         events.filter(event => event.method === 'transport')
             .map(event => event.request.command),
-        ['prepare', 'rollback'],
+        ['prepare'],
     );
     assert.doesNotMatch(JSON.stringify(executor), new RegExp(remoteSecret));
 });
@@ -540,4 +542,37 @@ test('rehydrates a durable prepared binding without preparing or reading current
         command: 'rollback',
     }]);
     assert.doesNotMatch(JSON.stringify({ executor, rehydrated }), /secret|privateKey|topology-lookup/);
+});
+
+// A local timeout does not join the remote prepare process.
+test('prepare timeout exposes uncertainty and never races a cleanup command', async () => {
+    const calls = [];
+    class RunnerBootstrapper { async ensureRunner() {} }
+    class NodeTransportFactory {
+        async create() { return {
+            async prepare() { calls.push('prepare'); throw new Error('local timeout'); },
+            async rollback() { calls.push('rollback'); throw new Error('cleanup unavailable'); },
+        }; }
+    }
+    const executor = new TopologyOperationExecutor({ target: 'test',
+        nodeExecutionResolver: { async resolve() { return {}; } },
+        RunnerBootstrapper, NodeTransportFactory });
+    await assert.rejects(executor.prepare(prepareContext()), error => {
+        assert.equal(error.remoteOutcomeUncertain, true);
+        assert.match(error.backupId, /^topology-[a-f0-9]{64}$/);
+        return true;
+    });
+    assert.deepEqual(calls, ['prepare']);
+});
+
+test('runner bootstrap timeout is uncertain even before prepare dispatch', async () => {
+    const executor = new TopologyOperationExecutor({ target: 'test',
+        nodeExecutionResolver: { async resolve() { return {}; } },
+        RunnerBootstrapper: class { async ensureRunner() { throw new Error('upload timeout'); } },
+    });
+    await assert.rejects(executor.prepare(prepareContext()), error => {
+        assert.equal(error.remoteOutcomeUncertain, true);
+        assert.match(error.backupId, /^topology-[a-f0-9]{64}$/);
+        return true;
+    });
 });

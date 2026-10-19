@@ -648,6 +648,11 @@ class TopologyOperationWorker {
         let readiness;
         try {
             readiness = await heartbeat.run(() => this.pppResumeReadinessGate.verifyPlan(plan));
+            if (readiness?.ok === true && plan.kind === 'link.attach') {
+                if (!this.attachIngressGate) throw new Error('Attach ingress proof unavailable');
+                const ingress = await heartbeat.run(() => this.attachIngressGate.verifyPlan(plan));
+                if (ingress?.ok !== true) throw new Error('Attach ingress proof was not verified');
+            }
         } catch (error) {
             if (error instanceof LeaseLostError) throw error;
             await heartbeat.stop();
@@ -899,6 +904,10 @@ class TopologyOperationWorker {
             if (recorded !== true) throw new LeaseLostError();
         }
 
+        if (!cleanupFailed && prepared.length > 0
+            && !(await this.restoreUsersAfterRollback(plan, operationId, heartbeat))) {
+            cleanupFailed = true;
+        }
         const status = cleanupFailed ? 'failed' : 'rolled_back';
         const finished = await this.operationRepository.finishClaimed({
             operationId,
@@ -1023,7 +1032,6 @@ class TopologyOperationWorker {
         }
         this.running.add(operationId);
         let heartbeat;
-        let terminalSuccess = false;
         let resumeWait;
         let durablePppWait = false;
         let plan;
@@ -1057,6 +1065,17 @@ class TopologyOperationWorker {
                 return { claimed: true, operationId, status: 'failed' };
             }
 
+            // A crash can leave uncertainty recorded before terminal failure.
+            // Never reinterpret that durable failed node as permission to retry
+            // prepare/rollback; authoritative quiescence recovery is required.
+            if (entries.some(entry => entry.state === 'failed')) {
+                const finished = await this.operationRepository.finishClaimed({
+                    operationId, owner: this.workerId, now: this.clock.now(), status: 'failed',
+                });
+                if (finished !== true) throw new LeaseLostError();
+                return { claimed: true, operationId, status: 'failed', stopped: true,
+                    errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+            }
             heartbeat = this.createLeaseHeartbeat(operationId, acquiredNodeIds);
             if (operation.pppWait) {
                 resumeWait = operation.pppWait;
@@ -1098,8 +1117,10 @@ class TopologyOperationWorker {
             }
 
             const prepared = [];
+            let preparingNode;
             try {
                 for (const node of nodes) {
+                    preparingNode = node;
                     await this.renew(operationId);
                     const result = await heartbeat.run(
                         () => this.executor.prepare(this.context(plan, node)),
@@ -1123,6 +1144,24 @@ class TopologyOperationWorker {
                 if (error instanceof LeaseLostError) throw error;
                 logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
                 traceWorkerFailure(plan, operationId, 'worker.prepare', error);
+                // Only the typed executor's explicit pre-dispatch failure may
+                // enter cleanup. Unknown errors are not proof of quiescence.
+                if (error?.remoteOutcomeUncertain !== false) {
+                    if (preparingNode && typeof error?.backupId === 'string'
+                        && SAFE_ID_PATTERN.test(error.backupId)) {
+                        const recorded = await this.operationRepository.recordNode({
+                            operationId, owner: this.workerId, now: this.clock.now(),
+                            node: preparingNode.node, state: 'failed', backupId: error.backupId,
+                        });
+                        if (recorded !== true) throw new LeaseLostError();
+                    }
+                    const finished = await this.operationRepository.finishClaimed({
+                        operationId, owner: this.workerId, now: this.clock.now(), status: 'failed',
+                    });
+                    if (finished !== true) throw new LeaseLostError();
+                    return { claimed: true, operationId, status: 'failed', stopped: true,
+                        errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                }
                 return await this.cleanupAfterPrepareFailure(
                     plan,
                     operationId,
@@ -1286,7 +1325,17 @@ class TopologyOperationWorker {
                     );
                 }
             }
-            const leaseUntil = await heartbeat.renew();
+            // All remote work has settled in this test-only execution path.
+            // Stop lock renewal, then confirm exact release before publication
+            // can drop topology admission. No mutation is safe after this point.
+            await heartbeat.renew();
+            await heartbeat.stop();
+            if (!await this.releaseVerifiedLocks(operationId, acquiredNodeIds)) {
+                return { claimed: true, operationId, status: 'committing', stopped: true,
+                    errorCode: 'NODE_LOCK_RELEASE_FAILED' };
+            }
+            acquiredNodeIds.length = 0;
+            const leaseUntil = await this.renew(operationId);
             try {
                 const finalized = await this.finalizer.finalizeSucceeded({
                     operationId,
@@ -1302,16 +1351,12 @@ class TopologyOperationWorker {
                     throw new LeaseLostError();
                 }
                 traceWorkerFailure(plan, operationId, 'worker.finalize', error);
-                return await this.rollbackAfterCommitFailure(
-                    plan,
-                    operationId,
-                    prepared,
-                    changing,
-                    heartbeat,
-                    acquiredNodeIds,
-                );
+                // Release may have exposed these nodes to another owner. Keep
+                // admission and the recoverable committing state; a later
+                // claim must reacquire every lock before attempting rollback.
+                return { claimed: true, operationId, status: 'committing', stopped: true,
+                    errorCode: 'TOPOLOGY_OPERATION_FINALIZATION_FAILED' };
             }
-            terminalSuccess = true;
             return { claimed: true, operationId, status: 'succeeded' };
         } catch (error) {
             if (error instanceof LeaseLostError
@@ -1333,7 +1378,6 @@ class TopologyOperationWorker {
             if (resumeWait) await this.releaseUnrecordedProbeLocks(
                 operationId, resumeWait, acquiredNodeIds,
             );
-            if (terminalSuccess) await this.releaseVerifiedLocks(operationId, acquiredNodeIds);
             this.running.delete(operationId);
         }
     }
