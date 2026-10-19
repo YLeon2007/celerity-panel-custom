@@ -291,6 +291,26 @@ function legacyLinks(status) {
 }
 
 for (const writer of ['sync', 'cascade']) {
+    test(`${writer}: all 10 online legacy PROD links remain classic-owned with every execution flag set`, async t => {
+        const calls = stubSync(t, { linkStatuses: ['online'], links: legacyLinks('online') });
+        for (const optIn of ['false', 'true']) {
+            await withFlags([true, true, true], () => withEnv({ PANEL_DOMAIN: 'lm1.infograd.online',
+                TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: optIn }, async () => {
+                if (writer === 'sync') await syncService.updateXrayNodeConfig(node('relay'));
+                else await cascadeService._deployPortalConfig(node('relay'));
+            }));
+        }
+        assert.equal(calls.uploads.length, 2);
+        for (const upload of calls.uploads) {
+            const config = JSON.parse(upload.content);
+            assert.equal(config.inbounds.length, 9, 'eight reverse links and the forward inbound stay present');
+            assert.equal(config.outbounds.length, 1, 'the tenth legacy link is the forward outbound');
+            assert.equal(config.inbounds[0].settings.clients[0].id, 'legacy-reverse-0');
+            assert.equal(config.inbounds.at(-1).settings.clients[0].id, 'legacy-hop');
+            assert.equal(config.outbounds[0].settings.vnext[0].users[0].id, 'legacy-forward');
+        }
+    });
+
     test(`${writer}: enabled TEST excludes pending reverse/forward listeners from initial config`, async t => {
         const calls = stubSync(t, { linkStatuses: ['pending'], links: legacyLinks('pending') });
         await withFlags([true, true, true], async () => {
