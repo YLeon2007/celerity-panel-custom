@@ -14,6 +14,7 @@ const {
     createL2tpRootLifecycle,
     createL2tpRuntimeLifecycleHook,
     parseL2tpExecutionEnabled,
+    productionSchemaConnectionOptions,
 } = require('../l2tpRuntimeLifecycleHook');
 
 const ENABLED_ENV = Object.freeze({
@@ -239,6 +240,49 @@ test('root lifecycle awaits migrations once after the database boundary before r
         calls.map(call => call.kind ?? call),
         ['createMigrationBootstrap', 'migrate', 'indexes', 'create', 'stop'],
     );
+});
+
+test('dormant PROD skips schema writes and module workers despite inherited TEST flag', async () => {
+    const env = { PANEL_DOMAIN: 'lm1.infograd.online',
+        L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
+    const calls = [];
+    const root = createL2tpRootLifecycle({ env,
+        createMigrationBootstrap() { calls.push('migration'); throw new Error('must not migrate'); },
+        async ensureModelIndexes() { calls.push('index'); throw new Error('must not create indexes'); },
+        createRuntimeLifecycleHook({ env: selected }) {
+            calls.push('host');
+            assert.equal(selected.PANEL_DOMAIN, 'lm1.infograd.online');
+            assert.equal(selected.L2TP_EXECUTION_ENABLED, 'false');
+            assert.equal(selected.L2TP_MIGRATIONS_ENABLED, 'false');
+            return { async stop() {} };
+        },
+    });
+    await root.startAfterDatabase();
+    assert.deepEqual(calls, ['host']);
+    assert.equal(env.L2TP_EXECUTION_ENABLED, 'true');
+    await root.stop();
+});
+
+test('PROD execution opt-in cannot start before separately held schema/authority gate', async () => {
+    for (const flag of ['TOPOLOGY_PRODUCTION_EXECUTION_ENABLED', 'L2TP_PRODUCTION_EXECUTION_ENABLED']) {
+        const root = createL2tpRootLifecycle({
+            env: { PANEL_DOMAIN: 'lm1.infograd.online', [flag]: 'true',
+                L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true' },
+            createMigrationBootstrap() { throw new Error('premature schema write'); },
+            async ensureModelIndexes() { throw new Error('premature index build'); },
+        });
+        await assert.rejects(root.startAfterDatabase(), /PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE/);
+        await root.stop();
+    }
+});
+
+test('PROD Mongo model autoindex/autocreate is disabled before any model startup', () => {
+    assert.deepEqual(productionSchemaConnectionOptions({ PANEL_DOMAIN: 'lm1.infograd.online' }),
+        { autoIndex: false, autoCreate: false });
+    assert.deepEqual(productionSchemaConnectionOptions({ PANEL_DOMAIN: 'test.infograd.online' }), {});
+    const entry = fs.readFileSync(path.resolve(__dirname, '../../../index.js'), 'utf8');
+    assert.match(entry, /\.\.\.productionSchemaConnectionOptions\(process\.env\)/);
 });
 
 test('application startup awaits the post-database L2TP lifecycle boundary', () => {

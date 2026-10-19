@@ -12,6 +12,19 @@ const {
 const {
     DEFAULT_MAX_STALENESS_MS,
 } = require('./relay-l2tp/services/topologyHealthSource');
+const {
+    PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT,
+} = require('./relay-l2tp/domain/topologyExecutionContext');
+
+function isProductionSchemaHost(env) {
+    return env?.PANEL_DOMAIN === PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT.hostIdentity;
+}
+
+function productionSchemaConnectionOptions(env) {
+    // Existing PROD data is not an initialized topology admission schema.
+    // Never let model import/connection auto-create it ahead of the reviewed migration.
+    return isProductionSchemaHost(env) ? { autoIndex: false, autoCreate: false } : {};
+}
 
 const ROOT_LEASE_MS = 30_000;
 const ROOT_WORKER_INTERVAL_MS = 30_000;
@@ -232,13 +245,22 @@ function createL2tpRootLifecycle({
                 startPromise = Promise.resolve().then(async () => {
                     if (stopRequested) return undefined;
                     parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
-                    const migrationBootstrap = createMigrationBootstrap({ env });
-                    await migrationBootstrap.run();
-                    if (stopRequested) return undefined;
-                    await ensureModelIndexes();
+                    const dormantProduction = isProductionSchemaHost(env);
+                    if (dormantProduction && (env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
+                        || env.L2TP_PRODUCTION_EXECUTION_ENABLED === 'true')) {
+                        throw new TypeError('PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE');
+                    }
+                    if (!dormantProduction) {
+                        const migrationBootstrap = createMigrationBootstrap({ env });
+                        await migrationBootstrap.run();
+                        if (stopRequested) return undefined;
+                        await ensureModelIndexes();
+                    }
                     if (stopRequested) return undefined;
                     lifecycle = createRuntimeLifecycleHook({
-                        env,
+                        env: dormantProduction ? { ...env,
+                            L2TP_EXECUTION_ENABLED: 'false',
+                            L2TP_MIGRATIONS_ENABLED: 'false' } : env,
                         createHostDependencies,
                         activeHostProvider,
                     });
@@ -267,4 +289,5 @@ module.exports = {
     createL2tpRootLifecycle,
     createL2tpRuntimeLifecycleHook,
     parseL2tpExecutionEnabled,
+    productionSchemaConnectionOptions,
 };

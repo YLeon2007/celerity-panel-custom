@@ -30,7 +30,7 @@ const HyUser = require('./src/models/hyUserModel');
 const HyNode = require('./src/models/hyNodeModel');
 const backupService = require('./src/services/backupService');
 const homepageService = require('./src/services/homepageService');
-const { createL2tpRootLifecycle } = require('./src/modules/l2tpRuntimeLifecycleHook');
+const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('./src/modules/l2tpRuntimeLifecycleHook');
 
 const usersRoutes = require('./src/routes/users');
 const nodesRoutes = require('./src/routes/nodes');
@@ -499,6 +499,7 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 minPoolSize: 2,
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
+                ...productionSchemaConnectionOptions(process.env),
             });
             return;
         } catch (err) {

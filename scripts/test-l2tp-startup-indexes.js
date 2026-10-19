@@ -6,7 +6,7 @@ const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const mongoose = require('mongoose');
-const { createL2tpRootLifecycle } = require('../src/modules/l2tpRuntimeLifecycleHook');
+const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('../src/modules/l2tpRuntimeLifecycleHook');
 let directory, child, models;
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to an isolated local MongoDB binary' };
 async function until(work) {
@@ -24,14 +24,33 @@ test.before(async () => {
     const port = await new Promise(resolve => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const port = server.address().port; server.close(() => resolve(port)); }); });
     child = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
     const uri = `mongodb://127.0.0.1:${port}/startup_indexes_scratch`;
-    await until(() => mongoose.connect(uri, { serverSelectionTimeoutMS: 100, autoIndex: false, autoCreate: false }));
     models = require('../src/modules/relay-l2tp').registerModels();
+    await until(() => mongoose.connect(uri, { serverSelectionTimeoutMS: 100,
+        ...productionSchemaConnectionOptions({ PANEL_DOMAIN: 'lm1.infograd.online' }) }));
 });
 test.after(async () => {
     await mongoose.disconnect();
     if (child && child.exitCode === null) { const exited = new Promise(resolve => child.once('exit', resolve)); child.kill('SIGTERM'); await exited; }
     if (directory) await fs.rm(directory, { recursive: true, force: true });
 });
+test('dormant PROD startup leaves the real Mongo catalog unchanged with TEST flags inherited', local, async () => {
+    const before = await mongoose.connection.db.listCollections().toArray();
+    const env = { PANEL_DOMAIN: 'lm1.infograd.online',
+        L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
+    let selected;
+    const root = createL2tpRootLifecycle({ env,
+        createRuntimeLifecycleHook({ env: safe }) {
+            selected = safe;
+            return { async stop() {} };
+        },
+    });
+    await root.startAfterDatabase();
+    assert.equal(selected.L2TP_EXECUTION_ENABLED, 'false');
+    assert.deepEqual(await mongoose.connection.db.listCollections().toArray(), before);
+    await root.stop();
+});
+
 test('real startup upgrades applied 001 and verifies indexes without initializing raw legacy counters', local, async () => {
     await models.RelayL2tpMigrationState.createCollection();
     await models.RelayL2tpMigrationState.collection.insertOne({ _id: 'relay-l2tp', version: 1, appliedMigrationIds: ['001-ensure-module-indexes'] });
