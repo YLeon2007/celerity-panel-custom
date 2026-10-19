@@ -185,12 +185,12 @@ function projectFrozenNode(context, durableBackupId) {
     });
 }
 
-const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback']);
+const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback', 'close']);
 const FENCE_KEYS = Object.freeze(['executionContext', 'attemptId', 'generation', 'predecessorGeneration']);
 const RECORD_KEYS = Object.freeze([
     'operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile',
     'topologyRevision', 'priorDeployedRevision', 'owner', 'attempt',
-    ...FENCE_KEYS, 'commandIds',
+    ...FENCE_KEYS, 'commandIds', 'bootId', 'maintenanceId',
 ].sort());
 const V2_RECEIPT_KEYS = Object.freeze([
     ...PUBLIC_RECEIPT_KEYS, ...FENCE_KEYS, 'commandId', 'protocolVersion',
@@ -225,7 +225,7 @@ function assertReceipt(receipt, command, binding) {
         || receipt.protocolVersion !== 2 || receipt.completion !== 'completed'
         || receipt.phase !== ({ prepare: 'prepared', commit: 'committed', verify: 'verified', rollback: 'rolledback' })[command]
         || receipt.terminal !== false || receipt.terminalOutcome !== 'not-terminal'
-        || receipt.ownershipRetained !== true || !safeToken(receipt.bootId)
+        || receipt.ownershipRetained !== true || receipt.bootId !== binding.durable.bootId
         || receipt.completedCommand !== command
         || receipt.systemdJob !== (command === 'prepare' ? 'not-applicable' : 'completed')
         || (command === 'prepare' ? receipt.serviceState !== 'not-applicable'
@@ -237,6 +237,21 @@ function assertReceipt(receipt, command, binding) {
     // Preserve the public typed executor receipt semantics. This is explicitly
     // NOT a terminal V2 readback or authority to release database ownership.
     return Object.freeze(Object.fromEntries(PUBLIC_RECEIPT_KEYS.map(key => [key, receipt[key]])));
+}
+
+function assertTerminalReceipt(receipt, command, binding, outcome) {
+    const expected = transportRequest(binding, 'close');
+    if (!hasExactKeys(receipt, V2_RECEIPT_KEYS)
+        || receipt.ok !== true || receipt.command !== command
+        || receipt.protocolVersion !== 2 || receipt.completion !== 'completed'
+        || receipt.phase !== 'closed' || receipt.terminal !== true
+        || receipt.terminalOutcome !== outcome || receipt.ownershipRetained !== true
+        || receipt.bootId !== binding.durable.bootId || receipt.completedCommand !== 'close'
+        || receipt.systemdJob !== 'completed'
+        || !(receipt.serviceState === 'active:running'
+            || (outcome === 'rolledback' && receipt.serviceState === 'inactive:dead'))
+        || Object.keys(expected).some(key => receipt[key] !== expected[key])) throw executionFailed();
+    return Object.freeze({ ...receipt });
 }
 
 function preparedReceipt(binding) {
@@ -315,7 +330,7 @@ class TopologyOperationExecutor {
     // immutable binding + current exact claim/physical-node lock ownership;
     // a frozen object by itself is NOT durability or remote enrollment proof.
     // No production implementation is installed by the composed runtime.
-    async #proveBinding(context, binding, previous) {
+    async #proveBinding(context, binding, previous, reader = this.#executionBindingReader) {
         const fence = context.executionFence;
         if (!this.#executionBindingReader
             || !hasExactKeys(fence, ['attempt', 'generation', 'owner'])
@@ -334,11 +349,12 @@ class TopologyOperationExecutor {
             ...fence,
         });
         let durable;
-        try { durable = await this.#executionBindingReader.readVerified(expected); }
+        try { durable = await reader.readVerified(expected); }
         catch { throw unprovenBinding(); }
         if (!hasExactKeys(durable, RECORD_KEYS) || !isDeepFrozen(durable)
             || Object.entries(expected).some(([key, value]) => durable[key] !== value)
             || !safeToken(durable.attemptId) || !safeToken(durable.predecessorGeneration)
+            || !safeToken(durable.bootId) || !safeToken(durable.maintenanceId)
             || durable.generation === 'none' || durable.predecessorGeneration === durable.generation
             || !hasExactKeys(durable.commandIds, [...COMMANDS].sort())
             || !Object.values(durable.commandIds).every(safeToken)
@@ -346,7 +362,7 @@ class TopologyOperationExecutor {
             || (previous && RECORD_KEYS.some(key => key === 'commandIds'
                 ? COMMANDS.some(command => durable.commandIds[command] !== previous.commandIds[command])
                 : durable[key] !== previous[key]))) throw unprovenBinding();
-        return Object.freeze({ ...binding, durable });
+        return Object.freeze({ ...binding, durable, expected });
     }
 
     async #createTransport(binding, context) {
@@ -475,18 +491,23 @@ class TopologyOperationExecutor {
         return state;
     }
 
-    async #invokePrepared(command, context, release = false) {
-        let state;
+    async #invokePrepared(command, context) {
+        let state, ownsBusy = false;
         try {
             state = this.#preparedBinding(context);
+            if (state.phase === 'rollback') throw invalidPlan();
+            if (state.busy || state.uncertain || state.terminal) throw unprovenBinding();
+            state.busy = true;
+            ownsBusy = true;
             await this.#proveBinding(context, state.binding, state.binding.durable);
         } catch (error) {
             // Only our local binding validation proves no command was invoked.
+            if (ownsBusy) state.busy = false;
             error.remoteOutcomeUncertain = false;
             throw error;
         }
         try {
-            return assertReceipt(
+            const receipt = assertReceipt(
                 await state.transport[command](transportRequest(
                     state.binding,
                     command,
@@ -494,7 +515,10 @@ class TopologyOperationExecutor {
                 command,
                 state.binding,
             );
+            state.phase = command;
+            return receipt;
         } catch {
+            state.uncertain = true;
             const wrapped = executionFailed();
             if (COMMANDS.includes(command)) {
                 // Transport rejection, nonzero exit, or a malformed receipt
@@ -505,8 +529,52 @@ class TopologyOperationExecutor {
             }
             throw wrapped;
         } finally {
-            if (release) this.#preparedBindings.delete(context.prepared);
+            state.busy = false;
         }
+    }
+
+    // DORMANT data-only API: never called by worker; never releases ownership.
+    async close(context) {
+        const state = this.#preparedBinding(context);
+        if (state.busy || state.uncertain || state.terminal
+            || !['verify', 'rollback'].includes(state.phase)
+            || typeof this.#executionBindingReader?.withVerifiedBinding !== 'function') {
+            throw unprovenBinding();
+        }
+        state.busy = true;
+        try {
+            const binding = await this.#proveBinding(context, state.binding, state.binding.durable);
+            const outcome = state.phase === 'verify' ? 'verified' : 'rolledback';
+            const proof = await this.#executionBindingReader.withVerifiedBinding(binding.expected,
+                async (durable, assertCurrent) => {
+                    if (typeof assertCurrent !== 'function') throw unprovenBinding();
+                    await this.#proveBinding(context, binding, binding.durable, {
+                        readVerified: async () => durable,
+                    });
+                    await assertCurrent();
+                    const closed = assertTerminalReceipt(await state.transport.close(
+                        transportRequest(binding, 'close')), 'close', binding, outcome);
+                    await assertCurrent();
+                    // Status queries the exact durable close ID, not a newly minted command.
+                    const status = assertTerminalReceipt(await state.transport.status({
+                        ...transportRequest(binding, 'close'), completedCommand: 'close',
+                    }), 'status', binding, outcome);
+                    if (V2_RECEIPT_KEYS.some(key => key !== 'command' && status[key] !== closed[key])) {
+                        throw executionFailed();
+                    }
+                    await assertCurrent();
+                    return status;
+                });
+            state.terminal = true;
+            return proof;
+        } catch (error) {
+            state.uncertain = true;
+            const wrapped = executionFailed();
+            wrapped.remoteOutcomeUncertain = true;
+            wrapped.backupId = state.binding.backupId;
+            wrapped.cause = error;
+            throw wrapped;
+        } finally { state.busy = false; }
     }
 
     commit(context) {
@@ -521,11 +589,11 @@ class TopologyOperationExecutor {
         // Prepare stages without activation; request its bound rollback only.
         // This receipt is not terminal readback or classic/bootstrap handback.
         // The worker retains ownership for every V2 lifecycle outcome.
-        return this.#invokePrepared('rollback', context, true);
+        return this.#invokePrepared('rollback', context);
     }
 
     rollback(context) {
-        return this.#invokePrepared('rollback', context, true);
+        return this.#invokePrepared('rollback', context);
     }
 }
 

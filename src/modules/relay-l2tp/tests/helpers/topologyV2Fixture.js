@@ -29,9 +29,10 @@ function bindingRecord(context, hostIdentity = 'test.infograd.online') {
         owner: context.executionFence.owner, attempt: context.executionFence.attempt,
         generation: context.executionFence.generation,
         attemptId: `attempt-${context.executionFence.attempt}`,
+        bootId: 'boot-local-fixture', maintenanceId: 'maintenance-local-fixture',
         // Explicit simulated initial enrollment, never a dispatch-time default.
         predecessorGeneration: 'none',
-        commandIds: Object.fromEntries(['prepare', 'commit', 'verify', 'rollback'].map(
+        commandIds: Object.fromEntries(['prepare', 'commit', 'verify', 'rollback', 'close'].map(
             command => [command, `${command}-${node.node}`],
         )),
     });

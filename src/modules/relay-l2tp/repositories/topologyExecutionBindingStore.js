@@ -230,19 +230,20 @@ class TopologyExecutionBindingStore {
         ].join('\0')).digest('hex')}`;
         if (backupId !== expected.backupId) throw failure();
     }
-    async #binding(action, input) {
+    async #binding(action, input, work) {
         if (!validExpected(input)) throw failure();
         const expected = freeze({ ...input });
         await this.#indexes();
         const enrollment = await this.#enrollment(expected);
         return this.#scope(action, enrollmentProjection(enrollment), expected, async (receipt, ensureOpen) => {
+            if (receipt.maintenanceId !== enrollment.maintenanceId) throw failure();
             const nonce = randomUUID();
             let row = action === 'create' ? { ...expected, ...enrollmentProjection(enrollment),
                 _id: randomUUID(), enrollmentId: enrollment._id, attemptId: randomUUID(), ...receipt,
                 commandIds: Object.fromEntries(COMMANDS.map(command => [command, randomUUID()])) } : null;
             if (row) row.commandTokens = COMMANDS.map(command => row.commandIds[command]);
             const ownerFilter = this.#ownerFilter(enrollment);
-            return this.#transaction(async session => {
+            const check = () => this.#transaction(async session => {
                 ensureOpen();
                 await this.#checkOperation(expected, session);
                 await this.#cas(this.#models.Operation, this.#operationFilter(expected, new Date()), nonce, session);
@@ -256,6 +257,7 @@ class TopologyExecutionBindingStore {
                 } else {
                     row = await this.#models.Binding.findOne({ enrollmentId: enrollment._id }).session(session).setOptions(OPTIONS).lean();
                     this.#checkRow(row, enrollment, expected);
+                    if (row.maintenanceId !== receipt.maintenanceId) throw failure();
                 }
             }, async deadline => {
                 const confirmed = await this.#majority(this.#models.Binding, { _id: row._id }, deadline);
@@ -267,10 +269,26 @@ class TopologyExecutionBindingStore {
                 }
                 return recordProjection(confirmed);
             }, ensureOpen);
+            const record = await check();
+            if (!work) return record;
+            const assertCurrent = async () => {
+                ensureOpen();
+                if (!isDeepStrictEqual(await check(), record)) throw failure();
+                ensureOpen();
+            };
+            ensureOpen();
+            const result = await work(record, assertCurrent);
+            await assertCurrent();
+            return result;
         });
     }
     // No caller-selected attempt/command/predecessor IDs, no update/adopt/release API.
     async createBinding(expected) { return this.#binding('create', expected); }
     async readVerified(expected) { return this.#binding('read', expected); }
+    // Hold external exclusion through close, fresh status and final exact DB readback.
+    async withVerifiedBinding(expected, work) {
+        if (typeof work !== 'function') throw failure();
+        return this.#binding('terminal', expected, work);
+    }
 }
 module.exports = { TopologyExecutionBindingStore };

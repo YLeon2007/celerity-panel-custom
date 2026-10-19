@@ -10,7 +10,7 @@ const schema = new mongoose.Schema({ ...common(),
     attempt: { type: Number, required: true, immutable: true, min: 1, validate: Number.isSafeInteger },
     commandIds: { type: commandSchema, required: true, immutable: true },
     commandTokens: { type: [String], required: true, immutable: true, default: undefined,
-        validate: values => values.length === 4 && new Set(values).size === 4 && values.every(value => UUID.test(value)) },
+        validate: values => values.length === COMMANDS.length && new Set(values).size === COMMANDS.length && values.every(value => UUID.test(value)) },
 }, { strict: 'throw', versionKey: false });
 // Deliberately one-shot: no successor/reclaim/handback protocol is authorized here.
 schema.index({ operationId: 1, nodeId: 1, targetProfile: 1 }, { unique: true });

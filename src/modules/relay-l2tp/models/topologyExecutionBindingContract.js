@@ -4,10 +4,10 @@ const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD } = require('../domain/topol
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const ID = /^[a-f0-9]{24}$/;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback']);
+const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback', 'close']);
 const EXPECTED_KEYS = Object.freeze(['executionContext', 'operationId', 'nodeId', 'candidateHash', 'backupId',
     'targetProfile', 'topologyRevision', 'priorDeployedRevision', 'owner', 'attempt', 'generation']);
-const RECORD_KEYS = Object.freeze([...EXPECTED_KEYS, 'attemptId', 'predecessorGeneration', 'commandIds']);
+const RECORD_KEYS = Object.freeze([...EXPECTED_KEYS, 'attemptId', 'predecessorGeneration', 'commandIds', 'bootId', 'maintenanceId']);
 const strict = { _id: false, versionKey: false, strict: 'throw' };
 function exact(value, keys) {
     return value && typeof value === 'object' && !Array.isArray(value)

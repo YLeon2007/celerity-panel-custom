@@ -33,7 +33,10 @@ connections, credentials, database names, server identities or authority hooks.
   ID, canonical host, topology and prior deployed revisions, candidate hash,
   deterministic backup ID, node/profile, numeric claim attempt and owner, and
   **the already-acquired node-lock generation**. Server-generated UUID attempt
-  and four distinct command IDs are never accepted from requests.
+  and five distinct command IDs (including `close`) are never accepted from requests.
+  The executor projection now also includes enrolled `bootId` and `maintenanceId`;
+  every ordinary receipt must match that boot, and maintenance cannot switch
+  between enrollment, creation, reads or terminal reconciliation.
 - Unique indexes enforce one binding per operation/node/profile and enrollment,
   unique attempt IDs, and cross-record/cross-command ID reuse exclusion through
   a unique multikey `commandTokens` index. There is no update, adopt, reclaim,
@@ -151,6 +154,8 @@ Before any installation/activation, separately deliver and verify:
 3. An execution-spanning authority/resolver integration, supervised lifecycle,
    successor/recovery protocol and independent review before any runtime reader
    or worker opt-in; this file is not a rollout instruction.
-4. Exact terminal close/status persistence + fresh completion readback, safe
-   user/PPP/ingress integration, atomic physical ownership handback and exact
-   lock/admission release. Existing V2 refusal/retention gates stay closed.
+4. The [dormant terminal proof](topology-v2-terminal-proof.md) now binds persisted
+   close IDs and returns fresh close/status proof under one held authority scope.
+   Durable terminal-result/restart reconciliation, safe user/PPP/ingress
+   integration, atomic physical ownership handback and exact lock/admission
+   release are still absent. Existing V2 refusal/retention gates stay closed.

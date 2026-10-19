@@ -32,6 +32,7 @@ const IDENTITY = freeze({ machineId: '1'.repeat(32), sshHostKeySha256: '2'.repea
 const OWNER_GENERATION = randomUUID();
 const PREDECESSOR = randomUUID();
 const BOOT = randomUUID();
+const MAINTENANCE = randomUUID();
 const content = '{"inbounds":[],"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}\n';
 const hash = createHash('sha256').update(content).digest('hex');
 const frozenNode = freeze({ node: NODE, nodeRef: 'portal', role: 'portal', targetProfile: 'xray-main',
@@ -85,7 +86,7 @@ test.after(async () => {
 });
 function evidence(challenge, changes = {}) {
     return { authority: 'external-execution-maintenance-v1', status: 'verified', challenge: structuredClone(challenge),
-        proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
+        proofId: randomUUID(), maintenanceId: MAINTENANCE, maintenance: 'held', allWriters: 'drained',
         bootstrapWriters: 'excluded', physicalIdentity: { ...IDENTITY }, owner: 'topology',
         predecessor: { generation: PREDECESSOR, bootId: BOOT, status: 'pre-enrolled' },
         oldBackend: { instanceId: 'simulated-old-prod', pid: 42, processStartTime: 'simulated-start',
@@ -100,7 +101,7 @@ const missingInstanceAuthority = async (challenge, work) => {
 function newStore(authority = goodAuthority) {
     return new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
 }
-async function assembled(store, { onResolved, onBootstrap } = {}) {
+async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand } = {}) {
     const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
     const { TopologyNodeExecutionResolver } = require('../services/topologyNodeExecutionResolver');
     const { runnerRequest, v2Receipt } = require('./helpers/topologyV2Fixture');
@@ -115,10 +116,12 @@ async function assembled(store, { onResolved, onBootstrap } = {}) {
     class LocalSSH {
         constructor() { events.push('ssh-adapter'); }
         async writeFile() { events.push('local-upload'); }
-        async exec(command) {
+        async exec(command, options) {
             const request = runnerRequest(command);
             events.push(request);
-            return { code: 0, stdout: `${JSON.stringify(v2Receipt(request))}\n`, stderr: '' };
+            await onCommand?.(request);
+            if (localRunner) return localRunner.execute(command, options);
+            return { code: 0, stdout: `${JSON.stringify(v2Receipt(request, { bootId: BOOT }))}\n`, stderr: '' };
         }
     }
     class LocalBootstrapper { async ensureRunner() { events.push('local-bootstrap'); await onBootstrap?.(); } }
@@ -161,7 +164,7 @@ async function setup(authority = goodAuthority) {
         adoptionReceipt: { proofId: randomUUID(), maintenanceId: randomUUID(), fromGeneration: randomUUID(),
             toGeneration: OWNER_GENERATION, oldBackendInstanceId: 'simulated-old-prod', oldPid: 42,
             oldProcessStartTime: 'simulated-start', verifiedAt: new Date() } });
-    const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, ...expected } = bindingRecord(context, PROD.hostIdentity);
+    const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
     const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
     return { store, context, expected: freeze(expected), enrollment: freeze({ nodeId: NODE, targetProfile: 'xray-main',
         nodeIdentity: IDENTITY, ownerGeneration: OWNER_GENERATION, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
@@ -176,7 +179,10 @@ test('actual Mongo stores pre-enrollment and insert-only execution binding; fres
     assert.deepEqual(Object.fromEntries(Object.keys(expected).map(key => [key, row[key]])), expected);
     assert.equal(row.predecessorGeneration, PREDECESSOR);
     assert.match(row.attemptId, /^[a-f0-9-]{36}$/);
-    assert.equal(new Set(Object.values(row.commandIds)).size, 4);
+    assert.equal(new Set(Object.values(row.commandIds)).size, 5);
+    assert.match(row.commandIds.close, /^[a-f0-9-]{36}$/);
+    assert.equal(row.bootId, BOOT);
+    assert.match(row.maintenanceId, /^[a-f0-9-]{36}$/);
     assert.equal(Object.isFrozen(row), true);
     assert.equal(Object.isFrozen(row.commandIds), true);
     assert.equal(await models.Binding.countDocuments(), 1);
@@ -559,7 +565,7 @@ test('actual unique indexes exclude cross-record attempt and cross-command token
     await store.preEnroll(enrollment); await store.createBinding(expected);
     const original = await models.Binding.findOne().lean();
     for (const key of ['attemptId', 'commandTokens']) await t.test(key, async () => {
-        const commandIds = Object.fromEntries(['prepare', 'commit', 'verify', 'rollback'].map(command => [command, randomUUID()]));
+        const commandIds = Object.fromEntries(['prepare', 'commit', 'verify', 'rollback', 'close'].map(command => [command, randomUUID()]));
         const clone = { ...original, _id: randomUUID(), operationId: new mongoose.Types.ObjectId().toString(),
             enrollmentId: randomUUID(), attemptId: key === 'attemptId' ? original.attemptId : randomUUID(),
             commandIds, commandTokens: key === 'commandTokens'
@@ -595,4 +601,190 @@ test('immutable binding/enrollment models deny document deletion as well as upda
         await assert.rejects(document.save(), /immutable/i);
         assert.equal(await Model.countDocuments(), 1);
     }
+});
+
+async function terminalFixture(t, { authority = goodAuthority, onCommand } = {}) {
+    const { fakeRunner } = require('./helpers/topologyTerminalFakeRunner');
+    const state = await setup(authority);
+    const { store, expected, enrollment, context } = state;
+    await store.preEnroll(enrollment);
+    const row = await store.createBinding(expected);
+    const localRunner = fakeRunner(t, BOOT);
+    const prefix = `runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${expected.candidateHash} --backup-id previous --target-profile xray-main --execution-context ${PROD.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`;
+    assert.equal(localRunner.execute(prefix).code, 0);
+    const assembledState = await assembled(store, { localRunner, onCommand });
+    const { executor } = assembledState;
+    const prepared = await executor.prepare(context);
+    const lifecycle = { ...context, backupId: prepared.backupId, prepared: prepared.prepared };
+    await executor.commit(lifecycle);
+    return { ...state, ...assembledState, row, localRunner, prefix, lifecycle };
+}
+
+test('executor produces terminal proof data after verify or rollback with fresh exact real-runner status and retained Mongo ownership', async t => {
+    for (const outcome of ['verify', 'rollback']) await t.test(outcome, async t => {
+        const { executor, lifecycle, row, localRunner, prefix, expected, events } = await terminalFixture(t);
+        await executor[outcome](lifecycle);
+        assert.equal(typeof executor.close, 'function');
+        const proof = await executor.close(lifecycle);
+        assert.equal(proof.terminal, true);
+        assert.equal(proof.command, 'status');
+        assert.equal(proof.completedCommand, 'close');
+        assert.equal(proof.commandId, row.commandIds.close);
+        assert.equal(proof.bootId, BOOT);
+        assert.equal(proof.terminalOutcome, outcome === 'verify' ? 'verified' : 'rolledback');
+        assert.equal(proof.ownershipRetained, true);
+        assert.equal(Object.isFrozen(proof), true);
+        assert.deepEqual(events.filter(e => typeof e === 'object').map(e => e.command),
+            ['prepare', 'commit', outcome, 'close', 'status']);
+        const effects = fs.readFileSync(path.join(localRunner.root, 'systemctl.log'), 'utf8');
+        for (const command of ['prepare', 'commit']) {
+            const delayed = prefix.replace('--command close', `--command ${command}`)
+                .replace('--operation-id predecessor', `--operation-id ${expected.operationId}`)
+                .replace('--backup-id previous', `--backup-id ${expected.backupId}`)
+                .replace('--attempt-id previous', `--attempt-id ${row.attemptId}`)
+                .replace(`--generation ${PREDECESSOR}`, `--generation ${expected.generation}`)
+                .replace('--predecessor-generation none', `--predecessor-generation ${PREDECESSOR}`)
+                .replace('--command-id previous-close', `--command-id late-${command}`);
+            assert.match(localRunner.execute(delayed, { stdin: content }).stderr, /GENERATION_CLOSED/);
+        }
+        assert.equal(fs.readFileSync(path.join(localRunner.root, 'systemctl.log'), 'utf8'), effects);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
+});
+
+test('terminal status unknown, corrupt, missing, rebooted or in-flight never returns proof or releases ownership', async t => {
+    const { spawnSync } = require('node:child_process');
+    for (const fault of ['unknown', 'corrupt', 'missing', 'in-flight', 'reboot', 'changed-status']) {
+        await t.test(fault, async t => {
+            const { executor, lifecycle, expected, localRunner } = await terminalFixture(t);
+            await executor.verify(lifecycle);
+            const execute = localRunner.execute;
+            let statuses = 0;
+            localRunner.execute = (command, options) => {
+                if (!command.includes('--command status ')) return execute(command, options);
+                statuses++;
+                const journal = path.join(localRunner.root, 'var/lib/celerity/topology/fences/xray-main/journal.json');
+                if (fault === 'unknown') command = command.replace(/--command-id \S+/, '--command-id unknown-close');
+                if (fault === 'corrupt') fs.writeFileSync(journal, '{');
+                if (fault === 'missing') fs.unlinkSync(journal);
+                if (fault === 'reboot') localRunner.put('proc/sys/kernel/random/boot_id', `${randomUUID()}\n`);
+                if (fault === 'in-flight') {
+                    const result = spawnSync('flock', ['-x', path.join(path.dirname(journal), 'lock'), 'bash',
+                        path.join(__dirname, '../node-artifacts/topology/runner.sh'), ...command.split(' ').slice(1)],
+                    { env: { ...process.env, CELERITY_TOPOLOGY_ROOT: localRunner.root }, encoding: 'utf8' });
+                    assert.match(result.stderr, /COMMAND_IN_FLIGHT/);
+                    return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+                }
+                const result = execute(command, options);
+                if (fault === 'changed-status') {
+                    const receipt = JSON.parse(result.stdout);
+                    receipt.bootId = randomUUID();
+                    return { ...result, stdout: `${JSON.stringify(receipt)}\n` };
+                }
+                return result;
+            };
+            await assert.rejects(executor.close(lifecycle), {
+                code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true,
+            });
+            assert.equal(statuses, 1);
+            await assert.rejects(executor.commit(lifecycle));
+            await assert.rejects(executor.close(lifecycle));
+            assert.equal(statuses, 1, 'uncertain close is sticky, never redispatched');
+            assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+            assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+            assert.equal((await models.Owner.findOne().lean()).owner, 'topology');
+        });
+    }
+});
+
+test('terminal executor refuses missing scoped authority, switched maintenance and unsafe bootstrap/classic authority before close', async t => {
+    for (const fault of ['bootstrap', 'classic', 'maintenance', 'absent-scope']) await t.test(fault, async t => {
+        let unsafe = false;
+        const authority = async (challenge, work) => work(evidence(challenge, unsafe ? {
+            ...(fault === 'bootstrap' ? { bootstrapWriters: 'unknown' } : {}),
+            ...(fault === 'classic' ? { allWriters: 'unknown' } : {}),
+            ...(fault === 'maintenance' ? { maintenanceId: randomUUID() } : {}),
+        } : {}));
+        const { executor, lifecycle, expected, store, events } = await terminalFixture(t, { authority });
+        await executor.verify(lifecycle);
+        unsafe = true;
+        if (fault === 'absent-scope') store.withVerifiedBinding = undefined;
+        await assert.rejects(executor.close(lifecycle));
+        assert.deepEqual(events.filter(e => typeof e === 'object').map(e => e.command), ['prepare', 'commit', 'verify']);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal((await models.Owner.findOne().lean()).owner, 'topology');
+    });
+});
+
+test('terminal dispatch stays inside held authority and ownership loss before or after status prevents proof', async t => {
+    for (const lostAt of ['none', 'close', 'status']) await t.test(lostAt, async t => {
+        let held = false;
+        const authority = async (challenge, work) => {
+            held = true;
+            try { return await work(evidence(challenge)); } finally { held = false; }
+        };
+        const winner = randomUUID();
+        const { executor, lifecycle, expected, events } = await terminalFixture(t, {
+            authority,
+            onCommand: async request => {
+                if (!['close', 'status'].includes(request.command)) return;
+                assert.equal(held, true, 'terminal commands escaped external exclusion');
+                if (request.command === lostAt) await models.Lock.collection.updateOne({}, {
+                    $set: { generation: winner, owner: 'winner' },
+                });
+            },
+        });
+        await executor.verify(lifecycle);
+        if (lostAt === 'none') assert.equal((await executor.close(lifecycle)).terminal, true);
+        else await assert.rejects(executor.close(lifecycle), {
+            code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true,
+        });
+        assert.equal(held, false);
+        const statuses = events.filter(e => e?.command === 'status').length;
+        assert.equal(statuses, lostAt === 'close' ? 0 : 1);
+        assert.equal((await models.Lock.findOne().lean()).generation, lostAt === 'none' ? expected.generation : winner);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
+});
+
+test('binding creation cannot switch maintenance authority after predecessor enrollment', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const switched = newStore(async (challenge, work) => work(evidence(challenge, { maintenanceId: randomUUID() })));
+    await assert.rejects(switched.createBinding(expected), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal(await models.Binding.countDocuments(), 0);
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+});
+
+test('terminal scope holds original maintenance authority and rechecks persisted ownership after callback', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const original = await store.createBinding(expected);
+    assert.equal(typeof store.withVerifiedBinding, 'function');
+    let held = false;
+    const scoped = newStore(async (challenge, work) => {
+        assert.equal(challenge.action, 'terminal', 'read-only authority must not silently grant terminal dispatch');
+        held = true;
+        try { return await work(evidence(challenge)); } finally { held = false; }
+    });
+    assert.equal(await scoped.withVerifiedBinding(expected, async row => {
+        assert.equal(held, true);
+        assert.deepEqual(row, original);
+        return 'proof-data-only';
+    }), 'proof-data-only');
+    assert.equal(held, false);
+    let invoked = false;
+    const switched = newStore(async (challenge, work) => work(evidence(challenge, { maintenanceId: randomUUID() })));
+    await assert.rejects(switched.withVerifiedBinding(expected, async () => { invoked = true; }),
+        { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal(invoked, false);
+    const winner = randomUUID();
+    await assert.rejects(scoped.withVerifiedBinding(expected, async () => {
+        await models.Lock.collection.updateOne({}, { $set: { generation: winner, owner: 'winner' } });
+        return 'must-not-escape';
+    }), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal((await models.Lock.findOne().lean()).generation, winner);
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
 });

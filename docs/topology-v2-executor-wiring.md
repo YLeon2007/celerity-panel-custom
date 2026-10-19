@@ -63,11 +63,12 @@ Before any real reader/worker enablement, separately implement and verify:
    only as explicit initial enrollment; runtime does not default or synthesize
    it. Old runner binaries, classic config writers and bootstrap uploads need
    external exclusion/join authority before any enrollment can be trusted.
-3. Persisted exact close + fresh terminal status readback, including command,
-   generation, attempt, boot identity and recovery fences. This executor does
-   not implement terminal close/status dispatch or authorize database release.
-   Even a correct V2 terminal readback covers protocol-admitted commands only,
-   not all classic/bootstrap/independent writers.
+3. The [dormant data-only close API](topology-v2-terminal-proof.md) now dispatches
+   the persisted close ID and a fresh exact status query under scoped authority.
+   It matches generation, attempt, boot and original maintenance identity and
+   does not authorize database release. Durable terminal-result persistence and
+   restart/successor recovery remain absent. Even correct V2 terminal readback
+   covers protocol-admitted commands only, not classic/bootstrap/independent writers.
 4. Safe user/PPP/ingress writer integration and atomic ownership handback before
    exact lock release and terminal admission decrement. Current V2 outcomes keep
    these retained rather than asserting all host writers have stopped.
