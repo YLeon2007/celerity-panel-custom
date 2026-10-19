@@ -22,11 +22,16 @@ const drift = (verifiedRelayCount, relayNode, credentialRevision) => ({
 const id = value => value == null ? '' : String(value);
 
 function stagedTerminalRelayRef(nodes) {
-    let portalCount = 0;
+    let singlePortal = 0;
+    const portalNumbers = new Set();
     const relayNumbers = new Set();
     for (const node of nodes) {
         if (node?.role === 'portal' && node.nodeRef === 'portal') {
-            portalCount += 1;
+            singlePortal += 1;
+        } else if (node?.role === 'portal' && /^portal-[1-9]\d*$/.test(node.nodeRef)) {
+            const number = Number(node.nodeRef.slice('portal-'.length));
+            if (!Number.isSafeInteger(number) || portalNumbers.has(number)) return null;
+            portalNumbers.add(number);
         } else if (node?.role === 'relay' && /^relay-[1-9]\d*$/.test(node.nodeRef)) {
             const number = Number(node.nodeRef.slice('relay-'.length));
             if (!Number.isSafeInteger(number) || relayNumbers.has(number)) return null;
@@ -35,7 +40,12 @@ function stagedTerminalRelayRef(nodes) {
             return null;
         }
     }
-    if (portalCount !== 1 || relayNumbers.size === 0) return null;
+    if (!(singlePortal === 1 && portalNumbers.size === 0
+        || singlePortal === 0 && portalNumbers.size >= 2)
+        || relayNumbers.size === 0) return null;
+    for (let number = 1; number <= portalNumbers.size; number += 1) {
+        if (!portalNumbers.has(number)) return null;
+    }
     for (let number = 1; number <= relayNumbers.size; number += 1) {
         if (!relayNumbers.has(number)) return null;
     }

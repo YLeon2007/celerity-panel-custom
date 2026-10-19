@@ -9,7 +9,17 @@ function admissionError(code) {
 }
 
 const CLAIM_CAS_MISS = new Error('Queued install claim CAS miss');
+function installAttemptKey(nodeId, revision, operationId) {
+    return `install:${nodeId}:revision-${revision}:attempt-${operationId}`;
+}
+
 const SYNC_CLAIM_CAS_MISS = new Error('Queued sync_users claim CAS miss');
+const PRE_REMOTE_FAILURES = new Set([
+    'INSTALL_PLAN_REJECTED', 'INVALID_INSTALL_PLAN', 'INVALID_SYNC_USERS_PLAN',
+    'VERIFY_STEP_REQUIRED', 'XRAY_CANDIDATE_FAILED',
+    'NODE_OPERATION_LOCK_CONFLICT', 'NODE_LOCK_UNAVAILABLE',
+    'SECRET_RESOLUTION_FAILED', 'USER_SNAPSHOT_RESOLUTION_FAILED',
+]);
 
 // The readback is returned to the install service for exact comparison, never
 // to logs. Reject unexpected plan fields instead of copying possible secrets.
@@ -93,7 +103,8 @@ function oneShotTransactionRunnerFor(connection) {
 }
 
 class RemoteAdmissionRepository {
-    constructor({ CascadeTopologyState, RemoteAdmission, L2tpOperation, transactionRunner } = {}) {
+    constructor({ CascadeTopologyState, RemoteAdmission, L2tpOperation, NodeOperationLock,
+        transactionRunner } = {}) {
         if (typeof CascadeTopologyState?.updateOne !== 'function'
             || typeof RemoteAdmission?.create !== 'function'
             || typeof RemoteAdmission?.updateOne !== 'function') {
@@ -108,6 +119,7 @@ class RemoteAdmissionRepository {
         this.RemoteAdmission = RemoteAdmission;
         // Optional until the install handoff is explicitly wired by a caller.
         this.L2tpOperation = L2tpOperation;
+        this.NodeOperationLock = NodeOperationLock;
     }
 
     /** Exact counted, still-queued readback for an uncertain queue commit. */
@@ -156,7 +168,8 @@ class RemoteAdmissionRepository {
             || operation.kind !== 'install' || operation.status !== 'queued'
             || operation.ownerGeneration !== undefined || operation.attempts !== 0
             || operation.admissionId !== admissionId
-            || operation.idempotencyKey !== `install:${admission.nodeId}:revision-${operation.plan?.topologyRevision}`) {
+            || operation.idempotencyKey !== installAttemptKey(
+                admission.nodeId, operation.plan?.topologyRevision, operationId)) {
             return null;
         }
         const plan = normalizedInstallPlan(operation.plan);
@@ -186,8 +199,8 @@ class RemoteAdmissionRepository {
             || String(operationDocument.plan?.relayId) !== String(nodeId)
             || !Number.isSafeInteger(operationDocument.plan?.topologyRevision)
             || operationDocument.plan.topologyRevision < 0
-            || operationDocument.idempotencyKey
-                !== `install:${nodeId}:revision-${operationDocument.plan.topologyRevision}`) {
+            || operationDocument.idempotencyKey !== installAttemptKey(
+                nodeId, operationDocument.plan.topologyRevision, operationId)) {
             throw admissionError('REMOTE_ADMISSION_INVALID_INSTALL');
         }
 
@@ -202,9 +215,16 @@ class RemoteAdmissionRepository {
 
             // The unique _id and idempotencyKey indexes reject duplicates; never
             // reinterpret a duplicate as a successful handoff or delete a prior op.
-            await this.L2tpOperation.create([{
-                ...operationDocument, admissionId,
-            }], { session });
+            try {
+                await this.L2tpOperation.create([{
+                    ...operationDocument, admissionId,
+                }], { session });
+            } catch (error) {
+                // Duplicate key is rejected before handoff; the transaction
+                // will abort, so the caller may release only its unlinked claim.
+                if (error.code === 11000) error.installQueuePreCommitAbort = true;
+                throw error;
+            }
             const changed = await this.RemoteAdmission.updateOne({
                 _id: admissionId, nodeId: String(nodeId), kind: 'install',
                 phase: 'running', operationId: { $exists: false },
@@ -314,6 +334,12 @@ class RemoteAdmissionRepository {
                 if (!candidate) return null;
                 if (!Number.isSafeInteger(candidate.attempts) || candidate.attempts < 0
                     || candidate.attempts >= Number.MAX_SAFE_INTEGER) return null;
+                const unresolved = await this.RemoteAdmission.findOne({
+                    nodeId: String(candidate.node),
+                    kind: { $in: ['install', 'standalone_preflight', 'sync_users'] },
+                    phase: { $in: ['running', 'queued', 'recovery_required'] },
+                }).session(session).lean();
+                if (unresolved) return null;
 
                 // The singleton CAS serializes concurrent admissions and excludes
                 // drain/reservation. A later CAS/insert failure aborts the count.
@@ -353,12 +379,18 @@ class RemoteAdmissionRepository {
         if (!nodeId) throw new TypeError('Invalid install admission');
         const connection = this.CascadeTopologyState.db;
         if (!connection || typeof connection.startSession !== 'function'
-            || this.RemoteAdmission.db !== connection) {
+            || this.RemoteAdmission.db !== connection
+            || typeof this.RemoteAdmission.findOne !== 'function') {
             throw new TypeError('Install admission requires both models on one transactional Mongo connection');
         }
         const id = randomUUID();
         try {
             await this.transactionRunner(async session => {
+                const unresolved = await this.RemoteAdmission.findOne({
+                    nodeId: String(nodeId), kind: { $in: ['install', 'standalone_preflight', 'sync_users'] },
+                    phase: { $in: ['running', 'queued', 'recovery_required'] },
+                }).session(session).lean();
+                if (unresolved) throw admissionError('REMOTE_INSTALL_ALREADY_ACTIVE');
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
@@ -380,9 +412,20 @@ class RemoteAdmissionRepository {
 
     async acquire({ nodeId, kind = 'standalone_preflight' }) {
         if (!nodeId || kind !== 'standalone_preflight') throw new TypeError('Invalid standalone admission');
+        const connection = this.CascadeTopologyState.db;
+        if (!connection || typeof connection.startSession !== 'function'
+            || this.RemoteAdmission.db !== connection
+            || typeof this.RemoteAdmission.findOne !== 'function') {
+            throw new TypeError('Standalone admission requires both models on one transactional Mongo connection');
+        }
         const id = randomUUID();
         try {
             await this.transactionRunner(async session => {
+                const unresolved = await this.RemoteAdmission.findOne({
+                    nodeId: String(nodeId), kind: { $in: ['install', 'standalone_preflight', 'sync_users'] },
+                    phase: { $in: ['running', 'queued', 'recovery_required'] },
+                }).session(session).lean();
+                if (unresolved) throw admissionError('REMOTE_INSTALL_ALREADY_ACTIVE');
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
@@ -409,6 +452,8 @@ class RemoteAdmissionRepository {
             || !['install', 'sync_users'].includes(kind)
             || this.L2tpOperation?.db !== this.CascadeTopologyState.db
             || this.RemoteAdmission.db !== this.CascadeTopologyState.db
+            || this.NodeOperationLock?.db !== this.CascadeTopologyState.db
+            || typeof this.NodeOperationLock?.findOne !== 'function'
             || typeof this.L2tpOperation?.findOne !== 'function') {
             throw admissionError('REMOTE_ADMISSION_INVALID_COMPLETION');
         }
@@ -418,8 +463,13 @@ class RemoteAdmissionRepository {
                 admissionId, leaseOwner: owner, ownerGeneration,
             }).session(session).lean();
             if (!succeeded) throw admissionError('REMOTE_ADMISSION_NOT_VERIFIED');
+            const lock = await this.NodeOperationLock.findOne({
+                node: nodeId, operationId,
+            }).session(session).lean();
+            if (lock) throw admissionError('REMOTE_ADMISSION_LOCK_HELD');
             const changed = await this.RemoteAdmission.updateOne({
-                _id: admissionId, nodeId, kind, phase: 'running', operationId,
+                _id: admissionId, nodeId, kind,
+                phase: { $in: ['running', 'recovery_required'] }, operationId,
                 leaseOwner: owner, ownerGeneration,
             }, { $set: { phase: 'completed' } }, { session });
             if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
@@ -439,6 +489,118 @@ class RemoteAdmissionRepository {
             );
             if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
         });
+    }
+
+    /**
+     * Close a counted worker admission only after the operation reached a
+     * terminal state whose remote work is known to be quiescent. This is the
+     * rollback/pre-SSH counterpart of completeVerifiedOperation.
+     */
+    async completeTerminalOperation({ admissionId, operationId, nodeId, owner,
+        ownerGeneration, kind } = {}) {
+        if (!admissionId || !operationId || !nodeId || !owner
+            || !Number.isSafeInteger(ownerGeneration) || ownerGeneration < 1
+            || !['install', 'sync_users'].includes(kind)
+            || this.L2tpOperation?.db !== this.CascadeTopologyState.db
+            || this.RemoteAdmission.db !== this.CascadeTopologyState.db
+            || this.NodeOperationLock?.db !== this.CascadeTopologyState.db
+            || typeof this.NodeOperationLock?.findOne !== 'function'
+            || typeof this.L2tpOperation?.findOne !== 'function') {
+            throw admissionError('REMOTE_ADMISSION_INVALID_COMPLETION');
+        }
+        return this.transactionRunner(async session => {
+            const terminal = await this.L2tpOperation.findOne({
+                _id: operationId, node: nodeId, kind,
+                status: { $in: ['failed', 'rolled_back'] },
+                admissionId, leaseOwner: owner, ownerGeneration,
+            }).session(session).lean();
+            if (!terminal || terminal.status === 'failed'
+                && (terminal.progress !== 0 || !PRE_REMOTE_FAILURES.has(terminal.errorCode))) {
+                throw admissionError('REMOTE_ADMISSION_NOT_TERMINAL');
+            }
+            const lock = await this.NodeOperationLock.findOne({
+                node: nodeId, operationId,
+            }).session(session).lean();
+            if (lock) throw admissionError('REMOTE_ADMISSION_LOCK_HELD');
+            const changed = await this.RemoteAdmission.updateOne({
+                _id: admissionId, nodeId, kind,
+                phase: { $in: ['running', 'recovery_required'] }, operationId,
+                leaseOwner: owner, ownerGeneration,
+            }, { $set: { phase: 'completed' } }, { session });
+            if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
+            const gate = await this.CascadeTopologyState.updateOne({
+                _id: 'singleton', remoteAdmissionCount: { $gt: 0 },
+            }, { $inc: { remoteAdmissionCount: -1 } }, { session });
+            if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_GATE_MISSING');
+            return true;
+        });
+    }
+
+    /** Keep the count and mark the linked worker admission for authoritative recovery. */
+    async markOperationRecoveryRequired({ admissionId, operationId, nodeId, owner,
+        ownerGeneration, kind } = {}) {
+        if (!admissionId || !operationId || !nodeId || !owner
+            || !Number.isSafeInteger(ownerGeneration) || ownerGeneration < 1
+            || !['install', 'sync_users'].includes(kind)) {
+            throw admissionError('REMOTE_ADMISSION_INVALID_RECOVERY');
+        }
+        return this.transactionRunner(async session => {
+            const changed = await this.RemoteAdmission.updateOne({
+                _id: admissionId, nodeId, kind, phase: 'running', operationId,
+                leaseOwner: owner, ownerGeneration,
+            }, { $set: { phase: 'recovery_required' } }, { session });
+            if (changed.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_NOT_ACTIVE');
+            return true;
+        });
+    }
+
+    /**
+     * Repair only counted admissions with a durable terminal operation and no
+     * remaining node lock. Running/rolling-back work and failed rollback stay
+     * fenced; a restart is not evidence that SSH has stopped.
+     */
+    async recoverSettledAdmissions({ limit = 25 } = {}) {
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
+            || typeof this.RemoteAdmission.find !== 'function'
+            || typeof this.L2tpOperation?.findOne !== 'function'
+            || this.NodeOperationLock?.db !== this.CascadeTopologyState.db) {
+            throw admissionError('REMOTE_ADMISSION_RECOVERY_UNAVAILABLE');
+        }
+        const candidates = await this.RemoteAdmission.find({
+            kind: { $in: ['install', 'sync_users'] },
+            phase: { $in: ['running', 'recovery_required'] },
+            operationId: { $exists: true },
+        }).sort({ _id: 1 }).limit(limit).lean();
+        let recovered = 0;
+        for (const record of candidates) {
+            if (!record.operationId || !record.leaseOwner
+                || !Number.isSafeInteger(record.ownerGeneration)) continue;
+            const operation = await this.L2tpOperation.findOne({
+                _id: record.operationId,
+            }).lean();
+            if (!operation || !['succeeded', 'rolled_back', 'failed'].includes(operation.status)) {
+                continue;
+            }
+            const input = {
+                admissionId: record._id, operationId: record.operationId,
+                nodeId: record.nodeId, owner: record.leaseOwner,
+                ownerGeneration: record.ownerGeneration, kind: record.kind,
+            };
+            try {
+                if (operation.status === 'succeeded') {
+                    await this.completeVerifiedOperation(input);
+                } else {
+                    await this.completeTerminalOperation(input);
+                }
+                recovered += 1;
+            } catch (error) {
+                if (!['REMOTE_ADMISSION_NOT_ACTIVE', 'REMOTE_ADMISSION_NOT_VERIFIED',
+                    'REMOTE_ADMISSION_NOT_TERMINAL', 'REMOTE_ADMISSION_LOCK_HELD'].includes(error.code)) {
+                    throw error;
+                }
+            }
+        }
+        return { scanned: candidates.length, recovered };
     }
 
     async release(id) {

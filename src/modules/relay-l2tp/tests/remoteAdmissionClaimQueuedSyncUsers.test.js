@@ -71,6 +71,13 @@ function fixture({ operations = [op()], gate = {}, admissions = [], split,
     };
     const RemoteAdmission = {
         db: split === 'admission' ? {} : db,
+        findOne(filter) {
+            calls.push(['admissionSelect', filter]);
+            const row = [...records.values()].find(item => String(item.nodeId) === String(filter.nodeId)
+                && filter.kind.$in.includes(item.kind) && filter.phase.$in.includes(item.phase));
+            return { session(s) { assert.strictEqual(s, session); return this; },
+                async lean() { return row ? { ...row } : null; } };
+        },
         updateOne: async () => ({ matchedCount: 0 }),
         async create(docs, options) {
             assert.strictEqual(options.session, session);
@@ -123,25 +130,30 @@ test('claims oldest legacy queued sync_users, increments gate and creates exactl
     assert.deepEqual(f.records.get(result.admissionId), { _id: result.admissionId,
         kind: 'sync_users', phase: 'running', operationId: olderId, nodeId,
         ownerGeneration: 1, leaseOwner: 'worker-one' });
-    assert.deepEqual(f.calls.map(([type]) => type), ['select', 'gateCAS', 'operationCAS', 'create']);
-    assert.deepEqual(f.calls[1][1], { _id: 'singleton', remoteDrain: { $exists: false },
+    assert.deepEqual(f.calls.map(([type]) => type), ['select', 'admissionSelect', 'gateCAS', 'operationCAS', 'create']);
+    assert.deepEqual(f.calls[2][1], { _id: 'singleton', remoteDrain: { $exists: false },
         replacementReservation: { $exists: false }, remoteAdmissionCount: { $gte: 0 } });
     assert.equal(f.ops.get(laterId).status, 'queued');
 });
 
-test('createdAt ties resolve by _id and a second claim cannot reclaim the expired running lease', async () => {
+test('sync claim refuses a queued user sync when another same-node admission is unresolved', async () => {
+    const f = fixture({ admissions: [{ _id: 'install-admission', kind: 'install',
+        phase: 'running', nodeId }] });
+    assert.equal(await claim(f), null);
+    assert.equal(f.state.remoteAdmissionCount, 0);
+    assert.deepEqual(f.calls.map(([type]) => type), ['select', 'admissionSelect']);
+});
+
+test('a second same-node sync claim stays fenced while the first admission is unresolved', async () => {
     const olderId = '507f1f77bcf86cd799439010';
     const f = fixture({ operations: [op(), op({ _id: olderId })] });
     const first = await claim(f);
     assert.equal(String(first._id), olderId);
-    const second = await claim(f, { owner: 'worker-two', now: new Date('2026-10-01') });
-    assert.equal(String(second._id), operationId);
+    assert.equal(await claim(f, { owner: 'worker-two', now: new Date('2026-10-01') }), null);
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    assert.equal(f.records.size, 1);
     assert.equal(f.ops.get(olderId).leaseOwner, 'worker-one');
     assert.equal(f.ops.get(olderId).attempts, 1);
-    assert.equal(f.state.remoteAdmissionCount, 2);
-    assert.equal(f.records.size, 2);
-    assert.equal(await claim(f, { owner: 'worker-three', now: new Date('2026-10-02') }), null);
-    assert.equal(f.state.remoteAdmissionCount, 2);
 });
 
 test('running and rolling_back sync users never reclaim, including expired leases', async () => {
@@ -159,7 +171,7 @@ test('missing, draining, reserved or malformed gate blocks claim without an admi
         assert.equal(await claim(f), null);
         assert.deepEqual(f.ops.get(operationId), op());
         assert.equal(f.records.size, 0);
-        assert.deepEqual(f.calls.map(([type]) => type), ['select', 'gateCAS']);
+        assert.deepEqual(f.calls.map(([type]) => type), ['select', 'admissionSelect', 'gateCAS']);
     }
 });
 

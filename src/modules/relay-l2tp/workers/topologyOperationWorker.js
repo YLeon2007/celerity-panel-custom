@@ -13,6 +13,14 @@ function loadLogger() {
     }
 }
 const logger = loadLogger();
+const { logTopologyTestFailure } = require('../../../routes/topologyTestDiagnostics');
+function traceWorkerFailure(plan, operationId, phase, error, nodeId) {
+    logTopologyTestFailure({ action: 'topology.worker', phase,
+        revision: plan?.topologyRevision, linkId: plan?.linkId,
+        operationId, nodeId: nodeId && String(nodeId),
+        error: { code: error?.code || 'TOPOLOGY_DEPLOYMENT_FAILED',
+            causeCode: error?.causeCode, errors: error?.errors } });
+}
 
 const EXECUTOR_METHODS = Object.freeze([
     'prepare',
@@ -1018,6 +1026,7 @@ class TopologyOperationWorker {
         let terminalSuccess = false;
         let resumeWait;
         let durablePppWait = false;
+        let plan;
         const acquiredNodeIds = [];
         try {
             const operation = await this.operationRepository.claim({
@@ -1027,14 +1036,14 @@ class TopologyOperationWorker {
                 now: this.clock.now(),
             });
             if (!operation) return { claimed: false, operationId };
-            let plan;
             let nodes;
             let entries;
             try {
                 plan = durablePlan(operation, operationId);
                 nodes = orderedPlanNodes(plan);
                 entries = this.durableEntries(operation, nodes);
-            } catch {
+            } catch (error) {
+                traceWorkerFailure(plan, operationId, 'worker.plan', error);
                 if (operation.pppWait) {
                     return { claimed: true, operationId, status: 'awaiting_ppp', stopped: true };
                 }
@@ -1057,6 +1066,7 @@ class TopologyOperationWorker {
             }
             const lockErrorCode = await this.acquireLocks(operationId, nodes, acquiredNodeIds);
             if (lockErrorCode) {
+                traceWorkerFailure(plan, operationId, 'worker.lock', { code: lockErrorCode });
                 return {
                     claimed: true,
                     operationId,
@@ -1112,6 +1122,7 @@ class TopologyOperationWorker {
             } catch (error) {
                 if (error instanceof LeaseLostError) throw error;
                 logger.error(`[TopologyWorker] prepare failed for operation ${operationId}: ${error?.message || error}${error?.cause ? ` (cause: ${error.cause?.message || error.cause})` : ''}`);
+                traceWorkerFailure(plan, operationId, 'worker.prepare', error);
                 return await this.cleanupAfterPrepareFailure(
                     plan,
                     operationId,
@@ -1144,6 +1155,7 @@ class TopologyOperationWorker {
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
+                    traceWorkerFailure(plan, operationId, 'worker.commit', error, entry.node.node);
                     return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
@@ -1171,6 +1183,7 @@ class TopologyOperationWorker {
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
+                    traceWorkerFailure(plan, operationId, 'worker.verify', error, entry.node.node);
                     return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
@@ -1195,6 +1208,7 @@ class TopologyOperationWorker {
                     }
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
+                    traceWorkerFailure(plan, operationId, 'worker.usersync', error);
                     return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
@@ -1252,6 +1266,7 @@ class TopologyOperationWorker {
                     if (durablePppWait) {
                         return { claimed: true, operationId, status: 'awaiting_ppp' };
                     }
+                    traceWorkerFailure(plan, operationId, 'worker.ppp', error);
                     return await this.rollbackAfterCommitFailure(
                         plan, operationId, prepared, changing, heartbeat, acquiredNodeIds,
                     );
@@ -1265,6 +1280,7 @@ class TopologyOperationWorker {
                     if (proof?.ok !== true) throw new Error('Attach ingress proof was not verified');
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
+                    traceWorkerFailure(plan, operationId, 'worker.attach', error);
                     return await this.rollbackAfterCommitFailure(
                         plan, operationId, prepared, changing, heartbeat, acquiredNodeIds,
                     );
@@ -1285,6 +1301,7 @@ class TopologyOperationWorker {
                     || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') {
                     throw new LeaseLostError();
                 }
+                traceWorkerFailure(plan, operationId, 'worker.finalize', error);
                 return await this.rollbackAfterCommitFailure(
                     plan,
                     operationId,
@@ -1299,6 +1316,8 @@ class TopologyOperationWorker {
         } catch (error) {
             if (error instanceof LeaseLostError
                 || error?.code === 'TOPOLOGY_OPERATION_LEASE_LOST') {
+                traceWorkerFailure(plan, operationId, 'worker.lease',
+                    { code: 'TOPOLOGY_OPERATION_LEASE_LOST' });
                 return {
                     claimed: true,
                     operationId,
@@ -1307,6 +1326,7 @@ class TopologyOperationWorker {
                     errorCode: 'TOPOLOGY_OPERATION_LEASE_LOST',
                 };
             }
+            traceWorkerFailure(plan, operationId, 'worker.unhandled', error);
             throw error;
         } finally {
             if (heartbeat) await heartbeat.stop();

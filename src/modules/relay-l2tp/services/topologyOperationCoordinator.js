@@ -139,6 +139,16 @@ function sanitizeValidationErrors(errors) {
 
 function safeQueueError(error, operationId, expectedTopologyRevision) {
     if (error instanceof TopologyOperationCoordinatorError) return error;
+    if (error?.code === 'TOPOLOGY_ADMISSION_UNAVAILABLE') {
+        // The compare-and-swap did not acquire the admission slot; nothing
+        // was committed for this attempt. Do not classify ambiguous Mongo
+        // commit failures or arbitrary transaction errors as retryable.
+        return new TopologyOperationCoordinatorError(
+            'TOPOLOGY_DEPLOY_BUSY',
+            'Another topology deployment owns the slot; retry after it finishes',
+            { operationId, expectedTopologyRevision, retryable: true },
+        );
+    }
     if (error?.code === 'TOPOLOGY_REPLACEMENT_RESERVED') {
         return new TopologyOperationCoordinatorError(
             'TOPOLOGY_REPLACEMENT_RESERVED',

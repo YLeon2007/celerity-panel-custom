@@ -17,7 +17,9 @@ const {
     createTopologyDraftWriteService,
 } = require('../modules/relay-l2tp/services/topologyDraftWriteService');
 const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2tpPathMaintenance');
+const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const logger = require('../utils/logger');
+const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const { requireScope } = require('../middleware/auth');
 
 const LINK_POPULATE_SELECT = 'name ip flag status';
@@ -124,6 +126,7 @@ const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
     'INVALID_TOPOLOGY_REVISION',
     'STALE_TOPOLOGY_REVISION',
     'INVALID_TOPOLOGY_DEPLOYMENT',
+    'TOPOLOGY_DEPLOY_BUSY',
     'TOPOLOGY_OPERATION_QUEUE_FAILED',
     'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
 ]);
@@ -134,7 +137,10 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: 'The auto-deploy operation could not be queued',
+        message: code === 'TOPOLOGY_DEPLOY_BUSY'
+            ? 'Another topology deployment owns the slot; retry after it finishes'
+            : 'The auto-deploy operation could not be queued',
+        ...(code === 'TOPOLOGY_DEPLOY_BUSY' ? { retryable: true } : {}),
     };
 }
 
@@ -274,7 +280,12 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
     return { topologyRevision, deployedRevision, links };
 }
 
-function sendError(res, error, operation) {
+function sendError(res, error, operation, context = {}) {
+    if (['Create', 'Update', 'Delete'].includes(operation)) {
+        logTopologyTestFailure({ action: `link.${operation.toLowerCase()}`,
+            phase: 'draft.write', revision: context.revision,
+            linkId: context.linkId, error });
+    }
     let code = error?.code;
     let status;
     if (error instanceof RequestValidationError || error?.name === 'ValidationError') {
@@ -320,6 +331,21 @@ function createCascadeLinksRouter({
     topologyDraftWriteService,
     createDraftWriteService = createTopologyDraftWriteService,
     maintainAutoL2tpPathsFn = maintainAutoL2tpPaths,
+    prepareL2tpIngressFn = async input => {
+        const service = l2tpActiveHostProvider.getActiveHost()?.runtime?.simpleService;
+        if (typeof service?.prepareConfiguredRelayIngress === 'function') {
+            return service.prepareConfiguredRelayIngress(input);
+        }
+        // Do not freeze a candidate that silently omits an existing relay's
+        // ingress when the L2TP runtime has not been installed in this process.
+        const states = await RelayState.find({ routeGroup: { $ne: null } }).lean();
+        if ((states || []).length > 0) {
+            const error = new Error('The L2TP ingress preparation runtime is unavailable');
+            error.code = 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE';
+            throw error;
+        }
+        return { revision: input.expectedTopologyRevision };
+    },
     topologyCoordinator,
     createTopologyCoordinator = () => require('../modules/relay-l2tp')
         .createTopologyDeploymentService({
@@ -367,7 +393,7 @@ function createCascadeLinksRouter({
     // have settled, pinning the post-maintenance revision. The result is
     // truthful: an operation id with its real queued status, or a blocked
     // reason — never a readiness claim.
-    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links }) => {
+    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action }) => {
         const linkId = String(link._id);
         const baselineLinkIds = selectLinkApplyBaselineLinkIds({
             links,
@@ -408,6 +434,8 @@ function createCascadeLinksRouter({
                 },
             };
         } catch (error) {
+            logTopologyTestFailure({ action, phase: 'auto-deploy.queue',
+                revision, linkId, error });
             const blocked = autoDeployBlockedError(error);
             logger.warn(
                 `[Cascade Links API] Auto-deploy of link ${linkId} blocked: ${blocked.code}: ${blocked.message}`,
@@ -434,7 +462,7 @@ function createCascadeLinksRouter({
     // from the live graph so installed L2TP relays heal on the next topology
     // sync instead of requiring a reinstall. Best-effort: never fails the
     // link mutation itself.
-    const maintainL2tpPaths = async () => {
+    const maintainL2tpPaths = async ({ required = false } = {}) => {
         try {
             return await maintainAutoL2tpPathsFn({
                 HyNode: Node,
@@ -446,6 +474,7 @@ function createCascadeLinksRouter({
             });
         } catch (error) {
             logger.warn(`[Cascade Links API] L2TP auto path maintenance failed: ${error.message}`);
+            if (required) throw error;
         }
     };
 
@@ -643,31 +672,77 @@ function createCascadeLinksRouter({
                 link,
             });
             await invalidateCaches();
-            const maintenance = await maintainL2tpPaths();
-            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+            let maintenance = null;
+            let maintenanceError = null;
+            try {
+                maintenance = await maintainL2tpPaths({ required: link.autoDeploy === true });
+            } catch (error) {
+                maintenanceError = error;
+            }
+            if (link.autoDeploy === true && maintenanceError) {
+                logTopologyTestFailure({ action: 'link.create', phase: 'auto-path.maintain',
+                    revision: revisions.revision, linkId: String(link._id), error: maintenanceError });
+                logger.warn(`[Cascade Links API] L2TP auto path maintenance blocked autoDeploy: ${maintenanceError.code || 'UNKNOWN'}`);
+            }
+            let finalRevisions = Number.isSafeInteger(maintenance?.revision)
                 ? { ...revisions, revision: maintenance.revision }
                 : revisions;
             logger.info(
                 `[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`,
             );
-            const snapshot = await readLinkSnapshot({
+            let snapshot = await readLinkSnapshot({
                 Link,
                 TopologyState,
                 revisions: finalRevisions,
             });
+            let preparationError = maintenanceError;
+            if (link.autoDeploy === true && !preparationError) {
+                const linkId = String(link._id);
+                const baselineLinkIds = selectLinkApplyBaselineLinkIds({
+                    links: snapshot.links, linkId, portalNodeId, bridgeNodeId,
+                });
+                try {
+                    const prepared = await prepareL2tpIngressFn({
+                        link, linkId, linkIds: [linkId, ...baselineLinkIds],
+                        expectedTopologyRevision: finalRevisions.revision,
+                    });
+                    if (!Number.isSafeInteger(prepared?.revision)
+                        || prepared.revision < finalRevisions.revision) {
+                        const error = new Error('L2TP ingress preparation returned no exact revision');
+                        error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+                        throw error;
+                    }
+                    finalRevisions = { ...finalRevisions, revision: prepared.revision };
+                    snapshot = { ...snapshot, topologyRevision: prepared.revision };
+                } catch (error) {
+                    preparationError = error;
+                    logTopologyTestFailure({ action: 'link.create', phase: 'ingress.prepare',
+                        revision: finalRevisions.revision, linkId, error });
+                    logger.warn(`[Cascade Links API] L2TP ingress preparation blocked: ${error.code || 'UNKNOWN'}`);
+                }
+            }
             const body = { ...snapshot, createdLinkId: String(link._id) };
             if (link.autoDeploy === true) {
-                Object.assign(body, await queueAutoDeploy({
-                    link,
-                    portalNodeId,
-                    bridgeNodeId,
-                    revision: finalRevisions.revision,
-                    links: snapshot.links,
-                }));
+                if (preparationError) {
+                    Object.assign(body, {
+                        autoDeployStatus: 'blocked',
+                        autoDeployError: autoDeployBlockedError(preparationError),
+                    });
+                } else {
+                    Object.assign(body, await queueAutoDeploy({
+                        link,
+                        action: 'link.create',
+                        portalNodeId,
+                        bridgeNodeId,
+                        revision: finalRevisions.revision,
+                        links: snapshot.links,
+                    }));
+                }
             }
             return res.status(201).json(body);
         } catch (error) {
-            return sendError(res, error, 'Create');
+            return sendError(res, error, 'Create', {
+                revision: req.body?.expectedTopologyRevision });
         }
     });
 
@@ -821,34 +896,87 @@ function createCascadeLinksRouter({
                 changes,
             });
             await invalidateCaches();
-            const maintenance = await maintainL2tpPaths();
-            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+            let maintenance = null;
+            let maintenanceError = null;
+            try {
+                maintenance = await maintainL2tpPaths({ required: changes.autoDeploy === true });
+            } catch (error) {
+                maintenanceError = error;
+            }
+            if (changes.autoDeploy === true && maintenanceError) {
+                logTopologyTestFailure({ action: 'link.update', phase: 'auto-path.maintain',
+                    revision: revisions.revision, linkId: req.params.id, error: maintenanceError });
+                logger.warn(`[Cascade Links API] L2TP auto path maintenance blocked autoDeploy: ${maintenanceError.code || 'UNKNOWN'}`);
+            }
+            let finalRevisions = Number.isSafeInteger(maintenance?.revision)
                 ? { ...revisions, revision: maintenance.revision }
                 : revisions;
             logger.info(`[Cascade Links API] Updated link ${req.params.id}`);
-            const snapshot = await readLinkSnapshot({
+            let snapshot = await readLinkSnapshot({
                 Link,
                 TopologyState,
                 revisions: finalRevisions,
             });
-            const body = { ...snapshot };
+            let body = { ...snapshot };
             // Only this PUT's explicit opt-in may queue; persisted metadata on
             // another edit is never an instruction to activate the link.
             if (changes.autoDeploy === true) {
                 const link = snapshot.links.find(candidate => String(candidate._id) === req.params.id);
                 if (link?.active === true) {
-                    Object.assign(body, await queueAutoDeploy({
-                        link,
-                        portalNodeId: link.portalNode,
-                        bridgeNodeId: link.bridgeNode,
-                        revision: finalRevisions.revision,
-                        links: snapshot.links,
-                    }));
+                    let preparationError = maintenanceError;
+                    if (!preparationError) {
+                        try {
+                        const baselineLinkIds = selectLinkApplyBaselineLinkIds({
+                            links: snapshot.links,
+                            linkId: link._id,
+                            portalNodeId: link.portalNode,
+                            bridgeNodeId: link.bridgeNode,
+                        });
+                        const prepared = await prepareL2tpIngressFn({
+                            link,
+                            linkId: String(link._id),
+                            linkIds: [String(link._id), ...baselineLinkIds],
+                            expectedTopologyRevision: finalRevisions.revision,
+                        });
+                        if (!Number.isSafeInteger(prepared?.revision)
+                            || prepared.revision < finalRevisions.revision) {
+                            const error = new Error('L2TP ingress preparation returned no exact revision');
+                            error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+                            throw error;
+                        }
+                        if (prepared.revision !== finalRevisions.revision) {
+                            finalRevisions = { ...finalRevisions, revision: prepared.revision };
+                            snapshot = { ...snapshot, topologyRevision: prepared.revision };
+                            body = { ...body, topologyRevision: prepared.revision };
+                        }
+                    } catch (error) {
+                        preparationError = error;
+                        logTopologyTestFailure({ action: 'link.update', phase: 'ingress.prepare',
+                            revision: finalRevisions.revision, linkId: req.params.id, error });
+                        logger.warn(`[Cascade Links API] L2TP ingress preparation blocked: ${error.code || 'UNKNOWN'}`);
+                    }
+                    }
+                    if (preparationError) {
+                        Object.assign(body, {
+                            autoDeployStatus: 'blocked',
+                            autoDeployError: autoDeployBlockedError(preparationError),
+                        });
+                    } else {
+                        Object.assign(body, await queueAutoDeploy({
+                            link,
+                            action: 'link.update',
+                            portalNodeId: link.portalNode,
+                            bridgeNodeId: link.bridgeNode,
+                            revision: finalRevisions.revision,
+                            links: snapshot.links,
+                        }));
+                    }
                 }
             }
             return res.json(body);
         } catch (error) {
-            return sendError(res, error, 'Update');
+            return sendError(res, error, 'Update', {
+                revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
         }
     });
 
@@ -868,7 +996,7 @@ function createCascadeLinksRouter({
             });
             await invalidateCaches();
             const maintenance = await maintainL2tpPaths();
-            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+            let finalRevisions = Number.isSafeInteger(maintenance?.revision)
                 ? { ...revisions, revision: maintenance.revision }
                 : revisions;
             logger.info(`[Cascade Links API] Deleted link ${req.params.id}`);
@@ -878,7 +1006,8 @@ function createCascadeLinksRouter({
                 revisions: finalRevisions,
             }));
         } catch (error) {
-            return sendError(res, error, 'Delete');
+            return sendError(res, error, 'Delete', {
+                revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
         }
     });
 

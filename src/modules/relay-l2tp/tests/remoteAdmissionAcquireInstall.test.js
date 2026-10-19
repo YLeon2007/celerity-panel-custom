@@ -21,6 +21,8 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
     sessionUnavailable = false } = {}) {
     const state = gate === null ? null : { _id: 'singleton', remoteAdmissionCount: 0, ...gate };
     const records = new Map();
+    const locks = new Map();
+    const operations = new Map();
     const calls = [];
     const session = { id: 'install-acquisition' };
     const db = { startSession: sessionUnavailable ? undefined : async () => session };
@@ -44,6 +46,15 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
     };
     const RemoteAdmission = {
         db: splitConnection ? { startSession: async () => session } : db,
+        findOne(filter) {
+            const row = [...records.values()].find(record => matchesAdmission(record, filter));
+            return { session() { return this; }, async lean() { return row || null; } };
+        },
+        find(filter) {
+            const rows = [...records.values()].filter(record => matchesAdmission(record, filter));
+            return { sort() { return this; }, limit(max) { return this._rows = rows.slice(0, max), this; },
+                async lean() { return (this._rows ?? rows).map(row => ({ ...row })); } };
+        },
         async create(documents, options) {
             assert.strictEqual(options.session, session);
             calls.push('record');
@@ -61,17 +72,42 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
             return { matchedCount: 1 };
         },
     };
+    const L2tpOperation = {
+        db,
+        findOne(filter) {
+            const operation = [...operations.values()].find(candidate =>
+                Object.entries(filter).every(([key, expected]) => {
+                    const value = candidate[key];
+                    if (expected && typeof expected === 'object' && '$in' in expected) {
+                        return expected.$in.includes(value);
+                    }
+                    return value === expected;
+                }));
+            return {
+                session() { return this; },
+                async lean() { return operation ? { ...operation } : null; },
+            };
+        },
+    };
+    const NodeOperationLock = {
+        db,
+        findOne({ node, operationId }) {
+            const lock = locks.get(`${node}:${operationId}`);
+            return { session() { return this; }, async lean() { return lock ?? null; } };
+        },
+    };
     const repository = new RemoteAdmissionRepository({ CascadeTopologyState, RemoteAdmission,
-        transactionRunner: async work => {
+        L2tpOperation, NodeOperationLock, transactionRunner: async work => {
             const previousCount = state?.remoteAdmissionCount;
             const previousRecords = new Map([...records].map(([id, record]) => [id, { ...record }]));
             try {
-                await work(session);
+                const result = await work(session);
                 if (ambiguous) {
                     const error = new Error('uncertain commit');
                     error.code = 'UNKNOWN_TRANSACTION_COMMIT_RESULT';
                     throw error;
                 }
+                return result;
             } catch (error) {
                 if (error.code !== 'UNKNOWN_TRANSACTION_COMMIT_RESULT') {
                     if (state) state.remoteAdmissionCount = previousCount;
@@ -81,19 +117,33 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
                 throw error;
             }
         } });
-    return { repository, state, records, calls };
+    return { repository, state, records, locks, operations, calls };
 }
 
-test('acquireInstall atomically counts a uniquely owned running install admission', async () => {
+test('acquireInstall blocks a second unresolved same-node install before SSH', async () => {
     const f = fixture();
     const first = await f.repository.acquireInstall({ nodeId: 'relay-1' });
-    const second = await f.repository.acquireInstall({ nodeId: 'relay-1' });
-    assert.notEqual(first, second);
-    assert.deepEqual(f.calls, ['gate', 'record', 'gate', 'record']);
-    assert.equal(f.state.remoteAdmissionCount, 2);
-    assert.deepEqual([...f.records.values()], [first, second].map(_id => ({
-        _id, nodeId: 'relay-1', kind: 'install', phase: 'running', ownerGeneration: 1,
-    })));
+    await assert.rejects(f.repository.acquireInstall({ nodeId: 'relay-1' }),
+        { code: 'REMOTE_INSTALL_ALREADY_ACTIVE' });
+    assert.deepEqual(f.calls, ['gate', 'record']);
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    assert.deepEqual([...f.records.values()], [{
+        _id: first, nodeId: 'relay-1', kind: 'install', phase: 'running', ownerGeneration: 1,
+    }]);
+});
+
+test('install and standalone preflight share the same-node unresolved fence', async () => {
+    const first = fixture();
+    await first.repository.acquireInstall({ nodeId: 'relay-1' });
+    await assert.rejects(first.repository.acquire({ nodeId: 'relay-1' }),
+        { code: 'REMOTE_INSTALL_ALREADY_ACTIVE' });
+    assert.equal(first.state.remoteAdmissionCount, 1);
+
+    const second = fixture();
+    await second.repository.acquire({ nodeId: 'relay-1' });
+    await assert.rejects(second.repository.acquireInstall({ nodeId: 'relay-1' }),
+        { code: 'REMOTE_INSTALL_ALREADY_ACTIVE' });
+    assert.equal(second.state.remoteAdmissionCount, 1);
 });
 
 test('acquireInstall denies absent or legacy gate, drain, and reservation without creating a record', async () => {
@@ -151,6 +201,7 @@ test('acquireInstall cannot proceed with a nontransactional session', async () =
     const repository = new RemoteAdmissionRepository({
         CascadeTopologyState: { db, updateOne: async () => { updates += 1; return { matchedCount: 1 }; } },
         RemoteAdmission: { db, create: async () => { throw new Error('unexpected create'); },
+            findOne() { throw new Error('unexpected findOne'); },
             updateOne: async () => ({ matchedCount: 1 }) },
     });
     await assert.rejects(repository.acquireInstall({ nodeId: 'relay-1' }), error => {
@@ -195,7 +246,7 @@ test('release gate CAS miss rolls back a prequeue admission completion', async (
 test('install release decrements only its own running record once', async () => {
     const f = fixture();
     const first = await f.repository.acquireInstall({ nodeId: 'relay-1' });
-    const second = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    const second = await f.repository.acquireInstall({ nodeId: 'relay-2' });
     await f.repository.release(first);
     assert.equal(f.state.remoteAdmissionCount, 1);
     assert.equal(f.records.get(first).phase, 'completed');
@@ -208,4 +259,122 @@ test('acquireInstall rejects missing identity without a gate mutation', async ()
     const f = fixture();
     await assert.rejects(f.repository.acquireInstall({}), /Invalid install admission/);
     assert.deepEqual(f.calls, []);
+});
+
+test('completeTerminalOperation closes a verified rollback and decrements the counted gate once', async () => {
+    const f = fixture();
+    const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    const admission = f.records.get(admissionId);
+    Object.assign(admission, {
+        phase: 'running', operationId: 'operation-1', leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    f.operations.set('operation-1', {
+        _id: 'operation-1', node: 'relay-1', kind: 'install', status: 'rolled_back',
+        admissionId, leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    assert.equal(await f.repository.completeTerminalOperation({
+        admissionId, operationId: 'operation-1', nodeId: 'relay-1', owner: 'worker-1',
+        ownerGeneration: 2, kind: 'install',
+    }), true);
+    assert.equal(f.state.remoteAdmissionCount, 0);
+    assert.equal(admission.phase, 'completed');
+    await assert.rejects(f.repository.completeTerminalOperation({
+        admissionId, operationId: 'operation-1', nodeId: 'relay-1', owner: 'worker-1',
+        ownerGeneration: 2, kind: 'install',
+    }), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
+    assert.equal(f.state.remoteAdmissionCount, 0);
+});
+
+test('terminal completion refuses a still-owned node lock, even after operation rollback', async () => {
+    const f = fixture();
+    const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    Object.assign(f.records.get(admissionId), {
+        operationId: 'op-locked', leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    f.operations.set('op-locked', {
+        _id: 'op-locked', node: 'relay-1', kind: 'install', status: 'rolled_back',
+        admissionId, leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    f.locks.set('relay-1:op-locked', { generation: 'lock-uuid', remoteUncertain: true });
+    const request = { admissionId, operationId: 'op-locked', nodeId: 'relay-1',
+        owner: 'worker-1', ownerGeneration: 2, kind: 'install' };
+    await assert.rejects(f.repository.completeTerminalOperation(request),
+        { code: 'REMOTE_ADMISSION_LOCK_HELD' });
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    f.locks.delete('relay-1:op-locked');
+    assert.equal(await f.repository.completeTerminalOperation(request), true);
+    assert.equal(f.state.remoteAdmissionCount, 0);
+});
+
+test('failed rollback cannot be counted as a completed remote operation', async () => {
+    const f = fixture();
+    const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    Object.assign(f.records.get(admissionId), {
+        operationId: 'op-uncertain', leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    f.operations.set('op-uncertain', {
+        _id: 'op-uncertain', node: 'relay-1', kind: 'install', status: 'failed',
+        errorCode: 'ROLLBACK_FAILED', progress: 0, admissionId,
+        leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    await assert.rejects(f.repository.completeTerminalOperation({
+        admissionId, operationId: 'op-uncertain', nodeId: 'relay-1',
+        owner: 'worker-1', ownerGeneration: 2, kind: 'install',
+    }), { code: 'REMOTE_ADMISSION_NOT_TERMINAL' });
+    assert.equal(f.state.remoteAdmissionCount, 1);
+});
+
+test('recovery-required admission closes only after verified terminal readback', async () => {
+    const f = fixture();
+    const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    Object.assign(f.records.get(admissionId), {
+        phase: 'recovery_required', operationId: 'op-rolled-back',
+        leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    f.operations.set('op-rolled-back', {
+        _id: 'op-rolled-back', node: 'relay-1', kind: 'install', status: 'rolled_back',
+        admissionId, leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    assert.equal(await f.repository.completeTerminalOperation({
+        admissionId, operationId: 'op-rolled-back', nodeId: 'relay-1',
+        owner: 'worker-1', ownerGeneration: 2, kind: 'install',
+    }), true);
+    assert.equal(f.state.remoteAdmissionCount, 0);
+});
+
+test('recovery scan closes durable pre-SSH failure and leaves uncertain rollback fenced', async () => {
+    const f = fixture();
+    const pre = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    Object.assign(f.records.get(pre), { operationId: 'pre-op', leaseOwner: 'worker-1', ownerGeneration: 2 });
+    f.operations.set('pre-op', { _id: 'pre-op', node: 'relay-1', kind: 'install',
+        status: 'failed', progress: 0, errorCode: 'XRAY_CANDIDATE_FAILED',
+        admissionId: pre, leaseOwner: 'worker-1', ownerGeneration: 2 });
+    const uncertain = await f.repository.acquireInstall({ nodeId: 'relay-2' });
+    Object.assign(f.records.get(uncertain), {
+        phase: 'recovery_required', operationId: 'uncertain-op',
+        leaseOwner: 'worker-2', ownerGeneration: 2,
+    });
+    f.operations.set('uncertain-op', { _id: 'uncertain-op', node: 'relay-2', kind: 'install',
+        status: 'failed', progress: 0, errorCode: 'ROLLBACK_FAILED',
+        admissionId: uncertain, leaseOwner: 'worker-2', ownerGeneration: 2 });
+    f.locks.set('relay-2:uncertain-op', { generation: 'held-lock' });
+    assert.deepEqual(await f.repository.recoverSettledAdmissions(), { scanned: 2, recovered: 1 });
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    assert.equal(f.records.get(pre).phase, 'completed');
+    assert.equal(f.records.get(uncertain).phase, 'recovery_required');
+});
+
+test('markOperationRecoveryRequired preserves the counted gate after uncertain worker ownership', async () => {
+    const f = fixture();
+    const admissionId = await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    const admission = f.records.get(admissionId);
+    Object.assign(admission, {
+        phase: 'running', operationId: 'operation-2', leaseOwner: 'worker-1', ownerGeneration: 2,
+    });
+    assert.equal(await f.repository.markOperationRecoveryRequired({
+        admissionId, operationId: 'operation-2', nodeId: 'relay-1', owner: 'worker-1',
+        ownerGeneration: 2, kind: 'install',
+    }), true);
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    assert.equal(admission.phase, 'recovery_required');
 });

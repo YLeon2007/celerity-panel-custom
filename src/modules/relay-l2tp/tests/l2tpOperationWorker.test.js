@@ -8,6 +8,7 @@ const { L2tpOperationRepository } = require('../services/l2tpOperationRepository
 const { L2tpRemoteExecutor } = require('../services/l2tpRemoteExecutor');
 const { buildInstallPlan, INSTALL_STEP_TYPES } = require('../services/l2tpProvisionPlanService');
 const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
+const { L2tpStateManagementService } = require('../services/l2tpStateManagementService');
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
@@ -234,6 +235,7 @@ function createWorker(operationRepository, overrides = {}) {
         operation => operation.plan?.steps && !operation.plan.operationId);
     const lockService = {
         async renew() { return { ok: true }; },
+        async releaseVerified() { return { ok: true }; },
         ...(overrides.lockService || {}),
     };
     const acquire = lockService.acquire;
@@ -255,7 +257,9 @@ function createWorker(operationRepository, overrides = {}) {
     const worker = new L2tpOperationWorker({
         operationRepository,
         remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
-            completeVerifiedOperation: overrides.completeVerifiedOperation,
+            completeVerifiedOperation: overrides.completeVerifiedOperation ?? (async () => true),
+            completeTerminalOperation: overrides.completeTerminalOperation,
+            markOperationRecoveryRequired: overrides.markOperationRecoveryRequired,
             async claimQueuedInstall(request) {
                 const operation = operationRepository.operations?.find(candidate =>
                     candidate.status === 'queued' && candidate.kind === 'install');
@@ -305,6 +309,96 @@ function createWorker(operationRepository, overrides = {}) {
     }
     return worker;
 }
+
+test('counted install secret failure releases exact lock before terminal admission and never executes SSH', async () => {
+    const { operation: initialOperation } = createInstallOperation('operation-secret-counted');
+    const repository = createOperationRepository([initialOperation]);
+    const operation = repository.operations[0];
+    const order = [];
+    const worker = createWorker(repository, {
+        secretResolver: async () => { throw new Error('secret unavailable'); },
+        operationMaterializer: async ({ plan }) => ({ persistedPlan: plan, remoteArtifacts: [] }),
+        candidateService: { async buildCandidate({ plan }) {
+            return { operationId: plan.operationId, content: '{}' };
+        } },
+        lockService: {
+            async acquire() { order.push('acquire'); return { ok: true, lock: { generation: 'exact-secret-lock' } }; },
+            async releaseVerified(request) {
+                assert.equal(request.generation, 'exact-secret-lock');
+                order.push('lock');
+                return { ok: true };
+            },
+        },
+        remoteAdmissionRepository: {
+            async claimQueuedInstall(request) {
+                operation.status = 'running'; operation.leaseOwner = request.owner;
+                operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+                operation.ownerGeneration = 1;
+                return operation;
+            },
+            async claimQueuedSyncUsers() { return null; },
+            async completeTerminalOperation() { order.push('admission'); return true; },
+        },
+        executor: { async executeStep() { throw new Error('SSH must not execute'); } },
+    });
+    assert.deepEqual(await worker.runOnce(), {
+        claimed: true, operationId: operation.id, status: 'failed',
+    });
+    assert.deepEqual(order, ['acquire', 'lock', 'admission']);
+});
+
+test('retains counted admission when node lock acquisition is uncertain', async () => {
+    const { operation: initialOperation } = createInstallOperation('operation-lock-uncertain');
+    const repository = createOperationRepository([initialOperation]);
+    const operation = repository.operations[0];
+    let recoveryCalls = 0;
+    let sshCalls = 0;
+    const worker = createWorker(repository, {
+        operationMaterializer: async ({ plan }) => ({ persistedPlan: plan, remoteArtifacts: [] }),
+        candidateService: { async buildCandidate({ plan }) {
+            return { operationId: plan.operationId, content: '{}' };
+        } },
+        secretResolver: async () => ({ psk: 'lock-uncertain-psk' }),
+        remoteAdmissionRepository: {
+            async claimQueuedInstall(request) {
+                operation.status = 'running';
+                operation.leaseOwner = request.owner;
+                operation.leaseUntil = new Date(request.now.getTime() + request.leaseMs);
+                return operation;
+            },
+            async claimQueuedSyncUsers() {
+                return null;
+            },
+            async markOperationRecoveryRequired(request) {
+                recoveryCalls += 1;
+                assert.equal(request.admissionId, operation.admissionId);
+                assert.equal(request.operationId, operation.id);
+                assert.equal(request.ownerGeneration, 1);
+                return true;
+            },
+        },
+        lockService: {
+            async acquire() {
+                throw new Error('lock store response lost');
+            },
+        },
+        executor: {
+            async executeStep() {
+                sshCalls += 1;
+            },
+        },
+    });
+
+    assert.deepEqual(await worker.runOnce(), {
+        claimed: true,
+        operationId: operation.id,
+        status: 'running',
+        stopped: true,
+        errorCode: 'NODE_OPERATION_LOCK_UNCERTAIN',
+    });
+    assert.equal(recoveryCalls, 1);
+    assert.equal(sshCalls, 0);
+});
 
 function createInstallOperation(id = 'operation-install') {
     const desired = {
@@ -394,6 +488,7 @@ test('claims an install once and resolves its PSK once before typed artifact upl
             },
             async runArtifactCommand(request) {
                 transportCalls.push({ method: 'runArtifactCommand', request });
+                return { ok: true };
             },
         },
     });
@@ -550,7 +645,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const executor = new L2tpRemoteExecutor({
         transport: {
             async uploadRootFile() {},
-            async runArtifactCommand() {},
+            async runArtifactCommand() { return { ok: true }; },
         },
     });
     const worker = createWorker(operationRepository, {
@@ -595,7 +690,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const result = await worker.runOnce();
 
     assert.equal(result.status, 'succeeded');
-    assert.deepEqual(handoffOrder, ['admission', 'release', 'topology']);
+    assert.deepEqual(handoffOrder, ['release', 'admission', 'topology']);
     assert.deepEqual(hookCalls, [{
         operationId: 'operation-autodeploy',
         node: operation.node,
@@ -1953,7 +2048,7 @@ test('stops before a second step when node lock renewal rejects', async () => {
     assert.deepEqual(releases, [], 'failed lock renewal must not explicitly unlock the node');
 });
 
-test('retains the node lock after a transport timeout even when rollback succeeds', async () => {
+test('retains counted admission and lock without rollback after an uncertain SSH command', async () => {
     const operationRepository = createOperationRepository([{
         id: 'operation-transport-timeout',
         node: 'node-transport-timeout',
@@ -1962,15 +2057,20 @@ test('retains the node lock after a transport timeout even when rollback succeed
     }]);
     const releases = [];
     const rollbacks = [];
+    const recovery = [];
     const worker = createWorker(operationRepository, {
+        markOperationRecoveryRequired: async request => { recovery.push(request); return true; },
+        completeTerminalOperation: async () => { throw new Error('must not release admission'); },
         lockService: {
             async acquire() { return { ok: true }; },
-            async release(request) { releases.push(request); return { ok: true }; },
+            async releaseVerified(request) { releases.push(request); return { ok: true }; },
         },
         executor: {
             async executeStep() {
-                // A local transport timeout does not prove the remote command stopped.
-                throw Object.assign(new Error('Transport timed out'), { code: 'SSH_TIMEOUT' });
+                // NodeSSH timed out locally: the remote command may still be executing.
+                throw Object.assign(new Error('Transport timed out'), {
+                    code: 'REMOTE_COMMAND_FAILED', remoteOutcomeUncertain: true,
+                });
             },
             async rollback() { rollbacks.push('completed'); },
         },
@@ -1978,9 +2078,12 @@ test('retains the node lock after a transport timeout even when rollback succeed
 
     const result = await worker.runOnce();
 
-    assert.equal(result.status, 'rolled_back');
-    assert.deepEqual(rollbacks, ['completed']);
+    assert.equal(result.status, 'running');
+    assert.equal(result.stopped, true);
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.deepEqual(rollbacks, []);
     assert.deepEqual(releases, []);
+    assert.equal(recovery.length, 1);
     assert.equal(operationRepository.calls.some(call => call.method === 'succeedClaimed'), false);
 });
 
@@ -2067,8 +2170,13 @@ test('executor failure enters rolling back before rollback and finishes rolled b
     };
     const executionError = Object.assign(new Error('start failed'), { code: 'START_FAILED' });
     const worker = createWorker(operationRepository, {
+        completeTerminalOperation: async () => {
+            events.push({ method: 'admission' });
+            return true;
+        },
         lockService: {
             async acquire() { return { ok: true }; },
+            async releaseVerified() { events.push({ method: 'releaseVerified' }); return { ok: true }; },
             async release() { return { ok: true }; },
         },
         executor: {
@@ -2105,6 +2213,8 @@ test('executor failure enters rolling back before rollback and finishes rolled b
             error: executionError,
         },
         { method: 'setStatus', status: 'rolled_back' },
+        { method: 'releaseVerified' },
+        { method: 'admission' },
     ]);
     assert.deepEqual(
         operationRepository.calls.filter(call => call.method === 'setStatus'),
@@ -2618,7 +2728,16 @@ test('verified install state is reconciled before the operation can become succe
         stateReconciler: async request => {
             events.push({ method: 'reconcile', request });
             assert.equal(operationRepository.operations[0].status, 'running');
-            return { status: 'installed' };
+            const management = new L2tpStateManagementService({
+                secretKey: 'test-only',
+                repository: { async markInstalledAfterVerification(stateRequest) {
+                    assert.equal(stateRequest.ownerGeneration, 1);
+                    assert.equal(stateRequest.lockGeneration, 'fixture-lock-uuid');
+                    assert.equal(stateRequest.admissionId, 'admission-operation-reconcile-success');
+                    return { node: 'relay-1', status: 'installed' };
+                } },
+            });
+            return management.reconcileVerifiedOperation(request);
         },
         lockService: {
             async acquire() { return { ok: true }; },
@@ -2653,11 +2772,39 @@ test('verified install state is reconciled before the operation can become succe
     assert.ok(reconcileIndex < successIndex);
     assert.equal(events.some(event => event.method === 'release'), false,
         'successful reconciliation does not prove remote quiescence');
-    assert.deepEqual(events[reconcileIndex].request, {
-        operation: operationRepository.operations[0],
-        verifiedAt: NOW,
-    });
+    assert.strictEqual(events[reconcileIndex].request.operation,
+        operationRepository.operations[0]);
+    assert.deepEqual(events[reconcileIndex].request.verifiedAt, NOW);
+    assert.equal(events[reconcileIndex].request.claim.owner, 'worker-1');
+    assert.equal(typeof events[reconcileIndex].request.lockGeneration, 'string');
     assert.equal(events.some(event => event.method === 'rollback'), false);
+});
+
+test('stale reconciliation generation stops without rollback or another SSH command', async () => {
+    const { operation } = createInstallOperation('operation-stale-reconcile');
+    const repository = createOperationRepository([operation]);
+    let rollbacks = 0;
+    let recoveries = 0;
+    const worker = createWorker(repository, {
+        operationMaterializer: materializeInstallOperation,
+        candidateService: { async buildCandidate({ plan }) {
+            return { operationId: plan.operationId, content: '{}' };
+        } },
+        secretResolver: async () => ({ psk: 'in-memory-only', users: [] }),
+        stateReconciler: async () => {
+            throw Object.assign(new Error('stale generation'), { code: 'L2TP_OPERATION_FENCE_REJECTED' });
+        },
+        markOperationRecoveryRequired: async () => { recoveries++; return true; },
+        lockService: {
+            async acquire() { return { ok: true, lock: { generation: 'node-generation' } }; },
+        },
+        executor: { async executeStep() {}, async rollback() { rollbacks++; } },
+    });
+    const result = await worker.runOnce();
+    assert.equal(result.stopped, true);
+    assert.equal(result.errorCode, 'L2TP_OPERATION_FENCE_REJECTED');
+    assert.equal(rollbacks, 0);
+    assert.equal(recoveries, 1);
 });
 
 test('reconciliation failure cannot mark success and rolls back the verified install safely', async () => {

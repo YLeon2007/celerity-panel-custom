@@ -477,6 +477,35 @@ test('per-link deploy does not expose backend failure text in response or log', 
     assert.doesNotMatch(JSON.stringify(response.body) + logged.join(' '), /short-secret|password=/);
 });
 
+test('known deployment slot contention returns safe 409 with explicit retry guidance', async () => {
+    const selectedId = '507f1f77bcf86cd799439011';
+    const router = createCascadeTopologyDeployRouter({
+        models: { CascadeLink: {
+            find() { return { select() { return { lean: async () => [
+                { _id: selectedId, portalNode: 'p', bridgeNode: 'r', active: true, status: 'pending' },
+            ] }; } }; },
+        } },
+        topologyDeploymentService: {
+            async deploy() { assert.fail('global deploy must not run'); },
+            async queue() {
+                const error = new Error('password=never-leak');
+                error.code = 'TOPOLOGY_DEPLOY_BUSY';
+                error.retryable = true;
+                throw error;
+            },
+        },
+        ...guardHarness([]),
+    });
+    const response = await request(router, {
+        body: { expectedTopologyRevision: 7, linkId: selectedId },
+        headers: { 'x-test-auth': 'api-write' },
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, 'TOPOLOGY_DEPLOY_BUSY');
+    assert.equal(response.body.error.retryable, true);
+    assert.doesNotMatch(JSON.stringify(response.body), /never-leak|password=/);
+});
+
 test('per-link deploy rejects malformed or disabled links without queueing', async () => {
     const disabledId = '507f1f77bcf86cd799439019';
     let reads = 0;

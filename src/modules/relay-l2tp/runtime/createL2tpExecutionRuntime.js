@@ -321,6 +321,8 @@ function createL2tpExecutionRuntime({
         RelayL2tpState,
         CascadeRouteGroup,
         CascadeTopologyState,
+        L2tpOperation: operationModel,
+        NodeOperationLock: lockModel,
     });
     const managementService = new L2tpStateManagementService({
         repository: managementRepository,
@@ -376,6 +378,7 @@ function createL2tpExecutionRuntime({
         CascadeTopologyState,
         RemoteAdmission,
         L2tpOperation: operationModel,
+        NodeOperationLock: lockModel,
     });
     const lockService = new NodeOperationLockService({
         repository: lockRepository,
@@ -408,6 +411,9 @@ function createL2tpExecutionRuntime({
         userManagementService,
         stateRepository: runtimeDependencies.stateRepository,
         nodeSSHFactory: node => new NodeSSH(node),
+        remoteAdmissionRepository,
+        lockService,
+        allowRemoteExecution: runtimeDependencies?.enableInstallAdmission === true,
         secretBox,
         secretKey,
     });

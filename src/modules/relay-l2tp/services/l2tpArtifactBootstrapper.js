@@ -17,7 +17,7 @@ const STAGING_DIR = '/var/lib/celerity/l2tp-bootstrap';
 
 const INSPECT_COMMAND = Object.freeze([
     `if /usr/bin/test -x ${RUNNER_LINK} && /usr/bin/test -x ${RECEIVER_LINK} && /usr/bin/test -f ${INSTALLED_RUNNER}; then`,
-    `/usr/bin/sha256sum -- ${INSTALLED_RUNNER};`,
+    `/usr/bin/sha256sum -- ${INSTALLED_RUNNER} /usr/local/lib/celerity/relay-l2tp/*.sh /usr/local/lib/celerity/relay-l2tp/*.py;`,
     'else',
     "printf 'missing\\n';",
     'fi',
@@ -42,6 +42,30 @@ function localRunnerDigest(createHash) {
         .digest('hex');
 }
 
+function installedArtifactFiles() {
+    return localArtifactFiles().filter(name => name !== 'install.sh');
+}
+
+function localArtifactDigests(createHash, names = localArtifactFiles()) {
+    return new Map(names.map(name => [
+        name,
+        createHash('sha256')
+            .update(readFileSync(path.join(ARTIFACT_SOURCE_DIR, name)))
+            .digest('hex'),
+    ]));
+}
+
+function installedBundleMatches(stdout, createHash) {
+    if (typeof stdout !== 'string' || stdout.trim() === '' || stdout.trim() === 'missing') return false;
+    const digests = new Map();
+    for (const line of stdout.trim().split(/\r?\n/)) {
+        const match = line.match(/^([0-9a-f]{64})\s+(.+)$/);
+        if (match) digests.set(path.basename(match[2]), match[1]);
+    }
+    const expected = localArtifactDigests(createHash, installedArtifactFiles());
+    return [...expected].every(([name, digest]) => digests.get(name) === digest);
+}
+
 function isSilentSuccess(result) {
     return Boolean(result)
         && result.code === 0
@@ -64,25 +88,40 @@ class L2tpArtifactBootstrapper {
         this.#createHash = createHash;
     }
 
+    async #exec(command, options) {
+        let result;
+        try {
+            result = await this.#nodeSSH.exec(command, options);
+        } catch {
+            throw Object.assign(new L2tpArtifactBootstrapperError(),
+                { remoteOutcomeUncertain: true });
+        }
+        if (!Number.isInteger(result?.code) || result.code < 0) {
+            throw Object.assign(new L2tpArtifactBootstrapperError(),
+                { remoteOutcomeUncertain: true });
+        }
+        return result;
+    }
+
     async ensureArtifact() {
-        const expectedDigest = localRunnerDigest(this.#createHash);
-        const inspected = await this.#nodeSSH.exec(INSPECT_COMMAND);
-        if (inspected && inspected.code === 0
-            && typeof inspected.stdout === 'string'
-            && inspected.stdout.trim().split(/\s+/)[0] === expectedDigest) {
+        const inspected = await this.#exec(INSPECT_COMMAND);
+        if (inspected.code !== 0) throw new L2tpArtifactBootstrapperError();
+        if (installedBundleMatches(inspected.stdout, this.#createHash)) {
             return { ok: true, changed: false };
         }
 
-        if (!isSilentSuccess(await this.#nodeSSH.exec(
-            `/usr/bin/rm -rf -- ${STAGING_DIR} && /usr/bin/install -d -o 0 -g 0 -m 0700 -- ${STAGING_DIR}`,
-        ))) {
-            throw new L2tpArtifactBootstrapperError();
-        }
-
+        let remoteOutcomeUncertain = false;
         try {
+            const prepared = await this.#exec(
+                `/usr/bin/rm -rf -- ${STAGING_DIR} && /usr/bin/install -d -o 0 -g 0 -m 0700 -- ${STAGING_DIR}`,
+            );
+            if (!isSilentSuccess(prepared)) {
+                throw new L2tpArtifactBootstrapperError();
+            }
+
             for (const name of localArtifactFiles()) {
                 const content = readFileSync(path.join(ARTIFACT_SOURCE_DIR, name));
-                const uploaded = await this.#nodeSSH.exec(
+                const uploaded = await this.#exec(
                     `/usr/bin/tee -- ${STAGING_DIR}/${name} >/dev/null && /usr/bin/chmod 0755 -- ${STAGING_DIR}/${name}`,
                     { stdin: content },
                 );
@@ -91,17 +130,22 @@ class L2tpArtifactBootstrapper {
                 }
             }
 
-            const installed = await this.#nodeSSH.exec(
+            const installed = await this.#exec(
                 `/usr/bin/bash -- ${STAGING_DIR}/install.sh`,
                 { timeout: 120000 },
             );
-            if (!installed || installed.code !== 0
+            if (installed.code !== 0
                 || typeof installed.stdout !== 'string'
                 || !installed.stdout.includes('"status":"ok"')) {
                 throw new L2tpArtifactBootstrapperError();
             }
+        } catch (error) {
+            remoteOutcomeUncertain = error?.remoteOutcomeUncertain === true;
+            throw error;
         } finally {
-            await this.#nodeSSH.exec(`/usr/bin/rm -rf -- ${STAGING_DIR}`).catch(() => {});
+            if (!remoteOutcomeUncertain) {
+                await this.#exec(`/usr/bin/rm -rf -- ${STAGING_DIR}`).catch(() => {});
+            }
         }
 
         return { ok: true, changed: true };

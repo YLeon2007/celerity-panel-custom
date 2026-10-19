@@ -1,10 +1,12 @@
 'use strict';
 
 const { createHash, randomBytes } = require('node:crypto');
+const mongoose = require('mongoose');
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const {
     DefaultChainPathError,
     buildDefaultChainLinkIds,
+    buildDefaultChainPath,
 } = require('../domain/defaultChainPath');
 
 // Simplified, opinionated facade over the L2TP relay machinery: the panel
@@ -169,7 +171,7 @@ path = '/usr/local/etc/xray/config.json'
 try:
     with open(path) as handle:
         config = json.load(handle)
-except Exception:
+except FileNotFoundError:
     raise SystemExit(0)
 tags = {
     inbound.get('tag')
@@ -192,7 +194,7 @@ with open(path, 'w') as handle:
 print('xray-l2tp-removed')
 `).toString('base64');
     return [
-        'set -u',
+        'set -Eeuo pipefail',
         'ipsec stop >/dev/null 2>&1 || true',
         'rm -f /var/run/charon.pid /var/run/starter.charon.pid >/dev/null 2>&1 || true',
         'systemctl stop xl2tpd.service strongswan-starter.service >/dev/null 2>&1 || true',
@@ -203,9 +205,34 @@ print('xray-l2tp-removed')
         'rm -f /etc/ipsec.d/celerity-l2tp.conf /etc/ipsec.secrets'
             + ' /etc/xl2tpd/xl2tpd.conf /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets'
             + ' /etc/nftables.d/celerity-l2tp.nft',
-        `printf '%s' '${xrayStrip}' | base64 -d | python3 || true`,
-        'systemctl is-active --quiet xray.service'
-            + ' && systemctl restart xray.service >/dev/null 2>&1 || true',
+        `printf '%s' '${xrayStrip}' | base64 -d | python3`,
+        'xray_status="$(systemctl show --no-pager --property=LoadState,ActiveState --value xray.service)" || exit $?',
+        'case "$xray_status" in',
+        "    $'loaded\\nactive') systemctl restart xray.service >/dev/null 2>&1 || exit $? ;;",
+        "    $'loaded\\ninactive'|$'loaded\\nfailed'|$'not-found\\ninactive'|$'not-found\\nunknown') ;;",
+        '    *) exit 1 ;;',
+        'esac',
+        'unit_status() {',
+        '    local status',
+        '    status="$(systemctl show --no-pager --property=LoadState,ActiveState,UnitFileState --value "$1")" || exit $?',
+        '    case "$status" in',
+        "        $'loaded\\ninactive\\ndisabled'|$'loaded\\ninactive\\nmasked'|$'loaded\\ninactive\\nstatic'|$'loaded\\ninactive\\nindirect'|$'loaded\\ninactive\\ngenerated'|$'loaded\\ninactive\\ntransient'|$'loaded\\nfailed\\ndisabled'|$'loaded\\nfailed\\nmasked'|$'loaded\\nfailed\\nstatic'|$'loaded\\nfailed\\nindirect'|$'loaded\\nfailed\\ngenerated'|$'loaded\\nfailed\\ntransient'|$'not-found\\ninactive'|$'not-found\\nunknown') ;;",
+        '        *) exit 1 ;;',
+        '    esac',
+        '}',
+        'unit_status xl2tpd.service',
+        'unit_status strongswan-starter.service',
+        'nft_tables="$(nft list tables)"',
+        "case $'\\n'\"$nft_tables\"$'\\n' in *$'\\ntable inet celerity_l2tp\\n'*) exit 1;; esac",
+        'ip_rule_output="$(ip -4 rule show)"',
+        "case $'\\n'\"$ip_rule_output\"$'\\n' in *$'\\n10077:'*) exit 1;; esac",
+        ...(routeTable === 0 ? [] : [
+            `route_output="$(ip -4 route show table ${routeTable})"`,
+            'test -z "$route_output"',
+        ]),
+        'for path in /etc/ipsec.d/celerity-l2tp.conf /etc/ipsec.secrets'
+            + ' /etc/xl2tpd/xl2tpd.conf /etc/ppp/options.xl2tpd /etc/ppp/chap-secrets'
+            + ' /etc/nftables.d/celerity-l2tp.nft; do test ! -e "$path"; done',
         'echo TEARDOWN_OK',
     ].join('\n');
 }
@@ -223,6 +250,9 @@ class L2tpSimpleService {
         userManagementService,
         stateRepository,
         nodeSSHFactory,
+        remoteAdmissionRepository = null,
+        lockService = null,
+        allowRemoteExecution = false,
         secretBox = null,
         secretKey = null,
     } = {}) {
@@ -266,6 +296,9 @@ class L2tpSimpleService {
         this.userManagementService = userManagementService;
         this.stateRepository = stateRepository;
         this.nodeSSHFactory = nodeSSHFactory;
+        this.remoteAdmissionRepository = remoteAdmissionRepository;
+        this.lockService = lockService;
+        this.allowRemoteExecution = allowRemoteExecution === true;
         this.secretBox = secretBox;
         this.secretKey = secretKey;
     }
@@ -411,7 +444,7 @@ class L2tpSimpleService {
         }];
     }
 
-    async withPathWriter(work) {
+    async withPathWriter(work, expectedTopologyRevision = null) {
         const models = [this.HyNode, this.CascadeLink, this.CascadeRouteGroup,
             this.RelayL2tpState, this.CascadeTopologyState];
         const connection = this.CascadeTopologyState?.db;
@@ -427,6 +460,9 @@ class L2tpSimpleService {
                     throw simpleError('TOPOLOGY_REPLACEMENT_RESERVED', 'A topology replacement owns the path writer fence');
                 }
                 const expectedRevision = topology?.revision ?? 0;
+                if (expectedTopologyRevision !== null && expectedRevision !== expectedTopologyRevision) {
+                    throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Topology changed before L2TP ingress preparation');
+                }
                 const commit = async () => {
                     const update = { $inc: { revision: 1 } };
                     if (!topology) update.$setOnInsert = { deployedRevision: 0 };
@@ -437,8 +473,9 @@ class L2tpSimpleService {
                         { session, new: true, runValidators: true, upsert: !topology },
                     ).select('revision').lean();
                     if (!result) throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Topology changed during L2TP path write');
+                    return result.revision;
                 };
-                return work({ session, commit });
+                return work({ session, commit, revision: expectedRevision });
             });
         } catch (error) {
             if (error?.code === 11000 || error?.code === 11001) {
@@ -464,14 +501,120 @@ class L2tpSimpleService {
         }
     }
 
+    // Prepare only an already configured, uninstalled relay for this exact
+    // link.apply scope. The group and revision commit together before the
+    // coordinator freezes the Xray candidate (which needs the SOCKS ingress).
+    async prepareConfiguredRelayIngress({ linkId, linkIds = [linkId], expectedTopologyRevision } = {}) {
+        if (!mongoose.Types.ObjectId.isValid(linkId)
+            || !Number.isSafeInteger(expectedTopologyRevision)) {
+            throw simpleError('INVALID_TOPOLOGY_REVISION', 'An exact link and topology revision are required');
+        }
+        return this.withPathWriter(async ({ session, commit, revision }) => {
+            const scopedIds = new Set(linkIds.map(entityId));
+            if (!scopedIds.has(entityId(linkId))) {
+                throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'The new link is outside the deployment scope');
+            }
+            const allLinks = await this.CascadeLink.find({}).session(session).lean();
+            const newLink = (allLinks || []).find(link => entityId(link._id) === entityId(linkId));
+            if (!newLink || newLink.active === false || newLink.status !== 'pending') {
+                throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'The new pending link changed before ingress preparation');
+            }
+            const links = (allLinks || []).filter(link => scopedIds.has(entityId(link._id))
+                && link.active !== false && (entityId(link._id) === entityId(linkId)
+                    || ['deployed', 'online', 'staged'].includes(link.status)));
+            const nodes = await this.HyNode.find({}).select('_id cascadeRole').session(session).lean();
+            const nodesById = new Map((nodes || []).map(node => [entityId(node._id), node]));
+            const states = await this.RelayL2tpState.find({}).session(session).lean();
+            let changed = false;
+            let routeGroupId = null;
+            for (const state of states || []) {
+                const nodeId = entityId(state.node);
+                if (nodeRole(nodesById.get(nodeId)) !== 'relay' || !state.routeGroup) continue;
+                let chain;
+                try {
+                    chain = buildDefaultChainPath({
+                        links, nodesById, startNodeId: nodeId, maxHops: MAX_GROUP_WALK_HOPS,
+                    });
+                } catch (error) {
+                    if (!(error instanceof DefaultChainPathError)) throw error;
+                    throw simpleError(error.code, error.message);
+                }
+                if (!chain.complete || !chain.linkIds.some(id => entityId(id) === entityId(linkId))) continue;
+                const groupId = entityId(state.routeGroup);
+                if (state.desiredState === 'installed' || state.status !== 'not_installed') {
+                    // The installed/configured path belongs to the separate
+                    // prepared-ingress replacement protocol, never this hook.
+                    throw simpleError('PREPARED_INGRESS_REQUIRED', 'Installed relay path changes require prepared ingress');
+                }
+                const wantedIds = chain.linkIds.map(entityId);
+                const preferredKey = state.activePathKey || AUTO_GROUP_PATH_KEY;
+                const group = await this.CascadeRouteGroup.findById(groupId).session(session).lean();
+                const existing = group?.paths || [];
+                const linkIdsOf = path => (path.linkIds || []).map(entityId);
+                const covering = existing.filter(path => linkIdsOf(path)[0] === wantedIds[0]);
+                if (covering.length > 1 || covering.some(path => path.enabled === false
+                    || JSON.stringify(linkIdsOf(path)) !== JSON.stringify(wantedIds))) {
+                    throw simpleError('SHARED_ROUTE_GROUP_PATH', 'The pinned L2TP route path needs an explicit owner-aware edit');
+                }
+                if (covering.length === 1) {
+                    routeGroupId = groupId;
+                    continue;
+                }
+                if (existing.some(path => wantedIds.slice(1).includes(linkIdsOf(path)[0]))) {
+                    throw simpleError('SHARED_ROUTE_GROUP_PATH', 'A downstream route group path cannot be removed implicitly');
+                }
+                const usedKeys = new Set(existing.map(path => path.pathKey));
+                const pathKey = usedKeys.has(preferredKey)
+                    ? `${AUTO_GROUP_PATH_KEY}-${nodeId.slice(-6)}`
+                    : preferredKey;
+                if (usedKeys.has(pathKey)) {
+                    throw simpleError('SHARED_ROUTE_GROUP_PATH', 'The L2TP route path key is already owned');
+                }
+                await this.assertPathMutationSafe(nodeId, groupId, session);
+                const path = { pathKey, linkIds: chain.linkIds, priority: 1, enabled: true };
+                if (!group) {
+                    await this.CascadeRouteGroup.create([{
+                        _id: new mongoose.Types.ObjectId(groupId), name: AUTO_GROUP_NAME,
+                        mode: 'reverse', strategy: 'priority-failover', paths: [path],
+                    }], { session });
+                } else {
+                    const result = await this.CascadeRouteGroup.updateOne(
+                        { _id: groupId }, { $set: { paths: [...existing, path] } },
+                        { session, runValidators: true },
+                    );
+                    if (result.matchedCount !== 1) {
+                        throw simpleError('SIMPLE_TOPOLOGY_CONFLICT', 'Route group disappeared');
+                    }
+                }
+                changed = true;
+                routeGroupId = groupId;
+            }
+            return {
+                revision: changed ? await commit() : revision,
+                routeGroupId,
+                deferred: !changed && !routeGroupId,
+            };
+        }, expectedTopologyRevision);
+    }
+
     async ensureRouteGroup(nodeId) {
         return this.withPathWriter(async ({ session, commit }) => {
-            const groups = await this.CascadeRouteGroup.find({}).sort({ name: 1, _id: 1 })
+            const state = await this.RelayL2tpState.findOne({ node: nodeId })
                 .session(session).lean();
-            if (Array.isArray(groups) && groups.length > 0) return entityId(groups[0]._id);
+            const pinnedId = state?.routeGroup ? entityId(state.routeGroup) : null;
+            if (pinnedId) {
+                const pinned = await this.CascadeRouteGroup.findById(pinnedId)
+                    .session(session).lean();
+                if (pinned) return pinnedId;
+                await this.assertPathMutationSafe(nodeId, pinnedId, session);
+                if (!mongoose.Types.ObjectId.isValid(pinnedId)) {
+                    throw simpleError('ROUTE_GROUP_NOT_FOUND', 'The pinned L2TP route group is invalid');
+                }
+            }
             const paths = await this.buildAutoGroupPaths(nodeId, session);
-            await this.assertPathMutationSafe(nodeId, null, session);
+            await this.assertPathMutationSafe(nodeId, pinnedId, session);
             const [created] = await this.CascadeRouteGroup.create([{
+                ...(pinnedId ? { _id: new mongoose.Types.ObjectId(pinnedId) } : {}),
                 name: AUTO_GROUP_NAME,
                 mode: 'reverse',
                 strategy: 'priority-failover',
@@ -482,7 +625,17 @@ class L2tpSimpleService {
         });
     }
 
+    assertRemoteExecutionAllowed() {
+        if (!this.allowRemoteExecution) {
+            throw simpleError(
+                'REMOTE_EXECUTION_DISABLED',
+                'L2TP remote execution is disabled outside the authorized TEST runtime',
+            );
+        }
+    }
+
     async installRelay(nodeId) {
+        this.assertRemoteExecutionAllowed();
         const selectedNodeId = entityId(nodeId);
         const node = await this.HyNode.findById(selectedNodeId).lean();
         if (!node) {
@@ -693,13 +846,20 @@ class L2tpSimpleService {
     }
 
     async uninstallRelay(nodeId) {
+        this.assertRemoteExecutionAllowed();
         const selectedNodeId = entityId(nodeId);
+        if (typeof this.remoteAdmissionRepository?.acquire !== 'function'
+            || typeof this.remoteAdmissionRepository?.release !== 'function'
+            || typeof this.lockService?.acquire !== 'function'
+            || typeof this.lockService?.releaseVerified !== 'function') {
+            throw simpleError('REMOTE_ADMISSION_UNAVAILABLE', 'L2TP teardown fencing is unavailable');
+        }
         const node = await this.HyNode.findById(selectedNodeId).lean();
         if (!node) {
             throw simpleError('NODE_NOT_FOUND', 'L2TP node was not found');
         }
         const state = await this.RelayL2tpState.findOne({ node: selectedNodeId }).lean();
-        // A re-roled node (relay → bridge) keeps its installed L2TP state;
+        // A re-roled node (relay -> bridge) keeps its installed L2TP state;
         // teardown must stay possible exactly so decommissioning can proceed.
         if (nodeRole(node) !== 'relay' && state?.status !== 'installed') {
             throw simpleError('NODE_NOT_RELAY', 'L2TP can only be managed on relay nodes');
@@ -708,41 +868,111 @@ class L2tpSimpleService {
             throw simpleError('L2TP_NOT_CONFIGURED', 'L2TP is not installed on this relay');
         }
 
-        const ssh = this.nodeSSHFactory(node);
+        const owner = `simple-uninstall:${randomBytes(8).toString('hex')}`;
+        const operationId = `uninstall:${selectedNodeId}:${randomBytes(8).toString('hex')}`;
+        let admissionId;
+        let lock;
+        let remoteOutcomeUncertain = false;
+        let remoteQuiescent = false;
         try {
-            const result = await ssh.exec(buildTeardownScript(state));
-            const stdout = typeof result === 'string' ? result : result?.stdout ?? '';
-            const code = typeof result === 'object' && result !== null ? result.code : 0;
-            if ((code ?? 0) !== 0 || !stdout.includes('TEARDOWN_OK')) {
-                throw simpleError(
-                    'UNINSTALL_FAILED',
-                    'The relay L2TP teardown did not complete',
-                );
+            admissionId = await this.remoteAdmissionRepository.acquire({ nodeId: selectedNodeId });
+            let acquired;
+            try {
+                acquired = await this.lockService.acquire({
+                    node: selectedNodeId,
+                    owner,
+                    operationId,
+                    leaseMs: 15 * 60 * 1000,
+                });
+            } catch (error) {
+                remoteOutcomeUncertain = true;
+                if (error && typeof error === 'object') error.remoteOutcomeUncertain = true;
+                throw error;
             }
-        } catch (error) {
-            if (error instanceof L2tpSimpleError) throw error;
-            throw simpleError(
-                'UNINSTALL_FAILED',
-                'The relay L2TP teardown could not reach the node',
-            );
-        } finally {
-            ssh.disconnect?.();
-        }
+            if (!acquired?.ok) {
+                throw simpleError('NODE_OPERATION_LOCK_CONFLICT', 'The relay is busy with another operation');
+            }
+            lock = acquired.lock;
+            const ssh = this.nodeSSHFactory(node);
+            try {
+                const result = await ssh.exec(buildTeardownScript(state));
+                const stdout = typeof result === 'string' ? result : result?.stdout ?? '';
+                const hasExitCode = result !== null
+                    && typeof result === 'object'
+                    && Number.isInteger(result.code);
+                const code = hasExitCode ? result.code : undefined;
+                if (!hasExitCode || code !== 0 || !stdout.includes('TEARDOWN_OK')) {
+                    const failure = simpleError('UNINSTALL_UNCERTAIN', 'The relay L2TP teardown outcome could not be established');
+                    failure.remoteOutcomeUncertain = true;
+                    remoteOutcomeUncertain = true;
+                    throw failure;
+                }
+                remoteQuiescent = true;
+            } catch (error) {
+                remoteOutcomeUncertain = true;
+                if (error?.remoteOutcomeUncertain === true) throw error;
+                const uncertain = simpleError(
+                    'UNINSTALL_UNCERTAIN',
+                    'The relay L2TP teardown outcome could not be established',
+                );
+                uncertain.remoteOutcomeUncertain = true;
+                throw uncertain;
+            } finally {
+                ssh.disconnect?.();
+            }
 
-        // The SSH teardown above is outside this DB fence; remote admission
-        // requires separate protection. Only the resulting state write is fenced.
-        const stateRepository = new L2tpStateManagementRepository({
-            HyNode: this.HyNode,
-            CascadeRouteGroup: this.CascadeRouteGroup,
-            RelayL2tpState: this.RelayL2tpState,
-            CascadeTopologyState: this.CascadeTopologyState,
-        });
-        await stateRepository.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
-            { node: selectedNodeId },
-            { $set: { desiredState: 'not_installed', status: 'not_installed' } },
-            { session },
-        ));
-        return { ok: true };
+            const stateRepository = new L2tpStateManagementRepository({
+                HyNode: this.HyNode,
+                CascadeRouteGroup: this.CascadeRouteGroup,
+                RelayL2tpState: this.RelayL2tpState,
+                CascadeTopologyState: this.CascadeTopologyState,
+            });
+            await stateRepository.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
+                { node: selectedNodeId },
+                { $set: { desiredState: 'not_installed', status: 'not_installed' } },
+                { session },
+            ));
+            return { ok: true };
+        } catch (error) {
+            if (error?.remoteOutcomeUncertain === true) remoteOutcomeUncertain = true;
+            throw error;
+        } finally {
+            // An uncertain SSH outcome intentionally keeps both fences. A later
+            // recovery/readback path must prove quiescence before either is released.
+            let lockReleased = !lock;
+            if (!remoteOutcomeUncertain && lock) {
+                try {
+                    const released = await this.lockService.releaseVerified(lock);
+                    lockReleased = released?.ok === true;
+                } catch {
+                    lockReleased = false;
+                }
+                if (!lockReleased) {
+                    const releaseError = simpleError(
+                        'UNINSTALL_FENCE_RELEASE_FAILED',
+                        'The relay teardown completed but its exact fence could not be released',
+                    );
+                    releaseError.remoteOutcomeUncertain = true;
+                    throw releaseError;
+                }
+            }
+            if (!remoteOutcomeUncertain && admissionId && lockReleased) {
+                try {
+                    await this.remoteAdmissionRepository.release(admissionId);
+                } catch {
+                    const releaseError = simpleError(
+                        'UNINSTALL_ADMISSION_RELEASE_FAILED',
+                        'The relay teardown completed but its counted admission could not be released',
+                    );
+                    releaseError.remoteOutcomeUncertain = true;
+                    throw releaseError;
+                }
+            }
+            if (remoteQuiescent && remoteOutcomeUncertain) {
+                // Defensive assertion: a contradictory result must never clear fences.
+                remoteOutcomeUncertain = true;
+            }
+        }
     }
 
     async createAccount(input) {

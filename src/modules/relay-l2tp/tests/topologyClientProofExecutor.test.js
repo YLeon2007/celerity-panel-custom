@@ -26,10 +26,11 @@ const op = { status: 'succeeded', staged: false, linkIds: ['l1', 'l2', 'main', '
 ] };
 function profile(n) { return { remarks: n.name, outbounds: [{ protocol: 'vless', tag: 'proxy', settings: { vnext: [{ address: n.domain, port: 443, users: [{ id: UUID, encryption: 'none' }] }] }, streamSettings: { network: 'tcp', security: 'reality', realitySettings: { publicKey: 'public-key', serverName: 'front.example', shortId: '01234567' } } }] }; }
 function query(rows) { return { select() { return { lean: async () => rows }; } }; }
-function fixture({ operation = op, nodeRows = nodes, linkRows = links, groups = [group], states = [{ node: 'r', desiredState: 'installed', status: 'installed', routeGroup: 'g', activePathKey: 'main' }], sshResult = { code: 0, stdout: `${IP}\n`, stderr: '' }, hang = false, profiles = [profile(nodes[0]), profile(nodes[1])], probeResult = `${IP}\nPROBE_STATUS:200`, timeoutMs = 1000 } = {}) {
-    const calls = { ssh: [], curl: [], consumed: [] };
-    const HyNode = { find: () => query(nodeRows), findById: id => query(nodeRows.find(n => n._id === id)) };
-    const CascadeLink = { find: () => query(linkRows) };
+function fixture({ operation = op, nodeRows = nodes, linkRows = links, groups = [group], states = [{ node: 'r', desiredState: 'installed', status: 'installed', routeGroup: 'g', activePathKey: 'main' }], sshResult = { code: 0, stdout: `${IP}\n`, stderr: '' }, hang = false, profiles = [profile(nodes[0]), profile(nodes[1])], probeResult = `${IP}\nPROBE_STATUS:200`, timeoutMs = 1000, topologyState = { revision: 160, deployedRevision: 160 } } = {}) {
+    const calls = { ssh: [], curl: [], clients: [], nodes: [], links: [], topology: [] };
+    const HyNode = { find: filter => { calls.nodes.push(filter); return query(nodeRows); }, findById: id => query(nodeRows.find(n => n._id === id)) };
+    const CascadeLink = { find: filter => { calls.links.push(filter); return query(linkRows); } };
+    const CascadeTopologyState = { findById: key => { calls.topology.push(key); return query(typeof topologyState === 'function' ? topologyState(calls.topology.length) : topologyState); } };
     const CascadeRouteGroup = { find: () => query(groups) };
     const RelayL2tpState = { find: () => query(states) };
     class NodeSSH {
@@ -39,9 +40,139 @@ function fixture({ operation = op, nodeRows = nodes, linkRows = links, groups = 
         disconnect() { calls.ssh.push({ disconnect: true }); }
     }
     const profileSource = new TopologyPublishedProfileSource({ HyUser: { findOne: () => query({ enabled: true, subscriptionToken: TOKEN, xrayUuid: UUID }) }, probeUserId: 'test', fetchImpl: async () => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => JSON.stringify(profiles) }) });
-    const profileProbe = new TopologyClientProfileProbe({ spawnClient: (binary, args, opts) => spawn(process.execPath, ['-e', `const net=require('node:net'),fs=require('node:fs');const c=JSON.parse(fs.readFileSync(process.argv[1]));net.createServer(s=>s.end()).listen(c.inbounds[0].port,'127.0.0.1');`, args[2]], opts), runCurl: async (_binary, args) => { calls.curl.push(args); return { stdout: probeResult, stderr: '' }; } });
-    return { executor: new TopologyClientProofExecutor({ HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState, NodeSSH, profileSource, profileProbe, timeoutMs }), calls, operation };
+    const profileProbe = new TopologyClientProfileProbe({ spawnClient: (binary, args, opts) => { calls.clients.push({ binary, args }); return spawn(process.execPath, ['-e', `const net=require('node:net'),fs=require('node:fs');const c=JSON.parse(fs.readFileSync(process.argv[1]));net.createServer(s=>s.end()).listen(c.inbounds[0].port,'127.0.0.1');`, args[2]], opts); }, runCurl: async (_binary, args) => { calls.curl.push(args); return { stdout: probeResult, stderr: '' }; } });
+    return { executor: new TopologyClientProofExecutor({ HyNode, CascadeLink, CascadeTopologyState, CascadeRouteGroup, RelayL2tpState, NodeSSH, profileSource, profileProbe, timeoutMs }), calls, operation };
 }
+const fullOp = { status: 'succeeded', topologyRevision: 160,
+    heldTopologyAdmission: false, admissionFingerprint: 'a'.repeat(64), nodes: op.nodes };
+test('full Sync without scoped metadata derives current links and invokes published profile client probes', async () => {
+    const { executor, calls } = fixture();
+    assert.deepEqual(await executor.probeOperation(fullOp), { passed: true });
+    assert.deepEqual(calls.nodes, [{ type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } }]);
+    assert.deepEqual(calls.links, [{ active: true }]);
+    assert(calls.topology.length >= 2);
+    assert(calls.topology.every(key => key === 'singleton'));
+    assert.deepEqual(calls.ssh.filter(c => c.node).map(c => c.node), ['b']);
+    assert.equal(calls.clients.length, 2, 'real profile probe implementation starts a client per published portal');
+    assert.equal(calls.curl.length, 2);
+    assert(calls.curl.every(args => args.at(-1) === 'https://api.ipify.org'));
+    assert.equal(fullOp.linkIds, undefined, 'never mutate durable operation metadata');
+});
+test('full Sync derivation never accepts scoped or unsupported metadata', async () => {
+    for (const metadata of [
+        { kind: 'link.apply' }, { kind: 'domain.reconcile' }, { kind: 'link.replace' },
+        { kind: 'link.attach' }, { kind: 'full' }, { kind: null },
+        { linkId: 'l1' }, { staged: false }, { oldLinkId: 'old' }, { groupId: 'g' },
+        { pathKey: 'main' }, { ownerNodeId: 'r' }, { ownerTopologyRevision: 160 },
+        { ownerCredentialRevision: 1 }, { oldPathLinkIds: ['old'] },
+        { newPathLinkIds: ['main'] }, { heldTopologyAdmission: true },
+        { pppWait: {} },
+    ]) {
+        const { executor, calls } = fixture();
+        assert.deepEqual(await executor.probeOperation({ ...fullOp, ...metadata }), { passed: false }, JSON.stringify(metadata));
+        assert.equal(calls.ssh.length, 0);
+        assert.equal(calls.curl.length, 0);
+    }
+    const { executor, calls } = fixture();
+    assert.deepEqual(await executor.probeOperation({ ...op, kind: 'unsupported' }), { passed: false });
+    assert.equal(calls.ssh.length, 0);
+});
+
+test('full Sync rejects missing, duplicate, foreign, disconnected or ambiguous current graph rows before probing', async () => {
+    const extra = { _id: 'extra', type: 'xray', active: true, cascadeRole: 'relay' };
+    for (const [label, overrides] of [
+        ['missing geo link', { linkRows: links.filter(l => l._id !== 'geolink') }],
+        ['missing main link', { linkRows: links.filter(l => l._id !== 'main') }],
+        ['empty links', { linkRows: [] }],
+        ['duplicate node', { nodeRows: [...nodes, nodes[0]] }],
+        ['duplicate link', { linkRows: [...links, links[0]] }],
+        ['foreign node', { nodeRows: [...nodes, extra] }],
+        ['missing node', { nodeRows: nodes.slice(1) }],
+        ['foreign edge', { linkRows: [...links, { ...links[0], _id: 'foreign', bridgeNode: 'unknown' }] }],
+        ['foreign source', { linkRows: [...links, { ...links[0], _id: 'foreign', portalNode: 'unknown' }] }],
+        ['pending edge', { linkRows: links.map(l => l._id === 'geolink' ? { ...l, status: 'pending' } : l) }],
+        ['disabled edge', { linkRows: links.map(l => l._id === 'geolink' ? { ...l, active: false } : l) }],
+        ['ambiguous default', { linkRows: [...links, { ...links[2], _id: 'ambiguous' }] }],
+        ['bridge outgoing', { linkRows: [...links, { ...links[2], _id: 'outgoing', portalNode: 'b', bridgeNode: 'geo' }] }],
+        ['geo cycle', { linkRows: [...links, { ...links[3], _id: 'cycle', portalNode: 'geo', bridgeNode: 'r' }] }],
+        ['disconnected node', { nodeRows: [...nodes, extra], operation: { ...fullOp, nodes: [...fullOp.nodes, { node: 'extra', role: 'relay', state: 'committed' }] } }],
+    ]) {
+        const { executor, calls, operation } = fixture({ operation: fullOp, ...overrides });
+        assert.deepEqual(await executor.probeOperation(operation), { passed: false }, label);
+        assert.equal(calls.ssh.length, 0, label);
+        assert.equal(calls.clients.length, 0, label);
+    }
+});
+
+test('full Sync revision changes during graph lookup fail before SSH or profile probing', async () => {
+    const { executor, calls } = fixture({ topologyState: read => ({ revision: read === 1 ? 160 : 161, deployedRevision: 160 }) });
+    assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+    assert.equal(calls.ssh.length, 0);
+    assert.equal(calls.clients.length, 0);
+});
+
+test('full Sync requires an exact readable deployed singleton revision before graph discovery', async () => {
+    for (const topologyState of [null, {}, { revision: 161, deployedRevision: 160 },
+        { revision: 160, deployedRevision: 159 }, { revision: '160', deployedRevision: 160 },
+        { revision: 160, deployedRevision: '160' }, () => { throw Error(TOKEN); },
+        () => new Promise(() => {})]) {
+        const { executor, calls } = fixture({ topologyState, timeoutMs: 15 });
+        assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+        assert.equal(calls.nodes.length, 0);
+        assert.equal(calls.ssh.length, 0);
+    }
+    for (const topologyRevision of [undefined, null, '160', -1, 1.5, Infinity]) {
+        const { executor, calls } = fixture();
+        assert.deepEqual(await executor.probeOperation({ ...fullOp, topologyRevision }), { passed: false });
+        assert.equal(calls.nodes.length, 0);
+    }
+    const { executor, calls } = fixture();
+    delete executor.CascadeTopologyState;
+    assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+    assert.equal(calls.nodes.length, 0);
+});
+
+test('full Sync revision changes after successful client probes still fail closed', async () => {
+    for (const stale of [{ revision: 161, deployedRevision: 160 }, { revision: 160, deployedRevision: 159 }]) {
+        const { executor, calls } = fixture({ topologyState: read => read < 3
+            ? { revision: 160, deployedRevision: 160 } : stale });
+        assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+        assert.equal(calls.clients.length, 2);
+        assert.equal(calls.curl.length, 2);
+    }
+});
+
+test('full Sync graph and bridge success cannot replace published-profile client proof', async () => {
+    for (const overrides of [
+        { probeResult: '203.0.113.20\nPROBE_STATUS:200' },
+        { probeResult: `${IP}\nPROBE_STATUS:503` }, { profiles: [profile(nodes[0])] },
+        { hang: true, timeoutMs: 15 },
+    ]) {
+        const { executor } = fixture(overrides);
+        assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+    }
+    const { executor, calls } = fixture();
+    executor.profileSource = { load: async () => ({ ok: true, verifiedCount: 2 }) };
+    assert.deepEqual(await executor.probeOperation(fullOp), { passed: false });
+    assert.equal(calls.clients.length, 0, 'source success without consuming profiles is not proof');
+});
+
+test('explicit scoped operations retain ID-based lookup without the full-Sync singleton fence', async () => {
+    for (const kind of ['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']) {
+        const { executor, calls } = fixture({ topologyState: null });
+        assert.deepEqual(await executor.probeOperation({ ...op, kind, linkId: 'l1' }), { passed: true }, kind);
+        assert.deepEqual(calls.links, [{ _id: { $in: op.linkIds } }]);
+        assert.deepEqual(calls.nodes, [{ _id: { $in: op.nodes.map(n => n.node) } }]);
+        assert.equal(calls.topology.length, 0);
+        assert.equal(calls.clients.length, 2);
+    }
+    for (const linkIds of [[], null, 'l1', ['l1', 'l1']]) {
+        const { executor, calls } = fixture();
+        assert.deepEqual(await executor.probeOperation({ ...fullOp, linkIds }), { passed: false });
+        assert.equal(calls.nodes.length, 0);
+    }
+});
+
 test('published profiles for every operation portal are client-probed against installed main bridge egress', async () => {
     const { executor, calls, operation } = fixture();
     assert.deepEqual(await executor.probeOperation(operation), { passed: true });

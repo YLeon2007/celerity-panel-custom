@@ -515,6 +515,7 @@ test('reconcileVerifiedOperation persists canonical verified install identity th
     const result = await service.reconcileVerifiedOperation({
         operation: {
             id: 'operation-17',
+            admissionId: 'admission-1',
             node: 'relay-1',
             kind: 'install',
             plan: {
@@ -526,11 +527,17 @@ test('reconcileVerifiedOperation persists canonical verified install identity th
             },
         },
         verifiedAt,
+        claim: { owner: 'worker-1', ownerGeneration: 2 },
+        lockGeneration: 'lock-generation-1',
     });
 
     assert.deepEqual(calls, [{
         node: 'relay-1',
         operationId: 'operation-17',
+        admissionId: 'admission-1',
+        owner: 'worker-1',
+        ownerGeneration: 2,
+        lockGeneration: 'lock-generation-1',
         credentialRevision: 7,
         topologyRevision: 23,
         activePathKey: 'primary',

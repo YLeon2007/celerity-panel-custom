@@ -26,7 +26,7 @@ function fixture({ gate = {}, admission = {}, operation = {}, missing = '', spli
     const admitted = new RemoteAdmissionModel({ _id: admissionId, nodeId, kind: 'install',
         phase: 'queued', operationId, ownerGeneration: 1, ...admission }).toObject();
     const queued = new L2tpOperationModel({ _id: operationId, node: nodeId, kind: 'install',
-        status: 'queued', admissionId, idempotencyKey: `install:${nodeId}:revision-7`,
+        status: 'queued', admissionId, idempotencyKey: `install:${nodeId}:revision-7:attempt-${operationId}`,
         plan, ...operation }).toObject();
     if (rawPlan) queued.plan = rawPlan;
     function query(kind, doc) {
@@ -75,7 +75,7 @@ test('readback uses one transaction snapshot and returns only normalized linked 
     assert.deepEqual(await read(f), {
         admission: { _id: admissionId, nodeId, kind: 'install', phase: 'queued', operationId },
         operation: { _id: operationId, node: nodeId, kind: 'install', status: 'queued',
-            admissionId, idempotencyKey: `install:${nodeId}:revision-7`, plan },
+            admissionId, idempotencyKey: `install:${nodeId}:revision-7:attempt-${operationId}`, plan },
     });
     assert.deepEqual(f.calls, ['start', 'transaction', 'gate', 'admission', 'operation', 'end']);
 });

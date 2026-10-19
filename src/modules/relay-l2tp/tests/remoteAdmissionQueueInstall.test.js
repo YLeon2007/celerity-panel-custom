@@ -10,7 +10,7 @@ const L2tpOperationModel = require('../models/l2tpOperationModel');
 const node = '507f1f77bcf86cd799439011';
 const operationId = '507f1f77bcf86cd799439012';
 const admissionId = 'admission-install-1';
-const key = `install:${node}:revision-7`;
+const key = `install:${node}:revision-7:attempt-${operationId}`;
 
 function operation(overrides = {}) {
     return {
@@ -174,7 +174,7 @@ test('duplicate operation id or idempotency key fails closed without consuming a
     for (const existing of [operation(), operation({ _id: new mongoose.Types.ObjectId().toString() })]) {
         const f = fixture({ operations: [existing] });
         await assert.rejects(f.repository.queueInstall({ admissionId, operationDocument: operation() }),
-            { code: 11000 });
+            error => error.code === 11000 && error.installQueuePreCommitAbort === true);
         unchanged(f, 1, 1);
     }
 });

@@ -268,11 +268,13 @@ function sanitizeUserVerificationResult(value, expectation) {
 async function uploadRootFile(transport, request) {
     try {
         await transport.uploadRootFile(request);
-    } catch {
-        throw new L2tpRemoteExecutorError(
+    } catch (error) {
+        const sanitized = new L2tpRemoteExecutorError(
             'REMOTE_UPLOAD_FAILED',
             'Failed to upload an L2TP operation artifact',
         );
+        sanitized.remoteOutcomeUncertain = error?.remoteOutcomeUncertain === true;
+        throw sanitized;
     }
 }
 
@@ -286,10 +288,12 @@ async function runArtifactCommand(transport, request) {
             && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code)
             ? error.code
             : 'REMOTE_COMMAND_FAILED';
-        throw new L2tpRemoteExecutorError(
+        const sanitized = new L2tpRemoteExecutorError(
             code,
             'Failed to run an L2TP artifact command',
         );
+        sanitized.remoteOutcomeUncertain = error?.remoteOutcomeUncertain === true;
+        throw sanitized;
     }
 }
 
@@ -412,6 +416,14 @@ class L2tpRemoteExecutor {
             ...(step.type === 'verify_users' ? verificationExpectation : {}),
         });
 
+        if (step.type === 'preflight' && commandResult?.ok !== true) {
+            const code = commandResult?.error?.code;
+            throw new L2tpRemoteExecutorError(
+                typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code)
+                    ? code : 'PREFLIGHT_FAILED',
+                'L2TP preflight rejected the relay',
+            );
+        }
         if (desiredExpectation) {
             this.#userVerificationExpectations.set(operationId, desiredExpectation);
         }

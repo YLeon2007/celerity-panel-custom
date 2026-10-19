@@ -8,6 +8,12 @@ const fail = () => ({ passed: false });
 const id = value => value == null ? '' : typeof value.toHexString === 'function'
     ? value.toHexString() : String(value._id ?? value);
 const confirmed = link => link?.active === true && ['deployed', 'online'].includes(link.status);
+const scopedKinds = new Set(['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']);
+// Full Sync has no scoped identity. Never reinterpret incomplete/unknown scoped
+// metadata as permission to discover a different graph from the current DB.
+const scopedFields = ['kind', 'linkId', 'linkIds', 'staged', 'oldLinkId', 'groupId',
+    'pathKey', 'ownerNodeId', 'ownerTopologyRevision', 'ownerCredentialRevision',
+    'oldPathLinkIds', 'newPathLinkIds'];
 const bounded = async (work, ms) => {
     let timer;
     try {
@@ -17,8 +23,32 @@ const bounded = async (work, ms) => {
     } finally { clearTimeout(timer); }
 };
 
+function completeFullGraph(roles, links, portalIds) {
+    const outgoing = new Map([...roles.keys()].map(nodeId => [nodeId, []]));
+    for (const link of links.values()) {
+        if (roles.get(id(link.bridgeNode)) === 'portal') return false;
+        outgoing.get(id(link.portalNode)).push(link);
+    }
+    const visiting = new Set();
+    const visited = new Set();
+    const visit = nodeId => {
+        if (visiting.has(nodeId)) return false;
+        if (visited.has(nodeId)) return true;
+        const edges = outgoing.get(nodeId);
+        if (roles.get(nodeId) === 'bridge' ? edges.length !== 0
+            : edges.filter(link => link.geoRouting?.enabled !== true).length !== 1) return false;
+        visiting.add(nodeId);
+        if (!edges.every(link => visit(id(link.bridgeNode)))) return false;
+        visiting.delete(nodeId);
+        visited.add(nodeId);
+        return true;
+    };
+    // Include geo branches in completeness, not in default-egress selection.
+    return portalIds.every(visit) && visited.size === roles.size;
+}
+
 class TopologyClientProofExecutor {
-    constructor({ HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState, NodeSSH,
+    constructor({ HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState, CascadeTopologyState, NodeSSH,
         profileSource = new TopologyPublishedProfileSource(),
         profileProbe = new TopologyClientProfileProbe(), timeoutMs = 30000 } = {}) {
         if (![HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState].every(model => typeof model?.find === 'function')
@@ -26,36 +56,52 @@ class TopologyClientProofExecutor {
             || typeof profileProbe?.probe !== 'function' || !Number.isSafeInteger(timeoutMs)
             || timeoutMs < 1 || timeoutMs > 60000) throw new TypeError('Invalid topology proof dependencies');
         Object.assign(this, { HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState,
-            NodeSSH, profileSource, profileProbe, timeoutMs });
+            NodeSSH, CascadeTopologyState, profileSource, profileProbe, timeoutMs });
+    }
+
+    async currentFullRevision(op) {
+        if (!Number.isSafeInteger(op.topologyRevision) || op.topologyRevision < 0
+            || typeof this.CascadeTopologyState?.findById !== 'function') return false;
+        const state = await bounded(() => this.CascadeTopologyState.findById('singleton')
+            .select('revision deployedRevision').lean(), this.timeoutMs);
+        return state?.revision === op.topologyRevision && state.deployedRevision === op.topologyRevision;
     }
 
     async probeOperation(op) {
         try {
+            const full = !scopedFields.some(field => op?.[field] !== undefined);
             if (op?.status !== 'succeeded' || op.staged === true
+                || full && (op.heldTopologyAdmission === true || op.pppWait != null)
+                || op.kind !== undefined && !scopedKinds.has(op.kind)
                 || !Array.isArray(op.nodes) || op.nodes.length === 0
-                || !Array.isArray(op.linkIds) || op.linkIds.length === 0
-                || new Set(op.linkIds.map(id)).size !== op.linkIds.length
+                || !full && (!Array.isArray(op.linkIds) || op.linkIds.length === 0
+                    || new Set(op.linkIds.map(id)).size !== op.linkIds.length)
                 || op.nodes.some(n => n.state !== 'committed' || !['portal', 'relay', 'bridge'].includes(n.role))) return fail();
+            if (full && !await this.currentFullRevision(op)) return fail();
             const roles = new Map(op.nodes.map(n => [id(n.node), n.role]));
             if (roles.size !== op.nodes.length || roles.has('')) return fail();
             const portalIds = [...roles].filter(([, role]) => role === 'portal').map(([nodeId]) => nodeId);
             if (!portalIds.length) return fail();
             const [nodeRows, linkRows, states, groups] = await bounded(() => Promise.all([
-                this.HyNode.find({ _id: { $in: [...roles.keys()] } }).select('_id name flag domain ip port xray type active cascadeRole ssh').lean(),
-                this.CascadeLink.find({ _id: { $in: op.linkIds } }).select('_id portalNode bridgeNode active status geoRouting.enabled').lean(),
+                this.HyNode.find(full ? { type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } }
+                    : { _id: { $in: [...roles.keys()] } }).select('_id name flag domain ip port xray type active cascadeRole ssh').lean(),
+                this.CascadeLink.find(full ? { active: true } : { _id: { $in: op.linkIds } }).select('_id portalNode bridgeNode active status geoRouting.enabled').lean(),
                 this.RelayL2tpState.find({ node: { $in: [...roles.keys()] }, desiredState: 'installed' }).select('node desiredState status routeGroup activePathKey').lean(),
                 this.CascadeRouteGroup.find({}).select('_id paths.pathKey paths.enabled paths.linkIds').lean(),
             ]), this.timeoutMs);
             if (![nodeRows, linkRows, states, groups].every(Array.isArray)) return fail();
             const nodes = new Map(nodeRows.map(n => [id(n._id), n]));
             const links = new Map(linkRows.map(l => [id(l._id), l]));
-            if (nodes.size !== roles.size || links.size !== op.linkIds.length || nodes.has('') || links.has('')) return fail();
+            if (nodes.size !== roles.size || links.size === 0
+                || links.size !== (full ? linkRows.length : op.linkIds.length)
+                || nodes.has('') || links.has('') || full && nodeRows.length !== nodes.size) return fail();
             for (const [nodeId, role] of roles) {
                 const node = nodes.get(nodeId);
                 if (!node || node.active !== true || node.type !== 'xray' || node.cascadeRole !== role) return fail();
             }
             if ([...links.values()].some(link => !confirmed(link)
                 || !roles.has(id(link.portalNode)) || !roles.has(id(link.bridgeNode)))) return fail();
+            if (full && !completeFullGraph(roles, links, portalIds)) return fail();
             const owners = new Map();
             for (const state of states) {
                 const nodeId = id(state.node);
@@ -93,7 +139,7 @@ class TopologyClientProofExecutor {
                 if (mainSuffix?.length || !roles.has(current)) return fail();
                 bridgeIds.add(current);
             }
-            if (bridgeIds.size !== 1) return fail();
+            if (bridgeIds.size !== 1 || full && !await this.currentFullRevision(op)) return fail();
             const bridge = nodes.get([...bridgeIds][0]);
             if (!bridge?.ip || typeof bridge.ssh?.username !== 'string'
                 || !(bridge.ssh.privateKey || bridge.ssh.password)) return fail();
@@ -123,6 +169,7 @@ class TopologyClientProofExecutor {
                 observed.add(nodeId);
                 return { ok: true };
             } }), this.timeoutMs * portalIds.length);
+            if (full && !await this.currentFullRevision(op)) return fail();
             return loaded?.ok === true && loaded.verifiedCount === portalIds.length && observed.size === portalIds.length
                 ? { passed: true } : fail();
         } catch {
@@ -138,6 +185,7 @@ function probeOperation(op) {
         HyNode: require('../../../models/hyNodeModel'),
         CascadeLink: require('../../../models/cascadeLinkModel'),
         CascadeRouteGroup: require('../models/cascadeRouteGroupModel'),
+        CascadeTopologyState: require('../models/cascadeTopologyStateModel'),
         RelayL2tpState: require('../models/relayL2tpStateModel'),
         NodeSSH: require('../../../services/nodeSSH'),
     });

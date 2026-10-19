@@ -101,7 +101,8 @@ test('read-only verifier fails closed on an unresolved SSH execution deadline', 
     const transport = new L2tpNodeTransport({ nodeSSH: { exec: () => new Promise(() => {}) } });
     const pending = transport.verifyUsersReadOnly(readOnlyRequest);
     t.mock.timers.tick(120000);
-    await assert.rejects(pending, error => error.code === 'REMOTE_COMMAND_FAILED');
+    await assert.rejects(pending, error => error.code === 'REMOTE_COMMAND_FAILED'
+        && error.remoteOutcomeUncertain === true);
 });
 
 test('uploadRootFile sends an exact typed artifact to the fixed receiver over stdin', async () => {
@@ -304,6 +305,16 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
             options: { timeout: command === 'install_runtime' ? 600000 : 120000 },
         })),
     );
+});
+
+test('preflight rejects an absent SSH exit status as remotely uncertain', async () => {
+    const transport = new L2tpNodeTransport({ nodeSSH: {
+        async exec() { return { code: null, stdout: '', stderr: '' }; },
+    } });
+    await assert.rejects(transport.runArtifactCommand({
+        operationId: 'operation-preflight-no-exit', command: 'preflight',
+    }), error => error.code === 'REMOTE_COMMAND_FAILED'
+        && error.remoteOutcomeUncertain === true);
 });
 
 test('verify-users returns only a strict result bound to the requested revision and count', async () => {
@@ -773,6 +784,18 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
     }
 });
 
+test('uploadRootFile marks a rejected SSH receiver with no exit status as uncertain', async () => {
+    const transport = new L2tpNodeTransport({ nodeSSH: {
+        async exec() { throw new Error('ssh transport closed with private stderr'); },
+    } });
+    await assert.rejects(transport.uploadRootFile({
+        operationId: 'operation-upload-uncertain', type: 'desired', path: 'desired.json',
+        content: '{}', owner: 'root', group: 'root', mode: 0o600,
+    }), error => error.code === 'REMOTE_UPLOAD_FAILED'
+        && error.remoteOutcomeUncertain === true
+        && !JSON.stringify(error).includes('private stderr'));
+});
+
 test('uploadRootFile acknowledges only an explicit zero SSH exit code', async t => {
     const secret = 'upload-exit-code-secret';
     const responses = [
@@ -820,10 +843,12 @@ test('sanitizes rejected and nonzero artifact runner failures', async () => {
     const secret = 'runner-transport-secret';
     const facades = [
         {
+            uncertain: true,
             async exec() { throw new Error(`runner failed: ${secret}`); },
             async writeFile() {},
         },
         {
+            uncertain: false,
             async exec() { return { code: 70, stdout: secret, stderr: secret }; },
             async writeFile() {},
         },
@@ -837,6 +862,7 @@ test('sanitizes rejected and nonzero artifact runner failures', async () => {
             error => {
                 assert.equal(error.name, 'L2tpNodeTransportError');
                 assert.equal(error.code, 'REMOTE_COMMAND_FAILED');
+                assert.equal(error.remoteOutcomeUncertain, nodeSSH.uncertain);
                 assert.equal(error.message, 'Failed to run an L2TP artifact command');
                 assert.equal(Object.hasOwn(error, 'cause'), false);
                 assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));

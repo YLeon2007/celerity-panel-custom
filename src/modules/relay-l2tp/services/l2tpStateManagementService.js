@@ -324,7 +324,7 @@ class L2tpStateManagementService {
         return safeState(state);
     }
 
-    async reconcileVerifiedOperation({ operation, verifiedAt } = {}) {
+    async reconcileVerifiedOperation({ operation, verifiedAt, claim, lockGeneration } = {}) {
         if (!operation || typeof operation !== 'object' || operation.kind !== 'install') {
             throw new L2tpStateManagementError(
                 'INVALID_OPERATION_KIND',
@@ -376,6 +376,10 @@ class L2tpStateManagementService {
         const state = await this.repository.markInstalledAfterVerification({
             node: nodeId,
             operationId,
+            admissionId: operation.admissionId,
+            owner: claim?.owner,
+            ownerGeneration: claim?.ownerGeneration,
+            lockGeneration,
             credentialRevision,
             topologyRevision: plan.topologyRevision,
             activePathKey: plan.selectedPathKey,

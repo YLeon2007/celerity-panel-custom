@@ -18,6 +18,14 @@ const settingsSchema = new mongoose.Schema({
         hideOffline: { type: Boolean, default: true },
     },
     
+    // The map's virtual Internet icon has no HyNode document to store mapPosition.
+    networkMap: {
+        internetPosition: {
+            x: { type: Number, default: null },
+            y: { type: Number, default: null },
+        },
+    },
+
     deviceGracePeriod: { type: Number, default: 15 },
     
     cache: {

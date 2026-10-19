@@ -24,6 +24,10 @@ function createService(overrides = {}) {
         })),
         preflightRunner: overrides.preflightRunner || (async () => ({ ok: true, checks: [] })),
         remoteAdmissionRepository: overrides.remoteAdmissionRepository,
+        lockService: overrides.lockService || {
+            async acquire() { return { ok: true, lock: { generation: 'test-lock' } }; },
+            async releaseVerified() { return { ok: true }; },
+        },
         enableInstallAdmission: overrides.enableInstallAdmission,
         clock: overrides.clock || { now: () => new Date(NOW) },
     });
@@ -252,6 +256,63 @@ test('preflight validates injected state and delegates to the injected runner', 
     });
 });
 
+test('preflight requires exact node lock and retains counted admission when lock acquisition is uncertain', async () => {
+    const context = installContext();
+    const repositories = createContextRepositories(context);
+    const admissions = [];
+    let runnerCalled = false;
+    const service = createService({
+        ...repositories,
+        remoteAdmissionRepository: {
+            async acquire(request) { admissions.push(['acquire', request]); return 'admission-lock-uncertain'; },
+            async release(id) { admissions.push(['release', id]); },
+            async markRecoveryRequired(id) { admissions.push(['recovery', id]); },
+        },
+        lockService: {
+            async acquire() { throw new Error('lock store unavailable'); },
+            async releaseVerified() { throw new Error('must not release'); },
+        },
+        preflightRunner: async () => { runnerCalled = true; return { ok: true }; },
+    });
+
+    await assert.rejects(
+        service.preflight(context.node.id, context.input),
+        /lock store unavailable/,
+    );
+    assert.equal(runnerCalled, false);
+    assert.deepEqual(admissions, [
+        ['acquire', { nodeId: 'relay-1' }],
+        ['recovery', 'admission-lock-uncertain'],
+    ]);
+});
+
+test('preflight retains counted admission when exact lock release is not verified', async () => {
+    const context = installContext();
+    const repositories = createContextRepositories(context);
+    const admissions = [];
+    const service = createService({
+        ...repositories,
+        remoteAdmissionRepository: {
+            async acquire() { return 'admission-release-uncertain'; },
+            async release() { admissions.push('release'); },
+            async markRecoveryRequired(id) { admissions.push(['recovery', id]); },
+        },
+        lockService: {
+            async acquire() { return { ok: true, lock: { generation: 'lock-1' } }; },
+            async releaseVerified() { return { ok: false }; },
+        },
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: false, error: { code: 'PREFLIGHT_FAILED' } };
+        },
+    });
+
+    await assert.rejects(
+        service.preflight(context.node.id, context.input),
+        { code: 'PREFLIGHT_FENCE_RELEASE_FAILED' },
+    );
+    assert.deepEqual(admissions, [['recovery', 'admission-release-uncertain']]);
+});
 test('preflight rejects a non-relay node before loading L2TP state', async () => {
     let stateLookups = 0;
     const context = installContext({ node: { id: 'bridge-1', cascadeRole: 'bridge' } });
@@ -670,6 +731,37 @@ test('install without explicit test opt-in fails closed before transport or pers
     assert.deepEqual(calls, []);
 });
 
+test('retry after a rolled-back install at the same revision uses a fresh durable attempt key', async () => {
+    const context = installContext();
+    const keys = new Set();
+    const service = createService({
+        ...createContextRepositories(context),
+        enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { return 'admission-' + (keys.size + 1); },
+            async queueInstall({ operationDocument }) {
+                const key = operationDocument.idempotencyKey;
+                if (keys.has(key)) throw Object.assign(new Error('duplicate key'), { code: 11000 });
+                keys.add(key);
+            },
+            async release() { throw new Error('successful handoff cannot release'); },
+            async markRecoveryRequired() { throw new Error('successful handoff cannot recover'); },
+        },
+        preflightRunner: async request => {
+            request.onVerifiedRemoteComplete();
+            return { ok: true, checks: [] };
+        },
+        planBuilder: request => ({
+            ok: true, operationId: request.operationId, relayId: 'relay-1', topologyRevision: 17,
+        }),
+    });
+    const first = await service.install(context.node.id, context.input);
+    // The first operation later rolled back; topology revision and desired state did not change.
+    const second = await service.install(context.node.id, context.input);
+    assert.notEqual(first.operationId, second.operationId);
+    assert.equal(keys.size, 2);
+});
+
 test('opted-in install acquires before SSH and queues the same counted operation without release', async () => {
     const context = installContext();
     const events = [];
@@ -843,13 +935,35 @@ test('install validates context, builds a plan, and persists one queued operatio
             node: 'relay-1',
             kind: 'install',
             status: 'queued',
-            idempotencyKey: 'install:relay-1:revision-17',
+            idempotencyKey: `install:relay-1:revision-17:attempt-${result.operationId}`,
             progress: 0,
             attempts: 0,
             plan,
             createdAt: NOW,
         },
     });
+});
+
+test('definite precommit duplicate releases only the unqueued admission and permits retry', async () => {
+    const context = installContext();
+    const events = [];
+    const duplicate = Object.assign(new Error('E11000'),
+        { code: 11000, installQueuePreCommitAbort: true });
+    const service = createService({
+        ...createContextRepositories(context), enableInstallAdmission: true,
+        preflightRunner: async request => { request.onVerifiedRemoteComplete(); return { ok: true }; },
+        planBuilder: buildInstallPlan,
+        operationMaterializer: materializeInstallOperation,
+        remoteAdmissionRepository: {
+            async acquireInstall() { events.push('acquire'); return 'admission-1'; },
+            async queueInstall() { events.push('queue'); throw duplicate; },
+            async release() { events.push('release'); return true; },
+            async markRecoveryRequired() { events.push('recover'); },
+        },
+    });
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'INSTALL_OPERATION_CONFLICT' });
+    assert.deepEqual(events, ['acquire', 'queue', 'release']);
 });
 
 test('terminal duplicate is not deleted or retried and leaves new admission counted', async () => {

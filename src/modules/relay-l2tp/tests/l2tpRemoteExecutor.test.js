@@ -17,7 +17,7 @@ function createTransport() {
         },
         async runArtifactCommand(request) {
             calls.push({ method: 'runArtifactCommand', request });
-            return { stdout: 'remote output must stay private' };
+            return { ok: true, stdout: 'remote output must stay private' };
         },
     };
 }
@@ -84,6 +84,22 @@ test('preflight uploads its root-only desired file before its fixed command', as
     });
     assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
     assert.doesNotMatch(JSON.stringify(transport.calls[1]), new RegExp(secret));
+});
+
+test('executor rejects a definitive negative preflight before any subsequent command', async () => {
+    const commands = [];
+    const executor = new L2tpRemoteExecutor({ transport: {
+        async uploadRootFile() {},
+        async runArtifactCommand(request) {
+            commands.push(request.command);
+            return { ok: false, checks: [], error: { code: 'UNSUPPORTED_OS' } };
+        },
+    } });
+    await assert.rejects(executor.executeStep({
+        operation: { id: 'operation-preflight-negative' },
+        step: { type: 'preflight', artifacts: [{ type: 'desired', path: 'desired.json', content: '{}' }] },
+    }), error => error.code === 'UNSUPPORTED_OS' && error.remoteOutcomeUncertain !== true);
+    assert.deepEqual(commands, ['preflight']);
 });
 
 test('compose uploads only the fixed Xray candidate artifact before its fixed command', async () => {
@@ -707,8 +723,13 @@ test('sanitizes upload and command transport failures before returning them', as
         {
             expectedCode: 'REMOTE_UPLOAD_FAILED',
             expectedMessage: 'Failed to upload an L2TP operation artifact',
+            uncertain: true,
             transport: {
-                async uploadRootFile() { throw new Error(`upload leaked ${secret}`); },
+                async uploadRootFile() {
+                    throw Object.assign(new Error(`upload leaked ${secret}`), {
+                        remoteOutcomeUncertain: true,
+                    });
+                },
                 async runArtifactCommand() { throw new Error('must not run'); },
             },
             step: {
@@ -742,6 +763,7 @@ test('sanitizes upload and command transport failures before returning them', as
             error => {
                 assert.equal(error.name, 'L2tpRemoteExecutorError');
                 assert.equal(error.code, testCase.expectedCode);
+                assert.equal(error.remoteOutcomeUncertain === true, testCase.uncertain === true);
                 assert.equal(error.message, testCase.expectedMessage);
                 assert.equal(Object.hasOwn(error, 'cause'), false);
                 assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
@@ -749,6 +771,22 @@ test('sanitizes upload and command transport failures before returning them', as
             },
         );
     }
+});
+
+test('executor preserves only the sanitized remote uncertainty bit for a rejected SSH call', async () => {
+    const executor = new L2tpRemoteExecutor({ transport: {
+        async runArtifactCommand() {
+            throw Object.assign(new Error('secret from transport'), {
+                code: 'REMOTE_COMMAND_FAILED', remoteOutcomeUncertain: true,
+            });
+        },
+    } });
+    await assert.rejects(executor.executeStep({
+        operation: { id: 'operation-uncertain' }, step: { type: 'verify' },
+    }), error => error.code === 'REMOTE_COMMAND_FAILED'
+        && error.remoteOutcomeUncertain === true
+        && error.message === 'Failed to run an L2TP artifact command'
+        && !JSON.stringify(error).includes('secret'));
 });
 
 test('resolves one lazy transport per claimed operation and reuses it for every fixed command', async () => {

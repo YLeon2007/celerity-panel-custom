@@ -159,6 +159,7 @@ function createL2tpPanelHost({
             leaseMs,
             afterInstallSucceeded: deployTopologyAfterInstall,
             enableUnsafeExecutionForTests: testWorkerExecutionAllowed,
+            enableInstallAdmission: testWorkerExecutionAllowed,
         },
     });
 
@@ -197,6 +198,7 @@ function createL2tpPanelHost({
             const { TopologyClientProofExecutor } = require('./relay-l2tp/services/topologyClientProofExecutor');
             const { TopologyPublishedProfileSource } = require('./relay-l2tp/services/topologyPublishedProfileSource');
             const proofExecutor = new TopologyClientProofExecutor({
+                CascadeTopologyState: models.CascadeTopologyState,
                 HyNode: injectedHyNode,
                 CascadeLink: injectedCascadeLink,
                 CascadeRouteGroup: models.CascadeRouteGroup,

@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
-const { readFileSync } = require('node:fs');
+const { readFileSync, readdirSync } = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
@@ -32,6 +32,15 @@ const { generateXrayConfig } = require('../../services/configGenerator');
 
 function passThrough(req, res, next) {
     next();
+}
+
+function installedL2tpBundleInspection() {
+    const directory = path.join(__dirname, '../relay-l2tp/node-artifacts/l2tp');
+    return readdirSync(directory)
+        .filter(name => (name.endsWith('.sh') || name.endsWith('.py')) && name !== 'install.sh')
+        .sort()
+        .map(name => `${createHash('sha256').update(readFileSync(path.join(directory, name))).digest('hex')}  /usr/local/lib/celerity/relay-l2tp/${name}`)
+        .join('\n');
 }
 
 function queryResult(result, calls, kind) {
@@ -175,6 +184,20 @@ function createActiveHost(overrides = {}) {
             },
         },
         RemoteAdmission: { db,
+            findOne(filter) {
+                const record = [...admissionRecords.values()].find(candidate => {
+                    return Object.entries(filter).every(([key, expected]) => {
+                        if (expected && typeof expected === 'object' && '$in' in expected) {
+                            return expected.$in.includes(candidate[key]);
+                        }
+                        if (expected && typeof expected === 'object' && '$exists' in expected) {
+                            return (candidate[key] !== undefined) === expected.$exists;
+                        }
+                        return candidate[key] === expected;
+                    });
+                });
+                return queryResult(record ?? null, calls, 'RemoteAdmission');
+            },
             async create(documents, options) {
                 assert.strictEqual(options.session, admissionSession);
                 if (!admissionGate) throw new Error('blocked admission must not create a record');
@@ -188,8 +211,30 @@ function createActiveHost(overrides = {}) {
                 return { matchedCount: 1 };
             },
         },
-        L2tpOperation: { modelName: 'L2tpOperation' },
-        NodeOperationLock: { modelName: 'NodeOperationLock' },
+        L2tpOperation: {
+            modelName: 'L2tpOperation', db,
+            async updateOne(filter, update, options) {
+                calls.push({ kind: 'L2tpOperation.updateOne', filter, update, options });
+                assert.strictEqual(options.session, testSession);
+                return { matchedCount: 1 };
+            },
+        },
+        NodeOperationLock: {
+            modelName: 'NodeOperationLock', db,
+            async create(document) {
+                calls.push({ kind: 'NodeOperationLock.create', document });
+                return { ...document };
+            },
+            async updateOne(filter, update, options) {
+                calls.push({ kind: 'NodeOperationLock.updateOne', filter, update, options });
+                assert.strictEqual(options.session, testSession);
+                return { matchedCount: 1 };
+            },
+            async deleteOne(filter) {
+                calls.push({ kind: 'NodeOperationLock.deleteOne', filter });
+                return { deletedCount: 1 };
+            },
+        },
     };
 
     class FakeNodeSSH {
@@ -206,7 +251,7 @@ function createActiveHost(overrides = {}) {
                 ));
                 return {
                     code: 0,
-                    stdout: `${createHash('sha256').update(runner).digest('hex')}  /usr/local/lib/celerity/relay-l2tp/runner.sh\n`,
+                    stdout: installedL2tpBundleInspection(),
                     stderr: '',
                 };
             }
@@ -556,7 +601,7 @@ test('explicit complete activation wires execution factories lazily and starts o
     ]);
 });
 
-test('active host install is disabled before admission acquisition and SSH even with a ready gate', async () => {
+test('active host install remains disabled without explicit TEST admission opt-in', async () => {
     const { host, calls, admissionGate } = createActiveHost({ admissionReady: true });
     await assert.rejects(host.runtime.service.install('node-a', {
         routeGroupId: 'group-a', expectedTopologyRevision: 17,
@@ -618,6 +663,7 @@ test('active worker reconciler persists verified install state through the manag
     const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
     const operation = {
         id: 'operation-17',
+        admissionId: 'admission-17',
         node: 'node-a',
         kind: 'install',
         plan: {
@@ -630,10 +676,18 @@ test('active worker reconciler persists verified install state through the manag
     };
 
     assert.deepEqual(calls, []);
-    const result = await host.runtime.worker.stateReconciler({ operation, verifiedAt });
+    const result = await host.runtime.worker.stateReconciler({ operation, verifiedAt,
+        claim: { owner: 'worker-1', ownerGeneration: 2 }, lockGeneration: 'lock-17' });
 
     assert.strictEqual(host.runtime.worker.stateReconciler, runtimeCalls[0].stateReconciler);
-    assert.deepEqual(calls, [
+    const fences = calls.filter(call => ['L2tpOperation.updateOne', 'NodeOperationLock.updateOne']
+        .includes(call.kind));
+    assert.deepEqual(fences.map(call => call.kind),
+        ['L2tpOperation.updateOne', 'NodeOperationLock.updateOne']);
+    assert.equal(fences[0].filter.admissionId, 'admission-17');
+    assert.equal(fences[0].filter.ownerGeneration, 2);
+    assert.equal(fences[1].filter.generation, 'lock-17');
+    assert.deepEqual(calls.filter(call => !fences.includes(call)), [
         { kind: 'CascadeTopologyState.findById', id: 'singleton' },
         { kind: 'CascadeTopologyState.select', fields: 'stateTransitionRevision replacementReservation' },
         { kind: 'CascadeTopologyState.lean' },

@@ -44,7 +44,8 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
                 const state = stateStore.find(
                     entry => String(entry.node) === String(filter?.node),
                 ) ?? null;
-                return { lean: async () => state, then: resolve => resolve(state) };
+                return { session() { return this; }, lean: async () => state,
+                    then: resolve => resolve(state) };
             },
             findOneAndUpdate: async (filter, update) => {
                 const state = stateStore.find(
@@ -136,6 +137,16 @@ function createService(overrides = {}, models = createModels()) {
             exec: async () => ({ code: 0, stdout: 'TEARDOWN_OK' }),
             disconnect: () => {},
         })),
+        remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
+            acquire: async () => 'admission-1',
+            release: async () => true,
+        },
+        lockService: overrides.lockService ?? {
+            acquire: async ({ node, owner, operationId }) => ({ ok: true,
+                lock: { node, owner, operationId, generation: 'generation-1' } }),
+            releaseVerified: async () => ({ ok: true }),
+        },
+        allowRemoteExecution: overrides.allowRemoteExecution ?? true,
         secretBox: overrides.secretBox ?? null,
         secretKey: overrides.secretKey ?? null,
     });
@@ -158,6 +169,166 @@ const STATE = {
     secretRevision: 3,
     pskEncrypted: 'v1:enc',
 };
+
+test('prepares the pinned uninstalled relay ingress before final pending link autoDeploy', async () => {
+    const nodeId = '507f1f77bcf86cd799439034';
+    const bridgeId = '507f1f77bcf86cd799439032';
+    const groupId = '507f1f77bcf86cd799439099';
+    const linkId = '507f1f77bcf86cd799439098';
+    const models = createModels({
+        nodes: [{ _id: nodeId, cascadeRole: 'relay' }, { _id: bridgeId, cascadeRole: 'bridge' }],
+        states: [{ node: nodeId, desiredState: 'absent', status: 'not_installed',
+            routeGroup: groupId, secretRevision: 7 }],
+        links: [{ _id: linkId, portalNode: nodeId, bridgeNode: bridgeId,
+            active: true, status: 'pending', mode: 'reverse' }],
+    });
+    let created;
+    models.CascadeRouteGroup.create = async docs => { [created] = docs; return docs; };
+    const service = createService({}, models);
+    const result = await service.prepareConfiguredRelayIngress({
+        linkId, expectedTopologyRevision: 7,
+    });
+    assert.equal(result.revision, 8);
+    assert.equal(result.routeGroupId, groupId);
+    assert.equal(created._id.toString(), groupId);
+    assert.deepEqual(created.paths[0].linkIds.map(String), [linkId]);
+    assert.equal(models.RelayL2tpState._store[0].desiredState, 'absent');
+});
+
+test('preparation defers an incomplete suffix without changing the pinned group or revision', async () => {
+    const relay = '507f1f77bcf86cd799439034';
+    const downstream = '507f1f77bcf86cd799439035';
+    const groupId = '507f1f77bcf86cd799439099';
+    const linkId = '507f1f77bcf86cd799439098';
+    const models = createModels({
+        nodes: [{ _id: relay, cascadeRole: 'relay' }, { _id: downstream, cascadeRole: 'relay' }],
+        states: [{ node: relay, desiredState: 'absent', status: 'not_installed', routeGroup: groupId }],
+        links: [{ _id: linkId, portalNode: relay, bridgeNode: downstream,
+            active: true, status: 'pending' }],
+    });
+    models.CascadeRouteGroup.create = async () => { throw new Error('must not write'); };
+    models.CascadeTopologyState.findOneAndUpdate = () => { throw new Error('must not increment'); };
+    const result = await createService({}, models).prepareConfiguredRelayIngress({
+        linkId, expectedTopologyRevision: 7,
+    });
+    assert.equal(result.revision, 7);
+    assert.equal(result.deferred, true);
+});
+
+test('preparation excludes unrelated pending or disabled links from the relay suffix', async () => {
+    const relay = '507f1f77bcf86cd799439034';
+    const bridge = '507f1f77bcf86cd799439032';
+    const groupId = '507f1f77bcf86cd799439099';
+    const linkId = '507f1f77bcf86cd799439098';
+    const models = createModels({
+        nodes: [{ _id: relay, cascadeRole: 'relay' }, { _id: bridge, cascadeRole: 'bridge' }],
+        states: [{ node: relay, desiredState: 'absent', status: 'not_installed', routeGroup: groupId }],
+        links: [
+            { _id: linkId, portalNode: relay, bridgeNode: bridge, active: true, status: 'pending' },
+            { _id: '507f1f77bcf86cd799439097', portalNode: relay, bridgeNode: bridge,
+                active: true, status: 'pending' },
+            { _id: '507f1f77bcf86cd799439096', portalNode: relay, bridgeNode: bridge,
+                active: false, status: 'deployed' },
+        ],
+    });
+    let created;
+    models.CascadeRouteGroup.create = async docs => { [created] = docs; return docs; };
+    const result = await createService({}, models).prepareConfiguredRelayIngress({
+        linkId, linkIds: [linkId, '507f1f77bcf86cd799439097'],
+        expectedTopologyRevision: 7,
+    });
+    assert.equal(result.revision, 8);
+    assert.deepEqual(created.paths[0].linkIds.map(String), [linkId]);
+});
+
+test('preparation refuses installed relay path mutation without writing', async () => {
+    const relay = '507f1f77bcf86cd799439034';
+    const bridge = '507f1f77bcf86cd799439032';
+    const groupId = '507f1f77bcf86cd799439099';
+    const linkId = '507f1f77bcf86cd799439098';
+    const models = createModels({
+        nodes: [{ _id: relay, cascadeRole: 'relay' }, { _id: bridge, cascadeRole: 'bridge' }],
+        states: [{ node: relay, desiredState: 'installed', status: 'not_installed', routeGroup: groupId }],
+        links: [{ _id: linkId, portalNode: relay, bridgeNode: bridge,
+            active: true, status: 'pending' }],
+    });
+    models.CascadeRouteGroup.create = async () => { throw new Error('must not write'); };
+    models.CascadeTopologyState.findOneAndUpdate = () => { throw new Error('must not increment'); };
+    await assert.rejects(
+        createService({}, models).prepareConfiguredRelayIngress({ linkId, expectedTopologyRevision: 7 }),
+        { code: 'PREPARED_INGRESS_REQUIRED' },
+    );
+});
+
+test('preparation rejects a stale revision before publishing ingress', async () => {
+    const models = createModels();
+    models.CascadeRouteGroup.create = async () => { throw new Error('must not write'); };
+    await assert.rejects(
+        createService({}, models).prepareConfiguredRelayIngress({
+            linkId: '507f1f77bcf86cd799439098', expectedTopologyRevision: 6,
+        }),
+        { code: 'SIMPLE_TOPOLOGY_CONFLICT' },
+    );
+});
+
+test('preparation preserves a retained old main path and allocates a distinct new path key', async () => {
+    const relay = '507f1f77bcf86cd799439034';
+    const bridge = '507f1f77bcf86cd799439032';
+    const groupId = '507f1f77bcf86cd799439099';
+    const oldLinkId = '507f1f77bcf86cd799439097';
+    const linkId = '507f1f77bcf86cd799439098';
+    const group = { _id: groupId, name: 'auto-l2tp', paths: [
+        { pathKey: 'main', linkIds: [oldLinkId], enabled: true, priority: 100 },
+    ] };
+    const models = createModels({
+        nodes: [{ _id: relay, cascadeRole: 'relay' }, { _id: bridge, cascadeRole: 'bridge' }],
+        states: [{ node: relay, desiredState: 'absent', status: 'not_installed', routeGroup: groupId }],
+        groups: [group],
+        links: [{ _id: oldLinkId, portalNode: relay, bridgeNode: bridge,
+            active: true, status: 'deployed', mode: 'reverse' },
+        { _id: linkId, portalNode: relay, bridgeNode: bridge,
+            active: true, status: 'pending' }],
+    });
+    const result = await createService({}, models).prepareConfiguredRelayIngress({
+        linkId, expectedTopologyRevision: 7,
+    });
+    assert.equal(result.revision, 8);
+    assert.deepEqual(group.paths.map(path => path.pathKey), ['main', `main-${relay.slice(-6)}`]);
+    assert.deepEqual(group.paths[1].linkIds.map(String), [linkId]);
+});
+
+test('simple install never borrows another relay group when state has no pinned group', async () => {
+    const models = createModels({ nodes: [RELAY, { _id: 'bridge-1', cascadeRole: 'bridge' }],
+        links: [{ _id: 'link-1', portalNode: RELAY._id, bridgeNode: 'bridge-1',
+            active: true, status: 'online' }],
+        groups: [
+        { _id: 'foreign-group', name: 'auto-l2tp', paths: [] },
+    ] });
+    let created;
+    models.CascadeRouteGroup.create = async docs => {
+        created = { ...docs[0], _id: docs[0]._id ?? '507f1f77bcf86cd799439099' };
+        return [created];
+    };
+    const groupId = await createService({}, models).ensureRouteGroup(RELAY._id);
+    assert.ok(created, 'a private group must be created');
+    assert.equal(String(created._id), groupId);
+    assert.notEqual(groupId, 'foreign-group');
+});
+
+test('simple install recreates the exact pinned group id after deletion', async () => {
+    const groupId = '507f1f77bcf86cd799439099';
+    const models = createModels({ nodes: [RELAY, { _id: 'bridge-1', cascadeRole: 'bridge' }],
+        links: [{ _id: 'link-1', portalNode: RELAY._id, bridgeNode: 'bridge-1',
+            active: true, status: 'online' }],
+        states: [
+        { node: RELAY._id, status: 'not_installed', desiredState: 'absent', routeGroup: groupId },
+    ] });
+    let created;
+    models.CascadeRouteGroup.create = async docs => { [created] = docs; return docs; };
+    const result = await createService({}, models).ensureRouteGroup(RELAY._id);
+    assert.equal(result, groupId);
+    assert.equal(String(created._id), groupId);
+});
 
 test('entityId handles bson ObjectId self-referencing getters', async () => {
     const objectIdLike = { toHexString: () => '64b0f0f0f0f0f0f0f0f0f0f0' };
@@ -204,6 +375,9 @@ test('buildTeardownScript removes services, firewall state, files and the xray i
         '/etc/ipsec.secrets',
         '/etc/ppp/chap-secrets',
         'base64 -d | python3',
+        'xray_status=',
+        'systemctl restart xray.service',
+        'unit_status()',
         'TEARDOWN_OK',
     ]) {
         assert.ok(script.includes(marker), `missing ${marker}`);
@@ -213,6 +387,16 @@ test('buildTeardownScript removes services, firewall state, files and the xray i
     const python = Buffer.from(payload[1], 'base64').toString('utf8');
     assert.ok(python.includes('relay-l2tp-'));
     assert.ok(python.includes('/usr/local/etc/xray/config.json'));
+    assert.ok(python.includes('except FileNotFoundError'));
+    assert.ok(python.includes('raise'));
+    assert.match(script, /unit_status\(\) \{/);
+    assert.match(script, /systemctl show --no-pager --property=LoadState,ActiveState,UnitFileState --value/);
+    assert.match(script, /nft_tables=\"\$\(nft list tables\)\"/);
+    assert.ok(script.includes("case $'\\n'\"$nft_tables\"$'\\n' in"));
+    assert.ok(script.includes("case $'\\n'\"$ip_rule_output\"$'\\n' in"));
+    assert.doesNotMatch(script, /systemctl is-enabled/);
+    assert.doesNotMatch(script, /grep -q/);
+    assert.doesNotMatch(script, /! systemctl is-active/);
 });
 
 test('overview groups accounts by login and reveals the PSK per installed relay', async () => {
@@ -239,7 +423,10 @@ test('overview groups accounts by login and reveals the PSK per installed relay'
 
 test('installRelay auto-configures defaults, inherits accounts and queues install', async () => {
     const models = createModels({
-        nodes: [RELAY, { _id: 'relay-2', name: 'Two', cascadeRole: 'relay', status: 'online' }],
+        nodes: [RELAY, { _id: 'relay-2', name: 'Two', cascadeRole: 'relay', status: 'online' },
+            { _id: 'bridge-1', cascadeRole: 'bridge', status: 'online' }],
+        links: [{ _id: 'link-1', portalNode: RELAY._id, bridgeNode: 'bridge-1',
+            active: true, status: 'online' }],
         states: [{ ...STATE, node: 'relay-2' }],
         users: [{
             _id: 'u1',
@@ -287,7 +474,7 @@ test('installRelay auto-configures defaults, inherits accounts and queues instal
 
     assert.deepEqual(result, { operationId: 'op-9' });
     assert.equal(calls.configure.length, 1);
-    assert.equal(calls.configure[0].input.routeGroupId, 'group-a');
+    assert.equal(calls.configure[0].input.routeGroupId, 'group-auto');
     assert.equal(calls.configure[0].input.generatePsk, true);
     assert.match(calls.configure[0].input.clientCidr, /^10\.255\.\d+\.0\/24$/);
     assert.equal(calls.importUser.length, 1);
@@ -299,7 +486,7 @@ test('installRelay auto-configures defaults, inherits accounts and queues instal
         ),
         'inherited account must get an address from the new relay pool',
     );
-    assert.equal(calls.install[0].input.routeGroupId, 'group-a');
+    assert.equal(calls.install[0].input.routeGroupId, 'group-auto');
     assert.equal(calls.install[0].input.expectedTopologyRevision, 7);
 });
 
@@ -712,18 +899,157 @@ test('uninstallRelay runs the teardown over SSH and resets the desired state', a
     assert.equal(state.status, 'not_installed');
 });
 
+test('uninstallRelay does not decrement admission when exact lock release is not confirmed', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let admissionRelease = 0;
+    const service = createService({
+        nodeSSHFactory: () => ({
+            exec: async () => ({ code: 0, stdout: 'TEARDOWN_OK\n' }),
+            disconnect: () => {},
+        }),
+        remoteAdmissionRepository: {
+            acquire: async () => 'admission-release-failed',
+            release: async () => { admissionRelease += 1; },
+        },
+        lockService: {
+            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
+                operationId: 'op', generation: 'generation-1' } }),
+            releaseVerified: async () => ({ ok: false }),
+        },
+    }, models);
+
+    await assert.rejects(
+        () => service.uninstallRelay('relay-1'),
+        error => error?.code === 'UNINSTALL_FENCE_RELEASE_FAILED'
+            && error.remoteOutcomeUncertain === true,
+    );
+    assert.equal(admissionRelease, 0);
+});
+
 test('uninstallRelay keeps the state when the node cannot be reached', async () => {
     const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let admissionRelease = 0;
+    let lockRelease = 0;
     const service = createService({
         nodeSSHFactory: () => ({
             exec: async () => { throw new Error('ssh down'); },
+            disconnect: () => {},
+        }),
+        remoteAdmissionRepository: { acquire: async () => 'admission-1', release: async () => { admissionRelease += 1; } },
+        lockService: {
+            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
+                operationId: 'op', generation: 'generation-1' } }),
+            releaseVerified: async () => { lockRelease += 1; },
+        },
+    }, models);
+
+    await assert.rejects(
+        () => service.uninstallRelay('relay-1'),
+        error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
+    );
+    assert.equal(admissionRelease, 0);
+    assert.equal(lockRelease, 0);
+    assert.equal(models.RelayL2tpState._store[0].desiredState, 'installed');
+});
+
+test('simple install and uninstall are blocked before any state or SSH mutation outside TEST', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let sshCalls = 0;
+    const service = createService({
+        allowRemoteExecution: false,
+        nodeSSHFactory: () => ({
+            exec: async () => { sshCalls += 1; },
+            disconnect: () => {},
+        }),
+    }, models);
+
+    await assert.rejects(() => service.installRelay('relay-1'), { code: 'REMOTE_EXECUTION_DISABLED' });
+    await assert.rejects(() => service.uninstallRelay('relay-1'), { code: 'REMOTE_EXECUTION_DISABLED' });
+    assert.equal(sshCalls, 0);
+    assert.equal(models.RelayL2tpState._store[0].status, 'installed');
+});
+
+test('uninstallRelay retains admission when lock acquisition is uncertain', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let admissionRelease = 0;
+    let sshCalls = 0;
+    const service = createService({
+        remoteAdmissionRepository: {
+            acquire: async () => 'admission-lock-uncertain',
+            release: async () => { admissionRelease += 1; },
+        },
+        lockService: {
+            acquire: async () => { throw new Error('lock write timeout'); },
+            releaseVerified: async () => ({ ok: true }),
+        },
+        nodeSSHFactory: () => ({
+            exec: async () => { sshCalls += 1; },
             disconnect: () => {},
         }),
     }, models);
 
     await assert.rejects(
         () => service.uninstallRelay('relay-1'),
-        error => error?.code === 'UNINSTALL_FAILED',
+        error => error?.message === 'lock write timeout' && error.remoteOutcomeUncertain === true,
     );
-    assert.equal(models.RelayL2tpState._store[0].desiredState, 'installed');
+    assert.equal(admissionRelease, 0);
+    assert.equal(sshCalls, 0);
+});
+
+test('uninstallRelay retains fences when teardown exits without proof of cleanup', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let admissionRelease = 0;
+    let lockRelease = 0;
+    const service = createService({
+        nodeSSHFactory: () => ({
+            exec: async () => ({ code: 1, stdout: 'partial cleanup\\n' }),
+            disconnect: () => {},
+        }),
+        remoteAdmissionRepository: {
+            acquire: async () => 'admission-teardown-uncertain',
+            release: async () => { admissionRelease += 1; },
+        },
+        lockService: {
+            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
+                operationId: 'op', generation: 'generation-1' } }),
+            releaseVerified: async () => { lockRelease += 1; return { ok: true }; },
+        },
+    }, models);
+
+    await assert.rejects(
+        () => service.uninstallRelay('relay-1'),
+        error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
+    );
+    assert.equal(admissionRelease, 0);
+    assert.equal(lockRelease, 0);
+    assert.equal(models.RelayL2tpState._store[0].status, 'installed');
+});
+
+test('uninstallRelay treats TEARDOWN_OK without an exit code as uncertain', async () => {
+    const models = createModels({ nodes: [RELAY], states: [STATE] });
+    let admissionRelease = 0;
+    let lockRelease = 0;
+    const service = createService({
+        nodeSSHFactory: () => ({
+            exec: async () => ({ stdout: 'TEARDOWN_OK\\n' }),
+            disconnect: () => {},
+        }),
+        remoteAdmissionRepository: {
+            acquire: async () => 'admission-missing-exit-code',
+            release: async () => { admissionRelease += 1; },
+        },
+        lockService: {
+            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
+                operationId: 'op', generation: 'generation-1' } }),
+            releaseVerified: async () => { lockRelease += 1; return { ok: true }; },
+        },
+    }, models);
+
+    await assert.rejects(
+        () => service.uninstallRelay('relay-1'),
+        error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
+    );
+    assert.equal(admissionRelease, 0);
+    assert.equal(lockRelease, 0);
+    assert.equal(models.RelayL2tpState._store[0].status, 'installed');
 });

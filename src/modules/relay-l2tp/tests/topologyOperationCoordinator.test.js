@@ -102,6 +102,27 @@ test('legacy full deploy refuses pending links before composing or marking all l
     assert.equal(materialized, false);
 });
 
+test('known admission contention is a retryable busy conflict, not an opaque queue failure', async () => {
+    const coordinator = new TopologyOperationCoordinator({
+        topologyRepository: { async admitTopology() {
+            const error = new Error('do not expose internal admission details');
+            error.code = 'TOPOLOGY_ADMISSION_UNAVAILABLE';
+            throw error;
+        } },
+        planMaterializer: { async materialize() { assert.fail('must not materialize'); } },
+        operationRepository: { async createFrozen() { assert.fail('must not insert'); } },
+        validator: () => ({ valid: true }),
+        compiler: () => ({ valid: true }),
+    });
+    await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
+        assert.equal(error.code, 'TOPOLOGY_DEPLOY_BUSY');
+        assert.equal(error.retryable, true);
+        assert.equal(error.expectedTopologyRevision, 7);
+        assert.doesNotMatch(error.message, /internal admission details/);
+        return true;
+    });
+});
+
 test('queue keeps materialization, counted admission and frozen insert inside one transaction', async () => {
     const calls = [];
     const session = { inTransaction: () => true };
@@ -437,7 +458,8 @@ test('reservation injected between draft read and singleton CAS never queues an 
     });
     await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), error => {
         assert.equal(error.name, 'TopologyOperationCoordinatorError');
-        assert.equal(error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+        assert.equal(error.code, 'TOPOLOGY_DEPLOY_BUSY');
+        assert.equal(error.retryable, true);
         assert.doesNotMatch(JSON.stringify(error), /private-token/);
         return true;
     });

@@ -37,8 +37,12 @@
         TOPOLOGY_OPERATION_QUEUE_FAILED: 'Не удалось поставить операцию в очередь',
         TOPOLOGY_DEPLOYMENT_UNAVAILABLE: 'Сервис деплоя топологии недоступен',
         TOPOLOGY_DEPLOY_RATE_LIMITED: 'Слишком много запросов на деплой — повторите позже',
+        TOPOLOGY_DEPLOY_BUSY: 'Другая операция топологии уже выполняется — дождитесь завершения, обновите топологию и повторите вручную',
+        TOPOLOGY_OPERATION_BUSY: 'Другая операция топологии уже выполняется — дождитесь завершения, обновите топологию и повторите вручную',
+        TOPOLOGY_DEPLOYMENT_BUSY: 'Другая операция топологии уже выполняется — дождитесь завершения, обновите топологию и повторите вручную',
+        OPERATION_IN_PROGRESS: 'Другая операция уже выполняется — дождитесь завершения, обновите топологию и повторите вручную',
         SCOPE_LINK_MISSING: 'Связь отсутствует в зафиксированной топологии',
-        SCOPE_LINK_UNCONFIRMED: 'Базовая связь ещё не подтверждена как применённая',
+        SCOPE_LINK_UNCONFIRMED: 'Базовая связь ещё не подтверждена как применённая — сначала выполните отдельный Deploy этой связи, дождитесь завершения и повторите Sync применённого домена',
         UNCONFIRMED_LINK_IN_FULL_DEPLOY: 'Есть ожидающие связи: используйте отдельный деплой связи, не синхронизируйте всю топологию',
         USER_SYNC_UNAVAILABLE: 'Синхронизация пользователей Xray недоступна: готовность не подтверждена',
         L2TP_PPP_READBACK_UNAVAILABLE: 'Проверка пользователей PPP на реле недоступна: готовность не подтверждена',
@@ -143,6 +147,12 @@
 
     const i18n = window._networkI18n || {};
     const csrfToken = window._networkCsrfToken || '';
+
+    // Do not reuse legacy chain labels: domain.reconcile excludes pending edges
+    // and reconciles only the selected confirmed-applied connected component.
+    const syncDomainLabel = i18n.syncAppliedDomain || 'Sync применённого домена';
+    const syncDomainScope = i18n.syncAppliedDomainScope
+        || 'Только подтверждённые применённые связи в связанном домене выбранной связи. Ожидающие связи не включаются.';
 
     const STATUS_COLORS = {
         online:   '#22c55e',
@@ -371,6 +381,13 @@
     }
 
     function renderGraph(data) {
+        // Link mutations reload the graph, but must not discard the positions
+        // currently visible to the user (including positions not saved yet).
+        const previousNodes = cy.nodes();
+        const hadGraph = previousNodes.length > 0;
+        const previousPositions = new Map(previousNodes.map(n => [n.id(), { ...n.position() }]));
+        const previousPan = hadGraph ? cy.pan() : null;
+        const previousZoom = hadGraph ? cy.zoom() : null;
         cy.elements().remove();
 
         const isEmpty = (!data.nodes || data.nodes.length === 0) &&
@@ -397,7 +414,7 @@
                     roleAccent: ROLE_BORDER_ACCENT[role] || ROLE_BORDER_ACCENT.standalone,
                     roleGlow:   ROLE_GLOW[role]          || null,
                 },
-                position: n.position || undefined,
+                position: previousPositions.get(n.data.id) || n.position || undefined,
             });
         }
 
@@ -410,8 +427,13 @@
 
         cy.add(elements);
 
-        const hasPositions = data.nodes.some(n => n.position);
-        if (hasPositions) { cy.fit(50); } else { runAutoLayout(); }
+        if (hadGraph) {
+            cy.zoom(previousZoom);
+            cy.pan(previousPan);
+        } else {
+            const hasPositions = data.nodes.some(n => n.position);
+            if (hasPositions) { cy.fit(50); } else { runAutoLayout(); }
+        }
 
         initParticleSystem();
     }
@@ -836,6 +858,16 @@
         openInfoModal((d.flag ? d.flag + ' ' : '') + (d.label || d.ip || ''), html);
     }
 
+    // Match the API admission states, not the graph's optimistic syncing color.
+    // The server still fences/revalidates the snapshot; this is guidance only.
+    function domainSyncAnchorError(linkId) {
+        const link = _allLinks.find(link => String(link._id) === linkId);
+        if (!link) return topologyCauseText('SCOPE_LINK_MISSING');
+        if (link.active === false) return 'Связь отключена — включите её перед синхронизацией домена';
+        return ['deployed', 'online', 'staged'].includes(link.status)
+            ? null : topologyCauseText('SCOPE_LINK_UNCONFIRMED');
+    }
+
     function onEdgeTap(evt) {
         const d = evt.target.data();
         const sc = d.status || 'pending';
@@ -893,14 +925,17 @@
             '<button class="btn btn-sm btn-success" id="btnDeploy" onclick="window._cascadeDeploy(\'' + lid + '\')">' +
             '<i class="ti ti-upload"></i> ' + (i18n.deploy || 'Deploy') + '</button>' +
             '<button class="btn btn-sm btn-primary" id="btnDeployChain" onclick="window._cascadeDeployChain(\'' + lid + '\')">' +
-            '<i class="ti ti-link"></i> ' + (i18n.syncChain || 'Sync Chain') + '</button>' +
+            '<i class="ti ti-link"></i> ' + escHtml(syncDomainLabel) + '</button>' +
             '<button class="btn btn-sm btn-outline" id="btnUndeploy" onclick="window._cascadeUndeploy(\'' + lid + '\')">' +
             '<i class="ti ti-player-stop"></i> ' + (i18n.undeployLink || 'Undeploy') + '</button>' +
             '<button class="btn btn-sm btn-danger" id="btnDelete" onclick="window._cascadeDelete(\'' + lid + '\')">' +
             '<i class="ti ti-trash"></i> ' + (i18n.delete || 'Delete') + '</button>' +
             '</div>';
 
-        openInfoModal(d.label || 'Cascade Link', html);
+        openInfoModal(d.label || 'Cascade Link', html +
+            '<p class="info-hint">' + escHtml(syncDomainScope) + '</p>' +
+            (domainSyncAnchorError(lid)
+                ? '<p class="info-hint">' + escHtml(domainSyncAnchorError(lid)) + '</p>' : ''));
     }
 
     function escHtml(v) {
@@ -1180,9 +1215,11 @@
         }
         // Saving a draft is not evidence of physical deployment. In
         // particular, never fall back to an unscoped full-topology deploy.
-        const cause = snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus;
-        showToast((i18n.deployFailed || 'Failed') + ': '
-            + (topologyCauseText(cause) || cause || 'Автодеплой не поставлен в очередь'), 'error');
+        const error = snapshot?.autoDeployError
+            || { code: snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus };
+        showToast((i18n.savedAutoDeployBlocked || 'Изменения сохранены, но автодеплой не запущен') + ': '
+            + describeTopologyError({ error }, 'Автодеплой не поставлен в очередь')
+            + '. Для применения используйте отдельный Deploy этой связи.', 'error');
     }
 
     async function onAddLinkSubmit(e) {
@@ -1408,8 +1445,13 @@
     };
 
     window._cascadeDeployChain = async function (linkId) {
-        if (!confirm(i18n.confirmDeployChain || 'Deploy entire chain? This will sync all connected nodes in the correct order.')) return;
-        setActionLoading(i18n.syncingChain || 'Syncing chain...');
+        const anchorError = domainSyncAnchorError(linkId);
+        if (anchorError) {
+            showToast(anchorError, 'error');
+            return;
+        }
+        if (!confirm(syncDomainLabel + '? ' + syncDomainScope)) return;
+        setActionLoading(escHtml(i18n.syncingAppliedDomain || 'Синхронизация применённого домена...'));
 
         const edge = cy.edges().filter(e => e.data('linkId') === linkId);
         if (edge.length) edge.data('status', 'syncing');
@@ -1420,7 +1462,7 @@
             loadTopology();
             closeInfoModal();
         } catch (err) {
-            showToast((i18n.chainDeployFailed || 'Chain sync failed') + ': ' + err.message, 'error');
+            showToast((i18n.appliedDomainSyncFailed || 'Не удалось синхронизировать применённый домен') + ': ' + err.message, 'error');
             loadTopology();
         } finally { resetActionLoading(); }
     };

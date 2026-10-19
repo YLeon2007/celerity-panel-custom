@@ -156,6 +156,7 @@ test('builds the concrete repository adapters and composes a dormant runtime', a
         L2tpOperation: models.L2tpOperation,
     }]);
     assert.equal(runtimeCalls.length, 1);
+    assert.equal(runtimeCalls[0].enableInstallAdmission, false);
     assert.strictEqual(runtimeCalls[0].operationModel, models.L2tpOperation);
     assert.strictEqual(runtimeCalls[0].operationRepository, adapters.operationRepository);
     assert.strictEqual(runtimeCalls[0].nodeRepository, adapters.nodeRepository);
@@ -210,6 +211,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
     };
     const topologyDependencies = [];
     let l2tpWorkerAllowed;
+    let l2tpInstallAdmission;
     let topologyWorker;
     let recoveryStarts = 0;
     const moduleEntry = {
@@ -234,6 +236,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
         createPanelOverviewLoader: () => async () => ({}),
         createExecutionRuntime: dependencies => {
             l2tpWorkerAllowed = dependencies.runtimeDependencies.enableUnsafeExecutionForTests;
+            l2tpInstallAdmission = dependencies.runtimeDependencies.enableInstallAdmission;
             return {
                 runtime: { stateManagementService: {} },
                 start: () => ({}),
@@ -258,6 +261,7 @@ test('opted-in panel host passes the lock model to topology recovery and starts'
     assert.strictEqual(topologyDependencies[0].L2tpOperation, models.L2tpOperation);
     assert.strictEqual(topologyDependencies[0].L2tpUser, models.L2tpUser);
     assert.equal(l2tpWorkerAllowed, true);
+    assert.equal(l2tpInstallAdmission, true);
     assert.equal(recoveryStarts, 1);
 });
 

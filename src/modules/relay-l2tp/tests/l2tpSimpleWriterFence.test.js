@@ -50,7 +50,10 @@ function fixture({ reservation, beforeCas, groups = [], relayStates = [], links 
                 return { matchedCount: group ? 1 : 0 };
             },
         },
-        RelayL2tpState: { find: () => query(() => relayStates) },
+        RelayL2tpState: {
+            find: () => query(() => relayStates),
+            findOne: filter => query(() => relayStates.find(state => state.node === filter.node) ?? null),
+        },
         CascadeTopologyState: {
             findById: () => query(() => ({ ...topology })),
             findOneAndUpdate: (filter, update, options) => {
@@ -74,6 +77,7 @@ function fixture({ reservation, beforeCas, groups = [], relayStates = [], links 
         userManagementService: { createUser: async () => {}, deleteUser: async () => {}, importUser: async () => { calls.remote++; } },
         stateRepository: { getTopologyRevision: async () => 7 },
         nodeSSHFactory: () => ({}),
+        allowRemoteExecution: true,
     });
     return { service, stored, topology, calls };
 }

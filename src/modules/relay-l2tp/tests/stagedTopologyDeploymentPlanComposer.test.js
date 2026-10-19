@@ -427,7 +427,7 @@ test('bridge-less graph with geo-routing rules stays a structural error', () => 
     );
 });
 
-test('bridge-less graph with two portal sources is rejected (single domain per compose)', () => {
+test('bridge-less fan-in stages two portal sources to the shared relay without direct egress', () => {
     const input = stagedInput({
         snapshot: {
             nodes: [
@@ -444,10 +444,40 @@ test('bridge-less graph with two portal sources is rejected (single domain per c
     });
     input.nodeMetadata.push(nodeMeta('portal-2', 'portal', 4));
     input.linkMetadata.push(linkMeta('link-p2r', 10103));
-    assert.throws(
-        () => composeFrozenTopologyDeploymentPlan(input),
-        error => ['NON_LINEAR_TOPOLOGY', 'INVALID_TOPOLOGY_ROLES'].includes(error.code),
-    );
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.equal(plan.staged, true);
+    assert.deepEqual(plan.nodes.map(node => node.nodeRef).sort(), ['portal-1', 'portal-2', 'relay-1']);
+    const byRef = planByRef(plan);
+    const relay = candidateJson(byRef.get('relay-1'));
+    assert.equal((relay.reverse?.bridges || []).length, 2);
+    for (const bridge of relay.reverse.bridges) {
+        assert.ok(relay.routing.rules.some(rule => rule.inboundTag?.includes(bridge.tag)
+            && rule.outboundTag === 'block'));
+    }
+    assert.ok(!relay.routing.rules.some(rule => rule.outboundTag === 'direct'
+        && rule.inboundTag?.some(tag => tag.startsWith('bridge-'))));
+    const second = composeFrozenTopologyDeploymentPlan(input);
+    assert.deepEqual(plan.nodes.map(node => node.candidate.sha256),
+        second.nodes.map(node => node.candidate.sha256));
+});
+
+test('bridge-less multi-portal with two different relay sinks remains rejected', () => {
+    const input = stagedInput({
+        snapshot: {
+            nodes: [
+                { id: 'portal-1', role: 'portal' }, { id: 'portal-2', role: 'portal' },
+                { id: 'relay-1', role: 'relay' }, { id: 'relay-2', role: 'relay' },
+            ],
+            links: [
+                { id: 'link-pr', source: 'portal-1', target: 'relay-1', mode: 'reverse' },
+                { id: 'link-p2r', source: 'portal-2', target: 'relay-2', mode: 'reverse' },
+            ], groups: [],
+        },
+    });
+    input.nodeMetadata.push(nodeMeta('portal-2', 'portal', 4), nodeMeta('relay-2', 'relay', 5));
+    input.linkMetadata.push(linkMeta('link-p2r', 10103));
+    assert.throws(() => composeFrozenTopologyDeploymentPlan(input),
+        error => error.code === 'MULTIPLE_DEFAULT_EGRESS');
 });
 
 test('staged chain ending at a non-relay node is rejected', () => {

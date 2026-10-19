@@ -136,8 +136,8 @@ class L2tpOperationWorker {
     constructor({
         operationRepository,
         remoteAdmissionRepository,
-        // Test-only opt-in. The active runtime never supplies this until the
-        // ownership/finalization and remote recovery protocols are complete.
+        // Test-only opt-in. Production must not consume counted admissions
+        // without the explicit TEST composition predicate.
         enableUnsafeExecutionForTests = false,
         lockService,
         executor,
@@ -187,7 +187,7 @@ class L2tpOperationWorker {
         if (matched !== true) throw lostClaim();
     }
 
-    async failClaimedOperation({ claim, errorCode, errorMessage }) {
+    async failClaimedOperation({ claim, operation, lockGeneration, heartbeat, errorCode, errorMessage }) {
         const finishedAt = this.clock.now();
         await this.writeClaimed('transitionClaimed', claim, {
             status: 'failed',
@@ -202,7 +202,77 @@ class L2tpOperationWorker {
                 message: errorMessage,
             },
         });
-        return { claimed: true, operationId: claim.operationId, status: 'failed' };
+        const admissionSettled = await this.completeTerminalAdmission(operation, claim,
+            { lockGeneration, heartbeat });
+        return {
+            claimed: true,
+            operationId: claim.operationId,
+            status: 'failed',
+            ...(admissionSettled ? {} : {
+                stopped: true,
+                errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+            }),
+        };
+    }
+
+    async completeTerminalAdmission(operation, claim, { lockGeneration, heartbeat } = {}) {
+        const admissions = this.remoteAdmissionRepository;
+        if (lockGeneration) {
+            await heartbeat?.stop();
+            try {
+                const released = await this.lockService.releaseVerified({
+                    node: operation.node,
+                    owner: claim.owner,
+                    operationId: claim.operationId,
+                    generation: lockGeneration,
+                });
+                if (released?.ok !== true) throw new Error('Exact node lock release not confirmed');
+            } catch {
+                await this.retainAdmissionForRecovery(operation, claim);
+                return false;
+            }
+        }
+        if (typeof admissions?.completeTerminalOperation !== 'function') return true;
+        try {
+            const completed = await admissions.completeTerminalOperation({
+                admissionId: operation?.admissionId,
+                operationId: claim.operationId,
+                nodeId: entityId(operation?.node),
+                owner: claim.owner,
+                ownerGeneration: claim.ownerGeneration,
+                kind: operation?.kind,
+            });
+            return completed === true;
+        } catch {
+            try {
+                await admissions.markOperationRecoveryRequired({
+                    admissionId: operation?.admissionId,
+                    operationId: claim.operationId,
+                    nodeId: entityId(operation?.node),
+                    owner: claim.owner,
+                    ownerGeneration: claim.ownerGeneration,
+                    kind: operation?.kind,
+                });
+            } catch { /* preserve the counted fence for authoritative recovery */ }
+            return false;
+        }
+    }
+
+    async retainAdmissionForRecovery(operation, claim) {
+        const admissions = this.remoteAdmissionRepository;
+        if (typeof admissions?.markOperationRecoveryRequired !== 'function') return true;
+        try {
+            return await admissions.markOperationRecoveryRequired({
+                admissionId: operation?.admissionId,
+                operationId: claim.operationId,
+                nodeId: entityId(operation?.node),
+                owner: claim.owner,
+                ownerGeneration: claim.ownerGeneration,
+                kind: operation?.kind,
+            }) === true;
+        } catch {
+            return false;
+        }
     }
 
     async prepareInstallPlan(operation) {
@@ -394,6 +464,14 @@ class L2tpOperationWorker {
     }
 
     async runOnce() {
+        // A crash after exact lock release but before admission completion can
+        // leave a terminal operation counted. Reconcile durable terminal proof
+        // before admitting the next queued operation; never recover an active
+        // SSH attempt merely because its lease expired.
+        if (this.enableUnsafeExecutionForTests
+            && typeof this.remoteAdmissionRepository?.recoverSettledAdmissions === 'function') {
+            await this.remoteAdmissionRepository.recoverSettledAdmissions();
+        }
         let claimedId;
         let claimedStatus = 'running';
         try {
@@ -454,6 +532,7 @@ class L2tpOperationWorker {
             if (prepared.errorCode) {
                 return this.failClaimedOperation({
                     claim,
+                    operation,
                     errorCode: prepared.errorCode,
                     errorMessage: prepared.errorMessage,
                 });
@@ -464,6 +543,7 @@ class L2tpOperationWorker {
             if (prepared.errorCode) {
                 return this.failClaimedOperation({
                     claim,
+                    operation,
                     errorCode: prepared.errorCode,
                     errorMessage: prepared.errorMessage,
                 });
@@ -495,7 +575,16 @@ class L2tpOperationWorker {
                     message: errorMessage,
                 },
             });
-            return { claimed: true, operationId, status: 'failed' };
+            const admissionSettled = await this.completeTerminalAdmission(operation, claim);
+            return {
+                claimed: true,
+                operationId,
+                status: 'failed',
+                ...(admissionSettled ? {} : {
+                    stopped: true,
+                    errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+                }),
+            };
         }
 
         let candidateContent = null;
@@ -505,6 +594,7 @@ class L2tpOperationWorker {
             } catch {
                 return this.failClaimedOperation({
                     claim,
+                    operation,
                     errorCode: 'XRAY_CANDIDATE_FAILED',
                     errorMessage: 'Failed to build the L2TP Xray candidate',
                 });
@@ -517,7 +607,21 @@ class L2tpOperationWorker {
             operationId,
             leaseMs: this.leaseMs,
         };
-        const lock = await this.lockService.acquire(lockRequest);
+        let lock;
+        try {
+            lock = await this.lockService.acquire(lockRequest);
+        } catch {
+            const retained = await this.retainAdmissionForRecovery(operation, claim);
+            return {
+                claimed: true,
+                operationId,
+                status: 'running',
+                stopped: true,
+                errorCode: retained
+                    ? 'NODE_OPERATION_LOCK_UNCERTAIN'
+                    : 'REMOTE_ADMISSION_RECOVERY_FAILED',
+            };
+        }
 
         if (!lock?.ok) {
             const errorCode = lock?.error?.code || 'NODE_LOCK_UNAVAILABLE';
@@ -537,14 +641,24 @@ class L2tpOperationWorker {
                     message: errorMessage,
                 },
             });
-            return { claimed: true, operationId, status: 'failed' };
+            const admissionSettled = await this.completeTerminalAdmission(operation, claim);
+            return {
+                claimed: true,
+                operationId,
+                status: 'failed',
+                ...(admissionSettled ? {} : {
+                    stopped: true,
+                    errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+                }),
+            };
         }
 
         if (typeof lock.lock?.generation !== 'string' || !lock.lock.generation) {
             // A lock without its distinct UUID fence cannot be renewed or released.
             // It remains remote-uncertain; never execute SSH on this claim.
+            const retained = await this.retainAdmissionForRecovery(operation, claim);
             return { claimed: true, operationId, status: 'running', stopped: true,
-                errorCode: 'NODE_OPERATION_LOCK_LOST' };
+                errorCode: retained ? 'NODE_OPERATION_LOCK_LOST' : 'REMOTE_ADMISSION_RECOVERY_FAILED' };
         }
         const lockGeneration = lock.lock.generation;
         const heartbeat = this.createLeaseHeartbeat({
@@ -553,13 +667,18 @@ class L2tpOperationWorker {
             lockGeneration,
         });
         let currentStatus = 'running';
-        const leaseLostResult = () => ({
-            claimed: true,
-            operationId,
-            status: currentStatus,
-            stopped: true,
-            errorCode: heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED',
-        });
+        const leaseLostResult = async (fenceErrorCode) => {
+            const retained = await this.retainAdmissionForRecovery(operation, claim);
+            return {
+                claimed: true,
+                operationId,
+                status: currentStatus,
+                stopped: true,
+                errorCode: retained
+                    ? fenceErrorCode || heartbeat.getError()?.code || 'L2TP_LEASE_RENEWAL_FAILED'
+                    : 'REMOTE_ADMISSION_RECOVERY_FAILED',
+            };
+        };
         const enterRollback = async fields => heartbeat.switchToRollback(async () => {
             await this.writeClaimed('transitionClaimed', claim, fields);
             currentStatus = 'rolling_back';
@@ -595,6 +714,9 @@ class L2tpOperationWorker {
                     await heartbeat.stop();
                     return this.failClaimedOperation({
                         claim,
+                        operation,
+                        lockGeneration,
+                        heartbeat,
                         errorCode: 'SECRET_RESOLUTION_FAILED',
                         errorMessage: 'Failed to resolve L2TP operation secrets',
                     });
@@ -625,6 +747,9 @@ class L2tpOperationWorker {
                     await heartbeat.stop();
                     return this.failClaimedOperation({
                         claim,
+                        operation,
+                        lockGeneration,
+                        heartbeat,
                         errorCode: 'USER_SNAPSHOT_RESOLUTION_FAILED',
                         errorMessage: 'Failed to resolve the current L2TP user snapshot',
                     });
@@ -666,6 +791,14 @@ class L2tpOperationWorker {
                 } catch (error) {
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
+                    // The SSH call may have timed out locally while its remote
+                    // command keeps running. Rollback cannot prove quiescence.
+                    if (error?.remoteOutcomeUncertain === true) {
+                        await this.retainAdmissionForRecovery(operation, claim);
+                        return { claimed: true, operationId: claim.operationId,
+                            status: 'running', stopped: true,
+                            errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                    }
                     const errorCode = error.code || 'EXECUTOR_FAILED';
                     const errorMessage = error.message || 'L2TP operation executor failed';
                     if (!await enterRollback({
@@ -712,7 +845,16 @@ class L2tpOperationWorker {
                             },
                         });
 
-                        return { claimed: true, operationId, status: 'failed' };
+                        const retained = await this.retainAdmissionForRecovery(operation, rollbackClaim);
+                        return {
+                            claimed: true,
+                            operationId,
+                            status: 'failed',
+                            ...(retained ? {} : {
+                                stopped: true,
+                                errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
+                            }),
+                        };
                     }
 
                     if (!await rollbackLeaseValid()) return leaseLostResult();
@@ -733,7 +875,17 @@ class L2tpOperationWorker {
                         },
                     });
 
-                    return { claimed: true, operationId, status: 'rolled_back' };
+                    const admissionSettled = await this.completeTerminalAdmission(operation, rollbackClaim,
+                        { lockGeneration, heartbeat });
+                    return {
+                        claimed: true,
+                        operationId,
+                        status: 'rolled_back',
+                        ...(admissionSettled ? {} : {
+                            stopped: true,
+                            errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+                        }),
+                    };
                 }
 
                 completedSteps.push(secretFreeStep(step));
@@ -761,12 +913,17 @@ class L2tpOperationWorker {
                     if (typeof this.stateReconciler !== 'function') {
                         throw new TypeError('L2TP state reconciler is unavailable');
                     }
-                    await this.stateReconciler({ operation, verifiedAt });
+                    await this.stateReconciler({ operation, verifiedAt, claim, lockGeneration });
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
                     await heartbeat.renewNow();
                     if (heartbeat.getError()) return leaseLostResult();
-                } catch {
+                } catch (reconciliationFailure) {
+                    // A stale owner must not issue rollback SSH after losing its fence.
+                    if (['L2TP_OPERATION_FENCE_REJECTED', 'L2TP_NODE_FENCE_REJECTED']
+                        .includes(reconciliationFailure?.code)) {
+                        return leaseLostResult(reconciliationFailure.code);
+                    }
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
                     const errorCode = 'STATE_RECONCILIATION_FAILED';
@@ -817,7 +974,16 @@ class L2tpOperationWorker {
                                 message: 'Failed to roll back L2TP operation',
                             },
                         });
-                        return { claimed: true, operationId, status: 'failed' };
+                        const retained = await this.retainAdmissionForRecovery(operation, rollbackClaim);
+                        return {
+                            claimed: true,
+                            operationId,
+                            status: 'failed',
+                            ...(retained ? {} : {
+                                stopped: true,
+                                errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
+                            }),
+                        };
                     }
 
                     if (!await rollbackLeaseValid()) return leaseLostResult();
@@ -837,7 +1003,17 @@ class L2tpOperationWorker {
                             message: 'Rolled back L2TP operation after state reconciliation failure',
                         },
                     });
-                    return { claimed: true, operationId, status: 'rolled_back' };
+                    const admissionSettled = await this.completeTerminalAdmission(operation, rollbackClaim,
+                        { lockGeneration, heartbeat });
+                    return {
+                        claimed: true,
+                        operationId,
+                        status: 'rolled_back',
+                        ...(admissionSettled ? {} : {
+                            stopped: true,
+                            errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+                        }),
+                    };
                 }
             } else if (operation.kind === 'sync_users') {
                 try {
@@ -910,7 +1086,16 @@ class L2tpOperationWorker {
                                 message: 'Failed to roll back L2TP operation',
                             },
                         });
-                        return { claimed: true, operationId, status: 'failed' };
+                        const retained = await this.retainAdmissionForRecovery(operation, rollbackClaim);
+                        return {
+                            claimed: true,
+                            operationId,
+                            status: 'failed',
+                            ...(retained ? {} : {
+                                stopped: true,
+                                errorCode: 'REMOTE_ADMISSION_RECOVERY_FAILED',
+                            }),
+                        };
                     }
 
                     if (!await rollbackLeaseValid()) return leaseLostResult();
@@ -930,7 +1115,17 @@ class L2tpOperationWorker {
                             message: 'Rolled back L2TP operation after user sync finalization failure',
                         },
                     });
-                    return { claimed: true, operationId, status: 'rolled_back' };
+                    const admissionSettled = await this.completeTerminalAdmission(operation, rollbackClaim,
+                        { lockGeneration, heartbeat });
+                    return {
+                        claimed: true,
+                        operationId,
+                        status: 'rolled_back',
+                        ...(admissionSettled ? {} : {
+                            stopped: true,
+                            errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED',
+                        }),
+                    };
                 }
             }
             const finishedAt = this.clock.now();
@@ -945,43 +1140,42 @@ class L2tpOperationWorker {
                 },
             });
 
-            // A verified terminal operation must release its counted Mongo
-            // admission before a later replacement can enter the same contour.
-            if (typeof this.remoteAdmissionRepository.completeVerifiedOperation === 'function') {
-                await heartbeat.stop();
-                try {
-                    const completed = await this.remoteAdmissionRepository.completeVerifiedOperation({
-                        admissionId: operation.admissionId,
-                        operationId,
-                        nodeId: String(operation.node),
-                        owner: this.workerId,
-                        ownerGeneration: claim.ownerGeneration,
-                        kind: operation.kind,
-                    });
-                    if (completed !== true) throw new Error('Admission completion not confirmed');
-                } catch {
-                    return { claimed: true, operationId, status: 'succeeded', stopped: true,
-                        errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED' };
-                }
+            // The remote executor is quiescent and the exact node generation
+            // must be released before lifting the counted topology fence.
+            // A failed release keeps admission held for manual recovery.
+            await heartbeat.stop();
+            let released;
+            try {
+                released = await this.lockService.releaseVerified?.({
+                    node: operation.node,
+                    owner: this.workerId,
+                    operationId,
+                    generation: lockGeneration,
+                });
+            } catch { /* Keep the counted admission held. */ }
+            if (released?.ok !== true) {
+                await this.retainAdmissionForRecovery(operation, claim);
+                return { claimed: true, operationId, status: 'succeeded', stopped: true,
+                    errorCode: 'NODE_LOCK_RELEASE_FAILED' };
             }
-
-            // Topology auto-deploy reuses this relay. Hand off its exact
-            // generation only after verified L2TP success is durable.
-            if (typeof this.lockService.releaseVerified === 'function') {
-                await heartbeat.stop();
-                let released;
-                try {
-                    released = await this.lockService.releaseVerified({
-                        node: operation.node,
-                        owner: this.workerId,
-                        operationId,
-                        generation: lockGeneration,
-                    });
-                } catch { /* Keep the operation terminal; the node stays blocked. */ }
-                if (released?.ok !== true) {
-                    return { claimed: true, operationId, status: 'succeeded', stopped: true,
-                        errorCode: 'NODE_LOCK_RELEASE_FAILED' };
-                }
+            if (typeof this.remoteAdmissionRepository.completeVerifiedOperation !== 'function') {
+                return { claimed: true, operationId, status: 'succeeded', stopped: true,
+                    errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED' };
+            }
+            try {
+                const completed = await this.remoteAdmissionRepository.completeVerifiedOperation({
+                    admissionId: operation.admissionId,
+                    operationId,
+                    nodeId: entityId(operation.node),
+                    owner: this.workerId,
+                    ownerGeneration: claim.ownerGeneration,
+                    kind: operation.kind,
+                });
+                if (completed !== true) throw new Error('Admission completion not confirmed');
+            } catch {
+                await this.retainAdmissionForRecovery(operation, claim);
+                return { claimed: true, operationId, status: 'succeeded', stopped: true,
+                    errorCode: 'REMOTE_ADMISSION_COMPLETION_FAILED' };
             }
 
             // The install may have advanced the topology revision (route-group

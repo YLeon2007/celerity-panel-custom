@@ -9,10 +9,28 @@ const LINK_ID = '507f1f77bcf86cd799439011';
 const OP_ID = '507f1f77bcf86cd799439022';
 const snapshot = (extra = {}) => ({ topologyRevision: 7, deployedRevision: 6, links: [], ...extra });
 
-function browserHarness({ persistedAutoDeploy = true, operation = null } = {}) {
+function browserHarness({ persistedAutoDeploy = true, operation = null,
+    links = [], deployResponse = null, confirmResult = true, autoDeployError = null } = {}) {
     const requests = [];
     const toasts = [];
     const timers = [];
+    const confirmations = [];
+    let reloads = 0;
+    const edges = links.map(link => ({
+        values: { ...link, linkId: link._id, source: 'portal', target: 'bridge', mode: 'reverse' },
+        data(key, value) {
+            if (key === undefined) return this.values;
+            if (arguments.length > 1) this.values[key] = value;
+            return this.values[key];
+        },
+    }));
+    function collection(items) {
+        return { length: items.length, toArray: () => items,
+            filter: predicate => collection(items.filter(predicate)),
+            data: (...args) => items[0]?.data(...args) };
+    }
+    const graph = { edges: () => collection(edges), getElementById: () => ({ length: 0 }),
+        elements: () => ({ unselect() {} }) };
     const elements = {};
     const element = (id, value = '') => elements[id] = {
         value, textContent: '', innerHTML: '', style: {}, disabled: false, checked: false,
@@ -33,7 +51,9 @@ function browserHarness({ persistedAutoDeploy = true, operation = null } = {}) {
     for (const id of ['addLinkModal', 'selectPortal', 'selectBridge', 'linkModalTitle',
         'linkModalSubmit', 'linkAutoDeployLabel', 'linkIdInput', 'geoRoutingEnabled', 'geoRoutingFields',
         'geoRoutingDomains', 'geoRoutingGeoip', 'realitySection', 'tunnelDomainGroup',
-        'modeHint', 'modeSwitcher']) element(id);
+        'modeHint', 'modeSwitcher', 'nodeInfoTitleText', 'nodeInfoBody', 'nodeInfoModal']) element(id);
+    elements.nodeInfoBody.querySelector = () => null;
+    elements.nodeInfoBody.appendChild = () => {};
     form.linkId = elements.linkIdInput;
     const document = {
         readyState: 'loading', addEventListener() {},
@@ -48,34 +68,47 @@ function browserHarness({ persistedAutoDeploy = true, operation = null } = {}) {
     const fetch = async (url, options) => {
         requests.push({ url, method: options?.method || 'GET', body: options?.body && JSON.parse(options.body) });
         if (url === '/api/nodes') return json([{ _id: 'portal', name: 'Portal', ip: '1.2.3.4' }]);
-        if (url === '/api/cascade/links' && !options) return json(snapshot());
+        if (url === '/api/cascade/links' && !options) return json(snapshot({ links }));
         if (url === '/api/cascade/links/' + LINK_ID && !options) return json({
             name: 'Existing link', portalNode: 'portal', bridgeNode: 'bridge', autoDeploy: persistedAutoDeploy,
         });
+        if (url === '/api/cascade/topology/deploy' && deployResponse) return {
+            ok: false, status: deployResponse.status, async json() { return deployResponse.body; },
+        };
         if (url === '/api/cascade/topology/deploy') return json({
             operationId: OP_ID, status: 'queued', kind: 'link.apply', topologyRevision: 7,
         });
         if (url === '/api/cascade/topology/operations/' + OP_ID) return json({
             operationId: OP_ID, status: 'succeeded', kind: 'link.apply', topologyRevision: 7,
         });
-        if (options?.method === 'PUT' || options?.method === 'POST') return json(snapshot(operation
-            ? { autoDeployOperation: operation } : {}));
+        if (options?.method === 'PUT' || options?.method === 'POST') return json(snapshot({
+            ...(operation ? { autoDeployOperation: operation } : {}),
+            ...(autoDeployError ? { autoDeployError, autoDeployStatus: 'blocked' } : {}),
+        }));
         throw Error('Unexpected request: ' + url);
     };
     const window = { _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
-        deployAfterEdit: 'Deploy this link after saving', autoDeploy: 'Auto Deploy', createLink: 'Create' },
+        deployAfterEdit: 'Deploy this link after saving', autoDeploy: 'Auto Deploy', createLink: 'Create',
+        syncChain: 'Sync Chain', syncingChain: 'Syncing entire chain...',
+        confirmDeployChain: 'Deploy entire chain? This will sync all connected nodes in the correct order.' },
     showToast: (...args) => toasts.push(args) };
     // Expose the real browser handlers while skipping graph bootstrapping; all
     // form reads, fetch payloads, response handling and timers remain real.
     const instrumented = source.replace('    // ==================== START ====================',
-        '    loadTopology = async function () {}; refreshStatuses = async function () {}; window.__ui = { openAddLinkModal, openEditLinkModal, onAddLinkSubmit, updateLinkSubmitIntent, deployTopology };\n    // ==================== START ====================');
+        '    cy = window.__graph; applyLinkSnapshot(window.__snapshot); loadTopology = window.__reload; refreshStatuses = async function () {}; window.__ui = { openAddLinkModal, openEditLinkModal, onAddLinkSubmit, updateLinkSubmitIntent, deployTopology, onEdgeTap };\n    // ==================== START ====================');
     assert.notEqual(instrumented, source, 'browser probe insertion must find the boot boundary');
+    window.__graph = graph;
+    window.__snapshot = snapshot({ links });
+    window.__reload = async () => { reloads += 1; };
     vm.runInNewContext(instrumented, {
         window, document, fetch, cytoscape: () => {},
+        confirm: message => { confirmations.push(message); return confirmResult; },
         setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
         clearTimeout: () => {}, console,
     });
-    return { ui: window.__ui, form, elements, requests, toasts, timers };
+    return { ui: window.__ui, window, form, elements, requests, toasts, timers, confirmations,
+        get reloads() { return reloads; },
+        renderEdge: (index = 0) => window.__ui.onEdgeTap({ target: edges[index] }) };
 }
 
 async function save(harness) {
@@ -149,10 +182,126 @@ test('switching from edit to create clears edit intent while retaining create op
     assert.equal(h.elements.linkModalSubmit.textContent, 'Create');
 });
 
+test('unconfirmed domain anchor directs the user to separate Deploy without any mutation', async () => {
+    for (const status of ['pending', 'offline', 'error', 'syncing', undefined]) {
+        const h = browserHarness({ links: [{ _id: LINK_ID, status, active: true }] });
+        h.renderEdge();
+        assert.match(h.elements.nodeInfoBody.innerHTML, /сначала выполните отдельный Deploy/);
+        await h.window._cascadeDeployChain(LINK_ID);
+        assert.equal(h.requests.length, 0, `must not submit ${status} anchor`);
+        assert.equal(h.confirmations.length, 0);
+        assert.equal(h.timers.length, 0);
+        assert(h.toasts.some(([message, type]) => type === 'error'
+            && /сначала выполните отдельный Deploy/.test(message)));
+    }
+});
+
+test('typed 409 busy response offers a manual retry after the current operation, never replays', async () => {
+    for (const code of ['TOPOLOGY_DEPLOY_BUSY', 'TOPOLOGY_OPERATION_BUSY', 'TOPOLOGY_DEPLOYMENT_BUSY', 'OPERATION_IN_PROGRESS']) {
+        const h = browserHarness({ links: [{ _id: LINK_ID, status: 'deployed', active: true }],
+            deployResponse: { status: 409, body: { error: { code, message: 'secret=do-not-display' } } } });
+        await h.window._cascadeDeployChain(LINK_ID);
+        assert.equal(h.requests.filter(r => r.url === '/api/cascade/topology/deploy').length, 1);
+        assert(h.reloads > 0, 'conflict must refresh the snapshot');
+        assert.equal(h.timers.length, 0, 'busy is not an accepted operation and must not schedule retry');
+        assert(h.toasts.some(([message, type]) => type === 'error' && message.includes(code)
+            && /дождитесь завершения/i.test(message) && /повторите вручную/i.test(message)));
+        assert(!h.toasts.some(([message]) => message.includes('do-not-display')));
+    }
+});
+
+test('blocked auto-deploy surfaces typed busy guidance after saving without retrying', async () => {
+    for (const mode of ['create', 'edit']) {
+        const h = browserHarness({ autoDeployError: { code: 'TOPOLOGY_DEPLOY_BUSY',
+            message: 'secret=do-not-display', retryable: true } });
+        if (mode === 'edit') await h.ui.openEditLinkModal(LINK_ID);
+        else await h.ui.openAddLinkModal();
+        h.form.autoDeploy.checked = true;
+        await save(h);
+        assert.equal(h.requests.filter(r => ['PUT', 'POST'].includes(r.method)).length, 1);
+        assert(!h.requests.some(r => r.url === '/api/cascade/topology/deploy'));
+        assert.equal(h.timers.length, 0, 'retryable hint must not schedule an automatic deploy');
+        assert(h.toasts.some(([message, type]) => type === 'error' && message.includes('TOPOLOGY_DEPLOY_BUSY')
+            && /дождитесь завершения/i.test(message) && /повторите вручную/i.test(message)));
+        assert(!h.toasts.some(([message]) => message.includes('do-not-display')));
+    }
+});
+
+test('domain Sync explains confirmed-only scope despite legacy chain translations', async () => {
+    const h = browserHarness({ links: [
+        { _id: LINK_ID, status: 'deployed', active: true },
+        { _id: '507f1f77bcf86cd799439033', status: 'pending', active: true },
+    ] });
+    h.renderEdge();
+    const html = h.elements.nodeInfoBody.innerHTML;
+    assert.match(html, /Sync применённого домена/);
+    assert.match(html, /Только подтверждённые применённые связи/);
+    assert.match(html, /[Оо]жидающие связи не включаются/);
+    assert.doesNotMatch(html, /Sync Chain/);
+    await h.window._cascadeDeployChain(LINK_ID);
+    assert.equal(h.confirmations.length, 1);
+    assert.match(h.confirmations[0], /подтверждённые применённые связи/);
+    assert.match(h.confirmations[0], /[Оо]жидающие связи не включаются/);
+    assert.doesNotMatch(h.confirmations[0], /entire chain|all connected/);
+    const deploys = h.requests.filter(r => r.url === '/api/cascade/topology/deploy');
+    assert.equal(deploys.length, 1);
+    assert.deepEqual(deploys[0].body, { expectedTopologyRevision: 7, domainLinkId: LINK_ID });
+    assert.equal(h.timers.length, 1, 'accepted scoped operation still starts identity-bound polling');
+});
+
+test('all API-confirmed anchor states remain eligible for scoped Sync', async () => {
+    for (const status of ['deployed', 'online', 'staged']) {
+        const h = browserHarness({ links: [{ _id: LINK_ID, status, active: true }] });
+        await h.window._cascadeDeployChain(LINK_ID);
+        assert.equal(h.requests.length, 1);
+        assert.deepEqual(h.requests[0].body, { expectedTopologyRevision: 7, domainLinkId: LINK_ID });
+    }
+});
+
+test('missing, disabled or newly unconfirmed anchors cannot submit domain Sync', async () => {
+    for (const links of [[], [{ _id: LINK_ID, status: 'deployed', active: false }]]) {
+        const h = browserHarness({ links });
+        await h.window._cascadeDeployChain(LINK_ID);
+        assert.equal(h.requests.length, 0);
+        assert.equal(h.confirmations.length, 0);
+        assert(h.toasts.some(([, type]) => type === 'error'));
+    }
+    const links = [{ _id: LINK_ID, status: 'deployed', active: true }];
+    const h = browserHarness({ links });
+    h.renderEdge();
+    links[0].status = 'pending';
+    await h.window._cascadeDeployChain(LINK_ID);
+    assert.equal(h.requests.length, 0, 'click must check the latest snapshot, not the drawn edge color');
+});
+
+test('cancelled domain Sync does not mutate while Full Sync requires its own explicit confirmation', async () => {
+    const h = browserHarness({ links: [{ _id: LINK_ID, status: 'deployed', active: true }], confirmResult: false });
+    await h.window._cascadeDeployChain(LINK_ID);
+    await h.window._cascadeDeployFull();
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.confirmations.length, 2);
+    assert.match(h.confirmations[1], /всю топологию/);
+    const full = browserHarness();
+    await full.window._cascadeDeployFull();
+    assert.deepEqual(full.requests[0].body, { expectedTopologyRevision: 7 });
+    assert.equal(full.confirmations.length, 1);
+});
+
+test('server-side unconfirmed rejection stays actionable without expanding scope', async () => {
+    const h = browserHarness({ links: [{ _id: LINK_ID, status: 'deployed', active: true }],
+        deployResponse: { status: 422, body: { error: { code: 'INVALID_TOPOLOGY_DEPLOYMENT' },
+            errors: [{ code: 'SCOPE_LINK_UNCONFIRMED' }] } } });
+    await h.window._cascadeDeployChain(LINK_ID);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].body.domainLinkId, LINK_ID);
+    assert.equal(h.timers.length, 0);
+    assert(h.toasts.some(([message]) => /сначала выполните отдельный Deploy/.test(message)));
+});
+
 test('dedicated link deploy still sends the linkId, never unscoped', async () => {
-    const h = browserHarness();
-    await h.ui.openAddLinkModal();
-    await h.ui.deployTopology(LINK_ID);
+    const h = browserHarness({ links: [{ _id: LINK_ID, status: 'pending', active: true }] });
+    await h.window._cascadeDeploy(LINK_ID);
+    assert.equal(h.confirmations.length, 1);
     const deploy = h.requests.find(r => r.url === '/api/cascade/topology/deploy');
     assert.equal(deploy.method, 'POST');
     assert.equal(deploy.body.linkId, LINK_ID);

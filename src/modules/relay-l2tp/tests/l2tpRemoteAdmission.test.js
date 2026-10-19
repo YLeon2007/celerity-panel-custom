@@ -48,6 +48,10 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
     };
     const admission = {
         db: topology.db,
+        findOne(filter) {
+            const record = [...records.values()].find(candidate => matchesAdmission(candidate, filter));
+            return { session() { return this; }, async lean() { return record ?? null; } };
+        },
         async create(documents, options) {
             assert.strictEqual(options.session, session);
             for (const document of documents) {
@@ -102,6 +106,16 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
     const desired = { desiredState: 'installed', clientCidr: '10.0.0.0/24', localAddress: '10.0.0.1',
         poolStart: '10.0.0.2', poolEnd: '10.0.0.254', dnsServers: ['1.1.1.1'],
         tproxyPort: 1000, fwmark: 3, routeTable: 4 };
+    const lockService = {
+        async acquire(input) {
+            calls.push(['lock-acquire', input]);
+            return { ok: true, lock: { node: input.node, owner: input.owner, operationId: input.operationId } };
+        },
+        async releaseVerified(lock) {
+            calls.push(['lock-release', lock]);
+            return { ok: true };
+        },
+    };
     const service = new L2tpService({
         nodeRepository: { findById: async () => node },
         stateRepository: {
@@ -109,7 +123,7 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
             findRouteGroupById: async () => ({ id: 'group' }),
             getTopologyRevision: async () => 2,
             getRelayGroupPlan: async () => ({}),
-        }, preflightRunner: runner, remoteAdmissionRepository: repository,
+        }, preflightRunner: runner, remoteAdmissionRepository: repository, lockService,
     });
     const run = () => service.preflight('relay-1', { routeGroupId: 'group', expectedTopologyRevision: 2 });
     return { run, calls, state, records, repository };

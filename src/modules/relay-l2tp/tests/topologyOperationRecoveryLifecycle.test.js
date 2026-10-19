@@ -490,8 +490,9 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
         _id: 'proof-op', status: 'succeeded', topologyRevision: 7,
         clientReadiness: 'unverified', clientProofAttempts: 0,
         clientProofLeaseUntil: null, clientProofRetryAfter: null,
-        nodes: [], linkIds: [],
+        nodes: [{ node: '0123456789abcdef01234567', role: 'portal', state: 'committed' }],
     };
+    let singletonChecks = 0;
     let releaseClaim;
     let claimStarted;
     const claiming = new Promise(resolve => { claimStarted = resolve; });
@@ -517,7 +518,7 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
         },
     };
     const models = {
-        TopologyOperation, CascadeTopologyState: { findById() { throw Error('no positive proof'); } },
+        TopologyOperation, CascadeTopologyState: { findById(key) { assert.equal(key, 'singleton'); singletonChecks += 1; throw Error('no positive proof'); } },
         RelayL2tpState: { find() { throw Error('no live graph for invalid operation'); } },
         CascadeRouteGroup: { find() { throw Error('no live graph for invalid operation'); } },
         L2tpOperation: {}, NodeOperationLock: {},
@@ -558,6 +559,7 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
     assert.equal(updates[0].update.$set.clientProofReason, 'probe_failed');
     assert.equal(operation.clientReadiness, 'unverified');
     assert.equal(operation.clientProofAttempts, 1);
+    assert.equal(singletonChecks, 1, 'host must wire the full-Sync singleton revision fence into the proof executor');
 });
 
 test('non-TEST host with a probe user cannot construct or run client proof', async () => {

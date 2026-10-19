@@ -126,6 +126,31 @@ test('staged relay without installed PPP is skipped, never claimed node-verified
     assert.deepEqual(calls, []);
 });
 
+test('staged fan-in with two portals and one absent terminal relay remains blocked without PPP', async () => {
+    const { gate, calls } = fixture({
+        RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () =>
+            ({ status: 'not_installed', desiredState: 'not_installed', secretRevision: 59 }) }) }) },
+        L2tpUser: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
+        L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
+    });
+    const nodes = [
+        { role: 'portal', node: 'node-p1', nodeRef: 'portal-1' },
+        { role: 'portal', node: 'node-p2', nodeRef: 'portal-2' },
+        { role: 'relay', node: 'node-r', nodeRef: 'relay-1' },
+    ];
+    assert.deepEqual(await gate.verifyPlan({ staged: true, nodes }),
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
+    assert.deepEqual(calls, []);
+    for (const bad of [
+        [nodes[0], { ...nodes[1], nodeRef: 'portal-3' }, nodes[2]],
+        [nodes[0], { ...nodes[1], nodeRef: 'portal-1' }, nodes[2]],
+        [nodes[0], { ...nodes[1], nodeRef: 'portal' }, nodes[2]],
+    ]) {
+        assert.deepEqual(await gate.verifyPlan({ staged: true, nodes: bad }),
+            { ok: false, verifiedRelayCount: 0, reason: 'PPP_UNKNOWN' });
+    }
+});
+
 const stagedTwoRelayPlan = { staged: true, nodes: [
     { role: 'relay', node: 'node-t', nodeRef: 'relay-2', checks: [] },
     { role: 'portal', node: 'node-p', nodeRef: 'portal' },

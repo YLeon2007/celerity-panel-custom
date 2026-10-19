@@ -42,6 +42,7 @@ class L2tpService {
         operationMaterializer,
         preflightRunner,
         remoteAdmissionRepository,
+        lockService,
         enableInstallAdmission = false,
         clock,
     }) {
@@ -52,6 +53,7 @@ class L2tpService {
         this.operationMaterializer = operationMaterializer;
         this.preflightRunner = preflightRunner;
         this.remoteAdmissionRepository = remoteAdmissionRepository;
+        this.lockService = lockService;
         this.enableInstallAdmission = enableInstallAdmission === true;
         this.clock = clock;
     }
@@ -84,49 +86,87 @@ class L2tpService {
     }
 
     async preflight(nodeId, input) {
-        // Standalone preflight has separate admission. Install's test-only
-        // preflight acquires its own counted admission; the active host keeps
-        // install disabled until admission-aware worker claims are available.
+        // Standalone preflight has its own counted admission and exact node lock;
+        // no remote work is allowed without both fences.
         const context = await this._loadInstallContext(nodeId, input);
         const admissions = this.remoteAdmissionRepository;
         if (!admissions || typeof admissions.acquire !== 'function'
             || typeof admissions.release !== 'function'
-            || typeof admissions.markRecoveryRequired !== 'function') {
+            || typeof admissions.markRecoveryRequired !== 'function'
+            || !this.lockService || typeof this.lockService.acquire !== 'function'
+            || typeof this.lockService.releaseVerified !== 'function') {
             throw new L2tpServiceError('REMOTE_ADMISSION_UNAVAILABLE', 'Remote admission is unavailable');
         }
         const id = await admissions.acquire({ nodeId: entityId(context.node) });
+        const owner = `standalone-preflight:${randomBytes(8).toString('hex')}`;
+        const operationId = `preflight:${entityId(context.node)}:${randomBytes(8).toString('hex')}`;
+        let lock;
         let verifiedComplete = false;
         let result;
         let runnerError;
+        let acquired;
         try {
-            result = await this.preflightRunner({ ...context,
-                onVerifiedRemoteComplete: () => { verifiedComplete = true; },
-            });
-        } catch (error) {
-            runnerError = error;
-        }
-        if (verifiedComplete && !runnerError && result
-            && typeof result === 'object' && typeof result.ok === 'boolean'
-            && result.error?.code !== 'PREFLIGHT_RESPONSE_INVALID') {
+            try {
+                acquired = await this.lockService.acquire({
+                    node: entityId(context.node),
+                    owner,
+                    operationId,
+                    leaseMs: 15 * 60 * 1000,
+                });
+            } catch (error) {
+                await admissions.markRecoveryRequired(id);
+                throw error;
+            }
+            if (!acquired?.ok || !acquired.lock) {
+                try {
+                    await admissions.release(id);
+                } catch (error) {
+                    try { await admissions.markRecoveryRequired(id); } catch { /* preserve fence */ }
+                    throw error;
+                }
+                throw new L2tpServiceError('NODE_OPERATION_LOCK_CONFLICT',
+                    'The relay is busy with another operation');
+            }
+            lock = acquired.lock;
+            try {
+                result = await this.preflightRunner({ ...context,
+                    onVerifiedRemoteComplete: () => { verifiedComplete = true; },
+                });
+            } catch (error) {
+                runnerError = error;
+            }
+            const validResult = result && typeof result === 'object'
+                && typeof result.ok === 'boolean'
+                && result.error?.code !== 'PREFLIGHT_RESPONSE_INVALID';
+            if (!verifiedComplete || runnerError || !validResult) {
+                await admissions.markRecoveryRequired(id);
+                if (runnerError) throw runnerError;
+                return result;
+            }
+            const released = await this.lockService.releaseVerified(lock);
+            if (released?.ok !== true) {
+                await admissions.markRecoveryRequired(id);
+                throw new L2tpServiceError('PREFLIGHT_FENCE_RELEASE_FAILED',
+                    'The preflight completed but its exact node fence could not be released');
+            }
             try {
                 await admissions.release(id);
             } catch (error) {
-                // A failed/ambiguous commit cannot authorize a second release.
-                // The transaction either left the count held or completed once.
-                try { await admissions.markRecoveryRequired(id); } catch { /* already completed or DB down */ }
+                try { await admissions.markRecoveryRequired(id); } catch { /* preserve counted fence */ }
                 throw error;
             }
-        } else {
-            await admissions.markRecoveryRequired(id);
+            return result;
+        } catch (error) {
+            // Any path without a verified remote result intentionally retains the
+            // node lock and counted admission for recovery; never release here.
+            throw error;
         }
-        if (runnerError) throw runnerError;
-        return result;
     }
 
     async install(nodeId, input) {
         const context = await this._loadInstallContext(nodeId, input);
-        // The active host never opts in: its worker cannot yet claim counted
-        // admissions. An unsupported install must fail before remote transport.
+        // TEST execution opt-in and counted admission must be enabled together;
+        // an unsupported install fails before remote transport.
         const admissions = this.remoteAdmissionRepository;
         if (!this.enableInstallAdmission || !admissions
             || typeof admissions.acquireInstall !== 'function'
@@ -207,7 +247,7 @@ class L2tpService {
                 node: entityId(context.node),
                 kind: 'install',
                 status: 'queued',
-                idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}`,
+                idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}:attempt-${operationId}`,
                 progress: 0,
                 attempts: 0,
                 plan: persistedPlan,
@@ -250,6 +290,19 @@ class L2tpService {
                 return { operationId };
             }
             if (error?.code === 11000) {
+                if (error.installQueuePreCommitAbort === true) {
+                    try {
+                        // release() is an exact unlinked-admission CAS in one
+                        // transaction with the singleton count. A queued or
+                        // ambiguously committed handoff cannot match it.
+                        await admissions.release(admissionId);
+                    } catch {
+                        try { await admissions.markRecoveryRequired(admissionId); } catch { /* count stays fenced */ }
+                        throw new L2tpServiceError('REMOTE_ADMISSION_RECOVERY_REQUIRED',
+                            'Install admission could not be safely released',
+                            { nodeId: String(nodeId), operationId, admissionId });
+                    }
+                }
                 throw new L2tpServiceError('INSTALL_OPERATION_CONFLICT',
                     'An install operation already holds the idempotency key',
                     { nodeId: String(nodeId), operationId, admissionId });

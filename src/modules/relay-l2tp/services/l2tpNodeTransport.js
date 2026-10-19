@@ -311,17 +311,20 @@ class L2tpNodeTransport {
         assertArtifactContent(content);
 
         const remotePath = `${REMOTE_OPERATIONS_ROOT}/${operationId}/${artifact.remotePath}`;
-
+        let result;
         try {
-            assertSuccessfulExec(await this.nodeSSH.exec(
+            result = await this.nodeSSH.exec(
                 `${ARTIFACT_RECEIVER_PATH} --operation-id ${operationId} --artifact-name ${path}`,
                 { stdin: content },
-            ));
+            );
+            assertSuccessfulExec(result);
         } catch {
-            throw new L2tpNodeTransportError(
+            const error = new L2tpNodeTransportError(
                 'REMOTE_UPLOAD_FAILED',
                 'Failed to upload an L2TP operation artifact',
             );
+            error.remoteOutcomeUncertain = !Number.isInteger(result?.code) || result.code < 0;
+            throw error;
         }
 
         return { ok: true, path: remotePath };
@@ -353,24 +356,32 @@ class L2tpNodeTransport {
         const command = `test -d ${operationDir} && test -f ${VERIFY_USERS_PATH}`
             + ` && test -x ${VERIFY_USERS_PATH} && ${VERIFY_USERS_PATH} ${operationDir}`;
         let timeoutHandle;
+        let result;
         try {
-            const result = await Promise.race([
+            result = await Promise.race([
                 this.nodeSSH.exec(command, { timeout: COMMAND_EXEC_TIMEOUT_MS.default }),
                 new Promise((_, reject) => {
                     timeoutHandle = setTimeout(() => reject(new Error('Verifier timed out')),
                         COMMAND_EXEC_TIMEOUT_MS.default);
                 }),
             ]);
+        } catch {
+            throw Object.assign(new L2tpNodeTransportError(
+                'REMOTE_COMMAND_FAILED', 'Failed to run an L2TP artifact command',
+            ), { remoteOutcomeUncertain: true });
+        } finally {
+            clearTimeout(timeoutHandle);
+        }
+        try {
             return parseVerifyUsersExecResult(
                 result, expectedCredentialRevision, expectedEnabledUserCount,
             );
         } catch {
-            throw new L2tpNodeTransportError(
-                'REMOTE_COMMAND_FAILED',
-                'Failed to run an L2TP artifact command',
+            const error = new L2tpNodeTransportError(
+                'REMOTE_COMMAND_FAILED', 'Failed to run an L2TP artifact command',
             );
-        } finally {
-            clearTimeout(timeoutHandle);
+            error.remoteOutcomeUncertain = !Number.isInteger(result?.code) || result.code < 0;
+            throw error;
         }
     }
 
@@ -401,14 +412,25 @@ class L2tpNodeTransport {
             );
             if (command !== 'preflight' && command !== 'verify-users') assertSuccessfulExec(result);
         } catch {
-            // Note: no `cause` — stderr may carry sensitive material.
-            throw new L2tpNodeTransportError(
+            // Note: no `cause` — stderr may carry sensitive material. A
+            // rejected SSH call or absent exit status does not prove the
+            // remote runner has stopped.
+            const error = new L2tpNodeTransportError(
                 extractRunnerErrorCode(result) || 'REMOTE_COMMAND_FAILED',
                 'Failed to run an L2TP artifact command',
             );
+            error.remoteOutcomeUncertain = !Number.isInteger(result?.code) || result.code < 0;
+            throw error;
         }
 
-        if (command === 'preflight') return parsePreflightExecResult(result);
+        if (command === 'preflight') {
+            if (!Number.isInteger(result?.code) || result.code < 0) {
+                throw Object.assign(new L2tpNodeTransportError(
+                    'REMOTE_COMMAND_FAILED', 'Failed to run an L2TP artifact command',
+                ), { remoteOutcomeUncertain: true });
+            }
+            return parsePreflightExecResult(result);
+        }
         if (command === 'verify-users') {
             try {
                 return parseVerifyUsersExecResult(
@@ -417,10 +439,12 @@ class L2tpNodeTransport {
                     expectedEnabledUserCount,
                 );
             } catch {
-                throw new L2tpNodeTransportError(
+                const error = new L2tpNodeTransportError(
                     'REMOTE_COMMAND_FAILED',
                     'Failed to run an L2TP artifact command',
                 );
+                error.remoteOutcomeUncertain = !Number.isInteger(result?.code) || result.code < 0;
+                throw error;
             }
         }
         return { ok: true, operationId, command };

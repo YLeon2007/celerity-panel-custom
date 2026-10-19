@@ -8,6 +8,7 @@
 const net = require('net');
 const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
+const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
 const NodeSSH = require('./nodeSSH');
 const cache = require('./cacheService');
@@ -679,6 +680,18 @@ class CascadeService {
         );
 
         if (exitNodes.length > 0) {
+            const settings = await Settings.findById('settings').select('networkMap.internetPosition').lean();
+            const saved = settings?.networkMap?.internetPosition;
+            const positionedExits = exitNodes.map(n => n.mapPosition)
+                .filter(p => Number.isFinite(p?.x) && Number.isFinite(p?.y));
+            // On a fresh page, saved physical positions must not leave the
+            // virtual icon at Cytoscape's origin when it has not been dragged yet.
+            const defaultPosition = positionedExits.length > 0 ? {
+                x: Math.max(...positionedExits.map(p => p.x)) + 160,
+                y: Math.round(positionedExits.reduce((sum, p) => sum + p.y, 0) / positionedExits.length),
+            } : undefined;
+            const internetPosition = Number.isFinite(saved?.x) && Number.isFinite(saved?.y)
+                ? { x: saved.x, y: saved.y } : defaultPosition;
             nodes.push({
                 data: {
                     id: 'internet',
@@ -693,7 +706,7 @@ class CascadeService {
                     country: '',
                     port: null,
                 },
-                position: undefined,
+                position: internetPosition,
             });
 
             for (const exitNode of exitNodes) {
@@ -727,8 +740,10 @@ class CascadeService {
     async savePositions(positions) {
         if (!Array.isArray(positions) || positions.length === 0) return;
 
+        const internet = positions.find(p => p.id === 'internet'
+            && Number.isFinite(p.x) && Number.isFinite(p.y));
         const bulkOps = positions
-            .filter(p => p.id && typeof p.x === 'number' && typeof p.y === 'number')
+            .filter(p => p.id && p.id !== 'internet' && typeof p.x === 'number' && typeof p.y === 'number')
             .map(p => ({
                 updateOne: {
                     filter: { _id: p.id },
@@ -736,10 +751,13 @@ class CascadeService {
                 },
             }));
 
-        if (bulkOps.length > 0) {
-            await HyNode.bulkWrite(bulkOps, { ordered: false });
-            await this._invalidateTopologyCache();
+        if (bulkOps.length > 0) await HyNode.bulkWrite(bulkOps, { ordered: false });
+        if (internet) {
+            await Settings.findByIdAndUpdate('settings', {
+                $set: { 'networkMap.internetPosition': { x: internet.x, y: internet.y } },
+            }, { upsert: true });
         }
+        if (bulkOps.length > 0 || internet) await this._invalidateTopologyCache();
     }
 
     /**

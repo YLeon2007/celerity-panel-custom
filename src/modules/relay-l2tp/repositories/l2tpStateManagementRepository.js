@@ -59,8 +59,15 @@ function pickDefined(source, fields) {
     }, {});
 }
 
+function rejectedFence(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
 class L2tpStateManagementRepository {
-    constructor({ HyNode, RelayL2tpState, CascadeRouteGroup, CascadeTopologyState }) {
+    constructor({ HyNode, RelayL2tpState, CascadeRouteGroup, CascadeTopologyState,
+        L2tpOperation, NodeOperationLock }) {
         if (!HyNode) throw new TypeError('HyNode model is required');
         if (!RelayL2tpState) throw new TypeError('RelayL2tpState model is required');
         if (!CascadeRouteGroup) throw new TypeError('CascadeRouteGroup model is required');
@@ -68,6 +75,8 @@ class L2tpStateManagementRepository {
         this.RelayL2tpState = RelayL2tpState;
         this.CascadeRouteGroup = CascadeRouteGroup;
         this.CascadeTopologyState = CascadeTopologyState;
+        this.L2tpOperation = L2tpOperation;
+        this.NodeOperationLock = NodeOperationLock;
     }
 
     async withStateTransition(write) {
@@ -143,12 +152,38 @@ class L2tpStateManagementRepository {
     async markInstalledAfterVerification({
         node,
         operationId,
+        admissionId,
+        owner,
+        ownerGeneration,
+        lockGeneration,
         credentialRevision,
         topologyRevision,
         activePathKey,
         verifiedAt,
     }) {
-        const state = await this.withStateTransition(session => this.RelayL2tpState.findOneAndUpdate(
+        if (!node || !operationId || !admissionId || !owner || !ownerGeneration || !lockGeneration
+            || !(verifiedAt instanceof Date) || Number.isNaN(verifiedAt.getTime())
+            || this.L2tpOperation?.db !== this.RelayL2tpState.db
+            || this.NodeOperationLock?.db !== this.RelayL2tpState.db) {
+            throw new TypeError('Verified install requires same-connection operation and node fences');
+        }
+        const state = await this.withStateTransition(async session => {
+            const leaseCheckAt = new Date();
+            const active = await this.L2tpOperation.updateOne({
+                _id: operationId, node, kind: 'install', status: 'running', admissionId,
+                leaseOwner: owner, ownerGeneration, leaseUntil: { $gt: leaseCheckAt },
+            }, { $currentDate: { updatedAt: true } }, { session });
+            if (active.matchedCount !== 1) {
+                throw rejectedFence('L2TP_OPERATION_FENCE_REJECTED', 'L2TP operation fence rejected');
+            }
+            const locked = await this.NodeOperationLock.updateOne({
+                node, operationId, owner, generation: lockGeneration,
+                remoteUncertain: true, leaseUntil: { $gt: leaseCheckAt },
+            }, { $currentDate: { updatedAt: true } }, { session });
+            if (locked.matchedCount !== 1) {
+                throw rejectedFence('L2TP_NODE_FENCE_REJECTED', 'L2TP node fence rejected');
+            }
+            return this.RelayL2tpState.findOneAndUpdate(
             {
                 node,
                 desiredState: 'installed',
@@ -172,7 +207,8 @@ class L2tpStateManagementRepository {
             },
         )
             .select(VERIFIED_STATE_SAFE_SELECT)
-            .lean());
+            .lean();
+        });
         return state ? pickDefined(state, VERIFIED_STATE_SAFE_FIELDS) : null;
     }
 }

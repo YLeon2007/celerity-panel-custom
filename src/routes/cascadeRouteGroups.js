@@ -12,6 +12,7 @@ const {
     createTopologyDraftWriteService,
 } = require('../modules/relay-l2tp/services/topologyDraftWriteService');
 const logger = require('../utils/logger');
+const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const { requireScope } = require('../middleware/auth');
 
 const ROUTE_GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
@@ -186,7 +187,12 @@ async function readRouteGroupSnapshot({ RouteGroup, TopologyState, revisions }) 
     };
 }
 
-function sendError(res, error, operation) {
+function sendError(res, error, operation, context = {}) {
+    if (['Create', 'Update', 'Delete'].includes(operation)) {
+        logTopologyTestFailure({ action: `group.${operation.toLowerCase()}`,
+            phase: 'draft.write', revision: context.revision,
+            groupId: context.groupId, error });
+    }
     let code = error?.code;
     let status;
 
@@ -276,7 +282,8 @@ function createCascadeRouteGroupsRouter({
                 revisions,
             }));
         } catch (error) {
-            sendError(res, error, 'Create');
+            sendError(res, error, 'Create', {
+                revision: req.body?.expectedTopologyRevision });
         }
     });
 
@@ -302,7 +309,8 @@ function createCascadeRouteGroupsRouter({
                 revisions,
             }));
         } catch (error) {
-            return sendError(res, error, 'Update');
+            return sendError(res, error, 'Update', {
+                revision: req.body?.expectedTopologyRevision, groupId: req.params.id });
         }
     });
 
@@ -326,7 +334,8 @@ function createCascadeRouteGroupsRouter({
                 revisions,
             }));
         } catch (error) {
-            return sendError(res, error, 'Delete');
+            return sendError(res, error, 'Delete', {
+                revision: req.body?.expectedTopologyRevision, groupId: req.params.id });
         }
     });
 

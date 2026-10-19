@@ -19,6 +19,7 @@ const {
     requirePanelCsrf,
 } = require('./panel/csrf');
 const logger = require('../utils/logger');
+const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
 const { selectLinkApplyBaselineLinkIds } = require('./cascadeLinks');
 
 const DEFAULT_MODELS = Object.freeze({
@@ -43,6 +44,7 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['OPERATION_NOT_FOUND', 404],
     ['STALE_TOPOLOGY_REVISION', 409],
     ['TOPOLOGY_REPLACEMENT_RESERVED', 409],
+    ['TOPOLOGY_DEPLOY_BUSY', 409],
     ['INVALID_TOPOLOGY_DEPLOYMENT', 422],
     ['NODE_DEPLOY_FAILED', 502],
     ['NODE_VERIFICATION_FAILED', 502],
@@ -198,10 +200,15 @@ function publicError(error) {
     for (const field of PUBLIC_ERROR_FIELDS) {
         if (error[field] !== undefined) body[field] = error[field];
     }
+    if (error.code === 'TOPOLOGY_DEPLOY_BUSY') {
+        body.error.message = 'Another topology deployment owns the slot; retry after it finishes';
+        body.error.retryable = true;
+    }
     return body;
 }
 
-function sendError(res, error, routeLogger = logger) {
+function sendError(res, error, routeLogger = logger, context = {}) {
+    if (context.action) logTopologyTestFailure({ ...context, error });
     const status = ERROR_STATUS_BY_CODE.get(error?.code);
     if (status) {
         if (status >= 500) {
@@ -391,7 +398,10 @@ function createCascadeTopologyDeployRouter({
                         : input.domainLinkId ? { kind: 'domain.reconcile' } : {}),
                 });
             } catch (error) {
-                return sendError(res, error, routeLogger);
+                return sendError(res, error, routeLogger, {
+                    action: 'topology.sync', phase: 'deploy.queue',
+                    revision: req.body?.expectedTopologyRevision,
+                    linkId: req.body?.linkId || req.body?.domainLinkId });
             }
         },
     );
@@ -420,7 +430,10 @@ function createCascadeTopologyDeployRouter({
                 return res.status(result.status === 'queued' ? 202 : 200)
                     .json({ ...publicResult(result), kind: 'link.replace' });
             } catch (error) {
-                return sendError(res, error, routeLogger);
+                return sendError(res, error, routeLogger, {
+                    action: 'topology.replace', phase: 'deploy.queue',
+                    revision: req.body?.expectedTopologyRevision,
+                    linkId: req.body?.newLinkId });
             }
         });
 

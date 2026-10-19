@@ -12,6 +12,15 @@ const {
 
 const TEST_SESSION = { id: 'test-session' };
 const TEST_DB = { transaction: async work => work(TEST_SESSION) };
+const TEST_CLAIM = Object.freeze({
+    owner: 'worker-1', ownerGeneration: 'op-generation-1', lockGeneration: 'lock-generation-1',
+});
+function operationFence(db = TEST_DB) {
+    return { db, updateOne: async () => ({ matchedCount: 1 }) };
+}
+function nodeFence(db = TEST_DB) {
+    return { db, updateOne: async () => ({ matchedCount: 1 }) };
+}
 function createTopologyModel(result = { stateTransitionRevision: 0 }) {
     return {
         db: TEST_DB,
@@ -115,9 +124,12 @@ test('reservation arriving after state snapshot aborts the state transaction', a
     const repository = new L2tpStateManagementRepository({
         HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
         RelayL2tpState, CascadeTopologyState,
+        L2tpOperation: operationFence(db), NodeOperationLock: nodeFence(db),
     });
-    await assert.rejects(repository.markInstalledAfterVerification({ node: 'relay-1' }),
-        /topology singleton conflict/);
+    await assert.rejects(repository.markInstalledAfterVerification({
+        node: 'relay-1', operationId: 'operation-17', admissionId: 'admission-1', ...TEST_CLAIM,
+        verifiedAt: new Date(),
+    }), /topology singleton conflict/);
     assert.deepEqual(persisted, { status: 'not_installed' });
 });
 
@@ -154,7 +166,8 @@ test('legacy singleton lacking counter uses absent-field CAS and marks no-match 
         HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
         RelayL2tpState, CascadeTopologyState,
     });
-    assert.equal(await repository.markInstalledAfterVerification({ node: 'relay-1' }), null);
+    await assert.rejects(repository.markInstalledAfterVerification({ node: 'relay-1' }),
+        /operation and node fences/);
     assert.equal(bumps, 0);
     RelayL2tpState.findOneAndUpdate = () => ({ select() { return this; },
         lean: async () => ({ node: 'relay-1' }) });
@@ -309,6 +322,46 @@ test('execution lookup selects only matching state identity, revision, and encry
     ]);
 });
 
+test('verified install rejects a stale operation generation before changing relay state', async () => {
+    let stateWrites = 0;
+    const L2tpOperation = { db: TEST_DB, updateOne: async () => ({ matchedCount: 0 }) };
+    const NodeOperationLock = { db: TEST_DB, updateOne: async () => { throw new Error('lock touched'); } };
+    const RelayL2tpState = {
+        db: TEST_DB,
+        findOneAndUpdate() { stateWrites++; throw new Error('state touched'); },
+    };
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState, CascadeTopologyState: createTopologyModel(),
+        L2tpOperation, NodeOperationLock,
+    });
+    await assert.rejects(repository.markInstalledAfterVerification({
+        node: 'relay-1', operationId: 'operation-17', admissionId: 'admission-1',
+        owner: 'worker-1', ownerGeneration: 'operation-generation-1',
+        lockGeneration: 'node-generation-1', credentialRevision: 7,
+        topologyRevision: 23, activePathKey: 'primary', verifiedAt: new Date(),
+    }), /operation.*fence/i);
+    assert.equal(stateWrites, 0);
+});
+
+test('verified install rejects an expired node-lock generation before changing relay state', async () => {
+    let stateWrites = 0;
+    const repository = new L2tpStateManagementRepository({
+        HyNode: createQueryModel(), CascadeRouteGroup: createQueryModel(),
+        RelayL2tpState: { db: TEST_DB, findOneAndUpdate() { stateWrites++; return null; } },
+        CascadeTopologyState: createTopologyModel(),
+        L2tpOperation: { db: TEST_DB, updateOne: async () => ({ matchedCount: 1 }) },
+        NodeOperationLock: { db: TEST_DB, updateOne: async () => ({ matchedCount: 0 }) },
+    });
+    await assert.rejects(repository.markInstalledAfterVerification({
+        node: 'relay-1', operationId: 'operation-17', admissionId: 'admission-1',
+        owner: 'worker-1', ownerGeneration: 'operation-generation-1',
+        lockGeneration: 'node-generation-1', credentialRevision: 7,
+        topologyRevision: 23, activePathKey: 'primary', verifiedAt: new Date(),
+    }), /node.*fence/i);
+    assert.equal(stateWrites, 0);
+});
+
 test('verified install reconciliation atomically fences current desired state and writes safe fields only', async () => {
     const verifiedAt = new Date('2026-09-22T10:00:00.000Z');
     const storedState = {
@@ -331,11 +384,14 @@ test('verified install reconciliation atomically fences current desired state an
         RelayL2tpState,
         CascadeRouteGroup: createQueryModel(),
         CascadeTopologyState: createTopologyModel(),
+        L2tpOperation: operationFence(), NodeOperationLock: nodeFence(),
     });
 
     const result = await repository.markInstalledAfterVerification({
         node: 'relay-1',
         operationId: 'operation-17',
+        admissionId: 'admission-1',
+        ...TEST_CLAIM,
         credentialRevision: 7,
         topologyRevision: 23,
         activePathKey: 'primary',
@@ -396,11 +452,14 @@ test('verified install reconciliation preserves a rejected atomic fence as null'
         RelayL2tpState,
         CascadeRouteGroup: createQueryModel(),
         CascadeTopologyState: createTopologyModel(),
+        L2tpOperation: operationFence(), NodeOperationLock: nodeFence(),
     });
 
     const result = await repository.markInstalledAfterVerification({
         node: 'relay-1',
         operationId: 'operation-17',
+        admissionId: 'admission-1',
+        ...TEST_CLAIM,
         credentialRevision: 7,
         topologyRevision: 23,
         activePathKey: 'primary',

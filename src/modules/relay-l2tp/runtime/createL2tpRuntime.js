@@ -96,6 +96,7 @@ function createL2tpRuntime(dependencies) {
         operationMaterializer = materializeInstallOperation,
         afterInstallSucceeded,
         enableUnsafeExecutionForTests = false,
+        enableInstallAdmission = false,
         requireAuth,
         requireOnboarding,
         csrf,
@@ -115,6 +116,8 @@ function createL2tpRuntime(dependencies) {
         operationMaterializer,
         preflightRunner,
         remoteAdmissionRepository,
+        lockService,
+        enableInstallAdmission,
         clock,
     });
     const executor = new L2tpRemoteExecutor(
@@ -156,6 +159,7 @@ function createL2tpRuntime(dependencies) {
         'operationMaterializer',
         'preflightRunner',
         'remoteAdmissionRepository',
+        'lockService',
         'clock',
     ]);
     hideInjectedDependencies(worker, [

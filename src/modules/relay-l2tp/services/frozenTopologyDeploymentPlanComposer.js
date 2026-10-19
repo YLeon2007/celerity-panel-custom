@@ -667,9 +667,8 @@ function selectChainShape(snapshot, geoLeafLinkIds) {
  * builders must route its transit to `block` (fail closed), never `direct`.
  *
  * Deliberately stricter than the complete-chain walkers:
- * - exactly ONE portal source (a multi-portal bridge-less graph cannot be
- *   mapped back to node refs by the scoped coordinator, so it is a
- *   structural error rather than an implicit choice);
+ * - one or more portal sources may converge on the same terminal relay;
+ *   separate dead ends remain invalid (no implicit split egress);
  * - no geo-routing leaf links (a geo branch requires a dedicated bridge,
  *   which a bridge-less graph cannot have);
  * - every linked node must lie on the single portal path, and every node
@@ -745,61 +744,85 @@ function orderedStagedChain(snapshot, geoLeafLinkIds) {
         }
     }
 
+    // Every linked node must lie on a portal-rooted path to the SAME terminal
+    // relay. A multi-portal fan-in is staged safely: transit is blocked at
+    // that terminal until a confirmed downstream bridge joins the scope.
     const sources = [...outgoing.keys()]
         .filter(id => !incoming.has(id))
         .sort((left, right) => left.localeCompare(right, 'en'));
-    if (sources.length !== 1 || nodesById.get(sources[0])?.role !== 'portal') {
+    if (sources.length === 0 || sources.some(id => nodesById.get(id)?.role !== 'portal')) {
         throw new FrozenTopologyDeploymentPlanError(
             'NON_LINEAR_TOPOLOGY',
-            'A staged chain requires exactly one portal source reaching every linked node',
+            'A staged chain requires portal sources reaching one terminal relay',
         );
     }
-
-    const orderedNodes = [];
-    const orderedLinks = [];
-    const visited = new Set();
-    let currentId = sources[0];
-    while (currentId) {
-        if (visited.has(currentId)) {
+    const portalPaths = [];
+    let terminalId = null;
+    const coveredNodes = new Set();
+    const coveredLinks = new Set();
+    for (const portalId of sources) {
+        const nodeIds = [portalId];
+        const links = [];
+        const seen = new Set([portalId]);
+        let currentId = portalId;
+        while (outgoing.has(currentId)) {
+            const next = outgoing.get(currentId);
+            links.push(next);
+            coveredLinks.add(next.id);
+            currentId = next.target;
+            if (seen.has(currentId)) {
+                throw new FrozenTopologyDeploymentPlanError(
+                    'NON_LINEAR_TOPOLOGY', 'A staged chain must be acyclic',
+                );
+            }
+            seen.add(currentId);
+            nodeIds.push(currentId);
+        }
+        if (terminalId === null) terminalId = currentId;
+        else if (terminalId !== currentId) {
             throw new FrozenTopologyDeploymentPlanError(
-                'NON_LINEAR_TOPOLOGY',
-                'Topology v1 requires an acyclic linear chain',
+                'MULTIPLE_DEFAULT_EGRESS',
+                'All staged portal paths must end at the same relay',
             );
         }
-        visited.add(currentId);
-        orderedNodes.push({ id: currentId, node: nodesById.get(currentId) });
-        const next = outgoing.get(currentId);
-        if (!next) break;
-        orderedLinks.push(next);
-        currentId = next.target;
+        nodeIds.forEach(id => coveredNodes.add(id));
+        portalPaths.push({ portalId, nodeIds, links });
     }
-
-    // Fail closed on shape drift: every linked node must be covered by the
-    // single portal path, and every hop after the portal must be a relay —
-    // including the terminal dead end (a terminal portal/bridge would either
-    // strand clients or silently become an egress).
-    if (orderedNodes.length !== nodesById.size || orderedLinks.length !== linksById.size) {
+    if (coveredNodes.size !== nodesById.size || coveredLinks.size !== linksById.size
+        || nodesById.get(terminalId)?.role !== 'relay'
+        || portalPaths.some(path => path.nodeIds.slice(1)
+            .some(id => nodesById.get(id)?.role !== 'relay'))) {
         throw new FrozenTopologyDeploymentPlanError(
             'NON_LINEAR_TOPOLOGY',
-            'A staged chain requires every linked node on one portal-rooted path',
+            'A staged chain requires every linked node on portal paths to one terminal relay',
         );
     }
-    if (orderedNodes[0].node.role !== 'portal'
-        || orderedNodes.slice(1).some(entry => entry.node.role !== 'relay')) {
-        throw new FrozenTopologyDeploymentPlanError(
-            'NON_LINEAR_TOPOLOGY',
-            'A staged chain must run Portal to Relay(s); the terminal node must be a relay',
-        );
+    const orderedNodes = [];
+    const orderedLinks = [];
+    const emittedNodes = new Set();
+    const emittedLinks = new Set();
+    for (const portalId of sources) {
+        orderedNodes.push({ id: portalId, node: nodesById.get(portalId) });
+        emittedNodes.add(portalId);
     }
-
+    for (const path of portalPaths) {
+        for (const id of path.nodeIds.slice(1)) {
+            if (id === terminalId || emittedNodes.has(id)) continue;
+            orderedNodes.push({ id, node: nodesById.get(id) });
+            emittedNodes.add(id);
+        }
+        for (const link of path.links) {
+            if (emittedLinks.has(link.id)) continue;
+            orderedLinks.push(link);
+            emittedLinks.add(link.id);
+        }
+    }
+    orderedNodes.push({ id: terminalId, node: nodesById.get(terminalId) });
     return {
         mode: linkModes.size === 1 ? [...linkModes][0] : 'mixed',
         staged: true,
-        portalPaths: [{
-            portalId: sources[0],
-            nodeIds: orderedNodes.map(entry => entry.id),
-            links: orderedLinks,
-        }],
+        ...(sources.length > 1 ? { fanIn: true } : {}),
+        portalPaths,
         orderedNodes,
         orderedLinks,
         geoLeafNodes: [],
