@@ -27,11 +27,15 @@ function immutable(schema) {
         'deleteOne', 'deleteMany', 'findOneAndDelete', 'bulkWrite'], function () { throw failure('IMMUTABLE'); });
 }
 function string(match) { return { type: String, required: true, immutable: true, ...(match ? { match } : {}) }; }
+const endpointSchema = new mongoose.Schema({ ip: string(),
+    port: { type: Number, required: true, immutable: true, min: 1, max: 65535, validate: Number.isSafeInteger },
+    username: string() }, strict);
 const identitySchema = new mongoose.Schema({ machineId: string(/^[a-f0-9]{32}$/),
     sshHostKeySha256: string(/^[a-f0-9]{64}$/) }, strict);
 const common = () => ({
     _id: string(UUID), executionContext: { ...string(), enum: [PROD.hostIdentity] },
     nodeId: string(ID), targetProfile: { ...string(), enum: ['xray-main', 'xray-bridge'] },
+    endpoint: { type: endpointSchema, required: true, immutable: true },
     nodeIdentity: { type: identitySchema, required: true, immutable: true },
     ownerGeneration: string(UUID), predecessorGeneration: string(UUID), bootId: string(UUID),
     proofId: string(UUID), maintenanceId: string(UUID),

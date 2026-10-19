@@ -2,139 +2,186 @@
 
 ## Scope and non-activation
 
-`TopologyExecutionBindingStore` is a server-only implementation of the existing
-executor `readVerified(expected)` seam. It is deliberately **not imported or
-constructed** by `createTopologyOperationRuntime`, host composition, routes, MCP
-or workers. No flag, migration/startup registration, TEST enablement, PROD
-pre-claim bypass, SSH implementation change or deployment is included. Existing
-PROD serving backend and TEST candidate are untouched. Default real executors on
-both canonical hosts still refuse without a reader; the PROD pre-claim
-quiescence refusal and all V2 retained-lock/admission/handback gates remain.
+`TopologyExecutionBindingStore` implements the executor's server-only
+`readVerified(expected)` and `readVerifiedConnection(expected, verifiedBinding)`
+capabilities. It is **not imported or constructed** by runtime/host composition,
+routes, MCP or workers. No production flag, pre-claim bypass, migration, remote
+write, deployment, worker/runner/SSH/pool change or ownership release is included.
+Default executors still refuse without a reader. The PROD worker pre-claim gate
+and all retained-lock/admission/handback gates remain closed: **PROD is NO-GO**.
 
-Only the exact canonical **production** server pair is accepted by this bounded
-store. The constructor requires all five actual models on one connected,
-discovered replica-set connection and a trusted `withVerifiedAuthority`
-function. It rejects `directConnection`: the Mongo driver can rewrite a primary
-read to `primaryPreferred` on that topology. There are no implicit default
-connections, credentials, database names, server identities or authority hooks.
+The constructor requires the exact canonical production context, a trusted
+`withVerifiedAuthority` function, and **six actual models** (`Operation`, `Lock`,
+`Owner`, `Enrollment`, `Binding`, `HyNode`) on one connected discovered MongoDB
+replica set with a primary. `directConnection` is rejected because the driver
+can rewrite primary reads to primaryPreferred. There are no default models,
+connections, identities, credentials, authority adapters or endpoint fallbacks.
 
-## Immutable records and accepted ownership
+## Immutable enrollment and binding
 
-- `TopologyExecutionEnrollment` stores explicit node/profile, physical machine ID
-  and SSH-host-key digest, config-owner generation, nonempty pre-enrolled runner
-  predecessor, runner boot ID and external proof/maintenance IDs. This narrow
-  contract requires a UUID predecessor; **`none` is never inferred or accepted**.
-  Initial/empty-runner enrollment is not implemented.
-- Enrollment is globally unique by node/profile, physical-machine/profile and
-  SSH-host-key/profile. An alias cannot acquire another slot for the same
-  physical profile, including under another server context.
-- `TopologyExecutionBinding` inserts an immutable exact executor record plus the
-  enrollment/physical-owner/boot/proof metadata. It binds the accepted operation
-  ID, canonical host, topology and prior deployed revisions, candidate hash,
-  deterministic backup ID, node/profile, numeric claim attempt and owner, and
-  **the already-acquired node-lock generation**. Server-generated UUID attempt
-  and five distinct command IDs (including `close`) are never accepted from requests.
-  The executor projection now also includes enrolled `bootId` and `maintenanceId`;
-  every ordinary receipt must match that boot, and maintenance cannot switch
-  between enrollment, creation, reads or terminal reconciliation.
-- Unique indexes enforce one binding per operation/node/profile and enrollment,
-  unique attempt IDs, and cross-record/cross-command ID reuse exclusion through
-  a unique multikey `commandTokens` index. There is no update, adopt, reclaim,
-  delete, lock acquisition, lock release or admission-decrement API. Model
-  updates, replacements, query/document deletion, existing-document saves and
-  bulk writes refuse; privileged raw collection access is outside this API's
-  trust boundary, not cryptographically protected database storage.
-- This is intentionally **one-shot**: a consumed enrollment cannot authorize a
-  successor or another attempt. Failed/unknown work retains its rows. Recovery,
-  successor enrollment and physical-profile ownership handback require a
-  separately reviewed protocol, not deletion/reinsertion of evidence.
+Enrollment accepts exactly:
 
-`createBinding` and `readVerified` use the actual accepted `TopologyOperation`
-schema and the existing production claim-key grammar. Both require an active,
-unexpired exact attempt/owner, held topology admission, exact frozen revisions,
-a unique matching node/profile, valid canonical candidate bytes and backup
-identity. They transactionally CAS that operation, the exact current unexpired
-`NodeOperationLock` (including explicit `remoteUncertain: true`), and the paired
-`TopologyConfigOwner` in `topology` ownership with matching physical identity,
-owner generation and adoption generation. They never replace a generation or
-adopt an expired/reacquired lock. Missing, legacy, foreign, cloned, stale or
-malformed rows fail before node lookup/SSH. Optional `executionBindingCheck`
-nonce fields on the three existing schemas are transaction fences, **not**
-remote quiescence evidence and have no read-time defaults.
+```js
+{
+    nodeId, targetProfile,
+    endpoint: { ip, port, username },
+    nodeIdentity: { machineId, sshHostKeySha256 },
+    ownerGeneration, predecessorGeneration, bootId,
+}
+```
 
-## External authority is mandatory, not implemented here
+The IP must be an IP literal, port an integer in 1..65535, username a bounded
+Linux-style account name, machine ID 32 lowercase hex characters, and host-key
+digest 64 lowercase hex characters. Digests identify the **raw SSH public-key
+wire blob**, not PEM or base64 text. No coercion or normalization occurs; missing,
+extra, array-valued, changed and malformed authority is refused. Predecessor and
+boot must be explicit UUIDs; neither an empty runner nor `none` is adopted.
 
-`withVerifiedAuthority(challenge, awaitedCallback)` is constructor-injected from
-trusted server composition only. Enrollment, creation **and every read** require
-its fresh exact challenge proof of held maintenance, all writers drained,
-bootstrap exclusion, old backend instance/PID/start identity, old process tree
-stopped and future dispatch disabled, physical profile ownership, and exact
-pre-enrolled predecessor + boot identity. Returning a boolean/row, supplying a
-request proof, calling back later, or starting but not awaiting the callback
-cannot grant authority. The challenge and accepted values are copied/frozen;
-a callback cannot be reused outside its held scope.
+These caller-supplied values are a **proposal**, not trusted evidence. The store
+requires an independently supplied external server attestation matching them
+before its transactional writes. A matching mutable HyNode selection cannot
+substitute for that attestation.
 
-The adapter must actually attest the selected endpoint's machine/host-key and
-all aliases; metadata equality is not a live physical attestation. Its exclusion
-must be externally sustained across the **whole remote lifecycle**, including
-lookup, bootstrap, command dispatch, descendants, terminal reconciliation and
-handback—not merely the individual Mongo callback. This slice only checks the
-held validation/commit/readback scope and cannot manufacture that larger fence.
-The existing resolver/SSH layer does not independently attest/pin that physical
-identity for this contract. A callback returning the documented shape without
-real verification is untrusted and must never be installed in production.
+Both immutable records snapshot the exact endpoint, physical identity, owner
+generation, predecessor, boot and proof/maintenance metadata. The binding also
+stores the exact accepted operation, canonical host, revisions, candidate,
+deterministic backup, claim owner/attempt and **already-acquired lock generation**.
+Attempt IDs and five distinct command IDs, including close, are server-generated.
+The public executor binding projection deliberately stays unchanged; endpoint
+and physical trust are returned only through the separate connection capability.
 
-No such real authority or remote-spanning old-writer/endpoint fence is available
-in this slice. Positive tests explicitly simulate it; **PROD is still NO-GO**.
+Unique enrollment indexes enforce node/profile and physical-machine/profile /
+SSH-key/profile isolation, plus **global** machine-ID, SSH-host-key and IP/SSH-port
+listener isolation. A different profile or username cannot acquire an alias slot.
+This is intentionally conservative: shared/cloned machine IDs, reused host keys
+or multi-profile physical enrollment must be resolved by separately reviewed
+provisioning, not an exception or index removal. Unique binding indexes enforce
+operation/node/profile, enrollment and attempt uniqueness and cross-record /
+cross-command token exclusion.
 
-## Transaction and uncertainty behavior
+The API is one-shot and insert-only. Model updates, replacements, query/document
+deletion, existing-document saves and bulk writes refuse. Raw administrative
+collection access is outside its trust boundary, not cryptographically protected
+storage. There is no adopt, reclaim, successor, lock-release, admission-decrement
+or handback API, and failed/unknown work retains records and ownership.
 
-Enrollment inserts and binding inserts/validations use one snapshot transaction
-on the shared connection, primary routing and majority commit. The operation,
-node lock and config-owner CAS nonce is written in that same transaction;
-transaction conflicts/misses abort the entire insertion. There is no retry of
-the transaction or regeneration of IDs after an ambiguous commit.
+## Explicit external authority — required, not implemented
 
-Commit uses a 5-second driver timeout and server commit budget. A reported
-`UnknownTransactionCommitResult` permits only one exact primary-majority
-readback pass, outside the transaction, with a shared 5-second deadline. It
-confirms the immutable record plus the exact transactional owner/claim/lock CAS
-nonces and fresh leases. Normal commits require the same confirmation. Absence,
-read failure, timeout, changed record or replaced fence cannot acknowledge;
-there is no local-read fallback or automatic deletion/release. Individual
-transaction I/O and aborts also carry bounded driver/server options.
+`withVerifiedAuthority(challenge, awaitedCallback)` is constructor-injected by
+trusted server code only. Every enrollment, creation and read requires a fresh
+exact challenge and existing `external-execution-maintenance-v1` proof: held
+maintenance, writers drained, bootstrap writers excluded, old backend instance /
+PID / process-start identity with process tree stopped and dispatch disabled,
+physical topology ownership, and exact predecessor + boot. It additionally must
+supply **exactly** this connection attestation:
 
-A successful read proves this local durable acceptance/validation boundary,
-not future lease ownership or remote completion. The executor still rechecks
-before bootstrap/dispatch and each lifecycle command; node-side enforcement,
-external writer exclusion and final handback remain separate requirements.
+```js
+connectionAttestation: {
+    authority: 'server-physical-ssh-endpoint-v1',
+    endpoint: { ip, port, username },
+    physicalIdentity: { machineId, sshHostKeySha256 },
+    maintenanceId, // identical to the enclosing proof and original enrollment
+    aliases: 'excluded',
+    endpointReassignment: 'excluded',
+    hostKeyDigest: 'raw-ssh-public-key-sha256',
+}
+```
 
-## Local evidence and remaining prerequisites
+The adapter must independently establish these facts. Copying the challenge,
+reading user/database endpoint fields, returning the shape, or freezing an object
+is **not** physical attestation. The store cannot prove physical machine-ID /
+host-key correspondence, old-PID quiescence or endpoint reassignment exclusion
+itself. No real adapter is delivered; all positive local tests explicitly
+simulate this authority with separately fixed fixture inventory.
 
-`topologyExecutionBindingStore.test.js` starts an actual loopback-only MongoDB
-replica set under `TMPDIR`, uses a fresh guarded random scratch database and
-actual operation/lock repositories plus all real schemas, then drops only that
-DB, verifies absence, terminates its child Mongo and removes scratch files.
-There are no skips and no network/SSH transports. The real resolver, executor,
-transport factory and V2 transport are assembled with a scratch node model,
-local bootstrap and local command receipts. RED→GREEN covered the missing
-contract, missing old-backend instance proof, acceptance of a cloned persisted
-binding at the assembled boundary, and unsafe direct-connection acceptance.
+The authority must hold the awaited callback through commit/readback and sustain
+old-writer/bootstrap/alias/endpoint-reassignment exclusion externally across the
+**entire remote lifecycle**, including gaps between store calls. Ordinary Mongo
+CAS/readback does not exclude a writer immediately after its last read. A DB
+nonce, lease or earlier fresh read cannot replace that execution-spanning fence.
+Booleans, late callbacks and callbacks whose work is not awaited fail closed.
+Challenge/accepted values are copied and deeply frozen; original maintenance
+identity cannot switch between enrollment, binding, reads or terminal scope.
 
-Tests cover concurrent insert winners, transactional claim/lock CAS races,
-physical alias uniqueness, stale/cross-context/forged/missing proof rejection,
-unchanged retained fences, primary-majority command monitoring, and **injected**
-post-commit unknown/abort/readback failures. GREEN verification: **77 passed** in
-this direct+assembled scratch suite, repeated successfully, and **466 passed**
-across the relevant operation/lock/model/claim, executor/worker/runtime/recovery,
-runner/transport, panel-host and config-transfer suites. Both runs reported zero
-failed, cancelled or skipped tests and used no force-exit option. The broader
-suite used synthetic non-production config and an unusable loopback fallback
-Mongo URI; only explicitly started scratch connections were used for DB tests.
-This does not simulate a real multi-member quorum outage or prove production
-Mongo failover/network behavior.
+## Majority CAS, readback and connection reader
 
-Run explicitly (requires local binary; missing opt-in is an error, not a skip):
+Enrollment transactionally CASes the paired adopted config owner and current
+selected HyNode before inserting its immutable snapshot. Binding creation and
+all reads additionally CAS the exact active operation and unexpired acquired
+node lock (`remoteUncertain: true`). Accepted candidate bytes, backup identity,
+node/profile, revisions, claim attempt/owner, owner adoption/restoration evidence
+and physical owner generation must all match.
+
+HyNode is a **selection to compare**, not a source of trust. Its exact ID,
+active/type/profile role, IP, SSH port and username must agree with the enrollment.
+BSON aggregation `$type` and literal equality enforce scalar/object types; query
+equality that merely matches an array element cannot authorize a connection.
+The optional `executionBindingCheck` fields on operation/lock/owner/HyNode are
+transactional CAS nonces with no defaults, not physical or quiescence authority.
+The HyNode marker is excluded from ordinary selects; its confirmation projects
+only ID, eligibility and endpoint fields, never SSH credentials.
+
+One snapshot transaction uses primary routing and majority commit. Transaction
+conflicts/misses roll back the losing nonces and insert; there is no transaction
+retry or regenerated authority ID. Normal commits and unknown commit results
+require one bounded outside-transaction primary-majority confirmation pass per
+transaction. Commit, inserts, transaction I/O and aborts carry five-second
+budgets. Exact immutable row equality, each CAS nonce, ownership and fresh leases
+must confirm. The earliest observed claim/lock expiry caps remaining reads;
+freshness is rechecked after final read delivery, session cleanup and authority
+return. Absence, uncertainty, failed confirmation and elapsed leases refuse
+without deleting durable rows or releasing ownership.
+
+`readVerifiedConnection` revalidates the currently accepted binding and requires
+the supplied deeply frozen exact executor record to equal it. It returns exactly,
+with every level frozen:
+
+```js
+{
+    binding: verifiedBinding,
+    connection: {
+        expectedEndpoint: { ip, port, username },
+        expectedHostKeySha256: sshHostKeySha256,
+    },
+}
+```
+
+Connection values come only from immutable enrollment validated under external
+authority, never from the mutable selected row. The real executor/resolver passes
+that pin separately to its SSH adapter and refuses later endpoint/key changes.
+The existing pin transport validates the raw host key before authentication;
+that pin does not independently attest machine ID or quiescence.
+
+During `withVerifiedBinding`, private async-local context reuses the **same held
+terminal authority** for connection rechecks rather than reacquiring a potentially
+non-reentrant adapter. Each recheck still performs exact transactional/majority
+ownership and endpoint verification. Escaped async contexts cannot use this
+capability once the original scope closes. Terminal proof remains data only;
+worker release and classic handback remain unauthorized.
+
+## Local verification and remaining blockers
+
+`topologyExecutionBindingStore.test.js` starts a loopback-only single-member
+replica set under `TMPDIR`, creates a guarded random scratch database, uses all
+six real schemas and the real operation/lock repositories, and verifies cleanup.
+It assembles the **actual store without a connection-authority wrapper**, executor,
+resolver and V2 transport with simulated external physical authority and local-only
+SSH/bootstrap/runner adapters. No production DB, remote SSH or deployment occurs.
+
+RED→GREEN demonstrated missing endpoint enrollment, missing real-store reader,
+unsafe nested terminal authority, cross-profile physical alias acceptance,
+array-valued hidden proof acceptance and absent endpoint-reassignment exclusion.
+Tests cover real Mongo CAS/reassignment races, concurrent physical alias winners,
+immutable/malformed/changed evidence, exact primary-majority verification, unknown
+commit and real failCommand insert stalls, lease expiry/cleanup, retained ownership,
+and real fake-root terminal runner status. This is local orchestration evidence,
+not live physical attestation, multi-member quorum/failover proof or production
+connectivity. Missing local Mongo opt-in is an error; no tests are skipped.
+
+Final direct run: **290 passed**. Broader assembled/claim/worker/runtime/lock /
+recovery/runner/panel-host/real-loopback-host-key regression run: **682 passed**,
+including the direct suite. Both runs reported zero failed, skipped or cancelled
+tests and used no force-exit option. Syntax checks and `git diff --check` pass.
 
 ```sh
 NODE_PATH=/home/leon/c3-int-verify/node_modules \
@@ -143,19 +190,16 @@ node --test --test-concurrency=1 \
   src/modules/relay-l2tp/tests/topologyExecutionBindingStore.test.js
 ```
 
-Before any installation/activation, separately deliver and verify:
+Before installation/activation, separately deliver and independently verify:
 
-1. Trustworthy externally sustained old-backend/classic/bootstrap/alias writer
-   exclusion and endpoint physical attestation; preserve the currently serving
-   backend until a separately authorized, recoverable transfer is proven.
-2. Reviewed provisioning and enrollment under that authority, with real owner
-   adoption and runner predecessor/boot readback. This code does not migrate or
-   bless existing production rows, and cannot enroll an empty runner.
-3. An execution-spanning authority/resolver integration, supervised lifecycle,
-   successor/recovery protocol and independent review before any runtime reader
-   or worker opt-in; this file is not a rollout instruction.
-4. The [dormant terminal proof](topology-v2-terminal-proof.md) now binds persisted
-   close IDs and returns fresh close/status proof under one held authority scope.
-   Durable terminal-result/restart reconciliation, safe user/PPP/ingress
-   integration, atomic physical ownership handback and exact lock/admission
-   release are still absent. Existing V2 refusal/retention gates stay closed.
+1. Real independently attested physical machine / raw-host-key / exact endpoint
+   inventory and externally sustained old-backend, classic, bootstrap, alias and
+   endpoint-reassignment exclusion. The current serving backend is untouched.
+2. Recoverable provisioning: index conflict resolution, real owner adoption and
+   restoration evidence, explicit predecessor/boot readback, and reviewed initial
+   enrollment. No migration or existing-row blessing is delivered here.
+3. Execution-spanning authority wiring, supervised lifecycle, successor/restart
+   recovery and independent review before any runtime reader or worker opt-in.
+4. Durable terminal-result reconciliation, safe user/PPP/ingress integration,
+   atomic physical handback and exact lock/admission release. Existing PROD
+   pre-claim and V2 retention gates must stay closed until these are proven.

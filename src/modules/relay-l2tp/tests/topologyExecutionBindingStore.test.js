@@ -29,6 +29,7 @@ let connection, child, directory, models;
 const dbName = `binding_scratch_${randomUUID().replaceAll('-', '')}`;
 const NODE = '507f1f77bcf86cd799439011';
 const IDENTITY = freeze({ machineId: '1'.repeat(32), sshHostKeySha256: '2'.repeat(64) });
+const ENDPOINT = freeze({ ip: '192.0.2.17', port: 22, username: 'synthetic' });
 const OWNER_GENERATION = randomUUID();
 const PREDECESSOR = randomUUID();
 const BOOT = randomUUID();
@@ -88,6 +89,10 @@ function evidence(challenge, changes = {}) {
     return { authority: 'external-execution-maintenance-v1', status: 'verified', challenge: structuredClone(challenge),
         proofId: randomUUID(), maintenanceId: MAINTENANCE, maintenance: 'held', allWriters: 'drained',
         bootstrapWriters: 'excluded', physicalIdentity: { ...IDENTITY }, owner: 'topology',
+        // Fixed server fixture, NOT copied from the caller challenge or mutable DB.
+        connectionAttestation: { authority: 'server-physical-ssh-endpoint-v1', endpoint: { ...ENDPOINT },
+            physicalIdentity: { ...IDENTITY }, maintenanceId: MAINTENANCE, aliases: 'excluded',
+            hostKeyDigest: 'raw-ssh-public-key-sha256', endpointReassignment: 'excluded' },
         predecessor: { generation: PREDECESSOR, bootId: BOOT, status: 'pre-enrolled' },
         oldBackend: { instanceId: 'simulated-old-prod', pid: 42, processStartTime: 'simulated-start',
             processTree: 'stopped', dispatch: 'disabled' }, ...changes };
@@ -101,18 +106,12 @@ const missingInstanceAuthority = async (challenge, work) => {
 function newStore(authority = goodAuthority) {
     return new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
 }
-async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand, acceptedBinding } = {}) {
+async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand } = {}) {
     const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
     const { TopologyNodeExecutionResolver } = require('../services/topologyNodeExecutionResolver');
     const { runnerRequest, v2Receipt } = require('./helpers/topologyV2Fixture');
     const events = [];
-    const Node = connection.models.BindingLocalNode || connection.model('BindingLocalNode', new mongoose.Schema({
-        ip: String, name: String, type: String, active: Boolean, cascadeRole: String,
-        ssh: { port: Number, username: String, privateKey: String },
-    }));
-    await Node.deleteMany({});
-    await Node.create({ _id: NODE, ip: '192.0.2.17', name: 'local-only', type: 'xray', active: true,
-        cascadeRole: 'portal', ssh: { port: 22, username: 'synthetic', privateKey: 'synthetic-local-fixture-not-a-key' } });
+    const Node = models.HyNode;
     class LocalSSH {
         constructor(node, trustedConnection) {
             const { SIMULATED_TRUSTED_CONNECTION } = require('./helpers/topologyV2Fixture');
@@ -133,32 +132,9 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
     class LocalBootstrapper { async ensureRunner() { events.push('local-bootstrap'); await onBootstrap?.(); } }
     const resolver = new TopologyNodeExecutionResolver({ ...PROD, NodeSSH: LocalSSH,
         HyNode: { findById(id) { events.push('node-read'); return Node.findById(id); } } });
-    // Explicit LOCAL simulated authority, not a store capability and never
-    // composed in the production host. Endpoint/key enrollment comes from this
-    // independently fixed test fixture, not the mutable HyNode DB or request.
-    let reader = store;
-    if (store && acceptedBinding) {
-        const accepted = acceptedBinding;
-        let scoped;
-        reader = {
-            readVerified: expected => store.readVerified(expected),
-            async readVerifiedConnection(expected, durable) {
-                const { simulatedConnectionAuthority } = require('./helpers/topologyV2Fixture');
-                const current = scoped ? (await scoped.assertCurrent(), scoped.durable) : await store.readVerified(expected);
-                assert.deepEqual(current, accepted, 'simulated authority rejects changed accepted binding');
-                assert.deepEqual(durable, accepted);
-                assert.equal(current.maintenanceId, MAINTENANCE);
-                return simulatedConnectionAuthority(accepted);
-            },
-            get withVerifiedBinding() {
-                if (typeof store.withVerifiedBinding !== 'function') return undefined;
-                return (expected, work) => store.withVerifiedBinding(expected, async (durable, assertCurrent) => {
-                    scoped = { durable, assertCurrent };
-                    try { return await work(durable, assertCurrent); } finally { scoped = undefined; }
-                });
-            },
-        };
-    }
+    // REAL durable connection reader. Only external physical/maintenance
+    // attestation and the SSH adapter are simulated locally; no pin wrapper.
+    const reader = store;
     const executor = new TopologyOperationExecutor({ ...PROD, nodeExecutionResolver: {
         async resolve(request, trustedConnection) {
             const { SIMULATED_TRUSTED_CONNECTION } = require('./helpers/topologyV2Fixture');
@@ -179,11 +155,15 @@ async function setup(authority = goodAuthority) {
             Owner: bind('TopologyConfigOwner', '../../../models/topologyConfigOwnerModel'),
             Enrollment: bind('TopologyExecutionEnrollment', '../models/topologyExecutionEnrollmentModel'),
             Binding: bind('TopologyExecutionBinding', '../models/topologyExecutionBindingModel'),
+            HyNode: connection.model('BindingLocalNode', require('../../../models/hyNodeModel').schema),
         };
         await Promise.all(Object.values(models).map(model => model.init()));
     }
     // Administrative fixture cleanup uses raw collections; public immutable models refuse mutation.
     await Promise.all(Object.values(models).map(model => model.collection.deleteMany({})));
+    await models.HyNode.create({ _id: NODE, ip: ENDPOINT.ip, name: 'local-only', type: 'xray', active: true,
+        cascadeRole: 'portal', ssh: { port: ENDPOINT.port, username: ENDPOINT.username,
+            privateKey: 'synthetic-local-fixture-not-a-key' } });
     const operationId = new mongoose.Types.ObjectId().toString();
     const context = { operationId, topologyRevision: 17, priorDeployedRevision: 16, node: frozenNode,
         executionFence: freeze({ owner: 'worker-17', attempt: 1, generation: randomUUID() }) };
@@ -204,8 +184,55 @@ async function setup(authority = goodAuthority) {
     const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
     const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
     return { store, context, expected: freeze(expected), enrollment: freeze({ nodeId: NODE, targetProfile: 'xray-main',
-        nodeIdentity: IDENTITY, ownerGeneration: OWNER_GENERATION, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
+        endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration: OWNER_GENERATION, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
+
+test('server-attested exact endpoint is snapshotted immutably with physical enrollment', async () => {
+    const { expected, enrollment } = await setup();
+    const endpoint = freeze({ ip: '192.0.2.17', port: 22, username: 'synthetic' });
+    const store = newStore(async (challenge, work) => work(evidence(challenge, {
+        connectionAttestation: { authority: 'server-physical-ssh-endpoint-v1', endpoint: { ...endpoint },
+            physicalIdentity: { ...IDENTITY }, maintenanceId: MAINTENANCE, aliases: 'excluded',
+            hostKeyDigest: 'raw-ssh-public-key-sha256', endpointReassignment: 'excluded' },
+    })));
+    const accepted = await store.preEnroll(freeze({ ...enrollment, endpoint }));
+    assert.deepEqual(accepted.endpoint, endpoint);
+    assert.equal(Object.isFrozen(accepted.endpoint), true);
+    await store.createBinding(expected);
+    for (const Model of [models.Enrollment, models.Binding]) {
+        assert.deepEqual((await Model.findOne().lean()).endpoint, endpoint);
+    }
+});
+
+test('real store returns frozen exact connection authority only for the accepted immutable binding', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const binding = await store.createBinding(expected);
+    assert.equal(typeof store.readVerifiedConnection, 'function', 'real store connection reader is missing');
+    const result = await store.readVerifiedConnection(expected, binding);
+    assert.deepEqual(result, { binding, connection: { expectedEndpoint: ENDPOINT,
+        expectedHostKeySha256: IDENTITY.sshHostKeySha256 } });
+    for (const value of [result, result.binding, result.binding.commandIds, result.connection, result.connection.expectedEndpoint]) {
+        assert.equal(Object.isFrozen(value), true);
+    }
+});
+
+test('external authority must explicitly exclude endpoint reassignment while maintenance is held', async () => {
+    const { enrollment } = await setup();
+    const store = newStore(async (challenge, work) => {
+        const proof = evidence(challenge); delete proof.connectionAttestation.endpointReassignment; return work(proof);
+    });
+    await assert.rejects(store.preEnroll(enrollment), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal(await models.Enrollment.countDocuments(), 0);
+});
+
+test('connection reader rejects malformed array proof metadata even when executor projection hides it', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+    const row = await models.Binding.findOne().lean();
+    await models.Binding.collection.updateOne({}, { $set: { proofId: [row.proofId] } });
+    await assert.rejects(store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+});
 
 test('actual Mongo stores pre-enrollment and insert-only execution binding; fresh reader verifies exact accepted operation and acquired lock', async () => {
     assert.equal(typeof contract.TopologyExecutionBindingStore.prototype.preEnroll, 'function', 'pre-enrollment is missing');
@@ -350,7 +377,7 @@ test('real resolver/executor/transport seam consumes only majority-confirmed dur
     const { store, expected, enrollment, context } = await setup();
     await store.preEnroll(enrollment);
     const row = await store.createBinding(expected);
-    const { executor, events } = await assembled(store, { acceptedBinding: row });
+    const { executor, events } = await assembled(store);
     const prepared = await executor.prepare(context);
     const lifecycle = { ...context, ...prepared };
     delete lifecycle.ok;
@@ -374,10 +401,14 @@ test('real resolver/executor/transport seam consumes only majority-confirmed dur
     assert.deepEqual(normal.events, []);
 });
 
-test('real store alone has no trusted endpoint authority and remains unable to dispatch', async () => {
-    const { store, expected, enrollment, context } = await setup();
-    await store.preEnroll(enrollment); await store.createBinding(expected);
-    assert.equal(store.readVerifiedConnection, undefined, 'production endpoint authority is deliberately not installed');
+test('matching mutable DB endpoint without external connection attestation never enrolls or dispatches', async () => {
+    const { expected, enrollment, context } = await setup();
+    const store = newStore(async (challenge, work) => {
+        const proof = evidence(challenge); delete proof.connectionAttestation; return work(proof);
+    });
+    await assert.rejects(store.preEnroll(enrollment), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal(await models.Enrollment.countDocuments(), 0);
+    assert.equal(await models.Binding.countDocuments(), 0);
     const { executor, events } = await assembled(store);
     await assert.rejects(executor.prepare(context), {
         code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
@@ -385,15 +416,15 @@ test('real store alone has no trusted endpoint authority and remains unable to d
     assert.deepEqual(events, []);
 });
 
-test('real resolver refuses mutable DB endpoint changes instead of adopting them as pin authority', async t => {
+test('real store refuses mutable DB endpoint changes before resolver or SSH instead of adopting them as authority', async t => {
     for (const [field, value] of [['ip', '192.0.2.99'], ['ssh.port', 2222], ['ssh.username', 'foreign-user']]) {
         await t.test(field, async () => {
             const { store, expected, enrollment, context } = await setup();
             await store.preEnroll(enrollment); const row = await store.createBinding(expected);
-            const { executor, events, Node } = await assembled(store, { acceptedBinding: row });
+            const { executor, events, Node } = await assembled(store);
             await Node.updateOne({ _id: NODE }, { $set: { [field]: value } });
             await assert.rejects(executor.prepare(context));
-            assert.deepEqual(events, ['node-read']);
+            assert.deepEqual(events, []);
             assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
             assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
         });
@@ -435,10 +466,28 @@ test('required actual unique indexes reject missing physical isolation and block
     const alias = new mongoose.Types.ObjectId().toString();
     delete owner._id;
     await models.Owner.create({ ...owner, node: alias });
-    await assert.rejects(store.preEnroll(freeze({ ...enrollment, nodeId: alias })), { code: 'TOPOLOGY_EXECUTION_BINDING_CONFLICT' });
+    const node = await models.HyNode.findOne().lean(); delete node._id;
+    const endpoint = { ...ENDPOINT, ip: '192.0.2.18' };
+    await models.HyNode.create({ ...node, _id: alias, ip: endpoint.ip });
+    const aliasStore = newStore(async (challenge, work) => {
+        const proof = evidence(challenge); proof.connectionAttestation.endpoint = { ...endpoint }; return work(proof);
+    });
+    await assert.rejects(aliasStore.preEnroll(freeze({ ...enrollment, nodeId: alias, endpoint })), { code: 'TOPOLOGY_EXECUTION_BINDING_CONFLICT' });
     assert.equal(await models.Enrollment.countDocuments(), 1);
     assert.equal((await models.Owner.findOne({ node: alias }).lean()).executionBindingCheck, owner.executionBindingCheck,
         'losing alias transaction must roll back its owner CAS');
+});
+
+test('physical machine alias is excluded globally even under a different target profile', async () => {
+    const { store, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const row = await models.Enrollment.findOne().lean();
+    await assert.rejects(models.Enrollment.create({ ...row, _id: randomUUID(),
+        nodeId: new mongoose.Types.ObjectId().toString(), targetProfile: 'xray-bridge',
+        endpoint: { ...ENDPOINT, ip: '192.0.2.18' },
+        nodeIdentity: { ...IDENTITY, sshHostKeySha256: 'f'.repeat(64) },
+    }), error => error.code === 11000);
+    assert.equal(await models.Enrollment.countDocuments(), 1);
 });
 
 test('concurrent insert-only binding writers have one durable winner without replacing IDs', async () => {
@@ -595,7 +644,7 @@ test('actual binding reader rechecks ownership lost during real resolution or lo
         const { store, expected, enrollment, context } = await setup();
         await store.preEnroll(enrollment); const row = await store.createBinding(expected);
         const winner = randomUUID();
-        const { executor, events } = await assembled(store, { acceptedBinding: row,
+        const { executor, events } = await assembled(store, {
             [hook]: async () => models.Lock.collection.updateOne({}, { $set: { generation: winner, owner: 'winner' } }),
         });
         await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true });
@@ -712,7 +761,7 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
         const { store, expected, enrollment, context } = await setup(authority);
         await store.preEnroll(enrollment); await store.createBinding(expected);
         const execution = boundary === 'executor'
-            ? await assembled(store, { acceptedBinding: await store.readVerified(expected) }) : null;
+            ? await assembled(store) : null;
         untilDate = new Date(Date.now() + 1200);
         await models.Operation.updateOne({}, { $set: { leaseUntil: untilDate } });
         await models.Lock.updateOne({}, { $set: { leaseUntil: untilDate } });
@@ -726,7 +775,7 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
                 const row = await lean.apply(this, leanArgs);
                 if (this.getOptions().readConcern?.level !== 'majority') return row;
                 confirmations++;
-                if (confirmations === (boundary === 'executor' ? 3 : 1)) {
+                if (!delayed && (boundary === 'executor' ? execution.events.includes('ssh-adapter') : confirmations === 1)) {
                     delayed = true;
                     if (['read', 'executor'].includes(boundary)) await new Promise(resolve => setTimeout(resolve, 1500));
                 }
@@ -964,7 +1013,7 @@ async function terminalFixture(t, { authority = goodAuthority, onCommand } = {})
     const localRunner = fakeRunner(t, BOOT);
     const prefix = `runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${expected.candidateHash} --backup-id previous --target-profile xray-main --execution-context ${PROD.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`;
     assert.equal(localRunner.execute(prefix).code, 0);
-    const assembledState = await assembled(store, { localRunner, onCommand, acceptedBinding: row });
+    const assembledState = await assembled(store, { localRunner, onCommand });
     const { executor } = assembledState;
     const prepared = await executor.prepare(context);
     const lifecycle = { ...context, backupId: prepared.backupId, prepared: prepared.prepared };
@@ -1139,4 +1188,308 @@ test('terminal scope holds original maintenance authority and rechecks persisted
     }), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
     assert.equal((await models.Lock.findOne().lean()).generation, winner);
     assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+});
+
+test('endpoint enrollment rejects missing, non-exact, malformed or un-attested selected endpoints', async t => {
+    const invalid = {
+        missing: undefined, array: [ENDPOINT], extra: { ...ENDPOINT, hostKey: IDENTITY.sshHostKeySha256 },
+        missingIp: { port: 22, username: 'synthetic' }, ipArray: { ...ENDPOINT, ip: [ENDPOINT.ip] },
+        hostname: { ...ENDPOINT, ip: 'caller-selected.example' }, emptyIp: { ...ENDPOINT, ip: '' },
+        portArray: { ...ENDPOINT, port: [22] }, stringPort: { ...ENDPOINT, port: '22' },
+        zeroPort: { ...ENDPOINT, port: 0 }, highPort: { ...ENDPOINT, port: 65536 },
+        fractionalPort: { ...ENDPOINT, port: 22.5 }, usernameArray: { ...ENDPOINT, username: ['synthetic'] },
+        emptyUser: { ...ENDPOINT, username: '' }, extraWhitespace: { ...ENDPOINT, username: ' synthetic' },
+        foreignIp: { ...ENDPOINT, ip: '192.0.2.99' }, foreignPort: { ...ENDPOINT, port: 2222 },
+        foreignUser: { ...ENDPOINT, username: 'foreign-user' },
+    };
+    for (const [name, endpoint] of Object.entries(invalid)) await t.test(name, async () => {
+        const { store, enrollment } = await setup();
+        // Even matching mutable selection is not independent physical authority.
+        if (['foreignIp', 'foreignPort', 'foreignUser'].includes(name)) {
+            await models.HyNode.updateOne({}, { $set: { ip: endpoint.ip, 'ssh.port': endpoint.port, 'ssh.username': endpoint.username } });
+        }
+        const input = { ...enrollment, endpoint }; if (name === 'missing') delete input.endpoint;
+        await assert.rejects(store.preEnroll(freeze(input)), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.equal(await models.Enrollment.countDocuments(), 0);
+        assert.equal((await models.Owner.findOne().lean()).executionBindingCheck, undefined);
+    });
+});
+
+test('every connection authority read requires the same held independently attested endpoint and raw host key', async t => {
+    const changes = {
+        missing: proof => { delete proof.connectionAttestation; },
+        switchedAuthority: proof => { proof.authority = 'db-endpoint-authority'; },
+        switchedAttestor: proof => { proof.connectionAttestation.authority = 'request-selected'; },
+        released: proof => { proof.maintenance = 'released'; },
+        switchedMaintenance: proof => { proof.maintenanceId = randomUUID(); proof.connectionAttestation.maintenanceId = proof.maintenanceId; },
+        mismatchedMaintenance: proof => { proof.connectionAttestation.maintenanceId = randomUUID(); },
+        aliasesUnknown: proof => { proof.connectionAttestation.aliases = 'unknown'; },
+        reassignmentAllowed: proof => { proof.connectionAttestation.endpointReassignment = 'allowed'; },
+        wrongDigestRepresentation: proof => { proof.connectionAttestation.hostKeyDigest = 'pem-sha256'; },
+        changedIp: proof => { proof.connectionAttestation.endpoint.ip = '192.0.2.99'; },
+        changedPort: proof => { proof.connectionAttestation.endpoint.port = 2222; },
+        changedUser: proof => { proof.connectionAttestation.endpoint.username = 'foreign'; },
+        extraEndpoint: proof => { proof.connectionAttestation.endpoint.clone = true; },
+        endpointArray: proof => { proof.connectionAttestation.endpoint = [ENDPOINT]; },
+        changedMachine: proof => { proof.connectionAttestation.physicalIdentity.machineId = 'f'.repeat(32); },
+        changedKey: proof => { proof.connectionAttestation.physicalIdentity.sshHostKeySha256 = 'f'.repeat(64); },
+        keyArray: proof => { proof.connectionAttestation.physicalIdentity.sshHostKeySha256 = [IDENTITY.sshHostKeySha256]; },
+        proofArray: proof => { proof.proofId = [proof.proofId]; },
+        maintenanceArray: proof => { proof.maintenanceId = [proof.maintenanceId]; },
+    };
+    for (const [name, mutate] of Object.entries(changes)) await t.test(name, async () => {
+        const { store, expected, enrollment, context } = await setup();
+        await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+        const denied = newStore(async (challenge, work) => { const proof = evidence(challenge); mutate(proof); return work(proof); });
+        await assert.rejects(denied.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        const { executor, events } = await assembled(denied);
+        await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.deepEqual(events, []);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+    });
+});
+
+test('immutable connection records reject cloned, missing, changed or array-valued enrollment and binding evidence', async t => {
+    const changes = {
+        missingEndpoint: row => ({ $unset: { endpoint: 1 } }),
+        endpointArray: row => ({ $set: { endpoint: [row.endpoint] } }),
+        ipArray: row => ({ $set: { 'endpoint.ip': [row.endpoint.ip] } }),
+        portArray: row => ({ $set: { 'endpoint.port': [row.endpoint.port] } }),
+        userArray: row => ({ $set: { 'endpoint.username': [row.endpoint.username] } }),
+        extraEndpoint: row => ({ $set: { 'endpoint.clone': true } }),
+        changedIp: row => ({ $set: { 'endpoint.ip': '192.0.2.99' } }),
+        changedPort: row => ({ $set: { 'endpoint.port': 2222 } }),
+        changedUser: row => ({ $set: { 'endpoint.username': 'foreign' } }),
+        changedKey: row => ({ $set: { 'nodeIdentity.sshHostKeySha256': 'f'.repeat(64) } }),
+        keyArray: row => ({ $set: { 'nodeIdentity.sshHostKeySha256': [row.nodeIdentity.sshHostKeySha256] } }),
+        machineArray: row => ({ $set: { 'nodeIdentity.machineId': [row.nodeIdentity.machineId] } }),
+        proofArray: row => ({ $set: { proofId: [row.proofId] } }),
+        maintenanceArray: row => ({ $set: { maintenanceId: [row.maintenanceId] } }),
+        foreignContext: row => ({ $set: { executionContext: 'test.infograd.online' } }),
+    };
+    for (const name of ['Enrollment', 'Binding']) for (const [label, update] of Object.entries(changes)) {
+        await t.test(`${name}.${label}`, async () => {
+            const { store, expected, enrollment, context } = await setup();
+            await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+            await models[name].collection.updateOne({}, update(await models[name].findOne().lean()));
+            await assert.rejects(store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            const { executor, events } = await assembled(store);
+            await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.deepEqual(events, []);
+            assert.equal(await models.Binding.countDocuments(), 1);
+        });
+    }
+});
+
+test('current selected HyNode connection is strict BSON authority comparison before resolver or SSH', async t => {
+    const changes = { ip: [ENDPOINT.ip], 'ssh.port': [22], 'ssh.username': ['synthetic'],
+        ssh: [{ port: 22, username: 'synthetic' }], active: [true], type: ['xray'], cascadeRole: ['portal'] };
+    for (const phase of ['transaction', 'confirmation']) for (const [field, value] of Object.entries(changes)) {
+        await t.test(`${phase}.${field}`, async () => {
+            const { store, expected, enrollment, context } = await setup();
+            await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+            const change = () => models.HyNode.updateOne({}, [{ $set: { [field]: { $literal: value } } }], { runValidators: true });
+            const find = models.HyNode.findOne; let injected = false;
+            if (phase === 'transaction') await change();
+            else models.HyNode.findOne = function (...args) {
+                const query = find.apply(this, args), lean = query.lean;
+                query.lean = async function (...args) {
+                    if (!injected && this.getOptions().readConcern?.level === 'majority') { injected = true; await change(); }
+                    return lean.apply(this, args);
+                }; return query;
+            };
+            try {
+                await assert.rejects(store.readVerifiedConnection(expected, binding), {
+                    code: phase === 'confirmation' ? 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' : 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN',
+                });
+            } finally { models.HyNode.findOne = find; }
+            if (phase === 'confirmation') assert.equal(injected, true);
+            const { executor, events } = await assembled(store);
+            await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.deepEqual(events, []);
+        });
+    }
+});
+
+test('concurrent endpoint reassignment wins before CAS without publishing losing enrollment or binding authority', async t => {
+    for (const action of ['enroll', 'create', 'read']) await t.test(action, async () => {
+        const { store, expected, enrollment } = await setup();
+        if (action !== 'enroll') await store.preEnroll(enrollment);
+        const binding = action === 'read' ? await store.createBinding(expected) : null;
+        const before = await Promise.all(['Operation', 'Lock', 'Owner'].map(name => models[name].findOne().lean()));
+        const update = models.HyNode.updateOne; let injected = false;
+        models.HyNode.updateOne = async function (...args) {
+            if (!injected) { injected = true; await models.HyNode.collection.updateOne({}, { $set: { ip: '192.0.2.99' } }); }
+            return update.apply(this, args);
+        };
+        try {
+            await assert.rejects(action === 'enroll' ? store.preEnroll(enrollment) : action === 'create'
+                ? store.createBinding(expected) : store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        } finally { models.HyNode.updateOne = update; }
+        assert.equal(injected, true);
+        assert.deepEqual(await Promise.all(['Operation', 'Lock', 'Owner'].map(name => models[name].findOne().lean())), before);
+        assert.equal((await models.HyNode.findOne().lean()).ip, '192.0.2.99');
+        assert.equal(await models.Enrollment.countDocuments(), action === 'enroll' ? 0 : 1);
+        assert.equal(await models.Binding.countDocuments(), action === 'read' ? 1 : 0);
+    });
+});
+
+test('endpoint reassignment after resolution or bootstrap is rechecked before any local transport command', async t => {
+    for (const hook of ['onResolved', 'onBootstrap']) await t.test(hook, async () => {
+        const { store, expected, enrollment, context } = await setup();
+        await store.preEnroll(enrollment); await store.createBinding(expected);
+        const { executor, events } = await assembled(store, {
+            [hook]: async () => models.HyNode.collection.updateOne({}, { $set: { 'ssh.username': 'foreign-winner' } }),
+        });
+        await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true });
+        assert.equal(events.filter(event => typeof event === 'object').length, 0);
+        assert.equal(events.includes('local-upload'), false);
+        if (hook === 'onResolved') assert.equal(events.includes('local-bootstrap'), false);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+    });
+});
+
+test('concurrent cross-profile physical aliases have exactly one immutable enrollment winner on the local replica set', async () => {
+    const { enrollment } = await setup();
+    const alias = new mongoose.Types.ObjectId().toString(), endpoint = freeze({ ...ENDPOINT, ip: '192.0.2.18' });
+    const owner = await models.Owner.findOne().lean(); delete owner._id;
+    await models.Owner.create({ ...owner, node: alias, profile: 'xray-bridge' });
+    const node = await models.HyNode.findOne().lean(); delete node._id;
+    await models.HyNode.create({ ...node, _id: alias, ip: endpoint.ip, cascadeRole: 'bridge' });
+    // Fixed server inventory for this LOCAL fixture; never use challenge.endpoint as evidence.
+    const inventory = new Map([[NODE, ENDPOINT], [alias, endpoint]]);
+    const authority = async (challenge, work) => {
+        const proof = evidence(challenge); proof.connectionAttestation.endpoint = { ...inventory.get(challenge.enrollment.nodeId) };
+        return work(proof);
+    };
+    const outcomes = await Promise.allSettled([newStore(authority).preEnroll(enrollment),
+        newStore(authority).preEnroll(freeze({ ...enrollment, nodeId: alias, targetProfile: 'xray-bridge', endpoint }))]);
+    assert.equal(outcomes.filter(outcome => outcome.status === 'fulfilled').length, 1);
+    assert.equal(outcomes.filter(outcome => outcome.status === 'rejected').length, 1);
+    assert.equal(await models.Enrollment.countDocuments(), 1);
+    const winner = (await models.Enrollment.findOne().lean()).nodeId;
+    const loser = winner === NODE ? alias : NODE;
+    assert.equal((await models.Owner.findOne({ node: loser }).lean()).executionBindingCheck, undefined);
+    assert.equal((await models.HyNode.collection.findOne({ _id: new mongoose.Types.ObjectId(loser) })).executionBindingCheck, undefined);
+});
+
+test('global SSH-key and listener indexes exclude clones even with different machine IDs, profiles or usernames', async t => {
+    for (const kind of ['ssh-key', 'listener']) await t.test(kind, async () => {
+        const { store, enrollment } = await setup(); await store.preEnroll(enrollment);
+        const row = await models.Enrollment.findOne().lean();
+        await assert.rejects(models.Enrollment.create({ ...row, _id: randomUUID(),
+            nodeId: new mongoose.Types.ObjectId().toString(), targetProfile: 'xray-bridge',
+            endpoint: { ...ENDPOINT, ip: kind === 'ssh-key' ? '192.0.2.18' : ENDPOINT.ip, username: 'different-user' },
+            nodeIdentity: { machineId: 'f'.repeat(32), sshHostKeySha256: kind === 'ssh-key' ? IDENTITY.sshHostKeySha256 : 'f'.repeat(64) },
+        }), error => error.code === 11000);
+        assert.equal(await models.Enrollment.countDocuments(), 1);
+    });
+});
+
+test('connection capability refuses caller-replaced or unfrozen binding records and cannot escape a terminal authority scope', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+    for (const value of [undefined, { ...binding }, freeze({ ...binding, clone: true }),
+        freeze({ ...binding, attemptId: randomUUID() }), freeze({ ...binding, commandIds: { ...binding.commandIds, prepare: randomUUID() } })]) {
+        await assert.rejects(store.readVerifiedConnection(expected, value), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    }
+    let escaped;
+    await store.withVerifiedBinding(expected, async () => {
+        assert.deepEqual((await store.readVerifiedConnection(expected, binding)).binding, binding);
+        escaped = require('node:async_hooks').AsyncLocalStorage.snapshot();
+    });
+    await assert.rejects(escaped(() => store.readVerifiedConnection(expected, binding)), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+});
+
+test('connection confirmation monitors real primary-majority HyNode reads with bounded credential-free projection', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+    const commands = [], observe = event => commands.push({ name: event.commandName, command: event.command });
+    connection.getClient().on('commandStarted', observe);
+    try { await store.readVerifiedConnection(expected, binding); }
+    finally { connection.getClient().off('commandStarted', observe); }
+    const confirmations = commands.filter(({ name, command }) => name === 'find'
+        && command.find === models.HyNode.collection.name && !Object.hasOwn(command, 'autocommit'));
+    assert.ok(confirmations.length >= 1);
+    for (const { command } of confirmations) {
+        assert.equal(command.readConcern.level, 'majority');
+        assert.ok(!command.$readPreference || command.$readPreference.mode === 'primary');
+        assert.ok(command.maxTimeMS > 0 && command.maxTimeMS <= 5000);
+        assert.deepEqual(command.projection, { _id: 1, ip: 1, type: 1, active: 1, cascadeRole: 1, 'ssh.port': 1, 'ssh.username': 1 });
+        assert.equal(typeof command.filter.executionBindingCheck, 'string');
+    }
+});
+
+test('each global physical isolation index must actually exist before connection authority can be read', async t => {
+    for (const key of [{ 'nodeIdentity.machineId': 1 }, { 'nodeIdentity.sshHostKeySha256': 1 }, { 'endpoint.ip': 1, 'endpoint.port': 1 }]) {
+        await t.test(JSON.stringify(key), async () => {
+            const { store, expected, enrollment } = await setup();
+            await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+            const index = (await models.Enrollment.collection.indexes()).find(index => JSON.stringify(index.key) === JSON.stringify(key));
+            await models.Enrollment.collection.dropIndex(index.name);
+            try { await assert.rejects(store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_INDEX_REQUIRED' }); }
+            finally { await models.Enrollment.createIndexes(); }
+        });
+    }
+});
+
+test('selected node deletion, foreign role, inactive status or missing endpoint never authorizes SSH', async t => {
+    const changes = {
+        missing: () => models.HyNode.collection.deleteMany({}),
+        foreignNode: async () => {
+            const node = await models.HyNode.findOne().lean(); delete node._id;
+            await models.HyNode.collection.deleteMany({});
+            await models.HyNode.create({ ...node, _id: new mongoose.Types.ObjectId() });
+        },
+        foreignRole: () => models.HyNode.collection.updateOne({}, { $set: { cascadeRole: 'bridge' } }),
+        inactive: () => models.HyNode.collection.updateOne({}, { $set: { active: false } }),
+        missingPort: () => models.HyNode.collection.updateOne({}, { $unset: { 'ssh.port': 1 } }),
+        missingUser: () => models.HyNode.collection.updateOne({}, { $unset: { 'ssh.username': 1 } }),
+    };
+    for (const [label, change] of Object.entries(changes)) await t.test(label, async () => {
+        const { store, expected, enrollment, context } = await setup();
+        await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+        await change();
+        await assert.rejects(store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        const { executor, events } = await assembled(store);
+        await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.deepEqual(events, []);
+    });
+});
+
+test('last HyNode majority delivery cannot outlive either exact lease or confirm an array CAS nonce', async t => {
+    for (const fault of ['expired-claim', 'expired-lock', 'array-nonce']) await t.test(fault, async () => {
+        const { store, expected, enrollment } = await setup();
+        await store.preEnroll(enrollment); const binding = await store.createBinding(expected);
+        let untilDate;
+        if (fault !== 'array-nonce') {
+            untilDate = new Date(Date.now() + 1200);
+            await models[fault === 'expired-claim' ? 'Operation' : 'Lock'].updateOne({}, { $set: { leaseUntil: untilDate } });
+        }
+        const find = models.HyNode.findOne; let injected = false;
+        models.HyNode.findOne = function (...args) {
+            const query = find.apply(this, args), lean = query.lean;
+            query.lean = async function (...args) {
+                if (!injected && this.getOptions().readConcern?.level === 'majority') {
+                    injected = true;
+                    if (fault === 'array-nonce') {
+                        const node = await models.HyNode.collection.findOne({});
+                        await models.HyNode.updateOne({}, [{ $set: { executionBindingCheck: { $literal: [node.executionBindingCheck] } } }], { runValidators: true });
+                    } else {
+                        const row = await lean.apply(this, args);
+                        await new Promise(resolve => setTimeout(resolve, 1500));
+                        return row;
+                    }
+                }
+                return lean.apply(this, args);
+            }; return query;
+        };
+        try { await assert.rejects(store.readVerifiedConnection(expected, binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' }); }
+        finally { models.HyNode.findOne = find; }
+        assert.equal(injected, true);
+        if (untilDate) assert.ok(Date.now() > untilDate.getTime());
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
 });

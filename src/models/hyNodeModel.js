@@ -325,6 +325,9 @@ const hyNodeSchema = new mongoose.Schema({
         ref: 'ServerGroup',
     }],
     
+    // Dormant execution-binding CAS nonce, not endpoint/physical authority.
+    executionBindingCheck: { type: String, select: false },
+
     ssh: {
         port: { type: Number, default: 22 },
         username: { type: String, default: 'root' },

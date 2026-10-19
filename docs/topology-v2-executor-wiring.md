@@ -107,26 +107,45 @@ every commit/verify/rollback/cleanup dispatch. Rehydration has the same checks.
 The dormant terminal scope revalidates before both close and fresh status.
 No new worker gate, runtime reader installation, release or handback is added.
 
-**Required follow-up, intentionally not implemented here:** the real
-`TopologyExecutionBindingStore` has no `readVerifiedConnection` method and its
-enrollment does not bind an accepted endpoint. Extend the separately owned
-immutable enrollment/authority contract with exact endpoint + physical key and
-current scoped verification before implementing this method. Merely projecting
-mutable node fields or adding a fallback pin is unsafe. Until then, even an
-otherwise verified real store passed directly to the executor refuses locally
-before resolution/bootstrap/SSH.
+The dormant `TopologyExecutionBindingStore` now implements this capability.
+Its immutable enrollment and binding both snapshot the exact endpoint + physical
+identity; every read requires independent held external connection attestation,
+exact current HyNode selection, and operation/lock/owner/HyNode transactional CAS
+with bounded primary-majority confirmation. It never uses mutable node fields as
+endpoint/key authority. See [the storage contract](topology-v2-execution-binding-store.md)
+for the explicit external evidence shape and provisioning requirements.
 
-Positive integration tests explicitly wrap the real store with a **simulated
-trusted authority adapter**. It holds a separately captured immutable accepted
-binding, checks current real-store ownership/maintenance, and supplies a fixed
-local fixture endpoint/key independent of mutable HyNode fields. Terminal
-checks use the original held `withVerifiedBinding` scope. These tests exercise
-the real resolver's second argument and exact endpoint checks with local-only
-SSH/runner adapters, not a production authority or live network handshake.
+Positive integration tests now pass the **actual store directly**, with no
+connection-authority wrapper. They assemble the real resolver, executor and V2
+transport with fixed independently simulated server inventory and local-only
+SSH/bootstrap/runner adapters. Terminal connection rechecks reuse the original
+held authority scope through private async-local context, and reject escaped
+contexts. These tests do not deliver a real physical attestor, production
+provisioning, live remote connectivity or execution-spanning writer exclusion.
+No runtime installation or worker opt-in is included; PROD remains NO-GO.
 
 ## Test evidence
 
-### Pinned resolver reconciliation
+### Endpoint-backed real-store reader
+
+- Observed RED→GREEN for immutable endpoint enrollment, the missing real-store
+  connection reader, nested terminal authority losing its held scope, global
+  cross-profile physical aliases, hidden array-valued proof metadata, and missing
+  endpoint-reassignment exclusion.
+- Direct loopback replica-set suite: **290 passed, 0 failed, 0 skipped,
+  0 cancelled**, also included in the broader run.
+- Assembled regression run: **682 passed, 0 failed, 0 skipped, 0 cancelled**,
+  including executor/resolver/transport, worker/runtime/claim/recovery/locks,
+  fake-root runner, panel host and real loopback SSH host-key-pin tests.
+- Both runs completed without force-exit. Changed JavaScript syntax checks and
+  `git diff --check` pass. Worker, runner, resolver, transport, NodeSSH, pool and
+  host-composition sources are unchanged. Local scratch Mongo is cleaned up;
+  there are no remote writes, production DB access or deployment.
+- Physical attestation and whole-lifecycle exclusion remain simulated. Real
+  authority, provisioning, supervised recovery and atomic handback/release are
+  still blockers; the PROD gate remains closed.
+
+### Earlier pinned resolver reconciliation
 
 - Reproduced **23 failures / 98 tests** in the unmodified real-Mongo binding
   suite after the resolver's production pin requirement (no skips). The failures
