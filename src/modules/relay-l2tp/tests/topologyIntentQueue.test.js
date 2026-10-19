@@ -23,18 +23,21 @@ test.before(async () => {
     if (!process.env.C3_MONGOD) return;
     directory = await fs.mkdtemp(path.join(process.env.TMPDIR || os.tmpdir(), 'c3-intent-db-'));
     const port = await new Promise(resolve => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const p = server.address().port; server.close(() => resolve(p)); }); });
-    processHandle = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--replSet', 'intentScratch', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+    processHandle = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--replSet', 'intentScratch', '--setParameter', 'enableTestCommands=1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
     const uri = `mongodb://127.0.0.1:${port}/intent_scratch?directConnection=true`;
     const client = new mongoose.mongo.MongoClient(uri, { serverSelectionTimeoutMS: 100 });
     await until(() => client.connect());
     await client.db('admin').command({ replSetInitiate: { _id: 'intentScratch', members: [{ _id: 0, host: `127.0.0.1:${port}` }] } });
     await until(async () => { assert.equal((await client.db('admin').command({ hello: 1 })).isWritablePrimary, true); });
     await client.close();
-    await mongoose.connect(uri);
+    await mongoose.connect(uri, { monitorCommands: true });
     models = { ...moduleEntry.registerModels(), HyNode: require('../../../models/hyNodeModel'), CascadeLink: require('../../../models/cascadeLinkModel') };
     await Promise.all(Object.values(models).map(model => model.init()));
 });
 test.after(async () => {
+    // Assembled-host/HTTP imports initialize this singleton even with local executors.
+    // Close its idle-cleanup timer without importing it into otherwise isolated tests.
+    require.cache[require.resolve('../../../services/sshPoolService')]?.exports.closeAll();
     await mongoose.disconnect();
     if (processHandle && processHandle.exitCode === null) {
         const exited = new Promise(resolve => processHandle.once('exit', resolve));
@@ -74,6 +77,124 @@ test('four acceptances are durable before any draft mutation; duplicate and over
     assert.deepEqual((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 4);
     assert.equal(JSON.stringify(accepted).includes('tunnelUuid'), false);
 });
+test('unknown acceptance commit is acknowledged only after a bounded majority readback', local, async () => {
+    await reset();
+    const commands = [];
+    const observe = event => {
+        if (event.commandName === 'find' && event.command.filter?.requestKey === 'accept-unknown') commands.push(event.command);
+    };
+    mongoose.connection.getClient().on('commandStarted', observe);
+    let transactions = 0;
+    const service = moduleEntry.createTopologyIntentService({ ...models, transactionRunner: async work => {
+        transactions++;
+        await mongoose.connection.transaction(work, {
+            readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary',
+        });
+        throw Object.assign(new Error('synthetic unknown acceptance commit'), {
+            hasErrorLabel: label => label === 'UnknownTransactionCommitResult',
+        });
+    } });
+    try {
+        const payload = link(0);
+        const job = await service.accept({ expectedTopologyRevision: 7, requestKey: 'accept-unknown', link: payload });
+        const recoveryReads = commands.filter(command => command.autocommit !== false);
+        assert.equal(recoveryReads.length, 1, 'one exact readback, not another acceptance transaction');
+        assert.equal(recoveryReads[0].readConcern?.level, 'majority', 'local visibility does not confirm a durable acceptance');
+        assert.ok(recoveryReads[0].maxTimeMS > 0 && recoveryReads[0].maxTimeMS <= 5000, 'confirmation must be bounded');
+        assert.equal(transactions, 1);
+        assert.equal(job.status, 'waiting');
+        assert.equal(JSON.stringify(job).includes(payload.tunnelUuid), false);
+        assert.deepEqual(await moduleEntry.createTopologyIntentService(models).get(job.jobId), job);
+        assert.equal(await models.TopologyCreateIntent.countDocuments(), 1);
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+        assert.equal(await models.CascadeLink.countDocuments(), 0);
+        assert.equal(await models.TopologyOperation.countDocuments(), 0);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 7);
+    } finally {
+        mongoose.connection.getClient().off('commandStarted', observe);
+    }
+});
+test('unknown acceptance with no committed row fails closed without another transaction', local, async () => {
+    await reset();
+    const unknown = Object.assign(new Error('synthetic unknown aborted acceptance'), {
+        hasErrorLabel: label => label === 'UnknownTransactionCommitResult',
+    });
+    let transactions = 0;
+    const service = moduleEntry.createTopologyIntentService({ ...models, transactionRunner: async work => {
+        transactions++;
+        await assert.rejects(mongoose.connection.transaction(async session => {
+            await work(session);
+            throw unknown;
+        }), error => error === unknown);
+        throw unknown;
+    } });
+    await assert.rejects(service.accept({ expectedTopologyRevision: 7, requestKey: 'accept-absent', link: link(0) }), error => error === unknown);
+    assert.equal(transactions, 1);
+    assert.equal(await models.TopologyCreateIntent.countDocuments(), 0);
+    assert.equal(await models.TopologyIntentQueueState.countDocuments(), 0);
+    assert.equal(await models.CascadeLink.countDocuments(), 0);
+    assert.equal(await models.TopologyOperation.countDocuments(), 0);
+    const state = await models.CascadeTopologyState.findById('singleton').lean();
+    assert.equal(state.revision, 7);
+    assert.equal(state.stateTransitionRevision, 0);
+});
+test('unknown acceptance readback failure never acknowledges or retries the durable job', local, async () => {
+    await reset();
+    let transactions = 0;
+    const client = mongoose.connection.getClient();
+    const service = moduleEntry.createTopologyIntentService({ ...models, transactionRunner: async work => {
+        transactions++;
+        await mongoose.connection.transaction(work, { writeConcern: { w: 'majority' } });
+        // Fail only the subsequent read, after the real transaction has committed.
+        await client.db('admin').command({ configureFailPoint: 'failCommand', mode: { times: 1 },
+            data: { failCommands: ['find'], errorCode: 50 } });
+        throw Object.assign(new Error('synthetic unknown acceptance commit'), {
+            hasErrorLabel: label => label === 'UnknownTransactionCommitResult',
+        });
+    } });
+    try {
+        await assert.rejects(service.accept({ expectedTopologyRevision: 7, requestKey: 'accept-unreadable', link: link(0) }), { code: 50 });
+    } finally {
+        await client.db('admin').command({ configureFailPoint: 'failCommand', mode: 'off' });
+    }
+    assert.equal(transactions, 1);
+    assert.equal(await models.TopologyCreateIntent.countDocuments({ status: 'waiting' }), 1);
+    assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+    assert.equal(await models.CascadeLink.countDocuments(), 0);
+    assert.equal(await models.TopologyOperation.countDocuments(), 0);
+    assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 7);
+});
+test('ambiguous and duplicate acceptance readbacks enforce the exact payload identity', local, async t => {
+    for (const code of ['unknown', 'duplicate']) await t.test(code, async () => {
+        await reset();
+        const payload = link(0);
+        const accepted = moduleEntry.createTopologyIntentService(models);
+        const job = await accepted.accept({ expectedTopologyRevision: 7, requestKey: 'accept-exact', link: payload });
+        const commands = [];
+        const observe = event => {
+            if (event.commandName === 'find' && event.command.filter?.requestKey === 'accept-exact') commands.push(event.command);
+        };
+        const client = mongoose.connection.getClient();
+        client.on('commandStarted', observe);
+        const service = moduleEntry.createTopologyIntentService({ ...models, transactionRunner: async () => {
+            throw code === 'duplicate' ? Object.assign(new Error('synthetic duplicate key race'), { code: 11000 })
+                : Object.assign(new Error('synthetic unknown commit'), { hasErrorLabel: label => label === 'UnknownTransactionCommitResult' });
+        } });
+        try {
+            assert.deepEqual(await service.accept({ expectedTopologyRevision: 7, requestKey: 'accept-exact', link: payload }), job);
+            await assert.rejects(service.accept({ expectedTopologyRevision: 7, requestKey: 'accept-exact', link: { ...payload, name: 'different' } }),
+                { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
+            assert.equal(commands.length, 2);
+            assert.ok(commands.every(command => command.readConcern?.level === 'majority' && command.maxTimeMS > 0 && command.maxTimeMS <= 5000));
+            assert.equal(await models.TopologyCreateIntent.countDocuments(), 1);
+            assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+            assert.equal(await models.CascadeLink.countDocuments(), 0);
+            assert.equal(await models.TopologyOperation.countDocuments(), 0);
+        } finally {
+            client.off('commandStarted', observe);
+        }
+    });
+});
 async function finish(operation) {
     const now = new Date(); const leaseUntil = new Date(now.getTime() + 60000);
     await models.TopologyOperation.updateOne({ _id: operation._id }, { $set: { status: 'committing', leaseOwner: 'local-finalizer', leaseUntil } });
@@ -99,6 +220,68 @@ test('legacy autoDeploy pending drafts are neither inferred as intents nor inclu
     assert.deepEqual(operation.linkIds.map(String), [admitted.createdLinkId]);
     assert.equal((await models.CascadeLink.findById(legacy._id).lean()).status, 'pending');
     await finish(operation);
+});
+test('mixed-mode links cannot share the same actual listener node and port', local, async t => {
+    const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
+    for (const mode of ['forward', 'reverse']) await t.test(mode, async () => {
+        await reset();
+        const desired = { ...link(mode === 'forward' ? 0 : 2), mode };
+        const existing = { ...link(mode === 'forward' ? 2 : 0),
+            mode: mode === 'forward' ? 'reverse' : 'forward', tunnelPort: desired.tunnelPort };
+        await models.CascadeLink.create(existing);
+        const service = moduleEntry.createTopologyIntentService(models);
+        const job = await service.accept({ expectedTopologyRevision: 7, requestKey: `same-listener-${mode}`, link: desired });
+        const consumer = new TopologyIntentConsumer(models);
+        const claim = await consumer.claim();
+        await assert.rejects(consumer.consume(claim), { code: 'TOPOLOGY_INTENT_PORT_CONFLICT' });
+        assert.equal((await service.get(job.jobId)).status, 'claimed');
+        assert.equal(await models.CascadeLink.countDocuments(), 1);
+        assert.equal(await models.CascadeLink.exists({ _id: desired._id }), null);
+        assert.equal(await models.TopologyOperation.countDocuments(), 0);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 7);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).topologyAdmissionCount, 0);
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+    });
+});
+test('same-mode listener collisions including legacy default reverse mode remain blocked', local, async t => {
+    const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
+    for (const mode of ['forward', 'reverse', 'legacy-reverse']) await t.test(mode, async () => {
+        await reset();
+        const desired = { ...link(mode === 'forward' ? 0 : 1), mode: mode === 'forward' ? 'forward' : 'reverse' };
+        const existing = await models.CascadeLink.create({ ...desired, _id: new mongoose.Types.ObjectId() });
+        if (mode === 'legacy-reverse') await models.CascadeLink.collection.updateOne({ _id: existing._id }, { $unset: { mode: '' } });
+        const service = moduleEntry.createTopologyIntentService(models);
+        await service.accept({ expectedTopologyRevision: 7, requestKey: `same-mode-${mode}`, link: desired });
+        const consumer = new TopologyIntentConsumer(models);
+        await assert.rejects(consumer.consume(await consumer.claim()), { code: 'TOPOLOGY_INTENT_PORT_CONFLICT' });
+        assert.equal(await models.CascadeLink.countDocuments(), 1);
+        assert.equal(await models.TopologyOperation.countDocuments(), 0);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 7);
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+    });
+});
+test('mixed-mode links may reuse a port on different actual listener nodes', local, async t => {
+    for (const mode of ['forward', 'reverse']) await t.test(mode, async () => {
+        await reset();
+        const desired = { ...link(mode === 'forward' ? 0 : 1), mode };
+        const existing = { ...link(mode === 'forward' ? 1 : 2),
+            ...(mode === 'reverse' ? { portalNode: desired.portalNode } : {}),
+            mode: mode === 'forward' ? 'reverse' : 'forward', tunnelPort: desired.tunnelPort };
+        await models.CascadeLink.create(existing);
+        const service = moduleEntry.createTopologyIntentService(models);
+        const job = await service.accept({ expectedTopologyRevision: 7, requestKey: `different-listener-${mode}`, link: desired });
+        await service.runOnce();
+        const admitted = await service.get(job.jobId);
+        assert.equal(admitted.status, 'admitted', 'the shared endpoint is not the existing link listener');
+        assert.equal(await models.CascadeLink.countDocuments(), 2);
+        assert.equal(await models.TopologyOperation.countDocuments(), 1);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 8);
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+        await finish(await models.TopologyOperation.findById(admitted.operationId).lean());
+        await service.runOnce();
+        assert.equal((await service.get(job.jobId)).status, 'succeeded');
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 0);
+    });
 });
 test('an unrelated draft writer cannot advance the exact active revision', local, async () => {
     await reset();

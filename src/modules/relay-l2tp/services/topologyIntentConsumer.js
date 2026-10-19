@@ -117,9 +117,13 @@ class TopologyIntentConsumer {
                 replacementReservation: { $exists: false }, remoteDrain: { $exists: false } }).session(session).lean();
             if (!current) throw intentError('TOPOLOGY_INTENT_FENCE_LOST');
             const link = intent.payload;
-            // Port conflicts must be rechecked at the queue head, not only on HTTP acceptance.
-            const field = link.mode === 'forward' ? 'bridgeNode' : 'portalNode';
-            if (await this.dependencies.CascadeLink.exists({ [field]: link[field], tunnelPort: link.tunnelPort, active: true }).session(session)) {
+            // Compare actual listeners: forward on bridge, reverse (the legacy default) on portal.
+            // Recheck at the queue head against each existing link's own mode.
+            const listenerNode = link.mode === 'forward' ? link.bridgeNode : link.portalNode;
+            if (await this.dependencies.CascadeLink.exists({
+                active: true, tunnelPort: link.tunnelPort,
+                $or: [{ mode: 'forward', bridgeNode: listenerNode }, { mode: { $ne: 'forward' }, portalNode: listenerNode }],
+            }).session(session)) {
                 throw intentError('TOPOLOGY_INTENT_PORT_CONFLICT');
             }
             const writeService = new TopologyDraftWriteService({ repository: draft });

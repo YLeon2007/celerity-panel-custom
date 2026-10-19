@@ -15,6 +15,35 @@ test('intent transactions explicitly require primary snapshot reads and majority
     assert.deepEqual(options, Array.from({ length: 2 }, () => ({ readConcern: { level: 'snapshot' },
         writeConcern: { w: 'majority' }, readPreference: 'primary' })));
 });
+test('ambiguous intent acceptance explicitly confirms on the primary outside the transaction', async () => {
+    const { TopologyIntentService, digest } = require('../services/topologyIntentService');
+    const payload = { name: 'local-only', tunnelUuid: 'not-public' };
+    const row = { _id: 'intent-1', payloadHash: digest(payload), payload, status: 'waiting', acceptanceRevision: 7 };
+    const db = {};
+    const calls = [];
+    class CascadeLink {
+        static db = db;
+        async validate() {}
+        toObject() { return payload; }
+    }
+    const query = {
+        session(value) { calls.push(['session', value]); return this; },
+        readConcern(value) { calls.push(['readConcern', value]); return this; },
+        read(value) { calls.push(['read', value]); return this; },
+        maxTimeMS(value) { calls.push(['maxTimeMS', value]); return this; },
+        async lean() { calls.push(['lean']); return row; },
+    };
+    const service = new TopologyIntentService({ CascadeLink,
+        CascadeTopologyState: { db }, TopologyIntentQueueState: { db },
+        TopologyCreateIntent: { db, findOne(filter) { calls.push(['findOne', filter]); return query; } },
+        transactionRunner: async () => { throw { hasErrorLabel: label => label === 'UnknownTransactionCommitResult' }; },
+    });
+    const job = await service.accept({ expectedTopologyRevision: 7, requestKey: 'exact-key', link: payload });
+    assert.deepEqual(calls, [['findOne', { requestKey: 'exact-key' }], ['session', null],
+        ['readConcern', 'majority'], ['read', 'primary'], ['maxTimeMS', 5000], ['lean']]);
+    assert.equal(job.jobId, 'intent-1');
+    assert.equal(JSON.stringify(job).includes(payload.tunnelUuid), false);
+});
 test('the opt-in supervised startup consumes intents before scanning operations and stop joins its admitted transaction', async () => {
     let unblock; const gate = new Promise(resolve => { unblock = resolve; });
     const trace = []; let tick; let scheduled = 0;

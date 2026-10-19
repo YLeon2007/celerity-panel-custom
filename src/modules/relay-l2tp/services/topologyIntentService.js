@@ -50,8 +50,10 @@ class TopologyIntentService {
         const { _id, ...comparable } = payload;
         const fingerprint = payloadHash || digest(comparable);
         if (!/^[a-f0-9]{64}$/.test(fingerprint)) throw intentError('INVALID_REQUEST');
-        const findExisting = async session => {
-            const found = await this.TopologyCreateIntent.findOne({ requestKey }).session(session).lean();
+        const findExisting = async (session, confirmDurable = false) => {
+            const query = this.TopologyCreateIntent.findOne({ requestKey }).session(session);
+            if (confirmDurable) query.readConcern('majority').read('primary').maxTimeMS(5000);
+            const found = await query.lean();
             if (found && found.payloadHash !== fingerprint) throw intentError('TOPOLOGY_INTENT_KEY_CONFLICT');
             return found;
         };
@@ -82,9 +84,10 @@ class TopologyIntentService {
                 return publicIntent(row);
             });
         } catch (error) {
-            // Exact durable readback only; unknown acceptance is never permission to mutate/retry remotely.
+            // Local visibility is not durable confirmation after an ambiguous commit.
+            // Bound the primary majority read; absence/failure must never acknowledge acceptance.
             if (error?.code === 11000 || error?.hasErrorLabel?.('UnknownTransactionCommitResult')) {
-                const existing = await findExisting(undefined);
+                const existing = await findExisting(null, true);
                 if (existing) return publicIntent(existing);
             }
             throw error;
