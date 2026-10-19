@@ -8,8 +8,7 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
-const CascadeTopologyState = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
-const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
+const { withLegacyCascadeUndeploy } = require('../modules/relay-l2tp/services/legacyCascadeUndeploy');
 const cascadeLinksRoutes = require('./cascadeLinks');
 const cascadeService = require('../services/cascadeService');
 const cache = require('../services/cacheService');
@@ -65,26 +64,27 @@ router.post('/links/:id/undeploy', requireScope('nodes:write'), deployLimiter, a
         const link = await CascadeLink.findById(req.params.id);
         if (!link) return res.status(404).json({ error: 'Cascade link not found' });
 
-        await cascadeService.undeployLink(link);
-
-        // Reset the deployed topology state and purge recorded operations of the
-        // current revision so the next topology deploy re-queues from scratch.
-        const state = await CascadeTopologyState.findOneAndUpdate(
-            { _id: 'singleton' },
-            { $set: { deployedRevision: 0 } },
-            { new: true, timestamps: false },
-        ).lean();
-        if (state) {
-            await TopologyOperation.deleteMany({ topologyRevision: state?.revision });
-        }
+        // The legacy teardown is not queue-aware. Reject active/uncertain work
+        // before its first node effect and hold exact non-expiring ownership
+        // across the asynchronous teardown. Never purge queue-bound operations.
+        await withLegacyCascadeUndeploy(async () => {
+            // Resolve operational metadata only after ownership: an earlier
+            // draft edit may have won the race with the initial existence read.
+            const current = await CascadeLink.findById(req.params.id);
+            if (!current) throw new Error('Cascade link disappeared before undeploy');
+            await cascadeService.undeployLink(current);
+        });
 
         // Invalidate subscription cache after undeploy
         await invalidateCascadeCache();
 
         res.json({ success: true, message: 'Cascade link undeployed' });
     } catch (error) {
+        if (error.code === 'LEGACY_CASCADE_UNDEPLOY_BUSY') {
+            return res.status(409).json({ error: { code: error.code, message: error.message } });
+        }
         logger.error(`[Cascade API] Undeploy error: ${error.message}`);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: { code: error.code || 'INTERNAL_ERROR', message: error.message } });
     }
 });
 

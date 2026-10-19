@@ -4,8 +4,10 @@
  */
 
 const { z } = require('zod');
+const mongoose = require('mongoose');
 const CascadeLink = require('../../models/cascadeLinkModel');
 const HyNode = require('../../models/hyNodeModel');
+const CascadeTopologyState = require('../../modules/relay-l2tp/models/cascadeTopologyStateModel');
 const cascadeService = require('../../services/cascadeService');
 const cache = require('../../services/cacheService');
 const logger = require('../../utils/logger');
@@ -26,6 +28,8 @@ const queryCascadeSchema = z.object({
 });
 
 const manageCascadeSchema = z.object({
+    expectedTopologyRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional()
+        .describe('Required for create/update/delete; exact revision from the topology draft'),
     action: z.enum(['create', 'update', 'delete', 'deploy', 'undeploy', 'reconnect']),
     id: z.string().optional().describe('Link _id (required for all except create)'),
     data: z.object({
@@ -71,9 +75,29 @@ async function queryCascade(args) {
     return { links };
 }
 
+let draftWriteService;
+function getDraftWriteService() {
+    if (!draftWriteService) {
+        draftWriteService = require('../../modules/relay-l2tp/services/topologyDraftWriteService')
+            .createTopologyDraftWriteService({
+                HyNode, CascadeLink,
+                CascadeRouteGroup: require('../../modules/relay-l2tp/models/cascadeRouteGroupModel'),
+                CascadeTopologyState,
+                RelayL2tpState: require('../../modules/relay-l2tp/models/relayL2tpStateModel'),
+            });
+    }
+    return draftWriteService;
+}
+
 async function manageCascade(args, emit) {
     const parsed = manageCascadeSchema.parse(args);
-    const { action, id, data = {} } = parsed;
+    const { action, id, data = {}, expectedTopologyRevision } = parsed;
+    if (['create', 'update', 'delete'].includes(action)
+        && !Number.isSafeInteger(expectedTopologyRevision)) {
+        throw Object.assign(new Error('An explicit expectedTopologyRevision is required for draft writes'), {
+            code: 'INVALID_TOPOLOGY_REVISION',
+        });
+    }
 
     switch (action) {
         case 'create': {
@@ -108,7 +132,8 @@ async function manageCascade(args, emit) {
             }
 
             const crypto = require('crypto');
-            const link = await CascadeLink.create({
+            const link = {
+                _id: new mongoose.Types.ObjectId(),
                 name: data.name,
                 mode: linkMode,
                 portalNode: data.portalNodeId,
@@ -129,7 +154,8 @@ async function manageCascade(args, emit) {
                 xhttpMode: 'auto',
                 muxEnabled: false,
                 muxConcurrency: 8,
-            });
+            };
+            const revisions = await getDraftWriteService().createLink({ expectedTopologyRevision, link });
 
             await invalidateCascadeCache();
             logger.info(`[MCP] Created cascade link ${data.name}: ${portalNode.name} -> ${bridgeNode.name}`);
@@ -138,7 +164,7 @@ async function manageCascade(args, emit) {
                 .populate('portalNode', 'name ip status')
                 .populate('bridgeNode', 'name ip status');
 
-            return { success: true, link: populated };
+            return { success: true, link: populated, topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
         }
 
         case 'update': {
@@ -148,22 +174,25 @@ async function manageCascade(args, emit) {
             for (const k of allowed) {
                 if (data[k] !== undefined) updates[k] = data[k];
             }
-            const link = await CascadeLink.findByIdAndUpdate(id, { $set: updates }, { new: true })
+            const revisions = await getDraftWriteService().updateLink({
+                expectedTopologyRevision, linkId: id, changes: updates,
+            });
+            const link = await CascadeLink.findById(id)
                 .populate('portalNode', 'name ip status')
                 .populate('bridgeNode', 'name ip status');
-            if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
             await invalidateCascadeCache();
-            return { success: true, link };
+            return { success: true, link, topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
         }
 
         case 'delete': {
             if (!id) throw new Error('id is required for delete');
             const link = await CascadeLink.findById(id);
             if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-            await CascadeLink.findByIdAndDelete(id);
+            const revisions = await getDraftWriteService().deleteLink({ expectedTopologyRevision, linkId: id });
             await invalidateCascadeCache();
             logger.info(`[MCP] Deleted cascade link ${link.name}`);
-            return { success: true, message: `Link '${link.name}' deleted` };
+            return { success: true, message: `Link '${link.name}' deleted`,
+                topologyRevision: revisions.revision, deployedRevision: revisions.deployedRevision };
         }
 
         case 'deploy': {
@@ -176,13 +205,17 @@ async function manageCascade(args, emit) {
 
         case 'undeploy': {
             if (!id) throw new Error('id is required for undeploy');
-            const link = await CascadeLink.findById(id)
-                .populate('portalNode')
-                .populate('bridgeNode');
-            if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-
-            emit('progress', { message: `Undeploying cascade link '${link.name}'...` });
-            await cascadeService.undeployLink(link);
+            if (!await CascadeLink.findById(id)) return { error: `Cascade link '${id}' not found`, code: 404 };
+            const link = await require('../../modules/relay-l2tp/services/legacyCascadeUndeploy')
+                .withLegacyCascadeUndeploy(async () => {
+                    const current = await CascadeLink.findById(id)
+                        .populate('portalNode').populate('bridgeNode');
+                    if (!current) throw new Error('Cascade link disappeared before undeploy');
+                    emit('progress', { message: `Undeploying cascade link '${current.name}'...` });
+                    await cascadeService.undeployLink(current);
+                    return current;
+                });
+            await invalidateCascadeCache();
             return { success: true, message: `Link '${link.name}' undeployed` };
         }
 
@@ -200,7 +233,8 @@ async function manageCascade(args, emit) {
 }
 
 async function getTopology() {
-    const [nodes, links] = await Promise.all([
+    const [state, nodes, links] = await Promise.all([
+        CascadeTopologyState.findById('singleton').select('revision deployedRevision').lean(),
         HyNode.find({ active: true }).select('name ip status cascadeRole country type').lean(),
         CascadeLink.find({})
             .populate('portalNode', 'name ip status')
@@ -209,6 +243,8 @@ async function getTopology() {
     ]);
 
     return {
+        topologyRevision: state?.revision ?? 0,
+        deployedRevision: state?.deployedRevision ?? 0,
         nodes,
         links: links.map(l => ({
             _id: l._id,

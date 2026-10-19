@@ -20,7 +20,8 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
         default: 0,
         min: 0,
     },
-    // Reserved for a future replacement workflow; no acquisition path is enabled yet.
+    // Shared non-expiring draft/deployment fence. Legacy undeploy can acquire
+    // it only while quiescent; topology replacement acquisition remains disabled.
     // Keep the epoch after release so an old owner token cannot be reused as authority.
     replacementEpoch: {
         type: Number,

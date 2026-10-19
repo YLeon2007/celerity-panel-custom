@@ -841,24 +841,20 @@ test('legacy deploy entry points are fail-closed while explicit undeploy remains
     assert.match(CASCADE_ROUTE_SOURCE, /LEGACY_CASCADE_DEPLOY_DISABLED/);
     assert.match(
         CASCADE_ROUTE_SOURCE,
-        /router\.post\('\/links\/:id\/undeploy',[\s\S]*cascadeService\.undeployLink\(link\)/,
+        /router\.post\('\/links\/:id\/undeploy',[\s\S]*withLegacyCascadeUndeploy\([\s\S]*cascadeService\.undeployLink\(current\)/,
     );
     assert.equal((CASCADE_ROUTE_SOURCE.match(/cascadeService\.undeployLink\s*\(/g) || []).length, 1);
 });
 
-test('undeploy resets the deployed topology state and purges revision operations for redeploy', () => {
+test('undeploy delegates to exact ownership without deleting durable operation history', () => {
     const start = CASCADE_ROUTE_SOURCE.indexOf("router.post('/links/:id/undeploy'");
     assert.notStrictEqual(start, -1, 'undeploy route must exist');
     const end = CASCADE_ROUTE_SOURCE.indexOf('router.', start + 1);
     const undeploy = CASCADE_ROUTE_SOURCE.slice(start, end === -1 ? undefined : end);
-    assert.match(undeploy, /CascadeTopologyState\.findOneAndUpdate\(/,
-        'undeploy must touch the deployed topology state');
-    assert.match(undeploy, /deployedRevision: 0/,
-        'undeploy must reset deployedRevision so the map shows pending');
-    assert.match(undeploy, /TopologyOperation\.deleteMany\(/,
-        'undeploy must purge recorded operations of the current revision to allow redeploy');
-    assert.match(undeploy, /topologyRevision: state\?\.revision/,
-        'operation purge must be scoped to the current topology revision');
+    assert.match(undeploy, /withLegacyCascadeUndeploy\(/,
+        'undeploy must acquire the shared quiescence and ownership fence before teardown');
+    assert.doesNotMatch(undeploy, /TopologyOperation\.deleteMany\(|CascadeTopologyState\.findOneAndUpdate\(/,
+        'the legacy route must neither erase queue bindings nor reset deployed state outside the ownership fence');
 });
 
 test('legacy chain deployment is absent from docs and rejected by the live REST router', () => {
