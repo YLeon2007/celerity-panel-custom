@@ -231,6 +231,7 @@ function preparedReceipt(binding) {
 
 class TopologyOperationExecutor {
     #target;
+    #hostIdentity;
     #nodeExecutionResolver;
     #RunnerBootstrapper;
     #NodeTransportFactory;
@@ -271,6 +272,7 @@ class TopologyOperationExecutor {
             throw new TypeError('TopologyOperationExecutor requires fixed topology lifecycle adapters');
         }
         this.#target = target;
+        this.#hostIdentity = hostIdentity;
         this.#nodeExecutionResolver = nodeExecutionResolver;
         this.#RunnerBootstrapper = RunnerBootstrapper;
         this.#NodeTransportFactory = NodeTransportFactory;
@@ -284,6 +286,8 @@ class TopologyOperationExecutor {
         const bootstrapper = new this.#RunnerBootstrapper({
             nodeSSH,
             target: this.#target,
+            hostIdentity: this.#hostIdentity,
+            role: binding.role,
         });
         await bootstrapper.ensureRunner();
         const factory = new this.#NodeTransportFactory({

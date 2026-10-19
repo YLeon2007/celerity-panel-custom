@@ -132,7 +132,8 @@ function executorFixture({ responseOverrides = {},
     };
     class FakeBootstrapper {
         constructor(options) {
-            events.push({ method: 'bootstrapper', target: options.target });
+            events.push({ method: 'bootstrapper', target: options.target,
+                hostIdentity: options.hostIdentity, role: options.role });
         }
 
         async ensureRunner() {
@@ -150,7 +151,7 @@ function executorFixture({ responseOverrides = {},
     };
 }
 
-test('production lifecycle seam sends the actual target to the injected bootstrapper', async () => {
+test('production lifecycle seam sends the full server pair and frozen role to bootstrapper', async () => {
     const { executor, events } = executorFixture({
         contour: { target: 'production', hostIdentity: 'lm1.infograd.online' },
     });
@@ -158,17 +159,20 @@ test('production lifecycle seam sends the actual target to the injected bootstra
     await executor.commit(lifecycleContext(prepared));
     await executor.verify(lifecycleContext(prepared));
     await executor.rollback(lifecycleContext(prepared));
-    assert.equal(events.find(event => event.method === 'bootstrapper').target, 'production');
+    assert.deepEqual(events.find(event => event.method === 'bootstrapper'), {
+        method: 'bootstrapper', target: 'production',
+        hostIdentity: 'lm1.infograd.online', role: 'portal',
+    });
     assert.deepEqual(events.filter(event => event.method === 'transport').map(event => event.request.command),
         ['prepare', 'commit', 'verify', 'rollback']);
 });
 
-test('production default bootstrap remains an explicit integration prerequisite with zero remote calls', async () => {
+test('production default bootstrap enters the paired portal preflight before any write', async () => {
     const calls = [];
     const executor = new TopologyOperationExecutor({
         target: 'production', hostIdentity: 'lm1.infograd.online',
         nodeExecutionResolver: { async resolve() { return {
-            async exec() { calls.push('exec'); assert.fail('must not execute remotely'); },
+            async exec(command) { calls.push(command); return { code: 1, stdout: '', stderr: '' }; },
             async writeFile() { calls.push('upload'); assert.fail('must not upload'); },
         }; } },
     });
@@ -176,7 +180,8 @@ test('production default bootstrap remains an explicit integration prerequisite 
         assert.equal(error.cause?.code, 'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE');
         return true;
     });
-    assert.deepEqual(calls, []);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /sha256sum.*celerity-topology-node-runner/);
 });
 
 test('resolves one frozen test node, bootstraps first, and prepares through the role-bound transport', async () => {
@@ -568,7 +573,7 @@ test('rehydrates a durable prepared binding without preparing or reading current
 
     assert.deepEqual(events.filter(event => event.method), [
         { method: 'resolve', request: { nodeId: 'bridge-node', role: 'bridge' } },
-        { method: 'bootstrapper', target: 'test' },
+        { method: 'bootstrapper', target: 'test', hostIdentity: 'test.infograd.online', role: 'bridge' },
         { method: 'ensureRunner' },
     ]);
     assert.equal(events.filter(event => event.method === 'transport').length, 0);
