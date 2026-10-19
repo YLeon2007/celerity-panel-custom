@@ -4,6 +4,8 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { topologyExecutionContext, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
+const { matchesTopologyOperationClaimBinding } = require('../domain/topologyOperationClaimBinding');
 
 function loadLogger() {
     try {
@@ -224,6 +226,7 @@ class TopologyOperationWorker {
     #allowUnprovenTestExecution;
 
     constructor({
+        executionContext,
         operationRepository,
         executor,
         finalizer,
@@ -240,6 +243,11 @@ class TopologyOperationWorker {
         attachIngressGate,
         allowUnprovenTestExecution = false,
     } = {}) {
+        const selectedContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!matchesTopologyExecutionContext(executionContext, selectedContext)) {
+            throw new TypeError('Topology operation worker requires a trusted execution context');
+        }
+        Object.defineProperty(this, 'executionContext', { value: selectedContext, enumerable: true });
         const repositoryMethods = [
             'claim',
             'renewLease',
@@ -315,7 +323,8 @@ class TopologyOperationWorker {
         this.attachIngressGate = attachIngressGate;
         // TEST-only fake-executor seam. The composed runtime never grants this:
         // lock generation and quiescence are not proven for real execution.
-        this.#allowUnprovenTestExecution = allowUnprovenTestExecution === true;
+        this.#allowUnprovenTestExecution = selectedContext.target === 'test'
+            && allowUnprovenTestExecution === true;
         this.running = new Set();
     }
 
@@ -1041,12 +1050,20 @@ class TopologyOperationWorker {
         const acquiredNodeIds = [];
         try {
             const operation = await this.operationRepository.claim({
+                executionContext: this.executionContext,
                 operationId,
                 owner: this.workerId,
                 leaseMs: this.leaseMs,
                 now: this.clock.now(),
             });
             if (!operation) return { claimed: false, operationId };
+            // A malformed returned binding is not authority to terminalize or
+            // release anything. Validate before plans, heartbeats, locks or runners.
+            if (entityId(operation) !== operationId
+                || !matchesTopologyOperationClaimBinding(operation, this.executionContext)) {
+                return { claimed: true, operationId, stopped: true,
+                    errorCode: 'TOPOLOGY_OPERATION_EXECUTION_CONTEXT_MISMATCH' };
+            }
             let nodes;
             let entries;
             try {

@@ -9,6 +9,7 @@ const { TopologyOperationFinalizer } = require('../services/topologyOperationFin
 const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
 const { NodeOperationLockService } = require('../services/nodeOperationLockService');
 
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST_CONTEXT } = require('../domain/topologyExecutionContext');
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 const CANDIDATE_MEDIA_TYPE = 'application/vnd.celerity.xray-topology-node+json;version=1';
 const TARGET_BY_ROLE = Object.freeze({
@@ -110,6 +111,8 @@ function durableOperation() {
         .sort((left, right) => left.node.localeCompare(right.node));
     return {
         _id: 'operation-1',
+        executionContext: TEST_CONTEXT,
+        idempotencyKey: 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'queued',
@@ -263,6 +266,7 @@ function createWorker({
         },
     };
     return new TopologyOperationWorker({
+        executionContext: TEST_CONTEXT,
         operationRepository: repository,
         executor,
         finalizer: effectiveFinalizer,

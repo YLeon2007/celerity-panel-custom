@@ -46,6 +46,41 @@ function runtimeDependencies(env, calls = []) {
     };
 }
 
+test('assembled runtime binds the real worker claim to selected host despite later env and request identities', async () => {
+    for (const selected of [TEST, PROD]) {
+        const env = { ...(selected === TEST ? TEST_ENV : PROD_ENV) };
+        const calls = [];
+        const dependencies = runtimeDependencies(env);
+        dependencies.TopologyOperation.findOneAndUpdate = async (filter, update, options) => {
+            calls.push({ filter, update, options });
+            return null;
+        };
+        const service = createTopologyOperationRuntime({ ...dependencies,
+            createTopologyOperationExecutor(options) {
+                Object.assign(env, selected === TEST ? PROD_ENV : TEST_ENV);
+                return createTopologyOperationExecutor({ ...options, NodeSSH: class {} });
+            },
+        });
+        assert.ok(service instanceof TopologyOperationCoordinator);
+        assert.deepEqual(service.operationWorker.executionContext, selected);
+        const result = await service.operationWorker.run({ operationId: 'operation-1', executionContext: PROD });
+        if (selected === PROD) {
+            assert.equal(result.errorCode, 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN');
+            assert.deepEqual(calls, []);
+        } else {
+            assert.deepEqual(result, { claimed: false, operationId: 'operation-1' });
+            assert.equal(calls.length, 2);
+            for (const { filter, options } of calls) {
+                assert.equal(filter['executionContext.target'], TEST.target);
+                assert.equal(filter['executionContext.hostIdentity'], TEST.hostIdentity);
+                assert.ok(filter.$expr);
+                assert.equal(options.projection.executionContext, 1);
+                assert.equal(options.projection.idempotencyKey, 1);
+            }
+        }
+    }
+});
+
 test('allowlist contains only frozen exact pairs and never normalizes identities', () => {
     assert.deepEqual(TOPOLOGY_EXECUTION_CONTEXTS, [TEST, PROD]);
     assert.equal(Object.isFrozen(TOPOLOGY_EXECUTION_CONTEXTS), true);

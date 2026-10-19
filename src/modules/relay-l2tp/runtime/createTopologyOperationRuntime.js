@@ -261,6 +261,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             }),
         });
         const operationWorker = new OperationWorker({
+            executionContext,
             operationRepository,
             executor,
             finalizer,

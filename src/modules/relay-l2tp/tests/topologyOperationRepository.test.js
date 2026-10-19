@@ -8,6 +8,7 @@ const {
     TopologyOperationRepository,
 } = require('../repositories/topologyOperationRepository');
 const TopologyOperation = require('../models/topologyOperationModel');
+const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
 const ADMISSION_FINGERPRINT = 'a'.repeat(64);
 const TEST_BINDING = Object.freeze({
     executionContext: Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' }),
@@ -781,7 +782,7 @@ test('claim reads only durable candidates and never resets later active phases',
     };
     const repository = new TopologyOperationRepository({ model });
 
-    const result = await repository.claim({
+    const result = await repository.claim({ executionContext: TEST_BINDING.executionContext,
         operationId: 'operation-1',
         owner: 'worker-1',
         leaseMs: 30_000,
@@ -793,6 +794,7 @@ test('claim reads only durable candidates and never resets later active phases',
         method: 'findOneAndUpdate',
         query: {
             _id: 'operation-1',
+            ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
             $or: [
                 { status: 'queued' },
                 {
@@ -825,6 +827,8 @@ test('claim reads only durable candidates and never resets later active phases',
             lean: true,
             projection: {
                 _id: 1,
+                executionContext: 1,
+                idempotencyKey: 1,
                 topologyRevision: 1,
                 priorDeployedRevision: 1,
                 kind: 1,
@@ -874,7 +878,7 @@ test('claim reacquires expired committing and rolling-back phases without resett
     };
     const repository = new TopologyOperationRepository({ model });
 
-    const result = await repository.claim({
+    const result = await repository.claim({ executionContext: TEST_BINDING.executionContext,
         operationId: 'operation-1',
         owner: 'worker-1',
         leaseMs: 30_000,
@@ -886,6 +890,7 @@ test('claim reacquires expired committing and rolling-back phases without resett
         method: 'findOneAndUpdate',
         query: {
             _id: 'operation-1',
+            ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
             status: { $in: ['preparing', 'committing', 'rolling_back'] },
             leaseUntil: { $lte: NOW },
         },
@@ -902,6 +907,8 @@ test('claim reacquires expired committing and rolling-back phases without resett
             lean: true,
             projection: {
                 _id: 1,
+                executionContext: 1,
+                idempotencyKey: 1,
                 topologyRevision: 1,
                 priorDeployedRevision: 1,
                 kind: 1,
@@ -972,7 +979,7 @@ test('PPP wait CAS keeps committing admission and reclaims the expired durable w
     assert.equal(await repository.acknowledgePppLockRelease({ operationId: 'operation-1',
         owner: 'worker-1', now: NOW, node: 'relay-a', generation: 'generation-1',
         lockOwner: 'worker-1' }), true);
-    const reclaimed = await repository.claim({ operationId: 'operation-1',
+    const reclaimed = await repository.claim({ executionContext: TEST_BINDING.executionContext, operationId: 'operation-1',
         owner: 'worker-2', now: new Date(NOW.getTime() + 30_000), leaseMs: 30_000 });
     assert.equal(reclaimed.status, 'committing');
     assert.equal(reclaimed.heldTopologyAdmission, true);

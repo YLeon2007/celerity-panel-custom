@@ -146,7 +146,7 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
     const finalizer = new TopologyOperationFinalizer({ clock: { now: () => now },
         repository: new TopologyOperationFinalizationRepository({ TopologyOperation, CascadeTopologyState,
             transactionRunner: work => work({}) }) });
-    const worker = new TopologyOperationWorker({ operationRepository, executor: effectiveExecutor,
+    const worker = new TopologyOperationWorker({ executionContext, operationRepository, executor: effectiveExecutor,
         finalizer, lockService, workerId: 'worker-uncertain', leaseMs: 30000,
         clock: { now: () => now }, allowUnprovenTestExecution: true });
     const consumer = new TopologyIntentConsumer({ executionContext, TopologyOperation, CascadeTopologyState,

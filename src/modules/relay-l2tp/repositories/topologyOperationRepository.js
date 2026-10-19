@@ -4,7 +4,8 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
-const { topologyExecutionContext, matchesTopologyOperationExecutionContext } = require('../domain/topologyExecutionContext');
+const { topologyExecutionContext, matchesTopologyExecutionContext, matchesTopologyOperationExecutionContext } = require('../domain/topologyExecutionContext');
+const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
 
 const ACTIVE_STATUSES = Object.freeze([
     'preparing',
@@ -36,6 +37,8 @@ const TARGET_BY_ROLE = Object.freeze({
 });
 const CLAIM_PROJECTION = Object.freeze({
     _id: 1,
+    executionContext: 1,
+    idempotencyKey: 1,
     topologyRevision: 1,
     priorDeployedRevision: 1,
     kind: 1,
@@ -364,7 +367,11 @@ class TopologyOperationRepository {
         return result.matchedCount === 1 ? (verified ? 'verified' : 'unverified') : null;
     }
 
-    async claim({ operationId: id, owner, leaseMs, now }) {
+    async claim({ operationId: id, owner, leaseMs, now, executionContext }) {
+        const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!matchesTopologyExecutionContext(executionContext, context)) {
+            throw new TypeError('Topology operation claim requires a trusted execution context');
+        }
         const lease = new Date(now.getTime() + leaseMs);
         const options = {
             new: true,
@@ -374,6 +381,7 @@ class TopologyOperationRepository {
         };
         const claimed = await this.model.findOneAndUpdate({
             _id: id,
+            ...topologyOperationClaimBindingFilter(context),
             $or: [
                 { status: 'queued' },
                 {
@@ -403,6 +411,7 @@ class TopologyOperationRepository {
 
         return this.model.findOneAndUpdate({
             _id: id,
+            ...topologyOperationClaimBindingFilter(context),
             status: { $in: [...ACTIVE_STATUSES] },
             leaseUntil: { $lte: now },
         }, {

@@ -8,6 +8,7 @@ const { TopologyOperationWorker } = require('../workers/topologyOperationWorker'
 const { TopologyAttachIngressGate } = require('../services/topologyAttachIngressGate');
 const { cascadePathIngressPort } = require('../domain/cascadePathIngress');
 
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST_CONTEXT } = require('../domain/topologyExecutionContext');
 const port = cascadePathIngressPort('group', 'main');
 const ingress = { tag: 'cascade-main', listen: '127.0.0.1', port, protocol: 'socks', settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' } };
 const baseConfig = { inbounds: [{ tag: 'relay-l2tp-group', listen: '0.0.0.0', port: 12345, protocol: 'dokodemo-door', settings: { network: 'tcp,udp', followRedirect: true }, streamSettings: { sockopt: { tproxy: 'tproxy' } } }], outbounds: [{ tag: 'cascade-main', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port }] } }], routing: { rules: [{ type: 'field', inboundTag: ['relay-l2tp-group'], ip: ['geoip:private'], outboundTag: 'block' }, { type: 'field', inboundTag: ['relay-l2tp-group'], outboundTag: 'cascade-main' }] } };
@@ -23,7 +24,9 @@ function relayNode(config = { inbounds: [ingress], outbounds: [{ tag: 'downstrea
 }
 function fixture({ kind = 'link.attach', metadata = {}, node = relayNode(), gate, ppp = { async verifyPlan() { return { ok: true }; } } } = {}) {
     const events = [];
-    const operation = { _id: 'operation-1', kind, groupId: 'group', pathKey: 'main', ownerNodeId: 'r1', topologyRevision: 7, priorDeployedRevision: 5, status: 'preparing', nodes: [node], ...metadata };
+    const operation = { executionContext: TEST_CONTEXT,
+        idempotencyKey: 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
+        _id: 'operation-1', kind, groupId: 'group', pathKey: 'main', ownerNodeId: 'r1', topologyRevision: 7, priorDeployedRevision: 5, status: 'preparing', nodes: [node], ...metadata };
     const repository = {
         async claim() { events.push('claim'); return operation; },
         async renewLease() { return true; },
@@ -38,7 +41,7 @@ function fixture({ kind = 'link.attach', metadata = {}, node = relayNode(), gate
         async rollback() { events.push('rollback'); return { ok: true }; },
         async cleanupPrepared() { return { ok: true }; },
     };
-    const worker = new TopologyOperationWorker({ operationRepository: repository, executor,
+    const worker = new TopologyOperationWorker({ executionContext: TEST_CONTEXT, operationRepository: repository, executor,
         finalizer: { async finalizeSucceeded() { events.push('finalize'); return { ok: true }; } },
         lockService: { async acquire() { return { ok: true, lock: { generation: 'g1' } }; }, async renew() { return { ok: true }; }, async releaseVerified() { return { ok: true }; }, async release() { return { ok: true }; } },
         workerId: 'worker', leaseMs: 30000, clock: { now: () => new Date('2026-09-29T00:00:00Z') },
