@@ -101,10 +101,10 @@ test('production L2TP admission requires its own server-only opt-in and never in
 test('production is dormant without all independent production prerequisites', () => {
     for (const env of [
         { ...PROD_ENV, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: undefined },
+        { ...PROD_ENV, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: undefined,
+            TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' },
         { ...PROD_ENV, L2TP_EXECUTION_ENABLED: 'false' },
         { ...PROD_ENV, L2TP_MIGRATIONS_ENABLED: 'false' },
-        { ...PROD_ENV, PANEL_DOMAIN: undefined },
-        { ...PROD_ENV, PANEL_DOMAIN: TEST.hostIdentity },
     ]) {
         const { host, captured } = compose(env);
         assert.equal(host.topologyIntentService, undefined);
@@ -114,8 +114,18 @@ test('production is dormant without all independent production prerequisites', (
     }
 });
 
-test('TEST flag alone cannot compose production admission or recovery through an injected adapter', () => {
-    assert.throws(() => compose({ ...TEST_ENV, PANEL_DOMAIN: PROD.hostIdentity }), /exact execution identity/);
+test('preexisting TEST flag on PROD cannot compose production admission or recovery', () => {
+    const { host, captured } = compose({ ...TEST_ENV, PANEL_DOMAIN: PROD.hostIdentity });
+    assert.equal(host.topologyIntentService, undefined);
+    assert.equal(captured.deployment, undefined);
+    assert.equal(captured.recovery, undefined);
+});
+
+test('explicit production opt-in with an unknown host identity fails before factory calls', () => {
+    assert.throws(() => compose({ ...PROD_ENV, PANEL_DOMAIN: 'unknown.invalid' }), /exact execution identity/);
+    assert.throws(() => compose({ ...PROD_ENV, PANEL_DOMAIN: undefined }), /exact execution identity/);
+    assert.throws(() => compose({ ...PROD_ENV, PANEL_DOMAIN: TEST.hostIdentity }), /exact execution identity/);
+    assert.throws(() => compose({ ...TEST_ENV, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' }), /exact execution identity/);
 });
 
 test('production never inherits the TEST-only unfenced client-proof queue', () => {

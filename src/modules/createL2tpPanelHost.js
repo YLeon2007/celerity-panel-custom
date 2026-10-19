@@ -67,8 +67,16 @@ function createL2tpPanelHost({
     );
     const executionContext = resolveTopologyExecutionContext(topologyEnv);
     const l2tpExecutionAuthorization = resolveL2tpExecutionAuthorization(topologyEnv);
-    const topologyExecutionRequested = isTopologyTestExecutionEnabled(topologyEnv)
-        || executionContext !== undefined;
+    if (topologyEnv.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
+        && topologyEnv.PANEL_DOMAIN !== 'lm1.infograd.online') {
+        throw new TypeError('Opted-in topology recovery requires an operation worker with an exact execution identity');
+    }
+    const topologyExecutionRequested = (
+        topologyEnv.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
+        && topologyEnv.L2TP_EXECUTION_ENABLED === 'true'
+        && topologyEnv.L2TP_MIGRATIONS_ENABLED === 'true'
+    ) || (topologyEnv.PANEL_DOMAIN !== 'lm1.infograd.online'
+        && isTopologyTestExecutionEnabled(topologyEnv));
     if (topologyExecutionRequested && !executionContext) {
         throw new TypeError(
             'Opted-in topology recovery requires an operation worker with an exact execution identity',
