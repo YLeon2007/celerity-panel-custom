@@ -59,6 +59,20 @@ function createL2tpPanelHost({
     createRuntime = createL2tpRuntime,
     createExecutionRuntime = createL2tpExecutionRuntime,
 } = {}) {
+    // Select once before any injected factory can change the source environment.
+    const topologyEnv = Object.freeze({ ...env });
+    const { isTopologyTestExecutionEnabled, resolveTopologyExecutionContext } = require(
+        './relay-l2tp/runtime/createTopologyOperationRuntime'
+    );
+    const executionContext = resolveTopologyExecutionContext(topologyEnv);
+    const topologyExecutionRequested = isTopologyTestExecutionEnabled(topologyEnv)
+        || executionContext !== undefined;
+    if (topologyExecutionRequested && !executionContext) {
+        throw new TypeError(
+            'Opted-in topology recovery requires an operation worker with an exact execution identity',
+        );
+    }
+    const testWorkerExecutionAllowed = executionContext?.target === 'test';
     const models = injectedModuleEntry.registerModels();
     const topologyRuntimeDependencies = {
         HyNode: injectedHyNode,
@@ -112,10 +126,6 @@ function createL2tpPanelHost({
         await service.deploy({ expectedTopologyRevision: revision });
     };
 
-    const { isTopologyTestExecutionEnabled, isTestWorkerExecutionAllowed } = require(
-        './relay-l2tp/runtime/createTopologyOperationRuntime'
-    );
-    const testWorkerExecutionAllowed = isTestWorkerExecutionAllowed(env);
     const executionRuntime = createExecutionRuntime({
         workerLifecycle,
         HyNode: injectedHyNode,
@@ -164,14 +174,15 @@ function createL2tpPanelHost({
         },
     });
 
-    if (isTopologyTestExecutionEnabled(env)) {
+    if (executionContext) {
         if (typeof injectedModuleEntry.createTopologyDeploymentService !== 'function') {
             throw new TypeError(
                 'Opted-in topology recovery requires createTopologyDeploymentService',
             );
         }
         topologyDeploymentService = injectedModuleEntry.createTopologyDeploymentService({
-            env,
+            env: topologyEnv,
+            executionContext,
             HyNode: injectedHyNode,
             CascadeLink: injectedCascadeLink,
             CascadeRouteGroup: models.CascadeRouteGroup,
@@ -189,11 +200,11 @@ function createL2tpPanelHost({
         if (typeof topologyDeploymentService?.operationWorker?.run !== 'function') {
             throw new TypeError('Opted-in topology recovery requires an operation worker');
         }
-        // An explicit TEST probe identity is required; never fall back to
-        // process.env when this host's env does not authorize client proof.
+        // This separate proof queue is still TEST-only; it has no production
+        // identity fencing. Never enable it just because production opted in.
         let clientProofWorker;
-        if (typeof env.TOPOLOGY_PROBE_USER_ID === 'string'
-            && env.TOPOLOGY_PROBE_USER_ID.trim()) {
+        if (testWorkerExecutionAllowed && typeof topologyEnv.TOPOLOGY_PROBE_USER_ID === 'string'
+            && topologyEnv.TOPOLOGY_PROBE_USER_ID.trim()) {
             const { TopologyOperationRepository } = require('./relay-l2tp/repositories/topologyOperationRepository');
             const { TopologyClientReadinessWorker } = require('./relay-l2tp/workers/topologyClientReadinessWorker');
             const { TopologyClientProofExecutor } = require('./relay-l2tp/services/topologyClientProofExecutor');
@@ -205,7 +216,7 @@ function createL2tpPanelHost({
                 CascadeRouteGroup: models.CascadeRouteGroup,
                 RelayL2tpState: models.RelayL2tpState,
                 NodeSSH: NodeSSH ?? require('../services/nodeSSH'),
-                profileSource: new TopologyPublishedProfileSource({ probeUserId: env.TOPOLOGY_PROBE_USER_ID }),
+                profileSource: new TopologyPublishedProfileSource({ probeUserId: topologyEnv.TOPOLOGY_PROBE_USER_ID }),
             });
             clientProofWorker = new TopologyClientReadinessWorker({
                 repository: new TopologyOperationRepository({
@@ -216,9 +227,10 @@ function createL2tpPanelHost({
                 now: () => clock.now(),
             });
         }
-        if (testWorkerExecutionAllowed && typeof injectedModuleEntry.createTopologyIntentService === 'function') {
+        if (typeof injectedModuleEntry.createTopologyIntentService === 'function') {
             topologyIntentService = injectedModuleEntry.createTopologyIntentService({
                 ...models,
+                executionContext,
                 HyNode: injectedHyNode,
                 CascadeLink: injectedCascadeLink,
                 clock,
@@ -229,7 +241,8 @@ function createL2tpPanelHost({
             ?? require('./relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle')
                 .createTopologyOperationRecoveryLifecycle;
         topologyRecoveryLifecycle = recoveryFactory({
-            env,
+            env: topologyEnv,
+            executionContext,
             operationModel: models.TopologyOperation,
             worker: topologyDeploymentService.operationWorker,
             ...(topologyIntentService ? { intentConsumer: topologyIntentService } : {}),

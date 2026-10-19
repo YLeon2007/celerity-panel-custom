@@ -587,7 +587,7 @@ test('assembled flag-positive host without an exact identity fails closed before
         },
     }), /Opted-in topology recovery requires an operation worker/);
 
-    assert.equal(assembledService.operationWorker, undefined);
+    assert.equal(assembledService, undefined, 'invalid identity must fail before constructing adapters');
     assert.equal(recoveredWorker, undefined);
     assert.deepEqual(calls, []);
 });

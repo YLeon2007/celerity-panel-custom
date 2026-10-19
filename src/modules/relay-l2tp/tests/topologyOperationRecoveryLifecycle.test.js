@@ -413,7 +413,7 @@ test('host closes both admissions before joining either drain and preserves topo
     let finishRecovery;
     const recoveryDrain = new Promise(resolve => { finishRecovery = resolve; });
     const calls = [];
-    const host = createL2tpPanelHost({ env: ENABLED_ENV, HyNode: {}, CascadeLink: {},
+    const host = createL2tpPanelHost({ env: { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' }, HyNode: {}, CascadeLink: {},
         moduleEntry: { registerModels: () => ({}),
             createTopologyDeploymentService: () => ({ operationWorker: { async run() {} } }) },
         topologyRuntime: {}, Repository: class {}, createRepositoryAdapters: () => ({}),
@@ -490,7 +490,7 @@ test('panel host lazily registers opted-in topology recovery and stops it before
     };
 
     const host = createL2tpPanelHost({
-        env: ENABLED_ENV,
+        env: { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' },
         moduleEntry,
         HyNode,
         CascadeLink,
@@ -525,9 +525,9 @@ test('panel host lazily registers opted-in topology recovery and stops it before
         'topology.create',
         'recovery.create',
     ]);
-    assert.strictEqual(deploymentDependencies.env, ENABLED_ENV);
+    assert.deepEqual(deploymentDependencies.env, { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' });
     assert.strictEqual(deploymentDependencies.TopologyOperation, TopologyOperation);
-    assert.strictEqual(recoveryDependencies.env, ENABLED_ENV);
+    assert.strictEqual(recoveryDependencies.env, deploymentDependencies.env);
     assert.strictEqual(recoveryDependencies.operationModel, TopologyOperation);
     assert.strictEqual(recoveryDependencies.worker, topologyWorker);
     assert.strictEqual(recoveryDependencies.clock, clock);
@@ -588,7 +588,7 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
         L2tpOperation: {}, NodeOperationLock: {},
     };
     const host = createL2tpPanelHost({
-        env: { ...ENABLED_ENV, TOPOLOGY_PROBE_USER_ID: 'test-probe-user' },
+        env: { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online', TOPOLOGY_PROBE_USER_ID: 'test-probe-user' },
         moduleEntry: {
             registerModels: () => models,
             createTopologyDeploymentService: () => ({ operationWorker: { async run() {} } }),
@@ -658,7 +658,7 @@ test('TEST host without probe user leaves proof unclaimed while topology recover
         async findOneAndUpdate() { proofClaims += 1; throw Error('must not claim'); },
     };
     const host = createL2tpPanelHost({
-        env: ENABLED_ENV,
+        env: { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' },
         moduleEntry: {
             registerModels: () => ({ TopologyOperation, RelayL2tpState: {}, CascadeTopologyState: {},
                 CascadeRouteGroup: {}, L2tpOperation: {}, NodeOperationLock: {} }),
