@@ -43,7 +43,7 @@ invoke() {
     stderr_file="$TMP_DIR/$label.stderr"
     status=0
     set +e
-    printf '%s' "$candidate" | CELERITY_TOPOLOGY_ROOT="$TEST_ROOT" "$RUNNER" \
+    printf '%s' "$candidate" | CELERITY_TOPOLOGY_ROOT="$TEST_ROOT" "$PAYLOAD_RUNNER" \
         --command "$command" \
         --operation-id "$operation_id" \
         --node-id "$node_id" \
@@ -58,6 +58,18 @@ invoke() {
 }
 
 [[ -x "$RUNNER" ]] || fail 'topology runner is missing or not executable'
+# Preserve the existing config/backup/check regression matrix for the private
+# shell payload. topologyRunnerFence.test.js exercises the ONLY public entry
+# point, including v2 validation, exclusive execution and terminal closure.
+PAYLOAD_RUNNER="$TMP_DIR/payload-runner"
+/usr/bin/python3 - "$RUNNER" "$PAYLOAD_RUNNER" <<'PY'
+import os, sys
+with open(sys.argv[1]) as handle:
+    payload = handle.read().split('# BEGIN_FENCED_SHELL_PAYLOAD\n', 1)[1]
+with open(sys.argv[2], 'w') as handle:
+    handle.write('#!/usr/bin/env bash\n' + payload)
+os.chmod(sys.argv[2], 0o700)
+PY
 mkdir -p \
     "$TEST_ROOT/usr/local/bin" \
     "$TEST_ROOT/usr/bin" \

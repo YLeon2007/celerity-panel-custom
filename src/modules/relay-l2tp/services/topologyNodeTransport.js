@@ -9,6 +9,8 @@ const TOPOLOGY_NODE_COMMANDS = Object.freeze({
     COMMIT: 'commit',
     VERIFY: 'verify',
     ROLLBACK: 'rollback',
+    CLOSE: 'close',
+    STATUS: 'status',
 });
 const TARGET_PROFILES = new Set(['xray-main', 'xray-bridge']);
 const SERVICE_BY_TARGET_PROFILE = Object.freeze({
@@ -17,7 +19,9 @@ const SERVICE_BY_TARGET_PROFILE = Object.freeze({
 });
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CANDIDATE_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const FENCE_KEYS = Object.freeze(['executionContext', 'attemptId', 'generation', 'predecessorGeneration', 'commandId']);
 const BASE_KEYS = Object.freeze([
+    ...FENCE_KEYS,
     'backupId',
     'candidateHash',
     'nodeId',
@@ -27,7 +31,8 @@ const BASE_KEYS = Object.freeze([
 const RECEIPT_KEYS = Object.freeze([
     ...BASE_KEYS,
     'command',
-    'ok',
+    'ok', 'protocolVersion', 'completion', 'phase', 'terminal', 'terminalOutcome',
+    'ownershipRetained', 'bootId', 'systemdJob', 'serviceState', 'completedCommand',
 ].sort());
 
 class TopologyNodeTransportError extends Error {
@@ -35,6 +40,8 @@ class TopologyNodeTransportError extends Error {
         super(message);
         this.name = 'TopologyNodeTransportError';
         this.code = code;
+        this.ownershipRetained = true;
+        this.remoteOutcomeUnknown = ['INVALID_RECEIPT', 'ARTIFACT_INVOCATION_FAILED'].includes(code);
     }
 }
 
@@ -53,6 +60,10 @@ function assertBasePlan(plan, extraKeys = []) {
         || !SAFE_ID_PATTERN.test(plan.operationId)
         || !SAFE_ID_PATTERN.test(plan.nodeId)
         || !SAFE_ID_PATTERN.test(plan.backupId)
+        || ['attemptId', 'generation', 'predecessorGeneration', 'commandId'].some(key => !SAFE_ID_PATTERN.test(plan[key]) || ['.', '..'].includes(plan[key]))
+        || ['.', '..'].includes(plan.operationId) || ['.', '..'].includes(plan.nodeId) || ['.', '..'].includes(plan.backupId)
+        || plan.generation === 'none'
+        || !['test.infograd.online', 'lm1.infograd.online'].includes(plan.executionContext)
         || !CANDIDATE_HASH_PATTERN.test(plan.candidateHash)
         || !TARGET_PROFILES.has(plan.targetProfile)) {
         throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid topology node plan');
@@ -107,6 +118,28 @@ function assertArtifact(artifact, candidateHash) {
     }
 }
 
+// Completion is bounded to this runner's admitted commands, not arbitrary host
+// writers, bootstrap uploads, classic config ownership or database lock release.
+function validCompletion(receipt, completedCommand) {
+    const phases = { prepare: 'prepared', commit: 'committed', verify: 'verified', rollback: 'rolledback', close: 'closed' };
+    if (receipt.protocolVersion !== 2 || receipt.completion !== 'completed'
+        || receipt.ownershipRetained !== true || typeof receipt.bootId !== 'string'
+        || !SAFE_ID_PATTERN.test(receipt.bootId)
+        || receipt.completedCommand !== completedCommand || !Object.hasOwn(phases, completedCommand)
+        || receipt.phase !== phases[completedCommand]
+        || receipt.terminal !== (completedCommand === 'close')) return false;
+    if (completedCommand === 'close') {
+        if (!['verified', 'rolledback', 'cancelled'].includes(receipt.terminalOutcome)) return false;
+    } else if (receipt.terminalOutcome !== 'not-terminal') return false;
+    if (completedCommand === 'prepare' || receipt.terminalOutcome === 'cancelled') {
+        return receipt.systemdJob === 'not-applicable' && receipt.serviceState === 'not-applicable';
+    }
+    return receipt.systemdJob === 'completed'
+        && (receipt.serviceState === 'active:running'
+            || ((completedCommand === 'rollback' || receipt.terminalOutcome === 'rolledback')
+                && receipt.serviceState === 'inactive:dead'));
+}
+
 function parseReceipt(result, command, expected) {
     if (!result || typeof result !== 'object'
         || result.code !== 0
@@ -121,7 +154,7 @@ function parseReceipt(result, command, expected) {
         // diagnostics go to the server log only.
         try {
             const logger = require('../../../utils/logger');
-            logger.error(`[TopologyNodeTransport] invalid receipt: exit=${result?.code} stderr=${String(result?.stderr ?? '').slice(0, 300)} stdout=${String(result?.stdout ?? '').slice(0, 300)}`);
+            logger.error('[TopologyNodeTransport] invalid receipt; remote outcome unknown, ownership retained');
         } catch { /* logger unavailable in tests */ }
         throw error;
     }
@@ -137,19 +170,13 @@ function parseReceipt(result, command, expected) {
     }
     if (!hasExactKeys(receipt, RECEIPT_KEYS)
         || receipt.ok !== true
+        || JSON.stringify(receipt) !== serialized
         || receipt.command !== command
+        || !validCompletion(receipt, command === 'status' ? expected.completedCommand : command)
         || BASE_KEYS.some(key => receipt[key] !== expected[key])) {
         throw new TopologyNodeTransportError('INVALID_RECEIPT', 'Invalid topology node receipt');
     }
-    return Object.freeze({
-        ok: true,
-        command,
-        operationId: expected.operationId,
-        nodeId: expected.nodeId,
-        candidateHash: expected.candidateHash,
-        backupId: expected.backupId,
-        targetProfile: expected.targetProfile,
-    });
+    return Object.freeze({ ...receipt });
 }
 
 class TopologyNodeTransport {
@@ -163,10 +190,15 @@ class TopologyNodeTransport {
     }
 
     async #invoke(command, request, artifactRequired = false) {
+        request = { ...request }; // Freeze primitive binding before the first await.
         const checksRequired = command === TOPOLOGY_NODE_COMMANDS.VERIFY;
+        const statusRequired = command === TOPOLOGY_NODE_COMMANDS.STATUS;
         assertBasePlan(request, artifactRequired
             ? ['artifact']
-            : (checksRequired ? ['checks'] : []));
+            : (checksRequired ? ['checks'] : (statusRequired ? ['completedCommand'] : [])));
+        if (statusRequired && !['prepare', 'commit', 'verify', 'rollback', 'close'].includes(request.completedCommand)) {
+            throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid topology node plan');
+        }
         if (artifactRequired) assertArtifact(request.artifact, request.candidateHash);
         if (checksRequired && !validChecks(request.checks, request.targetProfile)) {
             throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid topology node plan');
@@ -176,6 +208,8 @@ class TopologyNodeTransport {
         try {
             result = await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, {
                 command,
+                ...Object.fromEntries(FENCE_KEYS.map(key => [key, request[key]])),
+                ...(statusRequired ? { completedCommand: request.completedCommand } : {}),
                 operationId: request.operationId,
                 nodeId: request.nodeId,
                 candidateHash: request.candidateHash,
@@ -207,6 +241,14 @@ class TopologyNodeTransport {
 
     rollback(request) {
         return this.#invoke(TOPOLOGY_NODE_COMMANDS.ROLLBACK, request);
+    }
+
+    close(request) {
+        return this.#invoke(TOPOLOGY_NODE_COMMANDS.CLOSE, request);
+    }
+
+    status(request) {
+        return this.#invoke(TOPOLOGY_NODE_COMMANDS.STATUS, request);
     }
 }
 

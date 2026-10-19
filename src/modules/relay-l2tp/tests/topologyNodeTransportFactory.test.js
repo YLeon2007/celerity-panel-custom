@@ -21,6 +21,7 @@ const artifactContent = `${JSON.stringify({
     routing: { rules: [] },
 })}\n`;
 const candidateHash = `sha256:${createHash('sha256').update(artifactContent).digest('hex')}`;
+const fencePlan = Object.freeze({ executionContext: 'test.infograd.online', attemptId: 'attempt-1', generation: 'generation-1', predecessorGeneration: 'none', commandId: 'command-1' });
 const checks = Object.freeze([
     Object.freeze({
         type: 'service',
@@ -39,11 +40,19 @@ function receipt(command, plan) {
     return {
         ok: true,
         command,
+        ...fencePlan,
         operationId: plan.operationId,
         nodeId: plan.nodeId,
         candidateHash: plan.candidateHash,
         backupId: plan.backupId,
         targetProfile: plan.targetProfile,
+        protocolVersion: 2, completion: 'completed', ownershipRetained: true, bootId: 'boot-1',
+        phase: { prepare: 'prepared', commit: 'committed', verify: 'verified', rollback: 'rolledback', close: 'closed', status: 'closed' }[command],
+        completedCommand: command === 'status' ? 'close' : command,
+        terminal: ['close', 'status'].includes(command),
+        terminalOutcome: ['close', 'status'].includes(command) ? 'verified' : 'not-terminal',
+        systemdJob: command === 'prepare' ? 'not-applicable' : 'completed',
+        serviceState: command === 'prepare' ? 'not-applicable' : 'active:running',
     };
 }
 
@@ -60,6 +69,7 @@ test('creates a typed role-bound transport over only the fixed topology runner a
         async exec(command, options) {
             execCalls.push({ command, options });
             const plan = {
+                ...fencePlan,
                 operationId: 'topology-operation-17',
                 nodeId: 'portal-node',
                 candidateHash,
@@ -75,10 +85,11 @@ test('creates a typed role-bound transport over only the fixed topology runner a
             return nodeSSH;
         },
     };
-    const factory = new TopologyNodeTransportFactory({ nodeExecutionResolver });
+    const factory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online', nodeExecutionResolver });
 
     const transport = await factory.create({ nodeId: 'portal-node', role: 'portal' });
     const result = await transport.prepare({
+        ...fencePlan,
         operationId: 'topology-operation-17',
         nodeId: 'portal-node',
         candidateHash,
@@ -97,10 +108,13 @@ test('creates a typed role-bound transport over only the fixed topology runner a
             `--candidate-hash ${candidateHash}`,
             '--backup-id topology-backup-17-portal',
             '--target-profile xray-main',
+            '--execution-context test.infograd.online', '--attempt-id attempt-1',
+            '--generation generation-1', '--predecessor-generation none', '--command-id command-1',
         ].join(' '),
         options: { stdin: artifactContent },
     }]);
     assert.deepEqual(result, receipt('prepare', {
+        ...fencePlan,
         operationId: 'topology-operation-17',
         nodeId: 'portal-node',
         candidateHash,
@@ -120,6 +134,7 @@ test('binds node identity and role profile across every lifecycle command', asyn
             execCalls.push({ command, options });
             const commandName = command.match(/--command ([a-z]+)/)?.[1];
             return execResult(receipt(commandName, {
+                ...fencePlan,
                 operationId: 'topology-operation-18',
                 nodeId: 'relay-node',
                 candidateHash,
@@ -128,11 +143,12 @@ test('binds node identity and role profile across every lifecycle command', asyn
             }));
         },
     };
-    const factory = new TopologyNodeTransportFactory({
+    const factory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online',
         nodeExecutionResolver: { resolve: async () => nodeSSH },
     });
     const transport = await factory.create({ nodeId: 'relay-node', role: 'relay' });
     const plan = {
+        ...fencePlan,
         operationId: 'topology-operation-18',
         nodeId: 'relay-node',
         candidateHash,
@@ -185,6 +201,18 @@ test('binds node identity and role profile across every lifecycle command', asyn
     assert.equal(execCalls.length, 4);
 });
 
+test('missing factory context refuses before resolver/bootstrap; bound context cannot be supplied by the plan', async () => {
+    let resolves = 0, execs = 0;
+    const nodeExecutionResolver = { resolve: async () => { resolves++; return { exec: async () => { execs++; } }; } };
+    const unavailable = new TopologyNodeTransportFactory({ nodeExecutionResolver });
+    await assert.rejects(unavailable.create({ nodeId: 'portal-node', role: 'portal' }), { code: 'TOPOLOGY_NODE_TRANSPORT_UNAVAILABLE' });
+    assert.equal(resolves, 0);
+    const factory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online', nodeExecutionResolver });
+    const transport = await factory.create({ nodeId: 'portal-node', role: 'portal' });
+    await assert.rejects(transport.commit({ ...fencePlan, executionContext: 'lm1.infograd.online', operationId: 'operation-1', nodeId: 'portal-node', candidateHash, backupId: 'backup-1', targetProfile: 'xray-main' }), { code: 'ARTIFACT_INVOCATION_FAILED', ownershipRetained: true, remoteOutcomeUnknown: true });
+    assert.equal(execs, 0);
+});
+
 test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH without leaking details', async () => {
     const resolverCalls = [];
     const forbiddenRequests = [
@@ -196,7 +224,7 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
         { nodeId: 'portal-node', role: 'portal', argv: ['id'] },
         { nodeId: 'portal-node', role: 'portal', env: { TOKEN: 'request-secret' } },
     ];
-    const factory = new TopologyNodeTransportFactory({
+    const factory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online',
         nodeExecutionResolver: {
             async resolve(request) {
                 resolverCalls.push(request);
@@ -217,7 +245,7 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
     assert.deepEqual(resolverCalls, []);
 
     for (const missingNodeSSH of [null, {}, { exec: null }]) {
-        const unavailableFactory = new TopologyNodeTransportFactory({
+        const unavailableFactory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online',
             nodeExecutionResolver: { resolve: async () => missingNodeSSH },
         });
         await assert.rejects(
@@ -233,7 +261,7 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
             fixedFacade = invokeArtifact;
         }
     }
-    const facadeFactory = new TopologyNodeTransportFactory({
+    const facadeFactory = new TopologyNodeTransportFactory({ executionContext: 'test.infograd.online',
         nodeExecutionResolver: {
             resolve: async () => ({
                 async exec() {
@@ -248,6 +276,7 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
     await assert.rejects(
         fixedFacade('/tmp/request-runner', {
             command: 'commit',
+            ...fencePlan,
             operationId: 'topology-operation-19',
             nodeId: 'bridge-node',
             candidateHash,
@@ -261,6 +290,7 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
     await assert.rejects(
         fixedFacade('/usr/local/bin/celerity-topology-node-runner', {
             command: 'prepare',
+            ...fencePlan,
             operationId: 'topology-operation-19',
             nodeId: 'bridge-node',
             candidateHash,

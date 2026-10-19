@@ -21,7 +21,9 @@ const SERVICE_BY_TARGET_PROFILE = Object.freeze({
     'xray-main': 'xray.service',
     'xray-bridge': 'xray-bridge.service',
 });
+const FENCE_KEYS = Object.freeze(['executionContext', 'attemptId', 'generation', 'predecessorGeneration', 'commandId']);
 const BASE_RUNNER_REQUEST_KEYS = Object.freeze([
+    ...FENCE_KEYS,
     'backupId',
     'candidateHash',
     'command',
@@ -76,15 +78,21 @@ function validChecks(checks, targetProfile) {
 function assertRunnerRequest(runnerPath, request, binding) {
     const artifactRequired = request?.command === TOPOLOGY_NODE_COMMANDS.PREPARE;
     const checksRequired = request?.command === TOPOLOGY_NODE_COMMANDS.VERIFY;
+    const statusRequired = request?.command === TOPOLOGY_NODE_COMMANDS.STATUS;
     const expectedKeys = artifactRequired
         ? [...BASE_RUNNER_REQUEST_KEYS, 'artifact'].sort()
         : (checksRequired
             ? [...BASE_RUNNER_REQUEST_KEYS, 'checks'].sort()
-            : BASE_RUNNER_REQUEST_KEYS);
+            : (statusRequired ? [...BASE_RUNNER_REQUEST_KEYS, 'completedCommand'].sort() : [...BASE_RUNNER_REQUEST_KEYS].sort()));
     if (
         runnerPath !== TOPOLOGY_NODE_RUNNER_PATH
         || !hasExactKeys(request, expectedKeys)
         || !COMMANDS.has(request.command)
+        || BASE_RUNNER_REQUEST_KEYS.some(key => typeof request[key] !== 'string')
+        || ['attemptId', 'generation', 'predecessorGeneration', 'commandId'].some(key => !SAFE_ID_PATTERN.test(request[key]) || ['.', '..'].includes(request[key]))
+        || request.generation === 'none'
+        || request.executionContext !== binding.executionContext
+        || (statusRequired && !['prepare', 'commit', 'verify', 'rollback', 'close'].includes(request.completedCommand))
         || request.nodeId !== binding.nodeId
         || request.targetProfile !== binding.targetProfile
         || !SAFE_ID_PATTERN.test(request.operationId)
@@ -117,6 +125,11 @@ function runnerCommand(request) {
         `--candidate-hash ${request.candidateHash}`,
         `--backup-id ${request.backupId}`,
         `--target-profile ${request.targetProfile}`,
+        `--execution-context ${request.executionContext}`,
+        `--attempt-id ${request.attemptId}`,
+        `--generation ${request.generation}`,
+        `--predecessor-generation ${request.predecessorGeneration}`,
+        `--command-id ${request.commandId}`,
     ];
     if (request.command === TOPOLOGY_NODE_COMMANDS.VERIFY) {
         const encodedChecks = Buffer.from(JSON.stringify(request.checks), 'utf8')
@@ -146,8 +159,9 @@ function createArtifactInvoker(nodeSSH, binding) {
 class TopologyNodeTransportFactory {
     #nodeExecutionResolver;
     #NodeTransport;
+    #executionContext;
 
-    constructor({ nodeExecutionResolver, NodeTransport = TopologyNodeTransport } = {}) {
+    constructor({ nodeExecutionResolver, NodeTransport = TopologyNodeTransport, executionContext } = {}) {
         if (!nodeExecutionResolver || typeof nodeExecutionResolver.resolve !== 'function') {
             throw new TypeError('TopologyNodeTransportFactory requires nodeExecutionResolver.resolve');
         }
@@ -156,10 +170,12 @@ class TopologyNodeTransportFactory {
         }
         this.#nodeExecutionResolver = nodeExecutionResolver;
         this.#NodeTransport = NodeTransport;
+        this.#executionContext = executionContext;
     }
 
     async create(request) {
-        if (!isExactResolutionRequest(request)) {
+        if (!isExactResolutionRequest(request)
+            || !['test.infograd.online', 'lm1.infograd.online'].includes(this.#executionContext)) {
             throw new TopologyNodeTransportFactoryError();
         }
 
@@ -180,6 +196,7 @@ class TopologyNodeTransportFactory {
             return new this.#NodeTransport({
                 invokeArtifact: createArtifactInvoker(nodeSSH, {
                     nodeId: request.nodeId,
+                    executionContext: this.#executionContext,
                     targetProfile: TARGET_PROFILE_BY_ROLE[request.role],
                 }),
             });

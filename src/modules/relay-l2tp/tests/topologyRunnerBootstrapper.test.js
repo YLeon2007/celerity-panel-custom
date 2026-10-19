@@ -26,7 +26,7 @@ const TEST_AUTHORIZATION = Object.freeze({
 const RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
 const UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner.upload';
 const NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner.next';
-const RUNNER_DIGEST = '5dac7c11d85776aa93622ed6a6036b841ba43fe9db5db4b0fe2744b7dce1a030';
+const RUNNER_DIGEST = '649f9588cd190afd957ccf140562848acf08a712ce1c32e9e8818e7e61804d62';
 const INSPECT_COMMAND = [
     `if /usr/bin/test -f ${RUNNER_PATH} && /usr/bin/test ! -L ${RUNNER_PATH}; then`,
     `/usr/bin/sha256sum -- ${RUNNER_PATH}`,

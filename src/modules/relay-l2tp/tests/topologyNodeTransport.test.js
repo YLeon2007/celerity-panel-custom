@@ -25,6 +25,8 @@ const artifactContent = `${JSON.stringify({
 })}\n`;
 const candidateHash = `sha256:${createHash('sha256').update(artifactContent).digest('hex')}`;
 const basePlan = Object.freeze({
+    executionContext: 'test.infograd.online', attemptId: 'attempt-1', generation: 'generation-1',
+    predecessorGeneration: 'none', commandId: 'command-1',
     operationId: 'topology-operation-17',
     nodeId: 'bridge-node-2',
     candidateHash,
@@ -50,6 +52,13 @@ function receipt(command, overrides = {}) {
         ok: true,
         command,
         ...basePlan,
+        protocolVersion: 2, completion: 'completed', ownershipRetained: true, bootId: 'boot-1',
+        phase: { prepare: 'prepared', commit: 'committed', verify: 'verified', rollback: 'rolledback', close: 'closed', status: 'closed' }[command],
+        completedCommand: command === 'status' ? 'close' : command,
+        terminal: ['close', 'status'].includes(command),
+        terminalOutcome: ['close', 'status'].includes(command) ? 'verified' : 'not-terminal',
+        systemdJob: command === 'prepare' ? 'not-applicable' : 'completed',
+        serviceState: command === 'prepare' ? 'not-applicable' : 'active:running',
         ...overrides,
     };
 }
@@ -82,6 +91,8 @@ test('prepare sends one fixed Xray candidate to the fixed topology runner and re
         COMMIT: 'commit',
         VERIFY: 'verify',
         ROLLBACK: 'rollback',
+        CLOSE: 'close',
+        STATUS: 'status',
     }));
     assert.deepEqual(calls, [{
         runnerPath: TOPOLOGY_NODE_RUNNER_PATH,
@@ -98,16 +109,47 @@ test('prepare sends one fixed Xray candidate to the fixed topology runner and re
     assert.equal(Object.isFrozen(result), true);
 });
 
-test('exposes only the four typed topology lifecycle methods', () => {
+test('exposes only typed topology lifecycle and completion methods', () => {
     const transport = new TopologyNodeTransport({ invokeArtifact: async () => null });
 
     assert.deepEqual(
         Object.getOwnPropertyNames(Object.getPrototypeOf(transport)),
-        ['constructor', 'prepare', 'commit', 'verify', 'rollback'],
+        ['constructor', 'prepare', 'commit', 'verify', 'rollback', 'close', 'status'],
     );
     assert.equal(transport.exec, undefined);
     assert.equal(transport.run, undefined);
     assert.deepEqual(Object.keys(transport), []);
+});
+
+test('receipt binding uses the dispatched snapshot even if the caller mutates its request while awaiting remote completion', async () => {
+    let finish;
+    const transport = new TopologyNodeTransport({ invokeArtifact: () => new Promise(resolve => { finish = resolve; }) });
+    const request = { ...basePlan };
+    const pending = transport.commit(request);
+    request.generation = 'later-caller-generation';
+    finish(execResult(receipt('commit')));
+    assert.equal((await pending).generation, basePlan.generation);
+});
+
+test('unfenced legacy requests and invalid completion evidence are rejected', async () => {
+    let calls = 0;
+    const transport = new TopologyNodeTransport({ invokeArtifact: async () => { calls++; return execResult(receipt('commit')); } });
+    for (const key of ['executionContext', 'attemptId', 'generation', 'predecessorGeneration', 'commandId']) {
+        const request = { ...basePlan }; delete request[key];
+        await assert.rejects(transport.commit(request), { code: 'INVALID_PLAN' });
+    }
+    assert.equal(calls, 0);
+    for (const invalid of [
+        { generation: 'foreign-generation' }, { attemptId: 'foreign-attempt' }, { commandId: 'foreign-command' },
+        { completion: 'running' }, { ownershipRetained: false }, { protocolVersion: 1 },
+        { terminal: false }, { systemdJob: 'pending' }, { terminalOutcome: 'invented' },
+    ]) {
+        const t = new TopologyNodeTransport({ invokeArtifact: async () => execResult(receipt('close', invalid)) });
+        await assert.rejects(t.close({ ...basePlan }), { code: 'INVALID_RECEIPT' });
+    }
+    const t = new TopologyNodeTransport({ invokeArtifact: async () => execResult(receipt('status')) });
+    assert.deepEqual(await t.status({ ...basePlan, completedCommand: 'close' }), receipt('status'));
+    await assert.rejects(t.status({ ...basePlan, completedCommand: 'commit' }), { code: 'INVALID_RECEIPT' });
 });
 
 test('plan identity fields must be primitive strings in the closed schema', async () => {
@@ -330,6 +372,8 @@ test('malformed runner output and invocation failures become sanitized errors', 
     });
     await assert.rejects(transport.rollback({ ...basePlan }), error => {
         assert.equal(error.code, 'ARTIFACT_INVOCATION_FAILED');
+        assert.equal(error.remoteOutcomeUnknown, true);
+        assert.equal(error.ownershipRetained, true);
         assert.equal(error.message, 'Topology node artifact invocation failed');
         assert.equal(Object.hasOwn(error, 'cause'), false);
         assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));

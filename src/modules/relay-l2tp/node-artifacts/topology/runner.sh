@@ -1,4 +1,285 @@
 #!/usr/bin/env bash
+# Protocol v2: the Python supervisor is the only entry point. The shell payload
+# below is read as data, never entered through an environment/CLI bypass.
+# A timeout is NOT cancellation. No automatic lease expiry or journal recovery.
+exec /usr/bin/python3 /dev/fd/3 "$0" "$@" 3<<'FENCE_PY'
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+MAX_JOURNAL_BYTES = 4194304
+MAX_GENERATIONS = 1024
+
+
+def refuse(code, status=75):
+    print(json.dumps(dict(ok=False, code=code, outcome='unknown', ownershipRetained=True),
+                     separators=(',', ':')), file=sys.stderr)
+    raise SystemExit(status)
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate field')
+        result[key] = value
+    return result
+
+
+def durable(directory, value):
+    serialized = json.dumps(value, separators=(',', ':'), sort_keys=True) + '\n'
+    if len(serialized.encode()) > MAX_JOURNAL_BYTES:
+        refuse('JOURNAL_CAPACITY_RETAINED')
+    temporary = os.path.join(directory, 'journal.next')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, os.path.join(directory, 'journal.json'))
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def directory(path):
+    try:
+        os.mkdir(path, 0o700)
+        parent = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        refuse('UNSAFE_FENCE_ROOT')
+
+
+def sync_artifacts(state, binding, config):
+    # Completion is never published before the candidate, rollback snapshot,
+    # metadata and active config (including absent-directory entries) are synced.
+    roots = [state + '/operations/' + binding['operationId'] + '/' + binding['targetProfile'],
+             state + '/backups/' + binding['backupId'] + '/' + binding['targetProfile']]
+    for root in roots:
+        if not os.path.exists(root):
+            continue
+        for parent, directories, files in os.walk(root, followlinks=False):
+            for name in files + directories:
+                target = os.path.join(parent, name)
+                fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        parent = root
+        while parent != state:
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            parent = os.path.dirname(parent)
+    for target in ([config] if os.path.lexists(config) else []) + [os.path.dirname(config), state]:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def main():
+    script, *args = sys.argv[1:]
+    names = ['command', 'operation-id', 'node-id', 'candidate-hash', 'backup-id', 'target-profile',
+             'execution-context', 'attempt-id', 'generation', 'predecessor-generation', 'command-id']
+    if len(args) not in (22, 24) or args[::2] != ['--' + n for n in names] + (['--checks'] if len(args) == 24 else []):
+        refuse('FENCE_REQUIRED', 64)
+    request = dict(zip(names + ['checks'], args[1::2]))
+    command = request['command']
+    if command not in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status'):
+        refuse('UNSUPPORTED_FENCED_COMMAND', 64)
+    safe = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
+    for key in ('operation-id', 'node-id', 'backup-id', 'attempt-id', 'generation', 'predecessor-generation', 'command-id'):
+        if not safe.fullmatch(request[key]) or request[key] in ('.', '..'):
+            refuse('INVALID_IDENTITY', 65)
+    if request['generation'] == 'none' or not re.fullmatch(r'sha256:[a-f0-9]{64}', request['candidate-hash']):
+        refuse('INVALID_IDENTITY', 65)
+    if request['target-profile'] not in ('xray-main', 'xray-bridge') or request['execution-context'] not in ('test.infograd.online', 'lm1.infograd.online'):
+        refuse('INVALID_EXECUTION_CONTEXT', 65)
+    if ('checks' in request) != (command == 'verify'):
+        refuse('INVALID_ARGUMENTS', 64)
+    root = os.environ.get('CELERITY_TOPOLOGY_ROOT', '')
+    if root and (not root.startswith('/') or root == '/' or any(p in ('.', '..', '') for p in root.split('/')[1:])):
+        refuse('INVALID_ROOT', 73)
+    # Production ancestors are trusted root-owned provisioning paths. Fake-root
+    # tests use the same no-symlink rule, including all ancestors of that root.
+    path = ''
+    for part in (root + '/var/lib').split('/')[1:]:
+        path += '/' + part
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            refuse('UNSAFE_FENCE_ROOT')
+    state = root + '/var/lib/celerity/topology'
+    for path in (root + '/var/lib/celerity', state, state + '/fences', state + '/fences/' + request['target-profile']):
+        directory(path)
+    fence = path
+    try:
+        lock = os.open(fence + '/lock', os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fresh_lock = True
+    except FileExistsError:
+        lock = os.open(fence + '/lock', os.O_RDWR | os.O_NOFOLLOW)
+        fresh_lock = False
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        refuse('COMMAND_IN_FLIGHT')
+    # Keep the lock fd inherited by every shell child; killing only this local
+    # supervisor cannot release the mutex while an inherited child still runs.
+    boot_path = root + '/proc/sys/kernel/random/boot_id'
+    with open(boot_path) as handle:
+        boot = handle.read().strip()
+    if not safe.fullmatch(boot):
+        refuse('BOOT_ID_UNAVAILABLE')
+    keys = dict(zip(names[1:6] + names[6:10],
+                    ['operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile',
+                     'executionContext', 'attemptId', 'generation', 'predecessorGeneration']))
+    binding = {value: request[key] for key, value in keys.items()}
+    journal_path = fence + '/journal.json'
+    if os.path.lexists(fence + '/journal.next'):
+        refuse('JOURNAL_UNCERTAIN')
+    if os.path.lexists(journal_path):
+        fd = os.open(journal_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_JOURNAL_BYTES:
+                refuse('JOURNAL_CAPACITY_RETAINED')
+            journal = json.load(handle, object_pairs_hook=unique)
+        if set(journal) != {'version', 'bootId', 'nodeId', 'executionContext', 'head', 'generations'} or journal['version'] != 2:
+            refuse('JOURNAL_UNCERTAIN')
+        if journal['bootId'] != boot:
+            refuse('BOOT_CHANGED_UNCERTAIN')
+        if journal['nodeId'] != binding['nodeId'] or journal['executionContext'] != binding['executionContext']:
+            refuse('FENCE_BINDING_MISMATCH')
+    else:
+        if not fresh_lock:
+            refuse('JOURNAL_UNCERTAIN')
+        # Never silently adopt pre-v2 receipts as proof of remote quiescence.
+        for legacy in ('operations', 'backups'):
+            legacy_root = state + '/' + legacy
+            if os.path.lexists(legacy_root):
+                if not stat.S_ISDIR(os.lstat(legacy_root).st_mode):
+                    refuse('LEGACY_STATE_UNPROVEN')
+                for entry in os.scandir(legacy_root):
+                    if entry.is_symlink() or os.path.lexists(entry.path + '/' + binding['targetProfile']):
+                        refuse('LEGACY_STATE_UNPROVEN')
+        journal = dict(version=2, bootId=boot, nodeId=binding['nodeId'],
+                       executionContext=binding['executionContext'], head=None, generations={})
+    generations = journal['generations']
+    generation = binding['generation']
+    current = generations.get(generation)
+    command_id = request['command-id']
+    if current is not None and current['binding'] != binding:
+        refuse('FENCE_BINDING_MISMATCH')
+    if command == 'status':
+        if current is None:
+            refuse('UNKNOWN_COMMAND_OUTCOME')
+        record = current['commands'].get(command_id)
+        if record is None or record['state'] != 'completed':
+            refuse('UNKNOWN_COMMAND_OUTCOME')
+        print(json.dumps(dict(record['receipt'], command='status'), separators=(',', ':')))
+        return
+    if current is not None and current['phase'] == 'closed':
+        refuse('GENERATION_CLOSED')
+    if any(command_id in record['commands'] for record in generations.values()):
+        refuse('COMMAND_REUSE')
+    if current is None:
+        if len(generations) >= MAX_GENERATIONS:
+            refuse('JOURNAL_CAPACITY_RETAINED')
+        if command not in ('prepare', 'close'):
+            refuse('GENERATION_NOT_PREPARED')
+        head = journal['head']
+        if head is not None and generations[head]['phase'] != 'closed':
+            refuse('OWNERSHIP_RETAINED')
+        if binding['predecessorGeneration'] != (head or 'none'):
+            refuse('STALE_PREDECESSOR')
+        current = dict(binding=binding, phase='new', commands={})
+        generations[generation] = current
+        journal['head'] = generation
+    if journal['head'] != generation:
+        refuse('STALE_GENERATION')
+    if any(r['state'] != 'completed' for r in current['commands'].values()):
+        refuse('UNKNOWN_COMMAND_OUTCOME')
+    allowed = dict(prepare=('new',), commit=('prepared',), verify=('committed',),
+                   rollback=('prepared', 'committed', 'verified'),
+                   close=('new', 'prepared', 'verified', 'rolledback'))
+    if current['phase'] not in allowed[command]:
+        refuse('INVALID_PHASE')
+    previous_phase = current['phase']
+    current['phase'] = command + '-running'
+    current['commands'][command_id] = dict(state='running', command=command)
+    durable(fence, journal)  # Write-ahead: any crash now permanently retains it.
+    with open(script) as handle:
+        payload = handle.read().split('# BEGIN_FENCED_SHELL_PAYLOAD\n', 1)[1]
+    legacy_args = args[:12]
+    if command == 'verify':
+        legacy_args += ['--checks', request['checks']]
+    expected = dict(ok=True, command=command, **{k: binding[k] for k in
+                    ('operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile')})
+    if command != 'close':
+        result = subprocess.run(['/bin/bash', '-c', payload, script, *legacy_args],
+                                stdin=sys.stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                pass_fds=(lock,))
+        if (result.returncode != 0 or result.stderr or
+                result.stdout != (json.dumps(expected, separators=(',', ':')) + '\n').encode()):
+            refuse('COMMAND_OUTCOME_UNKNOWN')
+    # Blocking systemctl alone is not the proof: also observe no outstanding
+    # unit job and the exact resulting state under the same exclusive fence.
+    job, service_state = 'not-applicable', 'not-applicable'
+    service = 'xray.service' if binding['targetProfile'] == 'xray-main' else 'xray-bridge.service'
+    config = root + '/usr/local/etc/' + ('xray' if binding['targetProfile'] == 'xray-main' else 'xray-bridge') + '/config.json'
+    if command in ('commit', 'verify', 'rollback') or (command == 'close' and previous_phase in ('verified', 'rolledback')):
+        observation = subprocess.run([root + '/usr/bin/systemctl', 'show', '--property=Job',
+                                      '--property=ActiveState', '--property=SubState', '--', service],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(lock,))
+        stopped = command == 'rollback' and not os.path.exists(config)
+        if command == 'close':
+            stopped = current['serviceState'] == 'inactive:dead'
+        expected_state = ('inactive', 'dead') if stopped else ('active', 'running')
+        lines = observation.stdout.decode().splitlines()
+        if (observation.returncode != 0 or observation.stderr or len(lines) != 3 or
+                set(lines) != {'Job=0', 'ActiveState=' + expected_state[0], 'SubState=' + expected_state[1]}):
+            refuse('SYSTEMD_COMPLETION_UNPROVEN')
+        job, service_state = 'completed', ':'.join(expected_state)
+    if command != 'close':
+        sync_artifacts(state, binding, config)
+    current['phase'] = dict(prepare='prepared', commit='committed', verify='verified',
+                            rollback='rolledback', close='closed')[command]
+    receipt = dict(expected, **{k: binding[k] for k in
+                   ('executionContext', 'attemptId', 'generation', 'predecessorGeneration')},
+                   commandId=command_id, protocolVersion=2, completion='completed',
+                   phase=current['phase'], terminal=command == 'close', ownershipRetained=True,
+                   terminalOutcome=(previous_phase if previous_phase in ('verified', 'rolledback') else 'cancelled') if command == 'close' else 'not-terminal',
+                   bootId=boot, systemdJob=job, serviceState=service_state,
+                   completedCommand=command)
+    current['serviceState'] = service_state
+    current['commands'][command_id] = dict(state='completed', command=command, receipt=receipt)
+    durable(fence, journal)
+    print(json.dumps(receipt, separators=(',', ':')))
+
+
+try:
+    main()
+except SystemExit:
+    raise
+except BaseException:
+    refuse('JOURNAL_UNCERTAIN')
+FENCE_PY
+# BEGIN_FENCED_SHELL_PAYLOAD
 set -Eeuo pipefail
 umask 077
 
