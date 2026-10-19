@@ -378,8 +378,12 @@ function nodeIdsByRef(topology) {
         return path;
     });
     const fanIn = portals.length > 1;
+    // Match the composer: shared sink last, including a staged relay sink.
+    // PPP readiness also relies on the staged terminal's highest relay ref.
+    const sinkId = fanIn ? paths[0].at(-1) : null;
     const ordered = fanIn
-        ? [...portals.map(portal => portal.id), ...paths.flatMap(path => path.slice(1))]
+        ? [...portals.map(portal => portal.id),
+            ...paths.flatMap(path => path.slice(1).filter(id => id !== sinkId)), sinkId]
         : (paths[0] || []);
     const visited = new Set();
     const result = new Map();
