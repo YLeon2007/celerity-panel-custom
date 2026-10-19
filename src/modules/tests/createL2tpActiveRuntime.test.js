@@ -673,7 +673,8 @@ test('active preflight fails closed at admission before transport on a missing s
         filter: call.filter, update: call.update,
     })), [{
         filter: { _id: 'singleton', remoteDrain: { $exists: false },
-            replacementReservation: { $exists: false }, remoteAdmissionCount: { $gte: 0 } },
+            replacementReservation: { $exists: false }, topologyAdmissionCount: 0,
+            remoteAdmissionCount: { $gte: 0 } },
         update: { $inc: { remoteAdmissionCount: 1 } },
     }]);
     assert.equal(calls.filter(call => call.kind === 'NodeSSH.construct').length, 0);
