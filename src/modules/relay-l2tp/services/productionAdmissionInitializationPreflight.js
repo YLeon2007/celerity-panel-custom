@@ -31,7 +31,10 @@ const EXPECTED_INDEXES = {
         [{ commandTokens: 1 }, { unique: true }]],
     topologyexecutionenrollments: [[{ nodeId: 1, targetProfile: 1 }, { unique: true }],
         [{ 'nodeIdentity.machineId': 1, targetProfile: 1 }, { unique: true }],
-        [{ 'nodeIdentity.sshHostKeySha256': 1, targetProfile: 1 }, { unique: true }]],
+        [{ 'nodeIdentity.sshHostKeySha256': 1, targetProfile: 1 }, { unique: true }],
+        [{ 'nodeIdentity.machineId': 1 }, { unique: true }],
+        [{ 'nodeIdentity.sshHostKeySha256': 1 }, { unique: true }],
+        [{ 'endpoint.ip': 1, 'endpoint.port': 1 }, { unique: true }]],
     cascaderoutegroups: [],
 };
 function indexStatus(collection, actual) {
