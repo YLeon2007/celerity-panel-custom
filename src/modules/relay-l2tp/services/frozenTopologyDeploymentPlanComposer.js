@@ -1541,11 +1541,14 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
         ];
         const ingressTags = node.role === 'portal' ? clientInboundTags(nodeConfig) : transitTags;
 
-        // Loopback L2TP path ingress on relays: socks -> default downstream.
+        // Loopback L2TP path ingress follows the same geo/default policy as
+        // upstream transit. Install listeners only: an immediate per-path
+        // catch-all here would bypass the geo rules emitted below.
         if (node.role === 'relay' && downstream) {
-            const ingress = relayPathIngress(groups, downstream.id, egressTagOf(downstream));
+            const ingress = relayPathIngress(groups, downstream.id);
             if (ingress.length > 0) {
                 configGenerator.applyCascadePathIngress(config, ingress);
+                ingressTags.push(...ingress.map(entry => `cascade-${entry.pathKey}`));
                 ingressByNodeId.set(id, ingress);
             }
         }
