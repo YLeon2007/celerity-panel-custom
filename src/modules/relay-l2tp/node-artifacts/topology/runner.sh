@@ -179,6 +179,7 @@ def main():
                         refuse('LEGACY_STATE_UNPROVEN')
         journal = dict(version=2, bootId=boot, nodeId=binding['nodeId'],
                        executionContext=binding['executionContext'], head=None, generations={})
+        durable(fence, journal)  # Fresh fence must leave a recoverable journal before any result.
     generations = journal['generations']
     generation = binding['generation']
     current = generations.get(generation)
@@ -252,7 +253,7 @@ def main():
         expected_state = ('inactive', 'dead') if stopped else ('active', 'running')
         lines = observation.stdout.decode().splitlines()
         if (observation.returncode != 0 or observation.stderr or len(lines) != 3 or
-                set(lines) != {'Job=0', 'ActiveState=' + expected_state[0], 'SubState=' + expected_state[1]}):
+                set(lines) != {'Job=', 'ActiveState=' + expected_state[0], 'SubState=' + expected_state[1]}):
             refuse('SYSTEMD_COMPLETION_UNPROVEN')
         job, service_state = 'completed', ':'.join(expected_state)
     if command != 'close':

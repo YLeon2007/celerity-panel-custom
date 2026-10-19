@@ -35,8 +35,8 @@ restart|stop)
   ;;
 show)
   if [[ -e "$root/pending-job" ]]; then printf 'Job=42\\n';
-  elif [[ -e "$root/stopped" ]]; then printf 'Job=0\\nActiveState=inactive\\nSubState=dead\\n';
-  else printf 'Job=0\\nActiveState=active\\nSubState=running\\n'; fi
+  elif [[ -e "$root/stopped" ]]; then printf 'Job=\\nActiveState=inactive\\nSubState=dead\\n';
+  else printf 'Job=\\nActiveState=active\\nSubState=running\\n'; fi
   ;;
 is-active) exit 0 ;;
 *) exit 64 ;;
@@ -67,6 +67,31 @@ test('runner refuses the old unfenced protocol before any config or service effe
     assert.notEqual(result.status, 0, 'unfenced prepare was accepted');
     assert.match(result.stderr, /FENCE_REQUIRED/);
     assert.equal(fs.existsSync(path.join(f.root, 'systemctl.log')), false);
+});
+
+test('fresh status inquiry durably initializes the fence and cannot poison a later authorized prepare', t => {
+    const f = fixture(t);
+    const status = f.run('status');
+    assert.notEqual(status.status, 0);
+    assert.match(status.stderr, /UNKNOWN_COMMAND_OUTCOME/);
+    const journalPath = path.join(f.root, 'var/lib/celerity/topology/fences/xray-main/journal.json');
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    assert.deepEqual(journal.generations, {});
+    const prepared = f.ok('prepare');
+    assert.equal(prepared.phase, 'prepared');
+});
+
+test('real systemd zero-job encoding allows completion while a pending job ID is still rejected', t => {
+    const f = fixture(t);
+    f.ok('prepare');
+    const committed = f.ok('commit');
+    assert.equal(committed.systemdJob, 'completed');
+    const rollbackRoot = fixture(t);
+    rollbackRoot.ok('prepare');
+    rollbackRoot.put('pending-job', '1');
+    const blocked = rollbackRoot.run('commit');
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /SYSTEMD_COMPLETION_UNPROVEN/);
 });
 test('prepare completion is durably bound to attempt, generation and command', t => {
     const f = fixture(t);
