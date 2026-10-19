@@ -57,7 +57,7 @@ test.before(async () => {
         server.listen(0, '127.0.0.1', () => { const p = server.address().port; server.close(() => resolve(p)); });
     });
     child = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1',
-        '--replSet', 'bindingScratch', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+        '--setParameter', 'enableTestCommands=1', '--replSet', 'bindingScratch', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
     const uri = `mongodb://127.0.0.1:${port}/${dbName}?directConnection=true`;
     const client = new mongoose.mongo.MongoClient(uri, { serverSelectionTimeoutMS: 100 });
     try {
@@ -664,6 +664,294 @@ test('immutable binding/enrollment models deny document deletion as well as upda
         await assert.rejects(document.save(), /immutable/i);
         assert.equal(await Model.countDocuments(), 1);
     }
+});
+
+// Regression lineage: c3-binding-independent-probes.cjs, real failCommand insert stall.
+test('both enrollment and binding inserts honor the five-second driver I/O budget', async t => {
+    for (const name of ['Enrollment', 'Binding']) await t.test(name, async () => {
+        const { store, expected, enrollment } = await setup();
+        if (name === 'Binding') await store.preEnroll(enrollment);
+        const collection = models[name].collection;
+        const originals = Object.fromEntries(['insertOne', 'insertMany'].map(key => [key, collection[key]]));
+        const observed = [];
+        for (const key of Object.keys(originals)) collection[key] = function (rows, options, ...rest) {
+            observed.push({ timeoutMS: options.timeoutMS, session: Boolean(options.session) });
+            return originals[key].call(this, rows, options, ...rest);
+        };
+        await connection.db.admin().command({ configureFailPoint: 'failCommand', mode: { times: 1 },
+            data: { failCommands: ['insert'], blockConnection: true, blockTimeMS: 6500 } });
+        let outcome, elapsed;
+        try {
+            const start = Date.now();
+            outcome = await Promise.allSettled([name === 'Binding' ? store.createBinding(expected) : store.preEnroll(enrollment)]);
+            elapsed = Date.now() - start;
+        } finally {
+            Object.assign(collection, originals);
+            await connection.db.admin().command({ configureFailPoint: 'failCommand', mode: 'off' });
+        }
+        assert.equal(outcome[0].status, 'rejected', `stalled ${name} insert was accepted after ${elapsed}ms`);
+        assert.equal(outcome[0].reason.code, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+        assert.ok(elapsed >= 4500 && elapsed < 6000, `bounded refusal took ${elapsed}ms`);
+        assert.deepEqual(observed, [{ timeoutMS: 5000, session: true }]);
+        assert.equal(await models[name].countDocuments(), 0);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+    });
+});
+
+// Keep the real Mongo reads; delay only delivery of the final owner confirmation.
+// This reuses the independent reproducer's precise executor dispatch boundary.
+test('expired lease after final confirmation or awaited cleanup never returns binding authority or dispatches', async t => {
+    for (const boundary of ['read', 'executor', 'session-cleanup', 'authority-return']) await t.test(boundary, async () => {
+        let untilDate, delayed = false;
+        const authority = async (challenge, work) => {
+            const result = await work(evidence(challenge));
+            if (delayed && boundary === 'authority-return') await new Promise(resolve => setTimeout(resolve, 1500));
+            return result;
+        };
+        const { store, expected, enrollment, context } = await setup(authority);
+        await store.preEnroll(enrollment); await store.createBinding(expected);
+        const execution = boundary === 'executor' ? await assembled(store) : null;
+        untilDate = new Date(Date.now() + 1200);
+        await models.Operation.updateOne({}, { $set: { leaseUntil: untilDate } });
+        await models.Lock.updateOne({}, { $set: { leaseUntil: untilDate } });
+        const find = models.Owner.findOne;
+        const startSession = connection.startSession;
+        let confirmations = 0;
+        models.Owner.findOne = function (...args) {
+            const query = find.apply(this, args);
+            const lean = query.lean;
+            query.lean = async function (...leanArgs) {
+                const row = await lean.apply(this, leanArgs);
+                if (this.getOptions().readConcern?.level !== 'majority') return row;
+                confirmations++;
+                if (confirmations === (boundary === 'executor' ? 3 : 1)) {
+                    delayed = true;
+                    if (['read', 'executor'].includes(boundary)) await new Promise(resolve => setTimeout(resolve, 1500));
+                }
+                return row;
+            };
+            return query;
+        };
+        if (boundary === 'session-cleanup') connection.startSession = async function (...args) {
+            const session = await startSession.apply(this, args);
+            const end = session.endSession.bind(session);
+            session.endSession = async (...endArgs) => {
+                await end(...endArgs);
+                if (delayed) await new Promise(resolve => setTimeout(resolve, 1500));
+            };
+            return session;
+        };
+        try {
+            await assert.rejects(execution ? execution.executor.prepare(context) : store.readVerified(expected),
+                execution ? { code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true }
+                    : { code: 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' });
+        } finally { models.Owner.findOne = find; connection.startSession = startSession; }
+        assert.equal(delayed, true);
+        assert.ok(Date.now() > untilDate.getTime(), 'lease must actually expire at this boundary');
+        if (execution) assert.equal(execution.events.filter(event => typeof event === 'object').length, 0);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
+});
+
+// Public Mongoose aggregation-pipeline updates bypass ordinary field casting,
+// even with runValidators:true. Scalar query equality alone matches array elements.
+test('malformed BSON authority arrays never authorize enrollment, binding creation or executor dispatch', async t => {
+    const cases = {
+        Operation: { leaseOwner: 'worker-17', attempts: 1, heldTopologyAdmission: true, topologyRevision: 17,
+            priorDeployedRevision: 16, status: 'preparing', idempotencyKey: null, leaseUntil: null },
+        Lock: { owner: 'worker-17', operationId: null, generation: null, remoteUncertain: true, leaseUntil: null, node: null },
+        Owner: { owner: 'topology', generation: OWNER_GENERATION, profile: 'xray-main', node: null,
+            executionContext: { ...PROD }, nodeIdentity: { ...IDENTITY }, 'adoptionReceipt.toGeneration': OWNER_GENERATION },
+    };
+    for (const [name, fields] of Object.entries(cases)) for (const key of Object.keys(fields)) {
+        await t.test(`${name}.${key}`, async () => {
+            const { store, expected, enrollment, context } = await setup();
+            await store.preEnroll(enrollment); await store.createBinding(expected);
+            const before = await models[name].findOne().lean();
+            const value = key.split('.').reduce((row, part) => row[part], before);
+            const array = [value, key === 'remoteUncertain' ? false : value];
+            await models[name].updateOne({}, [{ $set: { [key]: { $literal: array } } }], { runValidators: true });
+            const malformed = await models[name].collection.findOne({});
+            assert.deepEqual(key.split('.').reduce((row, part) => row[part], malformed), array);
+            const { executor, events } = await assembled(store);
+            await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.deepEqual(events, []);
+            await models.Binding.collection.deleteMany({});
+            const operation = await models.Operation.collection.findOne({});
+            await assert.rejects(store.createBinding(expected), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.equal(await models.Binding.countDocuments(), 0);
+            assert.deepEqual(await models.Operation.collection.findOne({}), operation, 'failed transaction must roll back all CAS nonces');
+            if (name === 'Owner') {
+                await models.Enrollment.collection.deleteMany({});
+                await assert.rejects(store.preEnroll(enrollment), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+                assert.equal(await models.Enrollment.countDocuments(), 0);
+            }
+            assert.equal(await models.Lock.countDocuments(), 1);
+        });
+    }
+});
+
+test('only a complete non-null restoration snapshot and coherent adoption receipt authorize the store', async t => {
+    const changes = {
+        nullSnapshot: { originalSnapshot: null },
+        emptySnapshot: { originalSnapshot: {} },
+        missingConfig: { originalSnapshot: { unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' } },
+        badConfig: { 'originalSnapshot.configSha256': 'not-a-digest' },
+        arrayConfig: { 'originalSnapshot.configSha256': ['3'.repeat(64)] },
+        badUnit: { 'originalSnapshot.unitSha256': 'not-a-digest' },
+        badActive: { 'originalSnapshot.serviceActive': 'unknown' },
+        badEnabled: { 'originalSnapshot.serviceEnabled': 'unknown' },
+        nullReceipt: { adoptionReceipt: null },
+        emptyReceipt: { adoptionReceipt: { toGeneration: OWNER_GENERATION } },
+        badProof: { 'adoptionReceipt.proofId': 'not-a-uuid' },
+        arrayProof: { 'adoptionReceipt.proofId': [randomUUID()] },
+        badMaintenance: { 'adoptionReceipt.maintenanceId': 'not-a-uuid' },
+        badFrom: { 'adoptionReceipt.fromGeneration': 'not-a-uuid' },
+        sameGeneration: { 'adoptionReceipt.fromGeneration': OWNER_GENERATION },
+        blankInstance: { 'adoptionReceipt.oldBackendInstanceId': '' },
+        nonpositivePid: { 'adoptionReceipt.oldPid': 0 },
+        fractionalPid: { 'adoptionReceipt.oldPid': 1.5 },
+        stringPid: { 'adoptionReceipt.oldPid': '42' },
+        blankProcessStart: { 'adoptionReceipt.oldProcessStartTime': '' },
+        invalidVerificationDate: { 'adoptionReceipt.verifiedAt': 'yesterday' },
+        futureVerificationDate: { 'adoptionReceipt.verifiedAt': new Date(Date.now() + 86400000) },
+    };
+    for (const [label, update] of Object.entries(changes)) await t.test(label, async () => {
+        const { store, expected, enrollment, context } = await setup();
+        await store.preEnroll(enrollment); await store.createBinding(expected);
+        if (label === 'nullSnapshot') {
+            // Original review reproducer: ordinary validated model update + document
+            // validation accepted null. Keep that real persisted boundary explicit.
+            await models.Owner.updateOne({}, { $set: update }, { runValidators: true });
+            await (await models.Owner.findOne()).validate();
+        } else await models.Owner.updateOne({}, [{ $set: Object.fromEntries(
+            Object.entries(update).map(([key, value]) => [key, { $literal: value }])) }], { runValidators: true });
+        const { executor, events } = await assembled(store);
+        await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.deepEqual(events, []);
+        await models.Binding.collection.deleteMany({});
+        await assert.rejects(store.createBinding(expected), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.equal(await models.Binding.countDocuments(), 0);
+        await models.Enrollment.collection.deleteMany({});
+        await assert.rejects(store.preEnroll(enrollment), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.equal(await models.Enrollment.countDocuments(), 0);
+        assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
+});
+
+test('majority confirmation refuses authority fields changed after commit, including an array CAS nonce', async t => {
+    for (const [name, key] of [['Operation', 'leaseOwner'], ['Lock', 'generation'], ['Owner', 'owner'],
+        ['Operation', 'executionBindingCheck'], ['Lock', 'executionBindingCheck'], ['Owner', 'executionBindingCheck'],
+        ['Owner', 'originalSnapshot']]) await t.test(`${name}.${key}`, async () => {
+        const { store, expected, enrollment } = await setup();
+        await store.preEnroll(enrollment);
+        const find = models[name].findOne;
+        let injected = false;
+        models[name].findOne = function (...args) {
+            const query = find.apply(this, args);
+            const lean = query.lean;
+            query.lean = async function (...leanArgs) {
+                if (!injected && this.getOptions().readConcern?.level === 'majority') {
+                    injected = true;
+                    const row = await models[name].collection.findOne({});
+                    await models[name].updateOne({}, [{ $set: { [key]: { $literal: key === 'originalSnapshot' ? null : [row[key]] } } }],
+                        { runValidators: true });
+                }
+                return lean.apply(this, leanArgs);
+            };
+            return query;
+        };
+        try { await assert.rejects(store.createBinding(expected), { code: 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' }); }
+        finally { models[name].findOne = find; }
+        assert.equal(injected, true);
+        assert.equal(await models.Binding.countDocuments(), 1, 'refused readback must retain the real commit');
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal(await models.Lock.countDocuments(), 1);
+    });
+});
+
+test('operation node authority fields are exact scalar values in both transaction and majority readback', async t => {
+    for (const phase of ['transaction', 'confirmation']) for (const key of ['node', 'targetProfile', 'candidateHash']) {
+        await t.test(`${phase}.${key}`, async () => {
+            const { store, expected, enrollment, context } = await setup();
+            await store.preEnroll(enrollment); await store.createBinding(expected);
+            const operation = await models.Operation.findOne().lean();
+            // Pipeline dot paths are object paths, not positional array updates.
+            const mutate = () => models.Operation.updateOne({}, [{ $set: { nodes: { $literal:
+                operation.nodes.map(node => ({ ...node, [key]: [node[key]] })) } } }], { runValidators: true });
+            const find = models.Operation.findOne;
+            let injected = false;
+            if (phase === 'transaction') await mutate();
+            else models.Operation.findOne = function (...args) {
+                const query = find.apply(this, args);
+                const lean = query.lean;
+                query.lean = async function (...leanArgs) {
+                    if (!injected && this.getOptions().readConcern?.level === 'majority') {
+                        injected = true; await mutate();
+                    }
+                    return lean.apply(this, leanArgs);
+                };
+                return query;
+            };
+            const { executor, events } = await assembled(store);
+            try { await assert.rejects(executor.prepare(context), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' }); }
+            finally { models.Operation.findOne = find; }
+            if (phase === 'confirmation') assert.equal(injected, true);
+            assert.deepEqual(events, []);
+        });
+    }
+});
+
+test('real commit writeConcern uncertainty remains conservative with one bounded primary-majority binding confirmation', async () => {
+    const { store, expected, enrollment } = await setup();
+    await store.preEnroll(enrollment);
+    const commands = [];
+    const observe = event => commands.push({ name: event.commandName, command: event.command });
+    const start = connection.startSession;
+    let labels = [];
+    connection.startSession = async function (...args) {
+        const session = await start.apply(this, args);
+        const commit = session.commitTransaction.bind(session);
+        session.commitTransaction = async (...commitArgs) => {
+            try { return await commit(...commitArgs); }
+            catch (error) { labels = error.errorLabels; throw error; }
+        };
+        return session;
+    };
+    connection.getClient().on('commandStarted', observe);
+    await connection.db.admin().command({ configureFailPoint: 'failCommand', mode: { times: 1 },
+        data: { failCommands: ['commitTransaction'], writeConcernError: {
+            code: 64, codeName: 'WriteConcernFailed', errmsg: 'local binding regression commit uncertainty',
+        } } });
+    let outcome;
+    try { outcome = (await Promise.allSettled([store.createBinding(expected)]))[0]; }
+    finally {
+        connection.startSession = start;
+        connection.getClient().off('commandStarted', observe);
+        await connection.db.admin().command({ configureFailPoint: 'failCommand', mode: 'off' });
+    }
+    assert.ok(labels.includes('UnknownTransactionCommitResult'), 'server must actually produce unknown commit');
+    const readbacks = commands.filter(({ name, command }) => name === 'find'
+        && command.find === models.Binding.collection.name && !Object.hasOwn(command, 'autocommit'));
+    assert.equal(readbacks.length, 1);
+    const confirmation = readbacks[0].command;
+    assert.equal(confirmation.readConcern.level, 'majority');
+    assert.ok(!confirmation.$readPreference || confirmation.$readPreference.mode === 'primary');
+    assert.ok(confirmation.maxTimeMS > 0 && confirmation.maxTimeMS <= 5000);
+    assert.equal(commands.filter(({ name }) => name === 'insert').length, 1, 'unknown commit cannot regenerate IDs or retry the transaction');
+    const durable = await until(async () => {
+        const row = await models.Binding.findOne().read('primary').readConcern('majority').lean();
+        assert.ok(row); return row;
+    });
+    assert.equal(confirmation.filter._id, durable._id);
+    if (outcome.status === 'fulfilled') assert.equal(outcome.value.attemptId, durable.attemptId);
+    else assert.ok(['TOPOLOGY_EXECUTION_BINDING_UNPROVEN', 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED'].includes(outcome.reason.code));
+    assert.equal(await models.Binding.countDocuments(), 1);
+    assert.equal((await models.Lock.findOne().lean()).generation, expected.generation);
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
 });
 
 async function terminalFixture(t, { authority = goodAuthority, onCommand } = {}) {

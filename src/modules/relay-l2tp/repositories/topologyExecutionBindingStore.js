@@ -1,6 +1,7 @@
 'use strict';
 const { randomUUID, createHash } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
+const { Types: { ObjectId } } = require('mongoose');
 const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
 const { projectCanonicalXrayCandidate } = require('../services/topologyXrayCandidate');
@@ -11,6 +12,16 @@ const ENROLLMENT_ROW_KEYS = ['_id', 'executionContext', 'proofId', 'maintenanceI
 const BINDING_ROW_KEYS = [...new Set([...ENROLLMENT_ROW_KEYS, ...RECORD_KEYS, 'enrollmentId', 'commandTokens'])];
 const PROFILES = ['xray-main', 'xray-bridge'];
 const OPTIONS = { maxTimeMS: TIMEOUT_MS, timeoutMS: TIMEOUT_MS };
+const NUMBER_TYPES = ['double', 'int', 'long'];
+// Aggregation $type checks the field itself, unlike query $type/equality which
+// can match array elements. $literal also prevents values becoming expressions.
+function exactFields(filter, fields) {
+    const checks = Object.entries(fields).flatMap(([field, [type, ...value]]) => [
+        { $in: [{ $type: `$${field}` }, Array.isArray(type) ? type : [type]] },
+        ...(value.length ? [{ $eq: [`$${field}`, { $literal: value[0] }] }] : []),
+    ]);
+    return { ...filter, $expr: { $and: [...(filter.$expr ? [filter.$expr] : []), ...checks] } };
+}
 function token(value) { return typeof value === 'string' && TOKEN.test(value); }
 function validIdentity(identity) {
     return exact(identity, ['machineId', 'sshHostKeySha256'])
@@ -81,28 +92,72 @@ class TopologyExecutionBindingStore {
     }
 
     #ownerFilter(enrollment) {
-        return { executionContext: { ...PROD }, node: enrollment.nodeId, profile: enrollment.targetProfile,
+        return exactFields({ executionContext: { ...PROD }, node: enrollment.nodeId, profile: enrollment.targetProfile,
             nodeIdentity: enrollment.nodeIdentity, owner: 'topology', generation: enrollment.ownerGeneration,
             'adoptionReceipt.toGeneration': enrollment.ownerGeneration, originalSnapshot: { $exists: true },
-            handbackReceipt: { $exists: false } };
+            handbackReceipt: { $exists: false } }, {
+            executionContext: ['object', { ...PROD }], node: ['objectId', new ObjectId(enrollment.nodeId)],
+            profile: ['string', enrollment.targetProfile], nodeIdentity: ['object', enrollment.nodeIdentity],
+            owner: ['string', 'topology'], generation: ['string', enrollment.ownerGeneration],
+            originalSnapshot: ['object'], adoptionReceipt: ['object'],
+            'adoptionReceipt.toGeneration': ['string', enrollment.ownerGeneration],
+        });
+    }
+    #ownerEvidence(row) {
+        const snapshot = row?.originalSnapshot;
+        const receipt = row?.adoptionReceipt;
+        const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+        const uuid = value => typeof value === 'string' && UUID.test(value);
+        const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+        if (!exact(snapshot, ['configSha256', 'unitSha256', 'serviceActive', 'serviceEnabled'])
+            || !digest(snapshot.configSha256) || !digest(snapshot.unitSha256)
+            || !['active', 'inactive'].includes(snapshot.serviceActive)
+            || !['enabled', 'disabled', 'masked'].includes(snapshot.serviceEnabled)
+            || !exact(receipt, ['proofId', 'maintenanceId', 'fromGeneration', 'toGeneration',
+                'oldBackendInstanceId', 'oldPid', 'oldProcessStartTime', 'verifiedAt'])
+            || !uuid(receipt.proofId) || !uuid(receipt.maintenanceId) || !uuid(receipt.fromGeneration)
+            || !uuid(receipt.toGeneration) || receipt.toGeneration !== row.generation
+            || receipt.fromGeneration === receipt.toGeneration || !nonempty(receipt.oldBackendInstanceId)
+            || !Number.isSafeInteger(receipt.oldPid) || receipt.oldPid < 1 || !nonempty(receipt.oldProcessStartTime)
+            || !(receipt.verifiedAt instanceof Date) || !Number.isFinite(receipt.verifiedAt.getTime())
+            || receipt.verifiedAt.getTime() > Date.now()) throw failure();
+        return { originalSnapshot: snapshot, adoptionReceipt: receipt };
+    }
+    async #ownerInTransaction(filter, session) {
+        const row = await this.#models.Owner.findOne(filter).session(session).setOptions(OPTIONS).lean();
+        return this.#ownerEvidence(row);
     }
     #operationFilter(expected, now) {
-        return { _id: expected.operationId, ...topologyOperationClaimBindingFilter(PROD),
+        return exactFields({ _id: expected.operationId, ...topologyOperationClaimBindingFilter(PROD),
             topologyRevision: expected.topologyRevision, priorDeployedRevision: expected.priorDeployedRevision,
             heldTopologyAdmission: true, leaseOwner: expected.owner, attempts: expected.attempt,
             leaseUntil: { $gt: now }, status: { $in: ['preparing', 'committing', 'rolling_back'] },
             pppWait: { $exists: false }, nodes: { $elemMatch: { node: expected.nodeId,
-                targetProfile: expected.targetProfile, candidateHash: expected.candidateHash.slice(7) } } };
+                targetProfile: expected.targetProfile, candidateHash: expected.candidateHash.slice(7) } } }, {
+            _id: ['objectId', new ObjectId(expected.operationId)], idempotencyKey: ['string'],
+            topologyRevision: [NUMBER_TYPES, expected.topologyRevision],
+            priorDeployedRevision: [NUMBER_TYPES, expected.priorDeployedRevision],
+            heldTopologyAdmission: ['bool', true], leaseOwner: ['string', expected.owner],
+            attempts: [NUMBER_TYPES, expected.attempt], leaseUntil: ['date'], status: ['string'], nodes: ['array'],
+        });
     }
     #lockFilter(expected, now) {
-        return { node: expected.nodeId, owner: expected.owner, operationId: expected.operationId,
-            generation: expected.generation, remoteUncertain: true, leaseUntil: { $gt: now } };
+        return exactFields({ node: expected.nodeId, owner: expected.owner, operationId: expected.operationId,
+            generation: expected.generation, remoteUncertain: true, leaseUntil: { $gt: now } }, {
+            node: ['objectId', new ObjectId(expected.nodeId)], owner: ['string', expected.owner],
+            operationId: ['string', expected.operationId], generation: ['string', expected.generation],
+            remoteUncertain: ['bool', true], leaseUntil: ['date'],
+        });
     }
-    #majority(Model, filter, deadline = Date.now() + TIMEOUT_MS) {
+    async #majority(Model, filter, deadline = Date.now() + TIMEOUT_MS) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw failure('UNCONFIRMED');
-        return Model.findOne(filter).read('primary').readConcern('majority')
+        const exactFilter = Object.hasOwn(filter, 'executionBindingCheck')
+            ? exactFields(filter, { executionBindingCheck: ['string', filter.executionBindingCheck] }) : filter;
+        const row = await Model.findOne(exactFilter).read('primary').readConcern('majority')
             .setOptions({ maxTimeMS: remaining, timeoutMS: remaining }).lean();
+        if (Date.now() >= deadline) throw failure('UNCONFIRMED');
+        return row;
     }
 
     async #scope(action, enrollment, expected, work) {
@@ -184,14 +239,19 @@ class TopologyExecutionBindingStore {
         return this.#scope('enroll', enrollment, null, async (receipt, ensureOpen) => {
             const nonce = randomUUID();
             const filter = this.#ownerFilter(enrollment);
+            let ownerEvidence;
             return this.#transaction(async session => {
                 ensureOpen();
+                ownerEvidence = await this.#ownerInTransaction(filter, session);
                 await this.#cas(this.#models.Owner, filter, nonce, session);
-                await this.#models.Enrollment.create([{ ...row, ...receipt }], { session, ...OPTIONS });
+                // Model.create/save drops timeoutMS in Mongoose 8. insertMany validates
+                // the schema and forwards the bounded driver options unchanged.
+                await this.#models.Enrollment.insertMany([{ ...row, ...receipt }], { session, ...OPTIONS });
             }, async deadline => {
                 const confirmed = await this.#majority(this.#models.Enrollment, { ...row, ...receipt }, deadline);
                 const owner = await this.#majority(this.#models.Owner, { ...filter, executionBindingCheck: nonce }, deadline);
-                if (!confirmed || !owner || !isDeepStrictEqual(confirmed, { ...row, ...receipt })) throw failure('UNCONFIRMED');
+                if (!confirmed || !owner || !isDeepStrictEqual(confirmed, { ...row, ...receipt })
+                    || !isDeepStrictEqual(this.#ownerEvidence(owner), ownerEvidence)) throw failure('UNCONFIRMED');
                 return freeze({ enrollmentId: confirmed._id, ...enrollmentProjection(confirmed) });
             }, ensureOpen);
         });
@@ -218,10 +278,15 @@ class TopologyExecutionBindingStore {
     async #checkOperation(expected, session) {
         const row = await this.#models.Operation.findOne(this.#operationFilter(expected, new Date()))
             .session(session).setOptions(OPTIONS).lean();
-        const nodes = row?.nodes?.filter(node => String(node.node) === expected.nodeId);
-        if (nodes?.length !== 1) throw failure();
+        this.#checkOperationRow(row, expected);
+    }
+    #checkOperationRow(row, expected) {
+        const nodes = Array.isArray(row?.nodes) ? row.nodes.filter(node =>
+            node?.node instanceof ObjectId && node.node.toHexString() === expected.nodeId) : [];
+        if (nodes.length !== 1) throw failure();
         const node = nodes[0];
-        if ((node.role === 'portal' ? 'xray-main' : ['relay', 'bridge'].includes(node.role) ? 'xray-bridge' : null) !== expected.targetProfile
+        if (node.targetProfile !== expected.targetProfile || node.candidateHash !== expected.candidateHash.slice(7)
+            || (node.role === 'portal' ? 'xray-main' : ['relay', 'bridge'].includes(node.role) ? 'xray-bridge' : null) !== expected.targetProfile
             || !['', expected.backupId].includes(node.backupId)) throw failure();
         try { projectCanonicalXrayCandidate(node.candidate, expected.candidateHash.slice(7)); }
         catch { throw failure(); }
@@ -235,7 +300,11 @@ class TopologyExecutionBindingStore {
         const expected = freeze({ ...input });
         await this.#indexes();
         const enrollment = await this.#enrollment(expected);
-        return this.#scope(action, enrollmentProjection(enrollment), expected, async (receipt, ensureOpen) => {
+        let validUntil = 0;
+        const assertFresh = () => {
+            if (Date.now() >= validUntil) throw failure('UNCONFIRMED');
+        };
+        const result = await this.#scope(action, enrollmentProjection(enrollment), expected, async (receipt, ensureOpen) => {
             if (receipt.maintenanceId !== enrollment.maintenanceId) throw failure();
             const nonce = randomUUID();
             let row = action === 'create' ? { ...expected, ...enrollmentProjection(enrollment),
@@ -243,32 +312,52 @@ class TopologyExecutionBindingStore {
                 commandIds: Object.fromEntries(COMMANDS.map(command => [command, randomUUID()])) } : null;
             if (row) row.commandTokens = COMMANDS.map(command => row.commandIds[command]);
             const ownerFilter = this.#ownerFilter(enrollment);
-            const check = () => this.#transaction(async session => {
-                ensureOpen();
-                await this.#checkOperation(expected, session);
-                await this.#cas(this.#models.Operation, this.#operationFilter(expected, new Date()), nonce, session);
-                await this.#cas(this.#models.Lock, this.#lockFilter(expected, new Date()), nonce, session);
-                await this.#cas(this.#models.Owner, ownerFilter, nonce, session);
-                const enrolled = await this.#models.Enrollment.findOne({ _id: enrollment._id }).session(session).setOptions(OPTIONS).lean();
-                if (!isDeepStrictEqual(enrolled, enrollment)) throw failure();
-                if (action === 'create') {
-                    this.#checkRow(row, enrollment, expected);
-                    await this.#models.Binding.create([row], { session, ...OPTIONS });
-                } else {
-                    row = await this.#models.Binding.findOne({ enrollmentId: enrollment._id }).session(session).setOptions(OPTIONS).lean();
-                    this.#checkRow(row, enrollment, expected);
-                    if (row.maintenanceId !== receipt.maintenanceId) throw failure();
-                }
-            }, async deadline => {
-                const confirmed = await this.#majority(this.#models.Binding, { _id: row._id }, deadline);
-                this.#checkRow(confirmed, enrollment, expected);
-                if (!isDeepStrictEqual(confirmed, row)) throw failure('UNCONFIRMED');
-                for (const [Model, filter] of [[this.#models.Operation, this.#operationFilter(expected, new Date())],
-                    [this.#models.Lock, this.#lockFilter(expected, new Date())], [this.#models.Owner, ownerFilter]]) {
-                    if (!await this.#majority(Model, { ...filter, executionBindingCheck: nonce }, deadline)) throw failure('UNCONFIRMED');
-                }
-                return recordProjection(confirmed);
-            }, ensureOpen);
+            const check = async () => {
+                let ownerEvidence;
+                const confirmedRecord = await this.#transaction(async session => {
+                    ensureOpen();
+                    await this.#checkOperation(expected, session);
+                    await this.#cas(this.#models.Operation, this.#operationFilter(expected, new Date()), nonce, session);
+                    await this.#cas(this.#models.Lock, this.#lockFilter(expected, new Date()), nonce, session);
+                    ownerEvidence = await this.#ownerInTransaction(ownerFilter, session);
+                    await this.#cas(this.#models.Owner, ownerFilter, nonce, session);
+                    const enrolled = await this.#models.Enrollment.findOne({ _id: enrollment._id }).session(session).setOptions(OPTIONS).lean();
+                    if (!isDeepStrictEqual(enrolled, enrollment)) throw failure();
+                    if (action === 'create') {
+                        this.#checkRow(row, enrollment, expected);
+                        await this.#models.Binding.insertMany([row], { session, ...OPTIONS });
+                    } else {
+                        row = await this.#models.Binding.findOne({ enrollmentId: enrollment._id }).session(session).setOptions(OPTIONS).lean();
+                        this.#checkRow(row, enrollment, expected);
+                        if (row.maintenanceId !== receipt.maintenanceId) throw failure();
+                    }
+                }, async deadline => {
+                    const confirmed = await this.#majority(this.#models.Binding, { _id: row._id }, deadline);
+                    this.#checkRow(confirmed, enrollment, expected);
+                    if (!isDeepStrictEqual(confirmed, row)) throw failure('UNCONFIRMED');
+                    // Each filter is built immediately before its read, not before
+                    // another awaited confirmation. Retain both exact expiration dates
+                    // and bound all remaining readback by the earliest observed lease.
+                    for (const [Model, filter] of [[this.#models.Operation, () => this.#operationFilter(expected, new Date())],
+                        [this.#models.Lock, () => this.#lockFilter(expected, new Date())], [this.#models.Owner, () => ownerFilter]]) {
+                        const current = await this.#majority(Model, { ...filter(), executionBindingCheck: nonce }, deadline);
+                        if (!current) throw failure('UNCONFIRMED');
+                        if (Model === this.#models.Owner) {
+                            if (!isDeepStrictEqual(this.#ownerEvidence(current), ownerEvidence)) throw failure('UNCONFIRMED');
+                        } else {
+                            if (Model === this.#models.Operation) this.#checkOperationRow(current, expected);
+                            if (!(current.leaseUntil instanceof Date) || !Number.isFinite(current.leaseUntil.getTime())) throw failure('UNCONFIRMED');
+                            deadline = Math.min(deadline, current.leaseUntil.getTime());
+                        }
+                    }
+                    validUntil = deadline;
+                    assertFresh();
+                    return recordProjection(confirmed);
+                }, ensureOpen);
+                // Session cleanup is awaited by #transaction's finally block.
+                assertFresh();
+                return confirmedRecord;
+            };
             const record = await check();
             if (!work) return record;
             const assertCurrent = async () => {
@@ -281,6 +370,9 @@ class TopologyExecutionBindingStore {
             await assertCurrent();
             return result;
         });
+        // The authority itself can await cleanup after its callback completes.
+        assertFresh();
+        return result;
     }
     // No caller-selected attempt/command/predecessor IDs, no update/adopt/release API.
     async createBinding(expected) { return this.#binding('create', expected); }
