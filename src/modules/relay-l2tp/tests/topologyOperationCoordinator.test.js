@@ -477,7 +477,7 @@ test('held reservation returns a safe typed queue conflict without materializati
 
 test('reservation injected between draft read and singleton CAS never queues an operation', async () => {
     const calls = [];
-    const state = { revision: 7, deployedRevision: 5, topologyAdmissionCount: 0 };
+    const state = { revision: 7, deployedRevision: 5, topologyAdmissionCount: 0, remoteAdmissionCount: 0 };
     const session = fakeSession;
     const topologyRepository = new TopologyDeploymentRepository({
         snapshotReader: { async readDraft(candidateSession) {
@@ -489,6 +489,8 @@ test('reservation injected between draft read and singleton CAS never queues an 
             assert.strictEqual(options.session, session);
             calls.push('admission.cas');
             assert.equal(filter.topologyAdmissionCount, 0);
+            assert.equal(filter.remoteAdmissionCount, 0);
+            assert.deepEqual(filter.remoteDrain, { $exists: false });
             assert.deepEqual(update.$inc, { topologyAdmissionCount: 1 });
             // Simulate a concurrent reservation after the transaction's read.
             state.replacementReservation = { ownerToken: 'private-token' };

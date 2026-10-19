@@ -4,11 +4,13 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { TopologyDeploymentRepository } = require('../repositories/topologyDeploymentRepository');
 
-function harness({ count = 0, reservation, casFails = false, insertFails = false } = {}) {
+function harness({ count = 0, remoteCount = 0, drain, reservation, casFails = false, insertFails = false } = {}) {
     const calls = [];
     const session = { inTransaction: () => true };
     const state = { revision: 7, deployedRevision: 5,
         ...(count === null ? {} : { topologyAdmissionCount: count }),
+        ...(remoteCount === null ? {} : { remoteAdmissionCount: remoteCount }),
+        ...(drain === undefined ? {} : { remoteDrain: drain }),
         ...(reservation ? { replacementReservation: reservation } : {}) };
     const operations = [];
     const repository = new TopologyDeploymentRepository({
@@ -24,12 +26,15 @@ function harness({ count = 0, reservation, casFails = false, insertFails = false
             assert.equal(filter._id, 'singleton');
             assert.equal(filter.revision, 7);
             assert.deepEqual(filter.replacementReservation, { $exists: false });
+            assert.deepEqual(filter.remoteDrain, { $exists: false });
+            assert.equal(filter.remoteAdmissionCount, 0);
             assert.equal(filter.topologyAdmissionCount, 0);
             assert.deepEqual(update.$inc, { topologyAdmissionCount: 1 });
             const query = { select() { return this; }, session(value) {
                 assert.strictEqual(value, session); return this;
             }, async lean() {
-                if (casFails || state.replacementReservation || state.topologyAdmissionCount !== 0) return null;
+                if (casFails || state.replacementReservation || state.topologyAdmissionCount !== 0
+                    || state.remoteAdmissionCount !== 0 || state.remoteDrain !== undefined) return null;
                 state.topologyAdmissionCount += 1;
                 return { ...state };
             } };
@@ -80,6 +85,20 @@ test('missing legacy counter rejects admission without creating an operation', a
     }), error => error.code === 'TOPOLOGY_ADMISSION_UNAVAILABLE');
     assert.deepEqual(h.calls, ['begin', 'read', 'prepare', 'cas', 'abort']);
     assert.deepEqual(h.operations, []);
+});
+
+for (const [label, state] of [
+    ['missing remote counter', { remoteCount: null }],
+    ['active remote admissions', { remoteCount: 2 }],
+    ['foreign remote drain', { drain: { ownerToken: 'foreign-drain', epoch: 4 } }],
+]) test(`${label} rejects the shared singleton CAS without an operation`, async () => {
+    const h = harness(state);
+    await assert.rejects(h.repository.admitTopology({ expectedRevision: 7,
+        prepare: async () => ({}), admit: h.admit,
+    }), { code: 'TOPOLOGY_ADMISSION_UNAVAILABLE' });
+    assert.equal(h.state.topologyAdmissionCount, 0);
+    assert.deepEqual(h.operations, []);
+    assert.deepEqual(h.calls, ['begin', 'read', 'cas', 'abort']);
 });
 
 test('reservation held before read rejects without materialization or insert', async () => {

@@ -86,13 +86,16 @@ class TopologyDeploymentRepository {
                 );
             }
             const prepared = await prepare(snapshot, session);
-            // Never upsert or infer that a legacy singleton's missing counter is
-            // zero. This real write conflicts with a concurrent reservation CAS.
+            // Never upsert or infer that either missing legacy counter is zero.
+            // This shared singleton write conflicts with remote admission, drain
+            // and replacement acquisition; only explicitly quiescent state admits.
             const state = await withSession(this.CascadeTopologyState.findOneAndUpdate(
                 {
                     _id: 'singleton',
                     revision: expectedRevision,
                     replacementReservation: { $exists: false },
+                    remoteDrain: { $exists: false },
+                    remoteAdmissionCount: 0,
                     topologyAdmissionCount: 0,
                 },
                 { $inc: { topologyAdmissionCount: 1 } },

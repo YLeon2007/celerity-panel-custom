@@ -378,6 +378,32 @@ test('legacy autoDeploy pending drafts are neither inferred as intents nor inclu
     assert.equal((await models.CascadeLink.findById(legacy._id).lean()).status, 'pending');
     await finish(operation);
 });
+test('consumer rejects active or missing remote counters and rolls back draft assembly', local, async t => {
+    const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
+    for (const remoteCount of [2, undefined]) await t.test(`remote counter ${remoteCount}`, async () => {
+        await reset();
+        await models.CascadeTopologyState.collection.updateOne({ _id: 'singleton' },
+            remoteCount === undefined ? { $unset: { remoteAdmissionCount: '' } }
+                : { $set: { remoteAdmissionCount: remoteCount } });
+        const service = createIntentService(models);
+        const desired = link(0);
+        const job = await service.accept({ expectedTopologyRevision: 7,
+            requestKey: `remote-counter-${remoteCount}`, link: desired });
+        const consumer = new TopologyIntentConsumer({ ...models, executionContext: TEST_CONTEXT });
+        const claimed = await consumer.claim();
+        const before = await models.CascadeTopologyState.collection.findOne({ _id: 'singleton' });
+        await assert.rejects(consumer.consume(claimed), { code: 'TOPOLOGY_DEPLOY_BUSY' });
+        assert.equal(await models.CascadeLink.countDocuments(), 0, 'draft creation rolled back');
+        assert.equal(await models.CascadeRouteGroup.countDocuments(), 0, 'path maintenance rolled back');
+        assert.equal(await models.TopologyOperation.countDocuments(), 0);
+        assert.deepEqual(await models.CascadeTopologyState.collection.findOne({ _id: 'singleton' }), before);
+        const intent = await models.TopologyCreateIntent.findById(job.jobId).lean();
+        assert.equal(intent.status, 'claimed');
+        assert.equal(intent.operationId, undefined);
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
+    });
+});
+
 test('mixed-mode links cannot share the same actual listener node and port', local, async t => {
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
     for (const mode of ['forward', 'reverse']) await t.test(mode, async () => {
