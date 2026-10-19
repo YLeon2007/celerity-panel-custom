@@ -190,6 +190,7 @@ test('root lifecycle awaits migrations once after the database boundary before r
     };
     const rootLifecycle = createL2tpRootLifecycle({
         env: { L2TP_EXECUTION_ENABLED: 'false' },
+        async ensureModelIndexes() { calls.push('indexes'); },
         createMigrationBootstrap(options) {
             calls.push({ kind: 'createMigrationBootstrap', options });
             return {
@@ -220,13 +221,14 @@ test('root lifecycle awaits migrations once after the database boundary before r
     assert.strictEqual(firstStart, secondStart);
     assert.strictEqual(await firstStart, lifecycle);
     assert.strictEqual(await secondStart, lifecycle);
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
     assert.equal(calls[0].kind, 'createMigrationBootstrap');
     assert.deepEqual(calls[0].options.env, { L2TP_EXECUTION_ENABLED: 'false' });
     assert.equal(calls[1], 'migrate');
-    assert.equal(calls[2].kind, 'create');
-    assert.deepEqual(calls[2].options.env, { L2TP_EXECUTION_ENABLED: 'false' });
-    assert.equal(typeof calls[2].options.createHostDependencies, 'function');
+    assert.equal(calls[2], 'indexes');
+    assert.equal(calls[3].kind, 'create');
+    assert.deepEqual(calls[3].options.env, { L2TP_EXECUTION_ENABLED: 'false' });
+    assert.equal(typeof calls[3].options.createHostDependencies, 'function');
 
     const firstStop = rootLifecycle.stop();
     const secondStop = rootLifecycle.stop();
@@ -235,7 +237,7 @@ test('root lifecycle awaits migrations once after the database boundary before r
     assert.deepEqual(await secondStop, { stopped: true });
     assert.deepEqual(
         calls.map(call => call.kind ?? call),
-        ['createMigrationBootstrap', 'migrate', 'create', 'stop'],
+        ['createMigrationBootstrap', 'migrate', 'indexes', 'create', 'stop'],
     );
 });
 

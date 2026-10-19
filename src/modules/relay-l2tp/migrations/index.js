@@ -19,7 +19,8 @@ const ensureModuleIndexes = Object.freeze({
     }))),
 });
 
-const migrations = Object.freeze([ensureModuleIndexes]);
+const { ensureQueueAdmissionIndexes } = require('./002-ensure-queue-admission-indexes');
+const migrations = Object.freeze([ensureModuleIndexes, ensureQueueAdmissionIndexes]);
 
 module.exports = {
     migrations,

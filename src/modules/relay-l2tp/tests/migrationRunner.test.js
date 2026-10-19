@@ -13,8 +13,14 @@ const EXPECTED_MODEL_ORDER = [
     'NodeOperationLock',
 ];
 
+const EXPECTED_QUEUE_MODEL_ORDER = ['TopologyCreateIntent', 'TopologyIntentQueueState', 'RemoteAdmission'];
+const EXPECTED_MIGRATION_IDS = ['001-ensure-module-indexes', '002-ensure-queue-admission-indexes'];
+const expectedSteps = () => [EXPECTED_MODEL_ORDER, EXPECTED_QUEUE_MODEL_ORDER].flatMap((names, i) => names.map(modelName => ({
+    migrationId: EXPECTED_MIGRATION_IDS[i], version: i + 1, action: 'createIndexes', modelName,
+})));
+
 function createFakeModels(calls = []) {
-    return Object.fromEntries(EXPECTED_MODEL_ORDER.map(modelName => [
+    return Object.fromEntries([...EXPECTED_MODEL_ORDER, ...EXPECTED_QUEUE_MODEL_ORDER].map(modelName => [
         modelName,
         {
             async createIndexes() {
@@ -142,12 +148,7 @@ test('dry-run returns the exact ordered index steps without model or state write
 
     assert.deepEqual(result, {
         dryRun: true,
-        steps: EXPECTED_MODEL_ORDER.map(modelName => ({
-            migrationId: '001-ensure-module-indexes',
-            version: 1,
-            action: 'createIndexes',
-            modelName,
-        })),
+        steps: expectedSteps(),
         appliedMigrationIds: [],
         skippedMigrationIds: [],
     });
@@ -185,25 +186,16 @@ test('apply ensures only module indexes in order before recording migration succ
     const result = await runner.run();
 
     assert.deepEqual(events, [
-        ...EXPECTED_MODEL_ORDER.map(modelName => ({ action: 'createIndexes', modelName })),
-        {
-            action: 'recordApplied',
-            state: {
-                migrationId: '001-ensure-module-indexes',
-                version: 1,
-                appliedAt: new Date('2026-09-22T12:00:00.000Z'),
-            },
-        },
+        ...[EXPECTED_MODEL_ORDER, EXPECTED_QUEUE_MODEL_ORDER].flatMap((names, i) => [
+            ...names.map(modelName => ({ action: 'createIndexes', modelName })),
+            { action: 'recordApplied', state: { migrationId: EXPECTED_MIGRATION_IDS[i], version: i + 1,
+                appliedAt: new Date('2026-09-22T12:00:00.000Z') } },
+        ]),
     ]);
     assert.deepEqual(result, {
         dryRun: false,
-        steps: EXPECTED_MODEL_ORDER.map(modelName => ({
-            migrationId: '001-ensure-module-indexes',
-            version: 1,
-            action: 'createIndexes',
-            modelName,
-        })),
-        appliedMigrationIds: ['001-ensure-module-indexes'],
+        steps: expectedSteps(),
+        appliedMigrationIds: EXPECTED_MIGRATION_IDS,
         skippedMigrationIds: [],
     });
 });
@@ -237,13 +229,13 @@ test('a repeated apply skips recorded migrations without ensuring indexes again'
     await runner.run();
     const result = await runner.run();
 
-    assert.equal(modelCalls.length, EXPECTED_MODEL_ORDER.length);
-    assert.equal(stateWrites.length, 1);
+    assert.equal(modelCalls.length, EXPECTED_MODEL_ORDER.length + EXPECTED_QUEUE_MODEL_ORDER.length);
+    assert.equal(stateWrites.length, 2);
     assert.deepEqual(result, {
         dryRun: false,
         steps: [],
         appliedMigrationIds: [],
-        skippedMigrationIds: ['001-ensure-module-indexes'],
+        skippedMigrationIds: EXPECTED_MIGRATION_IDS,
     });
 });
 

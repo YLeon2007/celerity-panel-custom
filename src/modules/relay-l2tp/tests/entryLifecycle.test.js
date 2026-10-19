@@ -537,6 +537,7 @@ test('registerMigrations lazily registers the ordered module migration registry'
 
     assert.deepEqual(migrations.map(migration => migration.id), [
         '001-ensure-module-indexes',
+        '002-ensure-queue-admission-indexes',
     ]);
     assert.deepEqual(registrations, migrations.map(migration => [
         entry.manifest.id,

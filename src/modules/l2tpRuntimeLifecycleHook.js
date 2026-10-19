@@ -216,6 +216,7 @@ function createL2tpRootHostDependencies({
 function createL2tpRootLifecycle({
     env = process.env,
     createMigrationBootstrap = createL2tpMigrationBootstrap,
+    ensureModelIndexes = options => require('./l2tpModelIndexReadiness').ensureL2tpModelIndexes(options),
     createHostDependencies = createL2tpRootHostDependencies,
     createRuntimeLifecycleHook = createL2tpRuntimeLifecycleHook,
     activeHostProvider = l2tpActiveHostProvider,
@@ -223,13 +224,19 @@ function createL2tpRootLifecycle({
     let lifecycle;
     let startPromise;
     let stopPromise;
+    let stopRequested = false;
 
     return {
         startAfterDatabase() {
             if (startPromise === undefined) {
                 startPromise = Promise.resolve().then(async () => {
+                    if (stopRequested) return undefined;
+                    parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
                     const migrationBootstrap = createMigrationBootstrap({ env });
                     await migrationBootstrap.run();
+                    if (stopRequested) return undefined;
+                    await ensureModelIndexes();
+                    if (stopRequested) return undefined;
                     lifecycle = createRuntimeLifecycleHook({
                         env,
                         createHostDependencies,
@@ -241,11 +248,12 @@ function createL2tpRootLifecycle({
             return startPromise;
         },
         stop() {
+            stopRequested = true;
             if (stopPromise === undefined) {
                 stopPromise = startPromise === undefined
                     ? Promise.resolve()
                     : startPromise.then(
-                        () => lifecycle.stop(),
+                        () => lifecycle?.stop(),
                         () => undefined,
                     );
             }

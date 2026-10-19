@@ -512,11 +512,14 @@ async function connectMongo(retries = 5, delayMs = 3000) {
 async function startServer() {
     try {
         await connectMongo();
+        if (shutdownPromise !== undefined) return;
         logger.info('[MongoDB] Connected');
 
         await l2tpRootLifecycle.startAfterDatabase();
+        if (shutdownPromise !== undefined) return;
         
         await cacheService.connect();
+        if (shutdownPromise !== undefined) return;
 
         initSessionMiddleware();
         logger.info('[Redis] Session store initialized');
@@ -644,6 +647,7 @@ async function startServer() {
         // Boot catchup + arm next-fire-time timer for subscription expiry.
         // Also sweeps over-traffic users one time (migration of dirty state).
         await expireScheduler.init();
+        if (shutdownPromise !== undefined) return;
         
         const PORT = process.env.PORT || 3000;
         const useCaddy = process.env.USE_CADDY === 'true';
@@ -703,6 +707,7 @@ async function startServer() {
             });
             
             glInstance.ready((glx) => {
+            if (shutdownPromise !== undefined) return;
             const httpServer = glx.httpServer();
             activeServers.push(httpServer);
             httpServer.listen(80, () => {
@@ -767,7 +772,7 @@ async function startServer() {
 
     } catch (err) {
         logger.error(`[Server] Startup failed: ${err.message}`);
-        process.exit(1);
+        await shutdown('startupFailure');
     }
 }
 
@@ -1171,29 +1176,67 @@ function cleanOldLogs(days) {
 
 // Graceful shutdown
 const activeServers = [];
-const FORCE_SHUTDOWN_MS = 10000;
+// The HTTP grace period is NOT a worker-drain deadline. Remote commands can
+// take 120-600s, with multiple commands per operation. The outer supervisor's
+// stop timeout must exceed this bounded local drain budget. Expiry is uncertain,
+// never a successful restart or evidence that remote writers have stopped.
+const HTTP_CLOSE_GRACE_MS = 10000;
+const SHUTDOWN_DEADLINE_MS = 30 * 60 * 1000;
 
-let isShuttingDown = false;
-async function shutdown(signal) {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
+let shutdownPromise;
+let shutdownExitCode = 0;
+function shutdown(signal) {
+    if (signal === 'uncaughtException' || signal === 'startupFailure') shutdownExitCode = 1;
+    if (shutdownPromise !== undefined) return shutdownPromise;
     logger.info(`[Server] ${signal} received, shutting down...`);
-    await Promise.all(
-        activeServers.map(s => new Promise(resolve => s.close(resolve)))
-    );
-    await l2tpRootLifecycle.stop();
-    if (cacheService.isConnected()) {
-        await cacheService.redis.quit().catch(() => {});
-    }
-    await mongoose.disconnect().catch(() => {});
-    process.exit(0);
+    let expired = false;
+    const deadline = setTimeout(() => {
+        expired = true;
+        logger.error('[Server] Shutdown deadline exceeded; remote completion is uncertain. Retain durable admissions/locks for authoritative recovery.');
+        process.exit(1);
+    }, SHUTDOWN_DEADLINE_MS);
+    // Keep this deadline referenced: an unresolved Promise is not an event-loop
+    // handle, and must not permit a silent successful exit before the drain.
+    shutdownPromise = Promise.resolve().then(async () => {
+        const serversClosed = Promise.all(activeServers.map(server => new Promise((resolve, reject) => {
+            const grace = setTimeout(() => {
+                shutdownExitCode = 1;
+                logger.error('[Server] HTTP close grace exceeded; closing connections while supervised workers continue draining');
+                server.closeAllConnections?.();
+                resolve();
+            }, HTTP_CLOSE_GRACE_MS);
+            try {
+                server.close(error => {
+                    clearTimeout(grace);
+                    if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+                    else resolve();
+                });
+            } catch (error) {
+                clearTimeout(grace);
+                reject(error);
+            }
+        })));
+        // Stop worker admission immediately, not after HTTP keepalives or WS
+        // clients close. Keep Mongo/Redis open until the supervised drain joins.
+        const drains = await Promise.allSettled([serversClosed, l2tpRootLifecycle.stop()]);
+        if (expired) return;
+        const failedDrain = drains.find(result => result.status === 'rejected');
+        if (failedDrain) throw failedDrain.reason;
+        if (cacheService.isConnected()) await cacheService.redis.quit();
+        await mongoose.disconnect();
+        clearTimeout(deadline);
+        process.exit(shutdownExitCode);
+    }).catch(error => {
+        clearTimeout(deadline);
+        logger.error('[Server] Shutdown failed; remote completion is uncertain; retain durable admissions/locks:', error);
+        process.exit(1);
+    });
+    return shutdownPromise;
 }
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.once(sig, () => {
-        setTimeout(() => process.exit(1), FORCE_SHUTDOWN_MS).unref();
-        shutdown(sig).catch(() => process.exit(1));
-    });
+    // Repeated signals join the same bounded drain rather than bypassing it.
+    process.on(sig, () => { shutdown(sig); });
 }
 
 process.on('unhandledRejection', (reason) => {
