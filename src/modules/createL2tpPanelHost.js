@@ -9,6 +9,7 @@ const { createPanelOverviewLoader } = require('./relay-l2tp/routes/panelOverview
 const { createL2tpExecutionRuntime } = require('./relay-l2tp/runtime/createL2tpExecutionRuntime');
 const { createL2tpRuntime } = require('./relay-l2tp/runtime/createL2tpRuntime');
 const { createL2tpWorkerLifecycle } = require('./relay-l2tp/runtime/createL2tpWorkerLifecycle');
+const { resolveL2tpExecutionAuthorization } = require('./relay-l2tp/domain/l2tpExecutionAuthorization');
 const { TopologyRuntimeService } = require('./relay-l2tp/services/topologyRuntimeService');
 
 const DEFAULT_COMPILER_DATA = Object.freeze({ relays: Object.freeze([]) });
@@ -65,6 +66,7 @@ function createL2tpPanelHost({
         './relay-l2tp/runtime/createTopologyOperationRuntime'
     );
     const executionContext = resolveTopologyExecutionContext(topologyEnv);
+    const l2tpExecutionAuthorization = resolveL2tpExecutionAuthorization(topologyEnv);
     const topologyExecutionRequested = isTopologyTestExecutionEnabled(topologyEnv)
         || executionContext !== undefined;
     if (topologyExecutionRequested && !executionContext) {
@@ -169,8 +171,7 @@ function createL2tpPanelHost({
             workerId,
             leaseMs,
             afterInstallSucceeded: deployTopologyAfterInstall,
-            enableUnsafeExecutionForTests: testWorkerExecutionAllowed,
-            enableInstallAdmission: testWorkerExecutionAllowed,
+            ...l2tpExecutionAuthorization,
         },
     });
 

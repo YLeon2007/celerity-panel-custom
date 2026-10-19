@@ -84,7 +84,17 @@ test('TEST keeps its independent worker and ingress admission opt-ins and gets i
     const { captured } = compose({ ...TEST_ENV });
     assert.deepEqual(captured.intent.executionContext, TEST);
     assert.deepEqual(captured.recovery.executionContext, TEST);
+    assert.strictEqual(captured.execution.runtimeDependencies.executionContext, captured.intent.executionContext);
     assert.equal(captured.execution.runtimeDependencies.enableUnsafeExecutionForTests, true);
+    assert.equal(captured.execution.runtimeDependencies.enableInstallAdmission, true);
+});
+
+test('production L2TP admission requires its own server-only opt-in and never inherits TEST bypass', () => {
+    const { captured } = compose({ ...PROD_ENV, L2TP_PRODUCTION_EXECUTION_ENABLED: 'true' });
+    assert.strictEqual(captured.execution.runtimeDependencies.executionContext, captured.intent.executionContext);
+    assert.deepEqual(captured.execution.runtimeDependencies.executionContext, PROD);
+    assert.equal(captured.execution.runtimeDependencies.enableProductionExecution, true);
+    assert.equal(captured.execution.runtimeDependencies.enableUnsafeExecutionForTests, false);
     assert.equal(captured.execution.runtimeDependencies.enableInstallAdmission, true);
 });
 
