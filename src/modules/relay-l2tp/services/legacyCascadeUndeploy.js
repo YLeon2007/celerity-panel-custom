@@ -1,6 +1,33 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const completionScope = new AsyncLocalStorage();
+
+function uncertain() {
+    return Object.assign(new Error('Legacy undeploy remote completion is unproved; ownership retained for operator recovery'), {
+        code: 'LEGACY_CASCADE_UNDEPLOY_UNCERTAIN',
+    });
+}
+
+// The HTTP callback discards its return value and MCP returns a link document.
+// Track actual service completion in this async scope, not callback truthiness.
+// Any failed/pending invocation poisons the scope, even if its caller catches it
+// or later runs a successful teardown. Only checked service paths may use this.
+async function trackLegacyCascadeUndeploy(work) {
+    const scope = completionScope.getStore();
+    if (scope?.closed) throw uncertain();
+    if (scope) scope.started++;
+    try {
+        const result = await work();
+        if (result?.success !== true || result?.remoteQuiescent !== true) throw uncertain();
+        if (scope) scope.completed++;
+        return result;
+    } catch (error) {
+        if (scope) scope.failed = true;
+        throw error;
+    }
+}
 const CascadeTopologyState = require('../models/cascadeTopologyStateModel');
 const TopologyOperation = require('../models/topologyOperationModel');
 const TopologyCreateIntent = require('../models/topologyCreateIntentModel');
@@ -54,7 +81,10 @@ async function withLegacyCascadeUndeploy(work) {
 
     // Throw/unknown acquisition means zero external calls. A throw/crash after
     // acquisition retains the reservation for explicit operator recovery.
-    const result = await work();
+    const scope = { started: 0, completed: 0, failed: false, closed: false };
+    let result;
+    try { result = await completionScope.run(scope, work); } finally { scope.closed = true; }
+    if (scope.failed || scope.started === 0 || scope.completed !== scope.started) throw uncertain();
     const released = await CascadeTopologyState.findOneAndUpdate({
         _id: 'singleton', revision: claimed.revision, deployedRevision: 0,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0, replacementEpoch: claimed.epoch,
@@ -66,4 +96,4 @@ async function withLegacyCascadeUndeploy(work) {
     return result;
 }
 
-module.exports = { withLegacyCascadeUndeploy };
+module.exports = { withLegacyCascadeUndeploy, trackLegacyCascadeUndeploy };

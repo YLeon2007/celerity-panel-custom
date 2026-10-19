@@ -21,6 +21,15 @@ const operationId = '507f1f77bcf86cd799439041';
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to a local isolated MongoDB binary' };
 let models, directory, child, remoteCalls, cacheCalls;
 const originalUndeploy = cascadeService.undeployLink;
+const { trackLegacyCascadeUndeploy } = require('../../modules/relay-l2tp/services/legacyCascadeUndeploy');
+// Test-only attestation for isolated route/fence tests; actual remote receipt
+// semantics are exercised by cascadeUndeployCompletion.test.js.
+function attestedStub(work) {
+    return (...args) => trackLegacyCascadeUndeploy(async () => {
+        await work(...args);
+        return { success: true, remoteQuiescent: true };
+    });
+}
 const originalInvalidate = cache.invalidateAllSubscriptions;
 async function until(work) {
     let error;
@@ -81,7 +90,7 @@ async function reset({ count = 0, operation = false } = {}) {
         }
     }
     remoteCalls = 0; cacheCalls = 0;
-    cascadeService.undeployLink = async () => { remoteCalls++; };
+    cascadeService.undeployLink = attestedStub(async () => { remoteCalls++; });
 }
 async function httpUndeploy(body = {}) {
     // Fresh limiter per local request; the deployed middleware is unchanged.
@@ -191,7 +200,7 @@ test('quiescent HTTP undeploy owns the fence across teardown and preserves opera
     await reset({ operation: true });
     await models.TopologyOperation.updateOne({ _id: operationId }, { $set: { status: 'succeeded', heldTopologyAdmission: false } });
     const operation = await models.TopologyOperation.findById(operationId).lean();
-    cascadeService.undeployLink = async link => {
+    cascadeService.undeployLink = attestedStub(async link => {
         remoteCalls++;
         assert.equal(String(link._id), linkId);
         const owned = await models.CascadeTopologyState.findById('singleton').lean();
@@ -208,7 +217,7 @@ test('quiescent HTTP undeploy owns the fence across teardown and preserves opera
             admit: async () => assert.fail('cannot admit while teardown owns the topology') }), { code: 'TOPOLOGY_REPLACEMENT_RESERVED' });
         const denied = await httpUndeploy();
         assert.equal(denied.status, 409);
-    };
+    });
     const response = await httpUndeploy();
     assert.equal(response.status, 200);
     assert.equal(remoteCalls, 1);
@@ -283,11 +292,11 @@ test('HTTP undeploy loses a post-read admission race before external teardown', 
 test('quiescent MCP undeploy preserves its progress/response contract and invalidates subscriptions', local, async () => {
     await reset();
     const progress = [];
-    cascadeService.undeployLink = async current => {
+    cascadeService.undeployLink = attestedStub(async current => {
         remoteCalls++;
         assert.equal(String(current.portalNode._id), ids[0]);
         assert.ok((await models.CascadeTopologyState.findById('singleton').lean()).replacementReservation);
-    };
+    });
     const result = await manageCascade({ action: 'undeploy', id: linkId }, (...args) => progress.push(args));
     assert.equal(result.success, true);
     assert.equal(progress.length, 1);
@@ -328,12 +337,12 @@ test('HTTP undeploy rereads metadata after a draft edit wins the existence-read 
         };
         return query;
     };
-    cascadeService.undeployLink = async current => {
+    cascadeService.undeployLink = attestedStub(async current => {
         remoteCalls++;
         assert.equal(current.mode, 'reverse');
         assert.equal(current.name, 'new-metadata');
         assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 9);
-    };
+    });
     try {
         assert.equal((await httpUndeploy()).status, 200);
         assert.equal(remoteCalls, 1);
@@ -346,7 +355,7 @@ test('new intent accepted during teardown waits behind the owned reservation', l
     const { createTopologyIntentService } = require('../../modules/relay-l2tp/services/topologyIntentService');
     const service = createTopologyIntentService(models);
     let job;
-    cascadeService.undeployLink = async () => {
+    cascadeService.undeployLink = attestedStub(async () => {
         remoteCalls++;
         job = await service.accept({ expectedTopologyRevision: 8, requestKey: 'behind-undeploy', link: {
             _id: new mongoose.Types.ObjectId(), name: 'deferred', mode: 'forward', portalNode: ids[0], bridgeNode: ids[1],
@@ -356,7 +365,7 @@ test('new intent accepted during teardown waits behind the owned reservation', l
         assert.equal(await models.TopologyOperation.countDocuments(), 0);
         assert.equal(await CascadeLink.countDocuments(), 1);
         assert.equal((await service.get(job.jobId)).status, 'waiting');
-    };
+    });
     assert.equal((await httpUndeploy()).status, 200);
     assert.equal((await service.get(job.jobId)).status, 'waiting');
     assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
@@ -385,7 +394,7 @@ test('unknown reservation commit never authorizes teardown or a blind reservatio
 
 test('teardown failure retains non-expiring ownership with no operation purge', local, async () => {
     await reset();
-    cascadeService.undeployLink = async () => { remoteCalls++; throw new Error('local simulated uncertain teardown'); };
+    cascadeService.undeployLink = attestedStub(async () => { remoteCalls++; throw new Error('local simulated uncertain teardown'); });
     const response = await httpUndeploy();
     assert.equal(response.status, 500);
     const state = await models.CascadeTopologyState.findById('singleton').lean();
@@ -399,12 +408,12 @@ test('teardown failure retains non-expiring ownership with no operation purge', 
 
 test('undeploy never releases a foreign reservation after losing ownership', local, async () => {
     await reset();
-    cascadeService.undeployLink = async () => {
+    cascadeService.undeployLink = attestedStub(async () => {
         remoteCalls++;
         await models.CascadeTopologyState.updateOne({ _id: 'singleton' }, {
             $set: { replacementReservation: { ownerToken: 'foreign-owner', epoch: 2 }, replacementEpoch: 2 },
         });
-    };
+    });
     const response = await httpUndeploy();
     assert.equal(response.status, 500);
     assert.equal(response.body.error.code, 'LEGACY_CASCADE_UNDEPLOY_FENCE_LOST');
@@ -413,3 +422,59 @@ test('undeploy never releases a foreign reservation after losing ownership', loc
     assert.equal(state.replacementReservation.epoch, 2);
     assert.equal(remoteCalls, 1);
 });
+
+for (const ingress of ['HTTP', 'MCP']) {
+    for (const outcome of ['timeout', 'ambiguous', 'success']) {
+        test(`actual cascadeService ${ingress} ${outcome} uses durable completion ownership`, local, async t => {
+            await reset({ operation: true });
+            await models.TopologyOperation.updateOne({ _id: operationId }, { $set: { status: 'succeeded', heldTopologyAdmission: false } });
+            const history = await models.TopologyOperation.findById(operationId).lean();
+            await HyNode.collection.updateMany({}, { $set: { ssh: { password: 'local-only-mock' } } });
+            await CascadeLink.updateOne({ _id: linkId }, { $set: { mode: 'reverse' } });
+            cascadeService.undeployLink = originalUndeploy;
+            const NodeSSH = require('../../services/nodeSSH');
+            const syncService = require('../../services/syncService');
+            const configGenerator = require('../../services/configGenerator');
+            let writerAlive = false;
+            t.mock.method(syncService, '_getUsersForNode', async () => []);
+            t.mock.method(configGenerator, 'generateXrayConfigWithApi', () => JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } }));
+            t.mock.method(NodeSSH.prototype, 'connect', async () => {});
+            t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
+            t.mock.method(NodeSSH.prototype, 'uploadContent', async () => {});
+            t.mock.method(NodeSSH.prototype, 'exec', async command => {
+                remoteCalls++;
+                const owned = await models.CascadeTopologyState.findById('singleton').lean();
+                assert.ok(owned.replacementReservation);
+                if (command.includes('systemctl stop') && outcome !== 'success') {
+                    writerAlive = true;
+                    if (outcome === 'timeout') throw new Error('local simulated exec timeout; remote writer still alive');
+                    return { stdout: '', stderr: '' }; // close without exit/receipt
+                }
+                const marker = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)[0];
+                return { code: 0, stdout: `\n${marker}\n`, stderr: '' };
+            });
+            if (ingress === 'HTTP') {
+                const response = await httpUndeploy();
+                assert.equal(response.status, outcome === 'success' ? 200 : 500);
+            } else if (outcome === 'success') {
+                assert.equal((await manageCascade({ action: 'undeploy', id: linkId }, () => {})).success, true);
+            } else {
+                await assert.rejects(manageCascade({ action: 'undeploy', id: linkId }, () => {}));
+            }
+            const state = await models.CascadeTopologyState.findById('singleton').lean();
+            assert.deepEqual(await models.TopologyOperation.findById(operationId).lean(), history);
+            assert.equal(state.deployedRevision, 0);
+            assert.equal(cacheCalls, outcome === 'success' ? 1 : 0);
+            if (outcome === 'success') {
+                assert.equal(state.replacementReservation, undefined);
+            } else {
+                assert.equal(writerAlive, true);
+                assert.match(state.replacementReservation.ownerToken, /^legacy-undeploy:/);
+                assert.equal(state.replacementReservation.expiresAt, undefined);
+                const before = remoteCalls;
+                assert.equal((await httpUndeploy()).status, 409);
+                assert.equal(remoteCalls, before);
+            }
+        });
+    }
+}
