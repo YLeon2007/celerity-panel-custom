@@ -18,8 +18,10 @@ function matchesAdmission(record, filter) {
 }
 
 function fixture({ gate = {}, ambiguous = false, createFails = false, splitConnection = false,
-    sessionUnavailable = false } = {}) {
-    const state = gate === null ? null : { _id: 'singleton', remoteAdmissionCount: 0, ...gate };
+    sessionUnavailable = false, missingLockModel = false, splitLockConnection = false,
+    missingLockQuery = false } = {}) {
+    const state = gate === null ? null : { _id: 'singleton', remoteAdmissionCount: 0,
+        topologyAdmissionCount: 0, ...gate };
     const records = new Map();
     const locks = new Map();
     const operations = new Map();
@@ -37,6 +39,8 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
                 || filter.remoteAdmissionCount?.$gte !== undefined
                     && !(typeof state.remoteAdmissionCount === 'number'
                         && state.remoteAdmissionCount >= filter.remoteAdmissionCount.$gte)
+                || filter.topologyAdmissionCount !== undefined
+                    && state.topologyAdmissionCount !== filter.topologyAdmissionCount
                 || filter.remoteAdmissionCount?.$gt !== undefined && state.remoteAdmissionCount <= 0) {
                 return { matchedCount: 0 };
             }
@@ -92,12 +96,18 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
     const NodeOperationLock = {
         db,
         findOne({ node, operationId }) {
-            const lock = locks.get(`${node}:${operationId}`);
-            return { session() { return this; }, async lean() { return lock ?? null; } };
+            const lock = operationId === undefined
+                ? [...locks].find(([key]) => key.startsWith(`${node}:`))?.[1]
+                : locks.get(`${node}:${operationId}`);
+            return { session(value) { assert.strictEqual(value, session); return this; },
+                async lean() { return lock ?? null; } };
         },
     };
+    if (missingLockQuery) delete NodeOperationLock.findOne;
+    if (splitLockConnection) NodeOperationLock.db = {};
     const repository = new RemoteAdmissionRepository({ CascadeTopologyState, RemoteAdmission,
-        L2tpOperation, NodeOperationLock, transactionRunner: async work => {
+        L2tpOperation, NodeOperationLock: missingLockModel ? undefined : NodeOperationLock,
+        transactionRunner: async work => {
             const previousCount = state?.remoteAdmissionCount;
             const previousRecords = new Map([...records].map(([id, record]) => [id, { ...record }]));
             try {
@@ -160,6 +170,40 @@ test('acquireInstall denies absent or legacy gate, drain, and reservation withou
     }
 });
 
+test('acquireInstall rejects active or missing topology admission counter before counting', async () => {
+    for (const topologyAdmissionCount of [1, undefined, -1]) {
+        const f = fixture({ gate: { topologyAdmissionCount } });
+        await assert.rejects(f.repository.acquireInstall({ nodeId: 'relay-1' }),
+            { code: 'REMOTE_ADMISSION_BLOCKED' });
+        assert.equal(f.state.remoteAdmissionCount, 0);
+        assert.equal(f.records.size, 0);
+        assert.equal(f.state.topologyAdmissionCount, topologyAdmissionCount);
+    }
+});
+
+test('acquireInstall refuses any existing exact node fence without counting or changing ownership', async () => {
+    for (const remoteUncertain of [true, false, undefined]) {
+        const f = fixture();
+        const lock = { node: 'relay-1', owner: 'topology-worker', operationId: 'topology-op',
+            generation: 'foreign-generation', leaseUntil: new Date(0), remoteUncertain };
+        f.locks.set('relay-1:topology-op', lock);
+        await assert.rejects(f.repository.acquireInstall({ nodeId: 'relay-1' }),
+            { code: 'NODE_OPERATION_LOCK_CONFLICT' });
+        assert.strictEqual(f.locks.get('relay-1:topology-op'), lock);
+        assert.equal(f.state.remoteAdmissionCount, 0);
+        assert.equal(f.records.size, 0);
+        assert.deepEqual(f.calls, []);
+    }
+});
+
+test('acquireInstall does not block on a different node fence', async () => {
+    const f = fixture();
+    f.locks.set('relay-2:topology-op', { node: 'relay-2', generation: 'foreign-generation' });
+    await f.repository.acquireInstall({ nodeId: 'relay-1' });
+    assert.equal(f.state.remoteAdmissionCount, 1);
+    assert.equal(f.locks.size, 1);
+});
+
 test('acquireInstall rolls back the count when creating the record fails', async () => {
     const f = fixture({ createFails: true });
     await assert.rejects(f.repository.acquireInstall({ nodeId: 'relay-1' }), error => {
@@ -184,11 +228,12 @@ test('acquireInstall reports its committed identity on uncertain outcome without
     assert.equal([...f.records.values()][0].phase, 'running');
 });
 
-test('acquireInstall rejects split connections and missing session capability before mutating', async () => {
-    for (const options of [{ splitConnection: true }, { sessionUnavailable: true }]) {
+test('acquireInstall rejects split connections and missing transaction or node-lock capability before mutating', async () => {
+    for (const options of [{ splitConnection: true }, { sessionUnavailable: true },
+        { missingLockModel: true }, { splitLockConnection: true }, { missingLockQuery: true }]) {
         const f = fixture(options);
         await assert.rejects(f.repository.acquireInstall({ nodeId: 'relay-1' }),
-            /both models on one transactional Mongo connection/);
+            /models on one transactional Mongo connection/);
         assert.deepEqual(f.calls, []);
         assert.equal(f.state.remoteAdmissionCount, 0);
         assert.equal(f.records.size, 0);
@@ -199,6 +244,7 @@ test('acquireInstall cannot proceed with a nontransactional session', async () =
     const db = { startSession: async () => ({ endSession: async () => {} }) };
     let updates = 0;
     const repository = new RemoteAdmissionRepository({
+        NodeOperationLock: { db, findOne() { throw new Error('unexpected lock query'); } },
         CascadeTopologyState: { db, updateOne: async () => { updates += 1; return { matchedCount: 1 }; } },
         RemoteAdmission: { db, create: async () => { throw new Error('unexpected create'); },
             findOne() { throw new Error('unexpected findOne'); },

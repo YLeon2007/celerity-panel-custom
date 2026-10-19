@@ -380,12 +380,20 @@ class RemoteAdmissionRepository {
         const connection = this.CascadeTopologyState.db;
         if (!connection || typeof connection.startSession !== 'function'
             || this.RemoteAdmission.db !== connection
-            || typeof this.RemoteAdmission.findOne !== 'function') {
-            throw new TypeError('Install admission requires both models on one transactional Mongo connection');
+            || typeof this.RemoteAdmission.findOne !== 'function'
+            || this.NodeOperationLock?.db !== connection
+            || typeof this.NodeOperationLock?.findOne !== 'function') {
+            throw new TypeError('Install admission requires admission and node lock models on one transactional Mongo connection');
         }
         const id = randomUUID();
         try {
             await this.transactionRunner(async session => {
+                // This snapshot rejects an already-held (even expired) fence.
+                // It cannot prevent a later insert: the service must still claim
+                // its own exact node lock before invoking remote preflight.
+                const lock = await this.NodeOperationLock.findOne({ node: String(nodeId) })
+                    .session(session).lean();
+                if (lock) throw admissionError('NODE_OPERATION_LOCK_CONFLICT');
                 const unresolved = await this.RemoteAdmission.findOne({
                     nodeId: String(nodeId), kind: { $in: ['install', 'standalone_preflight', 'sync_users'] },
                     phase: { $in: ['running', 'queued', 'recovery_required'] },
@@ -394,6 +402,9 @@ class RemoteAdmissionRepository {
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
+                    // An active topology operation owns deployment, even before
+                    // its worker has inserted the exact relay node lock.
+                    topologyAdmissionCount: 0,
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_BLOCKED');

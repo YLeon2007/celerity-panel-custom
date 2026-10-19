@@ -622,6 +622,112 @@ test('install requires a relay-group plan before preflight or planning', async (
     assert.equal(planCalls, 0);
 });
 
+test('install exact node lock conflict rejects before any remote side effect', async () => {
+    const context = installContext();
+    const events = [];
+    const service = createService({
+        ...createContextRepositories(context), enableInstallAdmission: true,
+        remoteAdmissionRepository: {
+            async acquireInstall() { events.push('admit'); return 'admission-1'; },
+            async release(id) { events.push(`release:${id}`); },
+            async queueInstall() { events.push('queue'); },
+            async markRecoveryRequired() { events.push('recovery'); },
+        },
+        lockService: {
+            async acquire() { events.push('lock-conflict'); return { ok: false }; },
+            async releaseVerified() { events.push('lock-release'); },
+        },
+        preflightRunner: async request => {
+            events.push('remote-side-effect');
+            request.onVerifiedRemoteComplete();
+            return { ok: true };
+        },
+    });
+    await assert.rejects(service.install(context.node.id, context.input),
+        { code: 'NODE_OPERATION_LOCK_CONFLICT' });
+    assert.deepEqual(events, ['admit', 'lock-conflict', 'release:admission-1']);
+});
+
+for (const result of [undefined, { ok: true }, { lock: { generation: 'unknown' } }]) {
+    test(`install indeterminate lock acquisition ${JSON.stringify(result)} retains count before transport`, async () => {
+        const context = installContext();
+        const events = [];
+        const service = createService({
+            ...createContextRepositories(context), enableInstallAdmission: true,
+            remoteAdmissionRepository: {
+                async acquireInstall() { return 'admission-1'; },
+                async release() { events.push('release'); },
+                async queueInstall() { events.push('queue'); },
+                async markRecoveryRequired(id) { events.push(`recovery:${id}`); },
+            },
+            lockService: { async acquire() { return result; }, async releaseVerified() { events.push('unlock'); } },
+            preflightRunner: async () => { events.push('remote'); },
+        });
+        await assert.rejects(service.install(context.node.id, context.input), { code: 'NODE_LOCK_UNAVAILABLE' });
+        assert.deepEqual(events, ['recovery:admission-1']);
+    });
+}
+
+for (const lockService of [{}, { acquire: async () => { throw new Error('unexpected acquire'); } }]) {
+    test('install without a complete exact-lock API fails before admission or transport', async () => {
+        const context = installContext();
+        const events = [];
+        const service = createService({
+            ...createContextRepositories(context), enableInstallAdmission: true, lockService,
+            remoteAdmissionRepository: {
+                async acquireInstall() { events.push('admit'); }, async release() {},
+                async queueInstall() {}, async markRecoveryRequired() {},
+            },
+            preflightRunner: async () => { events.push('remote'); },
+        });
+        await assert.rejects(service.install(context.node.id, context.input), { code: 'REMOTE_ADMISSION_UNAVAILABLE' });
+        assert.deepEqual(events, []);
+    });
+}
+
+for (const ok of [true, false]) {
+    test(`install verified ${ok ? 'success' : 'refusal'} releases exact preflight lock before admission handoff`, async () => {
+        const context = installContext();
+        const events = [];
+        let exactLock;
+        const service = createService({
+            ...createContextRepositories(context), enableInstallAdmission: true,
+            remoteAdmissionRepository: {
+                async acquireInstall() { events.push('admit'); return 'admission-1'; },
+                async release() { events.push('release-count'); },
+                async queueInstall({ operationDocument }) {
+                    assert.notEqual(operationDocument._id, exactLock.operationId);
+                    events.push('queue');
+                },
+                async markRecoveryRequired() { events.push('recovery'); },
+            },
+            lockService: {
+                async acquire(request) {
+                    assert.equal(request.node, 'relay-1');
+                    assert.match(request.owner, /^install-preflight:/);
+                    assert.match(request.operationId, /^preflight:relay-1:/);
+                    exactLock = { ...request, generation: 'exact-generation', remoteUncertain: true };
+                    events.push('lock');
+                    return { ok: true, lock: exactLock };
+                },
+                async releaseVerified(lock) {
+                    assert.strictEqual(lock, exactLock);
+                    events.push('release-lock');
+                    return { ok: true };
+                },
+            },
+            preflightRunner: async request => {
+                events.push('remote');
+                request.onVerifiedRemoteComplete();
+                return { ok };
+            },
+        });
+        if (ok) await service.install(context.node.id, context.input);
+        else await assert.rejects(service.install(context.node.id, context.input), { code: 'PREFLIGHT_FAILED' });
+        assert.deepEqual(events, ['admit', 'lock', 'remote', 'release-lock', ok ? 'queue' : 'release-count']);
+    });
+}
+
 test('install rejects a failed preflight without building or persisting a plan', async () => {
     const context = installContext();
     const repositories = createContextRepositories(context);
@@ -833,6 +939,10 @@ for (const [name, runner] of [
             ...createContextRepositories(context),
             enableInstallAdmission: true,
             preflightRunner: runner,
+            lockService: {
+                async acquire() { events.push('lock'); return { ok: true, lock: { generation: 'held-lock' } }; },
+                async releaseVerified() { events.push('unlock'); return { ok: true }; },
+            },
             planBuilder: () => { events.push('plan'); },
             remoteAdmissionRepository: {
                 async acquireInstall() { events.push('acquire'); return 'admission-1'; },
@@ -842,7 +952,7 @@ for (const [name, runner] of [
             },
         });
         await assert.rejects(service.install(context.node.id, context.input));
-        assert.deepEqual(events, ['acquire', 'recover:admission-1']);
+        assert.deepEqual(events, ['acquire', 'lock', 'recover:admission-1']);
     });
 }
 

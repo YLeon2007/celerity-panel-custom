@@ -172,10 +172,45 @@ class L2tpService {
             || typeof admissions.acquireInstall !== 'function'
             || typeof admissions.queueInstall !== 'function'
             || typeof admissions.release !== 'function'
-            || typeof admissions.markRecoveryRequired !== 'function') {
+            || typeof admissions.markRecoveryRequired !== 'function'
+            || !this.lockService || typeof this.lockService.acquire !== 'function'
+            || typeof this.lockService.releaseVerified !== 'function') {
             throw new L2tpServiceError('REMOTE_ADMISSION_UNAVAILABLE', 'Install admission is unavailable');
         }
         const admissionId = await admissions.acquireInstall({ nodeId: entityId(context.node) });
+        // Admission excludes drains/replacement but is not a node lock. A topology
+        // worker can win the node between admission and this insert-only claim.
+        // Use a distinct preflight identity: never hand this lock to the worker.
+        let acquired;
+        try {
+            acquired = await this.lockService.acquire({
+                node: entityId(context.node),
+                owner: `install-preflight:${randomBytes(8).toString('hex')}`,
+                operationId: `preflight:${entityId(context.node)}:${randomBytes(8).toString('hex')}`,
+                leaseMs: 15 * 60 * 1000,
+            });
+        } catch (error) {
+            // The insert may have committed. Retain both fences for recovery.
+            try { await admissions.markRecoveryRequired(admissionId); } catch { /* keep count */ }
+            throw error;
+        }
+        if (acquired?.ok === false) {
+            try {
+                await admissions.release(admissionId);
+            } catch (error) {
+                try { await admissions.markRecoveryRequired(admissionId); } catch { /* keep count */ }
+                throw error;
+            }
+            throw new L2tpServiceError('NODE_OPERATION_LOCK_CONFLICT',
+                'The relay is busy with another operation');
+        }
+        if (acquired?.ok !== true || !acquired.lock) {
+            // A malformed/absent claim result is not evidence of non-acquisition.
+            try { await admissions.markRecoveryRequired(admissionId); } catch { /* keep count */ }
+            throw new L2tpServiceError('NODE_LOCK_UNAVAILABLE',
+                'The install preflight node fence could not be verified');
+        }
+        const preflightLock = acquired.lock;
         let verifiedComplete = false;
         let preflightResult;
         let runnerError;
@@ -194,6 +229,19 @@ class L2tpService {
             await admissions.markRecoveryRequired(admissionId);
             if (runnerError) throw runnerError;
             throw new L2tpServiceError('PREFLIGHT_RESPONSE_INVALID', 'Install preflight was not verified');
+        }
+        // Only an attested, validated remote completion authorizes exact release.
+        // The counted admission stays live through planning and queue handoff;
+        // worker execution obtains its own independent node-lock generation.
+        try {
+            const released = await this.lockService.releaseVerified(preflightLock);
+            if (released?.ok !== true) {
+                throw new L2tpServiceError('PREFLIGHT_FENCE_RELEASE_FAILED',
+                    'The preflight completed but its exact node fence could not be released');
+            }
+        } catch (error) {
+            try { await admissions.markRecoveryRequired(admissionId); } catch { /* keep count */ }
+            throw error;
         }
         if (preflightResult.ok === false) {
             await admissions.release(admissionId);
