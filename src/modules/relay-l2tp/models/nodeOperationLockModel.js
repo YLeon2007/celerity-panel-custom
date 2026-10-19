@@ -22,6 +22,8 @@ const nodeOperationLockSchema = new mongoose.Schema({
         type: Date,
         required: true,
     },
+    // Transactional binding verification never acquires/replaces this generation.
+    executionBindingCheck: { type: String },
     generation: {
         type: String,
         required: true,

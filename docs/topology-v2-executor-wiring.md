@@ -42,17 +42,22 @@ quiescence refusal is unchanged. Default real executors on **both** canonical
 hosts refuse before node lookup/bootstrap because durable V2 authority is absent.
 
 A frozen object alone is not durability, enrollment or quiescence evidence. The
-injected reader is a server-owned test/integration seam, not an implemented
-persistence or ownership protocol. The fixtures use explicitly simulated local
-records and SSH responses, not a production database.
+executor's injected reader remains a server-owned integration seam. A real,
+**dormant** Mongo implementation now exists in `TopologyExecutionBindingStore`;
+see [the storage contract](topology-v2-execution-binding-store.md). It is not
+installed by any runtime, host, route or worker. Its local replica-set tests use
+explicitly simulated external maintenance/physical/predecessor authority and
+local-only SSH adapters, never a production database or real node.
 
 Before any real reader/worker enablement, separately implement and verify:
 
-1. Immutable node/attempt/command binding storage and exact claim + node-lock
-   CAS/readback, with primary-majority durable confirmation and bounded unknown
-   commit recovery. The current operation schema/repository do not persist this
-   execution record. Do not infer successful persistence from an in-memory
-   frozen row, phase label, lease or reacquired lock.
+1. Provision and review the dormant insert-only enrollment/binding indexes and
+   explicitly supply its connected replica-set models plus trustworthy external
+   authority. The separate immutable models now persist the execution record;
+   real-operation/claim/node-lock/physical-owner CAS and bounded primary-majority
+   readback are tested locally. No production schema migration, authority,
+   successor enrollment or runtime reader installation is delivered. Do not infer
+   ownership from a phase label, lease, reacquired lock or test authority.
 2. Authoritative predecessor enrollment and physical execution-host/profile
    ownership, including aliases. `none` is permitted in the simulated fixtures
    only as explicit initial enrollment; runtime does not default or synthesize

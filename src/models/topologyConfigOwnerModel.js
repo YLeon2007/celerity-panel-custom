@@ -31,6 +31,8 @@ const schema = new mongoose.Schema({
     handbackReceipt: { type: receiptSchema },
     // No defaults: an unbound/cloned/legacy row is not an adoption permit.
     owner: { type: String, required: true, enum: ['classic', 'topology'] },
+    // Dormant binding-store CAS nonce, not evidence of remote quiescence.
+    executionBindingCheck: { type: String },
     generation: { type: String, required: true, match: /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/ },
 }, { timestamps: true, strict: 'throw', versionKey: false });
 // Global node/profile uniqueness also prevents a foreign-context clone occupying

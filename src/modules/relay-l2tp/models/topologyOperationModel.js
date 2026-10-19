@@ -124,6 +124,8 @@ const pppWaitSchema = new mongoose.Schema({
 const executionContextField = require('./topologyExecutionContextSchema');
 const topologyOperationSchema = new mongoose.Schema({
     executionContext: executionContextField(),
+    // Dormant binding-store CAS nonce; never defaults/adopts a legacy operation.
+    executionBindingCheck: { type: String },
     idempotencyKey: { type: String, immutable: true },
     topologyRevision: {
         type: Number,
