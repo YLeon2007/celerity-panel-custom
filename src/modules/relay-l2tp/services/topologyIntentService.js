@@ -1,5 +1,6 @@
 'use strict';
 const { createHash, randomUUID } = require('node:crypto');
+const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const QUEUE_ID = 'create-v1';
 function intentError(code) { return Object.assign(new Error(code), { code }); }
 function canonical(value) {
@@ -19,9 +20,15 @@ function publicIntent(row) {
     };
 }
 class TopologyIntentService {
+    #executionContext;
     constructor(dependencies = {}) {
         const { TopologyCreateIntent, TopologyIntentQueueState, CascadeTopologyState, CascadeLink, capacity = 32, transactionRunner } = dependencies;
-        this.dependencies = dependencies;
+        const executionContext = topologyExecutionContext(
+            dependencies.executionContext?.target, dependencies.executionContext?.hostIdentity,
+        );
+        if (!executionContext) throw new TypeError('Intent admission requires an exact server execution context');
+        this.#executionContext = executionContext;
+        this.dependencies = { ...dependencies, executionContext };
         const models = { TopologyCreateIntent, TopologyIntentQueueState, CascadeTopologyState, CascadeLink };
         const connection = CascadeTopologyState?.db;
         if (!connection || Object.values(models).some(model => model?.db !== connection)) throw new TypeError('Intent admission requires one Mongo connection');
@@ -54,6 +61,9 @@ class TopologyIntentService {
             const query = this.TopologyCreateIntent.findOne({ requestKey }).session(session);
             if (confirmDurable) query.readConcern('majority').read('primary').maxTimeMS(5000);
             const found = await query.lean();
+            if (found && !matchesTopologyExecutionContext(found.executionContext, this.#executionContext)) {
+                throw intentError('TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH');
+            }
             if (found && found.payloadHash !== fingerprint) throw intentError('TOPOLOGY_INTENT_KEY_CONFLICT');
             return found;
         };
@@ -78,6 +88,7 @@ class TopologyIntentService {
                 ).lean();
                 if (!counted) throw intentError('TOPOLOGY_INTENT_BACKLOG_FULL');
                 const [row] = await this.TopologyCreateIntent.create([{
+                    executionContext: this.#executionContext,
                     requestKey, version: 1, payload, payloadHash: fingerprint, ordinal: counted.ordinal,
                     acceptanceRevision: expectedTopologyRevision, status: 'waiting', attempts: 0, generation: 0,
                 }], { session });

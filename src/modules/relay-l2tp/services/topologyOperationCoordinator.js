@@ -12,6 +12,7 @@ const { computeTopologyDomains } = require('../domain/topologyDomains');
 const { deriveReplacementTopology, deriveAttachTopology } = require('../domain/topologyReplacement');
 const {
     TEST_TOPOLOGY_EXECUTION_CONTEXT,
+    matchesTopologyOperationExecutionContext,
     topologyExecutionContext,
 } = require('../domain/topologyExecutionContext');
 
@@ -466,7 +467,7 @@ class TopologyOperationCoordinator {
 
     constructor({
         // Retain the fixed TEST-only seam for existing server-side callers
-        // (including the separately gated intent consumer). Runtime always
+        // (the intent consumer now requires an explicit context). Runtime always
         // supplies its validated context; request input cannot override it.
         executionContext = TEST_TOPOLOGY_EXECUTION_CONTEXT,
         topologyRepository,
@@ -564,7 +565,7 @@ class TopologyOperationCoordinator {
     async queueOnce({ expectedTopologyRevision, scope, idempotencyKey }) {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
-        const runIdempotencyKey = `${idempotencyKey}:${randomUUID()}`;
+        const runIdempotencyKey = `${idempotencyKey}:host-${this.#executionContext.hostIdentity}:${randomUUID()}`;
         let operationId = entityId(this.idFactory(runIdempotencyKey));
         if (!operationId) {
             throw new TopologyOperationCoordinatorError(
@@ -621,7 +622,7 @@ class TopologyOperationCoordinator {
                             linkIds: scope.linkIds,
                             newPathLinkIds: attach.newPathLinkIds,
                         })).digest('hex');
-                        effectiveRunIdempotencyKey = `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:link.attach:${scope.linkId}:${attachIdentity}:${runIdempotencyKey.slice(-36)}`;
+                        effectiveRunIdempotencyKey = `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:link.attach:${scope.linkId}:${attachIdentity}:host-${this.#executionContext.hostIdentity}:${runIdempotencyKey.slice(-36)}`;
                         operationId = entityId(this.idFactory(effectiveRunIdempotencyKey));
                         if (!operationId) {
                             throw new TopologyOperationCoordinatorError('TOPOLOGY_OPERATION_QUEUE_FAILED',
@@ -703,9 +704,12 @@ class TopologyOperationCoordinator {
                         topologyRevision: admitted.revision,
                         priorDeployedRevision: admitted.deployedRevision,
                         nodes: plan.nodes,
+                        executionContext: this.#executionContext,
+                        idempotencyKey: effectiveRunIdempotencyKey,
                         ...scopedIdentity,
                     })).digest('hex');
                     await this.operationRepository.createFrozen({
+                        executionContext: this.#executionContext,
                         operationId,
                         idempotencyKey: effectiveRunIdempotencyKey,
                         topologyRevision: admitted.revision,
@@ -725,6 +729,8 @@ class TopologyOperationCoordinator {
                 try {
                     const found = await this.operationRepository.findAdmissionById(operationId);
                     if (found && String(found._id) === operationId
+                        && matchesTopologyOperationExecutionContext(found, this.#executionContext)
+                        && found.idempotencyKey === effectiveRunIdempotencyKey
                         && found.topologyRevision === expectedTopologyRevision
                         && found.heldTopologyAdmission === true
                         && found.admissionFingerprint === admissionFingerprint

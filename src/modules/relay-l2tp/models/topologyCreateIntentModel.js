@@ -1,6 +1,8 @@
 'use strict';
 const mongoose = require('mongoose');
+const executionContextField = require('./topologyExecutionContextSchema');
 const schema = new mongoose.Schema({
+    executionContext: executionContextField(true),
     requestKey: { type: String, required: true, immutable: true, maxlength: 128 },
     payloadHash: { type: String, required: true, immutable: true },
     version: { type: Number, required: true, enum: [1], immutable: true },
@@ -13,6 +15,7 @@ const schema = new mongoose.Schema({
     leaseOwner: String,
     leaseUntil: Date,
     nextAttemptAt: Date,
+    operationIdempotencyKey: String,
     operationId: { type: mongoose.Schema.Types.ObjectId, ref: 'TopologyOperation' },
     topologyRevision: Number,
     priorDeployedRevision: Number,

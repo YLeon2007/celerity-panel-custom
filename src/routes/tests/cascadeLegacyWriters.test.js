@@ -353,7 +353,8 @@ test('HTTP undeploy rereads metadata after a draft edit wins the existence-read 
 test('new intent accepted during teardown waits behind the owned reservation', local, async () => {
     await reset();
     const { createTopologyIntentService } = require('../../modules/relay-l2tp/services/topologyIntentService');
-    const service = createTopologyIntentService(models);
+    const service = createTopologyIntentService({ ...models,
+        executionContext: { target: 'test', hostIdentity: 'test.infograd.online' } });
     let job;
     cascadeService.undeployLink = attestedStub(async () => {
         remoteCalls++;

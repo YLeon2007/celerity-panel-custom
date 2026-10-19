@@ -198,6 +198,31 @@ test('queue keeps materialization, counted admission and frozen insert inside on
     assert.deepEqual(calls, ['read', 'materialize', 'cas', 'insert', 'commit', 'worker']);
 });
 
+test('ambiguous admission cannot acknowledge an unbound or cloned operation identity', async () => {
+    for (const change of [
+        input => ({ ...input, executionContext: undefined }),
+        input => ({ ...input, executionContext: { target: 'production', hostIdentity: 'lm1.infograd.online' } }),
+        input => ({ ...input, idempotencyKey: undefined }),
+        input => ({ ...input, idempotencyKey: input.idempotencyKey.replace('test.infograd.online', 'lm1.infograd.online') }),
+    ]) {
+        let inserted;
+        const coordinator = new TopologyOperationCoordinator({
+            topologyRepository: { async admitTopology({ prepare, admit }) {
+                const prepared = await prepare(snapshot(), fakeSession);
+                await admit({ revision: 7, deployedRevision: 5, ...prepared }, fakeSession);
+                throw { hasErrorLabel: label => label === 'UnknownTransactionCommitResult' };
+            } },
+            planMaterializer: { async materialize() { return materializedPlan(); } },
+            operationRepository: {
+                async createFrozen(input) { inserted = input; },
+                async findAdmissionById() { return { ...change(inserted), _id: inserted.operationId, status: 'queued' }; },
+            },
+            operationWorker: { run() { assert.fail('ambiguous admission cannot dispatch'); } },
+            validator: () => ({ valid: true }), compiler: () => ({ valid: true }),
+        });
+        await assert.rejects(coordinator.queue({ expectedTopologyRevision: 7 }), { code: 'TOPOLOGY_OPERATION_QUEUE_FAILED' });
+    }
+});
 test('ambiguous commit acknowledges only exact held operation identity without starting worker', async () => {
     let inserted;
     let workerRuns = 0;
@@ -216,6 +241,7 @@ test('ambiguous commit acknowledges only exact held operation identity without s
             async findAdmissionById(id) {
                 assert.equal(id, 'operation-ambiguous');
                 return { _id: id, topologyRevision: 7, priorDeployedRevision: 5,
+                    executionContext: inserted.executionContext, idempotencyKey: inserted.idempotencyKey,
                     heldTopologyAdmission: true, admissionFingerprint: inserted.admissionFingerprint,
                     status: 'queued' };
             },
@@ -262,7 +288,7 @@ test('ambiguous commit rejects mismatched or unavailable readback without leakin
                 async createFrozen(input) { inserted = input; },
                 async findAdmissionById(id) {
                     assert.equal(id, 'operation-ambiguous');
-                    return readback && { ...readback,
+                    return readback && { executionContext: inserted.executionContext, idempotencyKey: inserted.idempotencyKey, ...readback,
                         admissionFingerprint: readback.admissionFingerprint ?? inserted.admissionFingerprint };
                 },
             },
@@ -351,7 +377,7 @@ test('queues one frozen fixed-test operation and starts only the injected worker
     assert.equal(frozenInput.operationId, 'operation-public');
     assert.match(
         frozenInput.idempotencyKey,
-        /^topology:test:revision-7:[0-9a-f-]{36}$/,
+        /^topology:test:revision-7:host-test\.infograd\.online:[0-9a-f-]{36}$/,
         'each queue run must use a unique idempotency key suffix so node-side runner state never collides',
     );
     assert.equal(frozenInput.topologyRevision, 7);
@@ -703,7 +729,7 @@ test('a cached idempotent result whose operation was purged (undeploy) is re-que
     const keys = calls
         .filter(call => call.method === 'createFrozen')
         .map(call => call.idempotencyKey);
-    assert.ok(keys.every(key => /^topology:test:revision-7:[0-9a-f-]{36}$/.test(key)));
+    assert.ok(keys.every(key => /^topology:test:revision-7:host-test\.infograd\.online:[0-9a-f-]{36}$/.test(key)));
     assert.notEqual(keys[0], keys[1],
         'a re-queued operation must get a fresh idempotency key so node-side runner state does not collide');
 });
@@ -1310,6 +1336,7 @@ test('ambiguous attach commit acknowledges only the effective operation fingerpr
             const frozen = calls.find(call => call.method === 'createFrozen').input;
             assert.equal(operationId, frozen.operationId);
             return { _id: operationId, topologyRevision: 12, priorDeployedRevision: 9,
+                executionContext: frozen.executionContext, idempotencyKey: frozen.idempotencyKey,
                 heldTopologyAdmission: true, status: 'queued',
                 admissionFingerprint: matches ? frozen.admissionFingerprint : '0'.repeat(64) };
         };
@@ -1333,6 +1360,8 @@ test('attach admission requires durable repository support for ordered suffix an
         findOneAndUpdate() {}, updateOne() {},
     } });
     await repository.createFrozen({
+        executionContext: { target: 'test', hostIdentity: 'test.infograd.online' },
+        idempotencyKey: 'topology:test:revision-12:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
         operationId: 'a'.repeat(24), topologyRevision: 12, priorDeployedRevision: 9,
         nodes: [], kind: 'link.attach', linkId: 'a'.repeat(24),
         linkIds: ['a'.repeat(24), 'b'.repeat(24), 'c'.repeat(24)],

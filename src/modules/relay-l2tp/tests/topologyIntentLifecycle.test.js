@@ -2,6 +2,21 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createTopologyOperationRecoveryLifecycle } = require('../runtime/createTopologyOperationRecoveryLifecycle');
+const TEST_CONTEXT = Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' });
+test('intent admission and consumption reject missing or cross-paired server contexts before persistence', () => {
+    const { TopologyIntentService } = require('../services/topologyIntentService');
+    const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
+    const db = {};
+    const models = Object.fromEntries(['CascadeTopologyState', 'TopologyCreateIntent', 'TopologyIntentQueueState',
+        'TopologyOperation', 'HyNode', 'CascadeLink', 'CascadeRouteGroup', 'RelayL2tpState'].map(name => [name, { db }]));
+    for (const executionContext of [undefined, null, {}, { target: 'production' },
+        { target: 'production', hostIdentity: 'test.infograd.online' },
+        { target: 'test', hostIdentity: 'lm1.infograd.online' }]) {
+        for (const Constructor of [TopologyIntentService, TopologyIntentConsumer]) {
+            assert.throws(() => new Constructor({ ...models, executionContext }), /requires an exact server execution context/);
+        }
+    }
+});
 const env = { L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
 test('intent transactions explicitly require primary snapshot reads and majority commit acknowledgement', async () => {
     const { TopologyIntentService } = require('../services/topologyIntentService');
@@ -10,6 +25,7 @@ test('intent transactions explicitly require primary snapshot reads and majority
     const db = { transaction(work, settings) { options.push(settings); return work({}); } };
     const dependencies = Object.fromEntries(['CascadeTopologyState', 'TopologyCreateIntent', 'TopologyIntentQueueState',
         'TopologyOperation', 'HyNode', 'CascadeLink', 'CascadeRouteGroup', 'RelayL2tpState'].map(name => [name, { db }]));
+    dependencies.executionContext = TEST_CONTEXT;
     await new TopologyIntentService(dependencies).transactionRunner(async () => undefined);
     await new TopologyIntentConsumer(dependencies).transactionRunner(async () => undefined);
     assert.deepEqual(options, Array.from({ length: 2 }, () => ({ readConcern: { level: 'snapshot' },
@@ -18,7 +34,7 @@ test('intent transactions explicitly require primary snapshot reads and majority
 test('ambiguous intent acceptance explicitly confirms on the primary outside the transaction', async () => {
     const { TopologyIntentService, digest } = require('../services/topologyIntentService');
     const payload = { name: 'local-only', tunnelUuid: 'not-public' };
-    const row = { _id: 'intent-1', payloadHash: digest(payload), payload, status: 'waiting', acceptanceRevision: 7 };
+    const row = { executionContext: { target: 'test', hostIdentity: 'test.infograd.online' }, _id: 'intent-1', payloadHash: digest(payload), payload, status: 'waiting', acceptanceRevision: 7 };
     const db = {};
     const calls = [];
     class CascadeLink {
@@ -33,7 +49,7 @@ test('ambiguous intent acceptance explicitly confirms on the primary outside the
         maxTimeMS(value) { calls.push(['maxTimeMS', value]); return this; },
         async lean() { calls.push(['lean']); return row; },
     };
-    const service = new TopologyIntentService({ CascadeLink,
+    const service = new TopologyIntentService({ executionContext: TEST_CONTEXT, CascadeLink,
         CascadeTopologyState: { db }, TopologyIntentQueueState: { db },
         TopologyCreateIntent: { db, findOne(filter) { calls.push(['findOne', filter]); return query; } },
         transactionRunner: async () => { throw { hasErrorLabel: label => label === 'UnknownTransactionCommitResult' }; },

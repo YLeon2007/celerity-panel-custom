@@ -115,6 +115,8 @@ test('frozen insertion retains replacement path identity in the same session', a
         findOneAndUpdate() {}, updateOne() {},
     }});
     const input = {operationId:ids[0],topologyRevision:7,priorDeployedRevision:5,
+        executionContext: { target: 'test', hostIdentity: 'test.infograd.online' },
+        idempotencyKey: 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
         kind:'link.replace',linkId:ids[1],linkIds:[ids[1]],
         oldLinkId:ids[2],groupId:ids[3],pathKey:'main',ownerNodeId:ids[1],
         oldPathLinkIds:[ids[1],ids[2]],nodes:[],

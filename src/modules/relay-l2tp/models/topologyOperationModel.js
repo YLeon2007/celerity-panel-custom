@@ -121,7 +121,10 @@ const pppWaitSchema = new mongoose.Schema({
     probeLocks: { type: [pppProbeLockSchema], required: true, default: [] },
 }, { _id: false, strict: true });
 
+const executionContextField = require('./topologyExecutionContextSchema');
 const topologyOperationSchema = new mongoose.Schema({
+    executionContext: executionContextField(),
+    idempotencyKey: { type: String, immutable: true },
     topologyRevision: {
         type: Number,
         required: true,

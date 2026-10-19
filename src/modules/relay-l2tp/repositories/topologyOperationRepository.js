@@ -4,6 +4,7 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { topologyExecutionContext, matchesTopologyOperationExecutionContext } = require('../domain/topologyExecutionContext');
 
 const ACTIVE_STATUSES = Object.freeze([
     'preparing',
@@ -142,6 +143,8 @@ class TopologyOperationRepository {
 
     async createFrozen({
         operationId: id,
+        executionContext,
+        idempotencyKey,
         topologyRevision,
         priorDeployedRevision,
         nodes,
@@ -161,6 +164,10 @@ class TopologyOperationRepository {
         admissionFingerprint,
         session,
     }) {
+        const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!matchesTopologyOperationExecutionContext({ executionContext, topologyRevision, idempotencyKey }, context)) {
+            throw new TypeError('Topology operation requires an exact execution identity and idempotency key');
+        }
         const scoped = kind !== undefined || linkId !== undefined
             || linkIds !== undefined || staged !== undefined
             || oldLinkId !== undefined || groupId !== undefined || pathKey !== undefined
@@ -212,6 +219,7 @@ class TopologyOperationRepository {
         }
         const document = {
             _id: id,
+            executionContext: { ...context }, idempotencyKey,
             topologyRevision,
             priorDeployedRevision,
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
@@ -255,7 +263,7 @@ class TopologyOperationRepository {
 
     async findAdmissionById(operationId) {
         return this.model.findById(operationId)
-            .select('status topologyRevision priorDeployedRevision heldTopologyAdmission admissionFingerprint')
+            .select('status topologyRevision priorDeployedRevision heldTopologyAdmission admissionFingerprint executionContext idempotencyKey')
             .lean();
     }
 

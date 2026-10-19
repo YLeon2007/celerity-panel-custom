@@ -16,6 +16,14 @@ Draft/path/revision writers require zero active topology admission. Successors t
 
 Unknown commit responses are reconciled through exact persisted identity. Known local preparation aborts roll back assembly together and may retry within the attempt bound. Expired claim generations cannot mutate or bind work. Remote execution remains the operation worker's responsibility; this queue never calls general Sync.
 
+## Server execution identity (admission only)
+
+The service and consumer require an explicit server-selected allowlisted `executionContext` (`test` / `test.infograd.online` or `production` / `lm1.infograd.online`). Both pin a canonical frozen copy; request bodies cannot choose it. Each new intent persists the pair as an immutable subdocument without a default. Replays, including unknown-commit/duplicate readbacks, require the same pair as well as the payload hash. Missing or foreign queue-head identity is refused before claiming, changing admission/capacity, or materializing a plan. A malformed head is not skipped or automatically repaired.
+
+The consumer passes the pinned context explicitly to the coordinator. New operations persist immutable execution identity and a host-bound run idempotency key; their admission fingerprint includes both. Intent binding pins the exact operation key alongside its existing revision/fingerprint fences. Settlement rejects missing/foreign identities or keys without releasing outstanding ownership. Historical unbound intents/operations require a separate audited migration or reconciliation, not a reader-side TEST default.
+
+**Not a production-execution readiness claim:** this slice proves PROD HTTP 202 → persisted intent → consumer → scoped frozen operation on an isolated local MongoDB replica set. It does not enable the PROD worker or modify serving state. The runtime/worker repository claim and recovery scanner still need independent execution-context fencing before PROD execution can be enabled; the operation claim projection/filter in this baseline does not yet enforce the persisted pair/key. Recovery lifecycle changes are separately owned.
+
 ## Prerequisites and verification
 
 A transaction-capable MongoDB replica set, initialized topology admission counters, normal model/index initialization, and the existing exact TEST execution opt-ins are required. Missing queue state alongside existing intents fails closed; this implementation does not repair deployed state or initialize legacy counters opportunistically.

@@ -52,14 +52,16 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
     let remoteCommitAlive = false;
     const commands = [], released = [], finalizations = [];
     const held = new Map();
-    const operation = { _id: 'operation-uncertain', topologyRevision: 7, priorDeployedRevision: 5,
+    const executionContext = { target: 'test', hostIdentity: 'test.infograd.online' };
+    const idempotencyKey = 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000';
+    const operation = { executionContext, idempotencyKey, _id: 'operation-uncertain', topologyRevision: 7, priorDeployedRevision: 5,
         status: 'queued', attempts: 0, leaseOwner: '', leaseUntil: null,
         heldTopologyAdmission: true, admissionFingerprint: 'a'.repeat(64),
         nodes: [node('node-a', 'portal', 'portal'), node('node-b', 'relay', 'relay-1'),
             node('node-c', 'bridge', 'bridge')] };
     const topology = { _id: 'singleton', deployedRevision: 5, topologyAdmissionCount: 1,
         stateTransitionRevision: 0 };
-    const intent = { _id: 'intent-head', operationId: operation._id, status: 'admitted', generation: 1,
+    const intent = { executionContext, operationIdempotencyKey: idempotencyKey, _id: 'intent-head', operationId: operation._id, status: 'admitted', generation: 1,
         topologyRevision: 7, priorDeployedRevision: 5, admissionFingerprint: operation.admissionFingerprint };
     const queue = { _id: QUEUE_ID, outstanding: 2 };
     const db = {};
@@ -147,7 +149,7 @@ function fixture({ outcome = 'timeout', failingNode = 'node-b', safeLocalFailure
     const worker = new TopologyOperationWorker({ operationRepository, executor: effectiveExecutor,
         finalizer, lockService, workerId: 'worker-uncertain', leaseMs: 30000,
         clock: { now: () => now }, allowUnprovenTestExecution: true });
-    const consumer = new TopologyIntentConsumer({ TopologyOperation, CascadeTopologyState,
+    const consumer = new TopologyIntentConsumer({ executionContext, TopologyOperation, CascadeTopologyState,
         TopologyCreateIntent, TopologyIntentQueueState,
         ...Object.fromEntries(['HyNode', 'CascadeLink', 'CascadeRouteGroup', 'RelayL2tpState']
             .map(key => [key, { db }])), transactionRunner: work => work({}) });

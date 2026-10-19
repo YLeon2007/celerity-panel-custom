@@ -9,6 +9,28 @@ const {
 } = require('../repositories/topologyOperationRepository');
 const TopologyOperation = require('../models/topologyOperationModel');
 const ADMISSION_FINGERPRINT = 'a'.repeat(64);
+const TEST_BINDING = Object.freeze({
+    executionContext: Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' }),
+    idempotencyKey: 'topology:test:revision-7:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
+});
+test('new frozen operations require an exact context and identity-bound idempotency before persistence', async () => {
+    const prod = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+    const key = 'topology:production:revision-7:host-lm1.infograd.online:00000000-0000-0000-0000-000000000000';
+    const model = createModel();
+    const repository = new TopologyOperationRepository({ model });
+    for (const fields of [
+        {}, { executionContext: prod }, { idempotencyKey: key },
+        { executionContext: { target: 'test', hostIdentity: prod.hostIdentity }, idempotencyKey: key },
+        { executionContext: prod, idempotencyKey: key.replace('production', 'test') },
+        { executionContext: prod, idempotencyKey: key.replace('revision-7', 'revision-8') },
+        { executionContext: { ...prod, extra: true }, idempotencyKey: key },
+    ]) await assert.rejects(repository.createFrozen({
+        operationId: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5, nodes: [],
+        heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
+        session: { inTransaction: () => true }, ...fields,
+    }), /requires an exact execution identity and idempotency key/);
+    assert.deepEqual(model.calls, []);
+});
 const PROOF_INITIAL = Object.freeze({
     clientProofAttempts: 0, clientProofRetryAfter: null,
     clientProofLeaseOwner: '', clientProofLeaseUntil: null,
@@ -47,7 +69,7 @@ test('link.attach freezes owner epochs and ordered suffix in a transactional cre
         async updateOne() {},
     };
     const repository = new TopologyOperationRepository({ model });
-    const created = await repository.createFrozen({
+    const created = await repository.createFrozen({ ...TEST_BINDING,
         operationId: '000000000000000000000007',
         topologyRevision: 7, priorDeployedRevision: 5, nodes: [],
         ...ATTACH_SCOPE,
@@ -58,7 +80,7 @@ test('link.attach freezes owner epochs and ordered suffix in a transactional cre
     assert.strictEqual(calls[0].options.session, session);
     assert.deepEqual(created, calls[0].documents[0]);
     assert.deepEqual(calls[0].documents[0], {
-        _id: '000000000000000000000007',
+        _id: '000000000000000000000007', ...TEST_BINDING,
         topologyRevision: 7, priorDeployedRevision: 5,
         ...ATTACH_SCOPE,
         status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
@@ -73,7 +95,7 @@ test('link.attach freezes owner epochs and ordered suffix in a transactional cre
 test('attach-only fields cannot silently disappear from an unscoped create', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
         nodes: [], newPathLinkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge],
         heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -97,7 +119,7 @@ test('link.attach rejects invalid ordered suffix and unrelated component links b
         { linkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge] },
     ];
     for (const fields of invalid) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE, ...fields,
             heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -121,7 +143,7 @@ test('link.attach rejects missing or unknown owner pins and extra scoped fields'
         { staged: false },
     ];
     for (const fields of invalid) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE, ...fields,
             heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -139,7 +161,7 @@ test('link.attach requires a held admission in an active Mongo session', async (
         { session: { inTransaction: () => false } },
         { heldTopologyAdmission: undefined }, { admissionFingerprint: undefined },
     ]) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], ...ATTACH_SCOPE,
             heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -163,7 +185,7 @@ test('scoped operation identity survives session-bound repository creation and s
         async updateOne() {},
     };
     const repository = new TopologyOperationRepository({ model });
-    await repository.createFrozen({
+    await repository.createFrozen({ ...TEST_BINDING,
         operationId: '507f1f77bcf86cd799439011',
         topologyRevision: 7,
         priorDeployedRevision: 5,
@@ -202,7 +224,7 @@ test('strict Mongo schema refuses partially scoped operation identity', async ()
 test('client readiness is durable and separate from execution status', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
-    const created = await repository.createFrozen({
+    const created = await repository.createFrozen({ ...TEST_BINDING,
         operationId: '507f1f77bcf86cd799439011',
         topologyRevision: 7, priorDeployedRevision: 5, nodes: [],
         heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -326,7 +348,7 @@ test('scoped operation rejects missing or inconsistent link identity before crea
         { kind: 'link.apply', linkId: 'a', linkIds: ['a', 'a'] },
         { kind: 'unsupported', linkId: 'a', linkIds: ['a'] },
     ]) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], ...scope,
         }), TypeError);
@@ -439,7 +461,7 @@ test('createFrozen refuses legacy and scoped operations without a held admission
     for (const scope of [{}, {
         kind: 'link.apply', linkId: 'link-a', linkIds: ['link-a'], staged: false,
     }]) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], ...scope,
         }), TypeError);
@@ -450,12 +472,12 @@ test('createFrozen refuses legacy and scoped operations without a held admission
 test('createFrozen refuses to claim a held admission without an active session', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT,
     }), TypeError);
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [],
         admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -466,7 +488,7 @@ test('createFrozen refuses to claim a held admission without an active session',
 test('createFrozen refuses a session-bound operation without the held admission identity', async () => {
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [],
         session: { inTransaction: () => true },
@@ -485,7 +507,7 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
     const repository = new TopologyOperationRepository({ model });
     const plan = nodePlan('node-a', 'portal', 'portal');
 
-    const result = await repository.createFrozen({
+    const result = await repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1',
         topologyRevision: 7,
         priorDeployedRevision: 5,
@@ -502,7 +524,7 @@ test('createFrozen inserts one scoped operation with its frozen candidate on the
     assert.strictEqual(result, createdDocument);
     assert.equal(model.calls.length, 1);
     assert.deepEqual(model.calls[0], [[{
-        _id: 'operation-1',
+        _id: 'operation-1', ...TEST_BINDING,
         topologyRevision: 7,
         priorDeployedRevision: 5,
         kind: 'link.apply',
@@ -536,7 +558,7 @@ test('createFrozen rejects null, malformed, or inactive sessions before writing'
     const repository = new TopologyOperationRepository({ model });
     for (const session of [null, false, '', {}, [], { inTransaction: true },
         { inTransaction: () => false }]) {
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
             admissionFingerprint: ADMISSION_FINGERPRINT, session,
@@ -549,14 +571,14 @@ test('createFrozen rejects invalid scoped identity and candidate before a sessio
     const model = createModel();
     const repository = new TopologyOperationRepository({ model });
     const session = { inTransaction: () => true };
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [],
         kind: 'link.apply', linkId: 'link-a', linkIds: ['link-b'], staged: true,
         heldTopologyAdmission: true, admissionFingerprint: ADMISSION_FINGERPRINT,
         session,
     }), TypeError);
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5,
         nodes: [{ ...nodePlan('node-a', 'portal', 'portal'), candidateHash: '0'.repeat(64) }],
@@ -575,14 +597,14 @@ test('createFrozen propagates session insert rejection without an unscoped fallb
         throw failure;
     };
     const repository = new TopologyOperationRepository({ model });
-    await assert.rejects(repository.createFrozen({
+    await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1', topologyRevision: 7,
         priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
         admissionFingerprint: ADMISSION_FINGERPRINT, session,
     }), error => error === failure);
     assert.equal(model.calls.length, 1);
     assert.deepEqual(model.calls[0], [[{
-        _id: 'operation-1', topologyRevision: 7, priorDeployedRevision: 5,
+        _id: 'operation-1', ...TEST_BINDING, topologyRevision: 7, priorDeployedRevision: 5,
         status: 'queued', clientReadiness: 'unverified', heldTopologyAdmission: true,
         ...PROOF_INITIAL,
         admissionFingerprint: ADMISSION_FINGERPRINT,
@@ -599,7 +621,7 @@ test('createFrozen fails closed on malformed session create results without retr
             return result;
         };
         const repository = new TopologyOperationRepository({ model });
-        await assert.rejects(repository.createFrozen({
+        await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
             operationId: 'operation-1', topologyRevision: 7,
             priorDeployedRevision: 5, nodes: [], heldTopologyAdmission: true,
             admissionFingerprint: ADMISSION_FINGERPRINT, session,
@@ -622,7 +644,7 @@ test('createFrozen durably preserves composer deployment order without sorting b
     const bridge = nodePlan('node-b', 'bridge', 'bridge', bridgeCandidate);
     const portal = nodePlan('node-a', 'portal', 'portal', portalCandidate);
 
-    const created = await repository.createFrozen({
+    const created = await repository.createFrozen({ ...TEST_BINDING,
         operationId: 'operation-1',
         topologyRevision: 7,
         priorDeployedRevision: 5,
@@ -647,7 +669,7 @@ test('createFrozen durably preserves composer deployment order without sorting b
     });
 
     const expected = {
-        _id: 'operation-1',
+        _id: 'operation-1', ...TEST_BINDING,
         topologyRevision: 7,
         priorDeployedRevision: 5,
         status: 'queued',
@@ -738,7 +760,7 @@ test('createFrozen rejects legacy, non-canonical, hash-mismatched, or unbound ca
         const model = createModel();
         const repository = new TopologyOperationRepository({ model });
         await assert.rejects(
-            repository.createFrozen({
+            repository.createFrozen({ ...TEST_BINDING,
                 operationId: 'operation-1',
                 topologyRevision: 7,
                 priorDeployedRevision: 5,

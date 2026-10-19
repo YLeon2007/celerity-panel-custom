@@ -8,6 +8,7 @@ const { TopologyOperationCoordinator } = require('./topologyOperationCoordinator
 const { TopologyOperationPlanMaterializer } = require('./topologyOperationPlanMaterializer');
 const { maintainAutoL2tpPaths } = require('./autoL2tpPathMaintenance');
 const { QUEUE_ID, intentError } = require('./topologyIntentService');
+const { matchesTopologyOperationExecutionContext, matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const TERMINAL = new Set(['succeeded', 'failed', 'rolled_back']);
 function baselineIds(links, link) {
     const touched = new Set([String(link.portalNode), String(link.bridgeNode)]);
@@ -27,8 +28,12 @@ function baselineIds(links, link) {
     return [...result].sort();
 }
 class TopologyIntentConsumer {
+    #executionContext;
     constructor(dependencies) {
-        this.dependencies = dependencies;
+        const context = dependencies.executionContext;
+        this.#executionContext = topologyExecutionContext(context?.target, context?.hostIdentity);
+        if (!this.#executionContext) throw new TypeError('Intent consumption requires an exact server execution context');
+        this.dependencies = { ...dependencies, executionContext: this.#executionContext };
         const { CascadeTopologyState, TopologyCreateIntent, TopologyIntentQueueState, TopologyOperation,
             clock = { now: () => new Date() }, owner = `intent-${randomUUID()}`, leaseMs = 30000,
             maxAttempts = 3, backoffMs = 1000, transactionRunner } = dependencies;
@@ -43,8 +48,30 @@ class TopologyIntentConsumer {
             readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary',
         }));
     }
+    assertContext(row) {
+        if (!matchesTopologyExecutionContext(row?.executionContext, this.#executionContext)) {
+            throw intentError('TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH');
+        }
+    }
+    assertOperationContext(operation) {
+        this.assertContext(operation);
+        if (!matchesTopologyOperationExecutionContext(operation, this.#executionContext)) {
+            throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
+        }
+    }
+    assertBinding(row) {
+        if (['admitted', 'blocked'].includes(row.status) !== Boolean(row.operationId)
+            || (row.operationId && (!Number.isSafeInteger(row.topologyRevision) || row.topologyRevision < 0
+                || !Number.isSafeInteger(row.priorDeployedRevision) || row.priorDeployedRevision < 0
+                || !/^[a-f0-9]{64}$/.test(row.admissionFingerprint)
+                || !matchesTopologyOperationExecutionContext({ ...row, idempotencyKey: row.operationIdempotencyKey }, this.#executionContext)))) {
+            throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
+        }
+    }
     fence(row, status = row.status) {
-        return { _id: row._id, status, generation: row.generation, leaseOwner: row.leaseOwner, leaseUntil: row.leaseUntil };
+        return { _id: row._id, status, generation: row.generation, leaseOwner: row.leaseOwner, leaseUntil: row.leaseUntil,
+            'executionContext.target': this.#executionContext.target,
+            'executionContext.hostIdentity': this.#executionContext.hostIdentity };
     }
     async releaseOutstanding(session) {
         const released = await this.TopologyIntentQueueState.updateOne(
@@ -57,6 +84,8 @@ class TopologyIntentConsumer {
             const row = await this.TopologyCreateIntent.findOne({ status: { $in: ['waiting', 'claimed', 'admitted', 'blocked'] } })
                 .sort({ ordinal: 1 }).session(session).lean();
             if (!row) return null;
+            this.assertContext(row);
+            this.assertBinding(row);
             if (row.operationId || row.status === 'blocked') return row;
             const now = this.clock.now();
             if ((row.status === 'claimed' && row.leaseUntil > now)
@@ -81,8 +110,15 @@ class TopologyIntentConsumer {
     async settle(row) {
         return this.transactionRunner(async session => {
             const intent = await this.TopologyCreateIntent.findById(row._id).session(session).lean();
-            if (!intent || !['admitted', 'blocked'].includes(intent.status) || !intent.operationId) return false;
+            if (!intent) return false;
+            this.assertContext(intent);
+            this.assertBinding(intent);
+            if (!['admitted', 'blocked'].includes(intent.status)) return false;
             const operation = await this.TopologyOperation.findById(intent.operationId).session(session).lean();
+            if (operation) {
+                this.assertOperationContext(operation);
+                if (operation.idempotencyKey !== intent.operationIdempotencyKey) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
+            }
             const exact = operation && String(operation._id) === String(intent.operationId)
                 && operation.topologyRevision === intent.topologyRevision
                 && operation.priorDeployedRevision === intent.priorDeployedRevision
@@ -110,6 +146,8 @@ class TopologyIntentConsumer {
             const intent = await this.TopologyCreateIntent.findOne({ ...this.fence(row, 'claimed'), leaseUntil: { $eq: row.leaseUntil, $gt: this.clock.now() } })
                 .select('+payload').session(session).lean();
             if (!intent) throw intentError('TOPOLOGY_INTENT_FENCE_LOST');
+            this.assertContext(intent);
+            this.assertBinding(intent);
             const transactionRunner = async work => work(session);
             const dependencies = { ...this.dependencies, transactionRunner };
             const draft = new TopologyDraftRepository(dependencies);
@@ -140,6 +178,7 @@ class TopologyIntentConsumer {
                 throw intentError('TOPOLOGY_INTENT_INGRESS_UNAVAILABLE');
             }
             const coordinator = new TopologyOperationCoordinator({
+                executionContext: this.#executionContext,
                 topologyRepository: new TopologyDeploymentRepository({ snapshotReader: draft, ...dependencies }),
                 planMaterializer: this.dependencies.planMaterializer || new TopologyOperationPlanMaterializer(dependencies),
                 operationRepository: new TopologyOperationRepository({ model: this.TopologyOperation }),
@@ -147,10 +186,12 @@ class TopologyIntentConsumer {
             });
             const queued = await coordinator.queue({ expectedTopologyRevision: revision, scope: { kind: 'link.apply', linkId: String(link._id), linkIds } });
             const operation = await this.TopologyOperation.findById(queued.operationId).session(session).lean();
+            if (operation) this.assertOperationContext(operation);
             if (!operation || operation.heldTopologyAdmission !== true || operation.topologyRevision !== revision
                 || !/^[a-f0-9]{64}$/.test(operation.admissionFingerprint)) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
             const updated = await this.TopologyCreateIntent.updateOne({ ...this.fence(row, 'claimed'), leaseUntil: { $eq: row.leaseUntil, $gt: this.clock.now() } }, {
                 $set: { status: 'admitted', operationId: operation._id, topologyRevision: revision,
+                    operationIdempotencyKey: operation.idempotencyKey,
                     priorDeployedRevision: operation.priorDeployedRevision, admissionFingerprint: operation.admissionFingerprint,
                     createdLinkId: link._id }, $unset: { leaseOwner: '', leaseUntil: '', errorCode: '' },
             }, { session });
@@ -159,7 +200,8 @@ class TopologyIntentConsumer {
         });
     }
     async failedAttempt(row, error) {
-        if (error?.hasErrorLabel?.('UnknownTransactionCommitResult') || error?.code === 'TOPOLOGY_INTENT_FENCE_LOST') return;
+        if (error?.hasErrorLabel?.('UnknownTransactionCommitResult')
+            || ['TOPOLOGY_INTENT_FENCE_LOST', 'TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH', 'TOPOLOGY_INTENT_BINDING_INVALID'].includes(error?.code)) return;
         // This transaction callback never executes remotely. A known abort rolled back
         // link/maintenance/admission/binding together, so bounded local preparation retry is safe.
         await this.transactionRunner(async session => {
