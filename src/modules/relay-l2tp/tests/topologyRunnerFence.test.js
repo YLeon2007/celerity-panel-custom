@@ -262,4 +262,3 @@ test('nonzero restart or still-pending systemd job retains the generation with u
         assert.match(f.run('status', { commandId: 'commit-1' }).stderr, /UNKNOWN_COMMAND_OUTCOME/);
     });
 });
-
