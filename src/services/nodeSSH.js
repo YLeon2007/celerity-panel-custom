@@ -292,17 +292,34 @@ class NodeSSH {
                 }
                 
                 const writeStream = sftp.createWriteStream(remotePath);
-                
-                writeStream
-                    .on('close', () => {
+                let writeComplete = false;
+                let closed = false;
+                let settled = false;
+                const complete = (error) => {
+                    if (settled) return;
+                    if (error) {
+                        settled = true;
+                        reject(error);
+                    } else if (writeComplete && closed) {
+                        settled = true;
                         logger.info(`[SSH] Written file ${remotePath} to ${this.node.name}`);
                         resolve();
+                    }
+                };
+
+                writeStream
+                    .on('close', () => {
+                        closed = true;
+                        complete();
                     })
-                    .on('error', (err) => {
-                        reject(err);
-                    });
-                
-                writeStream.write(content);
+                    .on('error', complete);
+
+                // ssh2 can suppress a failed WRITE's error event while closing
+                // successfully. Require the WRITE callback as well as CLOSE.
+                writeStream.write(content, (error) => {
+                    if (!error) writeComplete = true;
+                    complete(error);
+                });
                 writeStream.end();
             });
         });

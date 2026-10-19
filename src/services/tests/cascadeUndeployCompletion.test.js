@@ -4,6 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const { SFTP } = require('ssh2/lib/protocol/SFTP');
 const cascade = require('../cascadeService');
 const NodeSSH = require('../nodeSSH');
 const pool = require('../sshPoolService');
@@ -23,7 +24,7 @@ function query(value) {
     return { session() { return this; }, lean: async () => structuredClone(value), then(resolve) { return Promise.resolve(value).then(resolve); },
         populate() { return this; } };
 }
-function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, direct = false } = {}) {
+function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, direct = false, sftp = null } = {}) {
     const state = { _id: 'singleton', revision: 7, deployedRevision: 5, replacementEpoch: 0,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0 };
     const nodes = {
@@ -81,13 +82,13 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
                 if (failure) calls.liveWriter = true;
                 stream.emit('close', failure === 'nonzero' ? 1 : failure === 'missing-exit' ? undefined : 0);
             });
-        } };
+        }, sftp(callback) { callback(null, sftp(node, calls)); } };
     }
     t.mock.method(pool, 'getConnection', async node => client(node));
-    t.mock.method(pool, 'writeFile', async (node, remotePath) => { calls.uploads.push([node._id, remotePath]); });
+    if (!sftp) t.mock.method(pool, 'writeFile', async (node, remotePath) => { calls.uploads.push([node._id, remotePath]); });
     if (direct) {
         t.mock.method(NodeSSH.prototype, 'connect', async function () { this.usePool = false; this.directClient = client(this.node); });
-        t.mock.method(NodeSSH.prototype, 'writeFile', async function (remotePath) { calls.uploads.push([this.node._id, remotePath]); });
+        if (!sftp) t.mock.method(NodeSSH.prototype, 'writeFile', async function (remotePath) { calls.uploads.push([this.node._id, remotePath]); });
     }
     return { state, calls, nodes, link, run: () => legacy.withLegacyCascadeUndeploy(async () => {
         await cascade.undeployLink(link); // HTTP discards the return receipt.
@@ -202,6 +203,109 @@ for (const failure of ['missing-exit', 'missing-receipt']) {
         const f = fixture(t, { direct: true, fault: (node, command) => node._id === 'bridge' && command.includes('systemctl stop') ? failure : null });
         await assert.rejects(f.run(), { code: 'LEGACY_CASCADE_UNDEPLOY_UNCERTAIN' });
         await assertRetained(f);
+    });
+}
+
+// Use ssh2's real WriteStream: a failed WRITE calls destroy() without the
+// error, so a successful CLOSE can suppress the stream's error event entirely.
+// Only the SFTP request/response boundary is local; neither writeFile is mocked.
+function sftpTransport(evidence, { writeReply = callback => callback(null), closeReply = callback => callback(null) } = {}) {
+    return (node, calls) => ({
+        createWriteStream(remotePath) {
+            this.path = remotePath;
+            calls.uploads.push([node._id, remotePath]);
+            const stream = SFTP.prototype.createWriteStream.call(this, remotePath);
+            stream.on('error', error => evidence.errors.push(error));
+            stream.on('close', () => evidence.closes++);
+            return stream;
+        },
+        open(_path, _flags, _mode, callback) { setImmediate(() => callback(null, Buffer.from('handle'))); },
+        fchmod(_handle, _mode, callback) { setImmediate(() => callback(null)); },
+        write(_handle, buffer, offset, length, _position, callback) {
+            setImmediate(() => {
+                evidence.writes++;
+                writeReply(error => callback(error, error ? undefined : length), {
+                    node, path: this.path, content: buffer.subarray(offset, offset + length), calls,
+                });
+            });
+        },
+        close(_handle, callback) { setImmediate(() => closeReply(callback)); },
+    });
+}
+
+for (const direct of [false, true]) {
+    for (const [name, options, targetNode, targetPath] of [
+        ['portal config', {}, 'portal', '/usr/local/etc/xray/config.json'],
+        ['forward bridge config', { mode: 'forward' }, 'bridge', '/usr/local/etc/xray/config.json'],
+        ['remaining reverse bridge config', { remaining: true }, 'bridge', '/usr/local/etc/xray-bridge/config.json'],
+        ['remaining reverse bridge unit', { remaining: true }, 'bridge', '/etc/systemd/system/xray-bridge.service'],
+    ]) {
+        test(`actual ssh2 suppressed WRITE error cannot release the legacy fence (${direct ? 'direct' : 'pooled'}, ${name})`, async t => {
+            const evidence = { writes: 0, closes: 0, errors: [] };
+            let failedAt;
+            const f = fixture(t, { ...options, direct, sftp: sftpTransport(evidence, {
+                writeReply(callback, { node, path, calls }) {
+                    if (node._id === targetNode && path === targetPath) {
+                        failedAt = calls.commands.length;
+                        callback(Object.assign(new Error('SFTP WRITE status 4'), { code: 4 }));
+                    } else callback(null);
+                },
+            }) });
+            const error = await f.run().then(() => null, error => error);
+            await new Promise(resolve => setImmediate(resolve));
+            assert.ok(evidence.writes > 0);
+            assert.equal(evidence.closes, evidence.writes, 'CLOSE acknowledgement is successful despite failed WRITE');
+            assert.deepEqual(evidence.errors, [], 'regression must exercise the suppressed-error path');
+            assert.equal(f.calls.releases, 0, 'failed WRITE must not authorize fence release');
+            assert.match(error?.message || '', /SFTP WRITE status 4/);
+            assert.equal(error.code, 4);
+            assert.equal(f.calls.commands.length, failedAt, 'no commands or restarts after a failed upload');
+            await assertRetained(f);
+        });
+    }
+
+    test(`actual ssh2 failed CLOSE retains the fence after successful WRITE (${direct ? 'direct' : 'pooled'})`, async t => {
+        const evidence = { writes: 0, closes: 0, errors: [] };
+        const f = fixture(t, { direct, sftp: sftpTransport(evidence, {
+            closeReply(callback) { callback(new Error('SFTP CLOSE status 4')); },
+        }) });
+        await assert.rejects(f.run(), /SFTP CLOSE status 4/);
+        assert.equal(evidence.writes, 1);
+        assert.equal(evidence.closes, 0);
+        assert.equal(evidence.errors.length, 1);
+        assert.equal(f.calls.commands.some(([, command]) => command.includes('systemctl restart')), false);
+        await assertRetained(f);
+    });
+
+    test(`actual ssh2 success awaits WRITE and CLOSE before releasing the exact fence (${direct ? 'direct' : 'pooled'})`, async t => {
+        const evidence = { writes: 0, closes: 0, errors: [] };
+        let ackWrite, ackClose;
+        let reachedWrite, reachedClose;
+        const writing = new Promise(resolve => { reachedWrite = resolve; });
+        const closing = new Promise(resolve => { reachedClose = resolve; });
+        const f = fixture(t, { direct, sftp: sftpTransport(evidence, {
+            writeReply(callback, { content }) { ackWrite = callback; reachedWrite(content); },
+            closeReply(callback) { ackClose = callback; reachedClose(); },
+        }) });
+        let finished = false;
+        const work = f.run().then(() => { finished = true; });
+        const content = await writing;
+        assert.ok(content.length > 0, 'upload actual generated config bytes');
+        await assertRetained(f);
+        assert.equal(finished, false);
+        assert.equal(f.calls.commands.some(([, command]) => command.includes('systemctl restart')), false);
+        ackWrite(null);
+        await closing;
+        await assertRetained(f);
+        assert.equal(finished, false, 'WRITE success alone does not join the open upload');
+        assert.equal(f.calls.commands.some(([, command]) => command.includes('systemctl restart')), false);
+        ackClose(null);
+        await work;
+        assert.equal(evidence.writes, 1);
+        assert.equal(evidence.closes, 1);
+        assert.deepEqual(evidence.errors, []);
+        assert.equal(f.calls.releases, 1);
+        assert.equal(f.state.replacementReservation, undefined);
     });
 }
 
