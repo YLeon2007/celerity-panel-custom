@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -9,7 +10,7 @@ const nodeId = '507f1f77bcf86cd799439011';
 const operationId = '507f1f77bcf86cd799439012';
 const now = new Date('2026-09-28T09:00:00Z');
 const op = (changes = {}) => ({ _id: operationId, node: nodeId, kind: 'sync_users',
-    status: 'queued', attempts: 0, createdAt: new Date('2026-09-27'), ...changes });
+    executionContext: TEST, status: 'queued', attempts: 0, createdAt: new Date('2026-09-27'), ...changes });
 
 function fixture({ operations = [op()], gate = {}, admissions = [], split,
     operationCasMiss = false, gateCasMiss = false, createError = null,
@@ -110,7 +111,7 @@ function fixture({ operations = [op()], gate = {}, admissions = [], split,
     return { repository, state, ops, records, calls, db, session, CascadeTopologyState,
         RemoteAdmission, L2tpOperation, transactions: () => transactionCount };
 }
-const claim = (f, changes = {}) => f.repository.claimQueuedSyncUsers({ owner: 'worker-one', leaseMs: 30000, now, ...changes });
+const claim = (f, changes = {}) => f.repository.claimQueuedSyncUsers({ executionContext: TEST, owner: 'worker-one', leaseMs: 30000, now, ...changes });
 
 test('claims oldest legacy queued sync_users, increments gate and creates exactly one linked running admission', async () => {
     const olderId = '507f1f77bcf86cd799439010';
@@ -267,4 +268,16 @@ test('schema supports sync_users and has a unique partial operationId index scop
     const legacy = new RemoteAdmissionModel({ _id: 'legacy', nodeId, kind: 'install',
         phase: 'running', ownerGeneration: 1 });
     assert.equal(legacy.validateSync(), undefined);
+});
+
+test('execution identity mismatch or absence cannot change operation or admission', async () => {
+    const TEST = { target: 'test', hostIdentity: 'test.infograd.online' };
+    for (const binding of [undefined, {}, { target: 'production', hostIdentity: 'lm1.infograd.online' },
+        { ...TEST, hostIdentity: 'lm1.infograd.online' }, { ...TEST, extra: true }]) {
+        const f = fixture({ operations: [op({ executionContext: binding })] });
+        assert.equal(await f.repository.claimQueuedSyncUsers({ owner: 'worker', leaseMs: 30000, now,
+            executionContext: TEST }), null);
+        assert.equal(f.ops.get(operationId).status, 'queued');
+        assert.equal(f.calls.some(([type]) => ['gateCAS', 'operationCAS', 'admissionCAS', 'create'].includes(type)), false);
+    }
 });

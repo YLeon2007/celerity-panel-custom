@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -13,6 +14,7 @@ const OPERATION_ID = `preflight-${'ab'.repeat(12)}`;
 
 function validContext(overrides = {}) {
     return {
+        executionContext: TEST,
         node: {
             id: 'relay-1',
             cascadeRole: 'relay',
@@ -91,7 +93,7 @@ test('uploads one fixed secret-free desired artifact and runs typed preflight on
             assert.fail('generic exec must not be used');
         },
     };
-    const runner = new L2tpPreflightRunner({
+    const runner = new L2tpPreflightRunner({ executionContext: TEST,
         randomBytes(size) {
             assert.equal(size, 12);
             return Buffer.alloc(size, 0xab);
@@ -117,7 +119,7 @@ test('uploads one fixed secret-free desired artifact and runs typed preflight on
     assert.deepEqual(calls, [
         {
             method: 'transportResolver',
-            request: { operationId: OPERATION_ID, nodeId: 'relay-1' },
+            request: { operationId: OPERATION_ID, nodeId: 'relay-1', executionContext: TEST },
         },
         {
             method: 'uploadRootFile',
@@ -145,7 +147,7 @@ test('uploads one fixed secret-free desired artifact and runs typed preflight on
 test('rejects an invalid install context before randomness or transport resolution', async () => {
     let randomCalls = 0;
     let resolverCalls = 0;
-    const runner = new L2tpPreflightRunner({
+    const runner = new L2tpPreflightRunner({ executionContext: TEST,
         randomBytes() {
             randomCalls += 1;
             return Buffer.alloc(12);
@@ -172,7 +174,7 @@ test('rejects an invalid install context before randomness or transport resoluti
 test('maps a failed lazy relay transport resolution to a safe preflight result', async () => {
     const secret = 'resolver-private-key-must-not-leak';
     const resolverCalls = [];
-    const runner = new L2tpPreflightRunner({
+    const runner = new L2tpPreflightRunner({ executionContext: TEST,
         randomBytes: size => Buffer.alloc(size, 0xcd),
         async transportResolver(request) {
             resolverCalls.push(request);
@@ -188,6 +190,7 @@ test('maps a failed lazy relay transport resolution to a safe preflight result',
 
     assert.deepEqual(resolverCalls, [{
         operationId: `preflight-${'cd'.repeat(12)}`,
+        executionContext: TEST,
         nodeId: 'relay-1',
     }]);
     assert.deepEqual(result, {
@@ -227,7 +230,7 @@ test('maps typed upload and command failures without exposing remote details', a
 
     for (const candidate of cases) {
         await t.test(candidate.name, async () => {
-            const runner = new L2tpPreflightRunner({
+            const runner = new L2tpPreflightRunner({ executionContext: TEST,
                 randomBytes: size => Buffer.alloc(size, 0xef),
                 transportResolver: async () => candidate.transport,
             });
@@ -295,7 +298,7 @@ test('sanitizes structured preflight failures and rejects unvalidated responses'
 
     for (const candidate of cases) {
         await t.test(candidate.name, async () => {
-            const runner = new L2tpPreflightRunner({
+            const runner = new L2tpPreflightRunner({ executionContext: TEST,
                 randomBytes: size => Buffer.alloc(size, 0xfa),
                 transportResolver: async () => ({
                     async uploadRootFile() { return { ok: true }; },
@@ -313,7 +316,7 @@ test('sanitizes structured preflight failures and rejects unvalidated responses'
 
 test('fails closed before resolution when operation id entropy is invalid', async () => {
     let resolverCalls = 0;
-    const runner = new L2tpPreflightRunner({
+    const runner = new L2tpPreflightRunner({ executionContext: TEST,
         randomBytes() {
             return { toString: () => '../unsafe-operation-id' };
         },

@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization } = require('../domain/l2tpExecutionAuthorization');
+
 const { randomBytes } = require('node:crypto');
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -21,7 +23,7 @@ function syncPlan(operationId, relayNode, credentialRevision) {
 }
 
 class L2tpPppDriftSyncRepository {
-    constructor({ RelayL2tpState, L2tpOperation,
+    constructor({ executionContext, RelayL2tpState, L2tpOperation,
         operationIdFactory = () => randomBytes(12).toString('hex'), transactionRunner } = {}) {
         if (typeof RelayL2tpState?.findOne !== 'function'
             || typeof RelayL2tpState?.findOneAndUpdate !== 'function'
@@ -31,6 +33,7 @@ class L2tpPppDriftSyncRepository {
             || typeof operationIdFactory !== 'function') {
             throw new TypeError('PPP drift SYNC requires state and operation models');
         }
+        bindExecutionAuthorization(this, { executionContext });
         this.RelayL2tpState = RelayL2tpState;
         this.L2tpOperation = L2tpOperation;
         this.operationIdFactory = operationIdFactory;
@@ -116,6 +119,7 @@ class L2tpPppDriftSyncRepository {
                     _id: operationId,
                     node: relayNode,
                     kind: 'sync_users',
+                    ...(this.executionContext ? { executionContext: this.executionContext } : {}),
                     status: 'queued',
                     idempotencyKey,
                     progress: 0,

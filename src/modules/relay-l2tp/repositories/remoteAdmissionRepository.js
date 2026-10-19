@@ -1,5 +1,7 @@
 'use strict';
 
+const { selectExecutionContext, matchesExecutionContext, executionContextFilter } = require('../domain/l2tpExecutionAuthorization');
+
 const { randomUUID } = require('node:crypto');
 
 function admissionError(code) {
@@ -178,7 +180,10 @@ class RemoteAdmissionRepository {
             admission: { _id: admissionId, nodeId: admission.nodeId, kind: 'install',
                 phase: 'queued', operationId },
             operation: { _id: operationId, node: admission.nodeId, kind: 'install',
-                status: 'queued', admissionId, idempotencyKey: operation.idempotencyKey, plan },
+                status: 'queued', admissionId,
+                ...(selectExecutionContext(operation.executionContext)
+                    ? { executionContext: selectExecutionContext(operation.executionContext) } : {}),
+                idempotencyKey: operation.idempotencyKey, plan },
         };
     }
 
@@ -234,8 +239,10 @@ class RemoteAdmissionRepository {
         return String(operationId);
     }
 
-    /** Dormant DB-only claim: the worker is deliberately not wired to this path. */
-    async claimQueuedInstall({ owner, leaseMs, now } = {}) {
+    /** Exact context-scoped counted claim; no legacy/unbound fallback. */
+    async claimQueuedInstall({ owner, leaseMs, now, executionContext } = {}) {
+        const selected = selectExecutionContext(executionContext);
+        if (!selected) return null;
         if (typeof owner !== 'string' || !owner.trim()
             || !Number.isSafeInteger(leaseMs) || leaseMs <= 0
             || !(now instanceof Date) || !Number.isFinite(now.getTime())
@@ -263,9 +270,10 @@ class RemoteAdmissionRepository {
                 }).session(session).lean();
                 if (!gate) return null;
                 const candidate = await this.L2tpOperation.findOne({
+                    ...executionContextFilter(selected),
                     status: 'queued', kind: 'install', admissionId: { $type: 'string', $ne: '' },
                 }).sort({ createdAt: 1, _id: 1 }).session(session).lean();
-                if (!candidate) return null;
+                if (!candidate || !matchesExecutionContext(candidate.executionContext, selected)) return null;
                 if (!Number.isSafeInteger(candidate.attempts) || candidate.attempts < 0
                     || candidate.attempts >= Number.MAX_SAFE_INTEGER
                     || candidate.ownerGeneration !== undefined) return null;
@@ -280,6 +288,7 @@ class RemoteAdmissionRepository {
 
                 const ownerGeneration = admission.ownerGeneration + 1;
                 const changed = await this.L2tpOperation.updateOne({
+                    ...executionContextFilter(selected),
                     _id: candidate._id, node: candidate.node, kind: 'install', status: 'queued',
                     admissionId: candidate.admissionId, attempts: candidate.attempts,
                     ownerGeneration: { $exists: false },
@@ -305,8 +314,10 @@ class RemoteAdmissionRepository {
         }
     }
 
-    /** Dormant DB-only first claim; no worker or release path uses this yet. */
-    async claimQueuedSyncUsers({ owner, leaseMs, now } = {}) {
+    /** First context-scoped sync claim creates its counted admission atomically. */
+    async claimQueuedSyncUsers({ owner, leaseMs, now, executionContext } = {}) {
+        const selected = selectExecutionContext(executionContext);
+        if (!selected) return null;
         if (typeof owner !== 'string' || !owner.trim()
             || !Number.isSafeInteger(leaseMs) || leaseMs <= 0
             || !(now instanceof Date) || !Number.isFinite(now.getTime())
@@ -328,10 +339,11 @@ class RemoteAdmissionRepository {
         try {
             return await this.syncClaimRunner(async session => {
                 const candidate = await this.L2tpOperation.findOne({
+                    ...executionContextFilter(selected),
                     status: 'queued', kind: 'sync_users', admissionId: { $exists: false },
                     ownerGeneration: { $exists: false },
                 }).sort({ createdAt: 1, _id: 1 }).session(session).lean();
-                if (!candidate) return null;
+                if (!candidate || !matchesExecutionContext(candidate.executionContext, selected)) return null;
                 if (!Number.isSafeInteger(candidate.attempts) || candidate.attempts < 0
                     || candidate.attempts >= Number.MAX_SAFE_INTEGER) return null;
                 const unresolved = await this.RemoteAdmission.findOne({
@@ -350,6 +362,7 @@ class RemoteAdmissionRepository {
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) return null;
                 const changed = await this.L2tpOperation.updateOne({
+                    ...executionContextFilter(selected),
                     _id: candidate._id, node: candidate.node, kind: 'sync_users',
                     status: 'queued', admissionId: { $exists: false },
                     ownerGeneration: { $exists: false }, attempts: candidate.attempts,
@@ -570,7 +583,9 @@ class RemoteAdmissionRepository {
      * remaining node lock. Running/rolling-back work and failed rollback stay
      * fenced; a restart is not evidence that SSH has stopped.
      */
-    async recoverSettledAdmissions({ limit = 25 } = {}) {
+    async recoverSettledAdmissions({ limit = 25, executionContext } = {}) {
+        const selected = selectExecutionContext(executionContext);
+        if (!selected) return { recovered: 0 };
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
             || typeof this.RemoteAdmission.find !== 'function'
             || typeof this.L2tpOperation?.findOne !== 'function'
@@ -587,9 +602,11 @@ class RemoteAdmissionRepository {
             if (!record.operationId || !record.leaseOwner
                 || !Number.isSafeInteger(record.ownerGeneration)) continue;
             const operation = await this.L2tpOperation.findOne({
+                ...executionContextFilter(selected),
                 _id: record.operationId,
             }).lean();
-            if (!operation || !['succeeded', 'rolled_back', 'failed'].includes(operation.status)) {
+            if (!operation || !matchesExecutionContext(operation.executionContext, selected)
+                || !['succeeded', 'rolled_back', 'failed'].includes(operation.status)) {
                 continue;
             }
             const input = {

@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -19,9 +20,9 @@ function harness({ generation = 7, storedGeneration = generation, leaseUntil = n
         },
     };
     const operationRepository = new L2tpOperationRepository({ model });
-    const operation = { id: 'op-1', kind: 'install', node: 'node-1', status: 'running',
+    const operation = { executionContext: TEST, id: 'op-1', kind: 'install', node: 'node-1', status: 'running',
         admissionId: 'admission-1', ownerGeneration: generation, leaseOwner: 'worker-1', plan };
-    const worker = new L2tpOperationWorker({
+    const worker = new L2tpOperationWorker({ executionContext: TEST,
         operationRepository,
         remoteAdmissionRepository: {
             async claimQueuedInstall() { return operation; },

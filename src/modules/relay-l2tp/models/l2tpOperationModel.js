@@ -1,6 +1,7 @@
 'use strict';
 
 const mongoose = require('mongoose');
+const { selectExecutionContext } = require('../domain/l2tpExecutionAuthorization');
 
 const OPERATION_KINDS = [
     'preflight',
@@ -122,7 +123,18 @@ const operationPlanSchema = new mongoose.Schema({
     },
 }, { _id: false, strict: true });
 
+const executionContextSchema = new mongoose.Schema({
+    target: { type: String, required: true },
+    hostIdentity: { type: String, required: true },
+}, { _id: false, strict: 'throw' });
+
 const l2tpOperationSchema = new mongoose.Schema({
+    // Legacy rows remain readable, but unbound rows are never executable.
+    executionContext: {
+        type: executionContextSchema, immutable: true, default: undefined,
+        validate: { validator: value => !!selectExecutionContext(plainObject(value)),
+            message: 'An exact server-owned L2TP execution context is required' },
+    },
     node: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'HyNode',

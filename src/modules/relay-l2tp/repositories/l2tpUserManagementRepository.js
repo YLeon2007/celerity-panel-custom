@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization } = require('../domain/l2tpExecutionAuthorization');
+
 const { randomBytes } = require('node:crypto');
 
 const SAFE_USER_FIELDS = Object.freeze([
@@ -78,6 +80,7 @@ function repositoryError(code, message) {
 
 class L2tpUserManagementRepository {
     constructor({
+        executionContext,
         HyNode,
         L2tpUser,
         RelayL2tpState,
@@ -100,6 +103,7 @@ class L2tpUserManagementRepository {
         if (!RelayL2tpState || typeof RelayL2tpState.findOneAndUpdate !== 'function') {
             throw new TypeError('L2TP user management requires RelayL2tpState.findOneAndUpdate');
         }
+        bindExecutionAuthorization(this, { executionContext });
         this.HyNode = HyNode;
         this.L2tpUser = L2tpUser;
         this.RelayL2tpState = RelayL2tpState;
@@ -188,6 +192,7 @@ class L2tpUserManagementRepository {
                 _id: operationId,
                 node: fields.relayNode,
                 kind: 'sync_users',
+                ...(this.executionContext ? { executionContext: this.executionContext } : {}),
                 status: 'queued',
                 idempotencyKey: `sync-users:${fields.relayNode}:revision-${desiredRevision}`,
                 progress: 0,
@@ -263,6 +268,7 @@ class L2tpUserManagementRepository {
                 _id: operationId,
                 node: relayNode,
                 kind: 'sync_users',
+                ...(this.executionContext ? { executionContext: this.executionContext } : {}),
                 status: 'queued',
                 idempotencyKey: `sync-users:${relayNode}:revision-${desiredRevision}`,
                 progress: 0,
@@ -327,6 +333,7 @@ class L2tpUserManagementRepository {
                 _id: operationId,
                 node: relayNode,
                 kind: 'sync_users',
+                ...(this.executionContext ? { executionContext: this.executionContext } : {}),
                 status: 'queued',
                 idempotencyKey: `sync-users:${relayNode}:revision-${desiredRevision}`,
                 progress: 0,

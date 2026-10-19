@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -51,14 +52,14 @@ test('read-only gate selects only direct verifier and never falls back to runner
 test('factory opts in to read-only mode without changing default mode', () => {
     const deps = { RelayL2tpState: { findOne() {} }, L2tpUser: { find() {} },
         L2tpOperation: { findOne() {} }, HyNode: { findById() {} }, NodeSSH: class {} };
-    assert.equal(createTopologyPppReadinessGate(deps).readOnly, false);
-    assert.equal(createTopologyPppReadinessGate({ ...deps, readOnly: true }).readOnly, true);
+    assert.equal(createTopologyPppReadinessGate({ ...deps, executionContext: TEST }).readOnly, false);
+    assert.equal(createTopologyPppReadinessGate({ executionContext: TEST, ...deps, readOnly: true }).readOnly, true);
 });
 
 test('factory read-only gate uses pre-installed verifier without runner or bootstrap', async () => {
     const { deps } = fixture();
     const calls = [];
-    const gate = createTopologyPppReadinessGate({
+    const gate = createTopologyPppReadinessGate({ executionContext: TEST,
         ...deps,
         readOnly: true,
         HyNode: { findById: () => ({ select: () => ({ lean: async () => ({
@@ -87,7 +88,7 @@ test('factory read-only gate uses pre-installed verifier without runner or boots
 
 test('read-only installed verifier preserves a proven PPP drift for retry', async () => {
     const { deps } = fixture();
-    const gate = createTopologyPppReadinessGate({
+    const gate = createTopologyPppReadinessGate({ executionContext: TEST,
         ...deps, readOnly: true,
         HyNode: { findById: () => ({ select: () => ({ lean: async () => ({
             _id: 'node-r', active: true, type: 'xray', cascadeRole: 'relay', ssh: {},

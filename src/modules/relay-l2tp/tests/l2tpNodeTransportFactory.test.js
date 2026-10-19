@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -22,7 +23,7 @@ test('creates one typed transport from the operation node only when requested', 
         }
     }
 
-    const transportFactory = createL2tpNodeTransportFactory({
+    const transportFactory = createL2tpNodeTransportFactory({ executionContext: TEST,
         nodeSSHFactory(node) {
             const nodeSSH = { kind: 'node-ssh', node };
             constructions.push({ kind: 'node-ssh', node, instance: nodeSSH });
@@ -60,7 +61,7 @@ test('lazily adapts an injected node execution resolver to a typed transport', a
         }
     }
 
-    const resolveTransport = createL2tpNodeTransportResolver({
+    const resolveTransport = createL2tpNodeTransportResolver({ executionContext: TEST,
         nodeExecutionResolver,
         NodeTransport: FakeNodeTransport,
     });
@@ -68,6 +69,7 @@ test('lazily adapts an injected node execution resolver to a typed transport', a
     assert.deepEqual(calls, []);
 
     const transport = await resolveTransport({
+        executionContext: TEST,
         operationId: 'operation-adapter',
         nodeId: 'relay-adapter',
     });

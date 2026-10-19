@@ -83,8 +83,8 @@ function fixture() {
         }
     }
     let nextId = 12;
-    function makeRepository() {
-        return new L2tpPppDriftSyncRepository({ RelayL2tpState, L2tpOperation, transactionRunner,
+    function makeRepository(executionContext) {
+        return new L2tpPppDriftSyncRepository({ executionContext, RelayL2tpState, L2tpOperation, transactionRunner,
             operationIdFactory: () => `507f1f77bcf86cd7994390${nextId++}` });
     }
     return { operations, calls, state, RelayL2tpState, L2tpOperation, makeRepository };
@@ -242,4 +242,15 @@ test('duplicate idempotency key returns persisted winner without another operati
     assert.deepEqual(results.map(result => result.status).sort(), ['active', 'queued']);
     assert.equal(results[0].operationId, operations[0]._id);
     assert.equal(results[1].operationId, operations[0]._id);
+});
+
+test('drift queue stamps immutable server identity, never an enqueue payload identity', async () => {
+    const { operations, makeRepository } = fixture();
+    const selected = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+    const source = { ...selected };
+    const repository = makeRepository(source);
+    source.target = 'test';
+    await repository.enqueue({ relayNode, now,
+        executionContext: { target: 'test', hostIdentity: 'test.infograd.online' } });
+    assert.deepEqual(operations[0].executionContext, selected);
 });

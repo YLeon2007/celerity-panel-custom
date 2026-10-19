@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, assertExecutionBinding } = require('../domain/l2tpExecutionAuthorization');
+
 const NODE_EXECUTION_SELECT = '_id name ip type active cascadeRole ssh.port ssh.username ssh.privateKey ssh.password';
 
 class L2tpNodeExecutionResolverError extends Error {
@@ -45,7 +47,8 @@ class L2tpNodeExecutionResolver {
     #HyNode;
     #NodeSSH;
 
-    constructor({ HyNode, NodeSSH } = {}) {
+    constructor({ executionContext, enableProductionExecution = false, HyNode, NodeSSH } = {}) {
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         if (!HyNode || typeof HyNode.findById !== 'function') {
             throw new TypeError('L2tpNodeExecutionResolver requires HyNode.findById');
         }
@@ -56,7 +59,8 @@ class L2tpNodeExecutionResolver {
         this.#NodeSSH = NodeSSH;
     }
 
-    async resolve(nodeId) {
+    async resolve(nodeId, executionContext) {
+        assertExecutionBinding(this, executionContext);
         const node = await this.#HyNode.findById(nodeId)
             .select(NODE_EXECUTION_SELECT)
             .lean();

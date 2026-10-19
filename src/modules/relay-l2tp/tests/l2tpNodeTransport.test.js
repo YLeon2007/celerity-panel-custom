@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -23,7 +24,7 @@ function createNodeSSHFacade(response = { code: 0, stdout: '', stderr: '' }) {
 }
 
 test('exposes only the typed remote executor transport methods', () => {
-    const transport = new L2tpNodeTransport({ nodeSSH: createNodeSSHFacade() });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: createNodeSSHFacade() });
 
     assert.deepEqual(
         Object.getOwnPropertyNames(Object.getPrototypeOf(transport)),
@@ -48,14 +49,14 @@ test('read-only verifier checks the existing directory and installed script then
         return { code: 0, stdout: `${JSON.stringify(readOnlySuccess)}\n`, stderr: '' };
     } };
     const bootstrapper = { async ensureArtifact() { throw new Error('must never bootstrap'); } };
-    const transport = new L2tpNodeTransport({ nodeSSH, artifactBootstrapper: bootstrapper });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH, artifactBootstrapper: bootstrapper });
     assert.deepEqual(await transport.verifyUsersReadOnly(readOnlyRequest), readOnlySuccess);
     assert.deepEqual(calls, [{ command: readOnlyCommand, options: { timeout: 120000 } }]);
 });
 
 test('read-only verifier rejects invalid exact requests without SSH or bootstrap', async () => {
     const calls = [];
-    const transport = new L2tpNodeTransport({
+    const transport = new L2tpNodeTransport({ executionContext: TEST,
         nodeSSH: { async exec() { calls.push('ssh'); } },
         artifactBootstrapper: { async ensureArtifact() { calls.push('bootstrap'); } },
     });
@@ -76,11 +77,11 @@ test('read-only verifier fails closed when precheck, execution or strict parsing
         { code: 0, stdout: `${JSON.stringify({ ...readOnlySuccess, ok: false })}\n`, stderr: '' },
     ];
     for (const response of invalid) {
-        const transport = new L2tpNodeTransport({ nodeSSH: { async exec() { return response; } } });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: { async exec() { return response; } } });
         await assert.rejects(transport.verifyUsersReadOnly(readOnlyRequest),
             error => error.code === 'REMOTE_COMMAND_FAILED');
     }
-    const transport = new L2tpNodeTransport({ nodeSSH: { async exec() {
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: { async exec() {
         throw new Error('timeout secret');
     } } });
     await assert.rejects(transport.verifyUsersReadOnly(readOnlyRequest),
@@ -90,7 +91,7 @@ test('read-only verifier fails closed when precheck, execution or strict parsing
 test('read-only verifier returns only validated explicit drift as a negative result', async () => {
     const negative = { ok: false, code: 'MANAGED_USERS_MISSING',
         credentialRevision: 41, enabledUserCount: 1, managedUserCount: 0 };
-    const transport = new L2tpNodeTransport({ nodeSSH: { async exec() {
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: { async exec() {
         return { code: 65, stdout: `${JSON.stringify(negative)}\n`, stderr: '' };
     } } });
     assert.deepEqual(await transport.verifyUsersReadOnly(readOnlyRequest), negative);
@@ -98,7 +99,7 @@ test('read-only verifier returns only validated explicit drift as a negative res
 
 test('read-only verifier fails closed on an unresolved SSH execution deadline', async t => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
-    const transport = new L2tpNodeTransport({ nodeSSH: { exec: () => new Promise(() => {}) } });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: { exec: () => new Promise(() => {}) } });
     const pending = transport.verifyUsersReadOnly(readOnlyRequest);
     t.mock.timers.tick(120000);
     await assert.rejects(pending, error => error.code === 'REMOTE_COMMAND_FAILED'
@@ -107,7 +108,7 @@ test('read-only verifier fails closed on an unresolved SSH execution deadline', 
 
 test('uploadRootFile sends an exact typed artifact to the fixed receiver over stdin', async () => {
     const nodeSSH = createNodeSSHFacade();
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
     const content = '{"psk":"transport-secret"}\n';
 
     const result = await transport.uploadRootFile({
@@ -136,7 +137,7 @@ test('uploadRootFile sends an exact typed artifact to the fixed receiver over st
 
 test('uploadRootFile maps the exact candidate type and staging name to candidate/xray.json', async () => {
     const nodeSSH = createNodeSSHFacade();
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
     const content = '{"marker":"candidate-content-must-use-stdin"}';
 
     const result = await transport.uploadRootFile({
@@ -163,7 +164,7 @@ test('uploadRootFile maps the exact candidate type and staging name to candidate
 
 test('uploadRootFile accepts only exact typed artifact names', async () => {
     const acceptedNodeSSH = createNodeSSHFacade();
-    const transport = new L2tpNodeTransport({ nodeSSH: acceptedNodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: acceptedNodeSSH });
 
     await transport.uploadRootFile({
         operationId: 'operation-typed',
@@ -188,7 +189,7 @@ test('uploadRootFile accepts only exact typed artifact names', async () => {
         { type: 'xray_candidate', path: 'xray-candidate.json' },
     ]) {
         const nodeSSH = createNodeSSHFacade();
-        const candidate = new L2tpNodeTransport({ nodeSSH });
+        const candidate = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
         await assert.rejects(
             candidate.uploadRootFile({
                 operationId: 'operation-typed',
@@ -220,7 +221,7 @@ test('uploadRootFile rejects generic or extra request fields before invoking the
         { destination: '/tmp/desired.json' },
     ]) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.uploadRootFile({
@@ -258,7 +259,7 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
         stdout: `${JSON.stringify(verifierResult)}\n`,
         stderr: '',
     });
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
     const commands = [
         'preflight',
         'install_runtime',
@@ -308,7 +309,7 @@ test('runArtifactCommand maps every typed command to the fixed artifact runner',
 });
 
 test('preflight rejects an absent SSH exit status as remotely uncertain', async () => {
-    const transport = new L2tpNodeTransport({ nodeSSH: {
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: {
         async exec() { return { code: null, stdout: '', stderr: '' }; },
     } });
     await assert.rejects(transport.runArtifactCommand({
@@ -338,7 +339,7 @@ test('verify-users returns only a strict result bound to the requested revision 
             };
         },
     };
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
     const result = await transport.runArtifactCommand({
         operationId: 'operation-user-verify',
@@ -363,7 +364,7 @@ test('verify-users preserves strict unmanaged-collision results without exposing
         managedUserCount: 2,
         code: 'UNMANAGED_USERS_COLLISION',
     };
-    const transport = new L2tpNodeTransport({
+    const transport = new L2tpNodeTransport({ executionContext: TEST,
         nodeSSH: {
             async exec() {
                 return {
@@ -421,7 +422,7 @@ test('verify-users rejects raw, foreign, or mismatched output with a sanitized e
     ];
 
     for (const response of responses) {
-        const transport = new L2tpNodeTransport({
+        const transport = new L2tpNodeTransport({ executionContext: TEST,
             nodeSSH: { async exec() { return response; } },
         });
         await assert.rejects(
@@ -468,7 +469,7 @@ test('verify-users requires exact typed expectation metadata and rejects it on f
 
     for (const request of invalidRequests) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
         await assert.rejects(
             transport.runArtifactCommand(request),
             error => {
@@ -498,7 +499,7 @@ test('preflight returns only validated structured output from the fixed artifact
             return { code: 0, stdout, stderr: secret };
         },
     };
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
     const result = await transport.runArtifactCommand({
         operationId: 'preflight-operation',
@@ -545,7 +546,7 @@ test('preflight exposes a validated artifact failure without remote diagnostics'
             };
         },
     };
-    const transport = new L2tpNodeTransport({ nodeSSH });
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
     const result = await transport.runArtifactCommand({
         operationId: 'preflight-failed',
@@ -589,7 +590,7 @@ test('preflight fails closed on empty, malformed, or unrecognized command output
 
     for (const [index, response] of responses.entries()) {
         await t.test(String(index), async () => {
-            const transport = new L2tpNodeTransport({
+            const transport = new L2tpNodeTransport({ executionContext: TEST,
                 nodeSSH: { async exec() { return response; } },
             });
 
@@ -621,7 +622,7 @@ test('rejects invalid operation ids before invoking the NodeSSH facade', async (
 
     for (const operationId of invalidOperationIds) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         for (const invoke of [
             () => transport.uploadRootFile({
@@ -658,7 +659,7 @@ test('rejects unknown artifact commands before invoking the NodeSSH facade', asy
 
     for (const command of unknownCommands) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.runArtifactCommand({ operationId: 'operation-19', command }),
@@ -691,7 +692,7 @@ test('rejects non-root artifact paths before invoking the NodeSSH facade', async
 
     for (const path of invalidPaths) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.uploadRootFile({
@@ -724,7 +725,7 @@ test('rejects artifact metadata that is not root-owned mode 0600 before the faca
 
     for (const metadata of invalidMetadata) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.uploadRootFile({
@@ -760,7 +761,7 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
     ];
 
     for (const nodeSSH of failures) {
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.uploadRootFile({
@@ -785,7 +786,7 @@ test('sanitizes every NodeSSH upload failure without exposing content or remote 
 });
 
 test('uploadRootFile marks a rejected SSH receiver with no exit status as uncertain', async () => {
-    const transport = new L2tpNodeTransport({ nodeSSH: {
+    const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH: {
         async exec() { throw new Error('ssh transport closed with private stderr'); },
     } });
     await assert.rejects(transport.uploadRootFile({
@@ -809,7 +810,7 @@ test('uploadRootFile acknowledges only an explicit zero SSH exit code', async t 
     for (const { label, value, succeeds } of responses) {
         await t.test(label, async () => {
             const nodeSSH = createNodeSSHFacade(value);
-            const transport = new L2tpNodeTransport({ nodeSSH });
+            const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
             const upload = transport.uploadRootFile({
                 operationId: 'operation-exit-code',
                 type: 'desired',
@@ -855,7 +856,7 @@ test('sanitizes rejected and nonzero artifact runner failures', async () => {
     ];
 
     for (const nodeSSH of facades) {
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.runArtifactCommand({ operationId: 'operation-23', command: 'verify' }),
@@ -886,7 +887,7 @@ test('ordinary artifact commands including commit acknowledge only explicit zero
         for (const { label, value, succeeds } of responses) {
             await t.test(`${command}: ${label}`, async () => {
                 const nodeSSH = createNodeSSHFacade(value);
-                const transport = new L2tpNodeTransport({ nodeSSH });
+                const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
                 const run = transport.runArtifactCommand({ operationId: 'operation-exit-code', command });
                 if (succeeds) {
                     assert.deepEqual(await run, { ok: true, operationId: 'operation-exit-code', command });
@@ -909,7 +910,7 @@ test('ordinary artifact commands including commit acknowledge only explicit zero
 test('rejects non-string artifact content before invoking the NodeSSH facade', async () => {
     for (const content of [null, Buffer.from('{}'), { psk: 'secret' }]) {
         const nodeSSH = createNodeSSHFacade();
-        const transport = new L2tpNodeTransport({ nodeSSH });
+        const transport = new L2tpNodeTransport({ executionContext: TEST, nodeSSH });
 
         await assert.rejects(
             transport.uploadRootFile({

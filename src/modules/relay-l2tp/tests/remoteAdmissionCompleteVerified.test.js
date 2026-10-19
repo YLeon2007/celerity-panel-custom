@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -10,7 +11,7 @@ function fixture(kind = 'install', count = 1) {
     let gate = count;
     let phase = 'running';
     let heldLock = false;
-    const operation = { _id: 'operation-1', node: 'relay-1', kind, status: 'succeeded',
+    const operation = { executionContext: TEST, _id: 'operation-1', node: 'relay-1', kind, status: 'succeeded',
         admissionId: 'admission-1', leaseOwner: 'worker-1', ownerGeneration: 2 };
     const admission = { _id: 'admission-1', nodeId: 'relay-1', kind, phase,
         operationId: 'operation-1', leaseOwner: 'worker-1', ownerGeneration: 2 };

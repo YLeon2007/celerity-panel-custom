@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, assertExecutionAuthorized, matchesExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+
 const { randomBytes } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
 
@@ -37,6 +39,8 @@ class L2tpService {
     constructor({
         nodeRepository,
         stateRepository,
+        executionContext,
+        enableProductionExecution = false,
         operationRepository,
         planBuilder,
         operationMaterializer,
@@ -48,6 +52,7 @@ class L2tpService {
     }) {
         this.nodeRepository = nodeRepository;
         this.stateRepository = stateRepository;
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         this.operationRepository = operationRepository;
         this.planBuilder = planBuilder;
         this.operationMaterializer = operationMaterializer;
@@ -86,6 +91,7 @@ class L2tpService {
     }
 
     async preflight(nodeId, input) {
+        assertExecutionAuthorized(this);
         // Standalone preflight has its own counted admission and exact node lock;
         // no remote work is allowed without both fences.
         const context = await this._loadInstallContext(nodeId, input);
@@ -164,6 +170,7 @@ class L2tpService {
     }
 
     async install(nodeId, input) {
+        assertExecutionAuthorized(this);
         const context = await this._loadInstallContext(nodeId, input);
         // TEST execution opt-in and counted admission must be enabled together;
         // an unsupported install fails before remote transport.
@@ -294,6 +301,7 @@ class L2tpService {
                 _id: operationId,
                 node: entityId(context.node),
                 kind: 'install',
+                executionContext: this.executionContext,
                 status: 'queued',
                 idempotencyKey: `install:${entityId(context.node)}:revision-${topologyRevision}:attempt-${operationId}`,
                 progress: 0,
@@ -330,6 +338,7 @@ class L2tpService {
                 && entityId(operation) === operationId
                 && String(operation.admissionId) === String(admissionId)
                 && operation.node === operationDocument.node
+                && matchesExecutionContext(operation.executionContext, this.executionContext)
                 && operation.kind === 'install'
                 && operation.status === 'queued'
                 && operation.idempotencyKey === operationDocument.idempotencyKey
@@ -446,6 +455,7 @@ class L2tpService {
         }
 
         return {
+            executionContext: this.executionContext,
             node,
             relay: { ...node, role: nodeRole(node) },
             state,

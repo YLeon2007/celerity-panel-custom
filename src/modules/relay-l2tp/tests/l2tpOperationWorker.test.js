@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -16,7 +17,7 @@ const NOW = new Date('2026-09-22T10:00:00.000Z');
 
 test('worker stays disabled before any claim or SSH even with a queued operation', async () => {
     const calls = [];
-    const worker = new L2tpOperationWorker({
+    const worker = new L2tpOperationWorker({ executionContext: TEST,
         operationRepository: { async claimNext() { calls.push('generic claim'); } },
         remoteAdmissionRepository: {
             async claimQueuedInstall() { calls.push('install claim'); },
@@ -43,11 +44,11 @@ test('opted-in worker selects both counted kinds fairly, without generic claim',
     ].map(([method, kind]) => [method, async request => {
         claims.push(kind);
         const id = queued[kind].shift();
-        return id && { id, kind, status: 'running', admissionId: `admission-${id}`,
+        return id && { executionContext: TEST, id, kind, status: 'running', admissionId: `admission-${id}`,
             leaseOwner: request.owner, ownerGeneration: 1, node: 'node-a',
             plan: { steps: [] } };
     }]));
-    const worker = new L2tpOperationWorker({ operationRepository, remoteAdmissionRepository,
+    const worker = new L2tpOperationWorker({ executionContext: TEST, operationRepository, remoteAdmissionRepository,
         enableUnsafeExecutionForTests: true, workerId: 'worker-1', leaseMs: 30_000,
         clock: createClock() });
     for (const id of ['install-a', 'sync-a', 'install-b', 'sync-b']) {
@@ -64,7 +65,7 @@ test('opted-in worker refuses missing admission, unsupported kind, or incomplete
         { kind: 'install', admissionId: 'a', ownerGeneration: 1, status: 'queued' },
     ]) {
         let invoked = 0;
-        const worker = new L2tpOperationWorker({
+        const worker = new L2tpOperationWorker({ executionContext: TEST,
             operationRepository: { async claimNext() { throw new Error('generic claim'); } },
             remoteAdmissionRepository: {
                 async claimQueuedInstall() { return { id: 'op', kind: 'install', status: 'running',
@@ -83,7 +84,7 @@ test('opted-in worker refuses missing admission, unsupported kind, or incomplete
 test('opted-in worker requires both transactional claims before touching generic repository', async () => {
     for (const remoteAdmissionRepository of [undefined, {}, { async claimQueuedInstall() {} },
         { async claimQueuedSyncUsers() {} }]) {
-        const worker = new L2tpOperationWorker({
+        const worker = new L2tpOperationWorker({ executionContext: TEST,
             operationRepository: { async claimNext() { throw new Error('generic claim'); } },
             remoteAdmissionRepository, enableUnsafeExecutionForTests: true,
         });
@@ -93,7 +94,7 @@ test('opted-in worker requires both transactional claims before touching generic
 
 test('ambiguous counted claim aborts without trying another kind or executor', async () => {
     const calls = [];
-    const worker = new L2tpOperationWorker({
+    const worker = new L2tpOperationWorker({ executionContext: TEST,
         operationRepository: { async claimNext() { calls.push('generic'); } },
         remoteAdmissionRepository: {
             async claimQueuedInstall() { calls.push('install'); throw new Error('uncertain commit'); },
@@ -108,7 +109,8 @@ test('ambiguous counted claim aborts without trying another kind or executor', a
 });
 
 function createOperationRepository(initialOperations = []) {
-    const operations = initialOperations.map(operation => ({ ...operation,
+    const operations = initialOperations.map(operation => ({
+        executionContext: TEST, ...operation,
         // Old execution fixtures predate kind-scoped admission. Model them as
         // counted install claims; production does not accept these shapes.
         kind: operation.kind ?? 'install',
@@ -254,7 +256,8 @@ function createWorker(operationRepository, overrides = {}) {
         },
     };
 
-    const worker = new L2tpOperationWorker({
+    const worker = new L2tpOperationWorker({ executionContext: overrides.executionContext ?? TEST,
+        enableProductionExecution: overrides.enableProductionExecution === true,
         operationRepository,
         remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
             completeVerifiedOperation: overrides.completeVerifiedOperation ?? (async () => true),
@@ -281,7 +284,7 @@ function createWorker(operationRepository, overrides = {}) {
                 return operation;
             },
         },
-        enableUnsafeExecutionForTests: true,
+        enableUnsafeExecutionForTests: overrides.enableUnsafeExecutionForTests ?? true,
         lockService,
         executor: overrides.executor || {},
         secretResolver: overrides.secretResolver ?? (legacyExecutionFixture
@@ -481,7 +484,7 @@ test('claims an install once and resolves its PSK once before typed artifact upl
     const candidateCalls = [];
     const lockCalls = [];
     const transportCalls = [];
-    const executor = new L2tpRemoteExecutor({
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST,
         transport: {
             async uploadRootFile(request) {
                 transportCalls.push({ method: 'uploadRootFile', request });
@@ -642,7 +645,7 @@ test('queues the after-install topology deploy hook only for succeeded installs'
     const operationRepository = createOperationRepository([operation]);
     const hookCalls = [];
     const handoffOrder = [];
-    const executor = new L2tpRemoteExecutor({
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST,
         transport: {
             async uploadRootFile() {},
             async runArtifactCommand() { return { ok: true }; },
@@ -1404,7 +1407,7 @@ test('rejects invalid claimed install plans before resolving secrets or remote w
                 resolverCalls += 1;
                 return { psk: 'must-not-resolve' };
             },
-            executor: new L2tpRemoteExecutor({
+            executor: new L2tpRemoteExecutor({ executionContext: TEST,
                 transport: {
                     async uploadRootFile(request) { transportCalls.push(request); },
                     async runArtifactCommand(request) { transportCalls.push(request); },
@@ -1454,7 +1457,7 @@ test('candidate rejection is sanitized and performs no secret resolution or remo
             stateReconciler: async () => {
                 reconciliationCalls += 1;
             },
-            executor: new L2tpRemoteExecutor({
+            executor: new L2tpRemoteExecutor({ executionContext: TEST,
                 transport: {
                     async uploadRootFile(request) { transportCalls.push(request); },
                     async runArtifactCommand(request) { transportCalls.push(request); },
@@ -1509,7 +1512,7 @@ test('secret resolution failure is sanitized and performs no remote command or r
                 code: leakedSecret,
             });
         },
-        executor: new L2tpRemoteExecutor({
+        executor: new L2tpRemoteExecutor({ executionContext: TEST,
             transport: {
                 async uploadRootFile(request) { transportCalls.push(request); },
                 async runArtifactCommand(request) { transportCalls.push(request); },
@@ -1570,7 +1573,7 @@ test('combined secret resolution failure is sanitized and uploads no user artifa
                 code: 'L2TP_USER_DECRYPTION_FAILED',
             });
         },
-        executor: new L2tpRemoteExecutor({
+        executor: new L2tpRemoteExecutor({ executionContext: TEST,
             transport: {
                 async uploadRootFile(request) { transportCalls.push(request); },
                 async runArtifactCommand(request) { transportCalls.push(request); },
@@ -1619,6 +1622,7 @@ test('runOnce reports idle when no queued operation can be claimed', async () =>
     assert.deepEqual(operationRepository.calls, [{
         method: 'claimQueuedInstall',
         request: {
+            executionContext: TEST,
             owner: 'worker-1',
             leaseMs: 30_000,
             now: NOW,
@@ -1626,6 +1630,7 @@ test('runOnce reports idle when no queued operation can be claimed', async () =>
     }, {
         method: 'claimQueuedSyncUsers',
         request: {
+            executionContext: TEST,
             owner: 'worker-1',
             leaseMs: 30_000,
             now: NOW,
@@ -2941,4 +2946,41 @@ test('releases the per-operation execution transport after a claimed operation f
     assert.equal(result.status, 'succeeded');
     assert.equal(releases.length, 1);
     assert.strictEqual(releases[0], operationRepository.operations[0]);
+});
+
+test('separately opted-in production executes bound install and sync with real typed executor', async () => {
+    const PROD = require('../domain/topologyExecutionContext').PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT;
+    for (const kind of ['install', 'sync_users']) {
+        const operation = kind === 'install' ? createInstallOperation('production-install').operation
+            : createSyncUsersOperation('production-sync');
+        operation.executionContext = PROD;
+        const repository = createOperationRepository([operation]);
+        const commands = [];
+        const resolutions = [];
+        const executor = new L2tpRemoteExecutor({ executionContext: PROD, enableProductionExecution: true,
+            async transportResolver(request) {
+                resolutions.push(request);
+                return { async uploadRootFile(request) {
+                    assert.doesNotMatch(JSON.stringify(request), /executionContext|hostIdentity/);
+                }, async runArtifactCommand(request) {
+                    commands.push(request.command);
+                    return request.command === 'verify-users' ? { ok: true, code: 'USERS_VERIFIED',
+                        credentialRevision: 9, enabledUserCount: 0, managedUserCount: 0 } : { ok: true };
+                } };
+            } });
+        const worker = createWorker(repository, { executionContext: PROD, enableProductionExecution: true,
+            enableUnsafeExecutionForTests: false, executor, operationMaterializer: materializeInstallOperation,
+            secretResolver: async () => ({ psk: 'local-fixture', users: [] }),
+            userSnapshotResolver: async () => ({ credentialRevision: 9, users: [] }),
+            userSyncReconciler: { finalizeVerifiedSync: async () => ({ ok: true }) },
+            candidateService: { async buildCandidate({ plan }) { return { operationId: plan.operationId, content: '{}' }; } },
+            lockService: { async acquire() { return { ok: true }; } },
+        });
+        assert.deepEqual(await worker.runOnce(), { claimed: true, operationId: operation.id, status: 'succeeded' });
+        assert.equal(resolutions.length, 1);
+        assert.equal(resolutions[0].executionContext, PROD);
+        assert.deepEqual(commands, kind === 'install'
+            ? INSTALL_STEP_TYPES.map(type => type === 'sync_users' ? 'sync-users' : type)
+            : ['backup', 'sync-users', 'verify-users']);
+    }
 });

@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, assertExecutionBinding } = require('../domain/l2tpExecutionAuthorization');
+
 const STEP_COMMANDS = Object.freeze({
     preflight: 'preflight',
     install_runtime: 'install_runtime',
@@ -316,7 +318,8 @@ class L2tpRemoteExecutor {
 
     #userVerificationExpectations = new Map();
 
-    constructor({ transport, transportResolver } = {}) {
+    constructor({ executionContext, enableProductionExecution = false, transport, transportResolver } = {}) {
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         const hasTransport = transport !== undefined && transport !== null;
         const hasTransportResolver = typeof transportResolver === 'function';
         if (hasTransport === hasTransportResolver) {
@@ -332,6 +335,7 @@ class L2tpRemoteExecutor {
     }
 
     async resolveTransport(operation) {
+        assertExecutionBinding(this, operation?.executionContext);
         if (this.transport) return this.transport;
 
         const operationId = String(operation._id ?? operation.id);
@@ -340,6 +344,7 @@ class L2tpRemoteExecutor {
                 .then(() => this.transportResolver({
                     operationId,
                     nodeId: entityId(operation.node),
+                    executionContext: this.executionContext,
                 }))
                 .then(transport => {
                     if (

@@ -1,11 +1,15 @@
 'use strict';
 
+const { bindExecutionAuthorization, assertExecutionAuthorized, assertExecutionBinding } = require('../domain/l2tpExecutionAuthorization');
+
 const { createHash } = require('node:crypto');
 
 const { L2tpNodeTransport } = require('./l2tpNodeTransport');
 const { createL2tpArtifactBootstrapper } = require('./l2tpArtifactBootstrapper');
 
 function createL2tpNodeTransportFactory({
+    executionContext,
+    enableProductionExecution = false,
     nodeSSHFactory,
     NodeTransport = L2tpNodeTransport,
 } = {}) {
@@ -16,9 +20,16 @@ function createL2tpNodeTransportFactory({
         throw new TypeError('createL2tpNodeTransportFactory requires NodeTransport');
     }
 
-    return node => new NodeTransport({
-        nodeSSH: nodeSSHFactory(node),
-    });
+    const authorization = {};
+    bindExecutionAuthorization(authorization, { executionContext, enableProductionExecution });
+    return node => {
+        assertExecutionAuthorized(authorization);
+        return new NodeTransport({
+            executionContext: authorization.executionContext,
+            enableProductionExecution: authorization.enableProductionExecution,
+            nodeSSH: nodeSSHFactory(node),
+        });
+    };
 }
 
 function defaultArtifactBootstrapper(nodeSSH) {
@@ -30,6 +41,8 @@ function defaultArtifactBootstrapper(nodeSSH) {
 }
 
 function createL2tpNodeTransportResolver({
+    executionContext,
+    enableProductionExecution = false,
     nodeExecutionResolver,
     NodeTransport = L2tpNodeTransport,
 } = {}) {
@@ -40,10 +53,15 @@ function createL2tpNodeTransportResolver({
         throw new TypeError('createL2tpNodeTransportResolver requires NodeTransport');
     }
 
-    return async ({ nodeId }) => {
-        const nodeSSH = await nodeExecutionResolver.resolve(nodeId);
+    const authorization = {};
+    bindExecutionAuthorization(authorization, { executionContext, enableProductionExecution });
+    return async ({ nodeId, executionContext: binding }) => {
+        assertExecutionBinding(authorization, binding);
+        const nodeSSH = await nodeExecutionResolver.resolve(nodeId, authorization.executionContext);
         return new NodeTransport({
             nodeSSH,
+            executionContext: authorization.executionContext,
+            enableProductionExecution: authorization.enableProductionExecution,
             artifactBootstrapper: defaultArtifactBootstrapper(nodeSSH),
         });
     };

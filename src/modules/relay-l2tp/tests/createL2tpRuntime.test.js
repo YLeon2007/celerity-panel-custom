@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -16,6 +17,7 @@ const { L2tpOperationWorker } = require('../workers/l2tpOperationWorker');
 
 function createDependencies() {
     return {
+        executionContext: TEST,
         operationModel: {
             async create() {},
             async findById() {},
@@ -358,5 +360,20 @@ test('rejects every missing explicit runtime dependency before composition', () 
             () => createL2tpRuntime(dependencies),
             new RegExp(dependencyName, 'i'),
         );
+    }
+});
+
+test('runtime carries one immutable execution context into service, worker and executor', async () => {
+    for (const selected of [{ target: 'test', hostIdentity: 'test.infograd.online' },
+        { target: 'production', hostIdentity: 'lm1.infograd.online' }]) {
+        const source = { ...selected };
+        const runtime = createL2tpRuntime({ ...createDependencies(), executionContext: source,
+            enableProductionExecution: selected.target === 'production' });
+        source.target = 'bad';
+        for (const component of [runtime.service, runtime.worker, runtime.worker.executor]) {
+            assert.deepEqual(component.executionContext, selected);
+            assert.equal(Object.isFrozen(component.executionContext), true);
+            assert.throws(() => { component.executionContext = source; }, TypeError);
+        }
     }
 });

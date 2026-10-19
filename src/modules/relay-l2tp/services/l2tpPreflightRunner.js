@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, executionAuthorized, matchesExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+
 const { randomBytes: defaultRandomBytes } = require('node:crypto');
 
 const {
@@ -78,7 +80,8 @@ class L2tpPreflightRunner {
     #transportResolver;
     #randomBytes;
 
-    constructor({ transportResolver, randomBytes = defaultRandomBytes } = {}) {
+    constructor({ executionContext, enableProductionExecution = false, transportResolver, randomBytes = defaultRandomBytes } = {}) {
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         if (typeof transportResolver !== 'function') {
             throw new TypeError('L2tpPreflightRunner requires transportResolver');
         }
@@ -90,6 +93,9 @@ class L2tpPreflightRunner {
     }
 
     async run(context) {
+        if (!executionAuthorized(this) || !matchesExecutionContext(context?.executionContext, this.executionContext)) {
+            return failure('L2TP_EXECUTION_NOT_AUTHORIZED');
+        }
         if (!hasValidatedInstallContext(context)) {
             return failure('PREFLIGHT_CONTEXT_INVALID');
         }
@@ -110,7 +116,7 @@ class L2tpPreflightRunner {
         const nodeId = entityId(context.relay);
         let transport;
         try {
-            transport = await this.#transportResolver({ operationId, nodeId });
+            transport = await this.#transportResolver({ operationId, nodeId, executionContext: this.executionContext });
         } catch {
             return failure('PREFLIGHT_TRANSPORT_UNAVAILABLE');
         }

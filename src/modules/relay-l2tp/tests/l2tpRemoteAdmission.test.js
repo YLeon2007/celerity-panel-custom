@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -99,7 +100,7 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
                 { check: 'xray_unit', status: 'ok', unit: 'xray.service' },
             ] }; },
     };
-    const runner = createL2tpPreflightRunner({ transportResolver: async () => {
+    const runner = createL2tpPreflightRunner({ executionContext: TEST, transportResolver: async () => {
         calls.push(['resolve']); return transport;
     } });
     const node = { id: 'relay-1', cascadeRole: 'relay' };
@@ -116,7 +117,7 @@ function fixture({ gate = {}, releaseFails = false, ambiguousAcquire = false, re
             return { ok: true };
         },
     };
-    const service = new L2tpService({
+    const service = new L2tpService({ executionContext: TEST,
         nodeRepository: { findById: async () => node },
         stateRepository: {
             findByNodeId: async () => desired,

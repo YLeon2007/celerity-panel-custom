@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, executionAuthorized, matchesExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+
 const {
     materializeSyncUsersOperation,
 } = require('../services/l2tpOperationMaterializer');
@@ -134,10 +136,11 @@ function lostClaim() {
 
 class L2tpOperationWorker {
     constructor({
+        executionContext,
+        enableProductionExecution = false,
         operationRepository,
         remoteAdmissionRepository,
-        // Test-only opt-in. Production must not consume counted admissions
-        // without the explicit TEST composition predicate.
+        // Preserve the TEST flag independently of the production opt-in.
         enableUnsafeExecutionForTests = false,
         lockService,
         executor,
@@ -154,6 +157,7 @@ class L2tpOperationWorker {
         timer = globalThis,
         renewalIntervalMs,
     }) {
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         this.operationRepository = operationRepository;
         this.remoteAdmissionRepository = remoteAdmissionRepository;
         this.enableUnsafeExecutionForTests = enableUnsafeExecutionForTests === true;
@@ -464,13 +468,16 @@ class L2tpOperationWorker {
     }
 
     async runOnce() {
+        if (!executionAuthorized(this, this.enableUnsafeExecutionForTests)) {
+            return { claimed: false, unavailable: true };
+        }
         // A crash after exact lock release but before admission completion can
         // leave a terminal operation counted. Reconcile durable terminal proof
         // before admitting the next queued operation; never recover an active
         // SSH attempt merely because its lease expired.
-        if (this.enableUnsafeExecutionForTests
+        if (executionAuthorized(this, this.enableUnsafeExecutionForTests)
             && typeof this.remoteAdmissionRepository?.recoverSettledAdmissions === 'function') {
-            await this.remoteAdmissionRepository.recoverSettledAdmissions();
+            await this.remoteAdmissionRepository.recoverSettledAdmissions({ executionContext: this.executionContext });
         }
         let claimedId;
         let claimedStatus = 'running';
@@ -490,12 +497,13 @@ class L2tpOperationWorker {
         // Never consume counted admission while execution/finalization is not
         // fenced. Missing transactional claims are likewise not a reason to
         // fall back to the generic (uncounted) operation repository.
-        if (!this.enableUnsafeExecutionForTests
+        if (!executionAuthorized(this, this.enableUnsafeExecutionForTests)
             || typeof this.remoteAdmissionRepository?.claimQueuedInstall !== 'function'
             || typeof this.remoteAdmissionRepository?.claimQueuedSyncUsers !== 'function') {
             return { claimed: false, unavailable: true };
         }
         const request = {
+            executionContext: this.executionContext,
             owner: this.workerId,
             leaseMs: this.leaseMs,
             now: this.clock.now(),
@@ -510,7 +518,8 @@ class L2tpOperationWorker {
         if (!operation) return { claimed: false };
 
         // A malformed/injected claim must never reach lock acquisition or SSH.
-        if (!['install', 'sync_users'].includes(operation.kind)
+        if (!matchesExecutionContext(operation.executionContext, this.executionContext)
+            || !['install', 'sync_users'].includes(operation.kind)
             || operation.status !== 'running'
             || operation.leaseOwner !== this.workerId
             || !operation.admissionId

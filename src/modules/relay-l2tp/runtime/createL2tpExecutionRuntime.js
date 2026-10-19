@@ -1,5 +1,7 @@
 'use strict';
 
+const { selectExecutionContext, executionAuthorized } = require('../domain/l2tpExecutionAuthorization');
+
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const { L2tpUserExecutionRepository } = require('../repositories/l2tpUserExecutionRepository');
 const {
@@ -248,9 +250,14 @@ function createL2tpExecutionRuntime({
     createRuntime = createL2tpRuntime,
     createWorkerLifecycle = createL2tpWorkerLifecycle,
 } = {}) {
-    if (workerLifecycle?.enabled !== true) {
+    const authorization = Object.freeze({
+        executionContext: selectExecutionContext(runtimeDependencies?.executionContext),
+        enableProductionExecution: runtimeDependencies?.enableProductionExecution === true,
+    });
+    if (workerLifecycle?.enabled !== true || !executionAuthorized(authorization)) {
         const runtime = createRuntime({
             ...runtimeDependencies,
+            ...authorization,
             preflightRunner: unavailablePreflightRunner,
             candidateService: unavailableCandidateService,
             transport: dormantTransport,
@@ -297,12 +304,13 @@ function createL2tpExecutionRuntime({
         createWorkerLifecycle,
     });
 
-    const nodeExecutionResolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH });
+    const nodeExecutionResolver = new L2tpNodeExecutionResolver({ ...authorization, HyNode, NodeSSH });
     const transportResolver = createL2tpNodeTransportResolver({
+        ...authorization,
         nodeExecutionResolver,
         NodeTransport,
     });
-    const preflightRunner = createPreflightRunner({ transportResolver });
+    const preflightRunner = createPreflightRunner({ ...authorization, transportResolver });
     if (typeof preflightRunner !== 'function') {
         throw new TypeError('Active L2TP execution createPreflightRunner must return a function');
     }
@@ -338,6 +346,7 @@ function createL2tpExecutionRuntime({
         return runtimeStateManagementService.reconcileVerifiedOperation(request);
     };
     const userManagementRepository = new L2tpUserManagementRepository({
+        executionContext: authorization.executionContext,
         HyNode,
         L2tpUser,
         RelayL2tpState,
@@ -387,6 +396,7 @@ function createL2tpExecutionRuntime({
     });
     const runtime = createRuntime({
         ...runtimeDependencies,
+        ...authorization,
         preflightRunner,
         remoteAdmissionRepository,
         candidateService,
@@ -414,7 +424,8 @@ function createL2tpExecutionRuntime({
         nodeSSHFactory: node => new NodeSSH(node),
         remoteAdmissionRepository,
         lockService,
-        allowRemoteExecution: runtimeDependencies?.enableInstallAdmission === true,
+        allowRemoteExecution: executionAuthorized(authorization)
+            && runtimeDependencies?.enableInstallAdmission === true,
         secretBox,
         secretKey,
     });

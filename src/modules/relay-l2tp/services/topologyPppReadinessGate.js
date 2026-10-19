@@ -1,5 +1,7 @@
 'use strict';
 
+const { selectExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+
 const { createL2tpNodeTransportResolver } = require('./l2tpNodeTransportFactory');
 const { L2tpNodeExecutionResolver } = require('./l2tpNodeExecutionResolver');
 
@@ -219,14 +221,20 @@ class TopologyPppReadinessGate {
     }
 }
 
-function createTopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, HyNode, NodeSSH, readOnly = false }) {
-    const resolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH });
+function createTopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, HyNode, NodeSSH,
+    executionContext, enableProductionExecution = false, readOnly = false }) {
+    const authorization = Object.freeze({ executionContext: selectExecutionContext(executionContext),
+        enableProductionExecution: enableProductionExecution === true });
+    const resolver = new L2tpNodeExecutionResolver({ ...authorization, HyNode, NodeSSH });
+    const resolveTransport = createL2tpNodeTransportResolver({
+        ...authorization, nodeExecutionResolver: resolver,
+    });
     return new TopologyPppReadinessGate({
         RelayL2tpState,
         L2tpUser,
         L2tpOperation,
         readOnly,
-        transportResolver: createL2tpNodeTransportResolver({ nodeExecutionResolver: resolver }),
+        transportResolver: request => resolveTransport({ ...request, executionContext: authorization.executionContext }),
     });
 }
 

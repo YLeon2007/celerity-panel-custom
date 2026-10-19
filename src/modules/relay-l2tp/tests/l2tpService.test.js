@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -10,7 +11,7 @@ const { L2tpService } = require('../services/l2tpService');
 const NOW = new Date('2026-09-22T10:00:00.000Z');
 
 function createService(overrides = {}) {
-    return new L2tpService({
+    return new L2tpService({ executionContext: TEST,
         nodeRepository: overrides.nodeRepository || {
             async findById() { return null; },
         },
@@ -238,6 +239,7 @@ test('preflight validates injected state and delegates to the injected runner', 
     assert.equal(calls.length, 1);
     assert.equal(typeof calls[0].onVerifiedRemoteComplete, 'function');
     assert.deepEqual({ ...calls[0], onVerifiedRemoteComplete: undefined }, {
+        executionContext: TEST,
         node: context.node,
         relay: { ...context.node, role: 'relay' },
         state: context.state,
@@ -1042,6 +1044,7 @@ test('install validates context, builds a plan, and persists one queued operatio
         admissionId: 'admission-1',
         operation: {
             _id: result.operationId,
+            executionContext: TEST,
             node: 'relay-1',
             kind: 'install',
             status: 'queued',

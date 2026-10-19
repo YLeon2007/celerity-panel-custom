@@ -1,5 +1,7 @@
 'use strict';
 
+const { bindExecutionAuthorization, assertExecutionAuthorized } = require('../domain/l2tpExecutionAuthorization');
+
 const { parsePreflightExecResult } = require('./l2tpPreflightResult');
 
 const REMOTE_OPERATIONS_ROOT = '/var/lib/celerity/l2tp/operations';
@@ -279,7 +281,8 @@ class L2tpNodeTransport {
     #artifactBootstrapper;
     #artifactReady;
 
-    constructor({ nodeSSH, artifactBootstrapper = null }) {
+    constructor({ executionContext, enableProductionExecution = false, nodeSSH, artifactBootstrapper = null }) {
+        bindExecutionAuthorization(this, { executionContext, enableProductionExecution });
         this.nodeSSH = nodeSSH;
         this.#artifactBootstrapper = artifactBootstrapper;
         this.#artifactReady = false;
@@ -294,7 +297,7 @@ class L2tpNodeTransport {
     }
 
     async uploadRootFile(request) {
-        await this.#ensureArtifactBundle();
+        assertExecutionAuthorized(this);
         assertRootFileRequest(request);
         const {
             operationId,
@@ -309,6 +312,7 @@ class L2tpNodeTransport {
         const artifact = assertRootArtifact(type, path);
         assertRootFileMetadata({ owner, group, mode });
         assertArtifactContent(content);
+        await this.#ensureArtifactBundle();
 
         const remotePath = `${REMOTE_OPERATIONS_ROOT}/${operationId}/${artifact.remotePath}`;
         let result;
@@ -331,6 +335,7 @@ class L2tpNodeTransport {
     }
 
     async verifyUsersReadOnly(request) {
+        assertExecutionAuthorized(this);
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new L2tpNodeTransportError(
                 'INVALID_COMMAND_EXPECTATION',
@@ -386,7 +391,7 @@ class L2tpNodeTransport {
     }
 
     async runArtifactCommand(request) {
-        await this.#ensureArtifactBundle();
+        assertExecutionAuthorized(this);
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new L2tpNodeTransportError(
                 'INVALID_COMMAND_EXPECTATION',
@@ -402,6 +407,7 @@ class L2tpNodeTransport {
         assertOperationId(operationId);
         assertArtifactCommand(command);
         assertCommandExpectation(request);
+        await this.#ensureArtifactBundle();
 
         let result;
         try {

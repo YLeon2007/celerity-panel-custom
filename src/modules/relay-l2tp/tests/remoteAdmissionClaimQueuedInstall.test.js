@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -12,7 +13,7 @@ const now = new Date('2026-09-28T09:00:00Z');
 const admissionId = 'admission-one';
 
 function operation(overrides = {}) {
-    return { _id: operationId, node: nodeId, kind: 'install', status: 'queued',
+    return { _id: operationId, node: nodeId, kind: 'install', executionContext: TEST, status: 'queued',
         admissionId, attempts: 0, createdAt: new Date('2026-09-27T00:00:00Z'), ...overrides };
 }
 function admission(overrides = {}) {
@@ -103,7 +104,7 @@ function fixture({ operations = [operation()], admissions = [admission()], gate 
     return { repository, state, ops, records, calls, session, db,
         CascadeTopologyState, RemoteAdmission, L2tpOperation };
 }
-const claim = f => f.repository.claimQueuedInstall({ owner: 'worker-one', leaseMs: 30000, now });
+const claim = f => f.repository.claimQueuedInstall({ executionContext: TEST, owner: 'worker-one', leaseMs: 30000, now });
 
 test('claims oldest queued install and its admission as one owner generation without changing count', async () => {
     const f = fixture();
@@ -119,7 +120,8 @@ test('claims oldest queued install and its admission as one owner generation wit
     assert.equal(f.records.get(admissionId).ownerGeneration, 2);
     assert.equal(f.state.remoteAdmissionCount, 1);
     assert.deepEqual(f.calls.map(([type]) => type), ['gate', 'select', 'admissionLookup', 'operationCAS', 'admissionCAS']);
-    assert.deepEqual(f.calls[1][1], { status: 'queued', kind: 'install', admissionId: { $type: 'string', $ne: '' } });
+    assert.deepEqual(f.calls[1][1], { 'executionContext.target': TEST.target, 'executionContext.hostIdentity': TEST.hostIdentity,
+        status: 'queued', kind: 'install', admissionId: { $type: 'string', $ne: '' } });
     assert.deepEqual(f.calls[2][1], { _id: admissionId, nodeId, kind: 'install', phase: 'queued',
         operationId, leaseOwner: { $exists: false } });
 });
@@ -172,7 +174,7 @@ test('admission CAS race rolls back operation claim, attempts, lease and generat
 test('second claim cannot reclaim running operation, even after its lease expires', async () => {
     const f = fixture();
     await claim(f);
-    assert.equal(await f.repository.claimQueuedInstall({ owner: 'worker-two', leaseMs: 30000,
+    assert.equal(await f.repository.claimQueuedInstall({ executionContext: TEST, owner: 'worker-two', leaseMs: 30000,
         now: new Date('2026-10-01T00:00:00Z') }), null);
     assert.equal(f.ops.get(operationId).leaseOwner, 'worker-one');
     assert.equal(f.ops.get(operationId).attempts, 1);
@@ -241,7 +243,7 @@ test('rejects invalid owner, lease or clock before touching the database', async
     for (const input of [{ owner: '', leaseMs: 100, now },
         { owner: 'worker', leaseMs: 0, now }, { owner: 'worker', leaseMs: 1.5, now },
         { owner: 'worker', leaseMs: 100, now: new Date(NaN) }]) {
-        await assert.rejects(f.repository.claimQueuedInstall(input), /Invalid queued install claim/);
+        await assert.rejects(f.repository.claimQueuedInstall({ executionContext: TEST, ...input }), /Invalid queued install claim/);
     }
     assert.equal(f.calls.length, 0);
 });
@@ -262,4 +264,16 @@ test('operation schema stores owner generation but leaves legacy operations unve
     const oldAdmission = new RemoteAdmissionModel(admission());
     assert.equal(oldAdmission.validateSync(), undefined);
     assert.equal(oldAdmission.leaseOwner, undefined);
+});
+
+test('execution identity mismatch or absence cannot change operation or admission', async () => {
+    const TEST = { target: 'test', hostIdentity: 'test.infograd.online' };
+    for (const binding of [undefined, {}, { target: 'production', hostIdentity: 'lm1.infograd.online' },
+        { ...TEST, hostIdentity: 'lm1.infograd.online' }, { ...TEST, extra: true }]) {
+        const f = fixture({ operations: [operation({ executionContext: binding })] });
+        assert.equal(await f.repository.claimQueuedInstall({ owner: 'worker', leaseMs: 30000, now,
+            executionContext: TEST }), null);
+        assert.equal(f.ops.get(operationId).status, 'queued');
+        assert.equal(f.calls.some(([type]) => ['gateCAS', 'operationCAS', 'admissionCAS', 'create'].includes(type)), false);
+    }
 });

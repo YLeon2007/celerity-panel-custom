@@ -1,5 +1,7 @@
 'use strict';
 
+const { selectExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+
 const { createConfigFragmentRegistry } = require('../../../services/configFragmentRegistry');
 const { createL2tpRouter } = require('../routes/panel');
 const { L2tpOperationRepository } = require('../services/l2tpOperationRepository');
@@ -77,6 +79,8 @@ function optional(value, key) {
 function createL2tpRuntime(dependencies) {
     assertDependencies(dependencies);
     const {
+        executionContext: contextInput,
+        enableProductionExecution = false,
         operationModel,
         operationRepository,
         nodeRepository,
@@ -107,8 +111,11 @@ function createL2tpRuntime(dependencies) {
         workerId,
         leaseMs,
     } = dependencies;
+    const executionContext = selectExecutionContext(contextInput);
+    const authorization = { executionContext, enableProductionExecution };
     const workerOperationRepository = new L2tpOperationRepository({ model: operationModel });
     const service = new L2tpService({
+        ...authorization,
         nodeRepository,
         stateRepository,
         operationRepository,
@@ -121,9 +128,10 @@ function createL2tpRuntime(dependencies) {
         clock,
     });
     const executor = new L2tpRemoteExecutor(
-        transportResolver ? { transportResolver } : { transport },
+        { ...authorization, ...(transportResolver ? { transportResolver } : { transport }) },
     );
     const worker = new L2tpOperationWorker({
+        ...authorization,
         operationRepository: workerOperationRepository,
         remoteAdmissionRepository,
         lockService,

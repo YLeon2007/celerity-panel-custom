@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -56,12 +57,12 @@ test('selects only relay SSH execution fields and constructs one secret-safe Nod
         }
     }
 
-    const resolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH: FakeNodeSSH });
+    const resolver = new L2tpNodeExecutionResolver({ executionContext: TEST, HyNode, NodeSSH: FakeNodeSSH });
 
     assert.deepEqual(HyNode.calls, []);
     assert.deepEqual(constructions, []);
 
-    const nodeSSH = await resolver.resolve('relay-17');
+    const nodeSSH = await resolver.resolve('relay-17', TEST);
 
     assert.ok(nodeSSH instanceof FakeNodeSSH);
     assert.deepEqual(HyNode.calls, [
@@ -102,10 +103,10 @@ test('rejects missing, inactive, and non-Xray-relay nodes before NodeSSH constru
                 constructions += 1;
             }
         }
-        const resolver = new L2tpNodeExecutionResolver({ HyNode, NodeSSH: FakeNodeSSH });
+        const resolver = new L2tpNodeExecutionResolver({ executionContext: TEST, HyNode, NodeSSH: FakeNodeSSH });
 
         await assert.rejects(
-            resolver.resolve(node?._id || 'missing-node'),
+            resolver.resolve(node?._id || 'missing-node', TEST),
             error => {
                 assert.equal(error.name, 'L2tpNodeExecutionResolverError');
                 assert.equal(error.code, 'NODE_EXECUTION_UNAVAILABLE');

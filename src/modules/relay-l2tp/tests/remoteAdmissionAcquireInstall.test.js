@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -81,7 +82,7 @@ function fixture({ gate = {}, ambiguous = false, createFails = false, splitConne
         findOne(filter) {
             const operation = [...operations.values()].find(candidate =>
                 Object.entries(filter).every(([key, expected]) => {
-                    const value = candidate[key];
+                    const value = key.split('.').reduce((v, k) => v?.[k], candidate);
                     if (expected && typeof expected === 'object' && '$in' in expected) {
                         return expected.$in.includes(value);
                     }
@@ -392,7 +393,7 @@ test('recovery scan closes durable pre-SSH failure and leaves uncertain rollback
     const f = fixture();
     const pre = await f.repository.acquireInstall({ nodeId: 'relay-1' });
     Object.assign(f.records.get(pre), { operationId: 'pre-op', leaseOwner: 'worker-1', ownerGeneration: 2 });
-    f.operations.set('pre-op', { _id: 'pre-op', node: 'relay-1', kind: 'install',
+    f.operations.set('pre-op', { executionContext: TEST, _id: 'pre-op', node: 'relay-1', kind: 'install',
         status: 'failed', progress: 0, errorCode: 'XRAY_CANDIDATE_FAILED',
         admissionId: pre, leaseOwner: 'worker-1', ownerGeneration: 2 });
     const uncertain = await f.repository.acquireInstall({ nodeId: 'relay-2' });
@@ -400,11 +401,11 @@ test('recovery scan closes durable pre-SSH failure and leaves uncertain rollback
         phase: 'recovery_required', operationId: 'uncertain-op',
         leaseOwner: 'worker-2', ownerGeneration: 2,
     });
-    f.operations.set('uncertain-op', { _id: 'uncertain-op', node: 'relay-2', kind: 'install',
+    f.operations.set('uncertain-op', { executionContext: TEST, _id: 'uncertain-op', node: 'relay-2', kind: 'install',
         status: 'failed', progress: 0, errorCode: 'ROLLBACK_FAILED',
         admissionId: uncertain, leaseOwner: 'worker-2', ownerGeneration: 2 });
     f.locks.set('relay-2:uncertain-op', { generation: 'held-lock' });
-    assert.deepEqual(await f.repository.recoverSettledAdmissions(), { scanned: 2, recovered: 1 });
+    assert.deepEqual(await f.repository.recoverSettledAdmissions({ executionContext: TEST }), { scanned: 2, recovered: 1 });
     assert.equal(f.state.remoteAdmissionCount, 1);
     assert.equal(f.records.get(pre).phase, 'completed');
     assert.equal(f.records.get(uncertain).phase, 'recovery_required');

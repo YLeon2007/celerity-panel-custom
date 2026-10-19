@@ -212,11 +212,14 @@ test('create, update, and disable queues persist the exact model-valid sync plan
             const repository = new L2tpUserManagementRepository({
                 ...models,
                 L2tpOperation: createModelBackedOperationStore(models.calls, persistedPlans),
+                executionContext: { target: 'production', hostIdentity: 'lm1.infograd.online' },
                 operationIdFactory: () => scenario.operationId,
                 transactionRunner: work => work(session),
             });
 
             await scenario.run(repository);
+            assert.deepEqual(models.calls.find(c => c.method === 'L2tpOperation.create').documents[0].executionContext,
+                { target: 'production', hostIdentity: 'lm1.infograd.online' });
 
             assert.deepEqual(persistedPlans, [{
                 ok: true,

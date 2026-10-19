@@ -230,6 +230,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
         // The runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
         const pppGateDependencies = {
+            executionContext,
+            enableProductionExecution: executionContext.target === 'production',
             RelayL2tpState,
             L2tpUser: L2tpUser ?? require('../models/l2tpUserModel'),
             L2tpOperation: L2tpOperation ?? require('../models/l2tpOperationModel'),
@@ -242,6 +244,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         const testHostAllowed = executionContext.target === 'test';
         const pppDriftSync = testHostAllowed
             ? new L2tpPppDriftSyncRepository({
+                executionContext,
                 RelayL2tpState,
                 L2tpOperation,
                 ...optional(transactionRunner, 'transactionRunner'),

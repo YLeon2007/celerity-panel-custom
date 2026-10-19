@@ -1,4 +1,5 @@
 'use strict';
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
@@ -126,7 +127,8 @@ function fixture(options = {}) {
             return options.command ? options.command() : options.response ?? RESPONSE;
         },
     };
-    const preflightRunner = createL2tpPreflightRunner({ transportResolver: async () => {
+    const preflightRunner = createL2tpPreflightRunner({ executionContext: options.executionContext ?? TEST,
+        enableProductionExecution: options.enableProductionExecution === true, transportResolver: async () => {
         events.push('resolve');
         assert.equal(gate.remoteAdmissionCount, 1);
         assert.match(locks.get('relay-1').owner, /^install-preflight:/);
@@ -134,6 +136,8 @@ function fixture(options = {}) {
     } });
     const pass = (req, res, next) => next();
     const runtime = createL2tpRuntime({
+        executionContext: options.executionContext ?? TEST,
+        enableProductionExecution: options.enableProductionExecution === true,
         operationModel: L2tpOperation, operationRepository: {},
         nodeRepository: { findById: async () => ({ id: 'relay-1', cascadeRole: 'relay' }) },
         stateRepository: {
@@ -268,4 +272,18 @@ test('assembled verified remote refusal releases exact node lock and decrements 
     assert.equal(admission.phase, 'completed');
     await assert.rejects(f.repository.release(admission._id), { code: 'REMOTE_ADMISSION_NOT_ACTIVE' });
     assert.equal(f.gate.remoteAdmissionCount, 0);
+});
+
+test('assembled production requires separate opt-in and persists identity after fenced preflight', async () => {
+    const PROD = require('../domain/topologyExecutionContext').PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT;
+    const denied = fixture({ executionContext: PROD });
+    await assert.rejects(denied.run(), { code: 'L2TP_EXECUTION_NOT_AUTHORIZED' });
+    assert.equal(denied.gate.remoteAdmissionCount, 0);
+    assert.deepEqual(denied.events, []);
+    const allowed = fixture({ executionContext: PROD, enableProductionExecution: true });
+    const result = await allowed.run();
+    assert.deepEqual(allowed.operations.get(result.operationId).executionContext, PROD);
+    assert.equal(allowed.gate.remoteAdmissionCount, 1);
+    assert.equal(allowed.locks.size, 0);
+    assert.equal([...allowed.admissions.values()][0].phase, 'queued');
 });
