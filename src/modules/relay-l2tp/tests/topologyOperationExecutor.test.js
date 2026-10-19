@@ -6,6 +6,7 @@ const test = require('node:test');
 
 const {
     TopologyOperationExecutor,
+    TopologyOperationExecutorError,
 } = require('../services/topologyOperationExecutor');
 
 function canonicalize(value) {
@@ -432,7 +433,7 @@ test('fails closed outside test and rejects non-frozen, role-mismatched, or expa
     assert.equal(resolverCalls, 0);
 });
 
-test('sanitizes hash-bound transport failures and retains only the binding needed for fixed rollback', async () => {
+test('sanitizes hash-bound commit failures while preserving remote uncertainty', async () => {
     const remoteSecret = 'untrusted-transport-secret-canary';
     const { events, executor } = executorFixture({
         responseOverrides: {
@@ -450,20 +451,49 @@ test('sanitizes hash-bound transport failures and retains only the binding neede
         assert.equal(error.name, 'TopologyOperationExecutorError');
         assert.equal(error.code, 'TOPOLOGY_OPERATION_EXECUTION_FAILED');
         assert.equal(error.message, 'Topology node operation failed');
+        assert.equal(error.remoteOutcomeUncertain, true);
+        assert.equal(error.backupId, prepared.backupId);
         assert.equal(Object.hasOwn(error, 'cause'), false);
         assert.doesNotMatch(JSON.stringify(error), new RegExp(remoteSecret));
         return true;
     });
-    const rolledBack = await executor.rollback(context);
-
-    assert.equal(rolledBack.ok, true);
     assert.deepEqual(
         events.filter(event => event.method === 'transport')
             .map(event => event.request.command),
-        ['prepare', 'commit', 'rollback'],
+        ['prepare', 'commit'],
     );
     assert.equal(events.filter(event => event.method === 'resolve').length, 1);
-    assert.doesNotMatch(JSON.stringify({ executor, rolledBack }), new RegExp(remoteSecret));
+    assert.doesNotMatch(JSON.stringify(executor), new RegExp(remoteSecret));
+});
+
+test('transport exceptions cannot claim a commit was locally rejected before dispatch', async t => {
+    for (const transportError of [
+        Object.assign(new Error('untrusted-error-canary'), { remoteOutcomeUncertain: false }),
+        Object.assign(new TopologyOperationExecutorError('INVALID_FROZEN_NODE_PLAN', 'untrusted-error-canary'),
+            { remoteOutcomeUncertain: false }),
+    ]) await t.test(transportError.name, async () => {
+        let commits = 0;
+        class NodeTransportFactory {
+            async create() { return {
+                async prepare({ artifact: _artifact, ...request }) {
+                    return { ok: true, command: 'prepare', ...request };
+                },
+                async commit() { commits++; throw transportError; },
+            }; }
+        }
+        const executor = new TopologyOperationExecutor({ target: 'test',
+            nodeExecutionResolver: { async resolve() { return {}; } },
+            RunnerBootstrapper: class { async ensureRunner() {} }, NodeTransportFactory });
+        const prepared = await executor.prepare(prepareContext());
+        await assert.rejects(executor.commit(lifecycleContext(prepared)), error => {
+            assert.equal(error.code, 'TOPOLOGY_OPERATION_EXECUTION_FAILED');
+            assert.equal(error.remoteOutcomeUncertain, true);
+            assert.equal(error.backupId, prepared.backupId);
+            assert.doesNotMatch(JSON.stringify(error), /untrusted-error-canary/);
+            return true;
+        });
+        assert.equal(commits, 1);
+    });
 });
 
 test('a malformed prepare receipt retains uncertainty and exposes no prepared binding', async () => {

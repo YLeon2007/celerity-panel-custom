@@ -486,7 +486,8 @@ function createSlowPhaseHarness(phase) {
             async commit() {
                 commitCalls += 1;
                 if (phase === 'rollback' && commitCalls === 2) {
-                    return { ok: false };
+                    throw Object.assign(new Error('local pre-dispatch rejection'),
+                        { remoteOutcomeUncertain: false });
                 }
                 await pause('commit');
                 return { ok: true };
@@ -1688,7 +1689,7 @@ test('delegates terminal success to the atomic finalizer with only operation lea
     );
 });
 
-test('atomic finalizer failure leaves committing work recoverable without unlocked rollback', async () => {
+test('atomic finalizer failure leaves committing work fenced without unlocked rollback', async () => {
     const repository = createRepository();
     const rollbackNodes = [];
     const executor = {
@@ -1837,7 +1838,7 @@ test('prepare failure cleans only prepared nodes and performs no commits', async
     assert.equal(repository.operation.status, 'rolled_back');
 });
 
-test('commit failure rolls back the current and prior committed nodes in reverse only', async () => {
+test('unclassified commit failure retains current and prior changed nodes without rollback', async () => {
     const repository = createRepository(durableThreeNodeOperation());
     const events = [];
     const executor = {
@@ -1874,21 +1875,18 @@ test('commit failure rolls back the current and prior committed nodes in reverse
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'rolled_back');
-    assert.deepEqual(events.filter(event => event.method === 'rollback'), [
-        { method: 'rollback', node: 'node-b' },
-        { method: 'rollback', node: 'node-a' },
-    ]);
-    assert.deepEqual(events.filter(event => event.method === 'cleanupPrepared'), [
-        { method: 'cleanupPrepared', node: 'node-c' },
-    ]);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.equal(repository.operation.nodes[1].state, 'failed');
+    assert.deepEqual(events.filter(event => event.method === 'rollback'), []);
+    assert.deepEqual(events.filter(event => event.method === 'cleanupPrepared'), []);
     assert.deepEqual(events.filter(event => event.method === 'commit'), [
         { method: 'commit', node: 'node-a' },
         { method: 'commit', node: 'node-b' },
     ]);
 });
 
-test('atomic finalizer rejection defers rollback until recovery reacquires all locks', async () => {
+test('atomic finalizer rejection retains admission without unlocked rollback', async () => {
     const repository = createRepository();
     const events = [];
     const executor = {
@@ -2080,7 +2078,7 @@ test('expired partial preparation is rehydrated, cleaned, and retried from fresh
     assert.equal(preparedNode.backupId, 'topology-backup-node-a-fresh');
 });
 
-test('expired committing operation rolls back only durable committed and prepared bindings', async () => {
+test('expired committing operation retains durable bindings without quiescence proof', async () => {
     const operation = durableOperation();
     operation.status = 'committing';
     operation.leaseOwner = 'stopped-process';
@@ -2128,18 +2126,14 @@ test('expired committing operation rolls back only durable committed and prepare
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'rolled_back');
-    assert.deepEqual(events, [
-        { method: 'rehydrate', node: 'node-b', backupId: 'topology-backup-node-b' },
-        { method: 'cleanupPrepared', node: 'node-b' },
-        { method: 'rehydrate', node: 'node-a', backupId: 'topology-backup-node-a' },
-        { method: 'rollback', node: 'node-a' },
-    ]);
-    assert.equal(operation.status, 'rolled_back');
-    assert.deepEqual(operation.nodes.map(node => node.state), ['rolled_back', 'rolled_back']);
+    assert.equal(result.status, 'committing');
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.deepEqual(events, []);
+    assert.equal(operation.status, 'committing');
+    assert.deepEqual(operation.nodes.map(node => node.state), ['committed', 'prepared']);
 });
 
-test('expired rollback resumes after a crash point and preserves failed rollback status', async () => {
+test('expired rollback cannot resume an unjoined remote writer after a crash', async () => {
     const operation = durableOperation();
     operation.status = 'rolling_back';
     operation.leaseOwner = 'stopped-process';
@@ -2180,13 +2174,11 @@ test('expired rollback resumes after a crash point and preserves failed rollback
 
     const result = await worker.run('operation-1');
 
-    assert.equal(result.status, 'failed');
-    assert.deepEqual(events, [
-        { method: 'rehydrate', node: 'node-a' },
-        { method: 'rollback', node: 'node-a' },
-    ]);
-    assert.equal(operation.status, 'failed');
-    assert.equal(operation.nodes.find(node => node.node === 'node-a').state, 'failed');
+    assert.equal(result.status, 'rolling_back');
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.deepEqual(events, []);
+    assert.equal(operation.status, 'rolling_back');
+    assert.equal(operation.nodes.find(node => node.node === 'node-a').state, 'committed');
     assert.equal(operation.nodes.find(node => node.node === 'node-b').state, 'rolled_back');
 });
 
@@ -2331,7 +2323,7 @@ test('success publication waits for confirmed exact lock release', async t => {
     });
 });
 
-test('failed publication is recovered only after reacquiring every node lock', async () => {
+test('failed publication recovery keeps admission until authoritative quiescence exists', async () => {
     const operation = durableOperation();
     operation.heldTopologyAdmission = true;
     const held = new Set();
@@ -2380,9 +2372,11 @@ test('failed publication is recovered only after reacquiring every node lock', a
     assert.equal(held.size, 0);
     events.length = 0;
     recovery = true;
-    assert.equal((await worker.run('operation-1')).status, 'rolled_back');
-    assert.deepEqual(events, ['acquire:node-a', 'acquire:node-b', 'rollback:node-b', 'rollback:node-a']);
-    assert.equal(operation.heldTopologyAdmission, false);
+    const recovered = await worker.run('operation-1');
+    assert.equal(recovered.status, 'committing');
+    assert.equal(recovered.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.deepEqual(events, []);
+    assert.equal(operation.heldTopologyAdmission, true);
 });
 
 test('crash after recording an uncertain failed node cannot resume remote work', async t => {

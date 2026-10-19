@@ -391,7 +391,14 @@ class TopologyOperationExecutor {
     }
 
     async #invokePrepared(command, context, release = false) {
-        const state = this.#preparedBinding(context);
+        let state;
+        try {
+            state = this.#preparedBinding(context);
+        } catch (error) {
+            // Only our local binding validation proves no command was invoked.
+            error.remoteOutcomeUncertain = false;
+            throw error;
+        }
         try {
             return assertReceipt(
                 await state.transport[command](transportRequest(
@@ -401,12 +408,16 @@ class TopologyOperationExecutor {
                 command,
                 state.binding,
             );
-        } catch (error) {
-            if (error instanceof TopologyOperationExecutorError
-                && error.code === 'INVALID_FROZEN_NODE_PLAN') {
-                throw error;
+        } catch {
+            const wrapped = executionFailed();
+            if (command === 'commit') {
+                // Transport rejection, nonzero exit, or a malformed receipt
+                // cannot prove the remote writer has exited. Never propagate
+                // a transport-supplied pre-dispatch claim across this boundary.
+                wrapped.remoteOutcomeUncertain = true;
+                wrapped.backupId = state.binding.backupId;
             }
-            throw executionFailed();
+            throw wrapped;
         } finally {
             if (release) this.#preparedBindings.delete(context.prepared);
         }

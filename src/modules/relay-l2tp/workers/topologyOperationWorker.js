@@ -1083,6 +1083,15 @@ class TopologyOperationWorker {
                     plan, operation, operationId, nodes, heartbeat, acquiredNodeIds,
                 );
             }
+            // Phase/node labels and lease expiry cannot prove a prior commit
+            // (or rollback) writer has exited. There is no durable quiescence
+            // receipt in this protocol, so recovery must not dispatch rollback
+            // even if all old node locks are absent. The separately fenced PPP
+            // wait above remains read-only recovery, not commit recovery.
+            if (operation.status === 'committing' || operation.status === 'rolling_back') {
+                return { claimed: true, operationId, status: operation.status, stopped: true,
+                    errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+            }
             const lockErrorCode = await this.acquireLocks(operationId, nodes, acquiredNodeIds);
             if (lockErrorCode) {
                 traceWorkerFailure(plan, operationId, 'worker.lock', { code: lockErrorCode });
@@ -1093,17 +1102,6 @@ class TopologyOperationWorker {
                     stopped: true,
                     errorCode: lockErrorCode,
                 };
-            }
-
-            if (operation.status === 'committing' || operation.status === 'rolling_back') {
-                return await this.rollbackDurableOperation(
-                    plan,
-                    operation,
-                    operationId,
-                    entries,
-                    heartbeat,
-                    acquiredNodeIds,
-                );
             }
 
             if (entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
@@ -1195,6 +1193,23 @@ class TopologyOperationWorker {
                 } catch (error) {
                     if (error instanceof LeaseLostError) throw error;
                     traceWorkerFailure(plan, operationId, 'worker.commit', error, entry.node.node);
+                    // Only a locally proven pre-dispatch rejection permits
+                    // rollback. A timeout/invalid receipt can leave a commit
+                    // writer alive; even a successful rollback receipt would
+                    // not join it. Retain every exact lock and admission.
+                    if (error?.remoteOutcomeUncertain !== false) {
+                        const recorded = await this.operationRepository.recordNode({
+                            operationId, owner: this.workerId, now: this.clock.now(),
+                            node: entry.node.node, state: 'failed', backupId: entry.backupId,
+                        });
+                        if (recorded !== true) throw new LeaseLostError();
+                        const finished = await this.operationRepository.finishClaimed({
+                            operationId, owner: this.workerId, now: this.clock.now(), status: 'failed',
+                        });
+                        if (finished !== true) throw new LeaseLostError();
+                        return { claimed: true, operationId, status: 'failed', stopped: true,
+                            errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                    }
                     return await this.rollbackAfterCommitFailure(
                         plan,
                         operationId,
@@ -1352,8 +1367,8 @@ class TopologyOperationWorker {
                 }
                 traceWorkerFailure(plan, operationId, 'worker.finalize', error);
                 // Release may have exposed these nodes to another owner. Keep
-                // admission and the recoverable committing state; a later
-                // claim must reacquire every lock before attempting rollback.
+                // admission and committing state fail-closed. A later claim
+                // cannot infer quiescence merely by reacquiring node locks.
                 return { claimed: true, operationId, status: 'committing', stopped: true,
                     errorCode: 'TOPOLOGY_OPERATION_FINALIZATION_FAILED' };
             }
