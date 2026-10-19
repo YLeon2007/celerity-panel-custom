@@ -6,7 +6,7 @@ const { L2tpSimpleService } = require('../services/l2tpSimpleService');
 
 function fixture({ reservation, beforeCas, groups = [], relayStates = [], links = [], noConnection = false, createRace = false } = {}) {
     const session = {};
-    const topology = { revision: 7, ...(reservation ? { replacementReservation: reservation } : {}) };
+    const topology = { revision: 7, topologyAdmissionCount: 0, ...(reservation ? { replacementReservation: reservation } : {}) };
     const stored = structuredClone(groups);
     let staged = structuredClone(groups);
     const calls = { writes: 0, cas: 0, remote: 0, sessions: 0 };
@@ -59,7 +59,7 @@ function fixture({ reservation, beforeCas, groups = [], relayStates = [], links 
             findOneAndUpdate: (filter, update, options) => {
                 assert.equal(options.session, session);
                 assert.equal(options.runValidators, true);
-                assert.deepEqual(filter, { _id: 'singleton', revision: 7, replacementReservation: { $exists: false } });
+                assert.deepEqual(filter, { _id: 'singleton', revision: 7, topologyAdmissionCount: 0, replacementReservation: { $exists: false } });
                 calls.cas++;
                 beforeCas?.(topology);
                 if (topology.revision !== filter.revision || topology.replacementReservation) return query(() => null);
@@ -79,7 +79,7 @@ function fixture({ reservation, beforeCas, groups = [], relayStates = [], links 
         nodeSSHFactory: () => ({}),
         allowRemoteExecution: true,
     });
-    return { service, stored, topology, calls };
+    return { service, stored, topology, calls, session };
 }
 const chain = [{ _id: 'link-1', portalNode: 'relay-1', bridgeNode: 'bridge-1' }];
 
@@ -184,6 +184,15 @@ test('no-op path performs zero group writes and zero revision CAS', async () => 
     await f.service.ensureRelayGroupPath('relay-1', 'g');
     assert.equal(f.calls.writes, 0);
     assert.equal(f.calls.cas, 0);
+});
+
+test('intent ingress preparation joins the callers active transaction instead of opening a nested commit', async () => {
+    const f = fixture(); f.session.inTransaction = () => true;
+    f.service.CascadeTopologyState.db.transaction = async () => { throw Error('nested transaction would commit ingress outside the intent binding'); };
+    const value = await f.service.withPathWriter(async ({ session, revision }) => {
+        assert.strictEqual(session, f.session); return revision;
+    }, 7, f.session);
+    assert.equal(value, 7);
 });
 
 test('missing transactional connection fails closed before group mutation', async () => {

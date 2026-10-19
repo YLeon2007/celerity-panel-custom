@@ -96,6 +96,7 @@ function createL2tpPanelHost({
         L2tpOperation: models.L2tpOperation,
     });
     let topologyDeploymentService;
+    let topologyIntentService;
     let topologyRecoveryLifecycle;
 
     // The L2TP install worker may advance the topology revision (route-group
@@ -215,6 +216,15 @@ function createL2tpPanelHost({
                 now: () => clock.now(),
             });
         }
+        if (testWorkerExecutionAllowed && typeof injectedModuleEntry.createTopologyIntentService === 'function') {
+            topologyIntentService = injectedModuleEntry.createTopologyIntentService({
+                ...models,
+                HyNode: injectedHyNode,
+                CascadeLink: injectedCascadeLink,
+                clock,
+                prepareIngress: input => executionRuntime.runtime.simpleService.prepareConfiguredRelayIngress(input),
+            });
+        }
         const recoveryFactory = createTopologyRecoveryLifecycle
             ?? require('./relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle')
                 .createTopologyOperationRecoveryLifecycle;
@@ -222,6 +232,7 @@ function createL2tpPanelHost({
             env,
             operationModel: models.TopologyOperation,
             worker: topologyDeploymentService.operationWorker,
+            ...(topologyIntentService ? { intentConsumer: topologyIntentService } : {}),
             ...(clientProofWorker ? { clientProofWorker } : {}),
             clock,
             intervalMs: workerLifecycle?.intervalMs,
@@ -236,6 +247,7 @@ function createL2tpPanelHost({
     return {
         moduleEntry: injectedModuleEntry,
         topologyRuntime,
+        topologyIntentService,
         repository,
         loadPanelOverview,
         stateManagementService: executionRuntime.runtime.stateManagementService,

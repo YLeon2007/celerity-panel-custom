@@ -62,6 +62,7 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
         operationModel,
         worker,
         clientProofWorker,
+        intentConsumer,
         clock = DEFAULT_CLOCK,
         intervalMs = DEFAULT_INTERVAL_MS,
         scanLimit = DEFAULT_SCAN_LIMIT,
@@ -76,6 +77,9 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
     }
     if (clientProofWorker !== undefined && typeof clientProofWorker?.runOnce !== 'function') {
         throw new TypeError('Topology recovery lifecycle clientProofWorker requires runOnce');
+    }
+    if (intentConsumer !== undefined && typeof intentConsumer?.runOnce !== 'function') {
+        throw new TypeError('Topology recovery intentConsumer requires runOnce');
     }
     if (!clock || typeof clock.now !== 'function') {
         throw new TypeError('Topology recovery lifecycle requires clock.now');
@@ -142,6 +146,10 @@ function createTopologyOperationRecoveryLifecycle(options = {}) {
     }
 
     async function recoverTick() {
+        if (intentConsumer !== undefined) {
+            try { await intentConsumer.runOnce(); }
+            catch { logFailure('TOPOLOGY_INTENT_RECOVERY_RUN_FAILED'); }
+        }
         try {
             await scan();
         } catch {

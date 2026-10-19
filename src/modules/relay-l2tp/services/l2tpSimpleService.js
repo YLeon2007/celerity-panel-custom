@@ -444,7 +444,7 @@ class L2tpSimpleService {
         }];
     }
 
-    async withPathWriter(work, expectedTopologyRevision = null) {
+    async withPathWriter(work, expectedTopologyRevision = null, externalSession) {
         const models = [this.HyNode, this.CascadeLink, this.CascadeRouteGroup,
             this.RelayL2tpState, this.CascadeTopologyState];
         const connection = this.CascadeTopologyState?.db;
@@ -452,10 +452,18 @@ class L2tpSimpleService {
             || models.some(model => model?.db !== connection)) {
             throw new TypeError('L2TP simple path writer requires models on one transactional Mongo connection');
         }
+        if (externalSession !== undefined && externalSession?.inTransaction?.() !== true) {
+            throw new TypeError('Intent ingress requires an active transaction');
+        }
+        const runTransaction = externalSession === undefined
+            ? work => connection.transaction(work) : work => work(externalSession);
         try {
-            return await connection.transaction(async session => {
+            return await runTransaction(async session => {
                 const topology = await this.CascadeTopologyState.findById('singleton')
-                    .select('revision replacementReservation').session(session).lean();
+                    .select('revision replacementReservation topologyAdmissionCount').session(session).lean();
+                if (topology?.topologyAdmissionCount > 0) {
+                    throw simpleError('TOPOLOGY_DEPLOY_BUSY', 'An active operation owns the exact topology revision');
+                }
                 if (topology?.replacementReservation) {
                     throw simpleError('TOPOLOGY_REPLACEMENT_RESERVED', 'A topology replacement owns the path writer fence');
                 }
@@ -467,7 +475,7 @@ class L2tpSimpleService {
                     const update = { $inc: { revision: 1 } };
                     if (!topology) update.$setOnInsert = { deployedRevision: 0 };
                     const result = await this.CascadeTopologyState.findOneAndUpdate(
-                        { _id: 'singleton', revision: expectedRevision,
+                        { _id: 'singleton', revision: expectedRevision, topologyAdmissionCount: 0,
                             replacementReservation: { $exists: false } },
                         update,
                         { session, new: true, runValidators: true, upsert: !topology },
@@ -504,7 +512,7 @@ class L2tpSimpleService {
     // Prepare only an already configured, uninstalled relay for this exact
     // link.apply scope. The group and revision commit together before the
     // coordinator freezes the Xray candidate (which needs the SOCKS ingress).
-    async prepareConfiguredRelayIngress({ linkId, linkIds = [linkId], expectedTopologyRevision } = {}) {
+    async prepareConfiguredRelayIngress({ linkId, linkIds = [linkId], expectedTopologyRevision, session: externalSession } = {}) {
         if (!mongoose.Types.ObjectId.isValid(linkId)
             || !Number.isSafeInteger(expectedTopologyRevision)) {
             throw simpleError('INVALID_TOPOLOGY_REVISION', 'An exact link and topology revision are required');
@@ -594,7 +602,7 @@ class L2tpSimpleService {
                 routeGroupId,
                 deferred: !changed && !routeGroupId,
             };
-        }, expectedTopologyRevision);
+        }, expectedTopologyRevision, externalSession);
     }
 
     async ensureRouteGroup(nodeId) {

@@ -184,41 +184,7 @@ function createAutoDeployHarness({
     return { calls, router };
 }
 
-test('autoDeploy provisions uninstalled L2TP ingress before freezing the final link operation', async () => {
-    const order = [];
-    const harness = createAutoDeployHarness({
-        maintenanceRevision: null,
-        prepareL2tpIngressFn: async ({ link }) => {
-            assert.equal(link.autoDeploy, true);
-            order.push('prepare');
-            return { revision: 9 };
-        },
-        coordinator: { async queue(input) {
-            order.push('queue');
-            assert.equal(input.expectedTopologyRevision, 9);
-            return { operationId: 'op-1', status: 'queued', topologyRevision: 9 };
-        } },
-    });
-    const response = await request(harness.router, { method: 'POST', body: createBody() });
-    assert.equal(response.status, 201);
-    assert.deepEqual(order, ['prepare', 'queue']);
-});
 
-test('POST keeps the created draft blocked if L2TP ingress cannot be prepared', async () => {
-    const error = new Error('internal ingress detail');
-    error.code = 'PREPARED_INGRESS_REQUIRED';
-    const { calls, router } = createAutoDeployHarness({
-        maintenanceRevision: null,
-        prepareL2tpIngressFn: async () => { throw error; },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-    assert.equal(response.status, 201);
-    assert.equal(calls.queue.length, 0);
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
-    assert.equal(response.body.topologyRevision, 8);
-    assert.doesNotMatch(JSON.stringify(response.body), /internal ingress detail/);
-});
 
 test('baseline selection walks only confirmed deployed active links of the component', () => {
     const baseline = selectLinkApplyBaselineLinkIds({
@@ -255,64 +221,8 @@ test('baseline selection starts from both endpoints of the new link', () => {
     assert.deepEqual(baseline, [LINK_DEPLOYED_PORTAL_TO_RELAY]);
 });
 
-test('POST with autoDeploy queues a scoped link.apply with the post-maintenance revision', async () => {
-    const { calls, router } = createAutoDeployHarness();
-    const response = await request(router, { method: 'POST', body: createBody() });
 
-    assert.equal(response.status, 201);
-    assert.equal(calls.queue.length, 1, 'autoDeploy opt-in must enqueue exactly one scoped operation');
-    const queued = calls.queue[0];
-    assert.equal(queued.expectedTopologyRevision, 9,
-        'the queue must pin the revision after L2TP path maintenance, not the pre-maintenance one');
-    assert.equal(queued.scope.kind, 'link.apply');
-    assert.equal(queued.scope.linkId, response.body.createdLinkId);
-    assert.deepEqual([...queued.scope.linkIds].sort(), [
-        response.body.createdLinkId,
-        LINK_DEPLOYED_PORTAL_TO_RELAY,
-        LINK_ONLINE_RELAY_TO_RELAY,
-    ].sort(), 'scope = requested link + confirmed deployed component baseline only');
-    assert.ok(!queued.scope.linkIds.includes(LINK_PENDING_SHARED_RELAY),
-        'the old pending shared-relay link must never be queued');
-});
 
-test('POST with autoDeploy returns autoDeployOperation and never claims ready on queue', async () => {
-    const { router } = createAutoDeployHarness();
-    const response = await request(router, { method: 'POST', body: createBody() });
-
-    assert.equal(response.status, 201);
-    // The versioned snapshot shape the UI mutator relies on is preserved.
-    assert.equal(response.body.topologyRevision, 9);
-    assert.equal(response.body.deployedRevision, 5);
-    assert.ok(Array.isArray(response.body.links));
-    assert.ok(response.body.createdLinkId);
-    assert.deepEqual(response.body.autoDeployOperation, {
-        operationId: 'op-auto-1',
-        topologyRevision: 9,
-        status: 'queued',
-    });
-    assert.notEqual(response.body.autoDeployOperation.status, 'ready',
-        'a queued operation is not a ready chain');
-    assert.equal(response.body.autoDeployStatus, undefined,
-        'a successful queue must not be reported as blocked');
-});
-
-test('POST with the old pending shared relay never enqueues it even when it shares the new link endpoint', async () => {
-    const { calls, router } = createAutoDeployHarness({
-        links: [{
-            _id: LINK_PENDING_SHARED_RELAY,
-            portalNode: nodeRef(PORTAL_B),
-            bridgeNode: nodeRef(RELAY_B),
-            active: true,
-            status: 'pending',
-        }],
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-
-    assert.equal(response.status, 201);
-    assert.equal(calls.queue.length, 1);
-    assert.deepEqual(calls.queue[0].scope.linkIds, [response.body.createdLinkId],
-        'with no confirmed deployed baseline the scope is exactly the requested link');
-});
 
 test('POST without the autoDeploy opt-in never queues a scoped operation', async () => {
     const { calls, router } = createAutoDeployHarness();
@@ -356,124 +266,12 @@ test('baseline selection treats a persisted staged link as physically applied, n
     assert.deepEqual(baseline, [LINK_STAGED_FIRST_HOP]);
 });
 
-test('POST auto-deploy of the completing hop queues the staged first hop as baseline', async () => {
-    const { calls, router } = createAutoDeployHarness({
-        links: [{
-            _id: LINK_STAGED_FIRST_HOP,
-            portalNode: nodeRef(PORTAL_A),
-            bridgeNode: nodeRef(RELAY_B),
-            active: true,
-            status: 'staged',
-        }],
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
 
-    assert.equal(response.status, 201);
-    assert.equal(calls.queue.length, 1);
-    assert.deepEqual([...calls.queue[0].scope.linkIds].sort(), [
-        response.body.createdLinkId,
-        LINK_STAGED_FIRST_HOP,
-    ].sort(), 'a staged first hop is applied baseline; the new hop completes the chain');
-    assert.equal(response.body.autoDeployOperation.status, 'queued');
-});
 
-test('POST surfaces a queue failure as blocked with a safe code, keeping the created snapshot', async () => {
-    const queueError = new Error('A scoped baseline link is not confirmed deployed');
-    queueError.code = 'INVALID_TOPOLOGY_DEPLOYMENT';
-    const { calls, router } = createAutoDeployHarness({
-        coordinator: {
-            async queue(input) {
-                calls.queue.push(input);
-                throw queueError;
-            },
-        },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
 
-    assert.equal(response.status, 201,
-        'the link was already created; the auto-deploy failure must not masquerade as a create failure');
-    assert.equal(response.body.autoDeployOperation, undefined,
-        'no operation id may be reported when the queue did not succeed');
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'INVALID_TOPOLOGY_DEPLOYMENT');
-    assert.equal(response.body.topologyRevision, 9);
-    assert.ok(response.body.createdLinkId);
-});
 
-test('POST exposes retryable busy after persisting draft but never reports a queued operation', async () => {
-    const queueError = new Error('password=internal');
-    queueError.code = 'TOPOLOGY_DEPLOY_BUSY';
-    const { router } = createAutoDeployHarness({
-        coordinator: { async queue() { throw queueError; } },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-    assert.equal(response.status, 201);
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployOperation, undefined);
-    assert.deepEqual(response.body.autoDeployError, {
-        code: 'TOPOLOGY_DEPLOY_BUSY',
-        message: 'Another topology deployment owns the slot; retry after it finishes',
-        retryable: true,
-    });
-    assert.ok(response.body.createdLinkId);
-    assert.doesNotMatch(JSON.stringify(response.body), /password=internal/);
-});
 
-test('POST queue failure never reflects free-form backend credentials', async () => {
-    const queueError = new Error('password=short-secret must not leave server');
-    queueError.code = 'INVALID_TOPOLOGY_DEPLOYMENT';
-    const { router } = createAutoDeployHarness({
-        coordinator: { async queue() { throw queueError; } },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-    assert.equal(response.status, 201);
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'INVALID_TOPOLOGY_DEPLOYMENT');
-    assert.doesNotMatch(JSON.stringify(response.body), /short-secret/);
-});
 
-test('POST reports blocked when the scoped coordinator is unavailable', async () => {
-    const { router } = createAutoDeployHarness({
-        coordinator: {
-            // Mirrors unavailableTopologyDeploymentService: no queue capability.
-            async deploy() {
-                const error = new Error('Topology deployment capabilities are unavailable');
-                error.code = 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE';
-                throw error;
-            },
-        },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-
-    assert.equal(response.status, 201);
-    assert.equal(response.body.autoDeployOperation, undefined);
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
-});
-
-test('POST does not claim a queued operation when coordinator reports a terminal failure', async () => {
-    const { router } = createAutoDeployHarness({
-        coordinator: { async queue() { return { operationId: 'op-failed', topologyRevision: 9, status: 'failed' }; } },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-    assert.equal(response.status, 201);
-    assert.equal(response.body.autoDeployOperation, undefined);
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
-});
-
-test('POST reports blocked when the coordinator resolves to a malformed queue result', async () => {
-    const { router } = createAutoDeployHarness({
-        coordinator: { async queue() { return { status: 'queued' }; } },
-    });
-    const response = await request(router, { method: 'POST', body: createBody() });
-
-    assert.equal(response.status, 201);
-    assert.equal(response.body.autoDeployOperation, undefined,
-        'a queue result without an operation id is not a success');
-    assert.equal(response.body.autoDeployStatus, 'blocked');
-    assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
-});
 
 function editedLink(overrides = {}) {
     return {

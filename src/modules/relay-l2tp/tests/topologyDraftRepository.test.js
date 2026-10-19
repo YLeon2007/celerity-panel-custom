@@ -448,7 +448,7 @@ test('persists the draft and advances the singleton revision once in one transac
     }]);
     assert.deepEqual(trace.filter(entry => entry.label === 'topology.cas'), [{
         label: 'topology.cas',
-        filter: { _id: 'singleton', revision: 7, replacementReservation: { $exists: false } },
+        filter: { _id: 'singleton', revision: 7, topologyAdmissionCount: 0, replacementReservation: { $exists: false } },
         update: { $inc: { revision: 1 } },
         options: {
             new: true,
@@ -507,7 +507,7 @@ test('legacy singleton without reservation retains revision-zero upsert', async 
     }), { revision: 1, deployedRevision: 0 });
     const cas = trace.find(entry => entry.label === 'topology.cas');
     assert.deepEqual(cas.filter, {
-        _id: 'singleton', revision: 0, replacementReservation: { $exists: false },
+        _id: 'singleton', revision: 0, topologyAdmissionCount: 0, replacementReservation: { $exists: false },
     });
     assert.deepEqual(cas.update, { $inc: { revision: 1 }, $setOnInsert: { deployedRevision: 0 } });
     assert.equal(cas.options.upsert, true);

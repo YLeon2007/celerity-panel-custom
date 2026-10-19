@@ -187,12 +187,13 @@ class L2tpStateRepository {
     // topology revision — otherwise the change is invisible to the deploy
     // pipeline and relays keep stale (or missing) ingress listeners.
     async advanceTopologyRevision() {
-        const topologyState = await this.CascadeTopologyState.findByIdAndUpdate(
-            'singleton',
+        const topologyState = await this.CascadeTopologyState.findOneAndUpdate(
+            { _id: 'singleton', topologyAdmissionCount: 0, replacementReservation: { $exists: false } },
             { $inc: { revision: 1 } },
-            { new: true, upsert: true, setDefaultsOnInsert: true },
+            { new: true, upsert: false },
         ).select('revision').lean();
-        return topologyState?.revision ?? 0;
+        if (!topologyState) throw Object.assign(new Error('The topology revision is fenced by active work or requires audited initialization'), { code: 'TOPOLOGY_DEPLOY_BUSY' });
+        return topologyState.revision;
     }
 
     async getRelayGroupPlan(nodeId, routeGroupId) {

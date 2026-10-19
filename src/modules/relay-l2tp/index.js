@@ -17,6 +17,8 @@ function registerModels({ modelRegistry } = {}) {
         RemoteAdmission: require('./models/remoteAdmissionModel'),
         L2tpOperation: require('./models/l2tpOperationModel'),
         TopologyOperation: require('./models/topologyOperationModel'),
+        TopologyCreateIntent: require('./models/topologyCreateIntentModel'),
+        TopologyIntentQueueState: require('./models/topologyIntentQueueStateModel'),
         NodeOperationLock: require('./models/nodeOperationLockModel'),
         RelayL2tpMigrationState: require('./models/relayL2tpMigrationStateModel'),
         RelayL2tpTopologyTransferDraft: require('./models/relayL2tpTopologyTransferDraftModel'),
@@ -141,4 +143,5 @@ module.exports = {
     registerRoutes,
     createTopologyTransferDraftService,
     createTopologyDeploymentService,
+    createTopologyIntentService: dependencies => require('./services/topologyIntentService').createTopologyIntentService(dependencies),
 };

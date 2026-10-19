@@ -26,7 +26,7 @@ const NODE_SELECT = '_id cascadeRole';
 const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey appliedTopologyRevision secretRevision';
-const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation';
+const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation topologyAdmissionCount';
 
 class TopologyDraftRepositoryError extends Error {
     constructor(code, message, details = {}) {
@@ -139,6 +139,7 @@ class TopologyDraftRepository {
         return {
             revision: state?.revision ?? 0,
             deployedRevision: state?.deployedRevision ?? 0,
+            ...(state?.topologyAdmissionCount !== undefined ? { topologyAdmissionCount: state.topologyAdmissionCount } : {}),
             ...(state?.replacementReservation ? { replacementReservation: state.replacementReservation } : {}),
             nodes: nodes || [],
             links: links || [],
@@ -265,6 +266,9 @@ class TopologyDraftRepository {
                         'A topology replacement owns the draft mutation fence',
                     );
                 }
+                if (snapshot.topologyAdmissionCount > 0) {
+                    throw new TopologyDraftRepositoryError('TOPOLOGY_DEPLOY_BUSY', 'An active operation owns the exact topology revision');
+                }
                 const prepared = await prepare(snapshot);
                 await this.persistMutation(prepared?.mutation, session);
                 const update = { $inc: { revision: 1 } };
@@ -275,6 +279,7 @@ class TopologyDraftRepository {
                     {
                         _id: 'singleton',
                         revision: expectedRevision,
+                        topologyAdmissionCount: 0,
                         replacementReservation: { $exists: false },
                     },
                     update,

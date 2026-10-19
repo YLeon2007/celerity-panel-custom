@@ -39,6 +39,14 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CASCADE_LINK_IN_USE', 409],
     ['TOPOLOGY_REPLACEMENT_RESERVED', 409],
     ['INVALID_TOPOLOGY_DRAFT', 422],
+    ['TOPOLOGY_DEPLOY_BUSY', 409],
+    ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_BACKLOG_FULL', 429],
+    ['TOPOLOGY_INTENT_KEY_CONFLICT', 409],
+    ['TOPOLOGY_INTENT_NOT_FOUND', 404],
+    ['TOPOLOGY_INTENT_STATE_MISSING', 503],
+    ['INVALID_IDEMPOTENCY_KEY', 400],
+    ['TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE', 413],
 ]);
 
 class RequestValidationError extends Error {
@@ -329,6 +337,7 @@ function createCascadeLinksRouter({
     RelayState = RelayL2tpState,
     ClientProofOperation = TopologyOperation,
     topologyDraftWriteService,
+    topologyIntentService,
     createDraftWriteService = createTopologyDraftWriteService,
     maintainAutoL2tpPathsFn = maintainAutoL2tpPaths,
     prepareL2tpIngressFn = async input => {
@@ -365,6 +374,14 @@ function createCascadeLinksRouter({
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
     const router = express.Router();
+    const getIntentService = () => {
+        const service = topologyIntentService === undefined
+            ? l2tpActiveHostProvider.getActiveHost()?.topologyIntentService : topologyIntentService;
+        if (typeof service?.accept !== 'function' && typeof service?.get !== 'function') {
+            throw Object.assign(new Error('The supervised auto-deploy intent runtime is unavailable'), { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
+        }
+        return service;
+    };
     let writeService = topologyDraftWriteService;
     const getWriteService = () => {
         if (!writeService) {
@@ -497,6 +514,15 @@ function createCascadeLinksRouter({
         }
     });
 
+    router.get('/auto-deploy-jobs/:jobId', requireScope('nodes:read'), async (req, res) => {
+        try {
+            if (!mongoose.Types.ObjectId.isValid(req.params.jobId)) throw new RequestValidationError('Invalid job ID');
+            const job = await getIntentService().get(req.params.jobId);
+            if (!job) throw Object.assign(new Error('The auto-deploy job was not found'), { code: 'TOPOLOGY_INTENT_NOT_FOUND' });
+            return res.json({ autoDeployJob: job });
+        } catch (error) { return sendError(res, error, 'Get job'); }
+    });
+
     router.get('/:id', requireScope('nodes:read'), async (req, res) => {
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -609,7 +635,7 @@ function createCascadeLinksRouter({
             }
             const portCheckField = linkMode === 'forward' ? 'bridgeNode' : 'portalNode';
             const portCheckId = linkMode === 'forward' ? bridgeNodeId : portalNodeId;
-            const existingLink = await Link.findOne({
+            const existingLink = normalizeAutoDeploy(autoDeploy) ? null : await Link.findOne({
                 [portCheckField]: portCheckId,
                 tunnelPort: port,
                 active: true,
@@ -667,79 +693,30 @@ function createCascadeLinksRouter({
                         : [],
                 };
             }
+            if (link.autoDeploy === true) {
+                const { digest } = require('../modules/relay-l2tp/services/topologyIntentService');
+                const { expectedTopologyRevision: ignoredRevision, ...requestPayload } = req.body;
+                const job = await getIntentService().accept({
+                    expectedTopologyRevision, link,
+                    requestKey: req.get('Idempotency-Key'),
+                    payloadHash: digest(requestPayload),
+                });
+                return res.status(202).json({
+                    autoDeployJob: job,
+                    acceptedTopologyRevision: job.acceptanceRevision,
+                });
+            }
             const revisions = await getWriteService().createLink({
                 expectedTopologyRevision,
                 link,
             });
             await invalidateCaches();
-            let maintenance = null;
-            let maintenanceError = null;
-            try {
-                maintenance = await maintainL2tpPaths({ required: link.autoDeploy === true });
-            } catch (error) {
-                maintenanceError = error;
-            }
-            if (link.autoDeploy === true && maintenanceError) {
-                logTopologyTestFailure({ action: 'link.create', phase: 'auto-path.maintain',
-                    revision: revisions.revision, linkId: String(link._id), error: maintenanceError });
-                logger.warn(`[Cascade Links API] L2TP auto path maintenance blocked autoDeploy: ${maintenanceError.code || 'UNKNOWN'}`);
-            }
-            let finalRevisions = Number.isSafeInteger(maintenance?.revision)
-                ? { ...revisions, revision: maintenance.revision }
-                : revisions;
-            logger.info(
-                `[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`,
-            );
-            let snapshot = await readLinkSnapshot({
-                Link,
-                TopologyState,
-                revisions: finalRevisions,
-            });
-            let preparationError = maintenanceError;
-            if (link.autoDeploy === true && !preparationError) {
-                const linkId = String(link._id);
-                const baselineLinkIds = selectLinkApplyBaselineLinkIds({
-                    links: snapshot.links, linkId, portalNodeId, bridgeNodeId,
-                });
-                try {
-                    const prepared = await prepareL2tpIngressFn({
-                        link, linkId, linkIds: [linkId, ...baselineLinkIds],
-                        expectedTopologyRevision: finalRevisions.revision,
-                    });
-                    if (!Number.isSafeInteger(prepared?.revision)
-                        || prepared.revision < finalRevisions.revision) {
-                        const error = new Error('L2TP ingress preparation returned no exact revision');
-                        error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
-                        throw error;
-                    }
-                    finalRevisions = { ...finalRevisions, revision: prepared.revision };
-                    snapshot = { ...snapshot, topologyRevision: prepared.revision };
-                } catch (error) {
-                    preparationError = error;
-                    logTopologyTestFailure({ action: 'link.create', phase: 'ingress.prepare',
-                        revision: finalRevisions.revision, linkId, error });
-                    logger.warn(`[Cascade Links API] L2TP ingress preparation blocked: ${error.code || 'UNKNOWN'}`);
-                }
-            }
-            const body = { ...snapshot, createdLinkId: String(link._id) };
-            if (link.autoDeploy === true) {
-                if (preparationError) {
-                    Object.assign(body, {
-                        autoDeployStatus: 'blocked',
-                        autoDeployError: autoDeployBlockedError(preparationError),
-                    });
-                } else {
-                    Object.assign(body, await queueAutoDeploy({
-                        link,
-                        action: 'link.create',
-                        portalNodeId,
-                        bridgeNodeId,
-                        revision: finalRevisions.revision,
-                        links: snapshot.links,
-                    }));
-                }
-            }
-            return res.status(201).json(body);
+            const maintenance = await maintainL2tpPaths();
+            const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+                ? { ...revisions, revision: maintenance.revision } : revisions;
+            const snapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
+            logger.info(`[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
+            return res.status(201).json({ ...snapshot, createdLinkId: String(link._id) });
         } catch (error) {
             return sendError(res, error, 'Create', {
                 revision: req.body?.expectedTopologyRevision });

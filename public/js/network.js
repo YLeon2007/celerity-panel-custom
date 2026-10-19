@@ -199,6 +199,8 @@
     let cy = null;
     let linkModalMode = 'create';
     let linkModalSavedFingerprint = null;
+    let pendingCreateRequest = null;
+    const intentPolls = new Map();
     let topologyRevision = null;
     let deployedRevision = null;
     let _allLinks = [];
@@ -224,6 +226,10 @@
             return null;
         }
         if (!response.ok) throw new Error(errorMessage);
+        if (response.status === 202 && /^[a-f0-9]{24}$/i.test(payload?.autoDeployJob?.jobId || '')) {
+            // Acceptance is not a draft snapshot and must not advance the visible revision.
+            return payload;
+        }
         return applyLinkSnapshot(payload);
     }
 
@@ -1205,8 +1211,48 @@
         if (domGroup) domGroup.style.display = '';
     }
 
+    function startIntentPolling(job) {
+        const jobId = job?.jobId;
+        if (!/^[a-f0-9]{24}$/i.test(jobId || '') || intentPolls.has(jobId) || intentPolls.size >= 128) return;
+        const state = { failures: 0 };
+        const step = async () => {
+            try {
+                const response = await fetch('/api/cascade/links/auto-deploy-jobs/' + encodeURIComponent(jobId));
+                if (!response.ok) throw new Error('Job status unavailable');
+                const current = (await response.json()).autoDeployJob;
+                if (current?.jobId !== jobId) throw new Error('Job identity mismatch');
+                state.failures = 0;
+                if (['failed', 'blocked'].includes(current.status)) {
+                    intentPolls.delete(jobId);
+                    showToast('Автодеплой ' + jobId + ': ' + (current.status === 'blocked' ? 'заблокирован; требуется проверка' : 'завершился ошибкой'), 'error');
+                    await loadTopology(); return;
+                }
+                if (current.operationId && ['admitted', 'succeeded'].includes(current.status)) {
+                    intentPolls.delete(jobId);
+                    startBoundOperationPolling(current.operationId, 'link.apply');
+                    await loadTopology(); return;
+                }
+            } catch (_) {
+                if (++state.failures >= 6) {
+                    intentPolls.delete(jobId);
+                    showToast('Статус задания ' + jobId + ' недоступен. Принятый запрос остаётся на сервере.', 'error');
+                    return;
+                }
+            }
+            state.timer = setTimeout(step, 1500);
+        };
+        intentPolls.set(jobId, state);
+        state.timer = setTimeout(step, 1500);
+    }
+
     function handleLinkAutoDeploy(snapshot, optedIn) {
         if (!optedIn) return;
+        const job = snapshot?.autoDeployJob;
+        if (job?.jobId) {
+            showToast('Запрос автодеплоя принят: ' + job.jobId + '. Связь ещё может ожидать создания.');
+            startIntentPolling(job);
+            return;
+        }
         const operation = snapshot?.autoDeployOperation;
         if (operation?.status === 'queued' && operation.operationId) {
             startOperationPolling(operation);
@@ -1284,13 +1330,20 @@
         btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>';
 
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (!linkId && data.autoDeploy === true && window.crypto?.randomUUID) {
+                const signature = JSON.stringify({ ...data, expectedTopologyRevision: undefined });
+                if (pendingCreateRequest?.signature !== signature) pendingCreateRequest = { signature, key: window.crypto.randomUUID() };
+                headers['Idempotency-Key'] = pendingCreateRequest.key;
+            }
             const res = await fetch(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
                 method: linkId ? 'PUT' : 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify(data),
             });
             const savedSnapshot = await handleDraftMutationResponse(res);
             if (!savedSnapshot) return;
+            pendingCreateRequest = null;
             closeModal();
             await loadTopology();
             handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
@@ -1365,10 +1418,14 @@
     }
 
     function startOperationPolling(result) {
-        stopOperationPolling();
         if (!result || result.status !== 'queued') return;
-        if (!/^[a-f0-9]{24}$/i.test(result.operationId || '')) return;
-        scheduleOperationPollStep({ operationId: result.operationId, kind: result.kind || null }, 0, operationPollGeneration);
+        startBoundOperationPolling(result.operationId, result.kind);
+    }
+
+    function startBoundOperationPolling(operationId, kind) {
+        if (!/^[a-f0-9]{24}$/i.test(operationId || '')) return;
+        stopOperationPolling();
+        scheduleOperationPollStep({ operationId, kind: kind || null }, 0, operationPollGeneration);
     }
 
     function scheduleOperationPollStep(state, attempt, generation) {

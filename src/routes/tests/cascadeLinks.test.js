@@ -85,7 +85,7 @@ function validCreateBody(overrides = {}) {
         tunnelProtocol: 'vless',
         tunnelSecurity: 'none',
         tunnelTransport: 'tcp',
-        autoDeploy: true,
+        autoDeploy: false,
         ...overrides,
     };
 }
@@ -340,9 +340,8 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
             muxEnabled: false,
             muxConcurrency: 8,
             priority: 100,
-            // Explicit per-link autoDeploy opt-in is part of the link record:
-            // the server never derives it from incidental events.
-            autoDeploy: true,
+            // Non-autoDeploy creation retains the synchronous draft contract.
+            autoDeploy: false,
         },
     );
     assert.match(calls.createLink.link.tunnelUuid, /^[0-9a-f-]{36}$/i);
@@ -355,7 +354,7 @@ test('POST creates a versioned draft link and returns the revised snapshot witho
         'the create response must identify the new link so the UI can auto-deploy exactly it');
     assert.equal(response.body.links.length, 1);
     assert.equal(response.body.links[0]._id, String(calls.createLink.link._id));
-    assert.equal(response.body.links[0].autoDeploy, true);
+    assert.equal(response.body.links[0].autoDeploy, false);
 });
 
 test('POST returns the post-maintenance revision used by the next auto-deploy event', async () => {

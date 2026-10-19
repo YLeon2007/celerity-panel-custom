@@ -9,7 +9,7 @@ const LINK_ID = '507f1f77bcf86cd799439011';
 const OP_ID = '507f1f77bcf86cd799439022';
 const snapshot = (extra = {}) => ({ topologyRevision: 7, deployedRevision: 6, links: [], ...extra });
 
-function browserHarness({ persistedAutoDeploy = true, operation = null,
+function browserHarness({ persistedAutoDeploy = true, operation = null, job = null,
     links = [], deployResponse = null, confirmResult = true, autoDeployError = null } = {}) {
     const requests = [];
     const toasts = [];
@@ -66,7 +66,7 @@ function browserHarness({ persistedAutoDeploy = true, operation = null,
     form.realityFingerprint.appendChild = () => {};
     const json = body => ({ ok: true, status: 200, async json() { return body; } });
     const fetch = async (url, options) => {
-        requests.push({ url, method: options?.method || 'GET', body: options?.body && JSON.parse(options.body) });
+        requests.push({ url, method: options?.method || 'GET', headers: options?.headers, body: options?.body && JSON.parse(options.body) });
         if (url === '/api/nodes') return json([{ _id: 'portal', name: 'Portal', ip: '1.2.3.4' }]);
         if (url === '/api/cascade/links' && !options) return json(snapshot({ links }));
         if (url === '/api/cascade/links/' + LINK_ID && !options) return json({
@@ -81,13 +81,15 @@ function browserHarness({ persistedAutoDeploy = true, operation = null,
         if (url === '/api/cascade/topology/operations/' + OP_ID) return json({
             operationId: OP_ID, status: 'succeeded', kind: 'link.apply', topologyRevision: 7,
         });
+        if (job && url === '/api/cascade/links/auto-deploy-jobs/' + job.jobId) return json({ autoDeployJob: { ...job, status: 'admitted', operationId: OP_ID, topologyRevision: 8 } });
+        if (job && options?.method === 'POST' && url === '/api/cascade/links') return { ok: true, status: 202, async json() { return { autoDeployJob: job, acceptedTopologyRevision: 7 }; } };
         if (options?.method === 'PUT' || options?.method === 'POST') return json(snapshot({
             ...(operation ? { autoDeployOperation: operation } : {}),
             ...(autoDeployError ? { autoDeployError, autoDeployStatus: 'blocked' } : {}),
         }));
         throw Error('Unexpected request: ' + url);
     };
-    const window = { _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
+    const window = { crypto: { randomUUID: require('node:crypto').randomUUID }, _networkI18n: { save: 'Save', saveAndDeploy: 'Save & Deploy',
         deployAfterEdit: 'Deploy this link after saving', autoDeploy: 'Auto Deploy', createLink: 'Create',
         syncChain: 'Sync Chain', syncingChain: 'Syncing entire chain...',
         confirmDeployChain: 'Deploy entire chain? This will sync all connected nodes in the correct order.' },
@@ -115,6 +117,20 @@ async function save(harness) {
     await harness.ui.onAddLinkSubmit({ target: harness.form, preventDefault() {} });
     return harness.requests.find(r => r.method === 'PUT' || r.method === 'POST');
 }
+
+test('accepted create intent polls its job without claiming a created link, saved draft or readiness', async () => {
+    const job = { jobId: '507f1f77bcf86cd799439099', status: 'waiting', acceptanceRevision: 7 };
+    const h = browserHarness({ job });
+    await h.ui.openAddLinkModal();
+    const request = await save(h);
+    assert.match(request.headers['Idempotency-Key'], /^[a-f0-9-]{36}$/);
+    assert.equal(h.timers.length, 1, JSON.stringify(h.toasts));
+    assert(h.toasts.some(([message]) => /принят|accepted/i.test(message) && message.includes(job.jobId)));
+    assert(!h.toasts.some(([message]) => /saved|сохранен|ready|готова/i.test(message)));
+    await h.timers[0].fn();
+    assert(h.requests.some(row => row.url.endsWith('/auto-deploy-jobs/' + job.jobId)));
+    assert(!h.requests.some(row => row.url === '/api/cascade/topology/deploy'));
+});
 
 test('ordinary edit of a persisted autoDeploy link has no activation intent', async () => {
     const h = browserHarness({ persistedAutoDeploy: true });
