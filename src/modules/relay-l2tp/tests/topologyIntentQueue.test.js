@@ -359,9 +359,10 @@ async function finish(operation) {
     const now = new Date(); const leaseUntil = new Date(now.getTime() + 60000);
     await models.TopologyOperation.updateOne({ _id: operation._id }, { $set: { status: 'committing', leaseOwner: 'local-finalizer', leaseUntil } });
     const finalizer = new TopologyOperationFinalizationRepository(models);
+    // Publication reads kind/link/staged identity from the frozen operation;
+    // the public boundary accepts only the exact claim/revision request fields.
     assert.ok(await finalizer.finalizeSucceeded({ operationId: String(operation._id), owner: 'local-finalizer', leaseUntil, now,
         topologyRevision: operation.topologyRevision, priorDeployedRevision: operation.priorDeployedRevision,
-        kind: operation.kind, linkId: operation.linkId, linkIds: operation.linkIds, staged: operation.staged,
     }), 'the unchanged exact finalizer must accept the frozen operation');
 }
 test('legacy autoDeploy pending drafts are neither inferred as intents nor included in a scoped baseline', local, async () => {
