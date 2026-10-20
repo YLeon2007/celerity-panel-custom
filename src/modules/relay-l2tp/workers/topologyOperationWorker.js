@@ -226,6 +226,8 @@ class TopologyOperationWorker {
     #allowUnprovenTestExecution;
     #executionFences = new WeakMap();
     #retainExecutionOwnership;
+    #bindingProvisioner;
+    #bindingLifecycle;
 
     constructor({
         executionContext,
@@ -243,6 +245,8 @@ class TopologyOperationWorker {
         pppResumeReadinessGate,
         pppDriftSync,
         attachIngressGate,
+        bindingProvisioner,
+        bindingLifecycle,
         allowUnprovenTestExecution = false,
     } = {}) {
         const selectedContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -284,6 +288,12 @@ class TopologyOperationWorker {
                     || renewalIntervalMs >= leaseMs))) {
             throw new TypeError('Topology operation worker requires lease identity and clock');
         }
+        if ((bindingProvisioner === undefined) !== (bindingLifecycle === undefined)
+            || (bindingProvisioner && (selectedContext.target !== 'test'
+                || typeof bindingProvisioner.reserveBinding !== 'function'
+                || typeof bindingLifecycle.run !== 'function'))) throw new TypeError('Exact TEST binding lifecycle required');
+        this.#bindingProvisioner = bindingProvisioner;
+        this.#bindingLifecycle = bindingLifecycle;
         this.operationRepository = operationRepository;
         this.executor = executor;
         this.#retainExecutionOwnership = executor.executionProtocolVersion === 2;
@@ -1072,11 +1082,13 @@ class TopologyOperationWorker {
             const proofs = [];
             for (const context of contexts) proofs.push(await heartbeat.run(() => this.executor.close(context)));
             request = { ...request, leaseUntil: await heartbeat.renew() };
+            await this.#bindingLifecycle?.assertHeld();
             if (!await this.finalizer.persistV2TerminalProofs({ ...request, proofs, sideEffects })) throw new Error('Proof persistence unconfirmed');
             // Join all renewal before the single transaction deletes exact locks.
             // There is no release call or remote rollback, including on failure.
             const leaseUntil = await heartbeat.renew();
             await heartbeat.stop();
+            await this.#bindingLifecycle?.assertHeld();
             if (!await this.finalizer.finalizeV2Succeeded({ ...request, leaseUntil })) throw new Error('Settlement unconfirmed');
             acquiredNodeIds.length = 0;
             return { claimed: true, operationId, status: 'succeeded' };
@@ -1088,6 +1100,15 @@ class TopologyOperationWorker {
     }
 
     async run(operationIdentity) {
+        if (!this.#bindingLifecycle) return this.#runHeld(operationIdentity);
+        try { return await this.#bindingLifecycle.run(() => this.#runHeld(operationIdentity)); }
+        catch {
+            return { operationId: entityId(operationIdentity), stopped: true, drainUncertain: true,
+                errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+        }
+    }
+
+    async #runHeld(operationIdentity) {
         const operationId = entityId(operationIdentity);
         if (!SAFE_ID_PATTERN.test(operationId)) {
             throw new TypeError('Topology operation worker requires an operation id');
@@ -1214,6 +1235,33 @@ class TopologyOperationWorker {
             this.#executionFences.set(plan, new Map(acquiredNodeIds.map(({ node, generation }) => [
                 node, Object.freeze({ owner: this.workerId, attempt: operation.attempts, generation }),
             ])));
+
+            if (this.#bindingProvisioner) {
+                // Recovery is diagnostic only: never provision fresh IDs after any
+                // prior prepared/committed state, attempt reclaim or uncertain write.
+                if (operation.attempts !== 1 || entries.some(entry => entry.state !== 'pending')) {
+                    return { claimed: true, operationId, stopped: true, drainUncertain: true,
+                        errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+                }
+                try {
+                    const { createHash } = require('node:crypto');
+                    for (const node of nodes) {
+                        const context = this.context(plan, node);
+                        const candidateHash = `sha256:${node.candidateHash}`;
+                        const backupId = `topology-${createHash('sha256').update([operationId, node.node,
+                            candidateHash, node.targetProfile].join('\0')).digest('hex')}`;
+                        await heartbeat.run(() => this.#bindingProvisioner.reserveBinding(Object.freeze({
+                            executionContext: this.executionContext.hostIdentity, operationId, nodeId: node.node,
+                            candidateHash, backupId, targetProfile: node.targetProfile,
+                            topologyRevision: plan.topologyRevision, priorDeployedRevision: plan.priorDeployedRevision,
+                            ...context.executionFence,
+                        })));
+                    }
+                } catch {
+                    return { claimed: true, operationId, status: 'preparing', stopped: true, drainUncertain: true,
+                        errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+                }
+            }
 
             if (entries.some(entry => ['prepared', 'committed', 'failed'].includes(entry.state))) {
                 const cleaned = await this.cleanupExpiredPreparation(

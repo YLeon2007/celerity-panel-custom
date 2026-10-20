@@ -116,6 +116,7 @@ function createTopologyOperationExecutor({
     NodeSSH,
     hostIdentity,
     target,
+    executionBindingReader,
 } = {}) {
     if (!topologyExecutionContext(target, hostIdentity)) {
         return undefined;
@@ -129,16 +130,15 @@ function createTopologyOperationExecutor({
         target,
         hostIdentity,
     });
-    // No durable V2 execution binding reader is installed by this runtime.
-    // Until paired binding persistence/current-lock readback and recovery exist,
-    // the real executor refuses before node lookup/bootstrap on both hosts.
-    // Do not turn request fields or a generated predecessor into authority here.
+    // Only the TEST runtime may install its real connected store. Absent authority
+    // and every PROD composition retain the executor's pre-SSH refusal.
     return new TopologyOperationExecutor({
         target,
         hostIdentity,
         nodeExecutionResolver,
         NodeTransportFactory: TopologyNodeTransportFactory,
         RunnerBootstrapper: TopologyRunnerBootstrapper,
+        ...(target === 'test' ? optional(executionBindingReader, 'executionBindingReader') : {}),
     });
 }
 
@@ -231,9 +231,23 @@ function createTopologyOperationRuntime(dependencies = {}) {
             repository: finalizationRepository,
             clock,
         });
+        let bindingStore, bindingLifecycle;
+        if (executionContext.target === 'test' && dependencies.topologyExecutionAuthority !== undefined) {
+            const { TopologyExecutionAuthorityLifecycle } = require('./topologyExecutionAuthorityLifecycle');
+            const { TopologyExecutionBindingStore } = require('../repositories/topologyExecutionBindingStore');
+            bindingLifecycle = new TopologyExecutionAuthorityLifecycle({ executionContext,
+                controller: dependencies.topologyExecutionAuthority });
+            bindingStore = new TopologyExecutionBindingStore({ executionContext,
+                withVerifiedAuthority: (challenge, work) => bindingLifecycle.withVerifiedAuthority(challenge, work),
+                assertAuthorityHeld: () => bindingLifecycle.assertHeld(),
+                Operation: TopologyOperation, Lock: dependencies.NodeOperationLock,
+                Owner: dependencies.TopologyConfigOwner, Enrollment: dependencies.TopologyExecutionEnrollment,
+                Binding: dependencies.TopologyExecutionBinding, HyNode });
+        }
         const executor = executorFactory(Object.freeze({
             HyNode,
             ...executionContext,
+            ...optional(bindingStore, 'executionBindingReader'),
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
@@ -286,6 +300,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(pppResumeReadinessGate, 'pppResumeReadinessGate'),
             attachIngressGate,
             allowUnprovenTestExecution: testHostAllowed,
+            ...optional(bindingStore, 'bindingProvisioner'),
+            ...optional(bindingLifecycle, 'bindingLifecycle'),
         });
         return new Coordinator({
             executionContext,

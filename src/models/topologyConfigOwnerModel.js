@@ -1,10 +1,11 @@
 'use strict';
 const mongoose = require('mongoose');
+const { topologyExecutionContext } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
 const strict = { _id: false, versionKey: false, strict: 'throw' };
 const digest = { type: String, required: true, match: /^[a-f0-9]{64}$/ };
 const contextSchema = new mongoose.Schema({
-    target: { type: String, required: true, enum: ['production'] },
-    hostIdentity: { type: String, required: true, enum: ['lm1.infograd.online'] },
+    target: { type: String, required: true, enum: ['production', 'test'] },
+    hostIdentity: { type: String, required: true, enum: ['lm1.infograd.online', 'test.infograd.online'] },
 }, strict);
 const identitySchema = new mongoose.Schema({
     machineId: { type: String, required: true, match: /^[a-f0-9]{32}$/ },
@@ -22,7 +23,8 @@ const receiptSchema = new mongoose.Schema({
     oldProcessStartTime: { type: String, required: true }, verifiedAt: { type: Date, required: true },
 }, strict);
 const schema = new mongoose.Schema({
-    executionContext: { type: contextSchema, required: true, immutable: true },
+    executionContext: { type: contextSchema, required: true, immutable: true,
+        validate: value => Boolean(topologyExecutionContext(value?.target, value?.hostIdentity)) },
     node: { type: mongoose.Schema.Types.ObjectId, required: true, immutable: true },
     profile: { type: String, required: true, immutable: true, enum: ['xray-main', 'xray-bridge'] },
     nodeIdentity: { type: identitySchema, required: true, immutable: true },

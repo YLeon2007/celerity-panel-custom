@@ -15,13 +15,14 @@ const TEST_ENV = Object.freeze({
     TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity,
 });
 
-function compose(env, mutateSource = () => {}) {
+function compose(env, mutateSource = () => {}, topologyExecutionAuthority) {
     const captured = {};
     const worker = { async run() { assert.fail('composition must not execute a worker'); } };
     const intentService = { async runOnce() { assert.fail('composition must not consume'); } };
     const models = {};
     const host = createL2tpPanelHost({
         env,
+        topologyExecutionAuthority,
         moduleEntry: {
             registerModels: () => models,
             createTopologyDeploymentService(options) {
@@ -52,6 +53,13 @@ function compose(env, mutateSource = () => {}) {
     });
     return { host, captured, worker, intentService };
 }
+
+test('actual panel host forwards only explicit TEST server authority, never PROD authority', () => {
+    const authority = Object.freeze({ withHeldAuthority() { assert.fail('composition only'); } });
+    const { captured } = compose({ ...TEST_ENV }, () => {}, authority);
+    assert.ok(captured.deployment.topologyExecutionAuthority === authority, 'actual host drops the held authority capability');
+    assert.equal(compose({ ...PROD_ENV }, () => {}, authority).captured.deployment.topologyExecutionAuthority, undefined);
+});
 
 test('production opt-in composes durable intent admission and recovery with the exact server identity', async () => {
     const { host, captured, worker, intentService } = compose({ ...PROD_ENV });

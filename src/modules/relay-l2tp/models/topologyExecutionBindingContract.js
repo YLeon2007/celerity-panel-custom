@@ -1,6 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
-const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD } = require('../domain/topologyExecutionContext');
+const { TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const ID = /^[a-f0-9]{24}$/;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -54,7 +54,7 @@ const endpointSchema = new mongoose.Schema({ ip: string(),
 const identitySchema = new mongoose.Schema({ machineId: string(/^[a-f0-9]{32}$/),
     sshHostKeySha256: string(/^[a-f0-9]{64}$/) }, strict);
 const common = () => ({
-    _id: string(UUID), executionContext: { ...string(), enum: [PROD.hostIdentity] },
+    _id: string(UUID), executionContext: { ...string(), enum: TOPOLOGY_EXECUTION_CONTEXTS.map(context => context.hostIdentity) },
     nodeId: string(ID), targetProfile: { ...string(), enum: ['xray-main', 'xray-bridge'] },
     endpoint: { type: endpointSchema, required: true, immutable: true },
     nodeIdentity: { type: identitySchema, required: true, immutable: true },

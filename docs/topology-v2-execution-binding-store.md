@@ -1,21 +1,67 @@
-# Durable V2 execution binding — dormant, one-shot storage/reader contract
+# Durable V2 execution binding — server-only storage/reader contract
 
 ## Scope and non-activation
 
 `TopologyExecutionBindingStore` implements the executor's server-only
 `readVerified(expected)` and `readVerifiedConnection(expected, verifiedBinding)`
-capabilities. It is **not imported or constructed** by runtime/host composition,
-routes, MCP or workers. No production flag, pre-claim bypass, migration, remote
-write, deployment, worker/runner/SSH/pool change or ownership release is included.
-Default executors still refuse without a reader. The PROD worker pre-claim gate
-and all retained-lock/admission/handback gates remain closed: **PROD is NO-GO**.
+capabilities. The TEST panel host/runtime now constructs the **real store** only
+when trusted server composition explicitly supplies `topologyExecutionAuthority`.
+No route, MCP argument, environment boolean, node field or caller-selected runner
+ID supplies that capability. Without it the default executor still refuses before
+SSH/bootstrap. PROD never receives this capability and its pre-claim gate remains
+closed: **PROD is NO-GO**. No deployment, startup flag or index migration is included.
 
-The constructor requires the exact canonical production context, a trusted
+The constructor requires an exact canonical TEST or production context, a trusted
 `withVerifiedAuthority` function, and **six actual models** (`Operation`, `Lock`,
 `Owner`, `Enrollment`, `Binding`, `HyNode`) on one connected discovered MongoDB
 replica set with a primary. `directConnection` is rejected because the driver
 can rewrite primary reads to primaryPreferred. There are no default models,
 connections, identities, credentials, authority adapters or endpoint fallbacks.
+TEST and PROD owner contexts must be exact paired identities; immutable enrollment
+and binding schemas accept only their two canonical host identities. All store
+owner/operation/enrollment/binding predicates retain the constructor-selected pair.
+
+## TEST host lifecycle wiring (external controller prerequisite)
+
+The server-only dependency has this contract:
+
+- `topologyExecutionAuthority.withHeldAuthority(canonicalTestContext, awaitedWork)`
+  acquires and sustains exclusion across the whole worker invocation, including
+  preparation, bootstrap, command dispatch, user/PPP verification, close/status,
+  settlement and awaited cleanup. It must refuse challenges for physical nodes it
+  has not independently fenced; the context is not an inventory/adoption permit.
+- Its callback supplies `assertHeld()` (throw on revoked/uncertain ownership) and
+  `withVerifiedAuthority(challenge, awaitedCallback)` using the existing proof
+  contract below. Neither method is implemented by this repository's holder.
+- `TopologyExecutionAuthorityLifecycle` privately holds that scoped capability,
+  joins callback work, latches revocation, and rejects late/escaped async contexts.
+  The store invokes its revocation check on nested held connection/ownership
+  rechecks too; settlement checks the hold before proof persistence and finalization.
+  This is lifecycle plumbing, **not an operational physical exclusion controller**.
+
+Pre-enrollment remains a separate explicit server maintenance call to `preEnroll`
+with independently fixed physical/endpoint/boot/owner evidence. The worker never
+adopts current node documents or enrolls a runner. Only after the actual operation
+claim and exact uncertain node-lock acquisitions does it await `reserveBinding`.
+An existing exact row is verified, never overwritten. Initial bindings use
+`createBinding`; successors use `createSuccessor` selected from exact persisted
+owner settlement metadata and independently attested current runner head/terminal
+receipt. No predecessor, attempt or command ID is manufactured by the worker.
+Provisioning failure retains counted admission and exact locks with zero dispatch.
+A reclaimed attempt or prior prepared state cannot mint replacement bindings.
+Persisted terminal recovery remains the existing read-only exact-close-ID probe;
+it does not provision, bootstrap, claim, renew, write CAS nonces or settle.
+
+`topologyTestHostBinding.test.js` exercises the actual panel host, runtime/default
+executor factory, public TEST schemas/enrollment, connected real store, real locks,
+PPP gate, user-resync service, finalizer and fake-root runner over two serial
+operations. Only the physical controller, local SSH/bootstrap acknowledgements and
+empty user RPC are explicitly simulated. It also proves hold-loss/endpoint-change/
+missing-authority/missing-enrollment refusal before SSH, retained ownership, and
+read-only interrupted-settlement recovery. This is assembled local wiring evidence,
+**not operational authorization or live host quiescence**. The new source invalidates
+any image built from its parent: a later activation requires a separate rebuild and
+operational controller acceptance, neither performed here.
 
 ## Immutable enrollment and binding
 
@@ -35,7 +81,8 @@ Linux-style account name, machine ID 32 lowercase hex characters, and host-key
 digest 64 lowercase hex characters. Digests identify the **raw SSH public-key
 wire blob**, not PEM or base64 text. No coercion or normalization occurs; missing,
 extra, array-valued, changed and malformed authority is refused. Predecessor and
-boot must be explicit UUIDs; neither an empty runner nor `none` is adopted.
+boot must be explicit; an empty runner requires the independently attested V2
+empty-head provisioning receipt, not a current-state scan or implicit `none`.
 
 These caller-supplied values are a **proposal**, not trusted evidence. The store
 requires an independently supplied external server attestation matching them
@@ -56,14 +103,16 @@ listener isolation. A different profile or username cannot acquire an alias slot
 This is intentionally conservative: shared/cloned machine IDs, reused host keys
 or multi-profile physical enrollment must be resolved by separately reviewed
 provisioning, not an exception or index removal. Unique binding indexes enforce
-operation/node/profile, enrollment and attempt uniqueness and cross-record /
+operation/node/profile, enrollment/predecessor and enrollment/generation plus
+attempt uniqueness and cross-record /
 cross-command token exclusion.
 
 The API is one-shot and insert-only. Model updates, replacements, query/document
 deletion, existing-document saves and bulk writes refuse. Raw administrative
 collection access is outside its trust boundary, not cryptographically protected
-storage. There is no adopt, reclaim, successor, lock-release, admission-decrement
-or handback API, and failed/unknown work retains records and ownership.
+storage. Exact terminal successors have an insert-only API; there is no adopt,
+reclaim, lock-release, admission-decrement or handback API on this store, and
+failed/unknown work retains records and ownership.
 
 ## Explicit external authority — required, not implemented
 
@@ -157,7 +206,8 @@ terminal authority** for connection rechecks rather than reacquiring a potential
 non-reentrant adapter. Each recheck still performs exact transactional/majority
 ownership and endpoint verification. Escaped async contexts cannot use this
 capability once the original scope closes. Terminal proof remains data only;
-worker release and classic handback remain unauthorized.
+only the separately fenced private joined V2 settlement path may release exact
+operation locks/admission. Permanent topology ownership is not classic handback.
 
 ## Local verification and remaining blockers
 
@@ -178,7 +228,7 @@ and real fake-root terminal runner status. This is local orchestration evidence,
 not live physical attestation, multi-member quorum/failover proof or production
 connectivity. Missing local Mongo opt-in is an error; no tests are skipped.
 
-Final direct run: **290 passed**. Broader assembled/claim/worker/runtime/lock /
+Historical storage-slice direct run: **290 passed**. Broader assembled/claim/worker/runtime/lock /
 recovery/runner/panel-host/real-loopback-host-key regression run: **682 passed**,
 including the direct suite. Both runs reported zero failed, skipped or cancelled
 tests and used no force-exit option. Syntax checks and `git diff --check` pass.
@@ -198,8 +248,10 @@ Before installation/activation, separately deliver and independently verify:
 2. Recoverable provisioning: index conflict resolution, real owner adoption and
    restoration evidence, explicit predecessor/boot readback, and reviewed initial
    enrollment. No migration or existing-row blessing is delivered here.
-3. Execution-spanning authority wiring, supervised lifecycle, successor/restart
-   recovery and independent review before any runtime reader or worker opt-in.
-4. Durable terminal-result reconciliation, safe user/PPP/ingress integration,
-   atomic physical handback and exact lock/admission release. Existing PROD
-   pre-claim and V2 retention gates must stay closed until these are proven.
+3. Connect and operationally verify the external controller through the TEST-only
+   lifecycle contract above; rebuild the changed image and separately authorize
+   activation. The local assembled test is not an operational controller.
+4. Reconcile unknown/retained terminal outcomes explicitly and separately design
+   physical classic handback. The existing private joined V2 success settlement
+   and read-only recovery are not authorization to bypass PROD pre-claim refusal,
+   retry uncertain writes, adopt old history or release retained fences.

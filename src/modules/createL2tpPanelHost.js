@@ -42,6 +42,8 @@ function createL2tpPanelHost({
     secretBox,
     secretKey,
     NodeSSH,
+    // Server-owned external controller capability; never sourced from env or requests.
+    topologyExecutionAuthority,
     NodeTransport,
     workerLifecycle,
     topologyRecoveryScanLimit,
@@ -204,6 +206,8 @@ function createL2tpPanelHost({
             TopologyExecutionBinding: models.TopologyExecutionBinding,
             TopologyExecutionEnrollment: models.TopologyExecutionEnrollment,
             TopologyConfigOwner: models.TopologyConfigOwner,
+            ...(testWorkerExecutionAllowed && topologyExecutionAuthority !== undefined
+                ? { topologyExecutionAuthority } : {}),
             NodeSSH,
             clock,
             workerId: `${workerId}-topology`,

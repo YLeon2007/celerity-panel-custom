@@ -7,14 +7,15 @@ const modulePath = path.join(__dirname, '../repositories/topologyExecutionBindin
 const contract = fs.existsSync(modulePath) ? require(modulePath) : {};
 const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD } = require('../domain/topologyExecutionContext');
 
-test('dormant binding store requires exact trusted PROD context and scoped external authority', () => {
+test('binding store requires exact canonical server context and scoped external authority', () => {
     assert.equal(typeof contract.TopologyExecutionBindingStore, 'function', 'durable binding store is missing');
     for (const executionContext of [undefined, { ...PROD, forged: true },
         { target: 'production', hostIdentity: 'test.infograd.online' },
-        { target: 'test', hostIdentity: 'test.infograd.online' }]) {
+        { target: 'test', hostIdentity: 'lm1.infograd.online' }]) {
         assert.throws(() => new contract.TopologyExecutionBindingStore({ executionContext }), /server-owned production context/);
     }
     assert.throws(() => new contract.TopologyExecutionBindingStore({ executionContext: PROD }), /external authority/);
+    assert.throws(() => new contract.TopologyExecutionBindingStore({ executionContext: { target: 'test', hostIdentity: 'test.infograd.online' } }), /external authority/);
 });
 
 const fsp = require('node:fs/promises');
@@ -1050,8 +1051,9 @@ test('assembled TEST worker uses real Mongo finalizer and real runner while PROD
         const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
         const state = await setup();
         await state.store.preEnroll(state.enrollment); await state.store.createBinding(state.expected);
-        // TEST-only local inventory. Production binding/enrollment constructors do
-        // not permit TEST; this raw fixture is never an operational enrollment API.
+        // Legacy synthetic settlement-only inventory, not a host-wiring proof.
+        // Public TEST enrollment + real-store host assembly is exercised separately
+        // by topologyTestHostBinding.test.js; this fixture tests settlement races.
         await models.Operation.collection.updateOne({}, { $set: { executionContext: TEST, status: 'queued', attempts: 0,
             idempotencyKey: `topology:test:revision-17:host-${TEST.hostIdentity}:${randomUUID()}`, leaseOwner: '', leaseUntil: null } });
         await models.Binding.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
