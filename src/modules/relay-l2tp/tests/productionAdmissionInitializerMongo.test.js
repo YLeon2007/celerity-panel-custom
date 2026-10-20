@@ -539,15 +539,97 @@ test('failed index getMore refuses incomplete inventory without retry, before wr
             : event?.commandName === 'listIndexes' && event.command.listIndexes === 'cascadelinks',
         async () => { await failCommand('getMore', { errorCode: 50, errorLabels: [] }); armedAt = commands.length; });
         try {
-            await assert.rejects(assemble(pins, race.authority).initialize(), { code: postcommit
-                ? 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' : 'PRODUCTION_INITIALIZATION_REFUSED' });
+            await assert.rejects(assemble(pins, race.authority).initialize(),
+                { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
         } finally { await disableFailure(); }
         assert.equal(race.fired(), true);
         assert.equal(commands.slice(armedAt).filter(event => event.commandName === 'getMore').length, 1);
         assert.equal(await db.collection('cascadetopologystates').countDocuments(), postcommit ? 1 : 0);
-        assert.equal(race.authority.state.retained, postcommit);
+        // An incomplete prewrite inventory also cannot exclude an ongoing build.
+        assert.equal(race.authority.state.retained, true);
         if (!postcommit) assert.deepEqual(writes(commands.slice(armedAt)), []);
     });
+});
+
+test('raw index getMore has a client deadline without invalid server maxTimeMS', async () => {
+    const pins = await reset();
+    const race = afterCommand(event => event?.commandName === 'listIndexes' && event.command.listIndexes === 'cascadelinks',
+        () => failCommand('getMore', { blockConnection: true, blockTimeMS: 5000 }));
+    const start = commands.length;
+    let requestAt, failedAt;
+    const onStart = event => { if (event.commandName === 'getMore') requestAt = performance.now(); };
+    const onFailure = event => { if (event.commandName === 'getMore') failedAt = performance.now(); };
+    client.on('commandStarted', onStart);
+    client.on('commandFailed', onFailure);
+    try {
+        await assert.rejects(assemble(pins, race.authority).initialize(),
+            { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+    } finally {
+        await disableFailure();
+        client.removeListener('commandStarted', onStart);
+        client.removeListener('commandFailed', onFailure);
+    }
+    // Measure the transport deadline, not the separate cursor-cleanup/admin
+    // teardown budgets (the server's blocked thread can outlive client abort).
+    assert.ok(Number.isFinite(failedAt) && failedAt - requestAt < 3000,
+        'getMore abort deadline, not the five-second server stall');
+    assert.equal(race.fired(), true);
+    const pages = commands.slice(start).filter(event => event.commandName === 'getMore');
+    assert.equal(pages.length, 1, 'cancelled inventory is not retried');
+    assert.equal(pages[0].command.maxTimeMS, undefined, 'non-awaitData getMore forbids server maxTimeMS');
+    assert.equal(race.authority.state.retained, true);
+    assert.equal(race.authority.state.released, false);
+    assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+});
+
+test('surplus completed indexes cannot release maintenance before a later unfinished build is inspected', async () => {
+    const pins = await reset();
+    await db.collection('nodeoperationlocks').dropIndex('node_1');
+    for (let i = 0; i < 2; i++) await db.collection('nodeoperationlocks').createIndex({ [`foreign${i}`]: 1 });
+    const seed = { _id: new mongo.ObjectId(), node: new mongo.ObjectId() };
+    await db.collection('nodeoperationlocks').insertOne(seed);
+    const admin = client.db('admin');
+    const configured = await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn' });
+    let pending;
+    try {
+        pending = db.collection('nodeoperationlocks').createIndex({ node: 1 }, { unique: true })
+            .then(value => ({ value }), error => ({ error }));
+        await admin.command({ waitForFailPoint: 'hangAfterStartingIndexBuild', timesEntered: configured.count + 1, maxTimeMS: 5000 });
+        await db.collection('nodeoperationlocks').deleteOne({ _id: seed._id });
+        const before = await db.command({ listIndexes: 'nodeoperationlocks', includeBuildUUIDs: true });
+        assert.ok(before.cursor.firstBatch.some(row => row.buildUUID));
+        const authority = simulatedAuthority();
+        await assert.rejects(assemble(pins, authority).initialize(), { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+        assert.equal(authority.state.retained, true);
+        assert.equal(authority.state.released, false);
+        assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+        const after = await db.command({ listIndexes: 'nodeoperationlocks', includeBuildUUIDs: true });
+        assert.deepEqual(after.cursor.firstBatch, before.cursor.firstBatch);
+    } finally {
+        await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off' });
+        if (pending) assert.equal((await pending).error, undefined);
+    }
+});
+
+test('failed index cursor cleanup is observed and retains maintenance, never swallowed by native close', async () => {
+    const pins = await reset();
+    for (let i = 0; i < 5; i++) await db.collection('nodeoperationlocks').createIndex({ [`foreign${i}`]: 1 });
+    const failures = [];
+    const listener = event => failures.push(event);
+    client.on('commandFailed', listener);
+    const race = afterCommand(event => event?.commandName === 'listIndexes' && event.command.listIndexes === 'nodeoperationlocks',
+        () => failCommand('killCursors', { errorCode: 50, errorLabels: [] }));
+    const start = commands.length;
+    try {
+        await assert.rejects(assemble(pins, race.authority).initialize(), { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+    } finally { await disableFailure(); client.removeListener('commandFailed', listener); }
+    assert.equal(race.fired(), true);
+    const kills = commands.slice(start).filter(event => event.commandName === 'killCursors' && event.command.killCursors === 'nodeoperationlocks');
+    assert.equal(kills.length, 1, 'one checked cleanup attempt, no hidden retry');
+    assert.ok(failures.some(event => event.requestId === kills[0].requestId));
+    assert.equal(race.authority.state.retained, true);
+    assert.equal(race.authority.state.released, false);
+    assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
 });
 
 test('additive indexes match actual source schemas, with no sync/drop or conflict repair', async t => {
@@ -581,7 +663,13 @@ test('additive indexes match actual source schemas, with no sync/drop or conflic
         const pins = await reset();
         await mutate();
         const start = commands.length;
-        await assert.rejects(assemble(pins).initialize(), /PRODUCTION_INITIALIZATION_(INDEX_CONFLICT|CATALOG_REFUSED)/);
+        const authority = simulatedAuthority();
+        await assert.rejects(assemble(pins, authority).initialize(), label === 'foreign index'
+            ? { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' }
+            : /PRODUCTION_INITIALIZATION_(INDEX_CONFLICT|CATALOG_REFUSED)/);
+        if (label === 'foreign index') {
+            assert.equal(authority.state.retained, true, 'bounded incomplete inventory cannot authorize release');
+        }
         assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
         assert.deepEqual(commands.slice(start).filter(event => ['createIndexes', 'dropIndexes', 'drop', 'insert', 'update', 'delete'].includes(event.commandName)), []);
     });

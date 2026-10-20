@@ -146,27 +146,80 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     if (!same(baseline, await catalog(missing))) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
                 }
                 async function readIndexes(entry) {
-                    // runCursorCommand sends this exact listIndexes command and bounded
-                    // native getMore calls (no retry/resume wrapper). Unlike db.command,
-                    // its GetMoreOperation suppresses invalid CSOT maxTimeMS on non-awaitData.
-                    const cursor = db.runCursorCommand({ listIndexes: entry.name,
-                        includeBuildUUIDs: true, cursor: { batchSize: 2 }, maxTimeMS: 2000 },
-                    { readPreference: 'primary', timeoutMS: 2000 }).setBatchSize(2);
-                    try {
-                        const indexes = [];
-                        while (await guarded(() => cursor.hasNext())) {
-                            const index = await guarded(() => cursor.next());
-                            // Ordinary listIndexes() hides this field. Never unwrap/use a
-                            // building spec or wait for a foreign build to become ready.
-                            if (Object.hasOwn(index, 'buildUUID')) {
-                                uncertain = true;
-                                fail('PRODUCTION_INITIALIZATION_INDEX_BUILD_PRESENT');
-                            }
-                            indexes.push(index);
-                            if (indexes.length > entry.indexes.length) fail('PRODUCTION_INITIALIZATION_INDEX_CONFLICT');
+                    // Native cursor.close() suppresses killCursors failures. Keep the
+                    // exact server cursor and check raw cleanup acknowledgement instead.
+                    const scanSession = db.client.startSession({ causalConsistency: false });
+                    const options = { ...BUDGET, session: scanSession, promoteLongs: false };
+                    let cursorId = mongo.Long.ZERO;
+                    const deadline = performance.now() + 2000;
+                    function remainingBudget() {
+                        const remaining = Math.floor(deadline - performance.now());
+                        if (remaining < 1) fail('PRODUCTION_INITIALIZATION_INDEX_INVENTORY_UNCONFIRMED');
+                        return remaining;
+                    }
+                    function readPage(reply, field) {
+                        if (reply?.ok !== 1 || reply.writeConcernError || reply.writeErrors?.length
+                            || reply.errorLabels?.length || !reply.cursor
+                            || reply.cursor.ns !== `${challenge.databaseName}.${entry.name}`
+                            || !(reply.cursor.id instanceof mongo.Long)
+                            || !Array.isArray(reply.cursor[field])) {
+                            fail('PRODUCTION_INITIALIZATION_INDEX_INVENTORY_UNCONFIRMED');
                         }
-                        return indexes;
-                    } finally { await guarded(() => cursor.close()); }
+                        cursorId = reply.cursor.id;
+                        return reply.cursor[field];
+                    }
+                    try {
+                        let page = readPage(await guarded(() => {
+                            const remaining = remainingBudget();
+                            return db.command({ listIndexes: entry.name, includeBuildUUIDs: true,
+                                cursor: { batchSize: 2 }, maxTimeMS: remaining }, { ...options, timeoutMS: remaining });
+                        }), 'firstBatch');
+                        const indexes = [];
+                        while (true) {
+                            for (const index of page) {
+                                if (!index || typeof index !== 'object' || Object.hasOwn(index, 'buildUUID')) {
+                                    fail('PRODUCTION_INITIALIZATION_INDEX_BUILD_PRESENT');
+                                }
+                                indexes.push(index);
+                                // A bounded, incomplete inventory cannot rule out a later
+                                // buildUUID. Catch below retains maintenance, not clean refusal.
+                                if (indexes.length > entry.indexes.length) fail('PRODUCTION_INITIALIZATION_INDEX_CONFLICT');
+                            }
+                            if (cursorId.isZero()) return indexes;
+                            page = readPage(await guarded(() => db.command({ getMore: cursorId,
+                                collection: entry.name, batchSize: 2 },
+                            // Ordinary getMore forbids maxTimeMS, which driver 6.20
+                            // adds for CSOT. Use its public AbortSignal deadline instead;
+                            // any cancellation leaves this inventory unknown/held.
+                            { ...options, timeoutMS: 0, signal: AbortSignal.timeout(remainingBudget()) })), 'nextBatch');
+                        }
+                    } catch (error) {
+                        // Includes early inventory limits, failed reads and scope loss.
+                        // No unexamined page or driver-suppressed cleanup authorizes release.
+                        uncertain = true;
+                        throw error;
+                    } finally {
+                        try {
+                            if (!cursorId.isZero()) {
+                                try {
+                                    const reply = await guarded(() => db.command({ killCursors: entry.name,
+                                        cursors: [cursorId] }, options));
+                                    const killed = reply?.cursorsKilled, absent = reply?.cursorsNotFound;
+                                    if (reply?.ok !== 1 || reply.writeConcernError || reply.writeErrors?.length
+                                        || reply.errorLabels?.length || !Array.isArray(killed) || !Array.isArray(absent)
+                                        || !Array.isArray(reply.cursorsAlive) || reply.cursorsAlive.length
+                                        || !Array.isArray(reply.cursorsUnknown) || reply.cursorsUnknown.length
+                                        || killed.length + absent.length !== 1
+                                        || ![...killed, ...absent].every(id => id instanceof mongo.Long && id.equals(cursorId))) {
+                                        fail('PRODUCTION_INITIALIZATION_INDEX_CLEANUP_UNCONFIRMED');
+                                    }
+                                } catch (error) { uncertain = true; throw error; }
+                            }
+                        } finally {
+                            try { await guarded(() => scanSession.endSession()); }
+                            catch (error) { uncertain = true; throw error; }
+                        }
+                    }
                 }
                 async function planIndexes(missing = []) {
                     const additions = [];
