@@ -177,6 +177,11 @@ def held():
 engine.assert_held=held
 engine.host=SimpleNamespace(physical=lambda:{k:plan[k] for k in ('machineId','bootId','sshHostKeySha256')},
                             operator_session=lambda:{'pid':78,'start':'999'})
+def guard_check(guard,session=None):
+    n.need(guard==bundle['guard'] and session=={'pid':78,'start':'999'}, 'FRESH_INDEPENDENT_SESSION_REQUIRED')
+    n.need(fs.read_json('/fixture-live.json')['held'], 'SIMULATED_GUARD_LOST')
+    return {'session':{'pid':77,'start':'998'}}
+engine.host.guard_check=guard_check
 system=t.SimulatedSystem(SimpleNamespace(unit=n.profile_paths(plan['targetProfile'])[1]))
 system.states=fs.read_json('/fixture-services.json')
 fixture.system=system

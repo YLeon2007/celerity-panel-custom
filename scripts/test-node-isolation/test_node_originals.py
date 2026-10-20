@@ -432,6 +432,10 @@ plan={k:accepted[k] for k in n.IDENTITY}
 engine=SimpleNamespace(plan=plan,plan_hash=accepted['planHash'])
 engine.assert_held=lambda: {'guard':bundle['guard'],'dispatchInFlight':None,'dispatchCount':1}
 engine.host=SimpleNamespace(physical=lambda:{k:plan[k] for k in ('machineId','bootId','sshHostKeySha256')},operator_session=lambda:{'pid':78,'start':'999'})
+def guard_check(guard,session=None):
+ if guard!=bundle['guard'] or session!={'pid':78,'start':'999'}: raise n.Refusal('FRESH_INDEPENDENT_SESSION_REQUIRED')
+ return {'session':{'pid':77,'start':'998'}}
+engine.host.guard_check=guard_check
 f=SimpleNamespace(unit=n.profile_paths(plan['targetProfile'])[1])
 system=t.SimulatedSystem(f)
 system.states[n.service_name(plan['targetProfile'])]=fs.read_json(n.RESTORE_ACCEPTED)['profiles'][plan['targetProfile']]['service']
@@ -483,6 +487,11 @@ class Fixture:
         self.engine.host = SimpleNamespace(physical=lambda: {k:self.plan[k] for k in
                                                           ('machineId','bootId','sshHostKeySha256')},
                                           operator_session=lambda: {'pid': 78, 'start': '999'})
+        def guard_check(guard, session=None):
+            if guard != self.guard or session != {'pid': 78, 'start': '999'}:
+                raise n.Refusal('FRESH_INDEPENDENT_SESSION_REQUIRED')
+            return {'session': {'pid': 77, 'start': '998'}}
+        self.engine.host.guard_check = guard_check
         self.module = SimpleNamespace(RESTORE_ADMISSION_VERSION=1)
         self.config, self.unit = n.profile_paths(self.profile)
         self.original = b'{"inbounds":[],"private-original":"secret"}\n'

@@ -1,5 +1,13 @@
 # Durable TEST node originals — конечный примитив, не handback
 
+## Integrated review corrections
+
+Every capture, restore preparation, restore effect and held-scope checkpoint now
+passes the current operator session to the actual recovery guard check and pins
+that operator identity for the scope. The recovery session is not an operator
+channel. Losing or changing the independent operator session cannot repair a
+failed held scope. This is source-tested, not live SSH proof.
+
 `node_originals.py` действительно сохраняет и восстанавливает байты файлов и
 metadata, затем перечитывает их и состояние сервиса. Он **не** снимает маски,
 не размораживает host, не возвращает старых writers, не меняет Mongo owner,

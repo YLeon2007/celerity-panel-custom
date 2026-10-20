@@ -876,6 +876,35 @@ class Engine:
             # Close ingress durably BEFORE completion inspection or releasing either
             # lock. Unknown completion still leaves dispatch permanently closed.
             atomic_json(self.directory, 'restore-admission.json', marker)
+        # Rename may have succeeded before parent fsync failed. A retry must
+        # prove the same file AND parent durable, not merely read visible bytes.
+        raw = secure_file(path)
+        need(len(raw) <= 4096, 'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            named = path.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                 and (info.st_dev, info.st_ino) == (named.st_dev, named.st_ino)
+                 and os.read(fd, 4097) == raw, 'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+            os.fsync(fd)
+            directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                parent = os.fstat(directory)
+                named_parent = self.directory.lstat()
+                need((parent.st_dev, parent.st_ino) == (named_parent.st_dev, named_parent.st_ino),
+                     'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+                os.fsync(directory)
+                named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                need((info.st_dev, info.st_ino) == (named.st_dev, named.st_ino)
+                     and secure_file(path) == raw
+                     and not os.path.lexists(self.directory / 'restore-admission.json.next'),
+                     'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+                check_closed_marker()
+            finally:
+                os.close(directory)
+        finally:
+            os.close(fd)
         with self.host.held_current_runner_head(self.plan) as head:
             self.assert_held()
             check_closed_marker()

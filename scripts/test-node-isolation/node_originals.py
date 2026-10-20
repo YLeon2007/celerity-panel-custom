@@ -295,9 +295,14 @@ class NodeOriginals:
         self.current_pins = None
         self.intent = None
         self.lock_paths = {}
+        self.operator = None
 
     def held(self, guard=None):
         state = self.engine.assert_held()  # actual installed engine, fresh recovery root-peer challenge
+        session = self.engine.host.operator_session()
+        self.engine.host.guard_check(state['guard'], session)
+        need(self.operator is None or session == self.operator, 'OPERATOR_SESSION_DRIFT_RETAINED')
+        self.operator = dict(session)
         need(state['dispatchInFlight'] is None, 'DISPATCH_IN_FLIGHT_RETAINED')
         need(guard is None or state['guard'] == guard, 'GUARD_IDENTITY_DRIFT_RETAINED')
         observed = self.engine.host.physical()
