@@ -1,0 +1,185 @@
+{
+  "artifactRetention": "scratch is TTL-pruned; retain these exact artifacts in the parent mission before live rollout",
+  "baseCommit": "cb23b105df74a3a7e987424bdf5867a062f90199",
+  "boundaries": {
+    "PRODAccess": false,
+    "allAcceptedWorkPhasesEmpiricallyTested": false,
+    "liveTESTMutations": false,
+    "localXrayAlias": "same physical TEST panel host; native Xray/PPP cgroups not frozen",
+    "nodeState": "unknown",
+    "postKillThawImplemented": false,
+    "trustedHostAdministrator": true
+  },
+  "dockerKill": {
+    "acceptedAPIs": {
+      "accepted_exec_gate_released": true,
+      "event": "apis-and-preaccepted-helper-suspended",
+      "old_and_new_containerd": true,
+      "old_and_new_docker": true
+    },
+    "artifact": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-freezer-delivery-kill/result.json",
+      "sha256": "a88c4daa616bd48acdc577e23044141a6798d182eb5c236363f1c43dd563927b"
+    },
+    "cleanup": {
+      "cgroup_remaining": false,
+      "event": "cleanup",
+      "success": true
+    },
+    "result": {
+      "accepted_exec_marker_exists": false,
+      "cgroup_events": {
+        "frozen": 1,
+        "populated": 0
+      },
+      "event": "old-empty-no-restart",
+      "observation_s": 1,
+      "result": {
+        "hostFence": "held",
+        "nodeState": "unknown",
+        "oldExecutor": "empty",
+        "owner": "11111111-2222-3333-4444-555555555555"
+      },
+      "survivor_heartbeat_growth": 923
+    }
+  },
+  "dockerRestore": {
+    "artifact": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-freezer-delivery-restore/result.json",
+      "sha256": "4c32184139a5aa3e1524aae9f622f3d2f9e3b0ad10aa6112a9391f94fd70825d"
+    },
+    "cleanup": {
+      "cgroup_remaining": false,
+      "event": "cleanup",
+      "success": true
+    },
+    "result": {
+      "daemon_api_resumed": true,
+      "event": "nondestructive-exact-restore",
+      "original_state_equal": true,
+      "proxy_functional": true,
+      "result": {
+        "hostFence": "released",
+        "nodeState": "unknown",
+        "owner": "11111111-2222-3333-4444-555555555555"
+      }
+    }
+  },
+  "offline": {
+    "artifact": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-host-freezer-final-offline.log",
+      "sha256": "f0eff2d08323134f5139a179f145d77a11930bcf924e55d468fe38ffacd29aab"
+    },
+    "result": "OK",
+    "tests": 38
+  },
+  "readOnlyTEST": {
+    "artifact": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-host-freezer-test-delivery-readonly-capture.json",
+      "sha256": "7d19816c4faf2210a5114a3d745c56d0ece77d369ac50db58142a67367dba133"
+    },
+    "containerCount": 5,
+    "host": {
+      "bootId": "c1d372c0-d03b-4840-ab17-683f67174d80",
+      "machineId": "7fa266f995fe4aa69e96cf7d01359e34"
+    },
+    "runtimeCount": 11,
+    "shimCgroups": [
+      "/system.slice/containerd.service"
+    ],
+    "shimCount": 5,
+    "shimPIDs": [
+      988,
+      992,
+      996,
+      1452127,
+      3396656
+    ],
+    "supervisors": {
+      "containerd.service": {
+        "ActiveState": "active",
+        "ControlGroup": "/system.slice/containerd.service",
+        "ExecCondition": "",
+        "KillMode": "process",
+        "Restart": "always",
+        "Slice": "system.slice"
+      },
+      "docker.service": {
+        "ActiveState": "active",
+        "ControlGroup": "/system.slice/docker.service",
+        "ExecCondition": "",
+        "KillMode": "process",
+        "Restart": "always",
+        "Slice": "system.slice"
+      }
+    }
+  },
+  "schema": 1,
+  "scope": "local real kernel/Docker26/systemd drills plus read-only TEST capture; not live TEST isolation",
+  "sourceFiles": [
+    {
+      "path": "/home/leon/c3-test-host-isolation-20261020/scripts/panel-host-freezer.py",
+      "sha256": "b488abc896aac129289b5eb6f38b61142e4aba89471f0b651527ca77fb94082d"
+    },
+    {
+      "path": "/home/leon/c3-test-host-isolation-20261020/scripts/tests/test_panel_host_freezer.py",
+      "sha256": "84162d607d0c9b37f74d9e8669cc361bc0e0eeeb230eaed62e53388a439e80f5"
+    },
+    {
+      "path": "/home/leon/c3-test-host-isolation-20261020/scripts/tests/panel_host_freezer_drill.py",
+      "sha256": "16cf382df17b898a791af6ae7625219061f9126b2bb78eb8ee7b344d2a6eadbb"
+    },
+    {
+      "path": "/home/leon/c3-test-host-isolation-20261020/scripts/tests/panel_host_freezer_systemd_drill.py",
+      "sha256": "6b843e29360fe677c4163dabeb6ed2fbd15645b06c5f29d01f967e859fd69ff9"
+    }
+  ],
+  "systemd": {
+    "artifact": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-freezer-delivery-systemd/result.json",
+      "sha256": "5e078cb172c863f49a251ae93529fb276853d03f4c7e2d481bc4c16c890f155b"
+    },
+    "cleanup": {
+      "dropinExists": false,
+      "event": "cleanup",
+      "serviceState": "inactive",
+      "success": true
+    },
+    "restore": {
+      "event": "exact-nondestructive-supervisor-restore",
+      "original": {
+        "ActiveState": "active",
+        "ControlGroup": "/system.slice/c3-freezer-relaunch-drill-983585.service",
+        "ExecCondition": "",
+        "KillMode": "process",
+        "Restart": "always",
+        "Slice": "system.slice"
+      }
+    },
+    "result": {
+      "acceptedHelperFrozen": true,
+      "conditions": [
+        [
+          "ConditionPathExists",
+          false,
+          true,
+          "/run",
+          -1
+        ]
+      ],
+      "event": "automatic-restart-and-activation-refused",
+      "frozen": 1,
+      "helperHeartbeatGrowth": 0,
+      "managerResponsive": true,
+      "startMarkerCount": 1,
+      "state": {
+        "ActiveState": "failed",
+        "ControlGroup": "/system.slice/c3-freezer-relaunch-drill-983585.service",
+        "ExecCondition": "{ path=/usr/bin/false ; argv[]=/usr/bin/false ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+        "KillMode": "process",
+        "Restart": "no",
+        "Slice": "system.slice"
+      }
+    }
+  }
+}

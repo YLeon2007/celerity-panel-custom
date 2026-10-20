@@ -1,5 +1,10 @@
 # Panel maintenance preflight and offline hold drill
 
+This page describes the original advisory script only. The separately authorized
+TEST-only real kernel/supervisor implementation is documented in
+[panel-host-freezer.md](panel-host-freezer.md). It does not turn the advisory
+receipts below into authority or establish remote-node exclusion.
+
 **Delivered boundary: precheck/read-only drill only. Not maintenance authority,
 not rollout, not production dispatch exclusion.** No runtime, worker, database,
 Compose file or node service is changed. There is no daemon, timer, startup hook,
