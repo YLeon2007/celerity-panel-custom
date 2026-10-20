@@ -3,6 +3,7 @@
 const { createHash } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
+const { isDeepStrictEqual } = require('node:util');
 
 const TOPOLOGY_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
 const TOPOLOGY_RUNNER_UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner.upload';
@@ -235,7 +236,43 @@ class TopologyRunnerBootstrapper {
     }
 }
 
+// No SSH inspection/installation in this path. Only an independently supplied,
+// still-held server attestor may confirm the exact installed bytes and profile.
+async function withAttestedPreinstalledRunner(authority, challenge, work) {
+    const unavailable = () => { throw new TopologyRunnerBootstrapperError(); };
+    if (typeof authority?.withVerifiedPreinstalledRunner !== 'function'
+        || challenge.binding.executionContext !== 'test.infograd.online'
+        || challenge.connection.expectedEndpoint.port !== 2222
+        || challenge.connection.expectedEndpoint.username !== 'c3-test-runner') unavailable();
+    return authority.withVerifiedPreinstalledRunner(challenge, async (proof, assertCurrent) => {
+        const expected = {
+            authority: 'server-preinstalled-topology-runner-v1',
+            binding: challenge.binding,
+            bootId: challenge.binding.bootId,
+            maintenanceId: challenge.binding.maintenanceId,
+            connection: challenge.connection,
+            runner: { path: TOPOLOGY_RUNNER_PATH, sha256: TOPOLOGY_RUNNER_SHA256,
+                mode: TOPOLOGY_RUNNER_MODE, owner: 'root', regularFile: true,
+                symlink: false, writableByRunner: false },
+            profile: { targetProfile: challenge.binding.targetProfile, configDirectoryReady: true,
+                bridgeUnitSha256: challenge.role === 'portal' ? null : `sha256:${BRIDGE_UNIT_DIGEST}`,
+                bridgeUnitDropIns: challenge.role === 'portal' ? null : 'absent' },
+            writers: 'excluded',
+        };
+        if (typeof assertCurrent !== 'function') unavailable();
+        const check = async () => {
+            await assertCurrent();
+            if (!isDeepStrictEqual(proof, expected)) unavailable();
+        };
+        await check();
+        const result = await work(check);
+        await check();
+        return result;
+    });
+}
+
 module.exports = {
+    withAttestedPreinstalledRunner,
     ENSURE_CONFIG_DIRS_COMMAND,
     TOPOLOGY_RUNNER_MODE,
     TOPOLOGY_RUNNER_PATH,

@@ -62,3 +62,60 @@ test('controller returning before callback completion revokes and joins its pend
     }));
     assert.equal(joined, true);
 });
+
+test('runner attestor checks are sticky and cannot escape their callback or outer authority scope', async () => {
+    let runnerRevoked = false, savedCheck, escaped;
+    const lifecycle = new Lifecycle({ executionContext: TEST, controller: {
+        async withHeldAuthority(context, work) {
+            return work({ async assertHeld() {}, async withVerifiedAuthority() {},
+                async withVerifiedPreinstalledRunner(challenge, work) {
+                    return work({ simulated: true }, async () => { if (runnerRevoked) throw failure(); });
+                } });
+        },
+    } });
+    await assert.rejects(lifecycle.withVerifiedPreinstalledRunner({}, () => assert.fail()));
+    await assert.rejects(lifecycle.run(async () => {
+        await lifecycle.withVerifiedPreinstalledRunner({}, async (proof, check) => {
+            assert.deepEqual(proof, { simulated: true });
+            savedCheck = check;
+            escaped = new AsyncResource('escaped-runner-attestation');
+            await check();
+        });
+        await assert.rejects(savedCheck());
+        runnerRevoked = true;
+        await assert.rejects(lifecycle.withVerifiedPreinstalledRunner({}, () => assert.fail()));
+        runnerRevoked = false;
+        await assert.rejects(lifecycle.withVerifiedPreinstalledRunner({}, () => assert.fail()));
+    }));
+    try { await assert.rejects(escaped.runInAsyncScope(() => lifecycle.withVerifiedPreinstalledRunner({}, () => assert.fail()))); }
+    finally { escaped.emitDestroy(); }
+});
+test('runner attestor returning before its callback completes joins work but authorizes no dispatch', async () => {
+    let release, enter, joined = false, dispatches = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const entered = new Promise(resolve => { enter = resolve; });
+    const lifecycle = new Lifecycle({ executionContext: TEST, controller: {
+        async withHeldAuthority(context, work) {
+            return work({ async assertHeld() {}, async withVerifiedAuthority() {},
+                async withVerifiedPreinstalledRunner(challenge, work) {
+                    work({}, async () => {});
+                    await entered;
+                    release();
+                } });
+        },
+    } });
+    await assert.rejects(lifecycle.run(async () => {
+        await assert.rejects(lifecycle.withVerifiedPreinstalledRunner({}, async (proof, check) => {
+            try {
+                enter();
+                await gate;
+                await new Promise(resolve => setImmediate(resolve));
+                await check();
+                dispatches++;
+            } finally { joined = true; }
+        }));
+        await assert.rejects(lifecycle.assertHeld());
+    }), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+    assert.equal(joined, true);
+    assert.equal(dispatches, 0);
+});

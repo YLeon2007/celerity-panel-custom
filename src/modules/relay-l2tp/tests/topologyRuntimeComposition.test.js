@@ -186,6 +186,20 @@ test('test topology runtime requires all three exact opt-in flags', async () => 
     }
 });
 
+test('unknown server runner transport refuses runtime composition instead of falling back to shell bootstrap', async () => {
+    for (const runnerTransport of [null, true, 'preinstalled', 'shell-fallback']) {
+        const calls = [];
+        let selections = 0;
+        const service = createTopologyOperationRuntime({ ...compositionDependencies(calls),
+            topologyExecutionAuthority: { get runnerTransport() { selections++; return runnerTransport; },
+                async withHeldAuthority() { assert.fail('no authority invocation during composition'); } },
+            createTopologyOperationExecutor() { assert.fail('malformed selection must not reach executor'); } });
+        await assertUnavailable(service);
+        assert.equal(selections, 1);
+        assert.deepEqual(calls, []);
+    }
+});
+
 test('default typed executor factory constructs TEST and rejects invalid pairs', () => {
     const HyNode = modelWith(['findById'], []);
     class FakeNodeSSH {}

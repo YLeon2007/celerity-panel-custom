@@ -5,7 +5,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const net = require('node:net');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { TOPOLOGY_RUNNER_PATH, TOPOLOGY_RUNNER_SHA256, TOPOLOGY_RUNNER_MODE } = require('../services/topologyRunnerBootstrapper');
 const { randomUUID, randomBytes, createHash } = require('node:crypto');
 const mongoose = require('mongoose');
 const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD } = require('../domain/topologyExecutionContext');
@@ -18,7 +19,7 @@ const entry = require('..');
 let connection, child, directory, models;
 const NODE = new mongoose.Types.ObjectId().toString();
 // Independently fixed SIMULATED physical facts; never derive these from a challenge/node row.
-const ENDPOINT = freeze({ ip: '192.0.2.17', port: 22, username: 'synthetic' });
+const ENDPOINT = freeze({ ip: '192.0.2.17', port: 2222, username: 'c3-test-runner' });
 const IDENTITY = freeze({ machineId: randomBytes(16).toString('hex'), sshHostKeySha256: randomBytes(32).toString('hex') });
 const BOOT = randomUUID(), MAINTENANCE = randomUUID(), OWNER = randomUUID();
 const content = '{"inbounds":[],"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}\n';
@@ -27,6 +28,20 @@ const node = freeze({ node: NODE, nodeRef: 'portal', role: 'portal', targetProfi
     configPath: '/usr/local/etc/xray/config.json', serviceUnit: 'xray.service',
     serviceUnitPath: '/etc/systemd/system/xray.service', checks: [], candidateHash: hash,
     candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1', bytes: [...Buffer.from(content)], sha256: hash } });
+// Load the REAL independently maintained finite V2 parser. Never emulate
+// successful shell inspection/mkdir replies or widen the forced-command grammar.
+function restrictedExecute(runner, command, options) {
+    assert.ok(process.env.C3_RESTRICTED_RUNNER_HELPER, 'set reviewed isolation.py path');
+    const parsed = spawnSync('python3', ['-I', '-c', `
+import importlib.util,json,sys
+sys.dont_write_bytecode=True
+spec=importlib.util.spec_from_file_location('isolation',sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+print(json.dumps(m.parse_runner(sys.argv[2],json.loads(sys.argv[3]))))
+`, process.env.C3_RESTRICTED_RUNNER_HELPER, command, JSON.stringify({ nodeId: NODE, targetProfile: 'xray-main' })], { encoding: 'utf8' });
+    assert.equal(parsed.status, 0, parsed.stderr);
+    return runner.execute(`${TOPOLOGY_RUNNER_PATH} ${JSON.parse(parsed.stdout).join(' ')}`, options);
+}
 async function until(work) {
     let last;
     for (let n = 0; n < 120; n++) {
@@ -81,8 +96,8 @@ async function fixture(t, fault, executionContext = TEST) {
         originalSnapshot: { configSha256: hash, unitSha256: hash, serviceActive: 'active', serviceEnabled: 'enabled' },
         adoptionReceipt: { proofId: randomUUID(), maintenanceId: MAINTENANCE, fromGeneration: randomUUID(), toGeneration: OWNER,
             oldBackendInstanceId: 'simulated-controller', oldPid: 42, oldProcessStartTime: 'local-start', verifiedAt: new Date() } });
-    const runner = fakeRunner(t, BOOT), events = [];
-    let active = false, revoked = false, first;
+    const runner = fakeRunner(t, BOOT), events = [], runnerExecutions = [];
+    let active = false, revoked = false, first, runnerHeld = 0, runnerRevoked = false;
     const assertHeld = async () => { if (!active || revoked) throw new Error('Simulated hold revoked'); };
     const attest = async (challenge, work) => {
         await assertHeld();
@@ -99,7 +114,7 @@ async function fixture(t, fault, executionContext = TEST) {
         if (challenge.predecessor) {
             assert.ok(first);
             const request = `/usr/local/bin/celerity-topology-node-runner --command status --operation-id ${first.operationId} --node-id ${NODE} --candidate-hash ${first.candidateHash} --backup-id ${first.backupId} --target-profile xray-main --execution-context ${executionContext.hostIdentity} --attempt-id ${first.attemptId} --generation ${first.generation} --predecessor-generation ${first.predecessorGeneration} --command-id ${first.commandIds.close}`;
-            const receipt = JSON.parse(runner.execute(request).stdout);
+            const receipt = JSON.parse(restrictedExecute(runner, request).stdout);
             const journal = JSON.parse(await fs.readFile(path.join(runner.root, 'var/lib/celerity/topology/fences/xray-main/journal.json'), 'utf8'));
             predecessor = { bindingId: first._id, generation: first.generation, headGeneration: journal.head, bootId: BOOT, status: 'terminal', receipt };
         }
@@ -115,9 +130,40 @@ async function fixture(t, fault, executionContext = TEST) {
         }
         return result;
     };
-    const authority = { async withHeldAuthority(context, work) {
+    // Explicitly SIMULATED independent installation/physical attestor. The
+    // source lifecycle must hold and recheck it; LocalSSH has no revocation gate.
+    const runnerCheck = async () => {
+        await assertHeld();
+        if (runnerRevoked) throw new Error('Simulated installation guard lost');
+    };
+    const attestRunner = async (challenge, work) => {
+        await runnerCheck();
+        assert.equal(challenge.binding.bootId, BOOT);
+        assert.equal(challenge.binding.maintenanceId, MAINTENANCE);
+        const proof = { authority: 'server-preinstalled-topology-runner-v1',
+            binding: structuredClone(challenge.binding), bootId: BOOT, maintenanceId: MAINTENANCE,
+            connection: { expectedEndpoint: ENDPOINT, expectedHostKeySha256: IDENTITY.sshHostKeySha256 },
+            runner: { path: TOPOLOGY_RUNNER_PATH, sha256: TOPOLOGY_RUNNER_SHA256, mode: TOPOLOGY_RUNNER_MODE,
+                owner: 'root', regularFile: true, symlink: false, writableByRunner: false },
+            profile: { targetProfile: 'xray-main', configDirectoryReady: true, bridgeUnitSha256: null, bridgeUnitDropIns: null },
+            writers: 'excluded' };
+        if (fault === 'runner-hash') proof.runner.sha256 = `sha256:${'f'.repeat(64)}`;
+        if (fault === 'runner-endpoint') proof.connection.expectedEndpoint = { ...ENDPOINT, port: 22 };
+        if (fault === 'runner-key') proof.connection.expectedHostKeySha256 = 'f'.repeat(64);
+        if (fault === 'runner-boot') proof.bootId = randomUUID();
+        if (fault === 'runner-profile') proof.profile.configDirectoryReady = false;
+        if (fault === 'runner-malformed') proof.runner.sha256 = [TOPOLOGY_RUNNER_SHA256];
+        if (fault === 'runner-missing-proof') return;
+        if (fault === 'runner-guard-loss') runnerRevoked = true;
+        freeze(proof);
+        runnerHeld++;
+        try { return await work(proof, runnerCheck); }
+        finally { runnerHeld--; }
+    };
+    const authority = { runnerTransport: 'preinstalled-attested-v1', async withHeldAuthority(context, work) {
         assert.deepEqual(context, TEST); assert.equal(active, false); active = true;
-        try { return await work(Object.freeze({ assertHeld, withVerifiedAuthority: attest })); }
+        try { return await work(Object.freeze({ assertHeld, withVerifiedAuthority: attest,
+            ...(fault === 'runner-missing-capability' ? {} : { withVerifiedPreinstalledRunner: attestRunner }) })); }
         finally { active = false; }
     } };
     // Enrollment is separate explicit server maintenance, never implicit worker adoption.
@@ -135,19 +181,20 @@ async function fixture(t, fault, executionContext = TEST) {
             assert.equal(active, true);
             assert.deepEqual(trusted, { expectedEndpoint: ENDPOINT, expectedHostKeySha256: IDENTITY.sshHostKeySha256 });
             assert.equal(actual.ip, ENDPOINT.ip);
+            if (fault === 'runner-loss-on-resolve') runnerRevoked = true;
         }
-        async writeFile() { assert.fail('preinstalled local runner requires no upload'); }
+        async writeFile() { events.push('upload'); assert.fail('preinstalled local runner requires no upload'); }
         async exec(command, options) {
             // Do not give this local SSH seam a revocation gate that the actual
             // adapter lacks: only source-owned lifecycle/store checks may refuse.
-            assert.equal(active, true); events.push(command);
-            if (command.startsWith('if /usr/bin/test -f')) {
-                const { TOPOLOGY_RUNNER_SHA256, TOPOLOGY_RUNNER_PATH } = require('../services/topologyRunnerBootstrapper');
-                return { code: 0, stdout: `${TOPOLOGY_RUNNER_SHA256.slice(7)}  ${TOPOLOGY_RUNNER_PATH}\n750\n`, stderr: '' };
-            }
-            if (command.startsWith('/usr/bin/install -d')) return { code: 0, stdout: '', stderr: '' };
-            const result = runner.execute(command, options);
+            events.push(command); // Count attempts even if a local assertion refuses.
+            assert.equal(active, true);
+            assert.ok(runnerHeld > 0, 'attestor callback must span real dispatch');
+            const result = restrictedExecute(runner, command, options);
+            assert.equal(result.code, 0, result.stderr);
+            runnerExecutions.push(command);
             if (fault === 'hold-lost-after-close' && command.includes('--command close ')) revoked = true;
+            if (fault === 'runner-loss-after-commit' && command.includes('--command commit ')) runnerRevoked = true;
             return result;
         }
     }
@@ -175,7 +222,8 @@ async function fixture(t, fault, executionContext = TEST) {
             topologyRevision: revision, priorDeployedRevision: revision - 1, nodes: [node], heldTopologyAdmission: true, admissionFingerprint: hash, session }));
         return operationId;
     }
-    return { worker: service.operationWorker, operation, events, revoke: () => { revoked = true; }, setFirst: row => { first = row; } };
+    return { worker: service.operationWorker, operation, events, runnerExecutions, revoke: () => { revoked = true; }, setFirst: row => { first = row; },
+        replayFirst: () => restrictedExecute(runner, events.find(event => event.includes('--command prepare ')), { stdin: content }) };
 }
 test('actual TEST host provisions after exact claim/locks and settles two serial real-store runner generations', async t => {
     const f = await fixture(t);
@@ -197,6 +245,36 @@ test('actual TEST host provisions after exact claim/locks and settles two serial
     }
     assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 1);
     assert.equal(await models.TopologyExecutionBinding.countDocuments(), 2);
+    const { runnerRequest } = require('./helpers/topologyV2Fixture');
+    assert.deepEqual(f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command),
+        ['prepare', 'commit', 'verify', 'close', 'status', 'prepare', 'commit', 'verify', 'close', 'status']);
+    const replay = f.replayFirst();
+    assert.notEqual(replay.code, 0, 'actual runner refuses stale first generation after successor');
+});
+test('preinstalled evidence refuses before credentials with zero shell, SFTP or runner dispatch', async t => {
+    for (const fault of ['runner-hash', 'runner-endpoint', 'runner-key', 'runner-boot', 'runner-profile',
+        'runner-malformed', 'runner-missing-proof', 'runner-missing-capability', 'runner-guard-loss']) await t.test(fault, async t => {
+        const f = await fixture(t, fault), id = await f.operation(17);
+        const result = await f.worker.run(id);
+        assert.equal(result.stopped, true);
+        assert.deepEqual(f.events, []);
+        assert.equal(await models.NodeOperationLock.countDocuments({ operationId: id, remoteUncertain: true }), 1);
+        assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, true);
+        assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 1);
+    });
+});
+test('runner guard loss at resolution or after commit prevents the next real dispatch and retains ownership', async t => {
+    for (const fault of ['runner-loss-on-resolve', 'runner-loss-after-commit']) await t.test(fault, async t => {
+        const f = await fixture(t, fault), id = await f.operation(17);
+        const result = await f.worker.run(id);
+        assert.equal(result.stopped, true);
+        const { runnerRequest } = require('./helpers/topologyV2Fixture');
+        assert.deepEqual(f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command),
+            fault === 'runner-loss-on-resolve' ? [] : ['prepare', 'commit']);
+        assert.equal(await models.NodeOperationLock.countDocuments({ operationId: id, remoteUncertain: true }), 1);
+        assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, true);
+        assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 1);
+    });
 });
 test('before-prepare authority/endpoint refusal retains exact locks and admission with zero SSH/bootstrap', async t => {
     for (const fault of ['hold-lost', 'endpoint-change', 'missing-authority', 'no-enrollment']) await t.test(fault, async t => {
@@ -240,7 +318,7 @@ test('assembled terminal recovery is read-only and never provisions or bootstrap
     finally { f.worker.finalizer.finalizeV2Succeeded = finalize; }
     const before = await Promise.all([models.TopologyOperation, models.TopologyExecutionBinding,
         models.TopologyExecutionEnrollment, models.TopologyConfigOwner, models.NodeOperationLock].map(model => model.findOne().lean()));
-    f.events.length = 0;
+    f.events.length = 0; f.runnerExecutions.length = 0;
     const commands = [], observe = event => commands.push(event.commandName);
     connection.getClient().on('commandStarted', observe);
     let result;
@@ -252,6 +330,7 @@ test('assembled terminal recovery is read-only and never provisions or bootstrap
         models.TopologyExecutionEnrollment, models.TopologyConfigOwner, models.NodeOperationLock].map(model => model.findOne().lean())), before);
     const { runnerRequest } = require('./helpers/topologyV2Fixture');
     assert.deepEqual(f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command), ['status']);
+    assert.deepEqual(f.runnerExecutions.map(command => runnerRequest(command).command), ['status']);
 });
 
 test('actual PROD worker refuses before claim even with server authority supplied', async t => {

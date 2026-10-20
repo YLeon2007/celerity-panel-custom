@@ -117,6 +117,7 @@ function createTopologyOperationExecutor({
     hostIdentity,
     target,
     executionBindingReader,
+    preinstalledRunnerAuthority,
 } = {}) {
     if (!topologyExecutionContext(target, hostIdentity)) {
         return undefined;
@@ -139,6 +140,7 @@ function createTopologyOperationExecutor({
         NodeTransportFactory: TopologyNodeTransportFactory,
         RunnerBootstrapper: TopologyRunnerBootstrapper,
         ...(target === 'test' ? optional(executionBindingReader, 'executionBindingReader') : {}),
+        ...(target === 'test' ? optional(preinstalledRunnerAuthority, 'preinstalledRunnerAuthority') : {}),
     });
 }
 
@@ -231,12 +233,19 @@ function createTopologyOperationRuntime(dependencies = {}) {
             repository: finalizationRepository,
             clock,
         });
-        let bindingStore, bindingLifecycle;
+        let bindingStore, bindingLifecycle, preinstalledRunnerAuthority;
         if (executionContext.target === 'test' && dependencies.topologyExecutionAuthority !== undefined) {
             const { TopologyExecutionAuthorityLifecycle } = require('./topologyExecutionAuthorityLifecycle');
             const { TopologyExecutionBindingStore } = require('../repositories/topologyExecutionBindingStore');
             bindingLifecycle = new TopologyExecutionAuthorityLifecycle({ executionContext,
                 controller: dependencies.topologyExecutionAuthority });
+            // Trusted server controller selection only, snapshotted at assembly.
+            // An unknown value refuses composition; no fallback to shell/SFTP.
+            const runnerTransport = dependencies.topologyExecutionAuthority.runnerTransport;
+            if (runnerTransport !== undefined && runnerTransport !== 'preinstalled-attested-v1') {
+                return unavailableTopologyDeploymentService;
+            }
+            if (runnerTransport === 'preinstalled-attested-v1') preinstalledRunnerAuthority = bindingLifecycle;
             bindingStore = new TopologyExecutionBindingStore({ executionContext,
                 withVerifiedAuthority: (challenge, work) => bindingLifecycle.withVerifiedAuthority(challenge, work),
                 assertAuthorityHeld: () => bindingLifecycle.assertHeld(),
@@ -248,6 +257,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             HyNode,
             ...executionContext,
             ...optional(bindingStore, 'executionBindingReader'),
+            ...optional(preinstalledRunnerAuthority, 'preinstalledRunnerAuthority'),
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 

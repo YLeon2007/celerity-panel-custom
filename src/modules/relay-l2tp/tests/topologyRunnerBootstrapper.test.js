@@ -17,6 +17,7 @@ const {
     TOPOLOGY_RUNNER_PATH,
     TOPOLOGY_RUNNER_SHA256,
     TopologyRunnerBootstrapper,
+    withAttestedPreinstalledRunner,
 } = require('../services/topologyRunnerBootstrapper');
 
 const TEST_AUTHORIZATION = Object.freeze({
@@ -101,6 +102,42 @@ function runnerSource() {
         'runner.sh',
     ));
 }
+
+test('preinstalled profile attestation accepts exact portal/managed units and refuses drift without transport', async () => {
+    for (const role of ['portal', 'relay', 'bridge']) {
+        const binding = Object.freeze({ executionContext: 'test.infograd.online', bootId: 'simulated-boot',
+            maintenanceId: 'simulated-maintenance', targetProfile: role === 'portal' ? 'xray-main' : 'xray-bridge' });
+        const connection = Object.freeze({ expectedEndpoint: Object.freeze({ ip: '192.0.2.17', port: 2222, username: 'c3-test-runner' }),
+            expectedHostKeySha256: 'a'.repeat(64) });
+        const challenge = Object.freeze({ binding, connection, role });
+        for (const fault of ['none', 'unit', 'drop-ins', 'directory', 'owner', 'mode', 'symlink', 'writable', 'extra']) {
+            let dispatches = 0;
+            // Explicit local installation-attestor simulation, not physical authority.
+            const authority = { async withVerifiedPreinstalledRunner(challenge, work) {
+                const proof = { authority: 'server-preinstalled-topology-runner-v1', binding, connection,
+                    bootId: binding.bootId, maintenanceId: binding.maintenanceId,
+                    runner: { path: TOPOLOGY_RUNNER_PATH, sha256: TOPOLOGY_RUNNER_SHA256, mode: TOPOLOGY_RUNNER_MODE,
+                        owner: 'root', regularFile: true, symlink: false, writableByRunner: false },
+                    profile: { targetProfile: binding.targetProfile, configDirectoryReady: true,
+                        bridgeUnitSha256: role === 'portal' ? null : `sha256:${BRIDGE_UNIT_DIGEST}`, bridgeUnitDropIns: role === 'portal' ? null : 'absent' },
+                    writers: 'excluded' };
+                if (fault === 'unit') proof.profile.bridgeUnitSha256 = `sha256:${'f'.repeat(64)}`;
+                if (fault === 'drop-ins') proof.profile.bridgeUnitDropIns = 'present';
+                if (fault === 'directory') proof.profile.configDirectoryReady = false;
+                if (fault === 'owner') proof.runner.owner = 'runner';
+                if (fault === 'mode') proof.runner.mode = '0777';
+                if (fault === 'symlink') proof.runner.symlink = true;
+                if (fault === 'writable') proof.runner.writableByRunner = true;
+                if (fault === 'extra') proof.ignored = true;
+                return work(proof, async () => {});
+            } };
+            const invoke = () => withAttestedPreinstalledRunner(authority, challenge, async () => { dispatches++; return 'checked'; });
+            if (fault === 'none') assert.equal(await invoke(), 'checked');
+            else await assert.rejects(invoke(), { code: 'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE' });
+            assert.equal(dispatches, fault === 'none' ? 1 : 0);
+        }
+    }
+});
 
 test('ensureRunner atomically installs the pinned topology runner with fixed NodeSSH operations', async () => {
     const calls = [];

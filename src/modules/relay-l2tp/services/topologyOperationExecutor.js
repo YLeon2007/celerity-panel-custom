@@ -7,6 +7,7 @@ const {
 } = require('./topologyNodeTransportFactory');
 const {
     TopologyRunnerBootstrapper,
+    withAttestedPreinstalledRunner,
 } = require('./topologyRunnerBootstrapper');
 const {
     projectCanonicalXrayCandidate,
@@ -295,6 +296,7 @@ class TopologyOperationExecutor {
     #NodeTransportFactory;
     #preparedBindings = new WeakMap();
     #executionBindingReader;
+    #preinstalledRunnerAuthority;
 
     constructor(options = {}) {
         const allowedKeys = new Set([
@@ -304,6 +306,7 @@ class TopologyOperationExecutor {
             'target',
             'hostIdentity',
             'executionBindingReader',
+            'preinstalledRunnerAuthority',
         ]);
         if (!options || typeof options !== 'object' || Array.isArray(options)
             || Object.keys(options).some(key => !allowedKeys.has(key))) {
@@ -317,6 +320,7 @@ class TopologyOperationExecutor {
             hostIdentity,
             nodeExecutionResolver,
             executionBindingReader,
+            preinstalledRunnerAuthority,
             RunnerBootstrapper = TopologyRunnerBootstrapper,
             NodeTransportFactory = TopologyNodeTransportFactory,
         } = options;
@@ -336,6 +340,11 @@ class TopologyOperationExecutor {
             && typeof executionBindingReader?.readVerified !== 'function') {
             throw new TypeError('Topology executor binding reader requires readVerified');
         }
+        if (preinstalledRunnerAuthority !== undefined
+            && typeof preinstalledRunnerAuthority?.withVerifiedPreinstalledRunner !== 'function') {
+            throw new TypeError('Preinstalled runner requires server authority');
+        }
+        this.#preinstalledRunnerAuthority = preinstalledRunnerAuthority;
         this.#executionBindingReader = executionBindingReader;
         this.#target = target;
         this.#hostIdentity = hostIdentity;
@@ -400,19 +409,40 @@ class TopologyOperationExecutor {
         return Object.freeze({ ...binding, durable, expected, trustedConnection: authority.connection });
     }
 
+    #withPreinstalledRunner(binding, work) {
+        return withAttestedPreinstalledRunner(this.#preinstalledRunnerAuthority, Object.freeze({
+            binding: binding.durable, connection: binding.trustedConnection, role: binding.role,
+        }), work);
+    }
+
     async #createTransport(binding, context) {
-        const nodeSSH = await this.#nodeExecutionResolver.resolve({
+        if (this.#preinstalledRunnerAuthority) {
+            // Refuse wrong/missing evidence before even selecting credentials.
+            await this.#withPreinstalledRunner(binding, async () => {});
+        }
+        let nodeSSH = await this.#nodeExecutionResolver.resolve({
             nodeId: binding.nodeId,
             role: binding.role,
         }, binding.trustedConnection);
         await this.#proveBinding(context, binding, binding.durable);
-        const bootstrapper = new this.#RunnerBootstrapper({
-            nodeSSH,
-            target: this.#target,
-            hostIdentity: this.#hostIdentity,
-            role: binding.role,
-        });
-        await bootstrapper.ensureRunner();
+        if (this.#preinstalledRunnerAuthority) {
+            const pinnedSSH = nodeSSH;
+            nodeSSH = Object.freeze({ exec: (command, options) => this.#withPreinstalledRunner(binding,
+                async assertRunner => {
+                    await this.#proveBinding(context, binding, binding.durable);
+                    await assertRunner();
+                    // Keep both external guards held across the awaited dispatch.
+                    return pinnedSSH.exec(command, options);
+                }) });
+        } else {
+            const bootstrapper = new this.#RunnerBootstrapper({
+                nodeSSH,
+                target: this.#target,
+                hostIdentity: this.#hostIdentity,
+                role: binding.role,
+            });
+            await bootstrapper.ensureRunner();
+        }
         const factory = new this.#NodeTransportFactory({
             executionContext: this.#hostIdentity,
             nodeExecutionResolver: {
@@ -616,15 +646,26 @@ class TopologyOperationExecutor {
             const authority = await this.#executionBindingReader.readVerifiedConnection(expected, current);
             if (!sameRecord(authority.binding, current) || !validTrustedConnection(authority.connection)) throw unprovenBinding();
             if (!(durable.targetProfile === 'xray-main' ? role === 'portal' : ['relay', 'bridge'].includes(role))) throw unprovenBinding();
-            const nodeSSH = await this.#nodeExecutionResolver.resolve({ nodeId: durable.nodeId, role }, authority.connection);
-            await assertCurrent();
-            const transport = new this.#NodeTransportFactory({ executionContext: this.#hostIdentity,
-                nodeExecutionResolver: { resolve: async () => nodeSSH } }).create({ nodeId: durable.nodeId, role });
-            const resolved = await transport;
-            const proof = assertTerminalReceipt(await resolved.status({ ...transportRequest({ ...durable, durable }, 'close'),
-                completedCommand: 'close' }), 'status', { ...durable, durable }, 'verified');
-            await assertCurrent();
-            return proof;
+            const probe = async assertRunner => {
+                await assertRunner();
+                const nodeSSH = await this.#nodeExecutionResolver.resolve({ nodeId: durable.nodeId, role }, authority.connection);
+                await assertCurrent();
+                const fresh = await this.#executionBindingReader.readVerifiedConnection(expected, current);
+                if (!sameRecord(fresh.binding, current) || !validTrustedConnection(fresh.connection)
+                    || !sameConnection(fresh.connection, authority.connection)) throw unprovenBinding();
+                const transport = await new this.#NodeTransportFactory({ executionContext: this.#hostIdentity,
+                    nodeExecutionResolver: { resolve: async () => nodeSSH } }).create({ nodeId: durable.nodeId, role });
+                await assertCurrent();
+                await assertRunner();
+                const proof = assertTerminalReceipt(await transport.status({ ...transportRequest({ ...durable, durable }, 'close'),
+                    completedCommand: 'close' }), 'status', { ...durable, durable }, 'verified');
+                await assertCurrent();
+                await assertRunner();
+                return proof;
+            };
+            return this.#preinstalledRunnerAuthority
+                ? this.#withPreinstalledRunner({ durable, role, trustedConnection: authority.connection }, probe)
+                : probe(async () => {});
         });
     }
 
