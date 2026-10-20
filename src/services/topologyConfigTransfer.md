@@ -1,15 +1,21 @@
-# Dormant production config-ownership transfer contract
+# Explicit TEST / production config-ownership maintenance contract
 
-**Not activation.** `TopologyConfigTransfer` has no route, MCP tool, module registration, startup consumer or runtime caller. Its model is not imported by normal startup. Existing TEST and classic PROD policy is unchanged. Do not create production ownership rows with a script or wire this service until the blockers below are closed.
+**Not activation.** `TopologyConfigTransfer` has no route, MCP tool, module registration, startup consumer or runtime caller. This service change adds no automatic provisioning or adoption. Existing TEST and classic PROD runtime policy is unchanged. Do not wire operational transfers until the blockers below are closed.
 
 ## Bounded state machine
 
-- Server selects the canonical `production` / `lm1.infograd.online` context, never a request identity. Initialization is insert-only and **classic-owned**. Missing records cannot adopt; neither execution flags nor operation history initialize/transfer ownership.
+- Server explicitly selects canonical `test` / `test.infograd.online` **or** `production` / `lm1.infograd.online`, never a request identity. The constructor validates the complete pair and retains the frozen canonical object, not the caller's mutable input. Missing, extra-field, foreign and cross-paired contexts refuse before persistence/external work; there is no default context. Initialization is insert-only and **classic-owned**. Missing records cannot adopt; neither execution flags nor operation history initialize/transfer ownership.
 - Unique `(node, profile)` slot; only `xray-main` and `xray-bridge` are accepted, each with fixed config/unit/service paths. Inventory binds the node's machine ID and SSH-host-key SHA-256. Every transition compares the exact pair, context, identity, previous owner and UUID generation.
 - `adopt`: classic → topology, new UUID generation, original config/unit digests plus active/enabled service states and adoption receipt committed together.
 - `handback`: topology → classic only after externally verified **node readback** matches every original snapshot field. Receipt must identify the adoption generation. CAS also compares the original snapshot and adoption receipt; flags, rollback labels, operation history or lease expiry never imply restoration. The adoption receipt is retained.
 - Transitions use a majority Mongo transaction and bounded primary/majority readback. No transport or external verification is inside a retryable transaction. A race has one winner. Unknown commit/readback failure is not success and never causes implicit handback/retry.
 - V1 requires existing config and unit files and known service states. It does not adopt absent artifacts, unsupported unit states, drop-ins or alternative paths by guessing. Snapshot hashes are evidence references, **not backup bytes**; an external backup/restoration implementation remains required.
+
+## Minimal accepted maintenance API
+
+Supply the explicit server context, same-connection `TopologyConfigOwner` model and trusted `withVerifiedMaintenance`; provision the required unique index separately. Use `initializeClassic({ node, profile, nodeIdentity })`, then `adopt({ node, profile, generation: classic.generation, proofRef })`. Initialization only inventories classic ownership; it is not dispatch authority. Keep the original config/unit **bytes** and service active/enabled state in the external backup implementation. An adopted owner can be passed to the existing `TopologyExecutionBindingStore.preEnroll` using its exact generation plus separately attested endpoint/physical/empty-head evidence; an owner row is not that evidence. Restore those original bytes and service states under held exclusion before `handback({ node, profile, generation: adopted.generation, proofRef })`. Use each returned generation, never an inferred/replayed one.
+
+No DB seed, snapshot default, worker claim, bootstrap or automatic controller is added. Physical aliases, endpoint reassignment, port/key drift and real systemd restoration remain external authority / existing binding-store obligations.
 
 ## Required trusted external authority — not implemented here
 
@@ -27,6 +33,6 @@ Evidence must establish an externally observed old-backend instance/PID/start id
 
 ## Local verification
 
-`src/services/tests/topologyConfigTransfer.test.js` starts its own loopback-only replica set under `TMPDIR` when `C3_MONGOD` names a local binary, uses scratch-bound models, drops the scratch DB, verifies absence and terminates Mongo. Positive evidence is explicitly simulated at the injected authority seam. Tests cover paired/physical identity negatives, unknown/missing evidence, stale replay, restoration mismatches, concurrent CAS, transaction rollback and injected unknown post-commit. These are local persistence/contract tests, not live maintenance, backup/restoration or PROD readback evidence.
+`src/services/tests/topologyConfigTransfer.test.js` starts its own loopback-only replica set under `TMPDIR` when `C3_MONGOD` names a local binary, uses scratch-bound models, drops the scratch DB, verifies absence and terminates Mongo. The complete regression matrix runs for both TEST and PROD: paired/physical identity negatives, unknown/missing snapshot evidence, stale replay, restoration mismatches, concurrent CAS, transaction rollback and injected unknown post-commit with retained simulated hold. The public positive path uses `initializeClassic → adopt → real store preEnroll → handback` on actual same-connection schemas, never a raw-seeded adopted owner. It hashes/restores scratch config/unit bytes and a simulated service-state file, checks exact receipts, and observes maintenance held through adoption CAS/commit/majority confirmation. Opposite canonical services cannot overwrite the globally occupied node/profile or consult their external verifier on a foreign transfer. Positive physical authority and systemd state remain explicitly simulated; local byte restoration is not remote backup/systemd or PROD readback evidence.
 
 `topologyConfigOwnership.test.js` additionally checks that all ten online legacy links retain their actual classic-generated reverse/forward listeners under both production opt-in values. `topologyRuntimeComposition.test.js` retains the assembled production no-dispatch guard.

@@ -2,6 +2,7 @@
 const { randomUUID } = require('node:crypto');
 const {
     PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD,
+    TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST,
     matchesTopologyExecutionContext,
 } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
 
@@ -32,13 +33,14 @@ const { isDeepStrictEqual } = require('node:util');
 // old backend PID/process-tree exit and revocation of its future dispatch.
 class TopologyConfigTransfer {
     constructor({ executionContext, withVerifiedMaintenance, TopologyConfigOwner } = {}) {
-        if (!matchesTopologyExecutionContext(executionContext, PROD)) {
-            throw new TypeError('Explicit server-owned production context required');
+        const context = [TEST, PROD].find(candidate => matchesTopologyExecutionContext(executionContext, candidate));
+        if (!context) {
+            throw new TypeError('Explicit server-owned TEST or production context required');
         }
         if (typeof withVerifiedMaintenance !== 'function') {
             throw new TypeError('External maintenance authority required');
         }
-        Object.defineProperty(this, 'executionContext', { value: PROD, enumerable: true });
+        Object.defineProperty(this, 'executionContext', { value: context, enumerable: true });
         this.withVerifiedMaintenance = withVerifiedMaintenance;
         this.Model = TopologyConfigOwner || require('../models/topologyConfigOwnerModel');
     }
