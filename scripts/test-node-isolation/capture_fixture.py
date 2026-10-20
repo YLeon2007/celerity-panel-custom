@@ -70,7 +70,7 @@ class CaptureFixture:
                 'guard':f.guard,'saved':{},'initialProcesses':[],'dispatchInFlight':None,'dispatchCount':0,
                 'accessBoundary':{'session':{'pid':78,'start':'999'},'ticks':'100'}}))
             # Installation is actually read; root UID/GID are simulated by the read adapter.
-            f.put(observer.RUNNER,b'independent fixture installed runner')
+            f.put(observer.RUNNER,(HERE.parents[1]/'src/modules/relay-l2tp/node-artifacts/topology/runner.sh').read_bytes())
             f.path(observer.RUNNER).chmod(0o750)
             for p in profiles:
                 f.path(t.n.profile_paths(p)[0]).parent.chmod(0o755)
@@ -136,7 +136,7 @@ class CaptureFixture:
         self.stack.close()
 
 
-def node(root, *, observer_serve=False):
+def node(root, *, observer_serve=False, runtime_observer=False, dispatch=None):
     n = t.n
     fixture = n.Fixture(Path(root),os.getuid(),os.getgid(),None)
     fs = n.Files(fixture)
@@ -177,15 +177,34 @@ def node(root, *, observer_serve=False):
         if path.startswith(str(root)+'/'): path = path[len(str(root)):]
         raw = b'' if directory else fs.read(path)[0]
         st = (Path(root)/path.lstrip('/')).stat()
-        return raw,SimpleNamespace(st_uid=0,st_gid=0,st_mode=st.st_mode)
+        return raw,SimpleNamespace(st_uid=0,st_gid=0,st_mode=st.st_mode,st_nlink=st.st_nlink)
     observer.installation.__defaults__ = (read,None)
     observer.config_snapshot.__defaults__ = (read,None)
+    observer.durable_originals.__defaults__ = (read,)
     observer.secure_read = read
     observer.Path = lambda path: Path(root)/str(path).lstrip('/')
-    module = SimpleNamespace(RESTORE_ADMISSION_VERSION=1,STATE=n.STATE,decode_json=isolation.decode_json)
+    module = SimpleNamespace(RESTORE_ADMISSION_VERSION=1,STATE=n.STATE,decode_json=isolation.decode_json,Host=lambda:engine.host)
     writer = n.NodeOriginals(engine,module,fixture=fixture)
     server = a.NodeServer(writer,n,config,a.Wire(0,1,time.monotonic()+120),c,shared=shared,attestor=observer)
-    if observer_serve:
+    if dispatch is not None:
+        # Same actual isolation journal/outer lock observed during capture and
+        # ordinary attestation. Only UID/kernel/systemd/SSH are SIMULATED.
+        import fcntl
+        real_run = subprocess.run
+        source = HERE.parents[1]/'src/modules/relay-l2tp/node-artifacts/topology/runner.sh'
+        def actual_runner(argv, **kwargs):
+            assert argv[:2] == ['/bin/bash', isolation.RUNNER]
+            env = {**kwargs.pop('env'), 'CELERITY_TOPOLOGY_ROOT': str(root)}
+            return real_run(['unshare', '--user', '--map-root-user', '/bin/bash', str(source), *argv[2:]],
+                            env=env, timeout=40, **kwargs)
+        with fs.opened(n.OUTER_LOCK) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            isolation.subprocess.run = actual_runner
+            sys.stdout.buffer.write(engine.dispatch(dispatch, sys.stdin.buffer.read(4194305), fd))
+    elif runtime_observer:
+        server.pins()
+        observer.serve(engine,module,shared)
+    elif observer_serve:
         server.pins()
         with a.CaptureHold(writer,n) as capture_hold:
             capture_hold.capture()
@@ -195,8 +214,10 @@ def node(root, *, observer_serve=False):
 
 
 def main():
-    if sys.argv[1] in ('node','observer-serve'):
-        node(sys.argv[2],observer_serve=sys.argv[1] == 'observer-serve'); return
+    if sys.argv[1] == 'runtime-dispatch':
+        node(sys.argv[2],dispatch=sys.argv[3]); return
+    if sys.argv[1] in ('node','observer-serve','runtime-observer'):
+        node(sys.argv[2],observer_serve=sys.argv[1] == 'observer-serve',runtime_observer=sys.argv[1] == 'runtime-observer'); return
     if sys.argv[1] == 'owner':
         fs = t.n.Files(t.n.Fixture(Path(sys.argv[2]),os.getuid(),os.getgid(),None))
         a.owner_bridge(fs,c,a.Wire(0,1,time.monotonic()+120),fixture_socket=sys.argv[3]); return
@@ -214,6 +235,7 @@ def main():
             # Preserve disposable files for exact post-scope readback. The
             # coordinator/OFD scope is already closed; no authority is retained.
             # The parent test owns this fixture process and closes it explicitly.
+            print(json.dumps({'fixtureCaptureHoldersClosed': True}),flush=True)
             sys.stdin.buffer.read(1)
         return
     raise RuntimeError('fixture verb')

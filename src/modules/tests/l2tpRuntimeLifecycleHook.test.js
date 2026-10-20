@@ -30,7 +30,7 @@ test('ordinary root dependency seam selects operational authority and forwards t
     const controller = { runnerTransport: 'preinstalled-attested-v1', withHeldAuthority() {} };
     let selections = 0;
     const dependencies = createL2tpRootHostDependencies({ env,
-        createTopologyExecutionAuthority(options) { assert.strictEqual(options.env, env); selections++; return controller; },
+        createTopologyExecutionAuthority(options) { assert.strictEqual(options.env, env); assert.equal(options.ownerEnrollment, false); selections++; return controller; },
     });
     assert.equal(selections, 1, 'default root seam must select its private physical controller');
     assert.strictEqual(dependencies.topologyExecutionAuthority, controller);
@@ -203,7 +203,7 @@ test('enabled runtime lifecycle passes the exact opt-in environment to lazy host
         },
     });
 
-    assert.deepEqual(receivedOptions, { env });
+    assert.deepEqual(receivedOptions, { env, ownerEnrollment: false });
 });
 
 test('root lifecycle awaits migrations once after the database boundary before runtime startup', async () => {

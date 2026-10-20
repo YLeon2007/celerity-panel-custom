@@ -155,7 +155,7 @@ async function openSshChannel(pin) {
             hostVerifier: raw => Buffer.isBuffer(raw) && createHash('sha256').update(raw).digest('hex') === pin.physical.sshHostKeySha256 });
     });
 }
-function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals, readObservations } = {}) {
+function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals, readObservations, requireDurableOriginals = false } = {}) {
     const config = validateConfig(input), channels = new Map();
     // Original secret bytes remain lexical/private and never enter Mongo proofs,
     // logs, error messages or public return values. No recapture after uncertainty.
@@ -184,6 +184,13 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
                         need(value.nodeId === pin.nodeId && value.targetProfile === pin.targetProfile && value.maintenanceId === pin.maintenanceId
                             && value.planHash === pin.planHash && equal(value.physical, pin.physical) && equal(value.endpoint, pin.endpoint)
                             && equal(value.guard, pin.guard) && (pin.nodeId === SHARED ? equal(value.host, config.host) : value.host === null));
+                        if (requireDurableOriginals) {
+                            const durable = value.durableOriginals;
+                            const { proofRef: _ref, ...accepted } = pin.originalSnapshot;
+                            need(exact(durable, ['version', 'bundleSha256', 'readback']) && durable.version === 1
+                                && digest(durable.bundleSha256, 64)
+                                && equal(durable.readback, { source: 'node-readback', ...accepted }));
+                        }
                         return [pin.nodeId, value];
                     }));
                     alive(scope);
@@ -344,13 +351,21 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
         close() { poisoned = true; for (const channel of channels.values()) channel.close(); },
     });
 }
-function createRootTestPhysicalAuthority({ env = process.env, read = privateRead, openChannel, captureSpawn } = {}) {
+function createRootTestPhysicalAuthority({ env = process.env, read = privateRead, openChannel, captureSpawn, ownerEnrollment = false } = {}) {
     // Flags select eligibility only; NEVER authorize or choose pins/endpoints.
     if (env.L2TP_EXECUTION_ENABLED !== 'true' || env.TOPOLOGY_TEST_EXECUTION_ENABLED !== 'true'
         || env.PANEL_DOMAIN !== TEST.hostIdentity || env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
         || env.L2TP_PRODUCTION_EXECUTION_ENABLED === 'true') return undefined;
     let raw;
     try { raw = read(CONFIG); } catch (error) { if (error.code === 'ENOENT') return undefined; refuse(); }
+    need(typeof ownerEnrollment === 'boolean');
+    if (!ownerEnrollment) {
+        // Trusted root composition selects read-only runtime, never missing-pin
+        // detection, an environment switch, or replay of the one-shot capture.
+        const config = validateConfig(JSON.parse(raw));
+        need(config.nodes.every(pin => pin.originalSnapshot));
+        return createTestPhysicalController({ config, openChannel, requireDurableOriginals: true });
+    }
     const { createDurableNodeOriginals } = require('./testDurableOriginals');
     const withDurableNodeOriginals = createDurableNodeOriginals({
         ...(read !== privateRead ? { read } : {}), ...(captureSpawn ? { spawn: captureSpawn } : {}),

@@ -15,42 +15,7 @@ const { once } = require('node:events');
 const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
 const fixtureScript = path.join(__dirname, '../../../../scripts/test-node-isolation/capture_fixture.py');
 const env = { PANEL_DOMAIN: TEST.hostIdentity, L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
-async function actualFixture(t, fault, large = false) {
-    const supervisor = spawn('/usr/bin/python3', [fixtureScript, 'supervisor', ...(large ? ['large'] : [])], { env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let errors = ''; supervisor.stderr.on('data', b => { errors += b; });
-    t.after(async () => {
-        if (supervisor.exitCode === null && supervisor.signalCode === null) {
-            const done = once(supervisor, 'close'); supervisor.kill('SIGINT'); await done;
-        }
-    });
-    const f = await new Promise((resolve, reject) => {
-        let text = '';
-        supervisor.stdout.on('data', b => { text += b; if (text.includes('\n')) resolve(JSON.parse(text.trim())); });
-        supervisor.once('close', code => { if (code) reject(new Error(errors)); });
-    });
-    const runtime = require('../runtime/testPhysicalController');
-    const controller = runtime.createRootTestPhysicalAuthority({ env,
-        read(file) {
-            if (file === '/etc/celerity/topology-test-physical.json') return Buffer.from(JSON.stringify(f.physical));
-            if (file === '/etc/celerity/topology-test-capture.json') return Buffer.from(JSON.stringify({ version: 1, helperSha256: sha(fs.readFileSync(path.join(__dirname, '../../../../scripts/test-node-isolation/coordinated_capture.py'))) }));
-            assert.equal(file, '/usr/local/libexec/c3-test-coordinated-capture.py');
-            return fs.readFileSync(path.join(__dirname, '../../../../scripts/test-node-isolation/coordinated_capture.py'));
-        },
-        captureSpawn(command, args, options) {
-            assert.equal(command, '/usr/bin/python3');
-            assert.deepEqual(args, ['-I', '/usr/local/libexec/c3-test-coordinated-capture.py', 'owner-channel']);
-            if (fault === 'challenge') {
-                const file = path.join(f.root, 'etc/c3-test-coordinated-capture.json');
-                const config = JSON.parse(fs.readFileSync(file)); config.ownerChallenge.host.backend.pid++;
-                fs.writeFileSync(file, JSON.stringify(config));
-            }
-            return spawn('/usr/bin/python3', [fixtureScript, 'owner', f.root, f.socket], { ...options, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
-        },
-        openChannel: async () => { assert.fail('default same-OFD path must never open a second observer'); },
-    });
-    t.after(() => controller.close());
-    return { ...f, controller, supervisor, errors: () => errors };
-}
+const { actualFixture } = require('./helpers/durableCaptureFixture');
 async function scratchMongo(t) {
     const mongoose = require('mongoose'), net = require('node:net');
     const { randomUUID } = require('node:crypto');

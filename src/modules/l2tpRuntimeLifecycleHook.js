@@ -73,11 +73,11 @@ function parseL2tpExecutionEnabled(value) {
     );
 }
 
-function createEnabledHostDependencies(factory, env) {
+function createEnabledHostDependencies(factory, env, ownerEnrollment) {
     if (typeof factory !== 'function') {
         throw new TypeError('L2TP enabled startup requires createHostDependencies');
     }
-    const dependencies = factory({ env });
+    const dependencies = factory({ env, ownerEnrollment });
     if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
         throw new TypeError('L2TP createHostDependencies must return an object');
     }
@@ -100,10 +100,11 @@ function createL2tpRuntimeLifecycleHook({
     createStartupLifecycle = createL2tpStartupLifecycle,
     activeHostProvider = l2tpActiveHostProvider,
     startWorkers = true,
+    ownerEnrollment = false,
 } = {}) {
     const enabled = parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
     const hostDependencies = enabled
-        ? createEnabledHostDependencies(createHostDependencies, env)
+        ? createEnabledHostDependencies(createHostDependencies, env, ownerEnrollment)
         : {};
     const lifecycle = createStartupLifecycle({
         config: { enabled },
@@ -124,6 +125,7 @@ function createL2tpRuntimeLifecycleHook({
 
 function createL2tpRootHostDependencies({
     env = process.env,
+    ownerEnrollment = false,
     HyNode = require('../models/hyNodeModel'),
     NodeSSH = require('../services/nodeSSH'),
     NodeTransport = require('./relay-l2tp/services/l2tpNodeTransport').L2tpNodeTransport,
@@ -191,7 +193,7 @@ function createL2tpRootHostDependencies({
         }));
     });
 
-    const authority = topologyExecutionAuthority ?? createTopologyExecutionAuthority({ env });
+    const authority = topologyExecutionAuthority ?? createTopologyExecutionAuthority({ env, ownerEnrollment });
     return {
         env,
         ...(authority ? { topologyExecutionAuthority: authority } : {}),
@@ -263,7 +265,7 @@ function createL2tpRootLifecycle({
             // not migrate/index or start consumers before durable capture.
             startPromise = Promise.resolve().then(async () => {
                 if (stopRequested) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
-                lifecycle = createRuntimeLifecycleHook({ env: ownerEnv, createHostDependencies, activeHostProvider, startWorkers: false });
+                lifecycle = createRuntimeLifecycleHook({ env: ownerEnv, createHostDependencies, activeHostProvider, startWorkers: false, ownerEnrollment: true });
                 return lifecycle.enrollTestOwners();
             });
             return startPromise;

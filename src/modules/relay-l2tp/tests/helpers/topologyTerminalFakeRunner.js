@@ -4,8 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const runner = path.join(__dirname, '../../node-artifacts/topology/runner.sh');
-function fakeRunner(t, bootId) {
-    const root = fs.mkdtempSync(path.join(process.env.TMPDIR, 'c3-terminal-runner-'));
+function fakeRunner(t, bootId, { root: existingRoot } = {}) {
+    const root = existingRoot || fs.mkdtempSync(path.join(process.env.TMPDIR, 'c3-terminal-runner-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const put = (name, content, mode = 0o600) => {
         const file = path.join(root, name);
@@ -13,7 +13,7 @@ function fakeRunner(t, bootId) {
         fs.writeFileSync(file, content, { mode });
     };
     put('proc/sys/kernel/random/boot_id', `${bootId}\n`);
-    put('usr/local/etc/xray/config.json', '{"old":true}\n');
+    if (!existingRoot) put('usr/local/etc/xray/config.json', '{"old":true}\n');
     fs.mkdirSync(path.join(root, 'usr/local/share/xray'), { recursive: true });
     fs.mkdirSync(path.join(root, 'var/lib'), { recursive: true });
     put('usr/local/bin/xray', '#!/bin/bash\nexit 0\n', 0o700);

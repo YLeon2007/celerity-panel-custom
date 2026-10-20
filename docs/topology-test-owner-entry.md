@@ -46,7 +46,9 @@ The CLI calls `createL2tpRootLifecycle().enrollTestOwnersAfterDatabase()`:
    public transaction and majority-readback checks succeed. Stop joins the entry
    and closes observers only. It never releases guards, locks or admission.
 
-Normal `index.js` startup never calls this entry. A root instance used for
+Normal `index.js` startup never calls this entry. It selects the distinct ordinary
+read-only postcapture composition, described in
+[ordinary TEST execution](topology-test-postcapture-execution.md). A root instance used for
 explicit enrollment cannot subsequently start its background workers or repeat
 that command. This is deliberately one-shot: no implicit adoption, raw owner
 rewrite, upsert, retry, rollback or cleanup after partial/uncertain writes.
@@ -55,7 +57,8 @@ Existing owners cause the public insert/CAS path to refuse. Recovery is separate
 ## Actual installed capture hook
 
 The fixed `testDurableOriginals` adapter is supplied by
-`createRootTestPhysicalAuthority`; no arbitrary module/path/opcode loader or
+`createRootTestPhysicalAuthority` only when the trusted explicit owner-entry
+composition selects `ownerEnrollment: true`; no arbitrary module/path/opcode loader or
 request-provided receipt selects authority. It opens the fixed installed
 `owner-channel` before the first lifecycle/controller assertion, carries fresh
 all-five observations from the actual pinned attestor inside the same capture

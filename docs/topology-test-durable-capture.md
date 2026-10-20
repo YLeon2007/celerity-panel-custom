@@ -38,13 +38,16 @@ No restoration, thaw, ownership release or dispatch reopening is introduced.
   frame in bounded fragments, checks deadlines, rejects duplicate/pipelined
   frames and EOF, and never repeats a logical operation. The separately owned
   restoration codec is unchanged.
-* The default root factory opens the installed `owner-channel` **before its
+* The explicit owner-enrollment root composition opens the installed `owner-channel` **before its
   first** physical/controller/lifecycle assertion and keeps it through public
   enrollment, the lifecycle's final `assertHeld`, the controller's final
   `assertHeld` and the adapter's final durable check. No separate observer SSH
   session or cached-observer fallback is used in this capture-bound scope.
   The default path is deliberately one-shot maintenance; subsequent execution,
   DB settlement and post-dispatch authority are not authorized by capture.
+  [Ordinary postcapture execution](topology-test-postcapture-execution.md) uses a
+  distinct trusted read-only composition with fresh existing-bundle validation,
+  not reuse of the one-shot capture capability.
 * The complete application owner challenge must equal the independently fixed
   root challenge before the first candidate DB write. This remains independent
   of captured state. Intent/bundle/`.next` uncertainty, channel EOF, guard/source/

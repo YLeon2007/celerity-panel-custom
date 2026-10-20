@@ -121,6 +121,7 @@ class InstallationTests(unittest.TestCase):
             try:
                 with os.fdopen(readfd, 'r') as inp, patch.object(fixture.m, 'STATE', root), \
                      patch.object(a, 'REQUEST_TIMEOUT_SECONDS', 0.03, create=True), \
+                     patch.object(a, 'durable_originals', return_value={'SIMULATED': True}), \
                      patch.object(a, 'observe', side_effect=lambda *_: time.sleep(2)):
                     started = time.monotonic()
                     with self.assertRaisesRegex(RuntimeError, 'PHYSICAL_ATTESTOR_TIMEOUT_RETAINED'):
@@ -130,6 +131,62 @@ class InstallationTests(unittest.TestCase):
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 signal.signal(signal.SIGALRM, previous)
+
+    def test_runtime_durable_originals_reads_existing_bundle_after_candidate_mutation_without_recapture(self):
+        import capture_fixture as fixture
+        with fixture.t.Fixture() as node:
+            node.module.decode_json = fixture.t.n.decode
+            node.writer.capture()
+            before = node.fs.read(fixture.t.n.BUNDLE)[0]
+            node.put(node.config, b'{"candidate":"changed after enrollment"}')
+            def read(path, directory=False):
+                with node.fs.opened(path, directory=directory) as fd:
+                    st = os.fstat(fd)
+                    return (b'' if directory else node.fs.read(path)[0],
+                            SimpleNamespace(st_uid=0, st_gid=0, st_mode=st.st_mode, st_nlink=st.st_nlink))
+            self.assertTrue(hasattr(a, 'durable_originals'), 'ordinary attestor cannot yet verify accepted durable originals')
+            value = a.durable_originals(node.engine, node.module, read=read)
+            self.assertEqual(value['readback']['configSha256'], node.accepted['profiles'][node.profile]['files']['config']['sha256'])
+            self.assertEqual(node.fs.read(fixture.t.n.BUNDLE)[0], before)
+            self.assertNotIn('private', json.dumps(value))
+            for fault in ['missing', 'bytes', 'identity', 'guard', 'runtime', 'partial']:
+                with self.subTest(fault=fault):
+                    if fault == 'missing': node.path(fixture.t.n.BUNDLE).unlink()
+                    elif fault == 'partial': node.put(fixture.t.n.BUNDLE+'.next', b'{}')
+                    else:
+                        bundle = json.loads(before)
+                        if fault == 'bytes': bundle['profiles'][node.profile]['files']['config']['data'] = 'Zm9yZWlnbg=='
+                        if fault == 'identity': bundle['bootId'] = 'foreign'
+                        if fault == 'guard': bundle['guard']['pid'] += 1
+                        if fault == 'runtime': bundle['profiles'][node.profile]['runtime'] = {'mode': 'none', 'inbounds': {'foreign': []}}
+                        node.put(fixture.t.n.BUNDLE, fixture.a.canonical(bundle))
+                    with self.assertRaises(Exception): a.durable_originals(node.engine, node.module, read=read)
+                    node.put(fixture.t.n.BUNDLE, before)
+                    node.path(fixture.t.n.BUNDLE+'.next').unlink(missing_ok=True)
+
+    def test_runtime_durable_originals_requires_the_dual_profile_backup_too(self):
+        import test_node_originals as fixture
+        with fixture.DualFixture() as node:
+            node.module.decode_json = fixture.n.decode
+            node.writer.capture()
+            before = node.fs.read(fixture.n.BUNDLE)[0]
+            def read(path, directory=False):
+                with node.fs.opened(path, directory=directory) as fd:
+                    st = os.fstat(fd)
+                    return (b'' if directory else node.fs.read(path)[0],
+                            SimpleNamespace(st_uid=0, st_gid=0, st_mode=st.st_mode, st_nlink=st.st_nlink))
+            self.assertEqual(a.durable_originals(node.engine, node.module, read=read)['version'], 1)
+            for fault in ['missing-profile', 'other-profile-bytes', 'metadata', 'accepted', 'mode']:
+                with self.subTest(fault=fault):
+                    bundle = json.loads(before)
+                    if fault == 'missing-profile': del bundle['profiles']['xray-main']
+                    if fault == 'other-profile-bytes': bundle['profiles']['xray-main']['files']['config']['data'] = 'Zm9yZWlnbg=='
+                    if fault == 'metadata': bundle['profiles']['xray-main']['files']['unit']['uid'] += 1
+                    if fault == 'accepted': bundle['acceptedSha256'] = 'f'*64
+                    node.put(fixture.n.BUNDLE, fixture.n.canonical(bundle))
+                    if fault == 'mode': node.path(fixture.n.BUNDLE).chmod(0o640)
+                    with self.assertRaises(Exception): a.durable_originals(node.engine, node.module, read=read)
+                    node.put(fixture.n.BUNDLE, before)
 
     def test_shared_mode_requires_the_actual_installed_shared_engine_hook(self):
         self.assertTrue(hasattr(a, 'select_engine'), 'shared engine selector missing')

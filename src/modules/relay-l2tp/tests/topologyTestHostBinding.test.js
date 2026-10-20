@@ -99,14 +99,19 @@ test.after(async () => {
 });
 async function fixture(t, fault, executionContext = TEST) {
     for (const model of Object.values(models)) await model.collection.deleteMany({});
+    const postcapture = fault?.startsWith('postcapture-');
+    const capture = postcapture ? await require('./helpers/durableCaptureFixture').actualFixture(t) : undefined;
+    const pin = capture?.physical.nodes.find(p => p.nodeId === NODE);
+    const identity = pin ? { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 } : IDENTITY;
+    const boot = pin?.physical.bootId || BOOT, maintenance = pin?.maintenanceId || MAINTENANCE;
     await models.HyNode.create({ _id: NODE, name: 'local-only', ip: ENDPOINT.ip, type: 'xray', active: true, cascadeRole: 'portal',
         ssh: { port: ENDPOINT.port, username: ENDPOINT.username, privateKey: randomBytes(32).toString('hex') } });
-    await models.TopologyConfigOwner.create({ executionContext, node: NODE, profile: 'xray-main', nodeIdentity: IDENTITY,
+    if (!postcapture) await models.TopologyConfigOwner.create({ executionContext, node: NODE, profile: 'xray-main', nodeIdentity: identity,
         owner: 'topology', generation: OWNER,
         originalSnapshot: { configSha256: hash, unitSha256: hash, serviceActive: 'active', serviceEnabled: 'enabled' },
-        adoptionReceipt: { proofId: randomUUID(), maintenanceId: MAINTENANCE, fromGeneration: randomUUID(), toGeneration: OWNER,
+        adoptionReceipt: { proofId: randomUUID(), maintenanceId: maintenance, fromGeneration: randomUUID(), toGeneration: OWNER,
             oldBackendInstanceId: 'simulated-controller', oldPid: 42, oldProcessStartTime: 'local-start', verifiedAt: new Date() } });
-    const runner = fakeRunner(t, BOOT), events = [], runnerExecutions = [];
+    const runner = fakeRunner(t, boot, capture ? { root: capture.nodeRoots[NODE] } : {}), events = [], runnerExecutions = [];
     runner.put('usr/local/bin/xray', await fs.readFile(process.env.C3_XRAY), 0o750);
     let xray;
     const stopXray = async () => {
@@ -127,20 +132,20 @@ async function fixture(t, fault, executionContext = TEST) {
             assert.equal(locked.generation, challenge.expected.generation); assert.equal(locked.remoteUncertain, true);
         }
         let predecessor = challenge.action === 'enroll'
-            ? { generation: 'none', bootId: BOOT, status: 'empty', protocolVersion: 2, journal: 'absent', legacyState: 'absent', writers: 'excluded' }
-            : { generation: 'none', bootId: BOOT, status: 'pre-enrolled' };
+            ? { generation: 'none', bootId: boot, status: 'empty', protocolVersion: 2, journal: 'absent', legacyState: 'absent', writers: 'excluded' }
+            : { generation: 'none', bootId: boot, status: 'pre-enrolled' };
         if (challenge.predecessor) {
             assert.ok(first);
             const request = `/usr/local/bin/celerity-topology-node-runner --command status --operation-id ${first.operationId} --node-id ${NODE} --candidate-hash ${first.candidateHash} --backup-id ${first.backupId} --target-profile xray-main --execution-context ${executionContext.hostIdentity} --attempt-id ${first.attemptId} --generation ${first.generation} --predecessor-generation ${first.predecessorGeneration} --command-id ${first.commandIds.close}`;
             const receipt = JSON.parse(restrictedExecute(runner, request).stdout);
             const journal = JSON.parse(await fs.readFile(path.join(runner.root, 'var/lib/celerity/topology/fences/xray-main/journal.json'), 'utf8'));
-            predecessor = { bindingId: first._id, generation: first.generation, headGeneration: journal.head, bootId: BOOT, status: 'terminal', receipt };
+            predecessor = { bindingId: first._id, generation: first.generation, headGeneration: journal.head, bootId: boot, status: 'terminal', receipt };
         }
         const result = await work({ authority: 'external-execution-maintenance-v1', status: 'verified', challenge: structuredClone(challenge),
-            proofId: randomUUID(), maintenanceId: MAINTENANCE, maintenance: 'held', allWriters: 'drained', bootstrapWriters: 'excluded',
-            physicalIdentity: IDENTITY, owner: 'topology', predecessor,
-            connectionAttestation: { authority: 'server-physical-ssh-endpoint-v1', endpoint: ENDPOINT, physicalIdentity: IDENTITY,
-                maintenanceId: MAINTENANCE, aliases: 'excluded', hostKeyDigest: 'raw-ssh-public-key-sha256', endpointReassignment: 'excluded' },
+            proofId: randomUUID(), maintenanceId: maintenance, maintenance: 'held', allWriters: 'drained', bootstrapWriters: 'excluded',
+            physicalIdentity: identity, owner: 'topology', predecessor,
+            connectionAttestation: { authority: 'server-physical-ssh-endpoint-v1', endpoint: ENDPOINT, physicalIdentity: identity,
+                maintenanceId: maintenance, aliases: 'excluded', hostKeyDigest: 'raw-ssh-public-key-sha256', endpointReassignment: 'excluded' },
             oldBackend: { instanceId: 'simulated-controller', pid: 42, processStartTime: 'local-start', processTree: 'stopped', dispatch: 'disabled' } });
         if (challenge.action === 'create') {
             if (fault === 'hold-lost') revoked = true;
@@ -156,11 +161,11 @@ async function fixture(t, fault, executionContext = TEST) {
     };
     const attestRunner = async (challenge, work) => {
         await runnerCheck();
-        assert.equal(challenge.binding.bootId, BOOT);
-        assert.equal(challenge.binding.maintenanceId, MAINTENANCE);
+        assert.equal(challenge.binding.bootId, boot);
+        assert.equal(challenge.binding.maintenanceId, maintenance);
         const proof = { authority: 'server-preinstalled-topology-runner-v1',
-            binding: structuredClone(challenge.binding), bootId: BOOT, maintenanceId: MAINTENANCE,
-            connection: { expectedEndpoint: ENDPOINT, expectedHostKeySha256: IDENTITY.sshHostKeySha256 },
+            binding: structuredClone(challenge.binding), bootId: boot, maintenanceId: maintenance,
+            connection: { expectedEndpoint: ENDPOINT, expectedHostKeySha256: identity.sshHostKeySha256 },
             runner: { path: TOPOLOGY_RUNNER_PATH, sha256: TOPOLOGY_RUNNER_SHA256, mode: TOPOLOGY_RUNNER_MODE,
                 owner: 'root', regularFile: true, symlink: false, writableByRunner: false },
             profile: { targetProfile: 'xray-main', configDirectoryReady: true, bridgeUnitSha256: null, bridgeUnitDropIns: null },
@@ -186,7 +191,7 @@ async function fixture(t, fault, executionContext = TEST) {
     } };
     if (fault === 'operational-root') {
         const { physicalControllerFixture } = require('./helpers/physicalControllerFixture');
-        const physical = physicalControllerFixture(t, { nodeId: NODE, identity: IDENTITY, bootId: BOOT, maintenanceId: MAINTENANCE, runnerRoot: runner.root });
+        const physical = physicalControllerFixture(t, { nodeId: NODE, identity: identity, bootId: boot, maintenanceId: maintenance, runnerRoot: runner.root });
         authority = { runnerTransport: physical.runnerTransport, close: () => physical.close(),
             withHeldAuthority: (context, work) => physical.withHeldAuthority(context, async capability => {
                 active = true;
@@ -199,20 +204,22 @@ async function fixture(t, fault, executionContext = TEST) {
         };
     }
     // Enrollment is separate explicit server maintenance, never implicit worker adoption.
+    if (!postcapture) {
     active = true;
     try {
         const store = new TopologyExecutionBindingStore({ executionContext, withVerifiedAuthority: fault === 'operational-root'
             ? (challenge, callback) => authority.withHeldAuthority(TEST, capability => capability.withVerifiedAuthority(challenge, callback)) : attest,
             Operation: models.TopologyOperation, Lock: models.NodeOperationLock, Owner: models.TopologyConfigOwner,
             Enrollment: models.TopologyExecutionEnrollment, Binding: models.TopologyExecutionBinding, HyNode: models.HyNode });
-        if (fault !== 'no-enrollment') await store.preEnroll(freeze({ nodeId: NODE, targetProfile: 'xray-main', endpoint: ENDPOINT, nodeIdentity: IDENTITY,
-            ownerGeneration: OWNER, predecessorGeneration: 'none', bootId: BOOT }));
+        if (fault !== 'no-enrollment') await store.preEnroll(freeze({ nodeId: NODE, targetProfile: 'xray-main', endpoint: ENDPOINT, nodeIdentity: identity,
+            ownerGeneration: OWNER, predecessorGeneration: 'none', bootId: boot }));
     } finally { active = false; }
+    }
     class LocalSSH {
         constructor(actual, trusted) {
             events.push('ssh');
-            assert.equal(active, true);
-            assert.deepEqual(trusted, { expectedEndpoint: ENDPOINT, expectedHostKeySha256: IDENTITY.sshHostKeySha256 });
+            if (!postcapture) assert.equal(active, true);
+            assert.deepEqual(trusted, { expectedEndpoint: ENDPOINT, expectedHostKeySha256: identity.sshHostKeySha256 });
             assert.equal(actual.ip, ENDPOINT.ip);
             if (fault === 'runner-loss-on-resolve') runnerRevoked = true;
         }
@@ -221,9 +228,12 @@ async function fixture(t, fault, executionContext = TEST) {
             // Do not give this local SSH seam a revocation gate that the actual
             // adapter lacks: only source-owned lifecycle/store checks may refuse.
             events.push(command); // Count attempts even if a local assertion refuses.
-            assert.equal(active, true);
-            assert.ok(runnerHeld > 0, 'attestor callback must span real dispatch');
-            const result = restrictedExecute(runner, command, options);
+            if (!postcapture) assert.equal(active, true);
+            if (!postcapture) assert.ok(runnerHeld > 0, 'attestor callback must span real dispatch');
+            const actual = postcapture ? spawnSync('/usr/bin/python3', [path.join(__dirname,
+                '../../../../scripts/test-node-isolation/capture_fixture.py'), 'runtime-dispatch', runner.root, command],
+                { encoding: 'utf8', input: options?.stdin, timeout: 45000 }) : undefined;
+            const result = postcapture ? { code: actual.status, stdout: actual.stdout, stderr: actual.stderr } : restrictedExecute(runner, command, options);
             assert.equal(result.code, 0, result.stderr);
             runnerExecutions.push(command);
             if (command.includes('--command commit ')) {
@@ -233,6 +243,9 @@ async function fixture(t, fault, executionContext = TEST) {
                 xray = spawn(process.env.C3_XRAY, ['run', '-config', path.join(runner.root, 'usr/local/etc/xray/config.json')], { stdio: 'ignore' });
                 await until(() => { const result = queryUsers(); assert.equal(result.status, 0, result.stderr);
                     assert.deepEqual(JSON.parse(result.stdout).users || [], []); });
+            }
+            if (fault === 'postcapture-guard-loss' && command.includes('--command commit ')) {
+                await fs.writeFile(path.join(capture.nodeRoots[capture.physical.nodes.at(-1).nodeId], 'fixture-live.json'), JSON.stringify({ held: false }));
             }
             if (fault === 'hold-lost-after-close' && command.includes('--command close ')) revoked = true;
             if (fault === 'runner-loss-after-commit' && command.includes('--command commit ')) runnerRevoked = true;
@@ -252,7 +265,7 @@ async function fixture(t, fault, executionContext = TEST) {
         createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start() {}, async stop() {} }),
         createTopologyRecoveryLifecycle: () => ({ start() {}, async stop() {} }), workerId: 'assembled-host', leaseMs: 120000 };
     let host;
-    if (fault === 'operational-root') {
+    if (fault === 'operational-root' || postcapture) {
         // Non-topology L2TP services are inert local seams; topology remains real.
         const noop = () => {};
         hostOptions.createExecutionRuntime = () => ({ runtime: {
@@ -263,14 +276,14 @@ async function fixture(t, fault, executionContext = TEST) {
         const { createL2tpRootLifecycle, createL2tpRootHostDependencies, createL2tpRuntimeLifecycleHook } = require('../../l2tpRuntimeLifecycleHook');
         const { createL2tpStartupLifecycle } = require('../../createL2tpStartupLifecycle');
         const noWork = () => {};
-        const root = createL2tpRootLifecycle({ env: hostOptions.env,
+        const makeRoot = () => createL2tpRootLifecycle({ env: hostOptions.env,
             createMigrationBootstrap: () => ({ async run() {} }),
             ensureModelIndexes: async () => { await Promise.all(Object.values(models).map(model => model.init())); },
-            createHostDependencies: ({ env }) => createL2tpRootHostDependencies({ ...hostOptions, env,
+            createHostDependencies: ({ env, ownerEnrollment }) => createL2tpRootHostDependencies({ ...hostOptions, env, ownerEnrollment,
                 // The ordinary root factory selects the real operational controller;
                 // its subprocess physical/SSH boundary is explicitly simulated.
                 topologyExecutionAuthority: undefined,
-                createTopologyExecutionAuthority: () => authority,
+                createTopologyExecutionAuthority: capture ? ({ ownerEnrollment }) => capture.createController(ownerEnrollment) : () => authority,
                 candidateUserResolver: async () => [], syncService: null,
                 requireAuth: noWork, requireOnboarding: noWork, csrf: noWork, rateLimiter: noWork, renderPage: noWork,
                 secretBox: { encrypt() {}, decrypt() {} }, secretKey: 'local-only',
@@ -279,6 +292,26 @@ async function fixture(t, fault, executionContext = TEST) {
                 createStartupLifecycle: options => createL2tpStartupLifecycle({ ...options,
                     createPanelHost(dependencies) { host = createL2tpPanelHost({ ...hostOptions, ...dependencies }); return host; } }) }),
         });
+        if (postcapture) {
+            for (const other of capture.physical.nodes.filter(p => p.nodeId !== NODE)) await models.HyNode.create({
+                _id: other.nodeId, name: 'local-only-other', ip: other.endpoint.ip, type: 'xray', active: true,
+                cascadeRole: other.targetProfile === 'xray-main' ? 'portal' : 'bridge',
+                ssh: { port: 2222, username: other.endpoint.username, privateKey: 'SIMULATED-unused' } });
+            const maintenanceRoot = makeRoot();
+            const enrolled = await maintenanceRoot.enrollTestOwnersAfterDatabase();
+            assert.equal(enrolled.status, 'enrolled'); assert.equal(enrolled.nodes.length, 5);
+            assert.equal(await models.TopologyConfigOwner.countDocuments({ owner: 'topology' }), 5);
+            assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 5);
+            assert.equal(await models.TopologyOperation.countDocuments(), 0);
+            assert.equal(await models.TopologyExecutionBinding.countDocuments(), 0);
+            await maintenanceRoot.stop();
+            capture.controller.close();
+            // Fixture teardown barrier only, not a proof or runtime capability.
+            // The real operator likewise waits for the foreground capture
+            // coordinator to exit while retaining independent kernel/SSH guards.
+            await capture.captureHoldersClosed;
+        }
+        const root = makeRoot();
         await root.startAfterDatabase();
         t.after(() => root.stop());
     } else {
@@ -289,7 +322,7 @@ async function fixture(t, fault, executionContext = TEST) {
     // The subscription lookup is local; actual nonempty RPC/readback goes via
     // source resync + exact scoped typed transport + restricted runner + Xray.
     service.operationWorker.userResync._syncService = {
-        async _getUsersForNode() { await assertHeld(); return fault === 'empty-users' ? [] : [{ userId: 'alice', xrayUuid: '550e8400-e29b-41d4-a716-446655440000' }]; },
+        async _getUsersForNode() { if (!postcapture) await assertHeld(); return fault === 'empty-users' ? [] : [{ userId: 'alice', xrayUuid: '550e8400-e29b-41d4-a716-446655440000' }]; },
         async addXrayUser() { assert.fail('legacy cc-agent must stay masked'); },
     };
     async function operation(revision) {
@@ -301,9 +334,68 @@ async function fixture(t, fault, executionContext = TEST) {
             topologyRevision: revision, priorDeployedRevision: revision - 1, nodes: [node], heldTopologyAdmission: true, admissionFingerprint: hash, session }));
         return operationId;
     }
-    return { operationalRoot: fault === 'operational-root', worker: service.operationWorker, operation, events, runnerExecutions, revoke: () => { revoked = true; }, setFirst: row => { first = row; },
+    return { capture, runner, operationalRoot: fault === 'operational-root', worker: service.operationWorker, operation, events, runnerExecutions, revoke: () => { revoked = true; }, setFirst: row => { first = row; },
         replayFirst: () => restrictedExecute(runner, events.find(event => event.includes('--command prepare ')), { stdin: content }) };
 }
+test('postcapture ordinary DEFAULT worker executes two real restricted runner generations after public all-five owner enrollment; missing original revokes before DB', async t => {
+    const f = await fixture(t, 'postcapture-root');
+    const bundlePaths = Object.values(f.capture.nodeRoots).map(root => path.join(root, 'var/lib/c3-test-node-isolation/originals/originals.json'));
+    const before = await Promise.all(bundlePaths.map(file => fs.readFile(file)));
+    let prior;
+    for (const revision of [37, 38]) {
+        const id = await f.operation(revision);
+        const result = await f.worker.run(id);
+        assert.equal(result.status, 'succeeded', JSON.stringify(result));
+        const binding = await models.TopologyExecutionBinding.findOne({ operationId: id }).lean();
+        assert.ok(binding);
+        assert.equal(binding.predecessorGeneration, prior?.generation || 'none');
+        if (prior) assert.equal(binding.predecessorBindingId, prior._id);
+        prior = binding;
+        assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+        assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 0);
+        assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, false);
+    }
+    assert.equal(await models.TopologyConfigOwner.countDocuments({ owner: 'topology' }), 5);
+    assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 5);
+    assert.equal(await models.TopologyExecutionBinding.countDocuments(), 2);
+    for (let n = 0; n < before.length; n++) assert.deepEqual(await fs.readFile(bundlePaths[n]), before[n], 'runtime must never overwrite/recapture originals');
+    const { runnerRequest } = require('./helpers/topologyV2Fixture');
+    assert.deepEqual(f.runnerExecutions.map(command => runnerRequest(command).command),
+        ['prepare', 'commit', 'verify', 'restore-users', 'close', 'status',
+            'prepare', 'commit', 'verify', 'restore-users', 'close', 'status']);
+    const isolation = JSON.parse(await fs.readFile(path.join(f.runner.root, 'var/lib/c3-test-node-isolation/journal.json'), 'utf8'));
+    assert.equal(isolation.dispatchCount, 12); assert.equal(isolation.dispatchInFlight, null);
+    const id = await f.operation(39), events = [...f.events];
+    const victim = bundlePaths.at(-1);
+    await fs.unlink(victim);
+    const commands = [], record = e => commands.push(e.commandName);
+    connection.getClient().on('commandStarted', record);
+    try {
+        await f.worker.run(id);
+        assert.deepEqual(commands, [], 'one missing nonselected-node durable original must refuse before any worker DB access');
+        await fs.writeFile(victim, before.at(-1), { mode: 0o600 });
+        await f.worker.run(id);
+        assert.deepEqual(commands, [], 'repair cannot resurrect poisoned default authority');
+    } finally { connection.getClient().off('commandStarted', record); }
+    assert.deepEqual(f.events, events);
+    assert.equal((await models.TopologyOperation.findById(id).lean()).attempts, 0);
+});
+
+test('postcapture default authority detects other-node guard loss after actual commit, dispatches nothing further and retains Mongo ownership', async t => {
+    const f = await fixture(t, 'postcapture-guard-loss'), id = await f.operation(47);
+    const result = await f.worker.run(id);
+    assert.equal(result.stopped, true); assert.equal(result.drainUncertain, true);
+    const { runnerRequest } = require('./helpers/topologyV2Fixture');
+    assert.deepEqual(f.runnerExecutions.map(command => runnerRequest(command).command), ['prepare', 'commit'], JSON.stringify({ result, events: f.events }));
+    assert.equal(await models.NodeOperationLock.countDocuments({ operationId: id, remoteUncertain: true }), 1);
+    assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, true);
+    assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 1);
+    assert.equal(await models.TopologyConfigOwner.countDocuments({ owner: 'topology' }), 5);
+    assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 5);
+    const isolation = JSON.parse(await fs.readFile(path.join(f.runner.root, 'var/lib/c3-test-node-isolation/journal.json'), 'utf8'));
+    assert.equal(isolation.dispatchCount, 2); assert.equal(isolation.dispatchInFlight, null);
+});
+
 test('ordinary root reaches real TEST store/default worker through operational subprocess controller for two serial generations', async t => {
     const f = await fixture(t, 'operational-root');
     assert.equal(f.operationalRoot, true, 'ordinary root + operational controller assembly missing');

@@ -24,6 +24,12 @@ calls. No SSH is opened at module import or dependency construction.
 
 The same `topologyExecutionAuthority` flows through the existing panel host,
 `TopologyExecutionAuthorityLifecycle`, actual binding store and default executor.
+Ordinary startup selects the read-only postcapture controller; only the internal
+explicit owner entry selects one-shot capture. Every ordinary all-five read now
+validates the existing durable original bundles, including both profiles on the
+dual-profile relay, without requiring zero previous dispatches. Missing/drifted
+originals permanently refuse. See [postcapture composition and actual assembled
+evidence](topology-test-postcapture-execution.md).
 It selects only `preinstalled-attested-v1`. No bootstrap, SFTP, shell inspection,
 runner install, node mask/stop, host kill, thaw or restoration fallback exists.
 
@@ -152,8 +158,9 @@ Remaining parent gates are explicit:
 * supported owner adoption and explicit `preEnroll` before worker execution.
   The explicit [TEST owner command](topology-test-owner-entry.md) now composes
   that public path through the ordinary root/default binding store without
-  starting consumers. It remains refused by default until the separately trusted
-  all-five crash-durable NodeOriginals capture hook is implemented;
+  starting consumers. Its separately trusted all-five crash-durable NodeOriginals
+  capture hook is now implemented; normal execution never reuses that one-shot
+  capture capability and requires fresh durable-original/external-guard checks;
   The controller now implements TEST-only
   `TopologyConfigTransfer.withVerifiedMaintenance` through the held lifecycle;
   see [original-byte maintenance](topology-test-owner-maintenance.md). It requires

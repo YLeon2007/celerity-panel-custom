@@ -142,6 +142,67 @@ test('disabled/wrong/missing private authority performs zero reads or SSH and wr
     assert.equal(opens, 0); controller.close();
 });
 
+test('ordinary default authority observes all five durable originals without invoking the one-shot capture adapter', async t => {
+    const config = pins(); config.host.guard.owner = config.host.owner;
+    for (const pin of config.nodes) pin.originalSnapshot = { proofRef: 'accepted-original', configSha256: 'b'.repeat(64),
+        unitSha256: 'c'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+    let observations = 0, escaped;
+    const controller = api.createRootTestPhysicalAuthority({
+        env: { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity },
+        read(file) { assert.equal(file, '/etc/celerity/topology-test-physical.json', 'ordinary runtime must never read capture configuration'); return Buffer.from(JSON.stringify(config)); },
+        captureSpawn() { assert.fail('ordinary runtime must never capture or recapture'); },
+        openChannel: async pin => ({ alive: true, close() {}, async request() {
+            observations++;
+            const { proofRef: _ref, ...snapshot } = pin.originalSnapshot;
+            return { ...observation(config, pin), durableOriginals: { version: 1, bundleSha256: 'd'.repeat(64),
+                readback: { source: 'node-readback', ...snapshot } } };
+        } }),
+    });
+    t.after(() => controller.close());
+    for (let i = 0; i < 2; i++) assert.equal(await controller.withHeldAuthority(TEST, async capability => {
+        escaped = capability.assertHeld; await capability.assertHeld(); return 17;
+    }), 17);
+    assert.ok(observations >= 30, 'fresh all-five observations must span each ordinary held invocation');
+    await assert.rejects(escaped);
+});
+
+test('ordinary default refuses any missing/drifted durable original and never falls back to capture or repaired observations', async t => {
+    for (const nodeId of Object.keys(NODES)) for (const fault of ['missing', 'digest']) await t.test(`${nodeId}:${fault}`, async t => {
+        const config = pins(); config.host.guard.owner = config.host.owner;
+        for (const pin of config.nodes) pin.originalSnapshot = { proofRef: 'accepted-original', configSha256: 'b'.repeat(64),
+            unitSha256: 'c'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+        let changed = false, entered = 0;
+        const controller = api.createRootTestPhysicalAuthority({
+            env: { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity,
+                TOPOLOGY_TEST_OWNER_ENROLLMENT: 'true' }, // ignored; not an authority selector
+            read(file) { assert.equal(file, '/etc/celerity/topology-test-physical.json'); return Buffer.from(JSON.stringify(config)); },
+            captureSpawn() { assert.fail('no capture fallback'); },
+            openChannel: async pin => ({ alive: true, close() {}, async request() {
+                const { proofRef: _ref, ...snapshot } = pin.originalSnapshot;
+                const value = { ...observation(config, pin), durableOriginals: { version: 1, bundleSha256: 'd'.repeat(64),
+                    readback: { source: 'node-readback', ...snapshot } } };
+                if (changed && pin.nodeId === nodeId) {
+                    if (fault === 'missing') delete value.durableOriginals;
+                    else value.durableOriginals.readback.configSha256 = 'f'.repeat(64);
+                }
+                return value;
+            } }),
+        });
+        t.after(() => controller.close());
+        await assert.rejects(controller.withHeldAuthority(TEST, async capability => {
+            entered++; changed = true; await assert.rejects(capability.assertHeld());
+            changed = false; await assert.rejects(capability.assertHeld());
+        }));
+        assert.equal(entered, 1);
+        await assert.rejects(controller.withHeldAuthority(TEST, () => assert.fail('poisoned runtime reused')));
+    });
+    const config = pins(); config.host.guard.owner = config.host.owner;
+    assert.throws(() => api.createRootTestPhysicalAuthority({
+        env: { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST.hostIdentity },
+        read: () => Buffer.from(JSON.stringify(config)), captureSpawn() { assert.fail('missing pins cannot select capture'); },
+    }), /TEST_PHYSICAL_AUTHORITY/);
+});
+
 test('held physical controller exposes actual config-transfer maintenance (not a caller callback)', async t => {
     const { controller } = setup(t);
     let method;

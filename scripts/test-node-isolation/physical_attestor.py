@@ -131,6 +131,67 @@ def config_snapshot(profile, host, read=secure_read, paths=None):
                          'serviceActive': after['ActiveState'], 'serviceEnabled': after['UnitFileState']}}
 
 
+def durable_originals(engine, m, read=secure_read):
+    """Read-only validation of the already published capture, never recapture.
+
+    Compare *all* profiles (including the dual-profile relay) with independently
+    accepted pins. Current candidate config/runtime may legitimately differ. No
+    historical observation, receipt or process cache is used as permission.
+    Called only under attest()'s outer lock and live exclusion checks.
+    """
+    state = engine.assert_held()
+    root = '/var/lib/c3-test-node-isolation/originals'
+    bundle_path = root + '/originals.json'
+    accepted_path = '/etc/c3-test-node-originals.json'
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    sha = lambda raw: hashlib.sha256(raw).hexdigest()
+    for directory in ('/var/lib/c3-test-node-isolation', root):
+        _, info = read(directory, directory=True)
+        need(info.st_uid == 0 and info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o700, 'PRIVATE_ORIGINALS_REQUIRED')
+    for pending in ('originals.json.next', 'restore.json', 'restore.json.next'):
+        try:
+            read(root + '/' + pending)
+        except FileNotFoundError:
+            continue
+        need(False, 'PARTIAL_ORIGINALS_RETAINED')
+    accepted_raw, _ = read(accepted_path)
+    accepted = m.decode_json(accepted_raw)
+    raw, info = read(bundle_path)
+    need(info.st_uid == 0 and info.st_gid == 0 and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600,
+         'PRIVATE_ORIGINALS_REQUIRED')
+    bundle = m.decode_json(raw)
+    identity = {k: engine.plan[k] for k in ('context', 'nodeId', 'endpointIp', 'targetProfile', 'machineId', 'bootId',
+                                          'sshHostKeySha256', 'maintenanceId')}
+    identity['planHash'] = engine.plan_hash
+    profiles = ['xray-main', 'xray-bridge'] if identity['endpointIp'] == '104.143.201.72' else [identity['targetProfile']]
+    need(set(accepted) == {'version', *identity, 'isolationSha256', 'xraySha256', 'profiles'} and
+         type(accepted['version']) is int and accepted['version'] == 1 and
+         all(accepted[k] == v for k, v in identity.items()) and set(accepted['profiles']) == set(profiles), 'ORIGINAL_ACCEPTED_IDENTITY_DRIFT')
+    need(sha(read(HELPER)[0]) == accepted['isolationSha256'], 'ORIGINAL_ISOLATION_PIN_DRIFT')
+    need(set(bundle) == {'version', *identity, 'guard', 'profiles', 'acceptedSha256'} and
+         type(bundle['version']) is int and bundle['version'] == 1 and raw == canonical(bundle) and
+         all(bundle[k] == v for k, v in identity.items()) and bundle['guard'] == state['guard'] and
+         bundle['acceptedSha256'] == sha(canonical(accepted)) and set(bundle['profiles']) == set(profiles), 'ORIGINAL_BUNDLE_IDENTITY_DRIFT')
+    for profile in profiles:
+        original, pins = bundle['profiles'][profile], accepted['profiles'][profile]
+        need(set(original) == {'files', 'service', 'runtime'} and set(original['files']) == {'config', 'unit'} and
+             set(pins) == {'files', 'service', 'runtimeSha256'} and original['service'] == pins['service'] and
+             sha(canonical(original['runtime'])) == pins['runtimeSha256'], 'ORIGINAL_PIN_DRIFT')
+        for name in ('config', 'unit'):
+            item = original['files'][name]
+            need(set(item) == {'sha256', 'mode', 'uid', 'gid', 'xattrs', 'data'} and
+                 {k: v for k, v in item.items() if k != 'data'} == pins['files'][name], 'ORIGINAL_METADATA_DRIFT')
+            data = base64.b64decode(item['data'], validate=True)
+            need(len(data) <= 512 * 1024 and base64.b64encode(data).decode() == item['data'] and sha(data) == item['sha256'],
+                 'ORIGINAL_BYTES_DRIFT')
+    need(read(bundle_path)[0] == raw and read(accepted_path)[0] == accepted_raw and
+         engine.assert_held()['guard'] == state['guard'], 'ORIGINALS_CHANGED')
+    selected = bundle['profiles'][identity['targetProfile']]
+    return {'version': 1, 'bundleSha256': sha(raw), 'readback': {'source': 'node-readback',
+            'configSha256': selected['files']['config']['sha256'], 'unitSha256': selected['files']['unit']['sha256'],
+            'serviceActive': selected['service']['ActiveState'], 'serviceEnabled': selected['service']['UnitFileState']}}
+
+
 def runner_state(plan, m, predecessor):
     root = Path('/var/lib/celerity/topology')
     fence = root / 'fences' / plan['targetProfile']
@@ -217,7 +278,15 @@ def attest(engine, m, shared, request, *, held=None):
         fd = os.open(Path(m.STATE) / 'lock', os.O_RDONLY | os.O_NOFOLLOW)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            before = os.fstat(fd)
+            state = engine.assert_held()
+            engine.host.guard_check(state['guard'], engine.host.operator_session())
+            durable = durable_originals(engine, m)
             result = observe(engine, m, shared, request['predecessor'])
+            need(durable_originals(engine, m) == durable, 'ORIGINALS_CHANGED')
+            named = (Path(m.STATE) / 'lock').lstat()
+            need((before.st_dev, before.st_ino) == (named.st_dev, named.st_ino), 'OUTER_LOCK_REPLACED')
+            result['durableOriginals'] = durable
         finally:
             os.close(fd)
     return {'nonce': request['nonce'], 'observation': result}

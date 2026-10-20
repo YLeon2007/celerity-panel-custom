@@ -25,6 +25,13 @@ def read(path, directory=False):
 
 
 class Host:
+    def operator_session(self):
+        return {'pid': 78, 'start': '999'}  # explicitly simulated independent SSH
+
+    def guard_check(self, guard, session=None):
+        a.need(guard == value['guard'] and session == self.operator_session() and
+               (root / 'guard-alive').read_text() == 'held', 'SIMULATED_GUARD_LOST')
+
     def physical(self):
         return value['physical']  # explicitly simulated independent fixture
 
@@ -53,6 +60,11 @@ setattr(a, 'installation', lambda profile, host: original_installation(profile, 
 # This fixture exercises maintenance, not runner journal authority (covered by
 # actual runner_state tests). Physical guard and systemd observations are simulated.
 setattr(a, 'runner_state', lambda *_: {'head': None, 'journal': 'absent', 'legacyState': 'absent', 'terminal': None})
+# This pre-existing narrow maintenance codec unit fixture SIMULATES the durable
+# precondition as it simulates runner state. It does not instantiate the ordinary
+# root authority or claim capture proof. Real capture/bundle/default execution is
+# exercised by durableCaptureFixture + topologyTestHostBinding's postcapture path.
+setattr(a, 'durable_originals', lambda *_: {'SIMULATED_MAINTENANCE_CODEC_PRECONDITION': True})
 original_observe = a.observe
 
 
