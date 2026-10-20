@@ -7,7 +7,7 @@ const { Types: { ObjectId } } = require('mongoose');
 const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
 const { projectCanonicalXrayCandidate } = require('../services/topologyXrayCandidate');
-const { UUID, ID, TOKEN, COMMANDS, EXPECTED_KEYS, RECORD_KEYS, exact, freeze, failure } = require('../models/topologyExecutionBindingContract');
+const { UUID, ID, TOKEN, COMMANDS, EXPECTED_KEYS, RECORD_KEYS, exact, freeze, failure, validTerminalReceipt } = require('../models/topologyExecutionBindingContract');
 const TIMEOUT_MS = 5000;
 const ENROLLMENT_KEYS = ['nodeId', 'targetProfile', 'endpoint', 'nodeIdentity', 'ownerGeneration', 'predecessorGeneration', 'bootId'];
 const ENROLLMENT_ROW_KEYS = ['_id', 'executionContext', 'proofId', 'maintenanceId', ...ENROLLMENT_KEYS];
@@ -39,7 +39,11 @@ function validIdentity(identity) {
 function validEnrollment(value) {
     return exact(value, ENROLLMENT_KEYS) && matches(value.nodeId, ID) && PROFILES.includes(value.targetProfile)
         && validEndpoint(value.endpoint) && validIdentity(value.nodeIdentity) && matches(value.ownerGeneration, UUID)
-        && matches(value.predecessorGeneration, UUID) && matches(value.bootId, UUID);
+        && (value.predecessorGeneration === 'none' || matches(value.predecessorGeneration, UUID)) && matches(value.bootId, UUID);
+}
+function emptyHead(enrollment) {
+    return { generation: 'none', bootId: enrollment.bootId, status: 'empty', protocolVersion: 2,
+        journal: 'absent', legacyState: 'absent', writers: 'excluded' };
 }
 function enrollmentProjection(row) {
     return Object.fromEntries(ENROLLMENT_KEYS.map(key => [key, row[key]]));
@@ -92,7 +96,7 @@ class TopologyExecutionBindingStore {
                 { 'nodeIdentity.sshHostKeySha256': 1, targetProfile: 1 },
                 { 'nodeIdentity.machineId': 1 }, { 'nodeIdentity.sshHostKeySha256': 1 },
                 { 'endpoint.ip': 1, 'endpoint.port': 1 }],
-            Binding: [{ operationId: 1, nodeId: 1, targetProfile: 1 }, { enrollmentId: 1 }, { attemptId: 1 }, { commandTokens: 1 }],
+            Binding: [{ operationId: 1, nodeId: 1, targetProfile: 1 }, { enrollmentId: 1, predecessorGeneration: 1 }, { enrollmentId: 1, generation: 1 }, { attemptId: 1 }, { commandTokens: 1 }],
         };
         for (const [name, keys] of Object.entries(requirements)) {
             let indexes;
@@ -182,9 +186,10 @@ class TopologyExecutionBindingStore {
         return row;
     }
 
-    async #scope(action, enrollment, expected, work) {
+    async #scope(action, enrollment, expected, work, predecessor = null) {
         const challenge = freeze({ action, nonce: randomUUID(), executionContext: { ...PROD },
-            enrollment: structuredClone(enrollment), ...(expected ? { expected: { ...expected } } : {}) });
+            enrollment: structuredClone(enrollment), ...(expected ? { expected: { ...expected } } : {}),
+            ...(predecessor ? { predecessor: { bindingId: predecessor._id, binding: recordProjection(predecessor) } } : {}) });
         let open = true, invoked = false, finished = false, pending, result;
         const ensureOpen = () => { if (!open) throw failure(); };
         const callback = proof => {
@@ -204,14 +209,25 @@ class TopologyExecutionBindingStore {
                     || proof.connectionAttestation.maintenanceId !== proof.maintenanceId
                     || !isDeepStrictEqual(proof.connectionAttestation.endpoint, enrollment.endpoint)
                     || !isDeepStrictEqual(proof.connectionAttestation.physicalIdentity, enrollment.nodeIdentity)
-                    || !isDeepStrictEqual(proof.predecessor, { generation: enrollment.predecessorGeneration,
-                        bootId: enrollment.bootId, status: 'pre-enrolled' })
+                    || (predecessor ? !exact(proof.predecessor, ['bindingId', 'generation', 'headGeneration', 'bootId', 'status', 'receipt'])
+                        || proof.predecessor.bindingId !== predecessor._id
+                        || proof.predecessor.generation !== predecessor.generation || proof.predecessor.bootId !== predecessor.bootId
+                        || !(action === 'successor' ? [predecessor.generation] : [predecessor.generation, expected.generation])
+                            .includes(proof.predecessor.headGeneration)
+                        || proof.predecessor.status !== 'terminal' || !validTerminalReceipt(proof.predecessor.receipt, predecessor)
+                        : !isDeepStrictEqual(proof.predecessor, action === 'enroll' && enrollment.predecessorGeneration === 'none'
+                        ? emptyHead(enrollment) : { generation: enrollment.predecessorGeneration,
+                            bootId: enrollment.bootId, status: 'pre-enrolled' }))
                     || proof.oldBackend?.processTree !== 'stopped' || proof.oldBackend?.dispatch !== 'disabled'
                     || !token(proof.oldBackend.instanceId) || !Number.isSafeInteger(proof.oldBackend.pid)
                     || proof.oldBackend.pid < 1 || typeof proof.oldBackend.processStartTime !== 'string'
                     || !proof.oldBackend.processStartTime) throw failure();
                 // Copy authority metadata before awaits; never retain its mutable proof object.
-                const receipt = freeze({ proofId: proof.proofId, maintenanceId: proof.maintenanceId });
+                const receipt = freeze({ proofId: proof.proofId, maintenanceId: proof.maintenanceId,
+                    ...(predecessor ? { predecessorBindingId: predecessor._id,
+                        predecessorReceipt: structuredClone(proof.predecessor.receipt) } : {}),
+                    ...(action === 'enroll' && enrollment.predecessorGeneration === 'none'
+                        ? { provisioningReceipt: structuredClone(proof.predecessor) } : {}) });
                 result = await work(receipt, ensureOpen);
                 ensureOpen();
                 finished = true;
@@ -293,20 +309,53 @@ class TopologyExecutionBindingStore {
     async #enrollment(expected) {
         const row = await this.#majority(this.#models.Enrollment, { executionContext: PROD.hostIdentity,
             nodeId: expected.nodeId, targetProfile: expected.targetProfile });
-        if (!exact(row, ENROLLMENT_ROW_KEYS) || !matches(row._id, UUID)
+        if (!exact(row, [...ENROLLMENT_ROW_KEYS, ...(row?.predecessorGeneration === 'none' ? ['provisioningReceipt'] : [])])
+            || (row.predecessorGeneration === 'none' && !isDeepStrictEqual(row.provisioningReceipt, emptyHead(row)))
+            || !matches(row._id, UUID)
             || !matches(row.proofId, UUID) || !matches(row.maintenanceId, UUID)
             || !validEnrollment(enrollmentProjection(row))) throw failure();
         return freeze(structuredClone(row));
     }
     #checkRow(row, enrollment, expected) {
-        if (!exact(row, BINDING_ROW_KEYS) || !matches(row.proofId, UUID) || !matches(row.maintenanceId, UUID)
+        if (!exact(row, [...BINDING_ROW_KEYS, ...(row?.predecessorBindingId ? ['predecessorBindingId', 'predecessorReceipt'] : [])])
+            || !matches(row.proofId, UUID) || !matches(row.maintenanceId, UUID)
             || row.enrollmentId !== enrollment._id || row.executionContext !== PROD.hostIdentity
-            || !isDeepStrictEqual(enrollmentProjection(row), enrollmentProjection(enrollment))
+            || !isDeepStrictEqual(enrollmentProjection(row), { ...enrollmentProjection(enrollment),
+                ...(row.predecessorBindingId ? { predecessorGeneration: row.predecessorGeneration } : {}) })
+            || (row.predecessorBindingId && (!matches(row.predecessorBindingId, UUID)
+                || !matches(row.predecessorGeneration, UUID)
+                || !validTerminalReceipt(row.predecessorReceipt, { ...row.predecessorReceipt,
+                    commandIds: { close: row.predecessorReceipt?.commandId }, bootId: enrollment.bootId })
+                || row.predecessorReceipt.generation !== row.predecessorGeneration
+                || ['nodeId', 'targetProfile', 'executionContext'].some(key => row.predecessorReceipt[key] !== row[key])
+                || row.predecessorReceipt.operationId === row.operationId))
             || EXPECTED_KEYS.some(key => row[key] !== expected[key]) || !matches(row._id, UUID) || !matches(row.attemptId, UUID)
             || row.generation === row.predecessorGeneration || !exact(row.commandIds, COMMANDS)
             || !COMMANDS.every(key => matches(row.commandIds[key], UUID))
             || new Set(Object.values(row.commandIds)).size !== COMMANDS.length
             || !isDeepStrictEqual(row.commandTokens, COMMANDS.map(key => row.commandIds[key]))) throw failure();
+    }
+    #terminalOperationFilter(prior) {
+        return exactFields({ _id: prior.operationId, ...topologyOperationClaimBindingFilter(PROD),
+            status: { $in: ['succeeded', 'failed'] }, heldTopologyAdmission: false, attempts: prior.attempt,
+            topologyRevision: prior.topologyRevision, priorDeployedRevision: prior.priorDeployedRevision,
+            nodes: { $elemMatch: { node: prior.nodeId, targetProfile: prior.targetProfile,
+                candidateHash: prior.candidateHash.slice(7) } } }, {
+            _id: ['objectId', new ObjectId(prior.operationId)], status: ['string'], heldTopologyAdmission: ['bool', false],
+            attempts: [NUMBER_TYPES, prior.attempt],
+            topologyRevision: [NUMBER_TYPES, prior.topologyRevision],
+            priorDeployedRevision: [NUMBER_TYPES, prior.priorDeployedRevision], nodes: ['array'],
+        });
+    }
+    async #predecessor(enrollment, id) {
+        if (!id) return null;
+        if (!matches(id, UUID)) throw failure();
+        const prior = await this.#majority(this.#models.Binding, { _id: id });
+        const expected = prior && freeze(Object.fromEntries(EXPECTED_KEYS.map(key => [key, prior[key]])));
+        if (!validExpected(expected)) throw failure();
+        this.#checkRow(prior, enrollment, expected);
+        if (prior.maintenanceId !== enrollment.maintenanceId) throw failure();
+        return freeze(structuredClone(prior));
     }
     async #checkOperation(expected, session) {
         const row = await this.#models.Operation.findOne(this.#operationFilter(expected, new Date()))
@@ -328,11 +377,20 @@ class TopologyExecutionBindingStore {
         ].join('\0')).digest('hex')}`;
         if (backupId !== expected.backupId) throw failure();
     }
-    async #binding(action, input, work) {
+    async #binding(action, input, work, predecessorId = null) {
         if (!validExpected(input)) throw failure();
         const expected = freeze({ ...input });
         await this.#indexes();
         const enrollment = await this.#enrollment(expected);
+        const creating = action === 'create' || action === 'successor';
+        const selected = creating ? null : await this.#majority(this.#models.Binding, { operationId: expected.operationId,
+            nodeId: expected.nodeId, targetProfile: expected.targetProfile });
+        if (selected) this.#checkRow(selected, enrollment, expected);
+        if (!creating && !selected) throw failure();
+        const predecessor = await this.#predecessor(enrollment, predecessorId || selected?.predecessorBindingId);
+        if (action === 'successor' && !predecessor) throw failure();
+        if (predecessor && (predecessor.operationId === expected.operationId
+            || predecessor.generation === expected.generation)) throw failure();
         let validUntil = 0;
         const assertFresh = () => {
             if (Date.now() >= validUntil) throw failure('UNCONFIRMED');
@@ -340,7 +398,8 @@ class TopologyExecutionBindingStore {
         const result = await this.#scope(action, enrollmentProjection(enrollment), expected, async (receipt, ensureOpen) => {
             if (receipt.maintenanceId !== enrollment.maintenanceId) throw failure();
             const nonce = randomUUID();
-            let row = action === 'create' ? { ...expected, ...enrollmentProjection(enrollment),
+            let row = creating ? { ...expected, ...enrollmentProjection(enrollment),
+                ...(predecessor ? { predecessorGeneration: predecessor.generation } : {}),
                 _id: randomUUID(), enrollmentId: enrollment._id, attemptId: randomUUID(), ...receipt,
                 commandIds: Object.fromEntries(COMMANDS.map(command => [command, randomUUID()])) } : null;
             if (row) row.commandTokens = COMMANDS.map(command => row.commandIds[command]);
@@ -358,15 +417,32 @@ class TopologyExecutionBindingStore {
                     await this.#cas(this.#models.HyNode, nodeFilter, nonce, session);
                     const enrolled = await this.#models.Enrollment.findOne({ _id: enrollment._id }).session(session).setOptions(OPTIONS).lean();
                     if (!isDeepStrictEqual(enrolled, enrollment)) throw failure();
-                    if (action === 'create') {
+                    if (predecessor) {
+                        const previous = await this.#models.Binding.findOne({ _id: predecessor._id }).session(session).setOptions(OPTIONS).lean();
+                        if (!isDeepStrictEqual(previous, predecessor)) throw failure();
+                        const terminalFilter = this.#terminalOperationFilter(predecessor);
+                        const terminalOperation = await this.#models.Operation.findOne(terminalFilter)
+                            .session(session).setOptions(OPTIONS).lean();
+                        this.#checkOperationRow(terminalOperation, predecessor);
+                        await this.#cas(this.#models.Operation, terminalFilter, nonce, session);
+                    }
+                    if (creating) {
                         this.#checkRow(row, enrollment, expected);
                         await this.#models.Binding.insertMany([row], { session, ...OPTIONS });
                     } else {
-                        row = await this.#models.Binding.findOne({ enrollmentId: enrollment._id }).session(session).setOptions(OPTIONS).lean();
+                        row = await this.#models.Binding.findOne({ _id: selected._id }).session(session).setOptions(OPTIONS).lean();
                         this.#checkRow(row, enrollment, expected);
                         if (row.maintenanceId !== receipt.maintenanceId) throw failure();
+                        if (predecessor && !isDeepStrictEqual(row.predecessorReceipt, receipt.predecessorReceipt)) throw failure();
                     }
                 }, async deadline => {
+                    if (predecessor) {
+                        const previous = await this.#majority(this.#models.Binding, { _id: predecessor._id }, deadline);
+                        const operation = await this.#majority(this.#models.Operation,
+                            { ...this.#terminalOperationFilter(predecessor), executionBindingCheck: nonce }, deadline);
+                        if (!isDeepStrictEqual(previous, predecessor) || !operation) throw failure('UNCONFIRMED');
+                        this.#checkOperationRow(operation, predecessor);
+                    }
                     const confirmed = await this.#majority(this.#models.Binding, { _id: row._id }, deadline);
                     this.#checkRow(confirmed, enrollment, expected);
                     if (!isDeepStrictEqual(confirmed, row)) throw failure('UNCONFIRMED');
@@ -414,12 +490,32 @@ class TopologyExecutionBindingStore {
                 await assertCurrent();
                 return result;
             });
-        });
+        }, predecessor);
         // The authority itself can await cleanup after its callback completes.
         assertFresh();
         return result;
     }
-    // No caller-selected attempt/command/predecessor IDs, no update/adopt/release API.
+    // Worker-followup interface (DORMANT; this store never settles/releases):
+    // 1. Independently settle the predecessor operation and acquire the successor's
+    //    exact claim + uncertain node lock; the paired config-owner generation stays.
+    // 2. createSuccessor(expected, predecessorBindingId) selects only a persisted
+    //    immutable row ID, never a caller-provided generation or terminal receipt.
+    // 3. The held external authority must independently supply proof.predecessor:
+    //    { bindingId, generation, headGeneration, bootId, status: 'terminal', receipt }.
+    //    On mint, headGeneration MUST equal that predecessor's persisted generation.
+    //    receipt is the exact fresh V2 `status` of its persisted commandIds.close,
+    //    checked by validTerminalReceipt; a historical close/status alone is NOT
+    //    current-head, writer-quiescence, endpoint or maintenance authority.
+    // 4. Reads permit only that head or the admitted successor's own generation.
+    //    Authority must sustain endpoint/alias/bootstrap/old-writer exclusion over
+    //    the entire lifecycle, not merely echo a challenge or perform a DB scan.
+    // Unknown commit/readback never releases anything; readVerified(expected)
+    // recovers a durably committed exact row without retrying or minting new IDs.
+    async createSuccessor(expected, predecessorBindingId) {
+        if (!matches(predecessorBindingId, UUID)) throw failure();
+        return this.#binding('successor', expected, null, predecessorBindingId);
+    }
+    // No caller-selected attempt/command IDs, no update/adopt/release API.
     async createBinding(expected) { return this.#binding('create', expected); }
     async readVerified(expected) { return this.#binding('read', expected); }
     // Return only immutable enrolled evidence; the mutable node selects a
