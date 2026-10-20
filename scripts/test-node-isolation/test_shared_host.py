@@ -379,7 +379,10 @@ class KernelReadbackTests(unittest.TestCase):
                 kernel = freezer.LinuxKernel(proc=proc, cgroup=cg, machine=machine)
                 for c in e['containers']:
                     pid = c['init']['pid']; path = proc / str(pid); path.mkdir()
-                    fields = ['S', '1'] + ['0'] * 20; fields[19] = '20'
+                    # Standard runc init leads its own session. Session zero was
+                    # a stale fixture hidden by the pre-B1 freezer implementation.
+                    fields = ['S', '1'] + ['0'] * 20
+                    fields[3] = str(pid); fields[19] = '20'
                     (path / 'stat').write_text(str(pid) + ' (payload) ' + ' '.join(fields))
                     (path / 'comm').write_text('payload')
                     (path / 'cgroup').write_text('0::' + c['cgroup'])
