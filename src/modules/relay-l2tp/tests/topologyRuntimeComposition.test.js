@@ -86,6 +86,9 @@ function compositionDependencies(calls = []) {
         NodeSSH: class FakeNodeSSH {},
         TopologyOperation: modelWith(['create', 'findById', 'findOneAndUpdate', 'updateOne'], calls),
         NodeOperationLock: modelWith(['findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'], calls),
+        TopologyExecutionBinding: modelWith(['findOne'], calls),
+        TopologyExecutionEnrollment: modelWith(['findById'], calls),
+        TopologyConfigOwner: modelWith(['findOne'], calls),
         transactionRunner: async work => work({ id: 'test-session' }),
         clock: {
             now() {
@@ -321,11 +324,19 @@ test('enabled composition rejects invalid typed executor factory overrides and f
 test('enabled composition wires the queued topology runtime without starting its worker', () => {
     const calls = [];
     let executorFactoryDependencies;
+    let finalizationDependencies;
+    class CaptureFinalizationRepository extends TopologyOperationFinalizationRepository {
+        constructor(options) {
+            super(options);
+            finalizationDependencies = options;
+        }
+    }
     const executor = typedExecutor(calls);
     const dependencies = compositionDependencies(calls);
 
     const service = createTopologyOperationRuntime({
         ...dependencies,
+        FinalizationRepository: CaptureFinalizationRepository,
         createTopologyOperationExecutor(candidateDependencies) {
             calls.push('createTopologyOperationExecutor');
             executorFactoryDependencies = candidateDependencies;
@@ -358,6 +369,14 @@ test('enabled composition wires the queued topology runtime without starting its
     assert.strictEqual(service.operationWorker.executor, executor);
     assert.ok(service.operationWorker.finalizer instanceof TopologyOperationFinalizer);
     assert.ok(service.operationWorker.finalizer.repository instanceof TopologyOperationFinalizationRepository);
+    for (const key of ['TopologyOperation', 'CascadeTopologyState', 'CascadeLink', 'CascadeRouteGroup',
+        'RelayL2tpState', 'HyNode', 'L2tpUser', 'L2tpOperation', 'NodeOperationLock',
+        'TopologyExecutionBinding', 'TopologyExecutionEnrollment', 'TopologyConfigOwner']) {
+        assert.strictEqual(finalizationDependencies[key], dependencies[key], `${key} must be injected explicitly`);
+    }
+    for (const key of ['NodeOperationLock', 'TopologyExecutionBinding', 'TopologyExecutionEnrollment', 'TopologyConfigOwner']) {
+        assert.strictEqual(service.operationWorker.finalizer.repository[key], dependencies[key]);
+    }
     assert.strictEqual(
         service.operationWorker.finalizer.repository.TopologyOperation,
         dependencies.TopologyOperation,

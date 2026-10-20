@@ -20,6 +20,9 @@ function registerModels({ modelRegistry } = {}) {
         TopologyCreateIntent: require('./models/topologyCreateIntentModel'),
         TopologyIntentQueueState: require('./models/topologyIntentQueueStateModel'),
         NodeOperationLock: require('./models/nodeOperationLockModel'),
+        TopologyExecutionBinding: require('./models/topologyExecutionBindingModel'),
+        TopologyExecutionEnrollment: require('./models/topologyExecutionEnrollmentModel'),
+        TopologyConfigOwner: require('../../models/topologyConfigOwnerModel'),
         RelayL2tpMigrationState: require('./models/relayL2tpMigrationStateModel'),
         RelayL2tpTopologyTransferDraft: require('./models/relayL2tpTopologyTransferDraftModel'),
     };

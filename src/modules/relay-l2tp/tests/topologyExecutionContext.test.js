@@ -30,7 +30,8 @@ function runtimeDependencies(env, calls = []) {
         calls.push(method);
         assert.fail('composition must not access persistence');
     }]));
-    return {
+    const db = {};
+    const dependencies = {
         env,
         HyNode: model('find', 'findById'),
         CascadeLink: model('find', 'create', 'updateOne', 'deleteOne'),
@@ -41,9 +42,16 @@ function runtimeDependencies(env, calls = []) {
         L2tpOperation: model('findOne', 'countDocuments', 'create'),
         TopologyOperation: model('create', 'findById', 'findOneAndUpdate', 'updateOne'),
         NodeOperationLock: model('findOne', 'findOneAndUpdate', 'updateOne', 'deleteOne'),
+        TopologyExecutionBinding: model('findOne'),
+        TopologyExecutionEnrollment: model('findById'),
+        TopologyConfigOwner: model('findOne'),
         NodeSSH: class { constructor() { calls.push('ssh'); assert.fail('must not connect'); } },
         transactionRunner: async () => assert.fail('must not open a transaction'),
     };
+    for (const value of Object.values(dependencies)) {
+        if (value && typeof value === 'object' && value !== env) value.db = db;
+    }
+    return dependencies;
 }
 
 test('assembled runtime binds the real worker claim to selected host despite later env and request identities', async () => {
@@ -51,6 +59,19 @@ test('assembled runtime binds the real worker claim to selected host despite lat
         const env = { ...(selected === TEST ? TEST_ENV : PROD_ENV) };
         const calls = [];
         const dependencies = runtimeDependencies(env);
+        const probes = [];
+        dependencies.TopologyOperation.findOne = filter => {
+            probes.push(filter);
+            return {
+                read(value) { assert.equal(value, 'primary'); return this; },
+                readConcern(value) { assert.equal(value, 'majority'); return this; },
+                setOptions(value) {
+                    assert.deepEqual(value, { maxTimeMS: 5000, timeoutMS: 5000 });
+                    return this;
+                },
+                lean: async () => null,
+            };
+        };
         dependencies.TopologyOperation.findOneAndUpdate = async (filter, update, options) => {
             calls.push({ filter, update, options });
             return null;
@@ -67,7 +88,9 @@ test('assembled runtime binds the real worker claim to selected host despite lat
         if (selected === PROD) {
             assert.equal(result.errorCode, 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN');
             assert.deepEqual(calls, []);
+            assert.deepEqual(probes, []);
         } else {
+            assert.deepEqual(probes, [{ _id: 'operation-1' }]);
             assert.deepEqual(result, { claimed: false, operationId: 'operation-1' });
             assert.equal(calls.length, 2);
             for (const { filter, options } of calls) {
@@ -77,6 +100,24 @@ test('assembled runtime binds the real worker claim to selected host despite lat
                 assert.equal(options.projection.executionContext, 1);
                 assert.equal(options.projection.idempotencyKey, 1);
             }
+        }
+    }
+});
+
+test('assembled TEST refuses incomplete or cross-connection settlement models before claiming', async () => {
+    for (const key of ['TopologyOperation', 'CascadeTopologyState', 'NodeOperationLock',
+        'TopologyExecutionBinding', 'TopologyExecutionEnrollment', 'TopologyConfigOwner']) {
+        for (const db of [undefined, {}]) {
+            const calls = [];
+            const dependencies = runtimeDependencies(TEST_ENV, calls);
+            dependencies[key].db = db;
+            const service = createTopologyOperationRuntime(dependencies);
+            assert.ok(service instanceof TopologyOperationCoordinator);
+            assert.deepEqual(await service.operationWorker.run('operation-1'), {
+                claimed: false, operationId: 'operation-1', stopped: true, drainUncertain: true,
+                errorCode: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED',
+            });
+            assert.deepEqual(calls, [], `${key} must refuse before claims, writes or transport`);
         }
     }
 });
