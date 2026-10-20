@@ -18,6 +18,7 @@ import signal
 import stat
 import subprocess
 import sys
+from typing import Any
 import time
 
 sys.dont_write_bytecode = True
@@ -518,94 +519,180 @@ class NodeOriginals:
                 self.rpc(['adu',server,'/dev/stdin'],canonical({'inbounds':additions}))
         need(self.runtime(raw,original['service']['ActiveState']) == expected, 'RUNTIME_RESTORE_READBACK_FAILED')
 
-    def restore(self):
+    @contextmanager
+    def restoration_hold(self):
+        """Acquire real OFDs once; never return a transferable lock receipt."""
         from contextlib import ExitStack
+        need(not getattr(self, '_restore_active', False), 'NESTED_RESTORE_HOLD_FORBIDDEN')
+        self._restore_active = True
         self.deadline = time.monotonic() + 120
-        with ExitStack() as stack:
-            outer = stack.enter_context(self.fs.lock(OUTER_LOCK))
-            locks = [outer] + [stack.enter_context(self.fs.lock(runner_lock(p))) for p in self.profiles]
-            self.locks = tuple(locks)
-            self.lock_paths = dict(zip([OUTER_LOCK,*[runner_lock(p) for p in self.profiles]],locks))
-            self.fs.private(STATE)
-            self.fs.private(STORE)
-            need(self.fs.absent(BUNDLE+'.next') and self.fs.absent(RESTORE_STATE) and self.fs.absent(RESTORE_STATE+'.next'),
-                 'PARTIAL_RESTORE_RETAINED')
-            bundle_raw = self.fs.read(BUNDLE)[0]
-            bundle = decode(bundle_raw)
-            need(set(bundle) == {'version',*identity(self.engine),'guard','profiles','acceptedSha256'}
-                 and type(bundle['version']) is int and bundle['version'] == 1 and
-                 all(bundle[k] == v for k,v in identity(self.engine).items()) and
-                 bundle['acceptedSha256'] == sha(canonical(self.accepted)) and set(bundle['profiles']) == set(self.profiles),
-                 'ORIGINAL_BUNDLE_IDENTITY_DRIFT')
-            state = self.held(bundle['guard'])
-            self.guard = bundle['guard']
-            self.engine.host.operator_session()
-            self.admission()
-            pins = self.fs.read_json(RESTORE_ACCEPTED)
-            need(set(pins) == {'version',*identity(self.engine),'bundleSha256','profiles'} and
-                 type(pins['version']) is int and pins['version'] == 1 and
-                 all(pins[k] == v for k,v in identity(self.engine).items()) and
-                 pins['bundleSha256'] == sha(bundle_raw) and set(pins['profiles']) == set(self.profiles),
-                 'RESTORE_CURRENT_PINS_REQUIRED')
-            for profile in self.profiles:
-                self.check_original(profile,bundle['profiles'][profile])
-                original = bundle['profiles'][profile]
-                for name in ('config','unit'):
-                    data = base64.b64decode(original['files'][name]['data'],validate=True)
-                    need(len(data) <= MAX_FILE and sha(data) == original['files'][name]['sha256'], 'BUNDLE_BYTES_CORRUPT_RETAINED')
-                current = pins['profiles'][profile]
-                need(set(current) == {'files','service','journalSha256'} and set(current['files']) == {'config','unit'}, 'INVALID_RESTORE_PINS')
-                self.terminal(profile,current['journalSha256'])
-                need(canonical(self.service(profile)) == canonical(current['service']), 'CURRENT_SERVICE_DRIFT_RETAINED')
-                for name,path in zip(('config','unit'),profile_paths(profile)):
-                    need(canonical(self.fs.info(path)) == canonical(current['files'][name]), 'CURRENT_FILE_DRIFT_RETAINED')
-            self.current_pins = pins
-            self.checkpoint()
-            # All checks complete before write-ahead intent, which is itself durable
-            # before the first stop/write. Crash/partial restore never auto-replays.
-            intent = {'version':1, **identity(self.engine),'bundleSha256':sha(bundle_raw),'phase':'restoring-retained'}
-            self.fs.atomic(RESTORE_STATE,canonical(intent),new=True)
-            self.intent = dict(intent)
-            for profile in self.profiles:
-                original = bundle['profiles'][profile]
-                self.held(state['guard'])
-                self.admission()
-                self.terminal(profile,pins['profiles'][profile]['journalSha256'])
-                self.effect('stop',service_name(profile))
-                need(self.service(profile)['ActiveState'] == 'inactive', 'SERVICE_STOP_UNCONFIRMED_RETAINED')
-                self.held(state['guard'])
-                self.admission()
-                for name,path in zip(('config','unit'),profile_paths(profile)):
-                    saved = original['files'][name]
-                    self.checkpoint()
-                    self.fs.atomic(path,base64.b64decode(saved['data'],validate=True),saved,
-                                   expected=pins['profiles'][profile]['files'][name])
-                    self.checkpoint()
-                self.effect('daemon-reload')
-                target = original['service']
-                if self.service(profile)['UnitFileState'] != target['UnitFileState']:
-                    self.effect('enable' if target['UnitFileState']=='enabled' else 'disable',service_name(profile))
-                self.held(state['guard'])
-                self.admission()
-                if target['ActiveState'] == 'active':
-                    self.effect('restart',service_name(profile))
-                self.restore_runtime(profile,original)
-            # Read every fixed original back, including BOTH services on .72.
-            for profile in self.profiles:
-                restored = self.snapshot(profile)
-                need(restored == bundle['profiles'][profile], 'RESTORE_EXACT_READBACK_FAILED')
-                self.terminal(profile,pins['profiles'][profile]['journalSha256'])
+        scope = _HeldRestoration(self)
+        try:
+            with ExitStack() as stack:
+                paths = [OUTER_LOCK, *[runner_lock(p) for p in self.profiles]]
+                locks = [stack.enter_context(self.fs.lock(path)) for path in paths]
+                self.locks = tuple(locks)
+                self.lock_paths = dict(zip(paths, locks))
+                scope._locks = dict(self.lock_paths)
+                self._held_restore_scope = scope
+                scope._prepared = self._prepare_restore()
+                scope._active = True
+                try:
+                    yield scope
+                finally:
+                    scope._active = False
+        finally:
+            scope._active = False
+            self._restore_active = False
+            self._held_restore_scope = None
+            self.locks = ()
+            self.lock_paths = {}
+
+    def _prepare_restore(self):
+        self.fs.private(STATE)
+        self.fs.private(STORE)
+        need(self.fs.absent(BUNDLE+'.next') and self.fs.absent(RESTORE_STATE) and self.fs.absent(RESTORE_STATE+'.next'),
+             'PARTIAL_RESTORE_RETAINED')
+        bundle_raw = self.fs.read(BUNDLE)[0]
+        bundle = decode(bundle_raw)
+        need(set(bundle) == {'version',*identity(self.engine),'guard','profiles','acceptedSha256'}
+             and type(bundle['version']) is int and bundle['version'] == 1 and
+             all(bundle[k] == v for k,v in identity(self.engine).items()) and
+             bundle['acceptedSha256'] == sha(canonical(self.accepted)) and set(bundle['profiles']) == set(self.profiles),
+             'ORIGINAL_BUNDLE_IDENTITY_DRIFT')
+        state = self.held(bundle['guard'])
+        self.guard = bundle['guard']
+        self.engine.host.operator_session()
+        self.admission()
+        pins = self.fs.read_json(RESTORE_ACCEPTED)
+        need(set(pins) == {'version',*identity(self.engine),'bundleSha256','profiles'} and
+             type(pins['version']) is int and pins['version'] == 1 and
+             all(pins[k] == v for k,v in identity(self.engine).items()) and
+             pins['bundleSha256'] == sha(bundle_raw) and set(pins['profiles']) == set(self.profiles),
+             'RESTORE_CURRENT_PINS_REQUIRED')
+        for profile in self.profiles:
+            self.check_original(profile,bundle['profiles'][profile])
+            original = bundle['profiles'][profile]
+            for name in ('config','unit'):
+                data = base64.b64decode(original['files'][name]['data'],validate=True)
+                need(len(data) <= MAX_FILE and sha(data) == original['files'][name]['sha256'], 'BUNDLE_BYTES_CORRUPT_RETAINED')
+            current = pins['profiles'][profile]
+            need(set(current) == {'files','service','journalSha256'} and set(current['files']) == {'config','unit'}, 'INVALID_RESTORE_PINS')
+            self.terminal(profile,current['journalSha256'])
+            need(canonical(self.service(profile)) == canonical(current['service']), 'CURRENT_SERVICE_DRIFT_RETAINED')
+            for name,path in zip(('config','unit'),profile_paths(profile)):
+                need(canonical(self.fs.info(path)) == canonical(current['files'][name]), 'CURRENT_FILE_DRIFT_RETAINED')
+        self.current_pins = pins
+        self.checkpoint()
+        return bundle_raw, bundle, state, pins
+
+    def restore(self):
+        with self.restoration_hold() as held:
+            return held.restore()
+
+    def _restore_held(self, held):
+        held.check()
+        bundle_raw, bundle, state, pins = held._prepared
+        # All checks complete before write-ahead intent, which is itself durable
+        # before the first stop/write. Crash/partial restore never auto-replays.
+        intent = {'version':1, **identity(self.engine),'bundleSha256':sha(bundle_raw),'phase':'restoring-retained'}
+        self.fs.atomic(RESTORE_STATE,canonical(intent),new=True)
+        self.intent = dict(intent)
+        for profile in self.profiles:
+            original = bundle['profiles'][profile]
             self.held(state['guard'])
             self.admission()
-            self.checkpoint()
-            intent['phase'] = 'verified-retained'
-            self.fs.atomic(RESTORE_STATE,canonical(intent))
-            self.intent = dict(intent)
-            need(self.fs.read_json(RESTORE_STATE) == intent, 'RESTORE_JOURNAL_READBACK_FAILED')
+            self.terminal(profile,pins['profiles'][profile]['journalSha256'])
+            self.effect('stop',service_name(profile))
+            need(self.service(profile)['ActiveState'] == 'inactive', 'SERVICE_STOP_UNCONFIRMED_RETAINED')
             self.held(state['guard'])
             self.admission()
-            return {'ok':True,'code':'NODE_ORIGINALS_RESTORED_RETAINED','bundleSha256':sha(bundle_raw),
-                    'ownershipRetained':True,'admission':'closed'}
+            for name,path in zip(('config','unit'),profile_paths(profile)):
+                saved = original['files'][name]
+                self.checkpoint()
+                self.fs.atomic(path,base64.b64decode(saved['data'],validate=True),saved,
+                               expected=pins['profiles'][profile]['files'][name])
+                self.checkpoint()
+            self.effect('daemon-reload')
+            target = original['service']
+            if self.service(profile)['UnitFileState'] != target['UnitFileState']:
+                self.effect('enable' if target['UnitFileState']=='enabled' else 'disable',service_name(profile))
+            self.held(state['guard'])
+            self.admission()
+            if target['ActiveState'] == 'active':
+                self.effect('restart',service_name(profile))
+            self.restore_runtime(profile,original)
+        # Read every fixed original back, including BOTH services on .72.
+        for profile in self.profiles:
+            restored = self.snapshot(profile)
+            need(restored == bundle['profiles'][profile], 'RESTORE_EXACT_READBACK_FAILED')
+            self.terminal(profile,pins['profiles'][profile]['journalSha256'])
+        self.held(state['guard'])
+        self.admission()
+        self.checkpoint()
+        intent['phase'] = 'verified-retained'
+        self.fs.atomic(RESTORE_STATE,canonical(intent))
+        self.intent = dict(intent)
+        need(self.fs.read_json(RESTORE_STATE) == intent, 'RESTORE_JOURNAL_READBACK_FAILED')
+        self.held(state['guard'])
+        self.admission()
+        return {'ok':True,'code':'NODE_ORIGINALS_RESTORED_RETAINED','bundleSha256':sha(bundle_raw),
+                'ownershipRetained':True,'admission':'closed'}
+
+
+class _HeldRestoration:
+    """Private lexical, one-shot capability backed by the writer's open flocks."""
+    def __init__(self, writer):
+        self._writer = writer
+        self._active = False
+        self._attempted = False
+        self._verified = False
+        self._prepared: Any = None
+        self._locks = {}
+
+    def check(self):
+        try:
+            need(self._active and self._writer.deadline > time.monotonic() and
+                 getattr(self._writer, '_held_restore_scope', None) is self and
+                 getattr(self._writer, '_restore_active', False) and self._locks and
+                 self._locks == self._writer.lock_paths and
+                 set(self._locks) == {OUTER_LOCK, *[runner_lock(p) for p in self._writer.profiles]} and
+                 tuple(self._locks.values()) == self._writer.locks, 'RESTORE_HOLD_REVOKED')
+            for fd in self._locks.values():
+                # Reuse the same locked open-file description, never a second
+                # open() flock. Closed/replaced descriptors fail before effects.
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._writer.checkpoint()
+        except BaseException:
+            self._active = False
+            self._verified = False
+            raise
+
+    def restore(self):
+        self.check()
+        need(not self._attempted, 'RESTORE_REPLAY_FORBIDDEN')
+        self._attempted = True
+        try:
+            result = self._writer._restore_held(self)
+            self._verified = True
+            return result
+        except BaseException:
+            self._active = False
+            raise
+
+    def verify(self):
+        try:
+            self.check()
+            need(self._verified, 'RESTORATION_NOT_VERIFIED')
+            _, bundle, _, _ = self._prepared
+            for profile in self._writer.profiles:
+                need(self._writer.snapshot(profile) == bundle['profiles'][profile], 'RESTORE_EXACT_READBACK_FAILED')
+            self.check()
+        except BaseException:
+            self._active = False
+            self._verified = False
+            raise
+
 
 
 def main():
