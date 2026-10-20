@@ -42,6 +42,20 @@ sudo command and a forced command. The helper accepts only finite V2 runner argv
 the fixed node/profile/TEST context, and bounded stdin. No `sh -c`, arbitrary
 upload, SFTP, scp, environment-selected root, or bootstrap API exists.
 
+Finite restricted-readiness extension: `restore-users` accepts only the enrolled
+`xray-main` profile, exact boot/snapshot SHA256/user-count checks and at most 4 MiB
+snapshot stdin. `verify-ppp-users` accepts only the exact enrolled node/profile and
+boot/operation/revision/user-count checks; it accepts no stdin. These are the only
+two auxiliary verbs. The runner derives their immutable command IDs from the
+admitted verify ID and journals before dispatch. The isolation **dispatch**, not
+just its parser, checks exact nested success fields and the original checks-byte
+digest before clearing its own in-flight marker. Any uncertain reply, malformed
+result, timeout or guard loss retains that marker. No legacy agent, upload, shell
+or config installation path is enabled. The PPP verifier is a separately pinned
+read-only file; parent must provision it independently before hold. The current
+runner digest and mandatory reinstall/pin refresh are recorded in
+`docs/topology-v2-terminal-proof.md`.
+
 This intentionally blocks the existing generic root bootstrap path. Parent runtime
 integration must use the already-installed pinned artifact through the restricted
 identity/endpoint, re-attest the changed port/username, and preserve all durable

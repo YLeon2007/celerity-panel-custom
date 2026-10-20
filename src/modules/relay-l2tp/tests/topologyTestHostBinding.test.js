@@ -42,19 +42,15 @@ test.before(async () => {
         serviceUnitPath: '/etc/systemd/system/xray.service', checks: [], candidateHash: hash,
         candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1', bytes: [...Buffer.from(content)], sha256: hash } });
 });
-// Load the REAL independently maintained finite V2 parser. Never emulate
-// successful shell inspection/mkdir replies or widen the forced-command grammar.
+// Run the actual isolation Engine.dispatch as well as its finite parser and
+// actual runner. The helper labels its physical/kernel/SSH adapter SIMULATED;
+// command journaling, bounded stdin, receipt readback and user RPC are real.
 function restrictedExecute(runner, command, options) {
     assert.ok(process.env.C3_RESTRICTED_RUNNER_HELPER, 'set reviewed isolation.py path');
-    const parsed = spawnSync('python3', ['-I', '-c', `
-import importlib.util,json,sys
-sys.dont_write_bytecode=True
-spec=importlib.util.spec_from_file_location('isolation',sys.argv[1])
-m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-print(json.dumps(m.parse_runner(sys.argv[2],json.loads(sys.argv[3]))))
-`, process.env.C3_RESTRICTED_RUNNER_HELPER, command, JSON.stringify({ nodeId: NODE, targetProfile: 'xray-main' })], { encoding: 'utf8' });
-    assert.equal(parsed.status, 0, parsed.stderr);
-    return runner.execute(`${TOPOLOGY_RUNNER_PATH} ${JSON.parse(parsed.stdout).join(' ')}`, options);
+    const actual = spawnSync('python3', ['-I', path.join(__dirname, 'helpers/restrictedNodeDispatchFixture.py'),
+        process.env.C3_RESTRICTED_RUNNER_HELPER, runner.root, command, NODE],
+    { encoding: 'utf8', input: options?.stdin, timeout: 45000 });
+    return { code: actual.status, stdout: actual.stdout, stderr: actual.stderr };
 }
 async function until(work) {
     let last;
@@ -321,7 +317,10 @@ test('ordinary root reaches real TEST store/default worker through operational s
     }
     assert.equal(await models.TopologyExecutionBinding.countDocuments(), 2);
     assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 1);
-    assert.equal(f.runnerExecutions.length, 10);
+    const { runnerRequest } = require('./helpers/topologyV2Fixture');
+    assert.deepEqual(f.runnerExecutions.map(command => runnerRequest(command).command),
+        ['prepare', 'commit', 'verify', 'restore-users', 'close', 'status',
+            'prepare', 'commit', 'verify', 'restore-users', 'close', 'status']);
 });
 
 test('actual TEST host provisions after exact claim/locks and settles two serial real-store runner generations', async t => {

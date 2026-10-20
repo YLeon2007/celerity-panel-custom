@@ -77,14 +77,14 @@ def parse_runner(original, plan):
     need(len(args) in (22, 24) and args[::2] == ['--' + n for n in NAMES] +
          (['--checks'] if len(args) == 24 else []), 'INVALID_ARGV')
     request = dict(zip(NAMES + ['checks'], args[1::2]))
-    need(request['command'] in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status'), 'INVALID_COMMAND')
+    need(request['command'] in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status', 'restore-users', 'verify-ppp-users'), 'INVALID_COMMAND')
     for name in ('operation-id', 'node-id', 'backup-id', 'attempt-id', 'generation', 'predecessor-generation', 'command-id'):
         need(bool(SAFE.fullmatch(request[name])) and request[name] not in ('.', '..'), 'INVALID_ID')
     need(request['generation'] != 'none', 'INVALID_GENERATION')
     need(bool(re.fullmatch(r'sha256:[a-f0-9]{64}', request['candidate-hash'])), 'INVALID_HASH')
     need(request['execution-context'] == 'test.infograd.online' and
          request['node-id'] == plan['nodeId'] and request['target-profile'] == plan['targetProfile'], 'FOREIGN_BINDING')
-    need(('checks' in request) == (request['command'] == 'verify'), 'INVALID_CHECKS')
+    need(('checks' in request) == (request['command'] in ('verify', 'restore-users', 'verify-ppp-users')), 'INVALID_CHECKS')
     if 'checks' in request:
         value = request['checks']
         need(bool(re.fullmatch(r'[A-Za-z0-9_-]{1,8192}', value)), 'INVALID_CHECKS')
@@ -94,6 +94,22 @@ def parse_runner(original, plan):
             raise Refusal('INVALID_CHECKS') from None
         need(base64.urlsafe_b64encode(raw).decode().rstrip('=') == value, 'INVALID_CHECKS')
         checks = decode_json(raw)
+        if request['command'] in ('restore-users', 'verify-ppp-users'):
+            need(isinstance(checks, dict), 'INVALID_CHECKS')
+            def token(value):
+                return isinstance(value, str) and bool(SAFE.fullmatch(value)) and value not in ('.', '..')
+            need(token(checks.get('bootId')), 'INVALID_CHECKS')
+            if request['command'] == 'restore-users':
+                need(plan['targetProfile'] == 'xray-main' and set(checks) == {'bootId', 'snapshotSha256', 'userCount'}
+                     and isinstance(checks.get('snapshotSha256'), str) and bool(re.fullmatch(r'[a-f0-9]{64}', checks['snapshotSha256']))
+                     and type(checks.get('userCount')) is int and 1 <= checks['userCount'] <= 4096, 'INVALID_CHECKS')
+            else:
+                need(set(checks) == {'bootId', 'operationId', 'expectedCredentialRevision', 'expectedEnabledUserCount'}
+                     and token(checks.get('operationId')) and type(checks.get('expectedCredentialRevision')) is int
+                     and 1 <= checks['expectedCredentialRevision'] <= 2**53-1
+                     and type(checks.get('expectedEnabledUserCount')) is int
+                     and 0 <= checks['expectedEnabledUserCount'] <= 2**53-1, 'INVALID_CHECKS')
+            return args
         need(isinstance(checks, list) and len(checks) <= 64, 'INVALID_CHECKS')
         service = 'xray.service' if plan['targetProfile'] == 'xray-main' else 'xray-bridge.service'
         for check in checks:
@@ -115,6 +131,30 @@ PLAN_KEYS = {'version', 'context', 'nodeId', 'endpointIp', 'targetProfile', 'mac
 
 def digest(value):
     return hashlib.sha256(value).hexdigest()
+
+
+def assert_readiness_receipt(receipt, request, fields, plan):
+    """Exact auxiliary result, in addition to dispatch's common identity checks."""
+    code = 'RUNNER_RECEIPT_UNKNOWN_RETAINED'
+    need(set(receipt) == {'command', *fields.values(), 'protocolVersion', 'completion',
+                         'phase', 'ownershipRetained', 'bootId', 'checksSha256', 'result'}, code)
+    raw = base64.urlsafe_b64decode(request['checks'] + '=' * (-len(request['checks']) % 4))
+    checks = decode_json(raw)
+    need(checks['bootId'] == plan['bootId'] and receipt['phase'] == 'verified'
+         and receipt['checksSha256'] == digest(raw), code)
+    result = receipt['result']
+    need(isinstance(result, dict) and result.get('ok') is True, code)
+    if request['command'] == 'restore-users':
+        need(set(result) == {'ok', 'code', 'userCount', 'inboundCount'}
+             and result['code'] == 'XRAY_USERS_RESTORED' and type(result['userCount']) is int
+             and result['userCount'] == checks['userCount'] and type(result['inboundCount']) is int
+             and 1 <= result['inboundCount'] <= 64, code)
+    else:
+        expected = {'ok': True, 'code': 'USERS_VERIFIED',
+                    'credentialRevision': checks['expectedCredentialRevision'],
+                    'enabledUserCount': checks['expectedEnabledUserCount'],
+                    'managedUserCount': checks['expectedEnabledUserCount']}
+        need(result == expected and all(type(result[k]) is type(v) for k, v in expected.items()), code)
 
 
 def validate_plan(p):
@@ -738,7 +778,7 @@ class Engine:
 
     def dispatch(self, original, payload, lock_fd):
         args = parse_runner(original, self.plan)
-        need(len(payload) <= 4194304 and (args[1] == 'prepare' or not payload), 'INVALID_STDIN')
+        need(len(payload) <= 4194304 and (args[1] in ('prepare', 'restore-users') or not payload), 'INVALID_STDIN')
         state = self.assert_held()
         state['dispatchInFlight'] = {'argvSha256': digest(json.dumps(args).encode()), 'startedBootId': self.plan['bootId']}
         state['dispatchCount'] += 1
@@ -758,11 +798,14 @@ class Engine:
         request = dict(zip(NAMES + ['checks'], args[1::2]))
         fields = dict(zip(NAMES[1:], ['operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile',
                                       'executionContext', 'attemptId', 'generation', 'predecessorGeneration', 'commandId']))
-        need(isinstance(receipt, dict) and receipt.get('ok') is True and receipt.get('protocolVersion') == 2 and
+        auxiliary = request['command'] in ('restore-users', 'verify-ppp-users')
+        need(isinstance(receipt, dict) and (auxiliary or receipt.get('ok') is True) and receipt.get('protocolVersion') == 2 and
              receipt.get('bootId') == self.plan['bootId'] and receipt.get('command') == request['command'] and
              receipt.get('completion') == 'completed' and receipt.get('ownershipRetained') is True and
              all(receipt.get(field) == request[name] for name, field in fields.items()),
              'RUNNER_RECEIPT_UNKNOWN_RETAINED')
+        if auxiliary:
+            assert_readiness_receipt(receipt, request, fields, self.plan)
         self.host.guard_check(state['guard'])
         self.verify_exclusion(state)
         state['dispatchInFlight'] = None

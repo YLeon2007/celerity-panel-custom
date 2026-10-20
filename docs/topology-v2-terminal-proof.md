@@ -83,6 +83,20 @@ not independently claimed as entry-point exclusion evidence. `git diff --check`
 passed. Synthetic config and an unusable loopback fallback Mongo URI were used
 for config-importing tests; only explicit scratch connections were exercised.
 
+### Current restricted-readiness runner
+
+The digest above describes the historical terminal-protocol proof, not the
+current installable runner. The later finite `restore-users`/`verify-ppp-users`
+source has SHA256
+`442663660ec974646b7969c457efd94cc17c57fe0e7a518be8a494480cf26765`.
+Any previously accepted installed-runner pins must be independently reviewed and
+replaced before activation; historical receipts do not authorize the new bytes.
+The isolation parser **and dispatch** must admit only these exact auxiliary
+commands. Dispatch bounds snapshot stdin to 4 MiB, validates their exact nested
+result/checks digest, and keeps in-flight state on an uncertain reply or guard
+loss. Actual disposable Engine.dispatch/runner tests cover a nonempty Xray RPC
+and PPP snapshot; physical/systemd authority is explicitly simulated, not live.
+
 ## Still NO-GO for production
 
 This slice does not provide real external writer exclusion or endpoint physical
