@@ -6,7 +6,6 @@ const { matchesTopologyOperationClaimBinding } = require('../domain/topologyOper
 const { topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { isTopologyTerminalProof } = require('../services/topologyOperationExecutor');
 const OPTIONS = { maxTimeMS: 5000, timeoutMS: 5000 };
-const SESSION = Symbol('V2_SETTLEMENT_SESSION');
 const DEADLINES = new WeakMap();
 function refused() { throw Object.assign(new Error('V2 terminal settlement unconfirmed'), { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' }); }
 function record(row) { return Object.fromEntries(RECORD_KEYS.map(key => [key, row?.[key]])); }
@@ -147,18 +146,37 @@ async function fenceSideEffects(repository, operation, effects, session) {
     const relays = operation.nodes.filter(node => node.role === 'relay').map(node => String(node.node));
     if (effects.pppProof.some(proof => !relays.includes(proof.relayNode)
         || typeof proof.relayNode !== 'string' || !Number.isSafeInteger(proof.credentialRevision) || proof.credentialRevision < 1)) refused();
+    const skipped = effects.skippedPppProof ?? [];
+    if (!Array.isArray(skipped) || skipped.some(proof => typeof proof?.relayNode !== 'string'
+        || !relays.includes(proof.relayNode) || proof.state !== 'not_installed'
+        || !['absent', 'not_installed'].includes(proof.desiredState)
+        || !Number.isSafeInteger(proof.credentialRevision) || proof.credentialRevision < 0)
+        || new Set([...effects.pppProof, ...skipped].map(proof => proof.relayNode)).size !== relays.length
+        || effects.pppProof.length + skipped.length !== relays.length) refused();
     if (!relays.length) return;
     if (repository.RelayL2tpState?.db !== repository.TopologyOperation.db) refused();
     for (const node of relays) {
         const proof = effects.pppProof.find(item => item.relayNode === node);
-        let filter;
-        if (proof) filter = { node, status: 'installed', desiredState: 'installed', secretRevision: proof.credentialRevision };
-        else {
-            const state = await repository.RelayL2tpState.findOne({ node }).session(session).setOptions(OPTIONS).lean();
-            if (state?.status !== 'not_installed' || !['absent', 'not_installed'].includes(state.desiredState)
-                || !Number.isSafeInteger(state.secretRevision) || state.secretRevision < 0) refused();
-            filter = { node, status: 'not_installed', desiredState: state.desiredState, secretRevision: state.secretRevision };
+        // Never reread/adopt the current epoch for an omitted PPP proof. The
+        // gate's original zero-user/no-active-sync observation must survive
+        // both persistence and publication; the producer writes this same row.
+        const absent = skipped.find(item => item.relayNode === node);
+        if (absent) {
+            if (['HyNode', 'L2tpUser', 'L2tpOperation'].some(key => repository[key]?.db !== repository.TopologyOperation.db)) refused();
+            const inventory = await repository.HyNode.findById(node).select('_id cascadeRole')
+                .session(session).setOptions(OPTIONS).lean();
+            const user = await repository.L2tpUser.findOne({ relayNode: node }).select('_id')
+                .session(session).setOptions(OPTIONS).lean();
+            const active = await repository.L2tpOperation.findOne({ node, status: { $in: ['queued', 'running', 'rolling_back'] } })
+                .select('_id').session(session).setOptions(OPTIONS).lean();
+            if (String(inventory?._id) !== node || inventory.cascadeRole !== 'relay' || user || active) refused();
+            // These snapshot reads alone do not exclude a new user/queue row.
+            // The exact ORIGINAL epoch write below conflicts with the actual
+            // producer's reserveCredentialRevision in the same transaction.
         }
+        const filter = proof
+            ? { node, status: 'installed', desiredState: 'installed', secretRevision: proof.credentialRevision }
+            : { node, status: 'not_installed', desiredState: absent.desiredState, secretRevision: absent.credentialRevision };
         const updated = await repository.RelayL2tpState.updateOne(filter, { $inc: { replacementFence: 1 } }, { session, ...OPTIONS });
         if (updated.matchedCount !== 1) refused();
     }
@@ -182,7 +200,7 @@ async function persist(repository, request) {
         if (!same((await majority(repository.TopologyOperation, operationFilter(request)))?.v2Terminal, terminal)) refused();
     });
 }
-async function settle(repository, request) {
+async function settle(repository, request, publish) {
     return once(repository, async session => {
         const stored = await repository.TopologyOperation.findById(request.operationId).session(session).setOptions(OPTIONS).lean();
         const terminal = stored?.v2Terminal;
@@ -193,7 +211,8 @@ async function settle(repository, request) {
         assertOwnerFences(terminal, rows);
         await fenceSideEffects(repository, operation, terminal.sideEffects, session);
         await fence(repository, rows, session, true);
-        const finalized = await repository.finalizeSucceeded({ ...request, [SESSION]: session });
+        if (!session.inTransaction() || !DEADLINES.has(session) || typeof publish !== 'function') refused();
+        const finalized = await publish(session);
         if (!finalized) refused();
         return { ...finalized, terminal };
     }, async result => {
@@ -234,4 +253,4 @@ async function probe(repository, operationId) {
     return freeze({ operationId, status: operation.status, retained: operation.heldTopologyAdmission !== false,
         terminal: structuredClone(operation.v2Terminal), nodes: operation.nodes.map(node => ({ nodeId: String(node.node), role: node.role })) });
 }
-module.exports = { SESSION, begin, persist, settle, probe };
+module.exports = { begin, persist, settle, probe };

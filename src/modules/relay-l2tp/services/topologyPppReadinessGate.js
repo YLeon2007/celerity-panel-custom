@@ -73,6 +73,7 @@ class TopologyPppReadinessGate {
         let verifiedRelayCount = 0;
         let skippedRelayCount = 0;
         const relayRevisions = [];
+        const skippedRelayRevisions = [];
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
             const terminalRelayRef = plan.staged === true ? stagedTerminalRelayRef(plan.nodes) : null;
@@ -86,9 +87,7 @@ class TopologyPppReadinessGate {
                 // A non-PPP relay can be transit in a complete or staged
                 // plan. A staged terminal with legacy explicit not_installed
                 // state uses the same fenced checks, then stays blocked.
-                if ((plan.staged !== true || node.nodeRef !== terminalRelayRef
-                    || state?.desiredState === 'not_installed')
-                    && state?.status === 'not_installed'
+                if (state?.status === 'not_installed'
                     && ['absent', 'not_installed'].includes(state.desiredState)) {
                     const users = await this.L2tpUser.find({ relayNode })
                         .select('_id').lean();
@@ -105,6 +104,8 @@ class TopologyPppReadinessGate {
                         || current.secretRevision !== state.secretRevision) {
                         return failed(verifiedRelayCount);
                     }
+                    skippedRelayRevisions.push({ relayNode, state: 'not_installed',
+                        desiredState: state.desiredState, credentialRevision: state.secretRevision });
                     if (plan.staged === true && node.nodeRef === terminalRelayRef) skippedRelayCount += 1;
                     continue;
                 }
@@ -114,6 +115,9 @@ class TopologyPppReadinessGate {
                     if (plan.staged !== true || node.nodeRef !== terminalRelayRef) {
                         return failed(verifiedRelayCount, REASON.NOT_INSTALLED);
                     }
+                    // Missing state has no serializable document fence. Record
+                    // that observation, but terminal settlement must refuse it.
+                    skippedRelayRevisions.push({ relayNode, state: 'unfenced' });
                     skippedRelayCount += 1;
                     continue;
                 }
@@ -210,9 +214,8 @@ class TopologyPppReadinessGate {
                 verifiedRelayCount += 1;
                 relayRevisions.push({ relayNode, credentialRevision: revision });
             }
-            return skippedRelayCount > 0
-                ? { ok: true, verifiedRelayCount, skippedRelayCount, relayRevisions }
-                : { ok: true, verifiedRelayCount, relayRevisions };
+            return { ok: true, verifiedRelayCount, ...(skippedRelayCount > 0 ? { skippedRelayCount } : {}),
+                relayRevisions, ...(skippedRelayRevisions.length ? { skippedRelayRevisions } : {}) };
         } catch {
             // Includes SSH/runner, malformed result and database failures. Never
             // propagate stderr or credentials into topology operation logs.

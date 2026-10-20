@@ -20,7 +20,8 @@ function hasExactKeys(value, expectedKeys) {
     return Boolean(value)
         && typeof value === 'object'
         && !Array.isArray(value)
-        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expectedKeys);
+        && Reflect.ownKeys(value).every(key => typeof key === 'string')
+        && JSON.stringify(Reflect.ownKeys(value).sort()) === JSON.stringify(expectedKeys);
 }
 
 function assertFinalizationInput(input) {

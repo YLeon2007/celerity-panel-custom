@@ -1042,67 +1042,110 @@ async function settlementPrepared(t) {
 }
 
 test('assembled TEST worker uses real Mongo finalizer and real runner while PROD quiescence stays closed', async t => {
-    const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
-    const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
-    const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
-    const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
-    const state = await setup();
-    await state.store.preEnroll(state.enrollment); await state.store.createBinding(state.expected);
-    // TEST-only local inventory. Production binding/enrollment constructors do
-    // not permit TEST; this raw fixture is never an operational enrollment API.
-    await models.Operation.collection.updateOne({}, { $set: { executionContext: TEST, status: 'queued', attempts: 0,
-        idempotencyKey: `topology:test:revision-17:host-${TEST.hostIdentity}:${randomUUID()}`, leaseOwner: '', leaseUntil: null } });
-    await models.Binding.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
-    await models.Enrollment.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
-    await models.Owner.collection.updateOne({}, { $set: { executionContext: TEST } });
-    await models.Lock.deleteMany({});
-    const { RECORD_KEYS } = require('../models/topologyExecutionBindingContract');
-    const bindingRow = await models.Binding.findOne().lean();
-    const binding = freeze(Object.fromEntries(RECORD_KEYS.map(key => [key, bindingRow[key]])));
-    const lockRepository = new NodeOperationLockRepository({ model: models.Lock });
-    let held = 0;
-    const assertCurrent = async () => {
-        const operation = await models.Operation.findById(binding.operationId).lean();
-        const lock = await models.Lock.findOne().lean();
-        assert.equal(operation.attempts, binding.attempt); assert.equal(operation.leaseOwner, binding.owner);
-        assert.ok(operation.leaseUntil > new Date()); assert.equal(operation.heldTopologyAdmission, true);
-        assert.equal(lock.generation, binding.generation); assert.equal(lock.owner, binding.owner); assert.ok(lock.leaseUntil > new Date());
-    };
-    const reader = {
-        async readVerified() { await assertCurrent(); return binding; },
-        async readVerifiedConnection() { await assertCurrent(); return freeze({ binding,
-            connection: require('./helpers/topologyV2Fixture').SIMULATED_TRUSTED_CONNECTION }); },
-        async withVerifiedBinding(expected, work) {
-            held++; try { await assertCurrent(); const result = await work(binding, assertCurrent); await assertCurrent(); return result; }
-            finally { held--; }
-        },
-    };
-    const runner = require('./helpers/topologyTerminalFakeRunner').fakeRunner(t, BOOT);
-    assert.equal(runner.execute(`runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${binding.candidateHash} --backup-id previous --target-profile xray-main --execution-context ${TEST.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`).code, 0);
-    const { executor, events } = await assembled(reader, { executionContext: TEST, localRunner: runner });
-    const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology', require('../models/cascadeTopologyStateModel').schema);
-    await Topology.deleteMany({}); await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
-    const finalizer = new TopologyOperationFinalizer({ clock: { now: () => new Date() }, repository: new Repository({
-        TopologyOperation: models.Operation, CascadeTopologyState: Topology, NodeOperationLock: models.Lock,
-        TopologyConfigOwner: models.Owner, TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment }) });
-    const worker = new TopologyOperationWorker({ executionContext: TEST, allowUnprovenTestExecution: true,
-        operationRepository: new TopologyOperationRepository({ model: models.Operation }), executor, finalizer,
-        workerId: binding.owner, clock: { now: () => new Date() }, leaseMs: 120000,
-        lockService: { async acquire({ node, owner, operationId, leaseMs }) {
-            const result = await lockRepository.acquireLease({ node, owner, operationId, generation: binding.generation,
-                leaseUntil: new Date(Date.now() + leaseMs) }); return { ok: result.acquired, lock: result.lock };
-        }, async renew(request) { return { ok: await lockRepository.renewLease({ ...request, now: new Date(), leaseUntil: new Date(Date.now() + request.leaseMs) }) }; },
-        async release() { throw new Error('no separate V2 release'); } },
-        userResync: { async resyncPlan() { assert.ok(held); await assertCurrent(); return { ok: true }; } },
-        pppReadinessGate: { async verifyPlan() { assert.ok(held); await assertCurrent(); return { ok: true, relayRevisions: [] }; } } });
-    assert.equal((await worker.run(binding.operationId)).status, 'succeeded');
-    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, false);
-    assert.equal(await models.Lock.countDocuments(), 0);
-    assert.equal((await Topology.findOne().lean()).topologyAdmissionCount, 0);
-    assert.deepEqual(events.filter(event => typeof event === 'object').map(event => event.command), ['prepare', 'commit', 'verify', 'close', 'status']);
-    const before = [...events];
-    assert.equal((await worker.run(binding.operationId)).status, 'succeeded');
-    assert.deepEqual(events, before, 'settled replay reads durable outcome without SSH');
+    for (const scenario of ['portal', 'non-PPP transit', 'transit producer race']) await t.test(scenario, async t => {
+        const transit = scenario !== 'portal', raced = scenario === 'transit producer race';
+        const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
+        const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+        const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
+        const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+        const state = await setup();
+        await state.store.preEnroll(state.enrollment); await state.store.createBinding(state.expected);
+        // TEST-only local inventory. Production binding/enrollment constructors do
+        // not permit TEST; this raw fixture is never an operational enrollment API.
+        await models.Operation.collection.updateOne({}, { $set: { executionContext: TEST, status: 'queued', attempts: 0,
+            idempotencyKey: `topology:test:revision-17:host-${TEST.hostIdentity}:${randomUUID()}`, leaseOwner: '', leaseUntil: null } });
+        await models.Binding.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
+        await models.Enrollment.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
+        await models.Owner.collection.updateOne({}, { $set: { executionContext: TEST } });
+        await models.Lock.deleteMany({});
+        if (transit) {
+            await models.Operation.collection.updateOne({}, { $set: { 'nodes.0.role': 'relay',
+                'nodes.0.nodeRef': 'relay-1', 'nodes.0.targetProfile': 'xray-bridge',
+                'nodes.0.configPath': '/usr/local/etc/xray-bridge/config.json',
+                'nodes.0.serviceUnit': 'xray-bridge.service',
+                'nodes.0.serviceUnitPath': '/etc/systemd/system/xray-bridge.service' } });
+            await models.HyNode.updateOne({}, { $set: { cascadeRole: 'relay' } });
+            const backupId = bindingRecord({ ...state.context, node: { ...frozenNode, targetProfile: 'xray-bridge' } }).backupId;
+            await models.Binding.collection.updateOne({}, { $set: { targetProfile: 'xray-bridge', backupId } });
+            await models.Enrollment.collection.updateOne({}, { $set: { targetProfile: 'xray-bridge' } });
+            await models.Owner.collection.updateOne({}, { $set: { profile: 'xray-bridge' } });
+        }
+        const { RECORD_KEYS } = require('../models/topologyExecutionBindingContract');
+        const bindingRow = await models.Binding.findOne().lean();
+        const binding = freeze(Object.fromEntries(RECORD_KEYS.map(key => [key, bindingRow[key]])));
+        const lockRepository = new NodeOperationLockRepository({ model: models.Lock });
+        let held = 0;
+        const assertCurrent = async () => {
+            const operation = await models.Operation.findById(binding.operationId).lean();
+            const lock = await models.Lock.findOne().lean();
+            assert.equal(operation.attempts, binding.attempt); assert.equal(operation.leaseOwner, binding.owner);
+            assert.ok(operation.leaseUntil > new Date()); assert.equal(operation.heldTopologyAdmission, true);
+            assert.equal(lock.generation, binding.generation); assert.equal(lock.owner, binding.owner); assert.ok(lock.leaseUntil > new Date());
+        };
+        const reader = {
+            async readVerified() { await assertCurrent(); return binding; },
+            async readVerifiedConnection() { await assertCurrent(); return freeze({ binding,
+                connection: require('./helpers/topologyV2Fixture').SIMULATED_TRUSTED_CONNECTION }); },
+            async withVerifiedBinding(expected, work) {
+                held++; try { await assertCurrent(); const result = await work(binding, assertCurrent); await assertCurrent(); return result; }
+                finally { held--; }
+            },
+        };
+        const runner = require('./helpers/topologyTerminalFakeRunner').fakeRunner(t, BOOT);
+        if (transit) runner.put('usr/local/etc/xray-bridge/config.json', '{"old":true}\n');
+        assert.equal(runner.execute(`runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${binding.candidateHash} --backup-id previous --target-profile ${binding.targetProfile} --execution-context ${TEST.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`).code, 0);
+        const { executor, events } = await assembled(reader, { executionContext: TEST, localRunner: runner });
+        const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology', require('../models/cascadeTopologyStateModel').schema);
+        await Topology.deleteMany({}); await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+        const Relay = connection.models.WorkerTransitRelay || connection.model('WorkerTransitRelay', require('../models/relayL2tpStateModel').schema);
+        const User = connection.models.WorkerTransitUser || connection.model('WorkerTransitUser', require('../models/l2tpUserModel').schema);
+        const L2tpOperation = connection.models.WorkerTransitOperation || connection.model('WorkerTransitOperation', require('../models/l2tpOperationModel').schema);
+        for (const model of [Relay, User, L2tpOperation]) await model.deleteMany({});
+        if (transit) await Relay.create({ node: NODE, status: 'not_installed', desiredState: 'absent', secretRevision: 4 });
+        const { TopologyPppReadinessGate: Gate } = require('../services/topologyPppReadinessGate');
+        const gate = new Gate({ RelayL2tpState: Relay, L2tpUser: User, L2tpOperation,
+            transportResolver: async () => { throw new Error('non-PPP transit must not resolve transport'); } });
+        const { L2tpUserManagementRepository: UserRepository } = require('../repositories/l2tpUserManagementRepository');
+        const producer = new UserRepository({ executionContext: TEST, HyNode: models.HyNode,
+            RelayL2tpState: Relay, L2tpUser: User, L2tpOperation });
+        const finalizer = new TopologyOperationFinalizer({ clock: { now: () => new Date() }, repository: new Repository({
+            TopologyOperation: models.Operation, CascadeTopologyState: Topology, RelayL2tpState: Relay, NodeOperationLock: models.Lock,
+            HyNode: models.HyNode, L2tpUser: User, L2tpOperation, TopologyConfigOwner: models.Owner, TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment }) });
+        const worker = new TopologyOperationWorker({ executionContext: TEST, allowUnprovenTestExecution: true,
+            operationRepository: new TopologyOperationRepository({ model: models.Operation }), executor, finalizer,
+            workerId: binding.owner, clock: { now: () => new Date() }, leaseMs: 120000,
+            lockService: { async acquire({ node, owner, operationId, leaseMs }) {
+                const result = await lockRepository.acquireLease({ node, owner, operationId, generation: binding.generation,
+                    leaseUntil: new Date(Date.now() + leaseMs) }); return { ok: result.acquired, lock: result.lock };
+            }, async renew(request) { return { ok: await lockRepository.renewLease({ ...request, now: new Date(), leaseUntil: new Date(Date.now() + request.leaseMs) }) }; },
+            async release() { throw new Error('no separate V2 release'); } },
+            userResync: { async resyncPlan() { assert.ok(held); await assertCurrent(); return { ok: true }; } },
+            pppReadinessGate: { async verifyPlan(plan) {
+                assert.ok(held); await assertCurrent();
+                const result = await gate.verifyPlan(plan);
+                assert.equal(result.ok, true);
+                if (raced) await producer.createUserAndQueueSync({ relayNode: NODE, login: 'worker-race-user',
+                    ip: '10.0.0.2', enabled: true, passwordEncrypted: 'synthetic-encrypted-not-a-secret' });
+                return result;
+            } } });
+        const result = await worker.run(binding.operationId);
+        assert.equal(result.status, raced ? 'committing' : 'succeeded');
+        if (raced) assert.equal(result.errorCode, 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED');
+        const operation = await models.Operation.findOne().lean();
+        assert.equal(operation.heldTopologyAdmission, raced);
+        assert.equal(await models.Lock.countDocuments(), raced ? 1 : 0);
+        assert.equal((await Topology.findOne().lean()).topologyAdmissionCount, raced ? 1 : 0);
+        if (transit && !raced) assert.deepEqual(operation.v2Terminal.sideEffects.skippedPppProof,
+            [{ relayNode: NODE, state: 'not_installed', desiredState: 'absent', credentialRevision: 4 }]);
+        assert.equal(await User.countDocuments(), raced ? 1 : 0);
+        assert.equal(await L2tpOperation.countDocuments({ status: 'queued' }), raced ? 1 : 0);
+        assert.deepEqual(events.filter(event => typeof event === 'object').map(event => event.command), ['prepare', 'commit', 'verify', 'close', 'status']);
+        const before = [...events];
+        if (!raced) {
+            assert.equal((await worker.run(binding.operationId)).status, 'succeeded');
+            assert.deepEqual(events, before, 'settled replay reads durable outcome without SSH');
+        }
+    });
 });
 
 test('V2 settlement rejects forged proof, changed bindings, ownership and lease fences without partial publication', async t => {
@@ -1191,6 +1234,181 @@ test('V2 relay settlement fences the proved PPP credential revision in the publi
             assert.equal(await models.Lock.countDocuments(), 0);
             assert.equal((await Relay.findOne().lean()).secretRevision, 4);
         }
+    });
+});
+
+test('V2 public finalization rejects supplied sessions and symbol capabilities before any publication', async t => {
+    for (const active of [false, true]) await t.test(active ? 'foreign active session' : 'nonactive session', async t => {
+        const f = await terminalFixture(t);
+        await f.executor.verify(f.lifecycle);
+        const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology', require('../models/cascadeTopologyStateModel').schema);
+        await Topology.deleteMany({});
+        await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+        await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed', 'nodes.0.backupId': f.expected.backupId } });
+        const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+        const { TopologyOperationFinalizer: Finalizer } = require('../services/topologyOperationFinalizer');
+        const repository = new Repository({ TopologyOperation: models.Operation, CascadeTopologyState: Topology,
+            NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner,
+            TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment });
+        const request = { operationId: f.expected.operationId, owner: f.expected.owner,
+            leaseUntil: (await models.Operation.findOne().lean()).leaseUntil, topologyRevision: 17, priorDeployedRevision: 16 };
+        const finalizer = new Finalizer({ repository, clock: { now: () => new Date() } });
+        await finalizer.beginV2Closure({ ...request, bindings: [f.row] });
+        assert.equal(await finalizer.finalizeSucceeded(request), null);
+        const before = await Promise.all([models.Operation, Topology, models.Lock].map(model => model.findOne().lean()));
+        const session = await connection.startSession();
+        if (active) session.startTransaction();
+        const settlement = require('../repositories/topologyV2Settlement');
+        // Exercise the original exported bypass if present, plus arbitrary
+        // symbol/session attempts after it is removed. inTransaction is not authority.
+        const capability = settlement.SESSION ?? Symbol('V2_SETTLEMENT_SESSION');
+        const commands = [], observe = event => commands.push(event.commandName);
+        connection.getClient().on('commandStarted', observe);
+        try {
+            await assert.rejects(finalizer.finalizeSucceeded({ ...request, [capability]: session }), TypeError);
+            await assert.rejects(repository.finalizeSucceeded({ ...request, now: new Date(), [capability]: session }), TypeError);
+            await assert.rejects(finalizer.finalizeSucceeded({ ...request, session }), TypeError);
+            await assert.rejects(repository.finalizeSucceeded({ ...request, now: new Date(), session }), TypeError);
+            assert.deepEqual(commands, [], 'public capability rejection must happen before database access');
+        } finally {
+            connection.getClient().off('commandStarted', observe);
+            if (session.inTransaction()) await session.abortTransaction();
+            await session.endSession();
+        }
+        assert.equal(Object.hasOwn(settlement, 'SESSION'), false);
+        assert.deepEqual(await Promise.all([models.Operation, Topology, models.Lock].map(model => model.findOne().lean())), before);
+        assert.deepEqual(f.events.filter(e => e && typeof e === 'object').map(e => e.command), ['prepare', 'commit', 'verify']);
+        assert.equal(before[0].v2Terminal.state, 'closing'); assert.deepEqual(before[0].v2Terminal.proofs, []);
+    });
+});
+
+test('V2 skipped PPP epoch rejects actual user producer races across persistence and settlement', async t => {
+    for (const timing of ['before-gate', 'during-gate', 'last-gate-read', 'before-persist', 'during-persist',
+        'after-persist', 'during-settle', 'epoch-before-persist', 'epoch-after-persist', 'unchanged', 'missing', 'missing-replaced']) await t.test(timing, async t => {
+        const state = await setup();
+        const node = freeze({ ...frozenNode, role: 'relay', nodeRef: 'relay-1', targetProfile: 'xray-bridge',
+            configPath: '/usr/local/etc/xray-bridge/config.json', serviceUnit: 'xray-bridge.service',
+            serviceUnitPath: '/etc/systemd/system/xray-bridge.service' });
+        await models.Operation.collection.updateOne({}, { $set: { 'nodes.0.role': 'relay', 'nodes.0.nodeRef': 'relay-1', 'nodes.0.targetProfile': 'xray-bridge' } });
+        await models.Owner.collection.updateOne({}, { $set: { profile: 'xray-bridge' } });
+        await models.HyNode.updateOne({}, { $set: { cascadeRole: 'relay' } });
+        const context = { ...state.context, node };
+        const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
+        await state.store.preEnroll(freeze({ ...state.enrollment, targetProfile: 'xray-bridge' }));
+        const binding = await state.store.createBinding(freeze(expected));
+        const runner = require('./helpers/topologyTerminalFakeRunner').fakeRunner(t, BOOT);
+        runner.put('usr/local/etc/xray-bridge/config.json', '{"old":true}\n');
+        assert.equal(runner.execute('runner --command close --operation-id predecessor --node-id ' + NODE + ' --candidate-hash ' + expected.candidateHash + ' --backup-id previous --target-profile xray-bridge --execution-context ' + PROD.hostIdentity + ' --attempt-id previous --generation ' + PREDECESSOR + ' --predecessor-generation none --command-id previous-close').code, 0);
+        const { executor } = await assembled(state.store, { localRunner: runner });
+        const prepared = await executor.prepare(context);
+        const lifecycle = { ...context, backupId: prepared.backupId, prepared: prepared.prepared };
+        await executor.commit(lifecycle); await executor.verify(lifecycle);
+        await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed', 'nodes.0.backupId': expected.backupId } });
+        const Topology = connection.models.ReviewTopology || connection.model('ReviewTopology', require('../models/cascadeTopologyStateModel').schema);
+        const Relay = connection.models.ReviewRelay || connection.model('ReviewRelay', require('../models/relayL2tpStateModel').schema);
+        const User = connection.models.ReviewUser || connection.model('ReviewUser', require('../models/l2tpUserModel').schema);
+        const Operation = connection.models.ReviewL2tpOperation || connection.model('ReviewL2tpOperation', require('../models/l2tpOperationModel').schema);
+        for (const model of [Topology, Relay, User, Operation]) await model.deleteMany({});
+        await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+        await Relay.create({ node: NODE, status: 'not_installed', desiredState: 'absent', secretRevision: 4, routeGroup: new mongoose.Types.ObjectId() });
+        const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+        const repository = new Repository({ TopologyOperation: models.Operation, CascadeTopologyState: Topology, RelayL2tpState: Relay,
+            NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner,
+            TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment,
+            HyNode: models.HyNode, L2tpUser: User, L2tpOperation: Operation });
+        assert.ok(repository.HyNode === models.HyNode, 'settlement retains the actual node inventory');
+        assert.ok(repository.L2tpUser === User, 'settlement retains the actual credential producer model');
+        assert.ok(repository.L2tpOperation === Operation, 'settlement retains the actual sync queue model');
+        const request = { operationId: expected.operationId, owner: expected.owner,
+            leaseUntil: (await models.Operation.findOne().lean()).leaseUntil, topologyRevision: 17, priorDeployedRevision: 16, now: new Date() };
+        await repository.beginV2Closure({ ...request, bindings: [binding] });
+        const { TopologyPppReadinessGate: Gate } = require('../services/topologyPppReadinessGate');
+        const gate = new Gate({ RelayL2tpState: Relay, L2tpUser: User, L2tpOperation: Operation,
+            transportResolver: async () => { throw new Error('absent relay should not use transport'); } });
+        const missing = timing.startsWith('missing');
+        if (missing) await Relay.deleteMany({});
+        const plan = missing ? { staged: true, nodes: [frozenNode, node] } : { nodes: [node] };
+        const { L2tpUserManagementRepository: UserRepository } = require('../repositories/l2tpUserManagementRepository');
+        const userRepository = new UserRepository({ executionContext: PROD, HyNode: models.HyNode,
+            L2tpUser: User, RelayL2tpState: Relay, L2tpOperation: Operation });
+        const addUser = () => userRepository.createUserAndQueueSync({ relayNode: NODE, login: 'review-user',
+            ip: '10.0.0.2', enabled: true, passwordEncrypted: 'synthetic-encrypted-not-a-secret' });
+        const epochOnly = timing.startsWith('epoch-');
+        const produce = async () => {
+            await addUser();
+            if (epochOnly) {
+                // Simulate completed/removed successor work without resetting
+                // its monotonic credential epoch. A clean CURRENT gate must
+                // not replace the original checked epoch at settlement.
+                await User.deleteMany({}); await Operation.deleteMany({});
+            }
+        };
+        if (timing === 'before-gate') await addUser();
+        const find = Relay.findOne;
+        let gateReads = 0, gateProof;
+        // Real reads and real producer: suspend delivery, not the Mongo result.
+        if (['during-gate', 'last-gate-read'].includes(timing)) Relay.findOne = function (...args) {
+            const query = find.apply(this, args), lean = query.lean;
+            const read = ++gateReads;
+            query.lean = async function (...args) {
+                const result = await lean.apply(this, args);
+                if (read === (timing === 'during-gate' ? 1 : 2)) await addUser();
+                return result;
+            };
+            return query;
+        };
+        try { gateProof = await executor.withVerifiedMutationScope([lifecycle], () => gate.verifyPlan(plan)); }
+        finally { Relay.findOne = find; }
+        const gateRefused = ['before-gate', 'during-gate'].includes(timing);
+        assert.equal(gateProof.ok, !gateRefused);
+        if (!gateRefused) {
+            assert.deepEqual(gateProof.relayRevisions, []);
+            if (!missing) assert.deepEqual(gateProof.skippedRelayRevisions,
+                [{ relayNode: NODE, state: 'not_installed', desiredState: 'absent', credentialRevision: 4 }]);
+            const sideEffects = { usersVerified: true, pppProof: gateProof.relayRevisions,
+                ...(gateProof.skippedRelayRevisions ? { skippedPppProof: gateProof.skippedRelayRevisions } : {}), attachVerified: false };
+            const proof = await executor.close(lifecycle);
+            if (timing === 'missing-replaced') await Relay.create({ node: NODE, status: 'not_installed',
+                desiredState: 'absent', secretRevision: 4, routeGroup: new mongoose.Types.ObjectId() });
+            if (['before-persist', 'epoch-before-persist'].includes(timing)) await produce();
+            const raceWrite = async work => {
+                const update = Relay.updateOne;
+                let injected = false;
+                Relay.updateOne = async function (...args) {
+                    if (!injected) { injected = true; await addUser(); }
+                    return update.apply(this, args);
+                };
+                try { await assert.rejects(work()); }
+                finally { Relay.updateOne = update; }
+                assert.equal(injected, true, 'race must reach the real transactional state fence');
+            };
+            const persist = () => repository.persistV2TerminalProofs({ ...request, proofs: [proof], sideEffects });
+            if (timing === 'during-persist') await raceWrite(persist);
+            else if (missing || ['before-persist', 'last-gate-read', 'epoch-before-persist'].includes(timing)) {
+                await assert.rejects(persist(), { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' });
+            } else {
+                await persist();
+                const durable = (await models.Operation.findOne().lean()).v2Terminal.sideEffects;
+                assert.deepEqual(durable.skippedPppProof, sideEffects.skippedPppProof);
+                if (['after-persist', 'epoch-after-persist'].includes(timing)) {
+                    await produce();
+                    await assert.rejects(repository.finalizeV2Succeeded(request), { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' });
+                } else if (timing === 'during-settle') await raceWrite(() => repository.finalizeV2Succeeded(request));
+                else assert.ok(await repository.finalizeV2Succeeded(request));
+            }
+        }
+        const retained = timing !== 'unchanged', produced = retained && !missing;
+        assert.equal((await Relay.findOne().lean())?.secretRevision,
+            timing === 'missing' ? undefined : produced ? 5 : 4);
+        if (!missing) assert.equal((await gate.verifyPlan(plan)).ok, epochOnly || !produced);
+        const operation = await models.Operation.findOne().lean();
+        assert.equal(operation.status, retained ? 'committing' : 'succeeded');
+        assert.equal(operation.heldTopologyAdmission, retained);
+        assert.equal(await models.Lock.countDocuments(), retained ? 1 : 0);
+        assert.equal((await Topology.findOne().lean()).topologyAdmissionCount, retained ? 1 : 0);
+        assert.equal(await User.countDocuments(), produced && !epochOnly ? 1 : 0);
+        assert.equal(await Operation.countDocuments({ status: 'queued' }), produced && !epochOnly ? 1 : 0);
+        if (missing) assert.equal(await Relay.countDocuments(), timing === 'missing' ? 0 : 1, 'never create/adopt missing state to settle');
     });
 });
 

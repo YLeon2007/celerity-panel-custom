@@ -1065,7 +1065,9 @@ class TopologyOperationWorker {
                     }
                     await assertCurrent();
                 }
-                return { usersVerified: true, pppProof: ppp.relayRevisions, attachVerified: plan.kind === 'link.attach' };
+                return { usersVerified: true, pppProof: ppp.relayRevisions,
+                    ...(ppp.skippedRelayRevisions ? { skippedPppProof: ppp.skippedRelayRevisions } : {}),
+                    attachVerified: plan.kind === 'link.attach' };
             }));
             const proofs = [];
             for (const context of contexts) proofs.push(await heartbeat.run(() => this.executor.close(context)));

@@ -19,6 +19,7 @@ function assertFinalizationRequest(request) {
     if (!request
         || typeof request !== 'object'
         || Array.isArray(request)
+        || Reflect.ownKeys(request).some(key => typeof key !== 'string')
         || typeof request.operationId !== 'string'
         || request.operationId.length === 0
         || typeof request.owner !== 'string'
@@ -165,7 +166,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
 class TopologyOperationFinalizationRepository {
     constructor({ TopologyOperation, CascadeTopologyState, CascadeLink,
         CascadeRouteGroup, RelayL2tpState, transactionRunner, NodeOperationLock,
-        TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment } = {}) {
+        TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment, HyNode, L2tpUser, L2tpOperation } = {}) {
         if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function'
             || typeof TopologyOperation.findById !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
@@ -184,7 +185,8 @@ class TopologyOperationFinalizationRepository {
         this.CascadeRouteGroup = CascadeRouteGroup || null;
         this.RelayL2tpState = RelayL2tpState || null;
         this.transactionRunner = runTransaction;
-        Object.assign(this, { NodeOperationLock, TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment });
+        Object.assign(this, { NodeOperationLock, TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment,
+            HyNode, L2tpUser, L2tpOperation });
     }
 
     beginV2Closure(request) {
@@ -199,7 +201,10 @@ class TopologyOperationFinalizationRepository {
 
     finalizeV2Succeeded(request) {
         assertFinalizationRequest(request);
-        return require('./topologyV2Settlement').settle(this, request);
+        // Only this lexical callback can join publication to the settlement
+        // transaction. No request field or exported capability authorizes it.
+        return require('./topologyV2Settlement').settle(this, request,
+            session => this.#finalizeSucceeded(request, session));
     }
 
     probeV2Settlement({ operationId }) {
@@ -251,6 +256,17 @@ class TopologyOperationFinalizationRepository {
 
     async finalizeSucceeded(request) {
         assertFinalizationRequest(request);
+        const allowed = ['operationId', 'owner', 'leaseUntil', 'topologyRevision', 'priorDeployedRevision', 'now', 'pppProof'];
+        if (Reflect.ownKeys(request).some(key => !allowed.includes(key))) {
+            throw new TypeError('Invalid public topology finalization request');
+        }
+        return this.#finalizeSucceeded(request);
+    }
+
+    async #finalizeSucceeded(request, settlementSession) {
+        assertFinalizationRequest(request);
+        if (settlementSession && (settlementSession.inTransaction() !== true
+            || settlementSession.client !== this.TopologyOperation.db.getClient())) rejectFinalization();
         const {
             operationId,
             owner,
@@ -259,15 +275,16 @@ class TopologyOperationFinalizationRepository {
             priorDeployedRevision,
             now,
         } = request;
-        const session = request[require('./topologyV2Settlement').SESSION];
-        const run = session ? work => work(session) : this.transactionRunner;
+        const run = settlementSession ? work => work(settlementSession) : this.transactionRunner;
         try {
             return await run(async session => {
                 const admission = await this.TopologyOperation.findById(operationId)
                     .select('heldTopologyAdmission pppWait nodes v2Terminal')
                     .session(session)
                     .lean();
-                if (!admission || (admission.v2Terminal && !request[require('./topologyV2Settlement').SESSION])) rejectFinalization();
+                if (!admission || (admission.v2Terminal && !settlementSession)
+                    || (settlementSession && (session !== settlementSession || !session.inTransaction()
+                        || admission.v2Terminal?.state !== 'proven'))) rejectFinalization();
                 const wait = admission.pppWait;
                 if (wait || request.pppProof !== undefined) {
                     const proof = request.pppProof;

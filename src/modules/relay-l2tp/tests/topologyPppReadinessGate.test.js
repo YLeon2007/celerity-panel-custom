@@ -123,7 +123,7 @@ test('staged relay without installed PPP is skipped, never claimed node-verified
     assert.deepEqual(await gate.verifyPlan({ staged: true, nodes: [
         { ...plan.nodes[0], nodeRef: 'portal' }, { ...plan.nodes[1], nodeRef: 'relay-1' },
     ] }),
-        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [], skippedRelayRevisions: [{ relayNode: 'node-r', state: 'unfenced' }] });
     assert.deepEqual(calls, []);
 });
 
@@ -140,7 +140,8 @@ test('staged fan-in with two portals and one absent terminal relay remains block
         { role: 'relay', node: 'node-r', nodeRef: 'relay-1' },
     ];
     assert.deepEqual(await gate.verifyPlan({ staged: true, nodes }),
-        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [], skippedRelayRevisions: [
+            { relayNode: 'node-r', state: 'not_installed', desiredState: 'not_installed', credentialRevision: 59 }] });
     assert.deepEqual(calls, []);
     for (const bad of [
         [nodes[0], { ...nodes[1], nodeRef: 'portal-3' }, nodes[2]],
@@ -182,7 +183,9 @@ test('staged explicit non-PPP transit with zero users allows an absent terminal 
         L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => null }) }) },
     });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
-        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [] });
+        { ok: true, verifiedRelayCount: 0, skippedRelayCount: 1, relayRevisions: [], skippedRelayRevisions: [
+            { relayNode: 'node-t', state: 'not_installed', desiredState: 'absent', credentialRevision: 4 },
+            { relayNode: 'node-r', state: 'not_installed', desiredState: 'absent', credentialRevision: 9 }] });
     assert.deepEqual(calls, []);
 });
 
@@ -214,7 +217,8 @@ test('staged verified intermediate and absent terminal allows exactly one skip r
     }) }) } });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
         { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
-            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }],
+            skippedRelayRevisions: [{ relayNode: 'node-t', state: 'unfenced' }] });
     assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
 });
@@ -242,7 +246,8 @@ test('staged installed owner accepts verified legacy non-PPP terminal without di
     });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan),
         { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
-            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }],
+            skippedRelayRevisions: [{ relayNode: 'node-t', state: 'not_installed', desiredState: 'not_installed', credentialRevision: 9 }] });
     assert.deepEqual(calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
 });
@@ -336,12 +341,14 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
     };
     const ready = make();
     assert.deepEqual(await ready.gate.verifyPlan(transitPlan),
-        { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+        { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }],
+            skippedRelayRevisions: [{ relayNode: 'node-t', state: 'not_installed', desiredState: 'not_installed', credentialRevision: 9 }] });
     assert.deepEqual(ready.calls.map(([action, value]) => [action, value?.command ?? value]),
         [['resolve', 'node-r'], ['verify', 'verify-users']]);
     assert.deepEqual(await make({ transitState: {
         status: 'not_installed', desiredState: 'absent', secretRevision: 9,
-    } }).gate.verifyPlan(transitPlan), { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+    } }).gate.verifyPlan(transitPlan), { ok: true, verifiedRelayCount: 1, relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }],
+            skippedRelayRevisions: [{ relayNode: 'node-t', state: 'not_installed', desiredState: 'absent', credentialRevision: 9 }] });
     const stagedTransit = { staged: true, nodes: [
         { ...plan.nodes[0], nodeRef: 'portal' },
         { ...plan.nodes[1], nodeRef: 'relay-1' },
@@ -349,7 +356,8 @@ test('explicit non-PPP transit relay with no users or active L2TP work does not 
     ] };
     assert.deepEqual(await make().gate.verifyPlan(stagedTransit),
         { ok: true, verifiedRelayCount: 1, skippedRelayCount: 1,
-            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }] });
+            relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 }],
+            skippedRelayRevisions: [{ relayNode: 'node-t', state: 'not_installed', desiredState: 'not_installed', credentialRevision: 9 }] });
     for (const options of [
         { users: [{ relayNode: 'node-t' }] },
         { active: true },
@@ -503,7 +511,8 @@ test('freshly verified relays expose ordered revision proof, excluding staged sk
         { role: 'relay', node: 'node-t', nodeRef: 'relay-3' },
     ] }), { ok: true, verifiedRelayCount: 2, skippedRelayCount: 1,
         relayRevisions: [{ relayNode: 'node-r', credentialRevision: 41 },
-            { relayNode: 'node-s', credentialRevision: 42 }] });
+            { relayNode: 'node-s', credentialRevision: 42 }],
+        skippedRelayRevisions: [{ relayNode: 'node-t', state: 'unfenced' }] });
 });
 
 test('persisted desired/applied credential revision mismatch is drift', async () => {
