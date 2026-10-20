@@ -49,6 +49,25 @@ test('read-only gate selects only direct verifier and never falls back to runner
         expectedCredentialRevision: 41, expectedEnabledUserCount: 1 }]);
 });
 
+test('restricted PPP factory cannot select legacy credentials, shell, bootstrap or sync fallback', async () => {
+    const { deps } = fixture();
+    const calls = [];
+    const { withTopologyReadinessScope } = require('../services/topologyReadinessScope');
+    const gate = createTopologyPppReadinessGate({ ...deps, executionContext: TEST, restrictedRunner: true,
+        HyNode: { findById() { throw new Error('No mutable credential lookup'); } },
+        NodeSSH: class { constructor() { throw new Error('No independent legacy SSH'); } } });
+    assert.equal(gate.readOnly, true);
+    assert.equal((await gate.verifyPlan(plan)).ok, false, 'absent exact scope must refuse');
+    const binding = { nodeId: 'node-r', targetProfile: 'xray-bridge', commandIds: { verify: 'v-1' } };
+    const result = await withTopologyReadinessScope([{ binding, poison() {}, async invoke(command, request) {
+        calls.push({ command, expectation: request.expectation });
+        return { ok: true, code: 'USERS_VERIFIED', credentialRevision: 41, enabledUserCount: 1, managedUserCount: 1 };
+    } }], async () => {}, () => gate.verifyPlan(plan));
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls, [{ command: 'verify-ppp-users', expectation: { operationId: 'abcdef012345abcdef012345',
+        expectedCredentialRevision: 41, expectedEnabledUserCount: 1 } }]);
+});
+
 test('factory opts in to read-only mode without changing default mode', () => {
     const deps = { RelayL2tpState: { findOne() {} }, L2tpUser: { find() {} },
         L2tpOperation: { findOne() {} }, HyNode: { findById() {} }, NodeSSH: class {} };

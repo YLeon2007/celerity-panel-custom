@@ -114,6 +114,26 @@ function typedExecutor(calls) {
     }])));
 }
 
+test('preinstalled runtime selects finite user and PPP readiness without opening PROD or legacy defaults', () => {
+    const deps = compositionDependencies();
+    // Composition-only constructor seam; actual-store proof is separate.
+    const db = { getClient: () => ({ options: {}, topology: { description: { type: 'ReplicaSetWithPrimary' } } }) };
+    for (const name of ['HyNode', 'TopologyOperation', 'NodeOperationLock', 'TopologyExecutionBinding',
+        'TopologyExecutionEnrollment', 'TopologyConfigOwner']) {
+        deps[name].db = db; deps[name].findOne ??= () => { throw new Error('no reads during assembly'); };
+    }
+    const service = createTopologyOperationRuntime({ ...deps, topologyExecutionAuthority: {
+        runnerTransport: 'preinstalled-attested-v1', async withHeldAuthority() { throw new Error('composition only'); },
+    } });
+    assert.ok(service.operationWorker);
+    assert.equal(service.operationWorker.userResync.restrictedRunner, true);
+    assert.equal(service.operationWorker.pppReadinessGate.readOnly, true);
+    assert.equal(service.operationWorker.pppResumeReadinessGate.readOnly, true);
+    const legacy = createTopologyOperationRuntime(compositionDependencies());
+    assert.equal(legacy.operationWorker.userResync.restrictedRunner, false);
+    assert.equal(legacy.operationWorker.pppReadinessGate.readOnly, false);
+});
+
 test('test topology runtime requires all three exact opt-in flags', async () => {
     assert.deepEqual(REQUIRED_TEST_RUNTIME_FLAGS, [
         'L2TP_EXECUTION_ENABLED',

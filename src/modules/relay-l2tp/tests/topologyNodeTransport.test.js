@@ -114,7 +114,7 @@ test('exposes only typed topology lifecycle and completion methods', () => {
 
     assert.deepEqual(
         Object.getOwnPropertyNames(Object.getPrototypeOf(transport)),
-        ['constructor', 'prepare', 'commit', 'verify', 'rollback', 'close', 'status'],
+        ['constructor', 'restoreUsers', 'verifyPppUsers', 'prepare', 'commit', 'verify', 'rollback', 'close', 'status'],
     );
     assert.equal(transport.exec, undefined);
     assert.equal(transport.run, undefined);

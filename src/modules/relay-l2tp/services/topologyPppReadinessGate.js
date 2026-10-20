@@ -225,7 +225,15 @@ class TopologyPppReadinessGate {
 }
 
 function createTopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, HyNode, NodeSSH,
-    executionContext, enableProductionExecution = false, readOnly = false }) {
+    executionContext, enableProductionExecution = false, readOnly = false, restrictedRunner = false }) {
+    if (restrictedRunner === true) {
+        // The executor provides the exact already-pinned transport only inside
+        // its held mutation scope. No independent credential/bootstrap path.
+        const { invokeTopologyReadiness } = require('./topologyReadinessScope');
+        return new TopologyPppReadinessGate({ RelayL2tpState, L2tpUser, L2tpOperation, readOnly: true,
+            transportResolver: async ({ nodeId }) => ({ verifyUsersReadOnly: expectation =>
+                invokeTopologyReadiness(nodeId, 'verify-ppp-users', expectation) }) });
+    }
     const authorization = Object.freeze({ executionContext: selectExecutionContext(executionContext),
         enableProductionExecution: enableProductionExecution === true });
     const resolver = new L2tpNodeExecutionResolver({ ...authorization, HyNode, NodeSSH });

@@ -22,12 +22,26 @@ const NODE = '6ab18adc63913ebd4a917471';
 const ENDPOINT = freeze({ ip: '132.243.230.19', port: 2222, username: 'c3-test-runner' });
 const IDENTITY = freeze({ machineId: randomBytes(16).toString('hex'), sshHostKeySha256: randomBytes(32).toString('hex') });
 const BOOT = randomUUID(), MAINTENANCE = randomUUID(), OWNER = randomUUID();
-const content = '{"inbounds":[],"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}\n';
-const hash = createHash('sha256').update(content).digest('hex');
-const node = freeze({ node: NODE, nodeRef: 'portal', role: 'portal', targetProfile: 'xray-main',
-    configPath: '/usr/local/etc/xray/config.json', serviceUnit: 'xray.service',
-    serviceUnitPath: '/etc/systemd/system/xray.service', checks: [], candidateHash: hash,
-    candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1', bytes: [...Buffer.from(content)], sha256: hash } });
+let content, hash, node, apiPort;
+test.before(async () => {
+    assert.ok(process.env.C3_XRAY, 'set a reviewed local Xray binary for nonempty runtime user proof');
+    apiPort = await new Promise(resolve => {
+        const server = net.createServer(); server.listen(0, '127.0.0.1', () => {
+            const port = server.address().port; server.close(() => resolve(port));
+        });
+    });
+    const canonical = value => Array.isArray(value) ? value.map(canonical)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+    content = `${JSON.stringify(canonical({ log: { loglevel: 'none' }, api: { tag: 'API', services: ['HandlerService'] },
+        inbounds: [{ tag: 'API_INBOUND', listen: '127.0.0.1', port: apiPort, protocol: 'dokodemo-door', settings: { address: '127.0.0.1' } },
+            { tag: 'vless-in', listen: '127.0.0.1', port: 0, protocol: 'vless', settings: { decryption: 'none', clients: [] } }],
+        outbounds: [{ protocol: 'freedom', tag: 'direct' }], routing: { rules: [{ type: 'field', inboundTag: ['API_INBOUND'], outboundTag: 'API' }] } }))}\n`;
+    hash = createHash('sha256').update(content).digest('hex');
+    node = freeze({ node: NODE, nodeRef: 'portal', role: 'portal', targetProfile: 'xray-main',
+        configPath: '/usr/local/etc/xray/config.json', serviceUnit: 'xray.service',
+        serviceUnitPath: '/etc/systemd/system/xray.service', checks: [], candidateHash: hash,
+        candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1', bytes: [...Buffer.from(content)], sha256: hash } });
+});
 // Load the REAL independently maintained finite V2 parser. Never emulate
 // successful shell inspection/mkdir replies or widen the forced-command grammar.
 function restrictedExecute(runner, command, options) {
@@ -97,6 +111,14 @@ async function fixture(t, fault, executionContext = TEST) {
         adoptionReceipt: { proofId: randomUUID(), maintenanceId: MAINTENANCE, fromGeneration: randomUUID(), toGeneration: OWNER,
             oldBackendInstanceId: 'simulated-controller', oldPid: 42, oldProcessStartTime: 'local-start', verifiedAt: new Date() } });
     const runner = fakeRunner(t, BOOT), events = [], runnerExecutions = [];
+    runner.put('usr/local/bin/xray', await fs.readFile(process.env.C3_XRAY), 0o750);
+    let xray;
+    const stopXray = async () => {
+        if (xray && xray.exitCode === null) { const exited = new Promise(resolve => xray.once('exit', resolve)); xray.kill(); await exited; }
+    };
+    t.after(stopXray);
+    const queryUsers = () => spawnSync(process.env.C3_XRAY,
+        ['api', 'inbounduser', `--server=127.0.0.1:${apiPort}`, '-tag=vless-in'], { encoding: 'utf8', timeout: 5000 });
     let active = false, revoked = false, first, runnerHeld = 0, runnerRevoked = false;
     const assertHeld = async () => { if (!active || revoked) throw new Error('Simulated hold revoked'); };
     const attest = async (challenge, work) => {
@@ -208,8 +230,17 @@ async function fixture(t, fault, executionContext = TEST) {
             const result = restrictedExecute(runner, command, options);
             assert.equal(result.code, 0, result.stderr);
             runnerExecutions.push(command);
+            if (command.includes('--command commit ')) {
+                // Disposable process boundary: real Xray starts from the actual
+                // committed candidate after the simulated systemd restart.
+                await stopXray();
+                xray = spawn(process.env.C3_XRAY, ['run', '-config', path.join(runner.root, 'usr/local/etc/xray/config.json')], { stdio: 'ignore' });
+                await until(() => { const result = queryUsers(); assert.equal(result.status, 0, result.stderr);
+                    assert.deepEqual(JSON.parse(result.stdout).users || [], []); });
+            }
             if (fault === 'hold-lost-after-close' && command.includes('--command close ')) revoked = true;
             if (fault === 'runner-loss-after-commit' && command.includes('--command commit ')) runnerRevoked = true;
+            if (fault === 'runner-loss-after-users' && command.includes('--command restore-users ')) runnerRevoked = true;
             return result;
         }
     }
@@ -259,8 +290,12 @@ async function fixture(t, fault, executionContext = TEST) {
         t.after(() => host.stop());
     }
     assert.ok(service?.operationWorker, 'actual host/runtime must compose real worker');
-    // Local user RPC seam only; keep actual resync/gate/finalizer/executor implementations.
-    service.operationWorker.userResync._syncService = { async _getUsersForNode() { await assertHeld(); return []; }, async addXrayUser() { assert.fail('no users'); } };
+    // The subscription lookup is local; actual nonempty RPC/readback goes via
+    // source resync + exact scoped typed transport + restricted runner + Xray.
+    service.operationWorker.userResync._syncService = {
+        async _getUsersForNode() { await assertHeld(); return fault === 'empty-users' ? [] : [{ userId: 'alice', xrayUuid: '550e8400-e29b-41d4-a716-446655440000' }]; },
+        async addXrayUser() { assert.fail('legacy cc-agent must stay masked'); },
+    };
     async function operation(revision) {
         await models.CascadeTopologyState.deleteMany({});
         await models.CascadeTopologyState.create({ _id: 'singleton', revision, deployedRevision: revision - 1, topologyAdmissionCount: 1 });
@@ -311,7 +346,7 @@ test('actual TEST host provisions after exact claim/locks and settles two serial
     assert.equal(await models.TopologyExecutionBinding.countDocuments(), 2);
     const { runnerRequest } = require('./helpers/topologyV2Fixture');
     assert.deepEqual(f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command),
-        ['prepare', 'commit', 'verify', 'close', 'status', 'prepare', 'commit', 'verify', 'close', 'status']);
+        ['prepare', 'commit', 'verify', 'restore-users', 'close', 'status', 'prepare', 'commit', 'verify', 'restore-users', 'close', 'status']);
     const replay = f.replayFirst();
     assert.notEqual(replay.code, 0, 'actual runner refuses stale first generation after successor');
 });
@@ -340,6 +375,20 @@ test('runner guard loss at resolution or after commit prevents the next real dis
         assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 1);
     });
 });
+test('empty user snapshot or attestor loss after actual nonempty RPC never closes or settles', async t => {
+    for (const fault of ['empty-users', 'runner-loss-after-users']) await t.test(fault, async t => {
+        const f = await fixture(t, fault), id = await f.operation(17);
+        const result = await f.worker.run(id);
+        assert.equal(result.stopped, true); assert.equal(result.drainUncertain, true);
+        const { runnerRequest } = require('./helpers/topologyV2Fixture');
+        assert.deepEqual(f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command),
+            fault === 'empty-users' ? ['prepare', 'commit', 'verify'] : ['prepare', 'commit', 'verify', 'restore-users']);
+        assert.equal(await models.NodeOperationLock.countDocuments({ operationId: id, remoteUncertain: true }), 1);
+        assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, true);
+        assert.equal((await models.CascadeTopologyState.findOne().lean()).topologyAdmissionCount, 1);
+    });
+});
+
 test('before-prepare authority/endpoint refusal retains exact locks and admission with zero SSH/bootstrap', async t => {
     for (const fault of ['hold-lost', 'endpoint-change', 'missing-authority', 'no-enrollment']) await t.test(fault, async t => {
         const f = await fixture(t, fault), id = await f.operation(17);
@@ -369,7 +418,7 @@ test('revocation inside a reused held store scope prevents status dispatch and r
     assert.equal(result.stopped, true); assert.equal(result.drainUncertain, true);
     const { runnerRequest } = require('./helpers/topologyV2Fixture');
     const commands = f.events.filter(event => event !== 'ssh').map(event => runnerRequest(event).command).filter(Boolean);
-    assert.deepEqual(commands, ['prepare', 'commit', 'verify', 'close']);
+    assert.deepEqual(commands, ['prepare', 'commit', 'verify', 'restore-users', 'close']);
     assert.equal(await models.NodeOperationLock.countDocuments({ operationId: id }), 1);
     assert.equal((await models.TopologyOperation.findById(id).lean()).heldTopologyAdmission, true);
 });

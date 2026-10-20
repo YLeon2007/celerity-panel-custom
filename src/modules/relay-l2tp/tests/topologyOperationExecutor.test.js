@@ -228,6 +228,41 @@ function executorFixture({ responseOverrides = {},
     };
 }
 
+test('readiness capability exists only inside the exact executor held mutation scope', async () => {
+    const { topologyReadinessProfile } = require('../services/topologyReadinessScope');
+    const { executor, reader } = executorFixture();
+    reader.withVerifiedBinding = async (expected, work) => work(await reader.readVerified(expected), async () => {});
+    const prepared = await executor.prepare(prepareContext());
+    const context = lifecycleContext(prepared);
+    await executor.commit(context); await executor.verify(context);
+    assert.throws(() => topologyReadinessProfile(context.node.node), /authority unavailable/);
+    let escaped;
+    await executor.withVerifiedMutationScope([context], async () => {
+        assert.equal(topologyReadinessProfile(context.node.node), 'xray-main');
+        assert.throws(() => topologyReadinessProfile('foreign'), /authority unavailable/);
+        escaped = () => topologyReadinessProfile(context.node.node);
+    });
+    assert.throws(escaped, /authority unavailable/);
+});
+
+test('an uncertain auxiliary receipt poisons the executor even if the caller catches it', async () => {
+    const { invokeTopologyReadiness } = require('../services/topologyReadinessScope');
+    const { executor, reader, events } = executorFixture();
+    reader.withVerifiedBinding = async (expected, work) => work(await reader.readVerified(expected), async () => {});
+    const prepared = await executor.prepare(prepareContext());
+    const context = lifecycleContext(prepared);
+    await executor.commit(context); await executor.verify(context);
+    await assert.rejects(executor.withVerifiedMutationScope([context], async () => {
+        await assert.rejects(invokeTopologyReadiness(context.node.node, 'verify-ppp-users', {
+            operationId: 'ppp-1', expectedCredentialRevision: 7, expectedEnabledUserCount: 1,
+        })); // Generic old V2 fixture is NOT an auxiliary success receipt.
+    }), /unconfirmed/);
+    const before = events.length;
+    await assert.rejects(executor.close(context));
+    await assert.rejects(invokeTopologyReadiness(context.node.node, 'verify-ppp-users', {}), /authority unavailable/);
+    assert.equal(events.length, before, 'no close or escaped dispatch');
+});
+
 test('missing durable execution authority refuses before node lookup or bootstrap', async () => {
     const events = [];
     const executor = new TopologyOperationExecutor({

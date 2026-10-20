@@ -3,6 +3,8 @@
 # below is read as data, never entered through an environment/CLI bypass.
 # A timeout is NOT cancellation. No automatic lease expiry or journal recovery.
 exec /usr/bin/python3 /dev/fd/3 "$0" "$@" 3<<'FENCE_PY'
+import base64
+import hashlib
 import fcntl
 import json
 import os
@@ -95,6 +97,142 @@ def sync_artifacts(state, binding, config):
             os.close(fd)
 
 
+def readiness_checks(token, boot, safe, command):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,8192}', token):
+        refuse('INVALID_READINESS', 64)
+    raw = base64.b64decode(token + '=' * (-len(token) % 4), altchars=b'-_', validate=True)
+    if base64.urlsafe_b64encode(raw).decode().rstrip('=') != token:
+        refuse('INVALID_READINESS', 64)
+    value = json.loads(raw, object_pairs_hook=unique)
+    if command == 'restore-users':
+        if (not isinstance(value, dict) or set(value) != {'bootId', 'snapshotSha256', 'userCount'}
+                or value['bootId'] != boot or not isinstance(value['snapshotSha256'], str)
+                or not re.fullmatch(r'[a-f0-9]{64}', value['snapshotSha256'])
+                or type(value['userCount']) is not int or not 1 <= value['userCount'] <= 4096):
+            refuse('INVALID_READINESS', 64)
+        return value, hashlib.sha256(raw).hexdigest()
+    if (not isinstance(value, dict) or set(value) != {'bootId', 'operationId', 'expectedCredentialRevision', 'expectedEnabledUserCount'}
+            or value['bootId'] != boot or not isinstance(value['operationId'], str)
+            or not safe.fullmatch(value['operationId']) or value['operationId'] in ('.', '..')
+            or type(value['expectedCredentialRevision']) is not int or not 1 <= value['expectedCredentialRevision'] <= 2**53-1
+            or type(value['expectedEnabledUserCount']) is not int or not 0 <= value['expectedEnabledUserCount'] <= 2**53-1):
+        refuse('INVALID_READINESS', 64)
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def verify_ppp(root, value, lock):
+    # Transitive source pin: never invoke an arbitrary/mutable L2TP artifact bundle.
+    relative = '/usr/local/lib/celerity/relay-l2tp/verify-users.sh'
+    path = root
+    for part in relative.split('/')[1:]:
+        path += '/' + part
+        info = os.lstat(path)
+        if (info.st_uid != 0 or info.st_mode & 0o022
+                or not (stat.S_ISREG(info.st_mode) if path.endswith('/verify-users.sh') else stat.S_ISDIR(info.st_mode))):
+            refuse('UNTRUSTED_PPP_VERIFIER')
+    with open(path, 'rb') as handle:
+        code = handle.read(65537)
+    if hashlib.sha256(code).hexdigest() != '135a366b9cebcdbc3c08b0c605b91f14db39c61d7190f758dab4707eca22d6d3':
+        refuse('PPP_VERIFIER_PIN_MISMATCH')
+    result = subprocess.run(['/bin/bash', path, root + '/var/lib/celerity/l2tp/operations/' + value['operationId']],
+                            env={'PATH': '/usr/bin:/bin', 'CELERITY_L2TP_ROOT': root or '/'},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(lock,), timeout=30)
+    if result.returncode != 0 or result.stderr:
+        refuse('PPP_READINESS_UNCONFIRMED')
+    actual = json.loads(result.stdout, object_pairs_hook=unique)
+    expected = dict(ok=True, credentialRevision=value['expectedCredentialRevision'],
+                    enabledUserCount=value['expectedEnabledUserCount'], managedUserCount=value['expectedEnabledUserCount'], code='USERS_VERIFIED')
+    if actual != expected or any(type(actual[k]) is not type(v) for k, v in expected.items()):
+        refuse('PPP_READINESS_UNCONFIRMED')
+    return actual
+
+
+def restore_users(root, value, binding, lock):
+    # Runtime-only VLESS user RPC, never config replacement or agent resurrection.
+    if binding['targetProfile'] != 'xray-main':
+        refuse('USER_PROFILE_UNCHANGED', 64)
+    raw = sys.stdin.buffer.read(4194305)
+    if len(raw) > 4194304 or hashlib.sha256(raw).hexdigest() != value['snapshotSha256']:
+        refuse('USER_SNAPSHOT_MISMATCH')
+    snapshot = json.loads(raw, object_pairs_hook=unique)
+    if not isinstance(snapshot, dict) or set(snapshot) != {'users'} or not isinstance(snapshot['users'], list):
+        refuse('INVALID_USER_SNAPSHOT')
+    users = snapshot['users']
+    if len(users) != value['userCount']:
+        refuse('INVALID_USER_SNAPSHOT')
+    emails, ids = set(), set()
+    for user in users:
+        if (not isinstance(user, dict) or set(user) != {'id', 'email'}
+                or not isinstance(user['id'], str) or not re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', user['id'])
+                or not isinstance(user['email'], str) or not re.fullmatch(r'[A-Za-z0-9@._+-]{1,128}', user['email'])
+                or user['email'] in emails or user['id'] in ids):
+            refuse('INVALID_USER_SNAPSHOT')
+        emails.add(user['email'])
+        ids.add(user['id'])
+    config_path = root + '/usr/local/etc/xray/config.json'
+    fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as handle:
+        active = handle.read(4194305)
+    if 'sha256:' + hashlib.sha256(active).hexdigest() != binding['candidateHash']:
+        refuse('ACTIVE_CANDIDATE_CHANGED')
+    config = json.loads(active, object_pairs_hook=unique)
+    api = [i for i in config['inbounds'] if i.get('tag') == 'API_INBOUND']
+    if (len(api) != 1 or api[0].get('listen') != '127.0.0.1' or api[0].get('protocol') != 'dokodemo-door'
+            or type(api[0].get('port')) is not int or not 1 <= api[0]['port'] <= 65535
+            or config.get('api', {}).get('tag') != 'API' or 'HandlerService' not in config['api'].get('services', [])
+            or not any(rule.get('inboundTag') == ['API_INBOUND'] and rule.get('outboundTag') == 'API'
+                       for rule in config.get('routing', {}).get('rules', []))):
+        refuse('USER_API_UNAVAILABLE')
+    # Nonempty static tunnel clients are never selected as subscription inbounds.
+    targets = [i for i in config['inbounds'] if i.get('protocol') == 'vless' and i.get('settings', {}).get('clients') == []]
+    if not 1 <= len(targets) <= 64 or len({i.get('tag') for i in targets}) != len(targets):
+        refuse('USER_INBOUNDS_UNAVAILABLE')
+    expected_by_tag = {}
+    rpc_inbounds = []
+    for inbound in targets:
+        tag = inbound.get('tag')
+        if not isinstance(tag, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', tag):
+            refuse('USER_INBOUNDS_UNAVAILABLE')
+        stream = inbound.get('streamSettings', {})
+        flow = 'xtls-rprx-vision' if stream.get('security') in ('tls', 'reality') and stream.get('network', 'tcp') in ('tcp', 'raw') else ''
+        clients = [dict(user, level=0, flow=flow) for user in users]
+        expected_by_tag[tag] = {user['email']: (user['id'], flow) for user in users}
+        rpc_inbounds.append(dict(inbound, settings=dict(inbound['settings'], clients=clients)))
+    executable = root + '/usr/local/bin/xray'
+    server = '--server=127.0.0.1:' + str(api[0]['port'])
+    deadline = __import__('time').monotonic() + 30
+    def rpc(args, data=None):
+        remaining = deadline - __import__('time').monotonic()
+        if remaining <= 0:
+            refuse('USER_RPC_UNCONFIRMED')
+        result = subprocess.run([executable, 'api', *args], input=data, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, pass_fds=(lock,), timeout=remaining,
+                                env={'PATH': '/usr/bin:/bin'})
+        if result.returncode != 0 or result.stderr:
+            refuse('USER_RPC_UNCONFIRMED')
+        return result.stdout
+    # adu can exit zero on partial RPC errors: NEVER accept exit zero alone.
+    # Authoritative readback below compares exact UUID/email/flow for every tag.
+    rpc(['adu', server, '/dev/stdin'], json.dumps(dict(inbounds=rpc_inbounds)).encode())
+    for tag, expected in expected_by_tag.items():
+        response = json.loads(rpc(['inbounduser', server, '-tag=' + tag]), object_pairs_hook=unique)
+        if not isinstance(response, dict) or set(response) != {'users'} or not isinstance(response['users'], list):
+            refuse('USER_RPC_UNCONFIRMED')
+        actual = {}
+        for user in response['users']:
+            if (not isinstance(user, dict) or set(user) - {'email', 'level', 'account'}
+                    or user.get('level', 0) != 0 or user.get('email') in actual):
+                refuse('USER_RPC_UNCONFIRMED')
+            account = user.get('account', {})
+            if (not isinstance(account, dict) or set(account) - {'_TypedMessage_', 'id', 'flow'}
+                    or account.get('_TypedMessage_') != 'xray.proxy.vless.Account'):
+                refuse('USER_RPC_UNCONFIRMED')
+            actual[user.get('email')] = (account.get('id'), account.get('flow', ''))
+        if actual != expected:
+            refuse('USER_RPC_UNCONFIRMED')
+    return dict(ok=True, code='XRAY_USERS_RESTORED', userCount=len(users), inboundCount=len(targets))
+
+
 def main():
     script, *args = sys.argv[1:]
     names = ['command', 'operation-id', 'node-id', 'candidate-hash', 'backup-id', 'target-profile',
@@ -103,7 +241,7 @@ def main():
         refuse('FENCE_REQUIRED', 64)
     request = dict(zip(names + ['checks'], args[1::2]))
     command = request['command']
-    if command not in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status'):
+    if command not in ('prepare', 'commit', 'verify', 'rollback', 'close', 'status', 'verify-ppp-users', 'restore-users'):
         refuse('UNSUPPORTED_FENCED_COMMAND', 64)
     safe = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
     for key in ('operation-id', 'node-id', 'backup-id', 'attempt-id', 'generation', 'predecessor-generation', 'command-id'):
@@ -113,7 +251,7 @@ def main():
         refuse('INVALID_IDENTITY', 65)
     if request['target-profile'] not in ('xray-main', 'xray-bridge') or request['execution-context'] not in ('test.infograd.online', 'lm1.infograd.online'):
         refuse('INVALID_EXECUTION_CONTEXT', 65)
-    if ('checks' in request) != (command == 'verify'):
+    if ('checks' in request) != (command in ('verify', 'verify-ppp-users', 'restore-users')):
         refuse('INVALID_ARGUMENTS', 64)
     root = os.environ.get('CELERITY_TOPOLOGY_ROOT', '')
     if root and (not root.startswith('/') or root == '/' or any(p in ('.', '..', '') for p in root.split('/')[1:])):
@@ -215,6 +353,28 @@ def main():
         refuse('STALE_GENERATION')
     if any(r['state'] != 'completed' for r in current['commands'].values()):
         refuse('UNKNOWN_COMMAND_OUTCOME')
+    if command in ('verify-ppp-users', 'restore-users'):
+        if current['phase'] != 'verified':
+            refuse('INVALID_PHASE')
+        # Exactly one finite auxiliary ID is derived from the admitted immutable
+        # verify ID. No mutable ID allocation or predecessor enrollment shortcut.
+        verified = [(key, r) for key, r in current['commands'].items() if r['command'] == 'verify']
+        if (len(verified) != 1 or command_id != hashlib.sha256(
+                ('topology-readiness-v1:' + command + ':' + verified[0][0]).encode()).hexdigest()):
+            refuse('READINESS_COMMAND_BINDING_MISMATCH')
+        checks, checks_hash = readiness_checks(request['checks'], boot, safe, command)
+        current['phase'] = 'readiness-running'
+        current['commands'][command_id] = dict(state='running', command=command)
+        durable(fence, journal)
+        actual = verify_ppp(root, checks, lock) if command == 'verify-ppp-users' else restore_users(root, checks, binding, lock)
+        receipt = dict(command=command, **binding, commandId=command_id, protocolVersion=2,
+                       completion='completed', phase='verified', ownershipRetained=True,
+                       bootId=boot, checksSha256=checks_hash, result=actual)
+        current['phase'] = 'verified'
+        current['commands'][command_id] = dict(state='completed', command=command, receipt=receipt)
+        durable(fence, journal)
+        print(json.dumps(receipt, separators=(',', ':')))
+        return
     allowed = dict(prepare=('new',), commit=('prepared',), verify=('committed',),
                    rollback=('prepared', 'committed', 'verified'),
                    close=('new', 'prepared', 'verified', 'rolledback'))

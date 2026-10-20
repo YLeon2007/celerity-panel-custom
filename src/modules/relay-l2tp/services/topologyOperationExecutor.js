@@ -619,7 +619,23 @@ class TopologyOperationExecutor {
         const enter = async index => {
             if (index === contexts.length) {
                 await assertCurrent();
-                const result = await work(assertCurrent);
+                const { withTopologyReadinessScope } = require('./topologyReadinessScope');
+                const entries = contexts.map((context, index) => {
+                    const state = this.#preparedBinding(context);
+                    return { binding: bindings[index], poison: () => { state.uncertain = true; },
+                        invoke: async (command, request) => {
+                            await assertCurrent();
+                            await this.#proveBinding(context, state.binding, state.binding.durable);
+                            if (state.busy || state.uncertain || state.terminal || state.phase !== 'verify') throw unprovenBinding();
+                            state.busy = true;
+                            try {
+                                if (command === 'verify-ppp-users') return await state.transport.verifyPppUsers(request);
+                                if (command === 'restore-users') return await state.transport.restoreUsers(request);
+                                throw unprovenBinding();
+                            } finally { state.busy = false; }
+                        } };
+                });
+                const result = await withTopologyReadinessScope(entries, assertCurrent, () => work(assertCurrent));
                 await assertCurrent();
                 return result;
             }

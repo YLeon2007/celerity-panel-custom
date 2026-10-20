@@ -227,6 +227,46 @@ class TopologyNodeTransport {
         return parseReceipt(result, command, request);
     }
 
+    async restoreUsers(request) {
+        const { bootId, users, ...binding } = request || {};
+        assertBasePlan(binding);
+        const { validReadiness, parseReadinessReceipt } = require('./topologyReadinessProtocol');
+        if (!hasExactKeys(request, [...BASE_KEYS, 'bootId', 'users'].sort())
+            || binding.targetProfile !== 'xray-main' || !Array.isArray(users) || users.length < 1 || users.length > 4096
+            || users.some(user => !hasExactKeys(user, ['email', 'id'])
+                || typeof user.id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(user.id)
+                || typeof user.email !== 'string' || !/^[A-Za-z0-9@._+-]{1,128}$/.test(user.email))
+            || new Set(users.map(u => u.email)).size !== users.length || new Set(users.map(u => u.id)).size !== users.length) {
+            throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid user snapshot');
+        }
+        const snapshot = `${JSON.stringify({ users: users.map(({ id, email }) => ({ id, email })) })}\n`;
+        const readiness = { bootId, snapshotSha256: createHash('sha256').update(snapshot).digest('hex'), userCount: users.length };
+        if (!validReadiness('restore-users', readiness)) throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid user snapshot');
+        const invocation = { command: 'restore-users', ...binding, readiness, snapshot };
+        try {
+            return parseReadinessReceipt(await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, invocation), 'restore-users', invocation);
+        } catch { throw new TopologyNodeTransportError('INVALID_RECEIPT', 'Unconfirmed user restoration'); }
+    }
+
+    async verifyPppUsers(request) {
+        const { bootId, expectation, ...binding } = request || {};
+        assertBasePlan(binding);
+        const { validReadiness, parseReadinessReceipt } = require('./topologyReadinessProtocol');
+        const readiness = { bootId, ...expectation };
+        if (!hasExactKeys(request, [...BASE_KEYS, 'bootId', 'expectation'].sort())
+            || !hasExactKeys(expectation, ['expectedCredentialRevision', 'expectedEnabledUserCount', 'operationId'])
+            || !validReadiness('verify-ppp-users', readiness)) {
+            throw new TopologyNodeTransportError('INVALID_PLAN', 'Invalid readiness request');
+        }
+        const invocation = { command: 'verify-ppp-users', ...binding, readiness };
+        try {
+            const result = await this.#invokeArtifact(TOPOLOGY_NODE_RUNNER_PATH, invocation);
+            return parseReadinessReceipt(result, 'verify-ppp-users', invocation);
+        } catch {
+            throw new TopologyNodeTransportError('INVALID_RECEIPT', 'Unconfirmed readiness');
+        }
+    }
+
     prepare(request) {
         return this.#invoke(TOPOLOGY_NODE_COMMANDS.PREPARE, request, true);
     }

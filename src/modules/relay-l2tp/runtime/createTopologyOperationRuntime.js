@@ -261,10 +261,11 @@ function createTopologyOperationRuntime(dependencies = {}) {
         }));
         if (!isTypedExecutor(executor)) return unavailableTopologyDeploymentService;
 
-        const userResync = new TopologyUserResync({ HyNode });
+        const userResync = new TopologyUserResync({ HyNode, restrictedRunner: Boolean(preinstalledRunnerAuthority) });
         // The runtime always wires the real node runner verifier. Missing
         // execution/model capabilities make the runtime unavailable, not ready.
         const pppGateDependencies = {
+            restrictedRunner: Boolean(preinstalledRunnerAuthority),
             executionContext,
             enableProductionExecution: executionContext.target === 'production',
             RelayL2tpState,

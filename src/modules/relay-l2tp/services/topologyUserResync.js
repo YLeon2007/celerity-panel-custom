@@ -30,11 +30,12 @@ function delay(ms) {
 }
 
 class TopologyUserResync {
-    constructor({ HyNode, syncService, logger, sleep, attempts, retryDelayMs } = {}) {
+    constructor({ HyNode, syncService, logger, sleep, attempts, retryDelayMs, restrictedRunner = false } = {}) {
         if (!HyNode || typeof HyNode.findById !== 'function') {
             throw new TypeError('TopologyUserResync requires HyNode.findById');
         }
         this.HyNode = HyNode;
+        this.restrictedRunner = restrictedRunner === true;
         this._syncService = syncService;
         this.logger = logger || defaultLogger();
         this.sleep = typeof sleep === 'function' ? sleep : delay;
@@ -73,7 +74,7 @@ class TopologyUserResync {
         // so every plan reaching the worker is a deploy.
         const syncService = this.syncService;
         if (typeof syncService?._getUsersForNode !== 'function'
-            || typeof syncService?.addXrayUser !== 'function') {
+            || (!this.restrictedRunner && typeof syncService?.addXrayUser !== 'function')) {
             return {
                 nodeCount: 0,
                 userCount: 0,
@@ -94,6 +95,31 @@ class TopologyUserResync {
                 continue;
             }
             if (node.type !== 'xray') {
+                continue;
+            }
+            if (this.restrictedRunner) {
+                try {
+                    const { topologyReadinessProfile, invokeTopologyReadiness } = require('./topologyReadinessScope');
+                    // Only xray-main was restarted with a clientless candidate.
+                    // Bridge profile writes do not restart/touch the main user runtime.
+                    if (topologyReadinessProfile(id) !== 'xray-main') continue;
+                    nodeCount += 1;
+                    const snapshot = rows => {
+                        if (!Array.isArray(rows) || rows.length === 0) throw new Error('Nonempty user snapshot required');
+                        return rows.map(user => ({ id: user.xrayUuid, email: user.userId }))
+                            .sort((a, b) => String(a.email).localeCompare(String(b.email)));
+                    };
+                    const users = snapshot(await syncService._getUsersForNode(node));
+                    const restored = await invokeTopologyReadiness(id, 'restore-users', users);
+                    if (restored?.ok !== true || restored.code !== 'XRAY_USERS_RESTORED' || restored.userCount !== users.length
+                        || JSON.stringify(snapshot(await syncService._getUsersForNode(node))) !== JSON.stringify(users)) {
+                        throw new Error('User restoration unconfirmed');
+                    }
+                    userCount += users.length;
+                } catch {
+                    // No retries or legacy HTTP fallback after an uncertain RPC.
+                    failedUsers.push({ node: id, userId: null, reason: 'RESTRICTED_USER_RESTORE_UNCONFIRMED' });
+                }
                 continue;
             }
             nodeCount += 1;

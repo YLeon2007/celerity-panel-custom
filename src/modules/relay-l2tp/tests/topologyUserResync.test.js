@@ -30,6 +30,28 @@ function hyNodeFixture(map) {
 
 const silentLogger = { info() {}, warn() {}, error() {} };
 
+test('restricted resync uses one finite nonempty batch and never calls config-capable agent', async () => {
+    const { withTopologyReadinessScope } = require('../services/topologyReadinessScope');
+    const calls = [];
+    const users = [{ userId: 'alice', xrayUuid: '550e8400-e29b-41d4-a716-446655440000' }];
+    const resync = new TopologyUserResync({ restrictedRunner: true,
+        HyNode: hyNodeFixture({ 'node-portal': { _id: 'node-portal', type: 'xray' },
+            'node-bridge': { _id: 'node-bridge', type: 'xray' } }),
+        syncService: { async _getUsersForNode() { return users; },
+            async addXrayUser() { throw new Error('Legacy HTTP must stay masked'); } }, logger: silentLogger });
+    const entries = ['node-portal', 'node-bridge'].map((nodeId, index) => ({
+        binding: { nodeId, targetProfile: index ? 'xray-bridge' : 'xray-main', commandIds: { verify: 'v-1' } },
+        poison() {}, async invoke(command, request) { calls.push({ nodeId, command, users: request.users });
+            return { ok: true, code: 'XRAY_USERS_RESTORED', userCount: 1, inboundCount: 1 }; },
+    }));
+    assert.equal((await resync.resyncPlan(planFixture())).ok, false, 'no held capability must refuse');
+    const result = await withTopologyReadinessScope(entries, async () => {}, () => resync.resyncPlan(planFixture()));
+    assert.equal(result.ok, true);
+    assert.equal(result.userCount, 1);
+    assert.deepEqual(calls, [{ nodeId: 'node-portal', command: 'restore-users',
+        users: [{ id: users[0].xrayUuid, email: 'alice' }] }]);
+});
+
 test('TopologyUserResync: requires HyNode.findById', () => {
     assert.throws(() => new TopologyUserResync({}), TypeError);
 });
