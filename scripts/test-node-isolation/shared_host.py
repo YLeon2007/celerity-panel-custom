@@ -65,7 +65,7 @@ def verify_record(row, p, kernel, m):
            'expected', 'frozen', 'dead'} and row['phase'] in ('held', 'empty') and
            row['owner'] == p['hostHold']['owner'] and row['pending'] is None and
            row['originalExpected'] == original and type(row['dead']) is bool and
-           row['dead'] == (row['phase'] == 'empty') and row['frozen'] == original['freezeOrder'],
+           row['dead'] == (row['phase'] == 'empty'),
            'HOST_STATE_UNKNOWN_RETAINED')
     expected = copy.deepcopy(original)
     current = row['expected']
@@ -94,6 +94,18 @@ def verify_record(row, p, kernel, m):
                item['path'] == '/run/systemd/system/' + unit + '.d/90-c3-test-host-isolation.conf',
                'HOST_SUPERVISION_REQUIRED')
     expected['relaunch'] = copy.deepcopy(relaunch)
+    frozen = original['freezeOrder'][:]
+    if 'candidateClosure' in current:
+        candidates = [c for c in original['containers'] if c['name'] == 'c3-test-candidate']
+        m.need(len(candidates) == 1, 'HOST_POLICY_DRIFT_RETAINED')
+        group = candidates[0]['cgroup']
+        m.need(current['candidateClosure'] == {'group': group}, 'HOST_POLICY_DRIFT_RETAINED')
+        expected['candidateClosure'] = {'group': group}
+        members = current.get('groups', {}).get(group, {}).get('members')
+        m.need(isinstance(members, list) and 1 <= len(members) <= 4096, 'HOST_POLICY_DRIFT_RETAINED')
+        expected['groups'][group]['members'] = copy.deepcopy(members)
+        frozen.append(group)
+    m.need(row['frozen'] == frozen, 'HOST_STATE_UNKNOWN_RETAINED')
     m.need(current == expected, 'HOST_POLICY_DRIFT_RETAINED')
     try:
         kernel.verify(current, row['frozen'], row['dead'])
@@ -168,9 +180,10 @@ def peer_identity(conn):
     return struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
 
 
-def check_hold(p, directory, m):
+def check_hold(p, directory, m, *, command='check'):
     """Real UDS roundtrip + SO_PEERCRED + independent current kernel verification."""
     import socket
+    m.need(command in ('check', 'close-candidate'), 'INVALID_HOST_OPERATION')
     identity = m.decode_json(m.secure_file(pathlib.Path(directory) / 'host-guard.json'))
     check_identity(identity, p, directory, m)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -179,7 +192,9 @@ def check_hold(p, directory, m):
         pid, uid, _ = peer_identity(conn)
         m.need(pid == identity['pid'] and uid == 0, 'HOST_GUARD_PEER_MISMATCH')
         nonce = os.urandom(32).hex()
-        conn.sendall((nonce + '\n').encode())
+        frame = nonce if command == 'check' else m.json.dumps({
+            'nonce': nonce, 'command': command, 'owner': identity['owner'], 'planHash': identity['planHash']})
+        conn.sendall((frame + '\n').encode())
         reply = b''
         while not reply.endswith(b'\n') and len(reply) <= 8192:
             chunk = conn.recv(8192)
@@ -238,6 +253,20 @@ def make_engine(directory, p, m, host=None):
             value['scope'] = 'shared-test-node-maintenance-v1'
             value['hostOwner'] = p['hostHold']['owner']
             return value
+
+        def close_candidate(self, lock_fd):
+            self.require_outer_lock(lock_fd)
+            state = self.assert_held()
+            self.host.guard_check(state['guard'], self.host.operator_session())
+            current = check_hold(p, directory, m, command='close-candidate')
+            m.need('candidateClosure' in current, 'CANDIDATE_CLOSURE_UNPROVEN')
+            local = self.close_dispatch(lock_fd)
+            # This host cannot inspect another node's live outer + runner locks.
+            # No receipt/boolean/frozen-candidate shortcut for remote effects.
+            return {**self.evidence(state), 'status': 'partial-unknown-retained',
+                    'candidate': 'closed', 'localNodeEffects': local['nodeEffects'],
+                    'unknownNodes': sorted(m.TEST_NODES), 'nodeEffects': 'unknown',
+                    'handbackAllowed': False, 'ownershipRetained': True}
 
         def restore(self):
             self.assert_held()
@@ -306,14 +335,27 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     _, uid, _ = peer_identity(conn)
                     m.need(uid == 0, 'ROOT_HOST_GUARD_CLIENT_REQUIRED')
                     request = b''
-                    while not request.endswith(b'\n') and len(request) <= 65:
-                        chunk = conn.recv(66)
+                    while not request.endswith(b'\n') and len(request) <= 1024:
+                        chunk = conn.recv(1025)
                         m.need(bool(chunk), 'HOST_CLIENT_LOST')
                         request += chunk
-                    m.need(re.fullmatch(rb'[a-f0-9]{64}\n', request), 'INVALID_HOST_CHALLENGE')
+                    m.need(len(request) <= 1024 and request.endswith(b'\n'), 'HOST_GUARD_FRAME_LIMIT')
+                    if re.fullmatch(rb'[a-f0-9]{64}\n', request):
+                        nonce = request.decode().strip()
+                        command = 'check'
+                    else:
+                        frame = m.decode_json(request)
+                        m.need(isinstance(frame, dict) and set(frame) == {'nonce', 'command', 'owner', 'planHash'}
+                               and frame['command'] == 'close-candidate' and frame['owner'] == identity['owner']
+                               and frame['planHash'] == identity['planHash'] and isinstance(frame['nonce'], str)
+                               and re.fullmatch('[a-f0-9]{64}', frame['nonce']), 'INVALID_HOST_CHALLENGE')
+                        nonce, command = frame['nonce'], frame['command']
                     check()
+                    if command == 'close-candidate':
+                        fence.close_candidate(identity['owner'])
+                        check()
                     raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
-                    conn.sendall((m.json.dumps({'nonce': request.decode().strip(), 'identity': identity,
+                    conn.sendall((m.json.dumps({'nonce': nonce, 'identity': identity,
                                               'recordSha256': m.digest(raw)}) + '\n').encode())
     except BaseException:
         fence.unknown()  # No finally-thaw; old dispatch remains kernel-fenced.

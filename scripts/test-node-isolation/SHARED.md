@@ -1,6 +1,9 @@
 # Bounded shared TEST-panel / LocalXray isolation
 
 **Source-only; not installed, not live-verified, not application authority.**
+
+For the subsequent one-way candidate/dispatch closure and its explicit unknown
+remote-effect boundary, see [CLOSURE.md](CLOSURE.md). No handback is authorized.
 The dedicated validator and its four-node allowlist remain separate and unchanged.
 The normal `c3-test-node-isolation` entry point selects this mode only with an
 explicit `mode: "shared-test"` plan and the trusted fixed shared module installed.

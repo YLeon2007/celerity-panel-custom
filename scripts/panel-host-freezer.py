@@ -373,6 +373,9 @@ class LinuxKernel:
                 init = next(c['init'] for c in expected['containers'] if c['cgroup'] == group)
                 need(self.pid(init['pid']) == init, 'survivor init identity drift')
                 survivors.update(self.survivor_descendants(group, init))
+                if group == expected.get('candidateClosure', {}).get('group'):
+                    need(group in frozen and self.members(group) == pin['members'],
+                         'closed candidate tree drift')
         self.escaped_descendants(expected, survivors)
         if self.barrier and 'relaunch' in expected:
             self.barrier.verify(expected)
@@ -616,7 +619,34 @@ class Fence:
             self.unknown()
             raise
         return {'hostFence': 'held', 'oldExecutor': 'empty' if self.dead else 'frozen',
-                'nodeState': 'unknown', 'owner': self.owner}
+                'nodeState': 'unknown', 'owner': self.owner,
+                **({'candidate': 'closed'} if 'candidateClosure' in self.expected else {})}
+
+    def close_candidate(self, owner):
+        """One-way exact payload freeze. External effects remain a node-side gate."""
+        self.require(('held', 'empty'), owner)
+        self.check()
+        if 'candidateClosure' in self.expected:
+            return self.check()
+        candidates = [c for c in self.expected['containers'] if c['name'] == 'c3-test-candidate']
+        need(len(candidates) == 1, 'exact candidate required')
+        candidate = candidates[0]; group = candidate['cgroup']
+        try:
+            # Old fences and launch refusal have just been read back. Accepted
+            # descendants may fork until freeze acknowledgement; prove the entire
+            # final tree's pinned init/session/ancestry AFTER it is kernel-held.
+            self.record('intent', action='freeze-candidate', group=group)
+            self.kernel.freeze(group, True)
+            self.frozen.append(group)
+            members = self.kernel.survivor_descendants(group, candidate['init'])
+            self.expected['groups'][group]['members'] = sorted(members.values(), key=lambda r: r['pid'])
+            self.expected['candidateClosure'] = {'group': group}
+            self.kernel.verify(self.expected, self.frozen, self.dead)
+            self.record('empty' if self.dead else 'held')
+            return self.check()
+        except BaseException:
+            self.unknown()
+            raise
 
     def terminate(self, owner, ack):
         self.require(('held',), owner)
@@ -635,6 +665,7 @@ class Fence:
             raise
 
     def restore(self, owner):
+        need('candidateClosure' not in self.expected, 'candidate closure forbids restore')
         self.require(('held',), owner)
         self.check()
         try:

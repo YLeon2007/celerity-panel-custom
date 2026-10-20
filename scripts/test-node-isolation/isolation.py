@@ -5,6 +5,7 @@ No CLI fake-root, shell passthrough, automatic retry, unfreeze or old-service st
 Use only after independent review/install; see README.md.
 """
 import base64
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -23,6 +24,7 @@ RUNNER = '/usr/local/bin/celerity-topology-node-runner'
 HELPER = '/usr/local/libexec/c3-test-node-isolation'
 CONFIG = '/etc/c3-test-node-isolation.json'
 STATE = '/var/lib/c3-test-node-isolation'
+RUNNER_FENCES = '/var/lib/celerity/topology/fences'
 MAINT_UNIT = 'c3-test-maintenance-sshd.service'
 MAINT_CONFIG = '/etc/ssh/c3-test-maintenance.conf'
 MASK_ROOT = '/etc/systemd/system'
@@ -443,6 +445,73 @@ class Host:
         finally:
             os.close(fd)
 
+    @contextmanager
+    def held_current_runner_head(self, p):
+        """Current disk head, not status of a requested historical generation.
+
+        No default-positive virgin/missing journal. Hold the actual runner mutex
+        through the caller's final checks. Root administration is the TCB.
+        """
+        fence = pathlib.Path(RUNNER_FENCES) / p['targetProfile']
+        secure_file(fence / 'lock')
+        fd = os.open(fence / 'lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            info = os.fstat(fd)
+            pin = (info.st_dev, info.st_ino)
+            current = (fence / 'lock').stat()
+            need(pin == (current.st_dev, current.st_ino),
+                 'RUNNER_TERMINAL_UNPROVEN')
+            def read():
+                need(not os.path.lexists(fence / 'journal.next'), 'RUNNER_TERMINAL_UNPROVEN')
+                raw = secure_file(fence / 'journal.json')
+                need(len(raw) <= 16777216, 'RUNNER_TERMINAL_UNPROVEN')
+                row = decode_json(raw)
+                need(isinstance(row, dict) and set(row) == {'version', 'bootId', 'nodeId',
+                     'executionContext', 'head', 'generations'} and type(row['version']) is int
+                     and row['version'] == 2 and row['bootId'] == p['bootId']
+                     and row['nodeId'] == p['nodeId'] and row['executionContext'] == p['context'],
+                     'RUNNER_TERMINAL_UNPROVEN')
+                generations = row['generations']
+                need(isinstance(generations, dict) and 1 <= len(generations) <= 1024
+                     and isinstance(row['head'], str) and row['head'] in generations,
+                     'RUNNER_TERMINAL_UNPROVEN')
+                for generation, entry in generations.items():
+                    need(isinstance(entry, dict) and entry.get('phase') == 'closed'
+                         and isinstance(entry.get('binding'), dict)
+                         and all(entry['binding'].get(k) == v for k, v in {
+                             'generation': generation, 'nodeId': p['nodeId'],
+                             'targetProfile': p['targetProfile'], 'executionContext': p['context']}.items()),
+                         'RUNNER_TERMINAL_UNPROVEN')
+                    commands = entry.get('commands')
+                    need(isinstance(commands, dict) and commands and
+                         all(isinstance(c, dict) and c.get('state') == 'completed' for c in commands.values()),
+                         'RUNNER_TERMINAL_UNPROVEN')
+                    closes = [(cid, c) for cid, c in commands.items() if c.get('command') == 'close']
+                    need(len(closes) == 1, 'RUNNER_TERMINAL_UNPROVEN')
+                    cid, close = closes[0]; receipt = close.get('receipt')
+                    need(isinstance(receipt, dict) and receipt.get('ok') is True
+                         and receipt.get('terminal') is True and receipt.get('ownershipRetained') is True
+                         and receipt.get('protocolVersion') == 2 and receipt.get('phase') == 'closed'
+                         and receipt.get('command') == receipt.get('completedCommand') == 'close'
+                         and receipt.get('commandId') == cid and receipt.get('bootId') == p['bootId']
+                         and receipt.get('completion') == 'completed'
+                         and all(receipt.get(k) == v for k, v in entry['binding'].items())
+                         and ((receipt.get('terminalOutcome') in ('verified', 'rolledback')
+                               and receipt.get('systemdJob') == 'completed'
+                               and receipt.get('serviceState') in ('active:running', 'inactive:dead'))
+                              or (receipt.get('terminalOutcome') == 'cancelled'
+                                  and receipt.get('systemdJob') == receipt.get('serviceState') == 'not-applicable')),
+                         'RUNNER_TERMINAL_UNPROVEN')
+                return raw, row
+            raw, row = read()
+            yield {'head': row['head'], 'journalSha256': digest(raw)}
+            current = (fence / 'lock').stat()
+            need(read()[0] == raw and pin == (current.st_dev, current.st_ino),
+                 'RUNNER_TERMINAL_UNPROVEN')
+        finally:
+            os.close(fd)
+
     def snapshot_mask(self, name):
         path = pathlib.Path(MASK_ROOT) / name
         attrs = {key: base64.b64encode(os.getxattr(path, key, follow_symlinks=False)).decode()
@@ -776,7 +845,49 @@ class Engine:
                 'physicalObservation': {k: self.plan[k] for k in ('machineId', 'bootId', 'sshHostKeySha256')},
                 'planHash': self.plan_hash, 'notApplicationAuthority': True}
 
+    def require_outer_lock(self, lock_fd):
+        need(os.geteuid() == 0, 'ROOT_REQUIRED')
+        info, path = os.fstat(lock_fd), (self.directory / 'lock').lstat()
+        need(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(path.st_mode) and
+             (info.st_dev, info.st_ino) == (path.st_dev, path.st_ino), 'OUTER_LOCK_REQUIRED')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def close_dispatch(self, lock_fd):
+        """Permanent root-operator admission close. No restore/reopen capability."""
+        self.require_outer_lock(lock_fd)
+        state = self.assert_held()
+        self.host.guard_check(state['guard'], self.host.operator_session())
+        marker = {'version': 1, 'planHash': self.plan_hash,
+                  'maintenanceId': self.plan['maintenanceId'], 'nodeId': self.plan['nodeId'],
+                  'bootId': self.plan['bootId'], 'state': 'closed'}
+        need(not os.path.lexists(self.directory / 'restore-admission.json.next'),
+             'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+        path = self.directory / 'restore-admission.json'
+        def check_closed_marker():
+            value = decode_json(secure_file(path))
+            need(isinstance(value, dict) and type(value.get('version')) is int and value == marker,
+                 'DISPATCH_ADMISSION_UNKNOWN_RETAINED')
+        if os.path.lexists(path):
+            check_closed_marker()
+        else:
+            # Close ingress durably BEFORE completion inspection or releasing either
+            # lock. Unknown completion still leaves dispatch permanently closed.
+            atomic_json(self.directory, 'restore-admission.json', marker)
+        with self.host.held_current_runner_head(self.plan) as head:
+            self.assert_held()
+            check_closed_marker()
+            output = {**self.evidence(state), 'dispatchAdmission': 'closed',
+                      'nodeEffects': 'drained', 'runnerHead': head, 'ownershipRetained': True}
+        return output
+
+    def assert_dispatch_open(self):
+        # lexists also rejects dangling symlinks and incomplete write-ahead files.
+        need(not any(os.path.lexists(self.directory / name) for name in
+                     ('restore-admission.json', 'restore-admission.json.next')),
+             'DISPATCH_ADMISSION_CLOSED_RETAINED')
+
     def dispatch(self, original, payload, lock_fd):
+        self.assert_dispatch_open()
         args = parse_runner(original, self.plan)
         need(len(payload) <= 4194304 and (args[1] in ('prepare', 'restore-users') or not payload), 'INVALID_STDIN')
         state = self.assert_held()
@@ -813,6 +924,7 @@ class Engine:
         return result.stdout
 
     def restore(self):
+        self.assert_dispatch_open()  # Closure never authorizes this legacy mask-return path.
         # Only a fully known hold and empty/closed pinned runner may return masks.
         # This is a trusted-operator handback step, NOT topology/DB ownership release.
         state = self.assert_held()
@@ -847,7 +959,7 @@ def select_mode(plan):
 
 def main():
     need(os.geteuid() == 0, 'ROOT_REQUIRED')
-    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'host-hold', 'apply', 'confirm-access', 'status', 'dispatch', 'restore-masks'), 'INVALID_CLI')
+    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'host-hold', 'apply', 'confirm-access', 'status', 'dispatch', 'close-dispatch', 'close-candidate', 'restore-masks'), 'INVALID_CLI')
     command = sys.argv[1]
     host = Host()
     if command == 'inventory':
@@ -880,6 +992,11 @@ def main():
             output = engine.confirm_access()
         elif command == 'status':
             output = engine.evidence(engine.assert_held())
+        elif command == 'close-dispatch':
+            output = engine.close_dispatch(lock)
+        elif command == 'close-candidate':
+            need(shared is not None, 'SHARED_MODE_REQUIRED')
+            output = engine.close_candidate(lock)
         elif command == 'restore-masks':
             output = engine.restore()
         else:
@@ -888,6 +1005,8 @@ def main():
             sys.stdout.buffer.write(result)
             return
         print(json.dumps(output, sort_keys=True))
+        if output.get('status') == 'partial-unknown-retained':
+            raise SystemExit(75)
     finally:
         os.close(lock)
 
