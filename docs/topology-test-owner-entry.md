@@ -1,9 +1,12 @@
 # Explicit TEST owner enrollment command
 
-**Source-only, not a live-operation authorization.** No TEST/PROD state, SSH,
-installed helper, freezer, runner grammar or restoration gate is changed by this
-slice. The default command intentionally remains refused until the parent-owned
-crash-durable capture adapter below is implemented and reviewed.
+**Source-only, not a live-operation authorization.** The finite capture hook is
+now selected by the default factory; actual all-five capture/UDS is implemented.
+Default operational enrollment nevertheless stays refused: the separate installed
+physical observer conflicts with the capture holder's retained outer flock.
+See [the exact known-negative boundary and operator pins](topology-test-durable-capture.md).
+The original hook contract below describes the interface, not closure of that
+remaining observation-composition dependency.
 
 ## Invocation and real composition
 
@@ -52,10 +55,11 @@ Existing owners cause the public insert/CAS path to refuse. Recovery is separate
 
 ## Precise remaining parent hook — default stays closed
 
-The current installed physical observer is read-only. Its process-local secret
-byte cache is **not** crash-durable NodeOriginals capture. Consequently this change
-adds only this finite **trusted constructor injection**, with no default-positive
-implementation and no environment/request/config receipt alternative:
+The installed physical observer is read-only. Its process-local secret byte
+cache is **not** crash-durable NodeOriginals capture. The finite installed capture
+hook now executes the required capture protocol, but the separate observer's
+outer-lock reacquisition is still incompatible with the retained capture hold.
+No environment/request/config receipt alternative is supplied:
 
 ```js
 createTestPhysicalController({
@@ -73,12 +77,12 @@ createTestPhysicalController({
 });
 ```
 
-The snippet states a required interface; it is **not runnable operational code**.
-A no-op checker or successful-looking JSON receipt does not implement the hook.
-The parent must wire its separately reviewed fixed finite protocol adapter into
-the ordinary `createRootTestPhysicalAuthority` constructor selection; no arbitrary
-module/path/opcode loader is provided. That root selector currently does **not**
-supply the hook, so running the default command cannot adopt/enroll successfully.
+The snippet states the trusted interface, not runnable operational code. The
+ordinary `createRootTestPhysicalAuthority` now supplies the fixed installed helper
+adapter; no arbitrary module/path/opcode loader is provided. It does **not**
+close default enrollment: observation must first be composed inside the actual
+capture-held OFD, as documented in `topology-test-durable-capture.md`. A no-op
+checker or successful-looking JSON receipt cannot substitute for that closure.
 
 `challenge` is deeply frozen:
 

@@ -343,13 +343,17 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
         close() { poisoned = true; for (const channel of channels.values()) channel.close(); },
     });
 }
-function createRootTestPhysicalAuthority({ env = process.env, read = privateRead, openChannel } = {}) {
+function createRootTestPhysicalAuthority({ env = process.env, read = privateRead, openChannel, captureSpawn } = {}) {
     // Flags select eligibility only; NEVER authorize or choose pins/endpoints.
     if (env.L2TP_EXECUTION_ENABLED !== 'true' || env.TOPOLOGY_TEST_EXECUTION_ENABLED !== 'true'
         || env.PANEL_DOMAIN !== TEST.hostIdentity || env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
         || env.L2TP_PRODUCTION_EXECUTION_ENABLED === 'true') return undefined;
     let raw;
     try { raw = read(CONFIG); } catch (error) { if (error.code === 'ENOENT') return undefined; refuse(); }
-    return createTestPhysicalController({ config: JSON.parse(raw), ...(openChannel ? { openChannel } : {}) });
+    const { createDurableNodeOriginals } = require('./testDurableOriginals');
+    const withDurableNodeOriginals = createDurableNodeOriginals({
+        ...(read !== privateRead ? { read } : {}), ...(captureSpawn ? { spawn: captureSpawn } : {}),
+    });
+    return createTestPhysicalController({ config: JSON.parse(raw), withDurableNodeOriginals, ...(openChannel ? { openChannel } : {}) });
 }
 module.exports = { createTestPhysicalController, createRootTestPhysicalAuthority, AttestationChannel };
