@@ -5,6 +5,7 @@ Requires an already held node isolation + live recovery SSH controller. Shared
 mode additionally requires the reviewed shared_host host-hold implementation.
 CLI has no fake root, configurable executable or environment authority.
 """
+import base64
 import fcntl
 import hashlib
 import importlib.machinery
@@ -94,6 +95,42 @@ def installation(profile, host, read=secure_read, paths=None):
                         'bridgeUnitSha256': sha, 'bridgeUnitDropIns': drops}}
 
 
+def config_snapshot(profile, host, read=secure_read, paths=None):
+    """Fixed-profile read-only original bytes, private SSH channel only, never logs.
+
+    No accepted digest/state is supplied by the request. The app independently
+    pins this observation before retaining it. Reject unsupported layouts rather
+    than following unit symlinks, drop-ins or choosing an alternate config path.
+    """
+    need(profile in ('xray-main', 'xray-bridge'), 'FOREIGN_PROFILE')
+    service = 'xray.service' if profile == 'xray-main' else 'xray-bridge.service'
+    paths = paths or {'config': '/usr/local/etc/' + ('xray' if profile == 'xray-main' else 'xray-bridge') + '/config.json',
+                      'unit': '/etc/systemd/system/' + service}
+    before = host.unit(service)
+    need(before.get('Id') == service and before.get('LoadState') == 'loaded' and
+         before.get('FragmentPath') == paths['unit'] and before.get('DropInPaths') == '' and
+         before.get('Job') == '' and before.get('ActiveState') in ('active', 'inactive') and
+         before.get('UnitFileState') in ('enabled', 'disabled'), 'CONFIG_SERVICE_UNPROVEN')
+    blobs = {}
+    for name in ('config', 'unit'):
+        raw, info = read(paths[name])
+        need(info.st_uid == 0 and info.st_gid == 0 and stat.S_ISREG(info.st_mode) and
+             not info.st_mode & 0o022 and len(raw) <= 512 * 1024, 'UNSAFE_CONFIG_SNAPSHOT')
+        blobs[name] = raw
+    after = host.unit(service)
+    need(before == after, 'CONFIG_SERVICE_CHANGED')
+    # Reread exact bytes after the manager observation too. Held exclusion is
+    # still provided by observe()'s before/after live engine checks.
+    for name in ('config', 'unit'):
+        need(read(paths[name])[0] == blobs[name], 'CONFIG_BYTES_CHANGED')
+    return {'configBase64': base64.b64encode(blobs['config']).decode('ascii'),
+            'unitBase64': base64.b64encode(blobs['unit']).decode('ascii'),
+            'readback': {'source': 'node-readback',
+                         'configSha256': hashlib.sha256(blobs['config']).hexdigest(),
+                         'unitSha256': hashlib.sha256(blobs['unit']).hexdigest(),
+                         'serviceActive': after['ActiveState'], 'serviceEnabled': after['UnitFileState']}}
+
+
 def runner_state(plan, m, predecessor):
     root = Path('/var/lib/celerity/topology')
     fence = root / 'fences' / plan['targetProfile']
@@ -145,6 +182,7 @@ def observe(engine, m, shared, predecessor=None):
              'maintenanceId': plan['maintenanceId'], 'planHash': engine.plan_hash,
              'guard': state['guard'], 'endpoint': {'ip': plan['endpointIp'], 'port': 2222, 'username': 'c3-test-runner'},
              'installation': installation(plan['targetProfile'], engine.host),
+             'configTransfer': config_snapshot(plan['targetProfile'], engine.host),
              'runnerState': runner_state(plan, m, predecessor), 'host': None}
     if shared:
         current = engine.host.host_hold()  # actual host pipe + independent kernel reread

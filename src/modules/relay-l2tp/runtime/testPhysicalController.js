@@ -35,13 +35,41 @@ function privateRead(file) {
     try { const st = fs.fstatSync(fd); need(st.isFile() && st.size <= 1024 * 1024 && !(st.mode & 0o007)); return fs.readFileSync(fd); }
     finally { fs.closeSync(fd); }
 }
+const PROFILES = Object.freeze({
+    'xray-main': Object.freeze({ configPath: '/usr/local/etc/xray/config.json', unitPath: '/etc/systemd/system/xray.service', service: 'xray' }),
+    'xray-bridge': Object.freeze({ configPath: '/usr/local/etc/xray-bridge/config.json', unitPath: '/etc/systemd/system/xray-bridge.service', service: 'xray-bridge' }),
+});
+function originalPin(value) {
+    return exact(value, ['proofRef', 'configSha256', 'unitSha256', 'serviceActive', 'serviceEnabled'])
+        && typeof value.proofRef === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.proofRef)
+        && digest(value.configSha256, 64) && digest(value.unitSha256, 64)
+        && ['active', 'inactive'].includes(value.serviceActive) && ['enabled', 'disabled'].includes(value.serviceEnabled);
+}
+function configBytes(value) {
+    need(exact(value, ['configBase64', 'unitBase64', 'readback'])
+        && exact(value.readback, ['source', 'configSha256', 'unitSha256', 'serviceActive', 'serviceEnabled'])
+        && value.readback.source === 'node-readback'
+        && originalPin({ proofRef: 'codec', ...Object.fromEntries(Object.entries(value.readback).filter(([key]) => key !== 'source')) }));
+    const blobs = {};
+    for (const name of ['config', 'unit']) {
+        const encoded = value[name + 'Base64'];
+        need(typeof encoded === 'string' && encoded.length <= 699052);
+        const bytes = Buffer.from(encoded, 'base64');
+        need(bytes.length <= 512 * 1024 && bytes.toString('base64') === encoded
+            && createHash('sha256').update(bytes).digest('hex') === value.readback[name + 'Sha256']);
+        blobs[name] = bytes;
+    }
+    return { ...blobs, readback: freeze(structuredClone(value.readback)) };
+}
 function validateConfig(input) {
     const config = structuredClone(input);
     need(exact(config, ['version', 'executionContext', 'nodes', 'host']) && config.version === 1 && matchesTopologyExecutionContext(config.executionContext, TEST));
     need(Array.isArray(config.nodes) && config.nodes.length === 5 && config.host);
     const seen = new Set(), machines = new Set(), keys = new Set();
     for (const pin of config.nodes) {
-        need(exact(pin, ['nodeId', 'targetProfile', 'endpoint', 'physical', 'maintenanceId', 'planHash', 'guard', 'operatorKeyPath'])
+        need(exact(pin, ['nodeId', 'targetProfile', 'endpoint', 'physical', 'maintenanceId', 'planHash', 'guard', 'operatorKeyPath',
+            ...(Object.hasOwn(pin, 'originalSnapshot') ? ['originalSnapshot'] : [])])
+            && (!Object.hasOwn(pin, 'originalSnapshot') || originalPin(pin.originalSnapshot))
             && typeof pin.nodeId === 'string' && !seen.has(pin.nodeId) && NODES[pin.nodeId]); seen.add(pin.nodeId);
         const [ip, targetProfile] = NODES[pin.nodeId];
         need(equal(pin.endpoint, { ip, port: 2222, username: 'c3-test-runner' }) && pin.targetProfile === targetProfile);
@@ -129,6 +157,9 @@ async function openSshChannel(pin) {
 }
 function createTestPhysicalController({ config: input, openChannel = openSshChannel } = {}) {
     const config = validateConfig(input), channels = new Map();
+    // Original secret bytes remain lexical/private and never enter Mongo proofs,
+    // logs, error messages or public return values. No recapture after uncertainty.
+    const originals = new Map();
     let opening, busy = false, poisoned = false;
     const alive = scope => { need(!poisoned && scope?.open && [...channels.values()].every(channel => channel.alive)); };
     const connect = async () => {
@@ -166,6 +197,51 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
             try {
                 await connect(); await assertHeld();
                 const result = await work(Object.freeze({ assertHeld,
+                    async withVerifiedMaintenance(challenge, callback) {
+                        try {
+                            alive(scope);
+                            need(exact(challenge, ['binding', 'proofRef']) && typeof callback === 'function');
+                            // Copy the entire challenge before awaiting any external read.
+                            const binding = freeze(structuredClone(challenge.binding)), proofRef = challenge.proofRef;
+                            need(exact(binding, ['executionContext', 'node', 'profile', 'nodeIdentity', 'generation', 'nextGeneration', 'action', 'paths'])
+                                && matchesTopologyExecutionContext(binding.executionContext, TEST)
+                                && uuid(binding.generation) && uuid(binding.nextGeneration) && binding.generation !== binding.nextGeneration
+                                && ['adopt', 'handback'].includes(binding.action) && equal(binding.paths, PROFILES[binding.profile]));
+                            const pin = config.nodes.find(pin => pin.nodeId === binding.node && pin.targetProfile === binding.profile);
+                            need(pin?.originalSnapshot && proofRef === pin.originalSnapshot.proofRef
+                                && equal(binding.nodeIdentity, { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 }));
+                            await assertHeld(); alive(scope);
+                            const current = configBytes(observations.get(pin.nodeId).configTransfer);
+                            const { proofRef: _ref, ...accepted } = pin.originalSnapshot;
+                            need(equal(current.readback, { source: 'node-readback', ...accepted }));
+                            let original = originals.get(pin.nodeId);
+                            if (binding.action === 'adopt') {
+                                need(!original);
+                                // Retain BEFORE invoking the database callback, even if its
+                                // commit/confirmation fails. Never infer rollback or handback.
+                                original = { ...current, generation: binding.nextGeneration };
+                                originals.set(pin.nodeId, original);
+                            } else {
+                                need(original && original.generation === binding.generation
+                                    && original.config.equals(current.config) && original.unit.equals(current.unit)
+                                    && equal(original.readback, current.readback));
+                            }
+                            let callbackOpen = true;
+                            const check = async () => {
+                                try {
+                                    need(callbackOpen); alive(scope); await assertHeld(); alive(scope); need(callbackOpen);
+                                    const now = configBytes(observations.get(pin.nodeId).configTransfer);
+                                    need(now.config.equals(original.config) && now.unit.equals(original.unit) && equal(now.readback, original.readback));
+                                } catch { poisoned = true; refuse(); }
+                            };
+                            const proof = freeze({ authority: 'external-maintenance-v1', status: 'verified', binding,
+                                proofId: randomUUID(), maintenanceId: pin.maintenanceId, maintenance: 'held', allWriters: 'drained',
+                                oldBackend: { ...observations.get(SHARED).host.backend, processTree: 'stopped', dispatch: 'disabled' },
+                                readback: current.readback });
+                            try { await check(); const result = await callback(proof, check); await check(); return result; }
+                            finally { callbackOpen = false; }
+                        } catch { poisoned = true; refuse(); }
+                    },
                     async withVerifiedAuthority(challenge, callback) {
                         alive(scope); need(matchesTopologyExecutionContext(challenge?.executionContext, TEST));
                         const e = challenge.enrollment;

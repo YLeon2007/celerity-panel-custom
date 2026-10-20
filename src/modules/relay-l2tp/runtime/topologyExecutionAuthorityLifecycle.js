@@ -102,6 +102,49 @@ class TopologyExecutionAuthorityLifecycle {
             if (pending) await pending.catch(() => {});
         }
     }
+    async withVerifiedMaintenance(challenge, work) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (typeof state.capability.withVerifiedMaintenance !== 'function') {
+            state.revoked = true;
+            throw failure();
+        }
+        let invoked = false, finished = false, open = true, pending, result;
+        const callback = (proof, externalCheck) => {
+            if (!open || invoked || typeof externalCheck !== 'function') {
+                state.revoked = true;
+                throw failure();
+            }
+            invoked = true;
+            let callbackOpen = true;
+            const check = async () => {
+                if (!open || !callbackOpen) throw failure();
+                await this.assertHeld();
+                try { await externalCheck(); }
+                catch { state.revoked = true; throw failure(); }
+                await this.assertHeld();
+                if (!open || !callbackOpen) throw failure();
+            };
+            pending = (async () => {
+                try {
+                    await check(); result = await work(proof, check); await check();
+                    finished = true; return result;
+                } finally { callbackOpen = false; }
+            })();
+            pending.catch(() => {});
+            return pending;
+        };
+        try {
+            await state.capability.withVerifiedMaintenance(challenge, callback);
+            if (!invoked || !finished) throw failure();
+            await this.assertHeld(); return result;
+        } catch {
+            state.revoked = true; throw failure();
+        } finally {
+            open = false;
+            if (pending) await pending.catch(() => {});
+        }
+    }
     async withVerifiedAuthority(challenge, work) {
         await this.assertHeld();
         const state = this.#held.getStore();

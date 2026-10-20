@@ -58,6 +58,7 @@ class InstallationTests(unittest.TestCase):
             engine.host.host_hold = lambda: current
             guard = {'pid': 888, 'start': '900', 'socket': 'fixture'}
             with patch.object(a, 'installation', return_value={'runner': {}, 'profile': {}}), \
+                 patch.object(a, 'config_snapshot', return_value={'simulated': True}), \
                  patch.object(a, 'runner_state', return_value={'head': None}), \
                  patch.object(a, 'secure_read', return_value=(json.dumps(guard).encode(), None)):
                 value = a.observe(proxy, fixture.m, True)

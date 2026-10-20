@@ -17,9 +17,18 @@ Supply the explicit server context, same-connection `TopologyConfigOwner` model 
 
 No DB seed, snapshot default, worker claim, bootstrap or automatic controller is added. Physical aliases, endpoint reassignment, port/key drift and real systemd restoration remain external authority / existing binding-store obligations.
 
-## Required trusted external authority — not implemented here
+## Required trusted external authority
 
-`withVerifiedMaintenance({ binding, proofRef }, work)` is a server-injected authority, with **no default implementation**. An opaque proof reference is not authority by itself. The adapter must authenticate its evidence, compare the complete challenge (including next generation, physical node identity and fixed paths), then await exactly one `work(evidence)` while exclusion remains held.
+A TEST-only held physical implementation now exists in
+`testPhysicalController` / `TopologyExecutionAuthorityLifecycle`; see
+[`docs/topology-test-owner-maintenance.md`](../../docs/topology-test-owner-maintenance.md).
+It reads current exact bytes/service states and retains private process-local
+originals against independently accepted root pins. It adds no automatic owner
+migration, restoration writer, crash-durable backup or production authority.
+Parent integration must explicitly invoke the public service in its held scope.
+
+`withVerifiedMaintenance({ binding, proofRef }, work)` remains a server-injected
+authority, with **no production default implementation**. An opaque proof reference is not authority by itself. The adapter must authenticate its evidence, compare the complete challenge (including next generation, physical node identity and fixed paths), then await exactly one `work(evidence)` while exclusion remains held.
 
 Evidence must establish an externally observed old-backend instance/PID/start identity, stopped process tree, disabled future dispatch, held maintenance and **all** relevant writers drained. A new DB marker cannot constrain an already running old backend. The adapter must independently read the actual node config, unit and service states; a caller's `verified` boolean or copied document is not proof. Maintenance must survive callback errors, ambiguous commits and failed confirmation until independently reconciled; do not resume the old dispatcher merely because the promise rejected. These obligations are trusted integration preconditions, not proven host enforcement by these local tests.
 

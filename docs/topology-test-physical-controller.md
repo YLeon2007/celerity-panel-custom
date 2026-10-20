@@ -150,10 +150,14 @@ Remaining parent gates are explicit:
 * independently review/install/pin the shared helper, this helper, all five node
   plans and current guards; maintain all external foreground recovery channels;
 * supported owner adoption and explicit `preEnroll` before worker execution.
-  This controller implements binding and preinstalled-runner authority, **not**
-  `TopologyConfigTransfer.withVerifiedMaintenance`. That separate operator hook
-  must retain original config/unit bytes and actual service-state readback under
-  the same hold; no raw adopted-row seed or copied snapshot is an alternative;
+  The controller now implements TEST-only
+  `TopologyConfigTransfer.withVerifiedMaintenance` through the held lifecycle;
+  see [original-byte maintenance](topology-test-owner-maintenance.md). It requires
+  independent per-node original pins, reads real config/unit bytes and stable
+  loaded service states, and retains exact private originals across the awaited
+  transfer. No raw adopted-row seed or copied snapshot is an alternative. This
+  process-local capture is not crash-durable backup or a restoration executor;
+  parent integration still owns invocation and independent recovery backups;
 * literal shared endpoint and correct separate runner credentials in real HyNode;
 * separately integrated finite nonempty user/PPP side-effect closure;
 * actual live TEST physical/traffic, serving rollback and unchanged-services tests;
