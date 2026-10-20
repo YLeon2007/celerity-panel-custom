@@ -146,6 +146,38 @@ for this read-only parser test, not an installed listener. OpenSSH emits repeate
 multiple scalar listener/key values. This is parser evidence only, **not a live
 login/auth rejection or service-install test**.
 
+## Distro compatibility corrections after rejected ff893553
+
+The reviewed predecessor remains immutable at
+`ff89355397b761130aec8ecfc8cac43ef4123d6d` (tree
+`266e80377a3bd950b5617144b30223d731bb68f0`). Its tests missed two preinstall
+blockers; this delta changes only those boundaries:
+
+* **Normal SSH `KillMode=process`:** only `ssh.service`/`sshd.service`, with one of
+  those exact canonical IDs and the exact `/system.slice/<Id>` cgroup, may use the
+  exception. Before any mutation the helper opens that cgroup, requires
+  `cgroup.kill`, and journals its device/inode. After **all** old activators,
+  services and separately listed SSH session scopes have been masked/stopped,
+  it rechecks the persistent mask, inactive/no-job/zero-MainPID state, opens the
+  snapshot path with `O_NOFOLLOW`, compares device/inode and writes `cgroup.kill`.
+  It joins population before the existing complete old-PID/cgroup checks. A
+  replaced cgroup, missing kernel support or failed drain retains unknown state.
+  Other active services with `KillMode=process` still refuse before mutation.
+* **Independent `/run/sshd`:** the maintenance unit now explicitly owns
+  `RuntimeDirectory=sshd`, mode 0755, root:root, with preservation enabled. **Both
+  the old and maintenance units must preserve it. Shared RuntimeDirectory alone
+  is insufficient:** a real systemd 257 local RED probe removed the directory
+  when the old unit stopped despite maintenance remaining active. The supplied
+  `normal-ssh-runtime.conf` is a concrete, pinned parent-install prerequisite,
+  not a suggestion to create `/run/sshd` with ExecStartPre. The helper verifies
+  effective preservation on every active old SSH unit sharing `sshd`, as well as
+  maintenance runtime ownership. It never installs this prerequisite itself.
+
+`collect-readonly.js` now requests fixed **named** SSH units and runtime properties.
+The earlier no-unit `systemctl show` returned manager properties, not target
+KillMode; the archived earlier collection does **not** establish target KillMode
+or runtime preservation. This updated collector has not been run on the targets.
+
 ## Parent-only install prerequisites (not executed here)
 
 1. Keep trusted console/out-of-band access available. Confirm these are still
@@ -174,7 +206,23 @@ login/auth rejection or service-install test**.
    or replace it while held. Verify runner bytes against the accepted source hash.
 5. Render `maintenance-sshd.conf.in` with the exact allowlisted host IPv4 at
    `TEST_ENDPOINT_IP`, install root:root 0600 to `/etc/ssh/c3-test-maintenance.conf`.
-   Install the supplied maintenance service root:root 0644. Validate `sshd -t` and
+   Install the supplied maintenance service root:root 0644. **Before stopping any
+   normal SSH unit**, record its canonical `Id`, `RuntimeDirectory`,
+   `RuntimeDirectoryPreserve`, `FragmentPath`, `DropInPaths` and exact existing
+   drop-in bytes/absence. For every old SSH service sharing `sshd`, install the
+   exact supplied `normal-ssh-runtime.conf` root:root 0644 at
+   `/etc/systemd/system/<observed-canonical-Id>.d/c3-test-runtime.conf`, without
+   overwriting any existing file. Run `systemctl daemon-reload` (no SSH restart),
+   then require `systemctl show <canonical-Id> --property=Id,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,DropInPaths`
+   to show `RuntimeDirectoryPreserve=yes` and the exact new drop-in path. Preserve
+   before/after output; include its exact SHA256 in the post-provisioning
+   `unitFilePins` (supplied file SHA256:
+   `bd154bb1a033768ecf715cc48e03134083f7a8cc3899b91d82f36b3f8a41301a`).
+   A local real-systemd probe verified this no-restart reload path;
+   failure on a target is a hard stop, not permission to kill SSH. Snapshot and
+   separately review restoration of this provisioning drop-in: `restore-masks`
+   intentionally does not remove it. Do not remove it while either daemon relies
+   on the shared directory. Validate `sshd -t` and
    effective `-T -C` for all three users. Stage `sudoers.in`, run `visudo -cf`, then
    install a root:root 0440 drop-in. Do not weaken the exact runner command or allow
    SETENV/general sudo. `SSH_ORIGINAL_COMMAND` is data parsed by the root helper,
@@ -241,12 +289,25 @@ omit only local key/known_hosts paths, which parent must supply explicitly.
    SSH connection or failed guard. It snapshots before masking/stopping old entry
    paths and writers; any uncertainty leaves `isolating` and all acquired masks.
    Do not retry apply, run unfreeze, or restart the old backend on failure.
-3. Independently verify normal SSH/old shell/SFTP/bootstrap attempts now fail,
+   Successful drain returns **`awaiting-fresh-login`, NOT held**; dispatch, status
+   and mask restoration are still refused.
+3. After that return, open a genuinely new **connection C** (no ControlMaster) to
+   port 2222 with the independent operator key and pinned host key. Run
+   `sudo -n /usr/local/libexec/c3-test-node-isolation confirm-access` through C.
+   The helper requires C's sshd connection PID/start to be distinct from B and
+   newer than the recorded post-drain boot-tick boundary, rechecks the full drain
+   and distinct live guard A, and only then persists `held`. An existing channel
+   echo or preopened third connection cannot pass. This is the mandatory real
+   post-stop authentication gate, not a supplied boolean. If fresh authentication
+   fails, retain masks and use A/console to investigate; never restart old SSH as
+   an automatic recovery. This live target login has **not** been executed here.
+   Independently verify normal SSH/old shell/SFTP/bootstrap attempts now fail,
    pre-existing old pooled SSH connections cannot execute/upload, and detached old
    children/session/root-user cgroups are gone. Verify agent HTTP writes fail
    because the entire service is stopped/masked and joined, not just denied at HTTP.
    Check cron/at/timers/ACME cannot reactivate. Verify xray/PPP/client data plane
-   remains good and independent operator connection A is still usable. These are
+   remains good, independent operator connection A is still usable, and fresh
+   connection C successfully authenticated after old SSH stopped. These are
    **required live acceptance checks, not yet executed**.
 4. `sudo -n /usr/local/libexec/c3-test-node-isolation status` performs fresh checks,
    not a cached caller boolean. Runner SSH sends only the existing exact V2 runner
@@ -286,7 +347,7 @@ node --check scripts/test-node-isolation/collect-readonly.js
 git diff --check
 ```
 
-Local result on this candidate: **14 Python tests passed**, and the unchanged
+Local result on this correction: **20 Python tests passed**, and the unchanged
 V2 runner fence suite reported **22 passed, zero failed/skipped/cancelled**. Python
 compile, JavaScript syntax and whitespace checks passed. No Mongo/full suite was
 run. Read-only collection/parser checks above are separate from these fixture tests.
@@ -297,7 +358,26 @@ close/status and stale replay. Other tests explicitly simulate the physical,
 SSH, systemd/cgroup adapter: they prove controller ordering, sticky unknown,
 receipt binding, boot/guard refusal, restored file/alias/absence readback, no old
 service restart, and unsupported command/profile/context/activation rejection.
-They do **not** prove real systemd KillMode containment, deployed SSH rejection,
+The separate explicit local root probe `test-systemd-local.py` exercised real
+systemd 257 (`257.13-1~deb13u1`) and the local cgroup-v2 kernel with randomly named
+transient units, a private runtime directory and scratch files only. It verified
+an old `KillMode=process` child survives stop then joins via pinned `cgroup.kill`,
+the supplied preservation drop-in changes `no` to `yes` after daemon-reload
+**without restart**, the shared directory survives old mask/reload/stop, and the
+maintenance unit alone recreates it from absence and across restart. It read back
+inactive units and absent private runtime directory after cleanup. It touched no
+real SSH service, account, authentication, `/run/sshd`, network or remote host.
+Run it only with explicit local-root authorization:
+
+```sh
+/usr/local/bin/hermes-admin /usr/bin/python3 -I \
+  /home/leon/c3-test-node-isolation-20261020/scripts/test-node-isolation/test-systemd-local.py
+```
+
+The first non-preserving real-systemd probe failed as expected; the corrected
+preserving probe passed. This is actual local platform evidence, **not** evidence
+of Ubuntu/systemd versions not exercised, a target reboot, or a real SSH login.
+The regular Python fixtures and runner suite do **not** prove deployed SSH rejection,
 positive operator recovery, data-plane connectivity, provisioning/owner restoration,
 endpoint reservations, backend isolation or a complete live node lifecycle.
 Those remain parent review/install acceptance boundaries; none are hidden behind

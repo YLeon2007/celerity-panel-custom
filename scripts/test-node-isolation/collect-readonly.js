@@ -34,7 +34,11 @@ for e in pathlib.Path('/proc').iterdir():
     except (FileNotFoundError,ProcessLookupError): pass
 units=command(['/usr/bin/systemctl','list-units','--all','--no-legend','--plain','--no-pager','--type=service,socket,timer,scope'])
 files=command(['/usr/bin/systemctl','list-unit-files','--no-legend','--no-pager','--type=service,socket,timer'])
-metadata=command(['/usr/bin/systemctl','show','--no-pager','--all','--property=Id,LoadState,ActiveState,SubState,ControlGroup,MainPID,Job,FragmentPath,DropInPaths,KillMode'])
+# No-unit 'systemctl show' describes the manager, not SSH's KillMode.
+# Fixed named queries only; absent names still return their not-found metadata.
+metadata={name:command(['/usr/bin/systemctl','show','--no-pager',
+ '--property=Id,LoadState,ActiveState,SubState,ControlGroup,MainPID,Job,FragmentPath,DropInPaths,KillMode,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,User,Group',
+ '--',name]) for name in ('ssh.service','sshd.service','ssh.socket','sshd-unix-local.socket','sshd-vsock.socket')}
 scheduler={}
 for root in ['/etc/crontab','/etc/cron.d','/etc/cron.hourly','/etc/cron.daily','/etc/cron.weekly',
              '/etc/cron.monthly','/var/spool/cron','/var/spool/at','/etc/letsencrypt/renewal-hooks']:

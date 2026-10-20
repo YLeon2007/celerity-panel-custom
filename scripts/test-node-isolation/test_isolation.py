@@ -69,6 +69,12 @@ import tempfile
 from unittest.mock import patch
 
 
+def fixture_hold(engine):
+    engine.apply({'fixture': 'guard'})
+    engine.host.session = {'pid': 125, 'start': '101'}
+    engine.confirm_access()
+
+
 class EngineTests(PlanTests):
     """Explicit simulated unit adapter, actual disk journal syscalls. Not authority."""
     class FixtureHost:
@@ -104,8 +110,11 @@ class EngineTests(PlanTests):
             if not self.groups_empty:
                 raise m.Refusal('WRITER_DESCENDANT_REMAINS')
 
+        def boot_ticks(self):
+            return '100'
+
         def operator_session(self):
-            return {'pid': os.getpid(), 'start': m.proc_identity(os.getpid())['start']}
+            return getattr(self, 'session', {'pid': 123, 'start': '90'})
 
         def guard_check(self, guard, session=None):
             if not self.alive:
@@ -122,10 +131,62 @@ class EngineTests(PlanTests):
         self.assertTrue(hasattr(m, 'Engine'), 'durable isolation controller is missing')
         return m.Engine(pathlib.Path(root), self.plan(), self.FixtureHost())
 
+    def test_no_hold_until_a_new_post_drain_independent_maintenance_login(self):
+        with tempfile.TemporaryDirectory() as root:
+            e = self.engine(root)
+            e.host.boot_ticks = lambda: '100'
+            session = {'pid': 123, 'start': '90'}
+            e.host.operator_session = lambda: session
+            result = e.apply({'fixture': 'guard'})
+            self.assertEqual(result['phase'], 'awaiting-fresh-login', 'live pre-drain channels do not prove new authentication')
+            with self.assertRaises(m.Refusal):
+                e.assert_held()
+            for stale in [{'pid': 123, 'start': '90'}, {'pid': 124, 'start': '99'}, {'pid': 124, 'start': '100'}]:
+                session = stale
+                with self.assertRaisesRegex(m.Refusal, 'POST_DRAIN_FRESH_LOGIN_REQUIRED'):
+                    e.confirm_access()
+                self.assertEqual(e.read()['phase'], 'awaiting-fresh-login')
+            session = {'pid': 125, 'start': '101'}
+            self.assertEqual(e.confirm_access()['phase'], 'held')
+            self.assertEqual(e.assert_held()['phase'], 'held')
+
+    def test_debian_process_killmode_ssh_gets_exact_pinned_drain_after_all_stops(self):
+        with tempfile.TemporaryDirectory() as root:
+            e = self.engine(root)
+            unit = e.host.unit
+            e.host.unit = lambda name: {**unit(name), 'Id': name, **(
+                {'KillMode': 'process'} if name == 'ssh.service' else {})}
+            pin = {'device': 1, 'inode': 42}
+            def prepare(name, item):
+                self.assertEqual(name, 'ssh.service')
+                self.assertEqual(item['ControlGroup'], '/system.slice/ssh.service')
+                return pin
+            def drain(name, saved):
+                self.assertEqual(saved['sshDrain'], pin)
+                self.assertEqual(set(x[1] for x in e.host.events if x[0] == 'stop'), set(e.plan['isolateUnits']))
+                self.assertEqual(e.read()['saved'][name]['sshDrain'], pin)
+                e.host.events.append(('ssh-drain', name))
+            e.host.prepare_ssh_drain = prepare
+            e.host.drain_ssh = drain
+            fixture_hold(e)
+            self.assertIn(('ssh-drain', 'ssh.service'), e.host.events)
+            self.assertEqual(e.read()['phase'], 'held')
+
+    def test_process_killmode_other_services_still_refuse_before_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            e = self.engine(root)
+            unit = e.host.unit
+            e.host.unit = lambda name: {**unit(name), **(
+                {'KillMode': 'process'} if name == 'cc-agent.service' else {})}
+            with self.assertRaisesRegex(m.Refusal, 'UNSAFE_KILL_MODE'):
+                fixture_hold(e)
+            self.assertEqual(e.host.events, [])
+            self.assertIsNone(e.read())
+
     def test_containment_precedes_held_and_restore_never_restarts(self):
         with tempfile.TemporaryDirectory() as root:
             e = self.engine(root)
-            e.apply({'fixture': 'guard'})
+            fixture_hold(e)
             self.assertEqual(e.read()['phase'], 'held')
             first_stop = next(i for i, x in enumerate(e.host.events) if x[0] == 'stop')
             self.assertTrue(all(x[0] != 'mask' for x in e.host.events[first_stop:]))
@@ -133,14 +194,14 @@ class EngineTests(PlanTests):
             self.assertEqual(e.read()['phase'], 'masks-restored-no-restart')
             self.assertFalse(any(x[0] == 'start' for x in e.host.events))
             with self.assertRaises(m.Refusal):
-                e.apply({'fixture': 'guard'})
+                fixture_hold(e)
 
     def test_live_descendant_keeps_sticky_unknown_and_blocks_dispatch_restore(self):
         with tempfile.TemporaryDirectory() as root:
             e = self.engine(root)
             e.host.groups_empty = False
             with self.assertRaisesRegex(m.Refusal, 'WRITER_DESCENDANT_REMAINS'):
-                e.apply({'fixture': 'guard'})
+                fixture_hold(e)
             self.assertEqual(e.read()['phase'], 'isolating')
             with self.assertRaises(m.Refusal):
                 e.assert_held()
@@ -150,7 +211,7 @@ class EngineTests(PlanTests):
     def test_structurally_corrupt_journal_cannot_drop_required_masks(self):
         with tempfile.TemporaryDirectory() as root:
             e = self.engine(root)
-            e.apply({'fixture': 'guard'})
+            fixture_hold(e)
             data = json.loads(pathlib.Path(root, 'journal.json').read_bytes())
             data['saved'] = {}
             pathlib.Path(root, 'journal.json').write_bytes(json_bytes(data))
@@ -160,7 +221,7 @@ class EngineTests(PlanTests):
     def test_dispatch_requires_full_exact_receipt_before_clearing_inflight(self):
         with tempfile.TemporaryDirectory() as root:
             e = self.engine(root)
-            e.apply({'fixture': 'guard'})
+            fixture_hold(e)
             args = ['--command', 'close', '--operation-id', 'op-1', '--node-id', e.plan['nodeId'],
                     '--candidate-hash', 'sha256:' + 'a' * 64, '--backup-id', 'backup-1',
                     '--target-profile', e.plan['targetProfile'], '--execution-context', e.plan['context'],
@@ -186,7 +247,7 @@ class EngineTests(PlanTests):
     def test_guard_loss_drift_or_uncertain_file_cannot_grant_hold(self):
         with tempfile.TemporaryDirectory() as root:
             e = self.engine(root)
-            e.apply({'fixture': 'guard'})
+            fixture_hold(e)
             e.host.alive = False
             with self.assertRaises(m.Refusal):
                 e.assert_held()
@@ -201,6 +262,73 @@ class EngineTests(PlanTests):
 
 
 class LinuxFixtureTests(unittest.TestCase):
+    def test_exact_ssh_cgroup_pin_and_mask_are_checked_before_kill_syscall(self):
+        # Real filesystem/open/fstat/write, simulated cgroup files (not kernel proof).
+        with tempfile.TemporaryDirectory() as root, patch.object(m, 'MASK_ROOT', root):
+            root = pathlib.Path(root)
+            group = root / 'group'; group.mkdir()
+            (group / 'cgroup.kill').write_bytes(b'')
+            (group / 'cgroup.events').write_text('populated 0\n')
+            (root / 'ssh.service').symlink_to('/dev/null')
+            item = {'Id': 'ssh.service', 'ControlGroup': '/system.slice/ssh.service', 'KillMode': 'process'}
+            stopped = {'LoadState': 'masked', 'ActiveState': 'inactive', 'MainPID': '0',
+                       'Job': '', 'ControlGroup': item['ControlGroup']}
+            real_open = os.open
+            def fixture_open(path, *args, **kw):
+                if path == '/sys/fs/cgroup/system.slice/ssh.service':
+                    path = group
+                return real_open(path, *args, **kw)
+            host = m.Host()
+            with patch.object(m.os, 'open', side_effect=fixture_open), patch.object(host, 'unit', return_value=stopped):
+                pin = host.prepare_ssh_drain('ssh.service', item)
+                saved = {'unit': item, 'oldCgroup': item['ControlGroup'], 'sshDrain': pin}
+                with self.assertRaisesRegex(m.Refusal, 'SSH_CGROUP_IDENTITY_CHANGED'):
+                    host.drain_ssh('ssh.service', {**saved, 'sshDrain': {**pin, 'inode': pin['inode'] + 1}})
+                self.assertEqual((group / 'cgroup.kill').read_bytes(), b'')
+                (root / 'ssh.service').unlink()
+                with self.assertRaisesRegex(m.Refusal, 'SSH_ENTRY_NOT_STOPPED'):
+                    host.drain_ssh('ssh.service', saved)
+                self.assertEqual((group / 'cgroup.kill').read_bytes(), b'')
+                (root / 'ssh.service').symlink_to('/dev/null')
+                host.drain_ssh('ssh.service', saved)
+                self.assertEqual((group / 'cgroup.kill').read_bytes(), b'1\n')
+                for name, changed in [('cc-agent.service', item), ('ssh.service', {**item, 'Id': 'cc-agent.service'}),
+                                      ('ssh.service', {**item, 'ControlGroup': '/system.slice'})]:
+                    with self.subTest(name=name, changed=changed), self.assertRaises(m.Refusal):
+                        host.prepare_ssh_drain(name, changed)
+
+    def test_runtime_prerequisite_refuses_unpreserved_old_sshd_before_apply(self):
+        self.assertTrue(hasattr(m.Host, 'check_ssh_runtime'), 'shared directory preservation is not verified')
+        good = {'RuntimeDirectory': 'sshd', 'RuntimeDirectoryMode': '0755',
+                'RuntimeDirectoryPreserve': 'yes', 'User': 'root', 'Group': 'root', 'ActiveState': 'active'}
+        plan = PlanTests().plan()
+        for old_preserve in ['no', '', 'yes']:
+            def unit(name):
+                return {**good, **({'RuntimeDirectoryPreserve': old_preserve} if name == 'ssh.service' else {})}
+            with self.subTest(old_preserve=old_preserve), patch.object(m.Host, 'unit', side_effect=unit):
+                if old_preserve == 'yes':
+                    m.Host().check_ssh_runtime(plan)
+                else:
+                    with self.assertRaisesRegex(m.Refusal, 'SSH_RUNTIME_PRESERVATION_REQUIRED'):
+                        m.Host().check_ssh_runtime(plan)
+        with patch.object(m.Host, 'unit', return_value={**good, 'RuntimeDirectory': ''}), \
+             self.assertRaisesRegex(m.Refusal, 'MAINT_RUNTIME_OWNERSHIP_REQUIRED'):
+            m.Host().check_ssh_runtime(plan)
+
+    def test_maintenance_unit_owns_shared_sshd_runtime_directory_without_preinstall_side_effects(self):
+        import configparser
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(HERE / 'c3-test-maintenance-sshd.service')
+        service = config['Service']
+        self.assertEqual(service.get('RuntimeDirectory'), 'sshd', 'sshd privilege separation directory has no independent owner')
+        self.assertEqual(service.get('RuntimeDirectoryMode'), '0755')
+        self.assertEqual(service.get('RuntimeDirectoryPreserve'), 'yes')
+        old = configparser.ConfigParser(interpolation=None)
+        old.read(HERE / 'normal-ssh-runtime.conf')
+        self.assertEqual(old['Service'].get('RuntimeDirectoryPreserve'), 'yes')
+        self.assertEqual(service.get('User'), 'root')
+        self.assertEqual(service.get('Group'), 'root')
+
     def test_recovery_guard_requires_fresh_bidirectional_ssh_channel_response(self):
         self.assertTrue(hasattr(m, 'recovery_roundtrip'), 'guard only checked local sshd PID, not live recovery channel')
         import subprocess
@@ -292,7 +420,7 @@ class LinuxFixtureTests(unittest.TestCase):
             put('usr/bin/systemctl', '#!/bin/sh\ncase "$1" in\nshow) printf "Job=\\nActiveState=active\\nSubState=running\\n";;\n*) exit 0;;\nesac\n', 0o700)
             runner = HERE.parents[1] / 'src/modules/relay-l2tp/node-artifacts/topology/runner.sh'
             e = m.Engine(state, PlanTests().plan(), EngineTests.FixtureHost())
-            e.apply({'fixture': 'guard'})
+            fixture_hold(e)
             content = b'{"inbounds":[],"outbounds":[]}\n'
             def original(command, generation='generation-1', predecessor='none'):
                 args = ['--command', command, '--operation-id', 'op-' + generation,

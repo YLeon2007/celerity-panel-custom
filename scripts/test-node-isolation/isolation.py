@@ -208,7 +208,8 @@ class Host:
 
     def unit(self, name):
         keys = ['Id', 'LoadState', 'ActiveState', 'SubState', 'UnitFileState', 'ControlGroup',
-                'MainPID', 'Job', 'FragmentPath', 'DropInPaths', 'KillMode', 'Triggers', 'TriggeredBy']
+                'MainPID', 'Job', 'FragmentPath', 'DropInPaths', 'KillMode', 'Triggers', 'TriggeredBy',
+                'RuntimeDirectory', 'RuntimeDirectoryMode', 'RuntimeDirectoryPreserve', 'User', 'Group']
         raw = self.run(['/usr/bin/systemctl', 'show', '--no-pager', '--property=' + ','.join(keys), '--', name])
         return dict(line.split('=', 1) for line in raw.splitlines() if '=' in line)
 
@@ -273,6 +274,17 @@ class Host:
                 'processes': self.processes(), 'units': details, 'unitFilePins': pins,
                 'schedulerFileDigests': sched, 'jobsPresent': bool(jobs.strip())}
 
+    def check_ssh_runtime(self, p):
+        maintenance = self.unit(MAINT_UNIT)
+        expected = {'RuntimeDirectory': 'sshd', 'RuntimeDirectoryMode': '0755',
+                    'RuntimeDirectoryPreserve': 'yes', 'User': 'root', 'Group': 'root'}
+        need(all(maintenance.get(k) == v for k, v in expected.items()), 'MAINT_RUNTIME_OWNERSHIP_REQUIRED')
+        for name in p['isolateUnits']:
+            if name.startswith('ssh') and name.endswith('.service'):
+                item = self.unit(name)
+                if item.get('ActiveState') not in ('inactive', 'failed') and 'sshd' in item.get('RuntimeDirectory', '').split():
+                    need(item.get('RuntimeDirectoryPreserve') == 'yes', 'SSH_RUNTIME_PRESERVATION_REQUIRED')
+
     def check_prerequisites(self, p):
         need(self.physical() == {k: p[k] for k in ('machineId', 'bootId', 'sshHostKeySha256')}, 'PHYSICAL_IDENTITY_DRIFT')
         need(digest(secure_file(RUNNER)) == p['runnerSha256'], 'RUNNER_PIN_MISMATCH')
@@ -284,6 +296,7 @@ class Host:
         need(digest(secure_file(MAINT_CONFIG)) == p['maintenanceConfigSha256'], 'MAINT_CONFIG_DRIFT')
         need(digest(secure_file('/etc/systemd/system/' + MAINT_UNIT)) == p['maintenanceUnitSha256'], 'MAINT_UNIT_DRIFT')
         need(self.unit(MAINT_UNIT).get('ActiveState') == 'active', 'RECOVERY_TRANSPORT_DOWN')
+        self.check_ssh_runtime(p)
         self.run(['/usr/sbin/sshd', '-t', '-f', MAINT_CONFIG])
         for user in (OPERATOR, RUNNER_USER, 'root'):
             raw = self.run(['/usr/sbin/sshd', '-T', '-f', MAINT_CONFIG, '-C',
@@ -340,6 +353,11 @@ class Host:
                 need(not exe.startswith('sshd') or proc['cgroup'] == maintenance_ssh or
                      proc['cgroup'].startswith(maintenance_ssh + '/'), 'OLD_SSH_EXECUTABLE_REMAINS')
         return inventory
+
+    def boot_ticks(self):
+        # /proc stat starttime uses ticks since boot. Strict > refuses same-tick
+        # or preopened connections; a later independent login must authenticate.
+        return str(int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf('SC_CLK_TCK')))
 
     def operator_session(self):
         import pwd
@@ -440,6 +458,66 @@ class Host:
         state = self.unit(name)
         if state.get('ActiveState') not in ('inactive', 'failed'):
             self.run(['/usr/bin/systemctl', 'stop', '--', name])
+
+    def prepare_ssh_drain(self, name, item):
+        # Sole exception to control-group/mixed: distro's normal SSH service.
+        # Its exact fragment/drop-ins were already checked by check_inventory.
+        need(name in ('ssh.service', 'sshd.service') and
+             item.get('Id') in ('ssh.service', 'sshd.service') and
+             item.get('KillMode') == 'process' and
+             item.get('ControlGroup') == '/system.slice/' + item['Id'], 'UNSAFE_KILL_MODE')
+        fd = os.open('/sys/fs/cgroup' + item['ControlGroup'],
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            kill = os.open('cgroup.kill', os.O_WRONLY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(kill)  # Require cgroup v2's atomic descendant kill before mutation.
+            return {'device': info.st_dev, 'inode': info.st_ino}
+        finally:
+            os.close(fd)
+
+    def drain_ssh(self, name, saved):
+        # Called only after ALL activation units, old services and session scopes
+        # have completed synchronous stop. Never kill by PID or a recomputed path.
+        item, pin = saved['unit'], saved['sshDrain']
+        need(name in ('ssh.service', 'sshd.service') and item.get('KillMode') == 'process' and
+             item.get('Id') in ('ssh.service', 'sshd.service') and
+             saved['oldCgroup'] == '/system.slice/' + item['Id'], 'UNSAFE_KILL_MODE')
+        state = self.unit(name)
+        mask = pathlib.Path(MASK_ROOT) / name
+        need(mask.is_symlink() and os.readlink(mask) == '/dev/null' and
+             state.get('LoadState') == 'masked' and state.get('ActiveState') in ('inactive', 'failed') and
+             state.get('Job') in ('', '0') and state.get('MainPID') == '0' and
+             state.get('ControlGroup', '') in ('', saved['oldCgroup']), 'SSH_ENTRY_NOT_STOPPED')
+        try:
+            fd = os.open('/sys/fs/cgroup' + saved['oldCgroup'],
+                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return  # Removed cgroup is joined; verify_exclusion still checks all old PIDs.
+        try:
+            info = os.fstat(fd)
+            need(pin == {'device': info.st_dev, 'inode': info.st_ino}, 'SSH_CGROUP_IDENTITY_CHANGED')
+            kill = os.open('cgroup.kill', os.O_WRONLY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                need(os.write(kill, b'1\n') == 2, 'SSH_CGROUP_KILL_UNCERTAIN')
+            finally:
+                os.close(kill)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    events = os.open('cgroup.events', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    break
+                try:
+                    values = dict(line.split() for line in os.read(events, 4096).decode().splitlines())
+                finally:
+                    os.close(events)
+                if values.get('populated') == '0':
+                    break
+                need(time.monotonic() < deadline, 'SSH_CGROUP_NOT_DRAINED')
+                time.sleep(0.05)
+        finally:
+            os.close(fd)
 
     def assert_stopped(self, name, oldgroup):
         state = self.unit(name)
@@ -544,17 +622,26 @@ class Engine:
             return None
         value = decode_json(path.read_bytes())
         need(isinstance(value, dict) and set(value) == {'version', 'phase', 'plan', 'planHash', 'guard', 'saved',
-                                                       'initialProcesses', 'dispatchInFlight', 'dispatchCount'}, 'JOURNAL_CORRUPT_RETAINED')
+                                                       'initialProcesses', 'dispatchInFlight', 'dispatchCount', 'accessBoundary'}, 'JOURNAL_CORRUPT_RETAINED')
         need(type(value['version']) is int and value['version'] == 1 and
-             value['phase'] in ('isolating', 'held', 'restoring', 'masks-restored-no-restart') and
+             value['phase'] in ('isolating', 'awaiting-fresh-login', 'held', 'restoring', 'masks-restored-no-restart') and
              type(value['dispatchCount']) is int and value['dispatchCount'] >= 0 and
              isinstance(value['initialProcesses'], list) and isinstance(value['saved'], dict) and
              set(value['saved']) == set(self.plan['isolateUnits']), 'JOURNAL_CORRUPT_RETAINED')
-        for saved in value['saved'].values():
-            need(isinstance(saved, dict) and set(saved) == {'mask', 'unit', 'oldCgroup'} and
+        for name, saved in value['saved'].items():
+            need(isinstance(saved, dict) and set(saved) == {'mask', 'unit', 'oldCgroup', 'sshDrain'} and
                  isinstance(saved['unit'], dict) and isinstance(saved['mask'], dict) and
                  isinstance(saved['oldCgroup'], str) and saved['oldCgroup'] == saved['unit'].get('ControlGroup', ''),
                  'JOURNAL_CORRUPT_RETAINED')
+            pin = saved['sshDrain']
+            need(pin is None or (name in ('ssh.service', 'sshd.service') and
+                 isinstance(pin, dict) and set(pin) == {'device', 'inode'} and
+                 all(type(v) is int and v >= 0 for v in pin.values())), 'JOURNAL_CORRUPT_RETAINED')
+        boundary = value['accessBoundary']
+        need((value['phase'] == 'isolating' and boundary is None) or
+             (isinstance(boundary, dict) and set(boundary) == {'session', 'ticks'} and
+              isinstance(boundary['session'], dict) and
+              isinstance(boundary['ticks'], str) and boundary['ticks'].isdecimal()), 'JOURNAL_CORRUPT_RETAINED')
         need(value.get('planHash') == self.plan_hash and value.get('plan') == self.plan, 'PLAN_DRIFT_RETAINED')
         return value
 
@@ -570,18 +657,21 @@ class Engine:
         saved = {}
         for name in self.plan['isolateUnits']:
             item = self.host.unit(name)
-            need((not name.endswith('.service') or item.get('KillMode') in ('control-group', 'mixed')) or
-                 item.get('ActiveState') in ('inactive', 'failed'), 'UNSAFE_KILL_MODE')
+            ssh_drain = None
+            if (name.endswith('.service') and item.get('KillMode') not in ('control-group', 'mixed') and
+                    item.get('ActiveState') not in ('inactive', 'failed')):
+                need(name in ('ssh.service', 'sshd.service') and item.get('KillMode') == 'process', 'UNSAFE_KILL_MODE')
+                ssh_drain = self.host.prepare_ssh_drain(name, item)
             group = item.get('ControlGroup', '')
             if group:
                 need(group.startswith('/') and group != '/' and '..' not in group.split('/') and
                      not any(group == keep or keep.startswith(group + '/') or group.startswith(keep + '/')
                              for keep in self.plan['keepCgroups']), 'WRITER_CGROUP_OVERLAPS_RECOVERY_OR_DATA_PLANE')
             saved[name] = {'mask': self.host.snapshot_mask(name), 'unit': item,
-                           'oldCgroup': item.get('ControlGroup', '')}
+                           'oldCgroup': item.get('ControlGroup', ''), 'sshDrain': ssh_drain}
         state = {'version': 1, 'phase': 'isolating', 'plan': self.plan, 'planHash': self.plan_hash,
                  'guard': guard, 'saved': saved, 'initialProcesses': inventory['processes'],
-                 'dispatchInFlight': None, 'dispatchCount': 0}
+                 'dispatchInFlight': None, 'dispatchCount': 0, 'accessBoundary': None}
         self.save(state)  # All touched config and states durable before first mutation.
         for name in saved:
             self.host.write_mask(name)
@@ -590,8 +680,26 @@ class Engine:
         ordered = sorted(saved, key=lambda u: (not u.endswith(('.socket', '.timer')), u))
         for name in ordered:
             self.host.stop(name)
+        for name, item in saved.items():
+            if item['sshDrain'] is not None:
+                self.host.drain_ssh(name, item)
         self.verify_exclusion(state)
         self.host.guard_check(guard, session)
+        state['accessBoundary'] = {'session': session, 'ticks': self.host.boot_ticks()}
+        state['phase'] = 'awaiting-fresh-login'
+        self.save(state)
+        return self.evidence(state)
+
+    def confirm_access(self):
+        state = self.read()
+        need(state is not None and state['phase'] == 'awaiting-fresh-login' and
+             state['dispatchInFlight'] is None, 'MAINTENANCE_UNKNOWN_RETAINED')
+        self.verify_exclusion(state)
+        session = self.host.operator_session()
+        boundary = state['accessBoundary']
+        need(session != boundary['session'] and int(session['start']) > int(boundary['ticks']),
+             'POST_DRAIN_FRESH_LOGIN_REQUIRED')
+        self.host.guard_check(state['guard'], session)
         state['phase'] = 'held'
         self.save(state)
         return self.evidence(state)
@@ -675,7 +783,7 @@ class Engine:
 
 def main():
     need(os.geteuid() == 0, 'ROOT_REQUIRED')
-    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'apply', 'status', 'dispatch', 'restore-masks'), 'INVALID_CLI')
+    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'apply', 'confirm-access', 'status', 'dispatch', 'restore-masks'), 'INVALID_CLI')
     command = sys.argv[1]
     host = Host()
     if command == 'inventory':
@@ -698,6 +806,8 @@ def main():
         if command == 'apply':
             guard = decode_json(secure_file(directory / 'guard.json'))
             output = engine.apply(guard)
+        elif command == 'confirm-access':
+            output = engine.confirm_access()
         elif command == 'status':
             output = engine.evidence(engine.assert_held())
         elif command == 'restore-masks':
