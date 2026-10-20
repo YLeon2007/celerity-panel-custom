@@ -110,6 +110,14 @@ function createL2tpRuntimeLifecycleHook({
         activeHostProvider,
     });
     lifecycle.start();
+    if (typeof hostDependencies.topologyExecutionAuthority?.close === 'function') {
+        const stop = lifecycle.stop.bind(lifecycle);
+        let stopping;
+        return { ...lifecycle, stop() {
+            if (!stopping) stopping = Promise.resolve().then(stop).finally(() => hostDependencies.topologyExecutionAuthority.close());
+            return stopping;
+        } };
+    }
     return lifecycle;
 }
 
@@ -153,6 +161,8 @@ function createL2tpRootHostDependencies({
     renderPage = require('../routes/panel').renderL2tpPage,
     clock = { now: () => new Date() },
     topologyHealthMaxStalenessMs = DEFAULT_MAX_STALENESS_MS,
+    createTopologyExecutionAuthority = require('./relay-l2tp/runtime/testPhysicalController').createRootTestPhysicalAuthority,
+    topologyExecutionAuthority,
     workerId = `panel-${process.pid}`,
     leaseMs = ROOT_LEASE_MS,
     intervalMs = ROOT_WORKER_INTERVAL_MS,
@@ -180,8 +190,10 @@ function createL2tpRootHostDependencies({
         }));
     });
 
+    const authority = topologyExecutionAuthority ?? createTopologyExecutionAuthority({ env });
     return {
         env,
+        ...(authority ? { topologyExecutionAuthority: authority } : {}),
         HyNode,
         NodeSSH,
         NodeTransport,

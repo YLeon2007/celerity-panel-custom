@@ -17,9 +17,9 @@ const { TopologyOperationRepository } = require('../repositories/topologyOperati
 const { createL2tpPanelHost } = require('../../createL2tpPanelHost');
 const entry = require('..');
 let connection, child, directory, models;
-const NODE = new mongoose.Types.ObjectId().toString();
+const NODE = '6ab18adc63913ebd4a917471';
 // Independently fixed SIMULATED physical facts; never derive these from a challenge/node row.
-const ENDPOINT = freeze({ ip: '192.0.2.17', port: 2222, username: 'c3-test-runner' });
+const ENDPOINT = freeze({ ip: '132.243.230.19', port: 2222, username: 'c3-test-runner' });
 const IDENTITY = freeze({ machineId: randomBytes(16).toString('hex'), sshHostKeySha256: randomBytes(32).toString('hex') });
 const BOOT = randomUUID(), MAINTENANCE = randomUUID(), OWNER = randomUUID();
 const content = '{"inbounds":[],"outbounds":[{"tag":"direct"}],"routing":{"rules":[]}}\n';
@@ -160,16 +160,31 @@ async function fixture(t, fault, executionContext = TEST) {
         try { return await work(proof, runnerCheck); }
         finally { runnerHeld--; }
     };
-    const authority = { runnerTransport: 'preinstalled-attested-v1', async withHeldAuthority(context, work) {
+    let authority = { runnerTransport: 'preinstalled-attested-v1', async withHeldAuthority(context, work) {
         assert.deepEqual(context, TEST); assert.equal(active, false); active = true;
         try { return await work(Object.freeze({ assertHeld, withVerifiedAuthority: attest,
             ...(fault === 'runner-missing-capability' ? {} : { withVerifiedPreinstalledRunner: attestRunner }) })); }
         finally { active = false; }
     } };
+    if (fault === 'operational-root') {
+        const { physicalControllerFixture } = require('./helpers/physicalControllerFixture');
+        const physical = physicalControllerFixture(t, { nodeId: NODE, identity: IDENTITY, bootId: BOOT, maintenanceId: MAINTENANCE, runnerRoot: runner.root });
+        authority = { runnerTransport: physical.runnerTransport, close: () => physical.close(),
+            withHeldAuthority: (context, work) => physical.withHeldAuthority(context, async capability => {
+                active = true;
+                try { return await work({ ...capability, withVerifiedPreinstalledRunner: (challenge, callback) =>
+                    capability.withVerifiedPreinstalledRunner(challenge, async (proof, check) => {
+                        runnerHeld++;
+                        try { return await callback(proof, check); } finally { runnerHeld--; }
+                    }) }); } finally { active = false; }
+            }),
+        };
+    }
     // Enrollment is separate explicit server maintenance, never implicit worker adoption.
     active = true;
     try {
-        const store = new TopologyExecutionBindingStore({ executionContext, withVerifiedAuthority: attest,
+        const store = new TopologyExecutionBindingStore({ executionContext, withVerifiedAuthority: fault === 'operational-root'
+            ? (challenge, callback) => authority.withHeldAuthority(TEST, capability => capability.withVerifiedAuthority(challenge, callback)) : attest,
             Operation: models.TopologyOperation, Lock: models.NodeOperationLock, Owner: models.TopologyConfigOwner,
             Enrollment: models.TopologyExecutionEnrollment, Binding: models.TopologyExecutionBinding, HyNode: models.HyNode });
         if (fault !== 'no-enrollment') await store.preEnroll(freeze({ nodeId: NODE, targetProfile: 'xray-main', endpoint: ENDPOINT, nodeIdentity: IDENTITY,
@@ -199,7 +214,7 @@ async function fixture(t, fault, executionContext = TEST) {
         }
     }
     let service;
-    const host = createL2tpPanelHost({ env: { PANEL_DOMAIN: executionContext.hostIdentity, L2TP_EXECUTION_ENABLED: 'true',
+    const hostOptions = { env: { PANEL_DOMAIN: executionContext.hostIdentity, L2TP_EXECUTION_ENABLED: 'true',
         L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: executionContext === PROD ? 'true' : undefined },
         topologyExecutionAuthority: fault === 'missing-authority' ? undefined : authority,
         HyNode: models.HyNode, CascadeLink: models.CascadeLink, NodeSSH: LocalSSH,
@@ -208,8 +223,41 @@ async function fixture(t, fault, executionContext = TEST) {
             createTopologyIntentService: undefined },
         topologyRuntime: {}, Repository: class {}, createRepositoryAdapters: () => ({}), createPanelOverviewLoader: () => async () => ({}),
         createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start() {}, async stop() {} }),
-        createTopologyRecoveryLifecycle: () => ({ start() {}, async stop() {} }), workerId: 'assembled-host', leaseMs: 120000 });
-    t.after(() => host.stop());
+        createTopologyRecoveryLifecycle: () => ({ start() {}, async stop() {} }), workerId: 'assembled-host', leaseMs: 120000 };
+    let host;
+    if (fault === 'operational-root') {
+        // Non-topology L2TP services are inert local seams; topology remains real.
+        const noop = () => {};
+        hostOptions.createExecutionRuntime = () => ({ runtime: {
+            service: { getStatus: noop, preflight: noop, install: noop, getOperation: noop },
+            stateManagementService: { configureRelay: noop },
+            userManagementService: { createUser: noop, listUsers: noop, updateUser: noop, disableUser: noop },
+        }, start() {}, async stop() {} });
+        const { createL2tpRootLifecycle, createL2tpRootHostDependencies, createL2tpRuntimeLifecycleHook } = require('../../l2tpRuntimeLifecycleHook');
+        const { createL2tpStartupLifecycle } = require('../../createL2tpStartupLifecycle');
+        const noWork = () => {};
+        const root = createL2tpRootLifecycle({ env: hostOptions.env,
+            createMigrationBootstrap: () => ({ async run() {} }),
+            ensureModelIndexes: async () => { await Promise.all(Object.values(models).map(model => model.init())); },
+            createHostDependencies: ({ env }) => createL2tpRootHostDependencies({ ...hostOptions, env,
+                // The ordinary root factory selects the real operational controller;
+                // its subprocess physical/SSH boundary is explicitly simulated.
+                topologyExecutionAuthority: undefined,
+                createTopologyExecutionAuthority: () => authority,
+                candidateUserResolver: async () => [], syncService: null,
+                requireAuth: noWork, requireOnboarding: noWork, csrf: noWork, rateLimiter: noWork, renderPage: noWork,
+                secretBox: { encrypt() {}, decrypt() {} }, secretKey: 'local-only',
+                timer: { setInterval() {}, clearInterval() {} }, logger: { error() {} } }),
+            createRuntimeLifecycleHook: options => createL2tpRuntimeLifecycleHook({ ...options,
+                createStartupLifecycle: options => createL2tpStartupLifecycle({ ...options,
+                    createPanelHost(dependencies) { host = createL2tpPanelHost({ ...hostOptions, ...dependencies }); return host; } }) }),
+        });
+        await root.startAfterDatabase();
+        t.after(() => root.stop());
+    } else {
+        host = createL2tpPanelHost(hostOptions);
+        t.after(() => host.stop());
+    }
     assert.ok(service?.operationWorker, 'actual host/runtime must compose real worker');
     // Local user RPC seam only; keep actual resync/gate/finalizer/executor implementations.
     service.operationWorker.userResync._syncService = { async _getUsersForNode() { await assertHeld(); return []; }, async addXrayUser() { assert.fail('no users'); } };
@@ -222,9 +270,25 @@ async function fixture(t, fault, executionContext = TEST) {
             topologyRevision: revision, priorDeployedRevision: revision - 1, nodes: [node], heldTopologyAdmission: true, admissionFingerprint: hash, session }));
         return operationId;
     }
-    return { worker: service.operationWorker, operation, events, runnerExecutions, revoke: () => { revoked = true; }, setFirst: row => { first = row; },
+    return { operationalRoot: fault === 'operational-root', worker: service.operationWorker, operation, events, runnerExecutions, revoke: () => { revoked = true; }, setFirst: row => { first = row; },
         replayFirst: () => restrictedExecute(runner, events.find(event => event.includes('--command prepare ')), { stdin: content }) };
 }
+test('ordinary root reaches real TEST store/default worker through operational subprocess controller for two serial generations', async t => {
+    const f = await fixture(t, 'operational-root');
+    assert.equal(f.operationalRoot, true, 'ordinary root + operational controller assembly missing');
+    for (const revision of [27, 28]) {
+        const id = await f.operation(revision);
+        const result = await f.worker.run(id);
+        assert.equal(result.status, 'succeeded', JSON.stringify(result));
+        const row = await models.TopologyExecutionBinding.findOne({ operationId: id }).lean();
+        assert.ok(row); f.setFirst(row);
+        assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+    }
+    assert.equal(await models.TopologyExecutionBinding.countDocuments(), 2);
+    assert.equal(await models.TopologyExecutionEnrollment.countDocuments(), 1);
+    assert.equal(f.runnerExecutions.length, 10);
+});
+
 test('actual TEST host provisions after exact claim/locks and settles two serial real-store runner generations', async t => {
     const f = await fixture(t);
     for (const revision of [17, 18]) {

@@ -23,6 +23,31 @@ const ENABLED_ENV = Object.freeze({
     TOPOLOGY_TEST_EXECUTION_ENABLED: 'true',
 });
 
+test.after(() => require('../../services/sshPoolService').closeAll());
+
+test('ordinary root dependency seam selects operational authority and forwards the same capability', () => {
+    const env = { L2TP_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: 'test.infograd.online' };
+    const controller = { runnerTransport: 'preinstalled-attested-v1', withHeldAuthority() {} };
+    let selections = 0;
+    const dependencies = createL2tpRootHostDependencies({ env,
+        createTopologyExecutionAuthority(options) { assert.strictEqual(options.env, env); selections++; return controller; },
+    });
+    assert.equal(selections, 1, 'default root seam must select its private physical controller');
+    assert.strictEqual(dependencies.topologyExecutionAuthority, controller);
+});
+
+test('root stop joins runtime then closes only observer channels, never external holds', async () => {
+    const events = [];
+    const authority = { close() { events.push('close-observers'); } };
+    const lifecycle = createL2tpRuntimeLifecycleHook({ env: { L2TP_EXECUTION_ENABLED: 'true' },
+        createHostDependencies: () => ({ topologyExecutionAuthority: authority,
+            createCandidateService() {}, createPreflightRunner() {}, createUserSnapshotResolver() {}, createUserSyncReconciler() {} }),
+        createStartupLifecycle: () => ({ start() {}, async stop() { events.push('join-runtime'); } }),
+    });
+    await lifecycle.stop();
+    assert.deepEqual(events, ['join-runtime', 'close-observers']);
+});
+
 test('parses L2TP_EXECUTION_ENABLED as an exact disabled-by-default boolean', () => {
     assert.equal(parseL2tpExecutionEnabled(undefined), false);
     assert.equal(parseL2tpExecutionEnabled('false'), false);

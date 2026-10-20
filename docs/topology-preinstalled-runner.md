@@ -3,8 +3,9 @@
 This is a source-level **TEST-only transport capability**, not physical authority,
 node provisioning, a PROD activation switch, or proof of deployed connectivity.
 PROD composition still omits the binding reader/capability and the real worker
-still refuses before claim. Root lifecycle, owner transfer and forced-command
-grammar are unchanged.
+still refuses before claim. The transport does not change owner transfer or the
+forced-command grammar. Ordinary root selection is now provided separately by
+[the TEST physical controller](topology-test-physical-controller.md).
 
 ## Trusted operational adapter contract
 
@@ -83,15 +84,20 @@ config directory is already safely usable (the legacy bootstrap's fixed
 vendor override, mask or drop-ins. The application does not install/reload it.
 Portal does not gain permission to inspect/change an unrelated bridge unit.
 
-**The adapter is not implemented by this slice.** It must independently fix and
-observe the enrolled physical machine, endpoint/user/raw key, boot, maintenance
-identity, installed runner bytes/metadata, profile prerequisites, excluded aliases
-and endpoint reassignment, old process trees and bootstrap/classic writers under
-the real maintained guard. Copying the challenge, an old JSON receipt, mutable
-HyNode data or the shipped digest into a proof is not physical evidence. The
-binding-store's physical attestation remains separately required. Tests below
-explicitly simulate this independent external boundary and do not install a
-production attestor in source.
+The separate [TEST physical controller](topology-test-physical-controller.md)
+now supplies this operational adapter through the ordinary root dependency seam.
+It consumes current installed-file and held host/node readbacks under independent
+private pins; it does not establish the external holds or install itself. The
+transport alone still cannot independently fix or observe the enrolled physical
+machine, endpoint/user/raw key, boot, maintenance identity, profile prerequisites,
+excluded aliases and endpoint reassignment, old process trees or classic writers.
+Copying the challenge, an old JSON receipt, mutable HyNode data or the shipped
+digest into a proof is not physical evidence. The binding-store's separate
+physical attestation remains required. Most transport tests below explicitly
+simulate that external boundary; the additional ordinary-root controller test
+uses real subprocess observations and installed fake-root bytes/journals with
+physical/UID/kernel/systemd/SSH facts still explicitly simulated. No production
+attestor or live deployment is provided.
 
 ## Dispatch behavior
 
