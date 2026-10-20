@@ -58,10 +58,37 @@ acceptance/timeouts as proof that a job was cancelled. Pending work remains
 suspended and could execute upon a later thaw; there is **no post-kill thaw API**.
 
 Mongo, Redis, Caddy and a pre-started candidate have independent payload scopes
-and remain unfrozen. Their init identities are rechecked without requiring their
-legitimate child-process inventories to remain static. Native Xray/PPP services
-are not targeted. LocalXray's alias on the TEST panel machine is the **same
-physical machine**, not a separate remote exclusion boundary.
+and remain unfrozen. Every capture, arm transition and fresh check requires each
+survivor member to have a revalidated PID/start-ticks parent chain inside its
+payload to the exact pinned init **and inherit that init's session**. The init
+must itself be the live session leader (`session == init PID`). Session IDs are
+pinned in process identities; previous captures without them must be replaced
+and independently accepted, never patched or automatically adopted.
+
+This rejects an already-entered generic Docker exec even if it was present
+before capture. PPID alone is not sufficient: when an exec shell exits, its
+background child can be adopted by container PID1 and appear to be a legitimate
+init child. Docker/runc gives that exec a separate session, which survives
+reparenting. Linux `setsid` creates the caller's own session; it cannot join the
+existing live init session. Require both ancestry and inherited session, not
+executable names, captured membership, or membership in any accepted cgroup.
+This is for the inspected standard Docker/runc layout, not a custom runtime that
+launches exec inside an existing payload session.
+
+Legitimate children/grandchildren in the inherited init session may fork, exit
+and be adopted by their init; their inventories are **not static pins**. A
+changed/disappearing member triggers at most three complete new snapshot
+attempts, each requiring the same ancestry/session/identity proof. New children
+seen during the global escaped-work scan are independently reproved, not allowed
+by cgroup alone. Observed identity/ancestry/session violations and persistently
+unstable inventories refuse. Independently daemonized (`setsid`) children are
+also unproven and conservatively refuse, even if otherwise legitimate; they are
+never frozen or silently grandfathered. This deliberate availability limit
+avoids treating an adopted exec orphan as data plane. Any refusal during arm or
+held check poisons the guard to sticky unknown without thawing held roots or
+freezing survivors. Native Xray/PPP services are not targeted. LocalXray's alias
+on the TEST panel machine is the **same physical machine**, not a separate remote
+exclusion boundary.
 
 ### Prevent service-cgroup recreation
 
@@ -226,7 +253,20 @@ HERMES_HEAVY_TMP_ROOT=/home/leon/.hermes/cache/scratch/freezer-heavy \
   --bin-dir /absolute/path/to/docker26/bin \
   --workspace /home/leon/.hermes/cache/scratch/new-freezer-drill
 # A separate new workspace plus --restore-only exercises real safe restoration.
+# Use short new workspace paths: Docker's nested Unix sockets have a path limit.
+# Repeat separately with --survivor-exec before-capture, after-capture, and
+# orphan-after-capture; each must refuse without freezing the survivor.
 ```
+
+The `--survivor-exec` variants run actual `docker exec -d` without a runc gate,
+observe its process **inside** the survivor payload, and require the real pipe
+controller to return sticky unknown for unproven survivor work. The pre-capture
+variant includes it in the proposed member inventory. The orphan variant starts
+a background child, exits the exec shell and verifies adoption by the survivor
+init before checking refusal; this reproduces why current PPID ancestry alone
+is not a safe fix. Survivor heartbeat and new proxied HTTP requests must continue,
+and disposable cleanup must leave no owned cgroup. These are local kernel/Docker
+experiments, not live TEST/native Xray/PPP observations.
 
 The drill runs the actual `serve` controller in a separate process and injects
 a compiled runc-exec gate **after real Docker/containerd/shim acceptance**. It
@@ -260,7 +300,10 @@ for cleanup. This is not a post-kill restoration route for the host mechanism.
 `SYSTEMD_BYPASS_USERDB=1` avoids optional NSS userdb resolution in the local
 privilege wrapper; it does not disable authentication or the host identity gate.
 
-The delivered verification record is
+The historical pre-B1 verification record is
 [panel-host-freezer-evidence-20261020.json](panel-host-freezer-evidence-20261020.json).
-It records local-only artifacts and read-only TEST inventory, not a live TEST
+Its source hashes and previous captures are **superseded by the survivor-exec
+fix**; retain it as historical evidence, not proof of these current source bytes.
+Current RED/GREEN logs and local drill results must be retained separately with
+exact current source hashes by the rollout owner. Neither record is a live TEST
 fence, node-side maintenance authority or production approval.

@@ -160,6 +160,7 @@ class LinuxKernel:
         cg = (p / 'cgroup').read_text().strip()
         need(cg.startswith('0::/') and '\n' not in cg, 'not unified cgroup v2')
         return {'pid': int(pid), 'startTicks': fields[19], 'cgroup': cg[3:],
+                'session': int(fields[3]),
                 'exe': os.readlink(p / 'exe'), 'comm': (p / 'comm').read_text().strip()}
 
     def members(self, name):
@@ -227,7 +228,63 @@ class LinuxKernel:
                     groups.append('/' + str((Path(base) / d).relative_to(self.root)))
         return sorted(groups)
 
-    def escaped_descendants(self, expected):
+    def parent_identity(self, pid):
+        text = (self.proc / str(pid) / 'stat').read_text()
+        fields = text[text.rfind(')') + 2:].split()
+        return {'pid': int(pid), 'startTicks': fields[19], 'ppid': int(fields[1]),
+                'session': int(fields[3])}
+
+    def survivor_descendants(self, group, init):
+        # Allow ordinary fork/exit churn, but never accept an incomplete walk.
+        # Each retry starts a new full proof; ancestry/session violations are
+        # not retryable. Persistent churn is bounded and refuses the hold.
+        for _ in range(3):
+            try:
+                rows = self.survivor_snapshot(group, init)
+                if rows is not None:
+                    return rows
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        raise RuntimeError('unproven survivor membership unstable')
+
+    def survivor_snapshot(self, group, init):
+        # A Docker exec can already be inside an unfrozen payload while its
+        # shim/runc parent is frozen elsewhere. Membership in an accepted cgroup
+        # is not authority. Prove every member's current chain to this exact init,
+        # including members already present at capture and detached/orphaned work.
+        rows = {r['pid']: r for r in self.members(group)}
+        need(rows.get(init['pid']) == init, 'survivor init identity drift')
+        # Runc launches init and exec into separate sessions. An exec child may
+        # be adopted by container PID1 after its parent exits, so PPID ancestry
+        # alone is insufficient. Linux cannot join another existing session:
+        # setsid creates only the caller's own session. Require the pinned live
+        # init to lead the inherited session; independently daemonized children
+        # are unproven and refuse rather than being frozen/adopted.
+        need(init['session'] == init['pid']
+             and all(row['session'] == init['session'] for row in rows.values()),
+             'unproven survivor session')
+        parents = {pid: self.parent_identity(pid) for pid in rows}
+        need(all(parents[pid]['startTicks'] == row['startTicks']
+                 and parents[pid]['session'] == row['session'] for pid, row in rows.items()),
+             'unproven survivor process identity')
+        for pid in rows:
+            current, seen = pid, set()
+            while current != init['pid']:
+                need(current in parents and current not in seen, 'unproven survivor ancestry')
+                seen.add(current)
+                child = parents[current]
+                current = child['ppid']
+                need(current in parents
+                     and int(parents[current]['startTicks']) <= int(child['startTicks']),
+                     'unproven survivor ancestry')
+        # Do not stitch a proof across PID reuse, reparenting, or moving members.
+        need(all(self.parent_identity(pid) == row for pid, row in parents.items()),
+             'unproven survivor ancestry changed')
+        if self.members(group) != sorted(rows.values(), key=lambda r: r['pid']):
+            return None
+        return rows
+
+    def escaped_descendants(self, expected, survivors):
         # Account for generic accepted-work children too, not just executables
         # whose basename happens to say runc/buildkit. Runtime roots are already
         # frozen before this can establish the held result.
@@ -242,6 +299,9 @@ class LinuxKernel:
             except (FileNotFoundError, ProcessLookupError):
                 continue
         roots = {r['pid'] for g in expected['controls'] for r in expected['groups'][g]['members']}
+        held_groups = [g for g in expected['groups'] if g in expected['controls']
+                       or g in expected['freezeOrder'] or g == expected.get('proxyGroup')]
+        survivor_containers = [c for c in expected['containers'] if c['cgroup'] not in held_groups]
         for pid in parents:
             current, seen = pid, set()
             while current in parents and current not in seen and current not in roots:
@@ -252,8 +312,22 @@ class LinuxKernel:
                     cg = (self.proc / str(pid) / 'cgroup').read_text().strip()[3:]
                 except (FileNotFoundError, ProcessLookupError):
                     continue
-                need(any(cg == g or cg.startswith(g + '/') for g in expected['groups']),
-                     'accepted-work descendant escaped accounted cgroups')
+                if any(cg == g or cg.startswith(g + '/') for g in held_groups):
+                    continue
+                try:
+                    row = self.pid(pid)
+                    if survivors.get(pid) != row:
+                        # A survivor may fork after its first snapshot. Reprove
+                        # the entire payload rather than exempt its cgroup.
+                        container = next((c for c in survivor_containers
+                                          if cg == c['cgroup'] or cg.startswith(c['cgroup'] + '/')), None)
+                        if container:
+                            survivors.update(self.survivor_descendants(container['cgroup'], container['init']))
+                            row = self.pid(pid)
+                    need(survivors.get(pid) == row,
+                         'accepted-work descendant escaped accounted cgroups')
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
 
     def verify(self, expected, frozen, dead=False):
         need(self.host() == expected['host'], 'host/boot identity drift')
@@ -274,6 +348,7 @@ class LinuxKernel:
             need(proxy or any(row['cgroup'] == g or row['cgroup'].startswith(g + '/') for g in controls), 'runtime helper outside frozen launch roots')
             if 'containerId' in row:
                 need(row['containerId'] in ids, 'unaccounted replica shim')
+        survivors = {}
         for group, pin in expected['groups'].items():
             path = self.group(group)
             need(path.stat().st_ino == pin['inode'], 'cgroup replaced')
@@ -293,11 +368,12 @@ class LinuxKernel:
             elif group in controls or group in expected['freezeOrder'] or group == expected.get('proxyGroup') or group == expected.get('relaunch', {}).get('cgroup'):
                 need(self.members(group) == pin['members'], 'pinned executor tree drift')
             else:
-                # Data-plane payloads may legitimately fork, but their pinned
-                # init and independent unfrozen cgroup must remain unchanged.
+                # Unfrozen payload children may vary, but cgroup membership alone
+                # never admits an extra shim/exec child as legitimate data plane.
                 init = next(c['init'] for c in expected['containers'] if c['cgroup'] == group)
                 need(self.pid(init['pid']) == init, 'survivor init identity drift')
-        self.escaped_descendants(expected)
+                survivors.update(self.survivor_descendants(group, init))
+        self.escaped_descendants(expected, survivors)
         if self.barrier and 'relaunch' in expected:
             self.barrier.verify(expected)
         for group in expected['freezeOrder']:

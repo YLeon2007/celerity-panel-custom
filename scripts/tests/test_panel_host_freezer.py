@@ -221,11 +221,16 @@ class ProcFixture:
             (p / f).write_text(value)
         return p
 
-    def pid(self, pid, exe, cg):
+    def pid(self, pid, exe, cg, ppid=1):
         p = self.proc / str(pid)
         p.mkdir()
-        fields = ['S', '1'] + ['0'] * 20
+        fields = ['S', str(ppid)] + ['0'] * 20
         fields[19] = str(pid * 100)
+        fields[3] = str(pid)
+        parent = self.proc / str(ppid)
+        if parent.exists() and (parent / 'cgroup').read_text().strip() == '0::' + cg:
+            text = (parent / 'stat').read_text()
+            fields[3] = text[text.rfind(')') + 2:].split()[3]
         (p / 'stat').write_text(f'{pid} ({exe}) ' + ' '.join(fields))
         (p / 'comm').write_text(exe[:15])  # Linux truncates comm, not exe.
         (p / 'cgroup').write_text('0::' + cg + '\n')
@@ -411,6 +416,193 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(self.calls[0], ['container', 'ls', '--all', '--quiet', '--no-trunc'])
         self.assertEqual(self.calls[1][:2], ['container', 'inspect'])
         self.assertEqual((f.k.group(f.old) / 'cgroup.freeze').read_text(), '0')
+
+    def acknowledged_freeze(self, group, value):
+        # Only kernel acknowledgements are simulated; inventory and Fence run real code.
+        path = self.f.k.group(group)
+        (path / 'cgroup.freeze').write_text(str(int(value)))
+        (path / 'cgroup.events').write_text(f'frozen {int(value)}\npopulated 1\n')
+
+    def test_arm_refuses_post_capture_exec_in_survivor_mongo(self):
+        f = self.f
+        expected = f.m.capture(f.k)
+        f.pid(80, 'busybox', f.survivor, ppid=24)  # Exact Mongo shim, not its init.
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        f.k.freeze = self.acknowledged_freeze
+        journal = MemoryJournal()
+        fence = f.m.Fence(expected, f.k, journal, 'owner')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor'):
+            fence.arm()
+        self.assertEqual(fence.phase, 'unknown')
+        self.assertEqual(journal.rows[-1]['phase'], 'unknown')
+        self.assertEqual((f.k.group(f.survivor) / 'cgroup.freeze').read_text(), '0')
+        with self.assertRaises(RuntimeError):
+            fence.check()
+
+    def test_capture_refuses_preexisting_exec_in_each_survivor(self):
+        f = self.f
+        for cid, shim in [('c', 24), ('d', 25), ('e', 26)]:
+            with self.subTest(container=cid):
+                group = '/system.slice/docker-' + cid * 64 + '.scope'
+                original = (f.k.group(group) / 'cgroup.procs').read_text()
+                f.pid(80, 'busybox', group, ppid=shim)
+                (f.k.group(group) / 'cgroup.procs').write_text(original + '\n80\n')
+                try:
+                    with self.assertRaisesRegex(RuntimeError, 'unproven survivor'):
+                        f.m.capture(f.k)
+                finally:
+                    (f.k.group(group) / 'cgroup.procs').write_text(original)
+                    import shutil
+                    shutil.rmtree(f.proc / '80')
+
+    def test_fresh_check_refuses_orphaned_exec_without_thawing_controls(self):
+        f = self.f
+        expected = f.m.capture(f.k)
+        f.k.freeze = self.acknowledged_freeze
+        journal = MemoryJournal()
+        fence = f.m.Fence(expected, f.k, journal, 'owner')
+        self.assertEqual(fence.arm()['hostFence'], 'held')
+        # The short-lived exec parent is gone. No frozen-root PPID chain remains.
+        f.pid(80, 'busybox', f.survivor, ppid=1)
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor'):
+            fence.check()
+        self.assertEqual(fence.phase, 'unknown')
+        for group in expected['freezeOrder']:
+            self.assertEqual((f.k.group(group) / 'cgroup.freeze').read_text(), '1')
+        for c in expected['containers']:
+            if c['cgroup'] not in expected['freezeOrder']:
+                self.assertEqual((f.k.group(c['cgroup']) / 'cgroup.freeze').read_text(), '0')
+        with self.assertRaises(RuntimeError):
+            fence.restore('owner')
+
+    def test_survivor_init_children_can_change_without_becoming_static_pins(self):
+        f = self.f
+        # Realistic host PPIDs: the container init is itself a shim descendant.
+        stat = f.proc / '50/stat'
+        stat.write_text(stat.read_text().replace(' S 1 ', ' S 24 '))
+        expected = f.m.capture(f.k)
+        f.pid(80, 'busybox', f.survivor, ppid=50)
+        f.pid(81, 'busybox', f.survivor, ppid=80)
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n81\n')
+        f.k.freeze = self.acknowledged_freeze
+        fence = f.m.Fence(expected, f.k, MemoryJournal(), 'owner')
+        self.assertEqual(fence.arm()['hostFence'], 'held')
+        # A legitimate orphan adopted by its container init still has a valid
+        # current chain; no historical immutable child inventory is required.
+        stat = f.proc / '81/stat'
+        stat.write_text(stat.read_text().replace(' S 80 ', ' S 50 '))
+        import shutil
+        shutil.rmtree(f.proc / '80')
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n81\n')
+        self.assertEqual(fence.check()['hostFence'], 'held')
+        self.assertEqual((f.k.group(f.survivor) / 'cgroup.freeze').read_text(), '0')
+
+    def test_capture_refuses_exec_orphan_adopted_by_survivor_init(self):
+        f = self.f
+        # Real Docker exec shell can exit, reparenting its child to container
+        # PID1. PPID alone now looks legitimate, but its exec session survives.
+        f.pid(80, 'busybox', f.survivor, ppid=50)
+        path = f.proc / '80/stat'
+        text = path.read_text()
+        fields = text[text.rfind(')') + 2:].split()
+        fields[3] = '79'  # Session of the exited exec parent, not survivor init.
+        path.write_text('80 (busybox) ' + ' '.join(fields))
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor session'):
+            f.m.capture(f.k)
+
+    def test_same_session_does_not_replace_survivor_init_ancestry(self):
+        f = self.f
+        f.pid(80, 'busybox', f.survivor, ppid=50)
+        path = f.proc / '80/stat'
+        path.write_text(path.read_text().replace(' S 50 ', ' S 24 '))
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor ancestry'):
+            f.m.capture(f.k)
+
+    def test_survivor_reparent_during_proof_is_refused(self):
+        f = self.f
+        expected = f.m.capture(f.k)
+        f.pid(80, 'busybox', f.survivor, ppid=50)
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        original = f.k.parent_identity
+        reads = 0
+        def reparent(pid):
+            nonlocal reads
+            row = original(pid)
+            if pid == 80:
+                reads += 1
+                if reads == 1:
+                    path = f.proc / '80/stat'
+                    path.write_text(path.read_text().replace(' S 50 ', ' S 24 '))
+            return row
+        f.k.parent_identity = reparent
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor ancestry changed'):
+            f.k.verify(expected, [])
+
+    def test_survivor_new_session_child_is_unproven_not_frozen(self):
+        f = self.f
+        f.pid(80, 'busybox', f.survivor, ppid=50)
+        path = f.proc / '80/stat'
+        text = path.read_text()
+        fields = text[text.rfind(')') + 2:].split()
+        fields[3] = '80'  # A legitimate setsid child cannot prove inherited origin.
+        path.write_text('80 (busybox) ' + ' '.join(fields))
+        (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor session'):
+            f.m.capture(f.k)
+        self.assertEqual((f.k.group(f.survivor) / 'cgroup.freeze').read_text(), '0')
+
+    def test_legitimate_survivor_fork_during_inventory_is_rechecked(self):
+        f = self.f
+        expected = f.m.capture(f.k)
+        original = f.k.members
+        changed = False
+        def fork(group):
+            nonlocal changed
+            rows = original(group)
+            if group == f.survivor and not changed:
+                changed = True
+                f.pid(80, 'busybox', f.survivor, ppid=50)
+                (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+            return rows
+        f.k.members = fork
+        f.k.verify(expected, [])
+        self.assertTrue(changed)
+        self.assertEqual((f.k.group(f.survivor) / 'cgroup.freeze').read_text(), '0')
+
+    def test_legitimate_fork_after_survivor_snapshot_is_reproved(self):
+        f = self.f
+        # This init is a shim child, so the global escaped-work walk reaches it.
+        path = f.proc / '50/stat'
+        path.write_text(path.read_text().replace(' S 1 ', ' S 24 '))
+        expected = f.m.capture(f.k)
+        original = f.k.escaped_descendants
+        def fork(expected, survivors):
+            f.pid(80, 'busybox', f.survivor, ppid=50)
+            (f.k.group(f.survivor) / 'cgroup.procs').write_text('50\n80\n')
+            original(expected, survivors)
+        f.k.escaped_descendants = fork
+        f.k.verify(expected, [])
+
+    def test_optional_candidate_exec_is_not_adopted(self):
+        f = self.f
+        candidate = copy.deepcopy(self.rows[-1])
+        candidate.update(Id='f' * 64, Name='/c3-test-candidate')
+        candidate['State']['Pid'] = 90
+        candidate['Config']['Labels'] = {}
+        self.rows.append(candidate)
+        group = '/system.slice/docker-' + 'f' * 64 + '.scope'
+        f.group(group, [90, 91])
+        f.pid(90, 'node', group, ppid=27)
+        f.pid(91, 'busybox', group, ppid=27)
+        f.pid(27, 'containerd-shim-runc-v2', f.m.CONTROL[1])
+        (f.proc / '27/cmdline').write_bytes(b'shim\0-namespace\0moby\0-id\0' + b'f' * 64 + b'\0')
+        path = f.k.group(f.m.CONTROL[1]) / 'cgroup.procs'
+        path.write_text(path.read_text() + '27\n')
+        with self.assertRaisesRegex(RuntimeError, 'unproven survivor'):
+            f.m.capture(f.k)
 
     def test_capture_refuses_missing_shim(self):
         f = self.f

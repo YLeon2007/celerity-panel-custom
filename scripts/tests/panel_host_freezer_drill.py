@@ -21,7 +21,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--bin-dir', required=True)
 parser.add_argument('--workspace', required=True)
 parser.add_argument('--restore-only', action='store_true')
+parser.add_argument('--survivor-exec', choices=('before-capture', 'after-capture', 'orphan-after-capture'),
+                    help='prove refusal after real exec has entered an unfrozen payload')
 a = parser.parse_args()
+assert not (a.restore_only and a.survivor_exec), 'choose restore or survivor-exec drill'
 P, B = Path(a.workspace).resolve(), Path(a.bin_dir).resolve()
 assert os.geteuid() == 0 and 'hermes-heavy-' in Path('/proc/self/cgroup').read_text()
 assert str(P).startswith('/home/leon/.hermes/cache/scratch/') and not P.exists()
@@ -160,7 +163,10 @@ class PipeFence:
         assert owner == self.owner
         return self.request('restore', ack='NO_DESTRUCTIVE_OR_NODE_MUTATION')
     def close(self):
-        self.send.close()  # EOF -> sticky unknown; NEVER release a kernel fence.
+        try:
+            self.send.close()  # EOF -> sticky unknown; NEVER release a kernel fence.
+        except BrokenPipeError:
+            pass  # Guard may already have refused; disposable cleanup must still run.
         for _ in range(50):
             done, status = os.waitpid(self.pid, os.WNOHANG)
             if done:
@@ -272,9 +278,21 @@ int main(int n,char **v){
             pass
     except socket.timeout:
         pass
-    (P / 'gate').touch()
-    launch(D + ['exec', old, '/usr/bin/busybox', 'touch', '/accepted-exec'], name='accepted-exec')
-    wait(lambda: (P / 'gate.entered').exists())
+    def launch_survivor_exec():
+        # No userspace gate: Docker returns only after the extra process is
+        # actually running in the unfrozen survivor cgroup.
+        command = ('/usr/bin/busybox sleep 600 >/dev/null 2>&1 & echo started > /out/exec-ticks'
+                   if a.survivor_exec == 'orphan-after-capture' else
+                   'echo started > /out/exec-ticks; exec /usr/bin/busybox sleep 600')
+        run(D + ['exec', '-d', survivor, '/usr/bin/busybox', 'sh', '-c', command])
+        wait(lambda: (P / 'heartbeat/exec-ticks').exists())
+
+    if a.survivor_exec == 'before-capture':
+        launch_survivor_exec()
+    if not a.survivor_exec:
+        (P / 'gate').touch()
+        launch(D + ['exec', old, '/usr/bin/busybox', 'touch', '/accepted-exec'], name='accepted-exec')
+        wait(lambda: (P / 'gate.entered').exists())
     kernel = LocalKernel(timeout=5)
     cs = []
     for cid in (old, survivor):
@@ -289,12 +307,50 @@ int main(int n,char **v){
                 'backend': oldcg, 'freezeOrder': [updater, *controls, oldcg],
                 'groups': {g: kernel.pin(g) for g in allgroups}, 'runtime': kernel.runtime()}
     kernel.pins = {g: p['inode'] for g, p in expected['groups'].items()}
+    if a.survivor_exec in ('after-capture', 'orphan-after-capture'):
+        launch_survivor_exec()
+        wait(lambda: kernel.runtime() == expected['runtime'])
+    if a.survivor_exec:
+        survivorcg = next(c['cgroup'] for c in cs if c['id'] == survivor)
+        survivorinit = next(c['init'] for c in cs if c['id'] == survivor)
+        payload = kernel.members(survivorcg)
+        shims = {r['pid'] for r in expected['runtime'] if r.get('containerId') == survivor}
+        exec_rows = [r for r in payload if r['pid'] != survivorinit['pid']
+                     and (kernel.parent_identity(r['pid'])['ppid'] in shims
+                          if a.survivor_exec != 'orphan-after-capture' else
+                          (Path('/proc') / str(r['pid']) / 'cmdline').read_bytes().split(b'\0')[:3]
+                          == [b'/usr/bin/busybox', b'sleep', b'600'])]
+        assert exec_rows, 'real entered exec must be observed inside survivor'
+        if a.survivor_exec == 'orphan-after-capture':
+            wait(lambda: all(kernel.parent_identity(r['pid'])['ppid'] == survivorinit['pid']
+                             for r in exec_rows))
+        emit('real-survivor-exec-entered', timing=a.survivor_exec, exec_rows=exec_rows,
+             parents=[kernel.parent_identity(r['pid']) for r in exec_rows],
+             init_stat=(Path('/proc') / str(survivorinit['pid']) / 'stat').read_text(),
+             exec_stats=[(Path('/proc') / str(r['pid']) / 'stat').read_text() for r in exec_rows])
     fence = PipeFence(expected, kernel)
     before = (P / 'heartbeat/ticks').stat().st_size
-    held = fence.arm()
-    assert proxy_ok()
-    emit('held', result=held, runtime=fence.expected['runtime'], groups=fence.expected['groups'], proxy_functional=True)
-    if a.restore_only:
+    if not a.survivor_exec:
+        held = fence.arm()
+        assert proxy_ok()
+        emit('held', result=held, runtime=fence.expected['runtime'], groups=fence.expected['groups'], proxy_functional=True)
+    if a.survivor_exec:
+        try:
+            fence.arm()
+            raise AssertionError('real entered survivor exec was admitted')
+        except RuntimeError as error:
+            assert 'unproven survivor' in str(error), str(error)
+        state = json.loads(fence.state.read_text())
+        assert state['phase'] == 'unknown'
+        assert kernel.group(survivorcg).joinpath('cgroup.freeze').read_text().strip() == '0'
+        time.sleep(.2)
+        growth = (P / 'heartbeat/ticks').stat().st_size - before
+        assert growth > 0 and proxy_ok()
+        emit('entered-survivor-exec-refused', timing=a.survivor_exec,
+             phase=state['phase'], survivor_frozen=0, survivor_heartbeat_growth=growth,
+             proxy_functional=True)
+        success = True
+    elif a.restore_only:
         result = fence.restore('11111111-2222-3333-4444-555555555555')
         assert fence.expected == expected and fence.phase == 'restored'
         kernel.verify(expected, [])
