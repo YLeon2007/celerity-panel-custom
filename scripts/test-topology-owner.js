@@ -50,14 +50,26 @@ async function main(argv = process.argv.slice(2)) {
     assertTestContext(process.env);
     const config = require('../config');
     const mongoose = require('mongoose');
-    const { createL2tpRootLifecycle } = require('../src/modules/l2tpRuntimeLifecycleHook');
-    const root = createL2tpRootLifecycle();
+    let root;
     try {
+        const { createL2tpRootLifecycle } = require('../src/modules/l2tpRuntimeLifecycleHook');
+        root = createL2tpRootLifecycle();
         // Enrollment never installs schema or starts background consumers.
         await mongoose.connect(config.MONGO_URI, { autoCreate: false, autoIndex: false, serverSelectionTimeoutMS: 5000 });
         const result = await root.enrollTestOwnersAfterDatabase();
         process.stdout.write(JSON.stringify(result) + '\n'); return 0;
-    } finally { try { await root.stop(); } finally { await mongoose.disconnect(); } }
+    } finally {
+        try { await root?.stop(); }
+        finally {
+            // A finite maintenance CLI owns this process. Drain the root first,
+            // then close only a pool already imported by its dependency graph;
+            // never instantiate a fresh pool during cleanup or force process.exit.
+            try {
+                const pool = require.cache[require.resolve('../src/services/sshPoolService')]?.exports;
+                if (pool) await pool.closeAll();
+            } finally { await mongoose.disconnect(); }
+        }
+    }
 }
 if (require.main === module) main().then(code => { process.exitCode = code; }, () => {
     // Driver/controller exceptions can contain credentials or secret file bytes.
