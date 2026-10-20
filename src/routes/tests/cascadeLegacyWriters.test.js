@@ -71,7 +71,10 @@ test.after(async () => {
     if (directory) await fs.rm(directory, { recursive: true, force: true });
 });
 async function reset({ count = 0, operation = false } = {}) {
-    for (const model of Object.values(models)) await model.deleteMany({});
+    assert.equal(mongoose.connection.name, 'legacy_writers_scratch');
+    // Administrative cleanup of this isolated fixture bypasses public immutable
+    // model mutation guards; deployed models retain those guards unchanged.
+    for (const model of Object.values(models)) await model.collection.deleteMany({});
     await models.CascadeTopologyState.create({ _id: 'singleton', revision: 7, deployedRevision: 5,
         topologyAdmissionCount: count, remoteAdmissionCount: 0 });
     await HyNode.collection.insertMany(ids.map((_id, i) => ({ _id: new mongoose.Types.ObjectId(_id),

@@ -50,7 +50,10 @@ test.after(async () => {
     if (directory) await fs.rm(directory, { recursive: true, force: true });
 });
 async function reset() {
-    for (const model of Object.values(models)) await model.deleteMany({});
+    assert.equal(mongoose.connection.name, 'intent_scratch');
+    // Registered immutable binding/enrollment models must retain their public
+    // mutation guards. Reset only the isolated fixture via its raw collections.
+    for (const model of Object.values(models)) await model.collection.deleteMany({});
     await models.CascadeTopologyState.create({ _id: 'singleton', revision: 7, deployedRevision: 5, topologyAdmissionCount: 0, remoteAdmissionCount: 0 });
     await models.HyNode.collection.insertMany(ids.map((_id, index) => ({ _id: new mongoose.Types.ObjectId(_id), type: 'xray', active: true, cascadeRole: ['portal', 'portal', 'relay', 'bridge', 'bridge'][index], ip: `192.0.2.${index + 1}`, domain: `node-${index}.test`, port: 443, xray: { security: 'none', transport: 'tcp', inboundTag: 'vless-in', apiPort: 10085 } })));
 }
