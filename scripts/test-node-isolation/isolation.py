@@ -119,9 +119,15 @@ def digest(value):
 
 def validate_plan(p):
     need(isinstance(p, dict) and set(p) == PLAN_KEYS, 'INVALID_PLAN_FIELDS')
-    need(type(p['version']) is int and p['version'] == 1 and p['context'] == 'test.infograd.online', 'TEST_ONLY')
     need(isinstance(p['nodeId'], str) and p['nodeId'] in TEST_NODES, 'DEDICATED_TEST_NODE_ONLY')
     need((p['endpointIp'], p['targetProfile']) == TEST_NODES[p['nodeId']], 'ENDPOINT_PROFILE_MISMATCH')
+    return validate_common_plan(p)
+
+
+def validate_common_plan(p):
+    # Shared mode uses this shape/policy check, never the dedicated node allowlist.
+    need(isinstance(p, dict) and set(p) == PLAN_KEYS, 'INVALID_PLAN_FIELDS')
+    need(type(p['version']) is int and p['version'] == 1 and p['context'] == 'test.infograd.online', 'TEST_ONLY')
     for name, pattern in [('machineId', r'[a-f0-9]{32}'), ('bootId', r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'),
                           ('maintenanceId', r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')]:
         need(isinstance(p[name], str) and re.fullmatch(pattern, p[name]) is not None, 'INVALID_IDENTITY')
@@ -609,9 +615,9 @@ def recovery_guard(directory, host):
 
 
 class Engine:
-    def __init__(self, directory, plan, host):
+    def __init__(self, directory, plan, host, *, validator=validate_plan):
         self.directory = pathlib.Path(directory)
-        self.plan = validate_plan(plan)
+        self.plan = validator(plan)
         self.host = host
         self.plan_hash = digest(json.dumps(plan, sort_keys=True, separators=(',', ':')).encode())
 
@@ -781,15 +787,30 @@ class Engine:
         return self.evidence(state)
 
 
+SHARED_MODULE = '/usr/local/libexec/c3-test-shared-host.py'
+
+
+def select_mode(plan):
+    if isinstance(plan, dict) and plan.get('mode') == 'shared-test':
+        import importlib.util
+        secure_file(SHARED_MODULE)
+        spec = importlib.util.spec_from_file_location('c3_shared_host', SHARED_MODULE)
+        need(spec is not None and spec.loader is not None, 'SHARED_MODULE_UNAVAILABLE')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.validate_plan(plan, sys.modules[__name__]), module
+    return validate_plan(plan), None
+
+
 def main():
     need(os.geteuid() == 0, 'ROOT_REQUIRED')
-    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'apply', 'confirm-access', 'status', 'dispatch', 'restore-masks'), 'INVALID_CLI')
+    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'host-hold', 'apply', 'confirm-access', 'status', 'dispatch', 'restore-masks'), 'INVALID_CLI')
     command = sys.argv[1]
     host = Host()
     if command == 'inventory':
         print(json.dumps(host.inventory(), sort_keys=True))
         return
-    plan = validate_plan(decode_json(secure_file(CONFIG)))
+    plan, shared = select_mode(decode_json(secure_file(CONFIG)))
     directory = pathlib.Path(STATE)
     # Installation creates this directory; no CLI creates/replaces authority roots.
     info = directory.lstat()
@@ -799,10 +820,16 @@ def main():
         host.check_prerequisites(plan)
         recovery_guard(directory, host)
         return
+    if command == 'host-hold':
+        need(shared is not None, 'SHARED_MODE_REQUIRED')
+        host.check_prerequisites(plan)
+        shared.serve_hold(plan, directory, sys.modules[__name__])
+        return
     lock = os.open(directory / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        engine = Engine(directory, plan, host)
+        engine = (shared.make_engine(directory, plan, sys.modules[__name__]) if shared else
+                  Engine(directory, plan, host))
         if command == 'apply':
             guard = decode_json(secure_file(directory / 'guard.json'))
             output = engine.apply(guard)
@@ -825,7 +852,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    except (Refusal, OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         code = str(error) if isinstance(error, Refusal) else 'NODE_MAINTENANCE_UNKNOWN_RETAINED'
         print(json.dumps({'ok': False, 'code': code, 'ownershipRetained': True}), file=sys.stderr)
         raise SystemExit(75)

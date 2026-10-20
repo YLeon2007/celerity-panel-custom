@@ -21,9 +21,11 @@ Only these independently reviewed dedicated TEST hosts can pass plan validation:
 | `6ab4b53bc4c0304573e06c72` | `104.143.201.72` | `xray-bridge` |
 
 The shared LocalXray/panel machine (`6ab189dc63913ebd4a917399`,
-`test.infograd.online` / `212.119.42.100`) is **refused**, not treated as a dedicated
-node. Its backend/container/operator coupling requires the separately owned host
-isolation work. This slice alone cannot authorize the full TEST topology.
+`test.infograd.online` / `212.119.42.100`) is **refused by the dedicated mode**,
+not added to its allowlist. A separate bounded [shared mode](SHARED.md) requires
+an actual live host freezer plus the node masks/drain and independent 2222
+recovery; its source-only delivery is not full TEST activation evidence.
+This dedicated slice alone cannot authorize the full TEST topology.
 
 Root operator and physical/hypervisor administrators are trusted TCB. There is no
 attempt to defend against a malicious root administrator. Conversely, an old
