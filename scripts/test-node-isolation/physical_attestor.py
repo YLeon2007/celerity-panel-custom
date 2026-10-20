@@ -195,7 +195,35 @@ def observe(engine, m, shared, predecessor=None):
     return value
 
 
-def serve(engine, m, shared, inp=sys.stdin, out=sys.stdout):
+def attest(engine, m, shared, request, *, held=None):
+    """One finite fresh observation; a retained capture OFD is never reacquired.
+
+    `held` is the live in-process CaptureHold, not an FD number/receipt from a
+    request. Its checks bind this exact engine, descriptor and current pathname
+    before and after observe. Separate SSH observer processes still use flock.
+    """
+    need(set(request) == {'nonce', 'predecessor'} and isinstance(request['nonce'], str) and
+         re.fullmatch('[a-f0-9]{64}', request['nonce']), 'INVALID_ATTESTATION_REQUEST')
+    if held is not None:
+        need(held.writer.engine is engine, 'FOREIGN_CAPTURE_HOLDER')
+        held.check()
+        try:
+            result = observe(engine, m, shared, request['predecessor'])
+            held.check()
+        except BaseException:
+            held.active = False
+            raise
+    else:
+        fd = os.open(Path(m.STATE) / 'lock', os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = observe(engine, m, shared, request['predecessor'])
+        finally:
+            os.close(fd)
+    return {'nonce': request['nonce'], 'observation': result}
+
+
+def serve(engine, m, shared, inp=sys.stdin, out=sys.stdout, *, held=None):
     # Each nonce roundtrip revalidates both real recovery protocols. No old reply
     # can authorize a new request. EOF/errors close only this read-only channel.
     signal.signal(signal.SIGALRM, timed_out)
@@ -208,15 +236,7 @@ def serve(engine, m, shared, inp=sys.stdin, out=sys.stdout):
             raw = inp.buffer.readline(65537)
             need(raw and len(raw) <= 65536 and raw.endswith(b'\n'), 'ATTESTOR_CHANNEL_LOST')
             request = m.decode_json(raw)
-            need(set(request) == {'nonce', 'predecessor'} and isinstance(request['nonce'], str) and
-                 re.fullmatch('[a-f0-9]{64}', request['nonce']), 'INVALID_ATTESTATION_REQUEST')
-            fd = os.open(Path(m.STATE) / 'lock', os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                result = observe(engine, m, shared, request['predecessor'])
-                print(json.dumps({'nonce': request['nonce'], 'observation': result}), file=out, flush=True)
-            finally:
-                os.close(fd)
+            print(json.dumps(attest(engine, m, shared, request, held=held)), file=out, flush=True)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
 

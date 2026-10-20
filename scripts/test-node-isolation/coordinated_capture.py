@@ -27,6 +27,7 @@ sys.dont_write_bytecode = True
 SELF = '/usr/local/libexec/c3-test-coordinated-capture.py'
 PROTOCOL = '/usr/local/libexec/c3-test-coordinated-restore.py'
 ORIGINALS = '/usr/local/libexec/c3-test-node-originals.py'
+ATTESTOR = '/usr/local/libexec/c3-test-physical-attestor'
 SHARED = '/usr/local/libexec/c3-test-shared-host.py'
 FREEZER = '/usr/local/libexec/c3-panel-host-freezer.py'
 CONFIG = '/etc/c3-test-coordinated-capture.json'
@@ -100,7 +101,7 @@ def validate(config):
         need(pin['profiles'] == profiles and isinstance(pin['guard'],dict) and pin['guard'])
         need(re.fullmatch('[a-f0-9]{32}',ident['machineId']) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',ident['bootId'])
              and re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,127}',ident['maintenanceId']))
-        names = {'self','originals','isolation','accepted'} | ({'shared','freezer'} if node == SHARED_NODE else set())
+        names = {'self','originals','isolation','accepted','attestor'} | ({'shared','freezer'} if node == SHARED_NODE else set())
         need(set(pin['files']) == names and all(isinstance(v,str) and DIGEST.fullmatch(v) for v in [*pin['files'].values(), ident['planHash'],ident['sshHostKeySha256']]))
         raw = base64.b64decode(pin['hostKey'],validate=True)
         need(base64.b64encode(raw).decode() == pin['hostKey'] and len(raw) == 51 and raw[:19] == struct.pack('>I',11)+b'ssh-ed25519'+struct.pack('>I',32) and sha(raw) == ident['sshHostKeySha256'])
@@ -121,6 +122,51 @@ def validate(config):
     host = challenge['host']
     need(set(host) == {'owner','guard','backend'} and host['owner'] == host['guard']['owner'] and host['guard']['planHash'] == config['nodes'][SHARED_NODE]['identity']['planHash'])
     return config
+
+
+class Wire:
+    """Finite capture codec, including five original-byte observations.
+
+    Restore receipts use a smaller codec. Observations can carry two 512-KiB
+    blobs per node; keep a separate fixed bound without changing restore code.
+    """
+    LIMIT = 8 * 1024 * 1024
+
+    def __init__(self, reader, writer, deadline):
+        self.reader,self.writer,self.deadline,self.buffer = reader,writer,deadline,b''
+
+    def send(self, value):
+        raw = canonical(value)+b'\n'
+        need(len(raw) <= self.LIMIT, 'FRAME_LIMIT_RETAINED')
+        offset = 0
+        while offset < len(raw):
+            remaining = self.deadline-time.monotonic()
+            need(remaining > 0, 'CHANNEL_TIMEOUT_RETAINED')
+            if not select.select([],[self.writer],[],min(remaining,.25))[1]: continue
+            # Bounded fragments continue one frame; never retry a logical request.
+            written = os.write(self.writer,raw[offset:offset+4096])
+            need(written > 0, 'FRAME_WRITE_UNKNOWN_RETAINED')
+            offset += written
+
+    def receive(self, watch=()):
+        while b'\n' not in self.buffer:
+            remaining = self.deadline-time.monotonic()
+            need(remaining > 0, 'CHANNEL_TIMEOUT_RETAINED')
+            ready,_,_ = select.select([self.reader,*watch],[],[],min(remaining,.25))
+            need(not any(fd in ready for fd in watch), 'OTHER_CHANNEL_LOST_RETAINED')
+            if self.reader not in ready: continue
+            part = os.read(self.reader,65536)
+            need(part, 'CHANNEL_EOF_RETAINED')
+            self.buffer += part
+            need(len(self.buffer) <= self.LIMIT, 'FRAME_LIMIT_RETAINED')
+        raw,self.buffer = self.buffer.split(b'\n',1)
+        need(not self.buffer, 'PIPELINED_FRAME_RETAINED')
+        value = decode(raw)
+        need(isinstance(value,dict), 'INVALID_FRAME_RETAINED')
+        return value
+
+    def quiet(self):
+        need(not self.buffer and not select.select([self.reader],[],[],0)[0], 'CHANNEL_LOST_OR_UNSOLICITED_RETAINED')
 
 
 class CaptureHold:
@@ -217,8 +263,9 @@ class CaptureHold:
 
 
 class NodeServer:
-    def __init__(self, writer, originals, config, wire, protocol, *, shared=None):
+    def __init__(self, writer, originals, config, wire, protocol, *, shared=None, attestor=None):
         self.writer, self.n, self.config, self.wire, self.c, self.shared = writer, originals, validate(config), wire, protocol, shared
+        self.attestor = attestor
         self.node = writer.engine.plan['nodeId']
         self.pin = config['nodes'][self.node]
         self.nonce = secrets.token_hex(32)
@@ -228,7 +275,7 @@ class NodeServer:
     def pins(self):
         need(self.n.identity(self.writer.engine) == self.pin['identity'] and self.writer.profiles == self.pin['profiles'])
         need(self.writer.held()['guard'] == self.pin['guard'] and self.writer.engine.host.operator_session() == self.session, 'GUARD_OPERATOR_PIN_DRIFT_RETAINED')
-        paths = {'self':SELF,'originals':ORIGINALS,'isolation':self.n.HELPER,'accepted':self.n.ACCEPTED}
+        paths = {'self':SELF,'originals':ORIGINALS,'isolation':self.n.HELPER,'accepted':self.n.ACCEPTED,'attestor':ATTESTOR}
         if self.node == SHARED_NODE:
             paths.update(shared=SHARED,freezer=FREEZER)
         for name,path in paths.items():
@@ -260,19 +307,24 @@ class NodeServer:
         with CaptureHold(self.writer,self.n) as held:
             seq,frame = 0,first
             while True:
-                need(set(frame) == BASE and type(frame['version']) is int and frame['version'] == 1 and frame['nodeId'] == self.node
+                need(set(frame) == BASE | ({'predecessor'} if frame['op'] == 'observe' else set()) and type(frame['version']) is int and frame['version'] == 1 and frame['nodeId'] == self.node
                      and frame['nodeNonce'] == self.nonce and frame['coordinatorNonce'] == first['coordinatorNonce'] and frame['origin'] == origin
                      and type(frame['seq']) is int and frame['seq'] == seq and isinstance(frame['challenge'],str) and DIGEST.fullmatch(frame['challenge']))
                 op = frame['op']
-                need(op in (('open',) if seq == 0 else ('check','capture','verify')))
+                need(op in (('open',) if seq == 0 else ('check','capture','verify','observe')))
                 self.pins(); held.check(); self.wire.quiet()
                 if op == 'capture':
                     held.capture()
                 if op == 'verify':
                     need(held.bundle is not None, 'CAPTURE_NOT_COMPLETED')
+                observation = {}
+                if op == 'observe':
+                    need(held.bundle is not None and self.attestor is not None, 'LIVE_CAPTURE_OBSERVER_REQUIRED')
+                    observation = self.attestor.attest(self.writer.engine,self.writer.module,self.shared,
+                        {'nonce':frame['challenge'],'predecessor':frame['predecessor']},held=held)
                 self.pins(); held.check(); self.wire.quiet()
                 self.wire.send({**frame,'op':op+'-held','pinSha256':sha(canonical(self.pin)),'guardSha256':sha(canonical(self.pin['guard'])),
-                                'captured':held.bundle is not None,'operator':self.session,**self.root})
+                                'captured':held.bundle is not None,'operator':self.session,**self.root,**observation})
                 seq += 1
                 while not select.select([self.wire.reader],[],[],.25)[0]:
                     need(time.monotonic() < self.wire.deadline, 'NODE_CAPTURE_TIMEOUT_RETAINED')
@@ -283,7 +335,7 @@ class NodeServer:
 class Channel:
     def __init__(self, process, node, pin, nonce, origin, deadline, protocol):
         self.process,self.node,self.pin,self.nonce,self.origin = process,node,pin,nonce,origin
-        self.wire = protocol.Wire(process.stdout.fileno(),process.stdin.fileno(),deadline)
+        self.wire = Wire(process.stdout.fileno(),process.stdin.fileno(),deadline)
         self.seq,self.hello,self.operator,self.captured = 0,None,None,False
 
     def start(self, watch):
@@ -295,15 +347,17 @@ class Channel:
         self.hello = hello
         self.request('open',watch)
 
-    def request(self, op, watch):
+    def request(self, op, watch, predecessor=None):
         need(self.hello is not None and self.process.poll() is None, 'NODE_CHANNEL_LOST_RETAINED')
         frame = {'version':1,'op':op,'nodeId':self.node,'nodeNonce':self.hello['nodeNonce'],'coordinatorNonce':self.nonce,
                  'seq':self.seq,'challenge':secrets.token_hex(32),'origin':self.origin}
+        if op == 'observe':
+            frame['predecessor'] = predecessor
         self.wire.send(frame)
         reply = self.wire.receive(watch)
-        need(set(reply) == BASE | {'pinSha256','guardSha256','captured','operator','pid','start'}
+        need(set(reply) == set(frame) | {'pinSha256','guardSha256','captured','operator','pid','start'} | ({'nonce','observation'} if op == 'observe' else set())
              and type(reply['version']) is int and type(reply['seq']) is int and type(reply['pid']) is int and type(reply['captured']) is bool)
-        need({k:reply[k] for k in BASE} == {**frame,'op':op+'-held'} and reply['pinSha256'] == sha(canonical(self.pin))
+        need({k:reply[k] for k in frame} == {**frame,'op':op+'-held'} and reply['pinSha256'] == sha(canonical(self.pin))
              and reply['guardSha256'] == sha(canonical(self.pin['guard'])) and (reply['pid'],reply['start']) == (self.hello['pid'],self.hello['start']))
         need(reply['captured'] is (self.captured or op in ('capture','verify')), 'CAPTURE_UNPROVEN_RETAINED')
         session = reply['operator']
@@ -311,6 +365,12 @@ class Channel:
              and isinstance(session['start'],str) and session['start'].isdigit() and (self.operator is None or session == self.operator))
         self.operator,self.captured = session,reply['captured']
         self.seq += 1
+        if op == 'observe':
+            need(reply['nonce'] == frame['challenge'] and isinstance(reply['observation'],dict))
+            return reply['observation']
+
+    def observe(self, predecessor, watch):
+        return self.request('observe',watch,predecessor)
 
     def close(self):
         for stream in (self.process.stdin,self.process.stdout):
@@ -399,29 +459,43 @@ class Coordinator:
         nonce = secrets.token_hex(32)
         try:
             while True:
-                self.check()
+                self.live()
                 if conn is None:
+                    self.check()
                     if not select.select([listener],[],[],.25)[0]:
                         continue
                     conn,_ = listener.accept(); conn.settimeout(2)
                     pid,uid,_ = struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
                     need(uid == self.fs.uid and pid != os.getpid(), 'ROOT_OWNER_PEER_REQUIRED')
                     peer = {'pid':pid,'start':self.c.proc_start(pid)}
-                    wire = self.c.Wire(conn.fileno(),conn.fileno(),self.deadline)
+                    wire = Wire(conn.fileno(),conn.fileno(),self.deadline)
                     wire.send({'version':1,'op':'owner-challenge','nonce':nonce,'peer':peer})
                 if not select.select([conn],[],[],.25)[0]:
+                    self.check()
                     continue
                 frame = wire.receive(self.watch())
-                need(set(frame) == {'version','op','nonce','peer','challenge','ownerChallengeSha256'} and type(frame['version']) is int
+                need(set(frame) == {'version','op','nonce','peer','challenge','ownerChallengeSha256'} | ({'nodeId','predecessor'} if frame['op'] in ('observe','observe-all') else set()) and type(frame['version']) is int
                      and frame['version'] == 1 and frame['nonce'] == nonce and frame['peer'] == peer and self.c.proc_start(peer['pid']) == peer['start']
                      and isinstance(frame['challenge'],str) and DIGEST.fullmatch(frame['challenge'])
-                     and frame['ownerChallengeSha256'] == sha(canonical(self.config['ownerChallenge'])) and frame['op'] in ('check-capture','finish'))
-                self.check()
+                     and frame['ownerChallengeSha256'] == sha(canonical(self.config['ownerChallenge'])) and frame['op'] in ('check-capture','finish','observe','observe-all'))
+                # observe-all itself freshly checks every retained node holder;
+                # do not surround each observation with redundant all-node RPCs.
+                if frame['op'] != 'observe-all': self.check()
                 if frame['op'] == 'finish':
                     completed = True
                     return
+                observation = {}
+                if frame['op'] == 'observe-all':
+                    need(frame['nodeId'] is None or frame['nodeId'] in NODES, 'FOREIGN_OBSERVATION_NODE')
+                    observation['observation'] = {c.node:c.observe(frame['predecessor'] if c.node == frame['nodeId'] else None,self.watch(c)) for c in self.nodes}
+                    self.live()
+                if frame['op'] == 'observe':
+                    channel = next((c for c in self.nodes if c.node == frame['nodeId']),None)
+                    need(channel is not None, 'FOREIGN_OBSERVATION_NODE')
+                    observation['observation'] = channel.observe(frame['predecessor'],self.watch(channel))
+                    self.check()
                 next_nonce = secrets.token_hex(32)
-                wire.send({**frame,'op':'capture-held','nodeCount':5,'handbackAllowed':False,'nextNonce':next_nonce})
+                wire.send({**frame,'op':'capture-held','nodeCount':5,'handbackAllowed':False,'nextNonce':next_nonce,**observation})
                 nonce = next_nonce
         finally:
             if not completed:
@@ -457,7 +531,7 @@ class CaptureChannel:
             self.conn = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
             self.conn.settimeout(2); self.conn.connect(self.path)
             self.active = True; self.state()
-            self.wire = self.c.Wire(self.conn.fileno(),self.conn.fileno(),time.monotonic()+self.config['lifetimeSeconds'])
+            self.wire = Wire(self.conn.fileno(),self.conn.fileno(),time.monotonic()+self.config['lifetimeSeconds'])
             hello = self.wire.receive()
             need(set(hello) == {'version','op','nonce','peer'} and type(hello['version']) is int and hello['version'] == 1
                  and hello['op'] == 'owner-challenge' and isinstance(hello['nonce'],str) and DIGEST.fullmatch(hello['nonce'])
@@ -473,15 +547,18 @@ class CaptureChannel:
         return {'version':1,'op':op,'nonce':self.nonce,'peer':self.peer,'challenge':secrets.token_hex(32),
                 'ownerChallengeSha256':sha(canonical(self.config['ownerChallenge']))}
 
-    def check(self):
+    def check(self, node=None, predecessor=None, *, all_nodes=False):
         try:
             self.state()
-            frame = self.frame('check-capture'); self.wire.send(frame)
+            frame = self.frame('observe-all' if all_nodes else 'observe' if node else 'check-capture')
+            if node or all_nodes: frame.update(nodeId=node,predecessor=predecessor)
+            self.wire.send(frame)
             reply = self.wire.receive()
-            need(set(reply) == {*frame,'nodeCount','handbackAllowed','nextNonce'} and type(reply['version']) is int and type(reply['nodeCount']) is int
+            need(set(reply) == {*frame,'nodeCount','handbackAllowed','nextNonce'} | ({'observation'} if node or all_nodes else set()) and type(reply['version']) is int and type(reply['nodeCount']) is int
                  and reply['nodeCount'] == 5 and {k:reply[k] for k in frame} == {**frame,'op':'capture-held'} and reply['handbackAllowed'] is False
                  and isinstance(reply['nextNonce'],str) and DIGEST.fullmatch(reply['nextNonce']) and reply['nextNonce'] != self.nonce)
             self.nonce = reply['nextNonce']; self.state()
+            if node or all_nodes: return reply['observation']
         except BaseException:
             self.close()
             raise
@@ -506,14 +583,18 @@ def owner_bridge(fs, protocol, wire, *, fixture_socket=None):
     with CaptureChannel(fs,protocol,fixture_socket=fixture_socket) as held:
         while True:
             frame = wire.receive()
-            need(set(frame) == {'version','op','seq','nonce','ownerChallenge'} and type(frame['version']) is int and frame['version'] == 1
+            need(set(frame) == {'version','op','seq','nonce','ownerChallenge'} | ({'nodeId','predecessor'} if frame['op'] in ('observe','observe-all') else set()) and type(frame['version']) is int and frame['version'] == 1
                  and type(frame['seq']) is int and frame['seq'] == seq and isinstance(frame['nonce'],str) and DIGEST.fullmatch(frame['nonce'])
                  and canonical(frame['ownerChallenge']) == canonical(config['ownerChallenge'])
-                 and frame['op'] in (('open',) if not opened else ('check','finish')))
-            held.check()
+                 and frame['op'] in (('open',) if not opened else ('check','finish','observe','observe-all')))
+            if frame['op'] != 'observe-all': held.check()
             if frame['op'] == 'finish':
                 return
-            wire.send({'version':1,'op':'capture-held','seq':seq,'nonce':frame['nonce']})
+            observation = {}
+            if frame['op'] in ('observe','observe-all'):
+                need(frame['nodeId'] in NODES or (frame['op'] == 'observe-all' and frame['nodeId'] is None), 'FOREIGN_OBSERVATION_NODE')
+                observation['observation'] = held.check(frame['nodeId'],frame['predecessor'],all_nodes=frame['op'] == 'observe-all')
+            wire.send({'version':1,'op':'capture-held','seq':seq,'nonce':frame['nonce'],**observation})
             opened = True; seq += 1
 
 
@@ -569,7 +650,7 @@ def main():
     signal.alarm(config['lifetimeSeconds'])
     if sys.argv[1] == 'owner-channel':
         need(c.local_origin(config) == {**config['origin'],'pid':os.getpid(),'start':c.proc_start(os.getpid())})
-        owner_bridge(fs,c,c.Wire(0,1,time.monotonic()+config['lifetimeSeconds']))
+        owner_bridge(fs,c,Wire(0,1,time.monotonic()+config['lifetimeSeconds']))
         return
     if sys.argv[1] == 'node-hold':
         accepted = fs.read_json(n.ACCEPTED)
@@ -585,7 +666,8 @@ def main():
         else:
             plan = module.validate_plan(proposed)
         engine = shared.make_engine(module.STATE,plan,module) if shared else module.Engine(module.STATE,plan,module.Host())
-        NodeServer(n.NodeOriginals(engine,module),n,config,c.Wire(0,1,time.monotonic()+config['lifetimeSeconds']),c,shared=shared).serve()
+        attestor = load_module('c3_capture_attestor',ATTESTOR,pin['files']['attestor'])
+        NodeServer(n.NodeOriginals(engine,module),n,config,Wire(0,1,time.monotonic()+config['lifetimeSeconds']),c,shared=shared,attestor=attestor).serve()
         return
     origin = c.local_origin(config)
     fs.private(STATE)

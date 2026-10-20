@@ -37,10 +37,10 @@ function createDurableNodeOriginals({ read = readTrusted, spawn = spawnProcess, 
             lost = true;
             if (pending) { clearTimeout(pending.timer); pending.reject(refusal()); pending = undefined; }
         };
-        const request = op => {
+        const request = (op, fields = {}) => {
             const run = () => new Promise((resolve, reject) => {
                 if (!open || lost || !child || exited) return reject(refusal());
-                const frame = { version: 1, op, seq: seq++, nonce: randomBytes(32).toString('hex'), ownerChallenge: challenge };
+                const frame = { version: 1, op, seq: seq++, nonce: randomBytes(32).toString('hex'), ownerChallenge: challenge, ...fields };
                 const timer = setTimeout(poison, timeoutMs);
                 pending = { frame, resolve, reject, timer };
                 child.stdin.write(JSON.stringify(frame) + '\n', error => { if (error) poison(); });
@@ -63,19 +63,27 @@ function createDurableNodeOriginals({ read = readTrusted, spawn = spawnProcess, 
             child.stdout.on('data', data => {
                 if (lost) return;
                 buffer += data.toString('utf8');
-                if (Buffer.byteLength(buffer) > 16384) return poison();
+                if (Buffer.byteLength(buffer) > 8 * 1024 * 1024) return poison();
                 const index = buffer.indexOf('\n');
                 if (index === -1) return;
                 try {
                     need(index === buffer.length - 1 && pending);
                     const reply = JSON.parse(buffer.slice(0, index)); buffer = '';
-                    need(equal(reply, { version: 1, op: 'capture-held', seq: pending.frame.seq, nonce: pending.frame.nonce }));
+                    const expected = { version: 1, op: 'capture-held', seq: pending.frame.seq, nonce: pending.frame.nonce };
+                    if (['observe', 'observe-all'].includes(pending.frame.op)) {
+                        need(reply.observation && typeof reply.observation === 'object');
+                        expected.observation = reply.observation;
+                    }
+                    need(equal(reply, expected));
                     const current = pending; pending = undefined;
-                    clearTimeout(current.timer); current.resolve();
+                    clearTimeout(current.timer); current.resolve(reply.observation);
                 } catch { poison(); }
             });
             await request('open');
             const check = () => request('check');
+            // Observation requests run on this same lexical root-peer channel.
+            check.observe = (nodeId, predecessor = null) => request('observe', { nodeId, predecessor });
+            check.observeAll = (nodeId = null, predecessor = null) => request('observe-all', { nodeId, predecessor });
             const result = await callback(check);
             await check();
             need(open && !lost && !exited);

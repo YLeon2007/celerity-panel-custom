@@ -85,7 +85,63 @@ class FiveNodeTests(unittest.TestCase):
                 with a.Coordinator(f.config,f.fs,f.spawn,c,origin=f.origin).capture_scope():
                     self.fail('historical capture is not a live hold')
 
-    def test_installed_observer_cannot_reacquire_capture_outer_lock_known_default_blocker(self):
+    def test_same_holder_actual_observer_reads_fresh_bytes_under_all_five_retained_locks(self):
+        import coordinated_capture as a
+        import coordinated_restore as c
+        from capture_fixture import CaptureFixture
+        with CaptureFixture() as f:
+            with a.Coordinator(f.config,f.fs,f.spawn,c,origin=f.origin).capture_scope() as held:
+                for channel, node in zip(held.nodes, f.fixtures):
+                    value = channel.observe(None, held.watch(channel))
+                    self.assertEqual(value['nodeId'], node.node)
+                    self.assertEqual(value['configTransfer']['configBase64'], __import__('base64').b64encode(node.original).decode())
+                    for other in f.fixtures:
+                        with open(other.path(t.n.OUTER_LOCK), 'rb') as competitor:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_actual_observer_large_current_originals_are_not_limited_to_restore_receipt_frame(self):
+        import coordinated_capture as a
+        import coordinated_restore as c
+        from capture_fixture import CaptureFixture
+        with CaptureFixture(large=True) as f:
+            with a.Coordinator(f.config,f.fs,f.spawn,c,origin=f.origin).capture_scope() as held:
+                for channel,node in zip(held.nodes,f.fixtures):
+                    value = channel.observe(None,held.watch(channel))
+                    self.assertEqual(value['configTransfer']['readback']['configSha256'],a.sha(node.original))
+                    self.assertGreater(len(value['configTransfer']['configBase64']),16384)
+
+    def test_actual_installed_observer_serve_reuses_live_holder_and_EOF_never_authorizes(self):
+        import subprocess
+        import sys
+        import json
+        import coordinated_capture as a
+        from capture_fixture import CaptureFixture
+        with CaptureFixture() as f:
+            node = f.fixtures[0]
+            child = subprocess.Popen([sys.executable,str(HERE/'capture_fixture.py'),'observer-serve',str(node.root)],
+                cwd=HERE,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})
+            f.children.append(child)
+            assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+            for nonce in ('a'*64,'b'*64):
+                child.stdin.write(a.canonical({'nonce':nonce,'predecessor':None})+b'\n'); child.stdin.flush()
+                raw = child.stdout.readline()
+                self.assertTrue(raw, child.stderr.read().decode() if child.poll() is not None else 'observer EOF')
+                reply = json.loads(raw)
+                self.assertEqual(reply['nonce'],nonce)
+                self.assertEqual(reply['observation']['nodeId'],node.node)
+                self.assertEqual(reply['observation']['configTransfer']['readback']['configSha256'],a.sha(node.original))
+                with open(node.path(t.n.OUTER_LOCK),'rb') as competitor:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(competitor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            child.stdin.close()
+            self.assertEqual(child.wait(timeout=5),75)
+            self.assertEqual(child.stdout.read(),b'')
+            self.assertFalse(node.path(t.n.RESTORE_STATE).exists())
+            self.assertEqual(node.system.events,[])
+
+    def test_separate_installed_observer_still_refuses_retained_outer_lock(self):
         import subprocess
         import sys
         import coordinated_capture as a

@@ -1,127 +1,117 @@
-# TEST all-five durable capture — bounded partial implementation
+# TEST all-five durable capture — same-holder source composition
 
-**NOT default-owner operational closure. NOT installation or live authorization.**
-The capture protocol below is implemented and exercised with real local files,
-fsync, flock, subprocess pipes and a root-peer-shaped UDS (UID/SSH/kernel/systemd
-facts are explicitly simulated). The normal installed physical observer still
-cannot coexist with this hold. The default owner command therefore remains
-fail-closed before candidate database writes. No restoration/handback capability
-is introduced.
+**PARTIAL / NOT deployment, live authority or combined handback approval.**
+The capture/observer lock mismatch is closed in the bounded source enrollment
+path. The default capture-bound controller now reads the actual installed
+observer inside each capture holder's retained outer OFD, rather than launching
+a second observer that would contend for that lock. External SSH, UID, physical,
+kernel, systemd and shared-host facts in source fixtures remain **simulated**.
+No restoration, thaw, ownership release or dispatch reopening is introduced.
 
-## Exact unresolved composition dependency
+## Same-holder contract
 
-`physical_attestor.py:serve` opens `/var/lib/c3-test-node-isolation/lock` and takes
-an exclusive nonblocking flock for **each** observation. `CaptureHold` must keep
-that same outer lock's open-file description across actual capture, all owner
-writes and awaited cleanup. A separate observer SSH process cannot reacquire it.
-`TopologyExecutionAuthorityLifecycle.run` and the controller request physical
-observations before entering `withCapturedTestOwnerEnrollment`, and around every
-awaited public operation. Thus adding the finite capture hook alone does **not**
-make the ordinary default enrollment operational.
-
-The test
-`test_installed_observer_cannot_reacquire_capture_outer_lock_known_default_blocker`
-executes the real observer `serve` against the actual capture-held file and
-requires `BlockingIOError`, no observation and no success output. This is a
-known-negative acceptance boundary, not a passing deployment criterion.
-
-The smallest remaining dependency is a reviewed finite observation operation
-inside the **same capture-holder process/OFD**, carrying the actual installed
-physical observer's current observations and accepted helper pins to the default
-controller for the entire outer lifecycle (including its final checks). It must
-not unlock/relock, substitute cached observations, or let a second process claim
-the lock. That protocol/default observation composition is **not implemented** in
-this bounded slice. No automatic fallback weakens the present refusal.
-
-## Implemented source contract
-
-* `scripts/test-node-isolation/coordinated_capture.py` has only three installed
-  fixed verbs: `capture`, `node-hold`, `owner-channel`. Root only, Python isolated
-  mode, no environment-selected roots/helpers/configs or arbitrary operation.
-* A separately started foreground `capture` coordinator opens **five independent
-  fresh** fixed SSH channels, not multiplexed connections or historical receipts.
-  All five helpers acquire their actual outer lock and freshly check accepted
-  node/boot/machine/key/plan/maintenance/recovery-guard/operator-session identities
-  **before the first bundle is published on any node**.
-* Only then does each held helper call the actual `NodeOriginals.capture()`.
-  Its original write/fsync/no-overwrite publication/readback executes unchanged.
-  The adapter reuses the already-held outer OFD instead of acquiring a second
-  flock. Both `xray-main` and `xray-bridge` are captured on `104.143.201.72`.
-  No runner locks or journals are created: initial public enrollment requires
-  them absent, and outer exclusion is the existing dispatch authority.
-* Fresh checks compare exact stored bundle bytes, accepted originals metadata,
-  config/unit bytes/xattrs, services and supported runtime snapshots, plus live
-  guards, current operator session and exact lock inode. Shared-node checks bind
-  the accepted host owner/guard/backend identity through the existing shared
-  freezer/guard readback. No new freezer, restore or release implementation.
-* Coordinator intent is fsynced **before channel launch**; in-flight node and
-  captured progress are durably retained. Any partial capture, unknown startup,
-  unfinished `.next`, existing bundle/intent, EOF, timeout, nonce/sequence error,
-  changed pin/lock/guard or uncertain acceptance refuses. There is no retry,
-  cleanup, adoption of old bundles, thaw or dispatch admission reopen.
-* Only after all five fresh checks does the coordinator offer its fixed private
-  UDS. `CaptureChannel` checks SO_PEERCRED against the exact coordinator
-  PID/start/UID and immutable held intent; the server pins the peer PID/start and
-  rotates challenges. Both ends revoke on failure. `check()` returns no receipt
-  or boolean. A historical `captured-held` journal is insufficient without the
-  live root process/socket and all five current channels.
-* `owner-channel` compares the complete application owner challenge against the
-  separately accepted root configuration and services bounded nonce/sequence
-  checks. The JS adapter launches only `/usr/bin/python3 -I
-  /usr/local/libexec/c3-test-coordinated-capture.py owner-channel`, verifies its
-  independently accepted installed-source hash, keeps it through the awaited
-  callback, and revokes escaped checkers. The root factory now selects this
-  finite hook; it still uses the separate observer, so the blocker above remains.
+* The installed helper still has only three fixed verbs: `capture`, `node-hold`,
+  `owner-channel`. Five independent foreground SSH channels acquire all five
+  real outer flocks **before the first** actual `NodeOriginals.capture()` call.
+  Its publication/fsync/no-overwrite/readback implementation is unchanged.
+  Both profiles on `104.143.201.72` are captured. No runner fence files are
+  created to make empty enrollment appear valid.
+* Every node's separately accepted `files` pins now **require `attestor`**, for
+  `/usr/local/libexec/c3-test-physical-attestor`. Production loads exactly those
+  verified bytes, then rechecks the installed bytes on every node request.
+  No current observation or freshly produced bundle may supply acceptance pins.
+* `physical_attestor.attest(..., held=CaptureHold)` executes the existing actual
+  `observe(engine, module, shared, predecessor)` with live holder checks before
+  and after it. The holder must belong to this exact in-process engine. It is
+  never a request-provided FD, boolean, historical observation or lock receipt.
+  No unlock/relock is performed. A separate `serve` process still attempts its
+  normal exclusive flock and **correctly refuses** against a retained holder.
+* Finite `observe` / `observe-all` requests carry fresh nonce/sequence checks
+  through NodeServer, coordinator, exact-PID/start/UID root-peer UDS and the app
+  pipe. Each `observe-all` freshly invokes the actual observer on all five nodes;
+  the selected predecessor goes only to the selected node. Bundle/current byte,
+  xattr, service, guard, operator, source and lock-inode checks remain active.
+  Idle node/coordinator loops also recheck retained authority. No historical
+  observation is used to answer a new assertion.
+* Capture uses its own fixed **8-MiB** framed codec for the five observations
+  (each profile can carry two 512-KiB original blobs). It streams one bounded
+  frame in bounded fragments, checks deadlines, rejects duplicate/pipelined
+  frames and EOF, and never repeats a logical operation. The separately owned
+  restoration codec is unchanged.
+* The default root factory opens the installed `owner-channel` **before its
+  first** physical/controller/lifecycle assertion and keeps it through public
+  enrollment, the lifecycle's final `assertHeld`, the controller's final
+  `assertHeld` and the adapter's final durable check. No separate observer SSH
+  session or cached-observer fallback is used in this capture-bound scope.
+  The default path is deliberately one-shot maintenance; subsequent execution,
+  DB settlement and post-dispatch authority are not authorized by capture.
+* The complete application owner challenge must equal the independently fixed
+  root challenge before the first candidate DB write. This remains independent
+  of captured state. Intent/bundle/`.next` uncertainty, channel EOF, guard/source/
+  lock drift, nonce error or timeout revoke the scope; repairing bytes cannot
+  resurrect it. Cleanup never restores originals, unmasks, thaws or hands back.
 
 ## Independent operator acceptance — never auto-published
 
-No installer or pin acceptance command is provided. Before any authorized later
-installation/run, the operator must independently provision/review:
+No installer or acceptance producer is supplied. A later authorized installation
+still requires independently accepted:
 
-1. Existing root-owned node isolation plans and held recovery/shared-host guards;
-   exact five fixed node/endpoint/profile identities, distinct machine IDs and
-   raw SSH ed25519 wire-key hashes (including accepted shared aliases).
-2. Existing `/etc/c3-test-node-originals.json` on every node: **all originals**
-   file metadata/digests, exact service states and runtime snapshot digests,
-   reviewed isolation/Xray source hashes. On `.72` this includes both profiles.
-   These accepted values must precede capture. Never derive acceptance from the
-   bundle produced by this helper or mutable database node documents.
-3. `/etc/c3-test-coordinated-capture.json` on coordinator and nodes: exact schema
-   enforced by `validate`, fixed context, finite lifetime (80–120 seconds), root
-   origin machine/boot/cgroup, private operator-key hash, protocol-source hash,
-   five nodes' original/isolation/self/accepted-file hashes (plus shared/freezer
-   hashes on the shared node), raw canonical ed25519 public keys, guards and
-   exact complete `ownerChallenge`. No captured response can replace these pins.
-4. `/etc/celerity/topology-test-capture.json` on the app host with exactly
-   `{version:1, helperSha256:<independently accepted installed source hash>}`.
-   All source/config/key paths are fixed and descriptor-walked root-controlled;
-   private app trust files and installed app helper must not be world-accessible.
-5. Fixed private state directories/locks/operator-key paths, independent fresh
-   operator SSH access and matching origin cgroup. Socket/intent/known-host files
-   left by attempts require explicit reconciliation; they are never auto-deleted.
+1. Root-owned isolation plans, live recovery/shared-host guards, exact fixed five
+   endpoints/profiles, machine IDs and raw ed25519 wire-key digests.
+2. Existing `/etc/c3-test-node-originals.json` pins for all original files,
+   metadata, services and runtime snapshots, including both profiles on `.72`.
+3. `/etc/c3-test-coordinated-capture.json` on coordinator and nodes, with exactly
+   the schema enforced by `validate`: context, 80–120 second lifetime, root
+   origin machine/boot/cgroup, private operator-key and protocol-source hashes,
+   `self/originals/isolation/accepted/attestor` source pins per node (plus
+   `shared/freezer` on the shared node), raw canonical keys, guards and complete
+   `ownerChallenge`. A successful observation cannot replace these pins.
+4. App `/etc/celerity/topology-test-capture.json` with exactly
+   `{version:1, helperSha256:<independently accepted installed helper hash>}`
+   and the independent `/etc/celerity/topology-test-physical.json` pins.
+5. Private state/locks/key paths and independent fresh operator SSH access.
+   Sticky intent/socket/known-host/bundle state needs explicit reconciliation;
+   it is never automatically removed or accepted after restart.
 
-Restoration accepted pins/bundle approval, DB settlement, owner handback,
-`SHARED_HANDBACK_UNAVAILABLE`, thaw and live TEST/PROD activation stay outside this
-slice. No source test or successful capture authorizes them.
+Restoration pins/bundle approval, DB settlement, global/owner/shared-host
+handback, `SHARED_HANDBACK_UNAVAILABLE`, thaw, live TEST and PROD activation stay
+outside this slice. A passing source enrollment does not authorize them.
 
-## Reproduce local source checks
+## Source evidence and reproduction
 
-From the repository root, use the approved scratch TMPDIR and serial scope:
+The focused Python tests exercise actual installed observer `serve` and
+`observe`, real Engine journal/read/assert logic, actual filesystem snapshots,
+fsync, flocks and child pipes. The independent UID/SSH/kernel/systemd/physical
+read adapters are explicitly simulated. Controls cover the separate-observer
+lock conflict, same-holder observations, EOF, loss, original drift, missing
+last guard, replay and original-publication fsync failure.
+
+The optional Mongo test in `testDurableOriginals.test.js` exercises the actual
+default root controller → root UDS → actual observer/Engine/capture composition
+and the actual owner entry → public `initializeClassic → adopt → preEnroll`
+for all five nodes using public schemas and the real binding store. It checks
+five persisted owners/enrollments and exact identities/snapshots/generations;
+each candidate DB mutation also probes all five real flocks with an independent
+competitor. Guard loss before entry causes **zero candidate DB commands**.
+No raw-seeded adopted owners or fabricated observation replies are used.
+Mongo listens only on a unique loopback port beneath the approved scratch root;
+its exact scratch database/process/files are cleaned and absence read back.
+
+Run serially only when the parent releases the heavy-test budget:
 
 ```sh
-NODE_PATH=/home/leon/celerity-panel-custom/node_modules \
-  ~/.local/bin/hermes-heavy node --test --test-concurrency=1 \
-  src/modules/relay-l2tp/tests/testDurableOriginals.test.js \
-  src/modules/relay-l2tp/tests/testPhysicalController.test.js \
-  scripts/test-topology-owner.test.js scripts/test-topology-owner-authority.test.js
 (cd scripts/test-node-isolation && PYTHONDONTWRITEBYTECODE=1 \
+  HERMES_HEAVY_TMP_ROOT=/home/leon/.hermes/cache/scratch/heavy \
   ~/.local/bin/hermes-heavy python3 -m unittest -v test_coordinated_capture)
+NODE_PATH=/home/leon/celerity-panel-custom/node_modules \
+C3_MONGOD=/home/leon/celerity-prod-release-20261019/toolchain/mongodb-linux-x86_64-debian12-8.0.16/bin/mongod \
+HERMES_HEAVY_TMP_ROOT=/home/leon/.hermes/cache/scratch/heavy \
+  ~/.local/bin/hermes-heavy node --test --test-concurrency=1 \
+  src/modules/relay-l2tp/tests/testDurableOriginals.test.js
 ```
 
-The new JS positive uses the real default factory, actual owner entry and actual
-capture UDS, **with a simulated independent physical observer**; it intentionally
-stops at the first public model boundary. It is not real-Mongo five-node
-initialize/adopt/preEnroll evidence and not the installed-observer positive.
-The older optional actual-Mongo owner fixture remains a separate parent serial
-check (`C3_MONGOD=/home/leon/celerity-prod-release-20261019/toolchain/mongodb-linux-x86_64-debian12-8.0.16/bin/mongod`).
-Do not run its heavy Mongo/Xray fixtures concurrently with the parent.
+Evidence is outside the source tree under
+`/home/leon/celerity-prod-release-20261019/evidence-durable-capture-composition-20261020`.
+The manifest identifies the exact source HEAD/tree and distinguishes completed
+acceptance runs from earlier failing/intermediate runs. No real Xray, fixed-port
+fixtures, live SSH, root installation, deployment or push is part of this slice.

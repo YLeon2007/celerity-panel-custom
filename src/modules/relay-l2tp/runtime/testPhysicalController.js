@@ -155,7 +155,7 @@ async function openSshChannel(pin) {
             hostVerifier: raw => Buffer.isBuffer(raw) && createHash('sha256').update(raw).digest('hex') === pin.physical.sshHostKeySha256 });
     });
 }
-function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals } = {}) {
+function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals, readObservations } = {}) {
     const config = validateConfig(input), channels = new Map();
     // Original secret bytes remain lexical/private and never enter Mongo proofs,
     // logs, error messages or public return values. No recapture after uncertainty.
@@ -177,8 +177,9 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
             const refresh = async (selected, predecessor) => {
                 try {
                     alive(scope);
+                    const batch = readObservations ? await readObservations(selected, predecessor) : undefined;
                     const pairs = await Promise.all(config.nodes.map(async pin => {
-                        const value = await channels.get(pin.nodeId).request(pin.nodeId === selected ? predecessor : null);
+                        const value = batch ? batch[pin.nodeId] : await channels.get(pin.nodeId).request(pin.nodeId === selected ? predecessor : null);
                         alive(scope);
                         need(value.nodeId === pin.nodeId && value.targetProfile === pin.targetProfile && value.maintenanceId === pin.maintenanceId
                             && value.planHash === pin.planHash && equal(value.physical, pin.physical) && equal(value.endpoint, pin.endpoint)
@@ -354,6 +355,39 @@ function createRootTestPhysicalAuthority({ env = process.env, read = privateRead
     const withDurableNodeOriginals = createDurableNodeOriginals({
         ...(read !== privateRead ? { read } : {}), ...(captureSpawn ? { spawn: captureSpawn } : {}),
     });
-    return createTestPhysicalController({ config: JSON.parse(raw), withDurableNodeOriginals, ...(openChannel ? { openChannel } : {}) });
+    const config = validateConfig(JSON.parse(raw));
+    const challenge = freeze({ version: 1, executionContext: TEST, host: config.host, nodes: config.nodes.map(pin => {
+        need(pin.originalSnapshot);
+        return { nodeId: pin.nodeId, targetProfile: pin.targetProfile, endpoint: pin.endpoint,
+            nodeIdentity: { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 },
+            bootId: pin.physical.bootId, maintenanceId: pin.maintenanceId, planHash: pin.planHash,
+            guard: pin.guard, originalSnapshot: pin.originalSnapshot };
+    }) });
+    let captured;
+    const controller = createTestPhysicalController({ config,
+        readObservations(selected, predecessor) { need(captured); return captured.observeAll(selected, predecessor); },
+        // The capture-holder performs fresh actual observation. Never open a
+        // second SSH observer that would contend for the retained outer lock.
+        openChannel: async pin => ({
+            get alive() { return typeof captured === 'function'; }, close() {},
+            request(predecessor = null) { need(captured); return captured.observe(pin.nodeId, predecessor); },
+        }),
+        withDurableNodeOriginals: async (accepted, callback) => {
+            need(captured && equal(accepted, challenge)); return callback(captured);
+        },
+    });
+    return Object.freeze({ runnerTransport: controller.runnerTransport,
+        async withHeldAuthority(context, work) {
+            // Open BEFORE the first controller/lifecycle assertion; close only
+            // AFTER their final assertions and awaited work have completed.
+            need(matchesTopologyExecutionContext(context, TEST));
+            return withDurableNodeOriginals(challenge, async check => {
+                need(!captured && typeof check.observe === 'function'); captured = check;
+                try { return await controller.withHeldAuthority(context, work); }
+                finally { captured = undefined; }
+            });
+        },
+        close() { controller.close(); },
+    });
 }
 module.exports = { createTestPhysicalController, createRootTestPhysicalAuthority, AttestationChannel };
