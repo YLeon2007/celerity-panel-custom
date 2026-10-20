@@ -3,6 +3,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
 const { createCascadeLinksRouter } = require('../cascadeLinks');
+const sshPool = require('../../services/sshPoolService');
+
+// The route import starts the SSH pool's recurring cleanup timer.
+test.after(() => sshPool.closeAll());
+
 const ids = ['507f1f77bcf86cd799439031', '507f1f77bcf86cd799439032'];
 async function request(router, body, method = 'POST', route = '/') {
     const app = express(); app.use(express.json());

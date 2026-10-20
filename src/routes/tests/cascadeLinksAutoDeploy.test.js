@@ -8,6 +8,10 @@ const {
     createCascadeLinksRouter,
     selectLinkApplyBaselineLinkIds,
 } = require('../cascadeLinks');
+const sshPool = require('../../services/sshPoolService');
+
+// The route import starts the SSH pool's recurring cleanup timer.
+test.after(() => sshPool.closeAll());
 
 const PORTAL_A = '507f1f77bcf86cd799439031';
 const PORTAL_B = '507f1f77bcf86cd799439033';
