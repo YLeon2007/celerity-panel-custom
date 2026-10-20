@@ -1,61 +1,81 @@
-# Production admission initialization: dormant preflight-only slice
+# Production admission initialization — dormant maintenance API
 
 ## Delivered boundary
 
-`services/productionAdmissionInitializationPreflight.js` is a **read-only diagnostic**, not a migration, initializer, execution gate, or database ownership authority. It is not imported by application startup, routes, workers, or legacy writers. It exports no write/execute method and opens no connection itself. Invoke it only from an explicitly assembled local/server maintenance tool with an already selected database handle.
+Two separate modules exist; neither is wired into startup, routes, workers or legacy writers:
 
-The workspace contains validated source schemas, but **does not contain the separately accepted ten production link IDs/full-record fingerprints or an implemented external maintenance/quiescence authority**. The authorized fallback therefore applies: do not invent production records, ownership evidence, initial revision history, or a successful commit. Every returned report has `mode: 'preflight-only'`, `ready: false`, `initialized: false` and the permanent blockers:
+- `services/productionAdmissionInitializationPreflight.js` remains an unchanged **read-only diagnostic**. It exports no write/execute method and always reports `mode: 'preflight-only'`, `ready: false`, `initialized: false`, with permanent blockers `EXTERNAL_MAINTENANCE_AUTHORITY_UNAVAILABLE` and `PRODUCTION_ACCEPTED_PIN_AUTHORITY_UNAVAILABLE`. Those blockers were not removed to manufacture a write gate.
+- `services/productionAdmissionInitializer.js` implements a separate explicit **insert-only, one-shot Mongo write** under an injected held-maintenance authority. Successful local initialization still reports `ready: false`, `dormant: true`. It never activates a worker, adopts links, writes ownership, executes SSH, connects from a URI, or changes environment flags.
 
-- `EXTERNAL_MAINTENANCE_AUTHORITY_UNAVAILABLE`
-- `PRODUCTION_ACCEPTED_PIN_AUTHORITY_UNAVAILABLE`
+**There is no operational external-maintenance adapter or accepted production record/revision authority in this repository. No production initialization was performed. This is not deployment approval.** The only authority implementation in the new integration suite is explicitly simulated and excludes no real processes. No default-authorizing adapter, URI-taking CLI, startup switch or production pins are supplied.
 
-`initialized: false` means this diagnostic did not initialize anything; it is not a judgment that an existing singleton is uninitialized. `zeroWorkObserved` only describes empty reviewed history collections across the two observations. Neither it, matching pins, nor exact-ready indexes authorizes writes, adoption, execution, or handback.
+## Independent operator prerequisites
 
-## Input and observation contract
+The server-side assembler must independently accept and retain:
+
+1. Exact native Mongo database handle and database name, canonical frozen `PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT` **by reference** (`production` / `lm1.infograd.online`), and expected replica-set identity `{ setName, replicaSetId }`. `replicaSetId` is a lowercase 24-character ObjectId string. The initializer checks `replSetGetConfig` and writable-primary `hello` before DDL, before the transaction and before confirmation; access to these commands is required. A database name alone is not deployment identity.
+2. A separately reviewed backup/restoration baseline and ten `{ id, sha256 }` full-record pins, not pins regenerated from a changed live scan. IDs must be distinct lowercase ObjectId strings; digests are lowercase SHA-256. `rawDocumentFingerprint` uses complete unprojected driver BSON serialized as non-relaxed Extended JSON, recursively key-sorted without sorting arrays. These are semantic record fingerprints, not raw BSON-byte hashes or proof of classic ownership.
+3. A separately reviewed explicit `initialState`, with **exactly** `_id: 'singleton'`, `revision`, `deployedRevision`, `stateTransitionRevision`, `replacementEpoch`, `remoteAdmissionCount`, and `topologyAdmissionCount`. All numeric fields must be nonnegative safe integers, both admission counters must explicitly be zero, and revision must equal deployedRevision. Nothing is inferred from source defaults, link counts or absent legacy fields. There are no generated timestamps, default revision, drain, reservation or ownership markers. The complete inserted state is compared on confirmation.
+4. Explicit review of exported deeply frozen `REVIEWED_MANIFEST` and independent acceptance of `REVIEWED_MANIFEST_SHA256`. Passing the exported digest in a fixture is **not** evidence of independent operator review. The manifest names all reviewed collections and source-schema indexes without importing live Mongoose models. All collections must already exist as ordinary collections with empty options and stable UUIDs; missing collections/views/options refuse rather than silently creating history.
+5. An independently fixed lowercase UUID `maintenanceGeneration`, bound to all preceding values by the external held authority. This identifier is data, not authority.
+
+The ten raw link rows must be exactly eight explicit `reverse` and two explicit `forward`, all `active: true`, status `online` or `deployed`, with scalar ObjectId portal/bridge references. Missing mode is not silently reverse. No extra/inactive row is admitted by this conservative first-install subset. Links remain byte-semantically unchanged and classic-owned; initialization is not import, topology revision adoption or ownership transfer.
+
+## Held-maintenance adapter contract — operationally unavailable
+
+`createProductionAdmissionInitializer(options)` requires a **trusted server-assembled dependency**, never a browser/request-supplied adapter or boolean:
 
 ```js
-const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT } = require('../domain/topologyExecutionContext');
-const { inspectProductionAdmissionInitialization } = require('./productionAdmissionInitializationPreflight');
-const report = await inspectProductionAdmissionInitialization({
-    db: explicitlySelectedNativeMongoDb,
-    serverContext: PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT,
-    expectedDatabaseName: separatelyVerifiedDatabaseName,
-    acceptedClassicLinks: separatelyAcceptedComparisonPins,
+maintenanceAuthority.withHeldMaintenance(frozenChallenge, async scope => {
+    // The initializer performs and awaits all work here.
 });
 ```
 
-This is an internal API illustration, not a runnable production command or permission to connect to PROD. There is deliberately no URI-taking CLI, startup switch, authority boolean, or automatic index builder.
+The challenge deeply freezes canonical context, database name, replica-set identity, maintenance generation, accepted pins, initial state and manifest digest before the first await. The adapter must independently verify this exact challenge rather than copying it back as proof. It must exclude **all** old/new ingress, worker processes, classic writers, aliases and remote in-flight processes throughout the entire callback and its cleanup, not merely hold a database lease. Read-only database checks cannot establish that exclusion.
 
-- Require the canonical frozen server context by reference (`production` / `lm1.infograd.online`), exact database-name agreement, and ten distinct lowercase ObjectId strings plus lowercase SHA-256 strings before reading persistence. Clones, TEST, cross-pairs, missing/malformed pins, and extra pin fields refuse without reads. No TEST code path is changed.
-- Comparison pins are `{ id, sha256 }`. `rawDocumentFingerprint` hashes complete unprojected driver BSON values serialized as non-relaxed Extended JSON, recursively key-sorted without sorting arrays. Generate/accept these pins independently under the future maintenance authority; do not regenerate pins from a changed live scan to bless drift. They are semantic record fingerprints, not raw BSON-byte digests or proof of classic ownership. No actual PROD pins are embedded here.
-- Require exactly ten raw rows, eight explicit reverse and two explicit forward, all `active: true`, status `online` or `deployed`, and scalar ObjectId portal/bridge references. Missing mode is unresolved, not a reverse default. Inactive/excess/missing/changed rows refuse comparison. This intentionally conservative first-install subset does not review additional inactive link history.
-- Read raw collections without Mongoose document defaults. An absent singleton remains `missing`; an absent collection is `collection-missing`/`missing`, not an empty collection or zero counters. Views and nonempty collection options are `unresolved`. Any existing singleton, including apparently valid zeros, requires separate review; no missing field is normalized or backfilled.
-- Inspect topology operations (including client-proof/retained-admission history), create intents and queue state, PPP/L2TP jobs, node locks, remote admissions, execution bindings/enrollments, and route groups. **Any row**, including terminal/completed/expired rows, vetoes a zero-history observation. This does not adjudicate old history or infer that a lease expiry/completed label proves remote quiescence. Other historic module data and all external writers remain a separate audit responsibility.
-- Compare all expected source-schema indexes, including `_id_`, with exact name, ordered key, uniqueness, sparseness and partial filter. Extra, hidden, TTL, collation, storage-engine or otherwise unexpected index options refuse. Missing indexes are diagnosed, never created. The reviewed manifest deliberately does not load model modules onto a live application connection, avoiding Mongoose auto-index side effects. The local integration fixture builds indexes from the actual source schemas and verifies manifest agreement.
-- Perform two bounded outside-transaction observations. Document reads explicitly use primary/majority with a 2-second server/client budget per read; catalog/index reads use primary and bounded deadlines (Mongo catalog commands are not claimed as majority snapshots). Compare raw document/catalog/collection-UUID/index evidence between passes, refusing detected drift. These sequential scans are **not a transactional snapshot or a TOCTOU fence**; an unobserved concurrent writer can still race after the scan. Read failures return a fixed redacted refusal, without raw Mongo errors or causes.
-- Return only allowlisted statuses/counts/refusal codes; never return credentials, full records, operation payloads or owner tokens. No links, ownership, counters, indexes, queue rows, locks, or admissions are mutated or released.
+The scope has two awaited capabilities:
 
-## Required future one-shot write contract — NOT IMPLEMENTED
+- `assertHeld(theExactChallenge)` checks the still-held exact generation/exclusion, completes with `undefined`, and throws on any uncertainty. A return value of `true` is refused. The initializer checks before and after each awaited ordinary DDL/read/write/confirmation operation, and after session cleanup. Abort/session cleanup on failure may still be attempted to close an uncommitted local transaction; it does not authorize release or external execution.
+- `retainUnknown(theExactChallenge)` durably latches maintenance/dormancy for explicit operator reconciliation. It must never release on failure to record the latch. The adapter itself must fail closed on callback rejection, scope loss, early return, retention failure, or its own cleanup failure, even if the callback cannot deliver a final retention request. It may not release an uncertain scope in a `finally` block. Only an explicitly confirmed safe outcome may finish its exclusion protocol.
 
-Do not add a write path merely by removing the permanent blockers. A separately reviewed implementation must first have:
+The adapter must call the callback exactly once, **await it**, return its exact result and prevent scope escape. The initializer refuses missing/late/reused callbacks, scope flags and a fabricated return value. These checks do not make a malicious or incorrect injected adapter trustworthy. No operational authority is inferred from empty history, flags, a successful fixture, matching pins, completed labels, expired leases or callbacks returning true.
 
-1. Accepted exact PROD database/deployment identity, restored backup validation, accepted ten classic-owned link pins, validated singleton initialization fields/revisions, and an explicit reviewed history/collection/index manifest. Source defaults and an absent collection are not migration evidence.
-2. An external maintenance authority that excludes **all** old and new database ingress, worker processes, legacy/classic writers, remote in-flight processes and alternate aliases. It must hold the exact target/generation/pins challenge throughout the awaited write/verification scope. An environment flag, request field, lease, empty query, callback returning `true`, or successful local fixture is not this authority. Keep the first installation dormant independently of initialized counters.
-3. Exact baseline catalog/index verification and an explicit additive-index plan. Build only reviewed absent indexes under that authority; never `syncIndexes`, drop, overwrite, or replace a conflicting existing index. Mongo index DDL must not be presented as an atomic part of a multi-collection singleton transaction. On partial/ambiguous DDL, remain dormant and refuse for operator audit; do not remove potentially foreign indexes or automatically resume.
-4. A single non-retrying transaction with snapshot reads and majority write concern. Recheck every pinned link and all reviewed history, singleton absence, locks, admissions, replacement/drain absence and authority immediately before an **insert-only** singleton/counter write. Never upsert, `$set` a legacy singleton, adopt classic links, infer missing counters as zero, or retry a callback to acquire a new snapshot/identity. Abort confirmed pre-commit conflicts; preserve every competing winner exactly.
-5. A bounded outside-transaction primary-majority readback of the exact inserted bytes/identity and index readiness while authority is still held. Missing, mismatched, timed-out or uncertain confirmation cannot acknowledge initialization. On unknown commit, never report success, auto-retry, backfill, delete a possibly committed singleton, or run compensating writes against foreign state. Retain dormancy and require explicit majority-confirmed operator reconciliation. Only a confirmed abort is rollback; unknown commit cannot safely promise rollback.
-6. Actual isolated-Mongo RED→GREEN tests for insert-only success, all concurrent ingress/CAS winners, transaction rollback, true uncertain commit/write-concern errors, failed majority confirmation, partial index creation, and external scope loss. Those **write-path** tests are intentionally not claimed by this read-only slice.
+## Additive schema and one-shot transaction
 
-Initialization of counters is not topology import/adoption or classic ownership transfer. The ten links must remain classic-owned, and deployment gates must stay closed even after a future successful initialization.
+Within that held scope:
+
+1. Verify deployment, full catalog identity, exact reviewed index inventory, baseline pins, singleton absence and empty reviewed histories **before DDL**. Any existing singleton—including valid zeros, partial fields, a drain, reservation or foreign `_id`—requires separate review and is untouched.
+2. Compute the missing-index plan from the exact reviewed manifest. Only absent reviewed non-`_id_` indexes are eligible. Existing names must have exact ordered keys, uniqueness, sparseness and partial filters; extra indexes and hidden/TTL/collation/storage-engine/unknown options refuse. `background` is tolerated as nonsemantic historical metadata. There is no `syncIndexes`, drop, replacement, conflict repair or collection creation.
+3. Build eligible indexes individually with majority write concern **outside the transaction**, then recheck all index readiness and stable collection UUIDs. This DDL is not atomic. Any failure after a DDL attempt is conservatively `PRODUCTION_INITIALIZATION_UNKNOWN_HOLD`, even if some additions succeeded or a later precommit refusal is known. Never compensate, remove foreign indexes, auto-resume or retry the initializer.
+4. Start exactly one manual transaction with snapshot reads and majority write concern. Recheck every full link pin, all histories and complete singleton absence in that snapshot immediately before `insertOne` of the explicit state. There is no upsert, update, default, callback retry, snapshot retry or identity regeneration. A competing singleton insertion wins by Mongo uniqueness/write-conflict enforcement; it is never repaired or deleted. A confirmed precommit abort rolls back the initializer's own insertion.
+5. Send exactly one bounded majority `commitTransaction` command. All commit errors, write-concern errors, error labels, scope loss or uncertain acknowledgement remain unknown, without retry, success, compensating writes or an abort after attempted commit.
+6. After a clean commit, while still held, verify deployment, all links/history, **the sole exact state**, exact indexes and unchanged collection UUIDs. Document reads are bounded outside-transaction **primary/majority** reads with a two-second client/server budget each. Catalog/index reads are bounded primary diagnostics, not majority snapshots. End the session and recheck held authority before returning `{ initialized: true, ready: false, dormant: true, mode: 'insert-only', stateSha256 }`.
+
+Reviewed histories are `topologyoperations` (including retained/client-proof work), `topologycreateintents`, `topologyintentqueuestates`, `l2tpoperations`, `nodeoperationlocks`, `remoteadmissions`, `topologyexecutionbindings`, `topologyexecutionenrollments`, and `cascaderoutegroups`. **Any row**, including terminal/completed/expired rows or an apparently empty queue-state singleton, vetoes this first-install path. This initializer writes only `cascadetopologystates`; it does not initialize/adopt the intent queue. Other historic module data and external writer exclusion remain an independent audit responsibility.
+
+A snapshot is not serializable exclusion: a writer violating maintenance can insert a phantom into a history collection or change a read-only pinned link after the transaction snapshot without conflicting with the singleton insertion. Postcommit majority confirmation detects the tested violations and retains **both** persisted initialization and foreign winner as unknown. It cannot promise rollback or replace the missing external writer fence. The real adapter is a hard prerequisite, not a future optimization.
+
+### Driver-specific non-retry boundary
+
+The Mongo Node driver's `session.commitTransaction()` can internally retry even when `withTransaction()` is not used and `retryWrites` is false. The initializer therefore uses one raw admin command with the existing session and explicit majority write concern, rejects raw `ok: 1` replies containing `writeConcernError`/error labels, and closes only the driver's local transaction bookkeeping via `session.transaction.transition`. That internal API is a deliberate compatibility limitation; it is checked before transactional writes and exercised against the installed driver. It does not establish server commit/abort and sends no cleanup/compensation command. Any driver upgrade requires replay of these command-count regressions before operational review. This slice supports replica sets, not sharded/mongos deployments.
+
+Each initializer object allows one call, including refused/unknown attempts. Creating another object does not authorize an automatic retry or reconcile an unknown outcome. Unknown DDL/commit/readback always requires separate majority-confirmed operator reconciliation under retained external maintenance; the module offers no resume/release/recovery method. Errors are fixed allowlisted codes, without raw Mongo errors, credentials, full records or owner tokens.
 
 ## Local verification
 
-The new integration suite requires `C3_MONGOD` and `TMPDIR` and fails rather than skips when unavailable. It starts a disposable loopback replica set and unique database, populates ten explicitly synthetic mixed-mode raw legacy links, constructs real source-schema indexes, and tears down its database/process/directory. It never opens remote connections or reads actual production backups.
+The suites require `C3_MONGOD` and `TMPDIR`, fail rather than skip when unavailable, and start disposable loopback replica sets and uniquely named databases. Verified locally with Node 22.23.1, Mongoose 8.24.1, Mongo Node driver 6.20.0 and MongoDB 8.0.16. They use synthetic full BSON records and source-schema indexes; they do not access production, backups, SSH or remote nodes. All temporary Mongo files are under configured scratch and removed on teardown.
+
+Run the two focused suites serially in an isolated scope (no full source suite/build):
 
 ```sh
-NODE_PATH=/home/leon/c3-int-verify/node_modules \
-C3_MONGOD=/home/leon/.hermes/cache/scratch/c3-queue-mongo/mongodb-linux-x86_64-debian12-8.0.16/bin/mongod \
-node --test src/modules/relay-l2tp/tests/productionAdmissionInitializationPreflightMongo.test.js
+/home/leon/.local/bin/hermes-heavy env \
+  NODE_PATH=/home/leon/c3-int-verify/node_modules \
+  C3_MONGOD=/home/leon/.hermes/cache/scratch/c3-queue-mongo/mongodb-linux-x86_64-debian12-8.0.16/bin/mongod \
+  node --test --test-concurrency=1 \
+  src/modules/relay-l2tp/tests/productionAdmissionInitializationPreflightMongo.test.js \
+  src/modules/relay-l2tp/tests/productionAdmissionInitializerMongo.test.js
 ```
 
-Tests cover exact input refusal before persistence; missing/partial/present singleton preservation; full-record inventory drift; all reviewed history collections; missing collection vs unresolved view; exact/missing/conflicting indexes; real competing writes between observation passes with complete winning-row/index readback; redacted failures; bounded majority-read commands; and an allowlist of read-only commands during preflight. This is local observational safety evidence, **not** a deployed migration, external quiescence proof, or successful initialization.
+The preflight suite retains observational/read-only safety coverage. The new write suite first failed on the absent initializer (RED), then exercised actual insertion (GREEN), explicit fields and identity refusal, existing/partial singleton preservation, every reviewed history winner arriving before the transaction snapshot, a competing singleton after snapshot, pin drift before/after snapshot, successful additive index creation, conflicts/views/missing collections, real `failCommand` partial DDL, real uncertain commit write-concern replies, real postcommit majority-read failure, scope loss before/after commit, one-shot invocation and command counts. The WCE failpoint can return an unknown reply without committing on this server; that case is not claimed as a durable commit. Separate postcommit failures prove preservation of a genuinely committed singleton. A deliberately injected snapshot phantom demonstrates why held exclusion is indispensable.
+
+This is local Mongo execution evidence with a **simulated** authority, not proof of deployed quiescence, production record acceptance, operational authorization, client readiness or release readiness.
