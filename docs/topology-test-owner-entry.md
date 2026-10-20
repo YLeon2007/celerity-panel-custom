@@ -1,12 +1,11 @@
 # Explicit TEST owner enrollment command
 
-**Source-only, not a live-operation authorization.** The finite capture hook is
-now selected by the default factory; actual all-five capture/UDS is implemented.
-Default operational enrollment nevertheless stays refused: the separate installed
-physical observer conflicts with the capture holder's retained outer flock.
-See [the exact known-negative boundary and operator pins](topology-test-durable-capture.md).
-The original hook contract below describes the interface, not closure of that
-remaining observation-composition dependency.
+**Source-only, not a live-operation authorization.** The default factory now
+selects actual all-five capture plus fresh installed-attestor observation inside
+each retained capture-holder OFD. The former separate-observer lock conflict is
+closed on this one-shot enrollment path. Independent installed pins, physical
+acceptance and the full serving lifecycle remain required; source tests are not
+live authority. See [the actual composition and operator pins](topology-test-durable-capture.md).
 
 ## Invocation and real composition
 
@@ -53,36 +52,22 @@ that command. This is deliberately one-shot: no implicit adoption, raw owner
 rewrite, upsert, retry, rollback or cleanup after partial/uncertain writes.
 Existing owners cause the public insert/CAS path to refuse. Recovery is separate.
 
-## Precise remaining parent hook — default stays closed
+## Actual installed capture hook
 
-The installed physical observer is read-only. Its process-local secret byte
-cache is **not** crash-durable NodeOriginals capture. The finite installed capture
-hook now executes the required capture protocol, but the separate observer's
-outer-lock reacquisition is still incompatible with the retained capture hold.
-No environment/request/config receipt alternative is supplied:
+The fixed `testDurableOriginals` adapter is supplied by
+`createRootTestPhysicalAuthority`; no arbitrary module/path/opcode loader or
+request-provided receipt selects authority. It opens the fixed installed
+`owner-channel` before the first lifecycle/controller assertion, carries fresh
+all-five observations from the actual pinned attestor inside the same capture
+holders, and keeps that channel through both final assertions and the final
+bundle check. It never reacquires a holder's outer flock from another observer.
 
-```js
-createTestPhysicalController({
-  config, openChannel,
-  withDurableNodeOriginals: async (challenge, callback) => {
-    // Parent-owned implementation, NOT supplied by this slice:
-    // actual fixed NodeOriginals capture protocol + fsync + independent exact
-    // readback on every one of the FIVE nodes under the already held guards.
-    // If ANY node is missing, changed, uncertain or not captured: throw.
-    return await callback(async function checkDurable() {
-      // Freshly validate ALL exact durable bundles and held capture authority.
-      // Throw on drift/loss/unknown; returning a receipt is not this capability.
-    });
-  },
-});
-```
-
-The snippet states the trusted interface, not runnable operational code. The
-ordinary `createRootTestPhysicalAuthority` now supplies the fixed installed helper
-adapter; no arbitrary module/path/opcode loader is provided. It does **not**
-close default enrollment: observation must first be composed inside the actual
-capture-held OFD, as documented in `topology-test-durable-capture.md`. A no-op
-checker or successful-looking JSON receipt cannot substitute for that closure.
+The generic `createTestPhysicalController({ withDurableNodeOriginals })`
+constructor remains a trusted programmatic seam. Its callback checker is a live
+lexical capability, not a boolean or successful-looking JSON receipt. The default
+implementation executes the real NodeOriginals capture/publication/fsync/readback
+protocol and refuses missing independent pins. This one-shot enrollment capability
+does not authorize later candidate dispatch, restoration or global handback.
 
 `challenge` is deeply frozen:
 
