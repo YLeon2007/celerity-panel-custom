@@ -55,7 +55,7 @@ function same(a, b) { return fingerprint(a) === fingerprint(b); }
 
 function createProductionAdmissionInitializer({ db, serverContext, expectedDatabaseName,
     expectedDeployment, acceptedClassicLinks, initialState, acceptedManifestSha256,
-    maintenanceAuthority, maintenanceGeneration } = {}) {
+    maintenanceAuthority, maintenanceGeneration, acceptedMissingCollections = [] } = {}) {
     if (serverContext !== PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT
         || typeof expectedDatabaseName !== 'string' || !expectedDatabaseName
         || db?.databaseName !== expectedDatabaseName || !db?.client
@@ -65,6 +65,12 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
         || typeof maintenanceGeneration !== 'string'
         || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(maintenanceGeneration)
         || acceptedManifestSha256 !== REVIEWED_MANIFEST_SHA256
+        || !Array.isArray(acceptedMissingCollections)
+        || Array.from(acceptedMissingCollections).some(entry => !exactKeys(entry, ['name', 'options'])
+            || typeof entry.name !== 'string' || entry.name === 'cascadelinks'
+            || !Object.hasOwn(INDEXES, entry.name) || !exactKeys(entry.options, [])
+            || Object.getPrototypeOf(entry.options) !== Object.prototype)
+        || new Set(acceptedMissingCollections.map(entry => entry.name)).size !== acceptedMissingCollections.length
         || !Array.isArray(acceptedClassicLinks) || acceptedClassicLinks.length !== 10
         || acceptedClassicLinks.some(pin => !exactKeys(pin, ['id', 'sha256'])
             || typeof pin.id !== 'string' || !/^[a-f0-9]{24}$/.test(pin.id)
@@ -83,7 +89,8 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
     const hold = maintenanceAuthority.withHeldMaintenance.bind(maintenanceAuthority);
     const challenge = freeze({ serverContext, databaseName: expectedDatabaseName, maintenanceGeneration,
         deployment: { ...expectedDeployment }, acceptedClassicLinks: acceptedClassicLinks.map(pin => ({ ...pin })),
-        initialState: { ...initialState }, manifestSha256: acceptedManifestSha256 });
+        initialState: { ...initialState }, manifestSha256: acceptedManifestSha256,
+        acceptedMissingCollections: acceptedMissingCollections.map(entry => ({ name: entry.name, options: {} })) });
     let attempted = false;
     return Object.freeze({ async initialize() {
         if (attempted) fail('PRODUCTION_INITIALIZATION_ALREADY_ATTEMPTED');
@@ -123,16 +130,53 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                         fail('PRODUCTION_INITIALIZATION_DEPLOYMENT_REFUSED');
                     }
                 }
-                async function catalog() {
+                const expectedMissing = challenge.acceptedMissingCollections.map(entry => entry.name);
+                async function catalog(missing = []) {
                     const rows = await guarded(() => db.listCollections({ name: { $in: Object.keys(INDEXES) } }, BUDGET).toArray());
-                    if (rows.length !== Object.keys(INDEXES).length || rows.some(row => row.type !== 'collection'
-                        || Object.keys(row.options || {}).length || !row.info?.uuid)) fail('PRODUCTION_INITIALIZATION_CATALOG_REFUSED');
+                    if (rows.length !== Object.keys(INDEXES).length - missing.length
+                        || rows.some(row => missing.includes(row.name) || row.type !== 'collection'
+                            || Object.keys(row.options || {}).length || !(row.info?.uuid instanceof mongo.Binary)
+                            || row.info.uuid.sub_type !== 4 || row.info.uuid.length() !== 16)
+                        || Object.keys(INDEXES).some(name => !missing.includes(name) && !rows.some(row => row.name === name))) {
+                        fail('PRODUCTION_INITIALIZATION_CATALOG_REFUSED');
+                    }
                     return rows.map(row => ({ name: row.name, uuid: row.info.uuid })).sort((a, b) => a.name.localeCompare(b.name));
                 }
-                async function planIndexes() {
+                async function requireCatalog(baseline, missing = []) {
+                    if (!same(baseline, await catalog(missing))) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
+                }
+                async function readIndexes(entry) {
+                    // runCursorCommand sends this exact listIndexes command and bounded
+                    // native getMore calls (no retry/resume wrapper). Unlike db.command,
+                    // its GetMoreOperation suppresses invalid CSOT maxTimeMS on non-awaitData.
+                    const cursor = db.runCursorCommand({ listIndexes: entry.name,
+                        includeBuildUUIDs: true, cursor: { batchSize: 2 }, maxTimeMS: 2000 },
+                    { readPreference: 'primary', timeoutMS: 2000 }).setBatchSize(2);
+                    try {
+                        const indexes = [];
+                        while (await guarded(() => cursor.hasNext())) {
+                            const index = await guarded(() => cursor.next());
+                            // Ordinary listIndexes() hides this field. Never unwrap/use a
+                            // building spec or wait for a foreign build to become ready.
+                            if (Object.hasOwn(index, 'buildUUID')) {
+                                uncertain = true;
+                                fail('PRODUCTION_INITIALIZATION_INDEX_BUILD_PRESENT');
+                            }
+                            indexes.push(index);
+                            if (indexes.length > entry.indexes.length) fail('PRODUCTION_INITIALIZATION_INDEX_CONFLICT');
+                        }
+                        return indexes;
+                    } finally { await guarded(() => cursor.close()); }
+                }
+                async function planIndexes(missing = []) {
                     const additions = [];
                     for (const entry of REVIEWED_MANIFEST.collections) {
-                        const actual = await guarded(() => db.collection(entry.name).listIndexes(BUDGET).toArray());
+                        if (missing.includes(entry.name)) {
+                            additions.push(...entry.indexes.filter(index => index.name !== '_id_')
+                                .map(index => ({ collection: entry.name, index })));
+                            continue;
+                        }
+                        const actual = await readIndexes(entry);
                         for (const index of actual) {
                             const wanted = entry.indexes.find(value => value.name === index.name);
                             if (!wanted || Object.keys(index).some(key => !['v', 'key', 'name', 'unique', 'sparse',
@@ -153,7 +197,7 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     }
                     return additions;
                 }
-                async function inventory(options, expectedState) {
+                async function inventory(options, expectedState, missing = []) {
                     const links = await guarded(() => db.collection('cascadelinks').find({}, options).sort({ _id: 1 }).limit(11).toArray());
                     if (links.length !== 10 || links.filter(row => row.mode === 'reverse').length !== 8
                         || links.filter(row => row.mode === 'forward').length !== 2
@@ -164,10 +208,13 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                         fail('PRODUCTION_INITIALIZATION_PIN_DRIFT');
                     }
                     for (const name of HISTORY) {
+                        // Absence is independently accepted catalog state, never inferred empty history.
+                        if (missing.includes(name)) continue;
                         if ((await guarded(() => db.collection(name).find({}, options).limit(1).toArray())).length) {
                             fail('PRODUCTION_INITIALIZATION_HISTORY_PRESENT');
                         }
                     }
+                    if (missing.includes('cascadetopologystates')) return;
                     const states = await guarded(() => db.collection('cascadetopologystates').find({}, options).limit(2).toArray());
                     if (expectedState ? states.length !== 1 || !same(states[0], expectedState) : states.length !== 0) {
                         fail(expectedState ? 'PRODUCTION_INITIALIZATION_READBACK_MISMATCH' : 'PRODUCTION_INITIALIZATION_STATE_PRESENT');
@@ -189,21 +236,105 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                         return reply;
                     } finally { session.transaction.transition(state); }
                 }
+                async function createdCatalog(receipt) {
+                    // A compatible Mongo `create` can return ok:1 for a FOREIGN existing
+                    // namespace. Only this transaction's expanded create events prove origin.
+                    // Raw cursor commands deliberately have no driver change-stream resume/retry.
+                    if (!(receipt.operationTime instanceof mongo.Timestamp)
+                        || !Number.isSafeInteger(session.serverSession?.txnNumber)) {
+                        fail('PRODUCTION_INITIALIZATION_CREATION_UNCONFIRMED');
+                    }
+                    const txnNumber = mongo.Long.fromNumber(session.serverSession.txnNumber);
+                    let cursor;
+                    try {
+                        const reply = await guarded(() => db.command({ aggregate: 1,
+                            pipeline: [{ $changeStream: { showExpandedEvents: true,
+                                startAtOperationTime: receipt.operationTime } },
+                            { $match: { operationType: 'create', 'lsid.id': session.id.id, txnNumber } }],
+                            cursor: { batchSize: 0 }, maxTimeMS: 2000 }, { ...BUDGET, session }));
+                        cursor = reply.cursor;
+                        if (!cursor || cursor.ns !== `${challenge.databaseName}.$cmd.aggregate`
+                            || !Array.isArray(cursor.firstBatch) || !(cursor.id instanceof mongo.Long)) {
+                            fail('PRODUCTION_INITIALIZATION_CREATION_UNCONFIRMED');
+                        }
+                        let events = cursor.firstBatch;
+                        if (events.length < expectedMissing.length && !cursor.id.isZero()) {
+                            const more = await guarded(() => db.command({ getMore: cursor.id,
+                                collection: '$cmd.aggregate', batchSize: expectedMissing.length + 1,
+                                maxTimeMS: 2000 }, { ...BUDGET, session }));
+                            cursor = more.cursor;
+                            if (!cursor || cursor.ns !== `${challenge.databaseName}.$cmd.aggregate`
+                                || !Array.isArray(cursor.nextBatch) || !(cursor.id instanceof mongo.Long)) {
+                                fail('PRODUCTION_INITIALIZATION_CREATION_UNCONFIRMED');
+                            }
+                            events = [...events, ...cursor.nextBatch];
+                        }
+                        if (events.length !== expectedMissing.length
+                            || new Set(events.map(event => event.ns?.coll)).size !== expectedMissing.length
+                            || events.some(event => event.operationType !== 'create'
+                                || event.ns?.db !== challenge.databaseName || !expectedMissing.includes(event.ns?.coll)
+                                || !same(event.lsid?.id, session.id.id) || String(event.txnNumber) !== String(txnNumber)
+                                || !(event.collectionUUID instanceof mongo.Binary)
+                                || event.collectionUUID.sub_type !== 4 || event.collectionUUID.length() !== 16)) {
+                            fail('PRODUCTION_INITIALIZATION_CREATION_UNCONFIRMED');
+                        }
+                        return events.map(event => ({ name: event.ns.coll, uuid: event.collectionUUID }));
+                    } finally {
+                        if (cursor?.id instanceof mongo.Long && !cursor.id.isZero()) {
+                            await guarded(() => db.command({ killCursors: '$cmd.aggregate', cursors: [cursor.id] }, { ...BUDGET, session }));
+                        }
+                    }
+                }
                 try {
                     await deploymentCheck();
-                    const baseline = await catalog();
-                    const additions = await planIndexes();
-                    // Avoid DDL on an already inadmissible baseline.
-                    await inventory(MAJORITY);
+                    let baseline = await catalog(expectedMissing);
+                    const additions = await planIndexes(expectedMissing);
+                    // Avoid ALL DDL on an already inadmissible or changed baseline.
+                    await inventory(MAJORITY, undefined, expectedMissing);
+                    await requireCatalog(baseline, expectedMissing);
+                    if (expectedMissing.length) {
+                        session = db.client.startSession({ causalConsistency: false });
+                        if (typeof session.transaction?.transition !== 'function'
+                            || !Number.isSafeInteger(session.serverSession?.txnNumber)) {
+                            fail('PRODUCTION_INITIALIZATION_DRIVER_REFUSED');
+                        }
+                        // Mongo only allows explicit collection creation at local read concern.
+                        // Majority is required on the single raw commit; no transaction retries.
+                        session.startTransaction({ readConcern: { level: 'local' },
+                            writeConcern: { w: 'majority' }, readPreference: 'primary' });
+                        for (const entry of challenge.acceptedMissingCollections) {
+                            await requireCatalog(baseline, expectedMissing);
+                            await check();
+                            ddlAttempted = true;
+                            const reply = await guarded(() => db.command({ create: entry.name, ...entry.options,
+                                maxTimeMS: 2000 }, { session, ...BUDGET }));
+                            if (reply.ok !== 1 || reply.writeConcernError || reply.writeErrors?.length || reply.errorLabels?.length) {
+                                fail('PRODUCTION_INITIALIZATION_CREATION_UNCONFIRMED');
+                            }
+                        }
+                        await check();
+                        commitAttempted = true;
+                        const receipt = await guarded(() => finishOnce('commitTransaction', 'TRANSACTION_COMMITTED'));
+                        const created = await createdCatalog(receipt);
+                        baseline = [...baseline, ...created].sort((a, b) => a.name.localeCompare(b.name));
+                        await requireCatalog(baseline);
+                        // Require the EXACT reviewed additions, not foreign index adoption.
+                        if (!same(additions, await planIndexes())) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
+                        await guarded(() => session.endSession());
+                        session = undefined;
+                        commitAttempted = false;
+                    }
                     for (const addition of additions) {
+                        await requireCatalog(baseline);
                         await check();
                         ddlAttempted = true;
                         const { key, ...options } = addition.index;
                         await guarded(() => db.collection(addition.collection).createIndex(key,
                             { ...options, ...BUDGET, writeConcern: { w: 'majority', wtimeoutMS: 2000 } }));
                     }
-                    if ((await planIndexes()).length || !same(baseline, await catalog())) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
                     await deploymentCheck();
+                    if ((await planIndexes()).length) fail('PRODUCTION_INITIALIZATION_SCHEMA_DRIFT');
+                    await requireCatalog(baseline);
                     session = db.client.startSession({ causalConsistency: false });
                     if (typeof session.transaction?.transition !== 'function') fail('PRODUCTION_INITIALIZATION_DRIVER_REFUSED');
                     session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
@@ -224,7 +355,7 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     completed = true;
                     return result;
                 } catch (error) {
-                    uncertain = ddlAttempted || commitAttempted;
+                    uncertain ||= ddlAttempted || commitAttempted;
                     if (session?.inTransaction() && !commitAttempted) {
                         try { await finishOnce('abortTransaction', 'TRANSACTION_ABORTED'); }
                         catch { uncertain = true; }
@@ -236,7 +367,8 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                     }
                     // Never delete, repair, compensate or retry. The adapter must latch this
                     // before any outer cleanup; failure to latch also cannot authorize release.
-                    if (uncertain || (error instanceof InitializationError && error.code === 'PRODUCTION_INITIALIZATION_SCOPE_LOST')) {
+                    if (uncertain || (error instanceof InitializationError && [
+                        'PRODUCTION_INITIALIZATION_SCOPE_LOST', 'PRODUCTION_INITIALIZATION_INDEX_BUILD_PRESENT'].includes(error.code))) {
                         try { await retainUnknown(challenge); } catch { /* adapter remains fail-closed by contract */ }
                         fail('PRODUCTION_INITIALIZATION_UNKNOWN_HOLD');
                     }

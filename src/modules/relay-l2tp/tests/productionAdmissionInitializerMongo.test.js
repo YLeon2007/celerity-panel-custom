@@ -140,6 +140,17 @@ test('insert-only success uses reviewed explicit fields, leaves ten classic link
     assert.ok(authority.state.assertions > 20);
     assert.equal(authority.state.released, true);
     assert.equal(authority.state.retained, false);
+    const catalogReads = observed.filter(event => event.commandName === 'listIndexes');
+    assert.deepEqual([...new Set(catalogReads.map(event => event.command.listIndexes))].sort(),
+        models.map(model => model.collection.name).sort());
+    for (const event of catalogReads) {
+        assert.equal(event.command.includeBuildUUIDs, true);
+        assert.ok(event.command.maxTimeMS > 0 && event.command.maxTimeMS <= 2000);
+    }
+    const pages = observed.filter(event => event.commandName === 'getMore');
+    assert.ok(pages.length > 0, 'bounded raw index cursor pagination exercised');
+    for (const event of pages) assert.equal(event.command.maxTimeMS, undefined,
+        'non-awaitData getMore inherits cursor server deadline and must not send maxTimeMS');
     const inserts = observed.filter(event => event.commandName === 'insert');
     assert.equal(inserts.length, 1);
     assert.equal(inserts[0].command.insert, 'cascadetopologystates');
@@ -157,6 +168,65 @@ test('insert-only success uses reviewed explicit fields, leaves ten classic link
     await assert.rejects(initializer.initialize(), { code: 'PRODUCTION_INITIALIZATION_ALREADY_ATTEMPTED' });
 });
 
+// Production-like first install: legacy links/locks/L2TP/groups exist; new stores do not.
+const firstInstallMissing = ['cascadetopologystates', 'topologyoperations', 'topologycreateintents',
+    'topologyintentqueuestates', 'remoteadmissions', 'topologyexecutionbindings', 'topologyexecutionenrollments'];
+async function firstInstall() {
+    const pins = await reset();
+    for (const name of firstInstallMissing) await db.collection(name).drop();
+    return { pins, plan: firstInstallMissing.map(name => ({ name, options: {} })) };
+}
+async function catalogIdentity() {
+    return (await db.listCollections().toArray()).map(row => ({ name: row.name, uuid: row.info?.uuid,
+        type: row.type, options: row.options })).sort((a, b) => a.name.localeCompare(b.name));
+}
+const writes = events => events.filter(event => ['create', 'createIndexes', 'drop', 'dropIndexes',
+    'collMod', 'insert', 'update', 'delete', 'commitTransaction'].includes(event.commandName));
+
+test('explicit missing-collection plan initializes production-like first install without replacing existing UUIDs', async () => {
+    const { pins, plan } = await firstInstall();
+    const before = await catalogIdentity();
+    const links = await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray();
+    const authority = simulatedAuthority(async challenge => {
+        assert.deepEqual(challenge.acceptedMissingCollections, plan);
+        assert.equal(Object.isFrozen(challenge.acceptedMissingCollections), true);
+        assert.equal(Object.isFrozen(challenge.acceptedMissingCollections[0].options), true);
+    });
+    const start = commands.length;
+    const result = await assemble(pins, authority, { acceptedMissingCollections: plan }).initialize();
+    const observed = commands.slice(start);
+    assert.equal(result.initialized, true);
+    assert.equal(result.ready, false);
+    assert.equal(result.dormant, true);
+    const after = await catalogIdentity();
+    for (const entry of before) assert.deepEqual(after.find(row => row.name === entry.name), entry);
+    assert.deepEqual(after.map(row => row.name).sort(), models.map(model => model.collection.name).sort());
+    assert.deepEqual(await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray(), links);
+    assert.deepEqual(await db.collection('cascadetopologystates').findOne({}), initialState);
+    const creates = observed.filter(event => event.commandName === 'create');
+    assert.deepEqual(creates.map(event => event.command.create), firstInstallMissing);
+    for (const event of creates) {
+        assert.ok(event.command.maxTimeMS > 0 && event.command.maxTimeMS <= 2000);
+        assert.equal(event.command.autocommit, false);
+    }
+    const proof = observed.find(event => event.commandName === 'aggregate' && event.command.pipeline?.[0]?.$changeStream);
+    assert.ok(proof.command.pipeline[0].$changeStream.showExpandedEvents);
+    const match = proof.command.pipeline[1].$match;
+    assert.deepEqual(match['lsid.id'], creates[0].command.lsid.id);
+    assert.equal(String(match.txnNumber), String(creates[0].command.txnNumber));
+    const proofPages = observed.filter(event => event.commandName === 'getMore' && event.command.collection === '$cmd.aggregate');
+    assert.equal(proofPages.length, 1);
+    assert.deepEqual(proofPages[0].command.lsid, proof.command.lsid, 'explicit evidence cursor session retained');
+    const events = replies.find(event => event.requestId === proofPages[0].requestId).reply.cursor.nextBatch;
+    assert.equal(events.length, plan.length);
+    for (const event of events) assert.deepEqual(after.find(row => row.name === event.ns.coll).uuid, event.collectionUUID);
+    const commits = observed.filter(event => event.commandName === 'commitTransaction');
+    assert.equal(commits.length, 2, 'one schema-create commit and one singleton commit, without retry');
+    for (const event of commits) assert.equal(event.command.writeConcern.w, 'majority');
+    assert.deepEqual(observed.filter(event => ['drop', 'dropIndexes', 'update', 'delete', 'collMod'].includes(event.commandName)), []);
+    assert.equal(authority.state.retained, false);
+});
+
 async function failCommand(command, data) {
     await client.db('admin').command({ configureFailPoint: 'failCommand', mode: { times: 1 },
         data: { failCommands: [command], ...data } });
@@ -171,6 +241,193 @@ function afterCommand(predicate, action) {
     });
     return { authority, fired: () => fired };
 }
+
+test('no accepted missing plan, or absent/present drift, refuses before any initializer write', async t => {
+    for (const [label, setup] of [
+        ['no plan', async () => { const fixture = await firstInstall(); return { ...fixture, plan: undefined }; }],
+        ['unlisted absence', async () => { const fixture = await firstInstall(); return { ...fixture, plan: fixture.plan.slice(1) }; }],
+        ['planned collection already exists', async () => { const fixture = await firstInstall();
+            await db.createCollection(firstInstallMissing[0]); return fixture; }],
+        ['legacy links absent', async () => { const fixture = await firstInstall(); await db.collection('cascadelinks').drop(); return fixture; }],
+        ['planned namespace is a view', async () => { const fixture = await firstInstall();
+            await db.createCollection(firstInstallMissing[0], { viewOn: 'cascadelinks', pipeline: [] }); return fixture; }],
+        ['existing options', async () => { const fixture = await firstInstall();
+            await db.collection('nodeoperationlocks').drop();
+            await db.createCollection('nodeoperationlocks', { validator: { node: { $type: 'objectId' } } }); return fixture; }],
+        ['existing index conflict', async () => { const fixture = await firstInstall();
+            await db.collection('nodeoperationlocks').dropIndex('node_1');
+            await db.collection('nodeoperationlocks').createIndex({ node: 1 }); return fixture; }],
+        ['existing history row', async () => { const fixture = await firstInstall();
+            await db.collection('l2tpoperations').insertOne({ _id: 'foreign', idempotencyKey: 'keep' }); return fixture; }],
+    ]) await t.test(label, async () => {
+        const { pins, plan } = await setup();
+        const before = await catalogIdentity();
+        const links = await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray();
+        const start = commands.length;
+        await assert.rejects(assemble(pins, simulatedAuthority(), { acceptedMissingCollections: plan }).initialize(),
+            /PRODUCTION_INITIALIZATION_(CATALOG_REFUSED|INDEX_CONFLICT|HISTORY_PRESENT)/);
+        assert.deepEqual(writes(commands.slice(start)), []);
+        assert.deepEqual(await catalogIdentity(), before);
+        assert.deepEqual(await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray(), links);
+    });
+});
+
+test('missing collection names and exact options require independent explicit allowlist acceptance', async t => {
+    const pins = await reset();
+    for (const plan of [null, {}, new Array(1), ['remoteadmissions'], [{ name: 'remoteadmissions', options: new Date(0) }],
+        [{ name: 'cascadelinks', options: {} }],
+        [{ name: 'system.users', options: {} }], [{ name: 'remoteadmissions' }],
+        [{ name: ['remoteadmissions'], options: {} }], [{ name: 'remoteadmissions', options: [] }],
+        [{ name: 'remoteadmissions', options: { capped: false } }],
+        [{ name: 'remoteadmissions', options: {}, uuid: randomUUID() }],
+        [{ name: 'remoteadmissions', options: {} }, { name: 'remoteadmissions', options: {} }]]) {
+        await t.test(JSON.stringify(plan), () => {
+            const start = commands.length;
+            assert.throws(() => assemble(pins, simulatedAuthority(), { acceptedMissingCollections: plan }),
+                { code: 'PRODUCTION_INITIALIZATION_INPUT_REFUSED' });
+            assert.equal(commands.length, start);
+        });
+    }
+});
+
+test('plan is copied and deeply frozen before await; source mutation cannot authorize other namespaces', async () => {
+    const { pins, plan } = await firstInstall();
+    const accepted = structuredClone(plan);
+    const authority = simulatedAuthority(async challenge => {
+        assert.deepEqual(challenge.acceptedMissingCollections, accepted);
+        assert.equal(Object.isFrozen(challenge.acceptedMissingCollections[0]), true);
+        plan[0].name = 'cascadelinks';
+        plan[0].options.capped = true;
+        plan.push({ name: 'foreign', options: {} });
+    });
+    await assemble(pins, authority, { acceptedMissingCollections: plan }).initialize();
+    assert.equal((await catalogIdentity()).some(row => row.name === 'foreign'), false);
+});
+
+test('foreign create in the last absence-check/create gap is retained, never adopted', async t => {
+    for (const kind of ['compatible empty', 'foreign row', 'view', 'options', 'conflicting index']) await t.test(kind, async () => {
+        const pins = await reset();
+        await db.collection('remoteadmissions').drop();
+        await db.collection('cascadetopologystates').drop();
+        const plan = ['cascadetopologystates', 'remoteadmissions'].map(name => ({ name, options: {} }));
+        const start = commands.length;
+        let winner;
+        const row = { _id: 'foreign', operationId: 'keep', kind: 'sync_users' };
+        const race = afterCommand(() => commands.slice(start).filter(event => event.commandName === 'listCollections').length === 4,
+            async () => {
+                await db.createCollection('remoteadmissions', kind === 'view' ? { viewOn: 'cascadelinks', pipeline: [] }
+                    : kind === 'options' ? { validator: { kind: { $type: 'string' } } } : {});
+                if (kind === 'foreign row') await db.collection('remoteadmissions').insertOne(row);
+                if (kind === 'conflicting index') await db.collection('remoteadmissions').createIndex({ foreign: 1 });
+                winner = (await catalogIdentity()).find(row => row.name === 'remoteadmissions');
+            });
+        const initializer = assemble(pins, race.authority, { acceptedMissingCollections: plan });
+        await assert.rejects(initializer.initialize(), { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+        const observed = commands.slice(start);
+        assert.equal(race.fired(), true);
+        assert.deepEqual((await catalogIdentity()).find(row => row.name === 'remoteadmissions'), winner);
+        assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+        assert.equal(race.authority.state.retained, true);
+        const create = observed.find(event => event.command.create === 'remoteadmissions' && event.command.autocommit === false);
+        assert.ok(create);
+        assert.equal(observed.filter(event => event.command.create === 'remoteadmissions'
+            && event.command.autocommit === false).length, 1, 'exactly one create attempt, no retry');
+        if (['compatible empty', 'foreign row', 'conflicting index'].includes(kind)) {
+            assert.equal(replies.find(event => event.requestId === create.requestId)?.reply.ok, 1,
+                'real Mongo accepts a compatible foreign namespace; ok:1 alone is NOT creation proof');
+            assert.equal(observed.filter(event => event.commandName === 'commitTransaction').length, 1);
+            assert.equal(observed.filter(event => event.commandName === 'abortTransaction').length, 0);
+        }
+        if (kind === 'foreign row') assert.deepEqual(await db.collection('remoteadmissions').findOne({ _id: 'foreign' }), row);
+        if (kind === 'conflicting index') assert.ok((await db.collection('remoteadmissions').listIndexes().toArray())
+            .some(index => index.name === 'foreign_1'));
+        assert.deepEqual(observed.filter(event => ['drop', 'dropIndexes', 'update', 'delete'].includes(event.commandName)), []);
+        await assert.rejects(initializer.initialize(), { code: 'PRODUCTION_INITIALIZATION_ALREADY_ATTEMPTED' });
+    });
+});
+
+test('existing UUID replacement after reviewed inventory is refused before DDL', async () => {
+    const pins = await reset();
+    await db.collection('remoteadmissions').drop();
+    let winner, afterForeign;
+    const race = afterCommand(event => event?.commandName === 'find' && event.command.find === 'cascadetopologystates', async () => {
+        await db.collection('nodeoperationlocks').drop();
+        await db.createCollection('nodeoperationlocks');
+        await db.collection('nodeoperationlocks').createIndex({ node: 1 }, { unique: true });
+        winner = (await catalogIdentity()).find(row => row.name === 'nodeoperationlocks');
+        afterForeign = commands.length;
+    });
+    await assert.rejects(assemble(pins, race.authority,
+        { acceptedMissingCollections: [{ name: 'remoteadmissions', options: {} }] }).initialize(),
+    { code: 'PRODUCTION_INITIALIZATION_SCHEMA_DRIFT' });
+    assert.equal(race.fired(), true);
+    assert.deepEqual(writes(commands.slice(afterForeign)), []);
+    assert.deepEqual((await catalogIdentity()).find(row => row.name === 'nodeoperationlocks'), winner);
+});
+
+test('created UUID is bound to own transactional event, not a replacement catalog row', async () => {
+    const pins = await reset();
+    await db.collection('remoteadmissions').drop();
+    let winner;
+    const race = afterCommand(event => event?.commandName === 'commitTransaction', async () => {
+        await db.collection('remoteadmissions').drop();
+        await db.createCollection('remoteadmissions');
+        winner = (await catalogIdentity()).find(row => row.name === 'remoteadmissions');
+    });
+    await assert.rejects(assemble(pins, race.authority,
+        { acceptedMissingCollections: [{ name: 'remoteadmissions', options: {} }] }).initialize(),
+    { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+    assert.equal(race.fired(), true);
+    assert.equal(race.authority.state.retained, true);
+    assert.deepEqual((await catalogIdentity()).find(row => row.name === 'remoteadmissions'), winner);
+    assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+});
+
+test('uncertain creation, creation commit, receipt and partial schema never retry or compensate', async t => {
+    for (const phase of ['create', 'second create', 'commit', 'receipt', 'receipt getMore', 'index']) await t.test(phase, async () => {
+        const { pins, plan } = await firstInstall();
+        const before = await catalogIdentity();
+        const links = await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray();
+        let authority = simulatedAuthority();
+        if (phase === 'create') await failCommand('create', { closeConnection: true });
+        if (phase === 'second create') authority = afterCommand(event => event?.commandName === 'create',
+            () => failCommand('create', { errorCode: 50, errorLabels: [] })).authority;
+        if (phase === 'commit') await failCommand('commitTransaction', {
+            writeConcernError: { code: 64, errmsg: 'synthetic schema commit uncertainty' }, errorLabels: ['UnknownTransactionCommitResult'] });
+        if (phase.startsWith('receipt')) authority = afterCommand(event => event?.commandName === 'commitTransaction',
+            () => failCommand(phase === 'receipt' ? 'aggregate' : 'getMore', { errorCode: 50, errorLabels: [] })).authority;
+        if (phase === 'index') authority = afterCommand(event => event?.commandName === 'createIndexes',
+            () => failCommand('createIndexes', { errorCode: 50, errorLabels: [] })).authority;
+        const start = commands.length;
+        try {
+            await assert.rejects(assemble(pins, authority, { acceptedMissingCollections: plan }).initialize(),
+                { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+        } finally { await disableFailure(); }
+        assert.equal(authority.state.retained, true);
+        assert.equal(authority.state.released, false);
+        const observed = commands.slice(start);
+        const creates = observed.filter(event => event.commandName === 'create');
+        assert.equal(new Set(creates.map(event => event.command.create)).size, creates.length);
+        assert.ok(observed.filter(event => event.commandName === 'commitTransaction').length <= 1);
+        assert.deepEqual(observed.filter(event => ['drop', 'dropIndexes', 'collMod', 'update', 'delete'].includes(event.commandName)), []);
+        assert.deepEqual(await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray(), links);
+        const after = await catalogIdentity();
+        for (const entry of before) assert.deepEqual(after.find(row => row.name === entry.name), entry);
+        assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+        if (phase.startsWith('receipt') || phase === 'index') {
+            assert.equal(after.length, models.length, 'committed schema retained after later uncertainty');
+            assert.equal(observed.filter(event => event.commandName === 'abortTransaction').length, 0);
+        }
+        if (phase === 'receipt getMore') assert.equal(observed.filter(event => event.commandName === 'getMore'
+            && event.command.collection === '$cmd.aggregate').length, 1, 'no resume/retry after creation receipt failure');
+        if (phase === 'index') {
+            const indexes = observed.filter(event => event.commandName === 'createIndexes');
+            assert.equal(indexes.length, 2, 'first reviewed index persists, second attempt fails');
+            assert.ok((await db.collection(indexes[0].command.createIndexes).listIndexes().toArray())
+                .some(index => index.name === indexes[0].command.indexes[0].name));
+        }
+    });
+});
 
 test('existing or partial singleton is never defaulted or overwritten', async t => {
     for (const row of [{ _id: 'singleton' }, { ...initialState },
@@ -196,6 +453,101 @@ test('all reviewed history including terminal rows veto initialization and prese
             assert.deepEqual(await db.collection(model.collection.name).findOne({}), row);
         });
     }
+});
+
+test('unfinished foreign unique index is not readiness; refusal retains held scope before singleton write', async () => {
+    const pins = await reset();
+    await db.collection('nodeoperationlocks').dropIndex('node_1');
+    const seed = { _id: new mongo.ObjectId(), node: new mongo.ObjectId() };
+    await db.collection('nodeoperationlocks').insertOne(seed);
+    const admin = client.db('admin');
+    const configured = await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn' });
+    let pending;
+    try {
+        pending = db.collection('nodeoperationlocks').createIndex({ node: 1 }, { unique: true })
+            .then(value => ({ value }), error => ({ error }));
+        await admin.command({ waitForFailPoint: 'hangAfterStartingIndexBuild',
+            timesEntered: configured.count + 1, maxTimeMS: 5000 });
+        await db.collection('nodeoperationlocks').deleteOne({ _id: seed._id });
+        const regular = await db.collection('nodeoperationlocks').listIndexes().toArray();
+        assert.equal(regular.find(row => row.name === 'node_1').buildUUID, undefined,
+            'ordinary listIndexes hides in-progress build metadata');
+        const detailed = await db.command({ listIndexes: 'nodeoperationlocks', includeBuildUUIDs: true });
+        assert.ok(detailed.cursor.firstBatch.some(row => row.buildUUID));
+        const authority = simulatedAuthority();
+        const start = commands.length;
+        await assert.rejects(assemble(pins, authority).initialize(), { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+        assert.deepEqual(writes(commands.slice(start)), []);
+        assert.equal(await db.collection('cascadetopologystates').countDocuments(), 0);
+        assert.equal(authority.state.retained, true);
+        const after = await db.command({ listIndexes: 'nodeoperationlocks', includeBuildUUIDs: true });
+        assert.deepEqual(after.cursor.firstBatch, detailed.cursor.firstBatch, 'foreign build retained, not awaited or cancelled');
+    } finally {
+        await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off' });
+        if (pending) assert.equal((await pending).error, undefined);
+    }
+    // Exactly the same catalog is admissible once the foreign build has completed,
+    // but a fresh operator attempt is needed (not a retry by the initializer).
+    const authority = simulatedAuthority();
+    assert.equal((await assemble(pins, authority).initialize()).initialized, true);
+    assert.equal(authority.state.retained, false);
+});
+
+test('late foreign builds on paginated catalogs veto pretransaction and postcommit confirmation', async t => {
+    for (const phase of ['before singleton transaction', 'after singleton commit']) await t.test(phase, async () => {
+        const pins = await reset();
+        const name = 'topologyexecutionenrollments';
+        const admin = client.db('admin');
+        let pending, configured;
+        const start = commands.length;
+        const race = afterCommand(event => phase === 'after singleton commit'
+            ? event?.commandName === 'commitTransaction'
+            : event?.commandName === 'hello'
+                && commands.slice(start).filter(row => row.commandName === 'hello').length === 2,
+        async () => {
+            await db.collection(name).dropIndex('endpoint.ip_1_endpoint.port_1');
+            const seed = { _id: new mongo.ObjectId() };
+            await db.collection(name).insertOne(seed);
+            configured = await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn' });
+            pending = db.collection(name).createIndex({ 'endpoint.ip': 1, 'endpoint.port': 1 }, { unique: true })
+                .then(value => ({ value }), error => ({ error }));
+            await admin.command({ waitForFailPoint: 'hangAfterStartingIndexBuild',
+                timesEntered: configured.count + 1, maxTimeMS: 5000 });
+            await db.collection(name).deleteOne({ _id: seed._id });
+        });
+        try {
+            await assert.rejects(assemble(pins, race.authority).initialize(), { code: 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' });
+            assert.equal(race.fired(), true);
+            assert.equal(race.authority.state.retained, true);
+            assert.equal(await db.collection('cascadetopologystates').countDocuments(), phase === 'after singleton commit' ? 1 : 0);
+            const detailed = await db.command({ listIndexes: name, includeBuildUUIDs: true });
+            assert.ok(detailed.cursor.firstBatch.some(row => row.buildUUID));
+            assert.ok(commands.slice(start).some(event => event.commandName === 'getMore'
+                && event.command.collection === name), 'real pagination examined, not only firstBatch');
+        } finally {
+            if (configured) await admin.command({ configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off' });
+            if (pending) assert.equal((await pending).error, undefined);
+        }
+    });
+});
+
+test('failed index getMore refuses incomplete inventory without retry, before writes or after commit', async t => {
+    for (const postcommit of [false, true]) await t.test(String(postcommit), async () => {
+        const pins = await reset();
+        let armedAt;
+        const race = afterCommand(event => postcommit ? event?.commandName === 'commitTransaction'
+            : event?.commandName === 'listIndexes' && event.command.listIndexes === 'cascadelinks',
+        async () => { await failCommand('getMore', { errorCode: 50, errorLabels: [] }); armedAt = commands.length; });
+        try {
+            await assert.rejects(assemble(pins, race.authority).initialize(), { code: postcommit
+                ? 'PRODUCTION_INITIALIZATION_UNKNOWN_HOLD' : 'PRODUCTION_INITIALIZATION_REFUSED' });
+        } finally { await disableFailure(); }
+        assert.equal(race.fired(), true);
+        assert.equal(commands.slice(armedAt).filter(event => event.commandName === 'getMore').length, 1);
+        assert.equal(await db.collection('cascadetopologystates').countDocuments(), postcommit ? 1 : 0);
+        assert.equal(race.authority.state.retained, postcommit);
+        if (!postcommit) assert.deepEqual(writes(commands.slice(armedAt)), []);
+    });
 });
 
 test('additive indexes match actual source schemas, with no sync/drop or conflict repair', async t => {
