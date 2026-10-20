@@ -1,0 +1,30 @@
+# Parent-reviewed template: replace TEST_ENDPOINT_IP before installation.
+# This is a SEPARATE daemon; do not include the normal sshd configuration.
+Port 2222
+ListenAddress TEST_ENDPOINT_IP
+AddressFamily inet
+PidFile /run/c3-test-maintenance-sshd.pid
+HostKey /etc/ssh/ssh_host_ed25519_key
+AllowUsers c3-test-operator c3-test-runner
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PubkeyAcceptedAlgorithms ssh-ed25519
+UsePAM no
+AuthorizedKeysFile /etc/ssh/c3-test-keys/%u
+AuthorizedKeysCommand none
+PermitUserEnvironment no
+PermitTTY no
+DisableForwarding yes
+X11Forwarding no
+PermitTunnel no
+GatewayPorts no
+StrictModes yes
+LogLevel VERBOSE
+MaxAuthTries 3
+MaxSessions 4
+Subsystem sftp internal-sftp
+Match User c3-test-runner
+    ForceCommand /usr/bin/sudo -n /usr/local/libexec/c3-test-node-isolation dispatch

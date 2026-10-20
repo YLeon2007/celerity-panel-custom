@@ -1,0 +1,65 @@
+{
+  "diagnosticOnly": true,
+  "notAuthority": true,
+  "observedAtUtc": "2026-10-20T12:14:10Z",
+  "collection": "fixed native ssh2 TEST backend credential read; first-observation Ed25519 handshake plus remote readback",
+  "sharedPanelHostExcluded": true,
+  "nodes": [
+    {
+      "nodeId": "6ab18adc63913ebd4a917471",
+      "endpoint": {
+        "ip": "132.243.230.19",
+        "port": 22,
+        "username": "root"
+      },
+      "handshakeRawKeySha256": "03660586b3ab3c27b41c84abfac781c9a086b958d94b25ae55410c5030ef4c75",
+      "physical": {
+        "machineId": "03ab697936cc4040aa9357936e136744",
+        "bootId": "f30e3499-136a-4727-a5b5-96f1b23e4957",
+        "localEd25519RawKeySha256": "03660586b3ab3c27b41c84abfac781c9a086b958d94b25ae55410c5030ef4c75"
+      }
+    },
+    {
+      "nodeId": "6ab18d9c63913ebd4a917670",
+      "endpoint": {
+        "ip": "50.114.160.63",
+        "port": 22,
+        "username": "root"
+      },
+      "handshakeRawKeySha256": "83fc09177532c5c48975f8fb31b780c18507f5e6a018e73934b9be43e9a09a2b",
+      "physical": {
+        "machineId": "f7534b370b944fd4bc5b2a78f246dc3c",
+        "bootId": "04447755-f5d8-4ca5-92cd-d2586ba5e1c5",
+        "localEd25519RawKeySha256": "83fc09177532c5c48975f8fb31b780c18507f5e6a018e73934b9be43e9a09a2b"
+      }
+    },
+    {
+      "nodeId": "6ab4b53bc4c0304573e06c72",
+      "endpoint": {
+        "ip": "104.143.201.72",
+        "port": 22,
+        "username": "root"
+      },
+      "handshakeRawKeySha256": "e0e351fc7ffa4ae78e17752dad975d4ec57aa298e1f719b6b16aa73f902e5aa2",
+      "physical": {
+        "machineId": "12c0b47b8fff4f2d8c3273f6db48c56a",
+        "bootId": "4ad1648b-4473-45db-95ce-43509eb4ca26",
+        "localEd25519RawKeySha256": "e0e351fc7ffa4ae78e17752dad975d4ec57aa298e1f719b6b16aa73f902e5aa2"
+      }
+    },
+    {
+      "nodeId": "6ab93ad2646b4b7d2f43c907",
+      "endpoint": {
+        "ip": "94.103.2.186",
+        "port": 22,
+        "username": "root"
+      },
+      "handshakeRawKeySha256": "9d23a4dfc2242f2244640c889f376b86f532bb19ae925f8a3f8fd9c5492b0e14",
+      "physical": {
+        "machineId": "dc637dbeac976689f40e5d431884553a",
+        "bootId": "c2dffccc-0bb1-4489-84cc-47c8e518eb5a",
+        "localEd25519RawKeySha256": "9d23a4dfc2242f2244640c889f376b86f532bb19ae925f8a3f8fd9c5492b0e14"
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# Parent must validate via visudo -cf; root:root 0440.
+# Root operator is explicitly trusted TCB. Runner has no general sudo or shell API.
+Defaults!/usr/local/libexec/c3-test-node-isolation env_keep += "SSH_ORIGINAL_COMMAND"
+c3-test-runner ALL=(root) NOPASSWD: /usr/local/libexec/c3-test-node-isolation dispatch
+c3-test-operator ALL=(root) NOPASSWD: ALL

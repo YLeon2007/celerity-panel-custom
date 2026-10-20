@@ -1,0 +1,14 @@
+[Unit]
+Description=Independent TEST node operator and protocol-only SSH transport
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/c3-test-maintenance.conf
+ExecStart=/usr/sbin/sshd -D -e -f /etc/ssh/c3-test-maintenance.conf
+KillMode=control-group
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
