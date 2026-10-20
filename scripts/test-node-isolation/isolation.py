@@ -24,6 +24,9 @@ RUNNER = '/usr/local/bin/celerity-topology-node-runner'
 HELPER = '/usr/local/libexec/c3-test-node-isolation'
 CONFIG = '/etc/c3-test-node-isolation.json'
 STATE = '/var/lib/c3-test-node-isolation'
+# Export only with the actual sticky Engine.dispatch admission gate below.
+# Installed helper SHA256 must still be independently accepted by the restorer.
+RESTORE_ADMISSION_VERSION = 1
 RUNNER_FENCES = '/var/lib/celerity/topology/fences'
 MAINT_UNIT = 'c3-test-maintenance-sshd.service'
 MAINT_CONFIG = '/etc/ssh/c3-test-maintenance.conf'

@@ -6,9 +6,11 @@ metadata, затем перечитывает их и состояние сер�
 node locks/admissions и никогда не удаляет/открывает restore admission.
 Успех означает только `NODE_ORIGINALS_RESTORED_RETAINED`, не право на handback.
 
-На этой ветке нет установки, SSH/live/systemd/root-мутаций. Production CLI
-пока **закрыт**: исходный установленный isolation не имеет требуемого admission
-hook. Родитель интегрирует и независимо проверяет этот hook отдельно.
+На этой ветке нет установки, SSH/live/systemd/root-мутаций. Production CLI требует отдельно проверенной установки: integrated isolation
+теперь экспортирует `RESTORE_ADMISSION_VERSION = 1` и реально закрывает dispatch
+при любом marker/unfinished marker. Parent проверяет эти installed bytes/pins;
+сам source export не является live authority. Positive local integration проходит
+реальные `Engine.close_dispatch → NodeOriginals.restore`, сохраняя marker и hold.
 
 ## Fixed surface
 
@@ -138,9 +140,9 @@ close or bad receipt refuse before stop/write. No journal is synthesized.
 
 ## Отдельный минимальный hook для владельца isolation.py
 
-Этот файл **не изменяет** `isolation.py`. Перед положительной production
-реставрацией родитель должен интегрировать/проверить следующий equivalent hunk
-во всех application dispatch paths, внутри уже взятого outer lock:
+Source hook интегрирован и закрыт actual-dispatch/actual-restore regression
+`test_originals_dispatch_integration.py`. Ниже зафиксирован minimal contract;
+production restore всё равно требует независимо accepted installed helper SHA256:
 
 ```python
 # Export ONLY after actual dispatch exclusion is implemented and tested.
