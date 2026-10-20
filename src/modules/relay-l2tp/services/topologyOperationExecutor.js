@@ -568,7 +568,67 @@ class TopologyOperationExecutor {
         }
     }
 
-    // DORMANT data-only API: never called by worker; never releases ownership.
+    async terminalBindings(contexts) {
+        if (!Array.isArray(contexts) || !contexts.length) throw unprovenBinding();
+        const bindings = [];
+        for (const context of contexts) {
+            const state = this.#preparedBinding(context);
+            if (state.phase !== 'verify' || state.busy || state.uncertain || state.terminal) throw unprovenBinding();
+            bindings.push((await this.#proveBinding(context, state.binding, state.binding.durable)).durable);
+        }
+        return Object.freeze(bindings);
+    }
+
+    // All side-effecting auxiliary writers must remain inside the independently
+    // held maintenance scopes AND the exact persisted claim/lock/owner fences.
+    async withVerifiedMutationScope(contexts, work) {
+        const bindings = await this.terminalBindings(contexts);
+        if (typeof this.#executionBindingReader?.withVerifiedBinding !== 'function') throw unprovenBinding();
+        const checks = [];
+        const assertCurrent = async () => { for (const check of checks) await check(); };
+        const enter = async index => {
+            if (index === contexts.length) {
+                await assertCurrent();
+                const result = await work(assertCurrent);
+                await assertCurrent();
+                return result;
+            }
+            const state = this.#preparedBinding(contexts[index]);
+            return this.#executionBindingReader.withVerifiedBinding(state.binding.expected, async (record, check) => {
+                if (!sameRecord(record, bindings[index]) || typeof check !== 'function') throw unprovenBinding();
+                checks.push(check);
+                try { return await enter(index + 1); } finally { checks.pop(); }
+            });
+        };
+        return enter(0);
+    }
+
+    // Recovery performs only the exact immutable close-ID status query. No
+    // bootstrap/upload, close retry, lease claim, generation or ID allocation.
+    async probeTerminalBinding(durable, role = durable?.targetProfile === 'xray-main' ? 'portal' : undefined) {
+        if (!hasExactKeys(durable, RECORD_KEYS) || !isDeepFrozen(durable)
+            || durable.executionContext !== this.#hostIdentity
+            || typeof this.#executionBindingReader?.withReadOnlyVerifiedBinding !== 'function') throw unprovenBinding();
+        const expectedKeys = RECORD_KEYS.filter(key => !['attemptId', 'predecessorGeneration', 'commandIds', 'bootId', 'maintenanceId'].includes(key));
+        const expected = Object.freeze(Object.fromEntries(expectedKeys.map(key => [key, durable[key]])));
+        return this.#executionBindingReader.withReadOnlyVerifiedBinding(expected, async (current, assertCurrent) => {
+            if (!sameRecord(current, durable)) throw unprovenBinding();
+            const authority = await this.#executionBindingReader.readVerifiedConnection(expected, current);
+            if (!sameRecord(authority.binding, current) || !validTrustedConnection(authority.connection)) throw unprovenBinding();
+            if (!(durable.targetProfile === 'xray-main' ? role === 'portal' : ['relay', 'bridge'].includes(role))) throw unprovenBinding();
+            const nodeSSH = await this.#nodeExecutionResolver.resolve({ nodeId: durable.nodeId, role }, authority.connection);
+            await assertCurrent();
+            const transport = new this.#NodeTransportFactory({ executionContext: this.#hostIdentity,
+                nodeExecutionResolver: { resolve: async () => nodeSSH } }).create({ nodeId: durable.nodeId, role });
+            const resolved = await transport;
+            const proof = assertTerminalReceipt(await resolved.status({ ...transportRequest({ ...durable, durable }, 'close'),
+                completedCommand: 'close' }), 'status', { ...durable, durable }, 'verified');
+            await assertCurrent();
+            return proof;
+        });
+    }
+
+    // Exact terminal readback; ownership settlement belongs to Mongo, not SSH.
     async close(context) {
         const state = this.#preparedBinding(context);
         if (state.busy || state.uncertain || state.terminal
@@ -604,6 +664,7 @@ class TopologyOperationExecutor {
                     return status;
                 });
             state.terminal = true;
+            TERMINAL_PROOFS.add(proof);
             return proof;
         } catch (error) {
             state.uncertain = true;
@@ -635,7 +696,11 @@ class TopologyOperationExecutor {
     }
 }
 
+const TERMINAL_PROOFS = new WeakSet();
+function isTopologyTerminalProof(proof) { return Boolean(proof) && TERMINAL_PROOFS.has(proof); }
+
 module.exports = {
+    isTopologyTerminalProof,
     TEST_TARGET,
     TopologyOperationExecutor,
     TopologyOperationExecutorError,

@@ -93,6 +93,34 @@ class TopologyOperationFinalizer {
         return this.repository.finalizeRolledBack({ ...input, now });
     }
 
+    #v2Request(input, extras = []) {
+        const base = Object.fromEntries(FINALIZATION_INPUT_KEYS.map(key => [key, input?.[key]]));
+        assertFinalizationInput(base);
+        if (!hasExactKeys(input, [...FINALIZATION_INPUT_KEYS, ...extras].sort())) throw new TypeError('Invalid V2 finalization input');
+        const now = this.clock.now();
+        if (!validDate(now)) throw new TypeError('Invalid V2 finalization clock');
+        return { ...input, now };
+    }
+
+    beginV2Closure(input) {
+        return this.repository.beginV2Closure(this.#v2Request(input, ['bindings']));
+    }
+
+    persistV2TerminalProofs(input) {
+        return this.repository.persistV2TerminalProofs(this.#v2Request(input, ['proofs', 'sideEffects']));
+    }
+
+    async finalizeV2Succeeded(input) {
+        return projectFinalized(await this.repository.finalizeV2Succeeded(this.#v2Request(input)), input);
+    }
+
+    probeV2Settlement(input) {
+        if (!hasExactKeys(input, ['operationId']) || typeof input.operationId !== 'string' || !input.operationId) {
+            throw new TypeError('Invalid V2 recovery input');
+        }
+        return this.repository.probeV2Settlement(input);
+    }
+
     async finalizeSucceeded(input) {
         assertFinalizationInput(input);
         const now = this.clock.now();

@@ -397,7 +397,7 @@ class TopologyExecutionBindingStore {
         };
         const result = await this.#scope(action, enrollmentProjection(enrollment), expected, async (receipt, ensureOpen) => {
             if (receipt.maintenanceId !== enrollment.maintenanceId) throw failure();
-            const nonce = randomUUID();
+            const nonce = action === 'probe' ? null : randomUUID();
             let row = creating ? { ...expected, ...enrollmentProjection(enrollment),
                 ...(predecessor ? { predecessorGeneration: predecessor.generation } : {}),
                 _id: randomUUID(), enrollmentId: enrollment._id, attemptId: randomUUID(), ...receipt,
@@ -405,7 +405,40 @@ class TopologyExecutionBindingStore {
             if (row) row.commandTokens = COMMANDS.map(command => row.commandIds[command]);
             const ownerFilter = this.#ownerFilter(enrollment);
             const nodeFilter = this.#nodeFilter(enrollment);
+            let readOnlyOwnerEvidence;
             const check = async () => {
+                if (action === 'probe') {
+                    // Diagnostic recovery must not renew/claim, update CAS nonces,
+                    // retry a transaction or allocate any execution identifiers.
+                    // The independent external scope still excludes remote writers.
+                    ensureOpen();
+                    let deadline = Date.now() + TIMEOUT_MS;
+                    const operation = await this.#majority(this.#models.Operation, this.#operationFilter(expected, new Date()), deadline);
+                    this.#checkOperationRow(operation, expected);
+                    if (!(operation?.leaseUntil instanceof Date)) throw failure();
+                    deadline = Math.min(deadline, operation.leaseUntil.getTime());
+                    const lock = await this.#majority(this.#models.Lock, this.#lockFilter(expected, new Date()), deadline);
+                    if (!(lock?.leaseUntil instanceof Date)) throw failure();
+                    deadline = Math.min(deadline, lock.leaseUntil.getTime());
+                    const owner = await this.#majority(this.#models.Owner, ownerFilter, deadline);
+                    const evidence = this.#ownerEvidence(owner);
+                    if (readOnlyOwnerEvidence && !isDeepStrictEqual(evidence, readOnlyOwnerEvidence)) throw failure();
+                    readOnlyOwnerEvidence = evidence;
+                    if (!await this.#majority(this.#models.HyNode, nodeFilter, deadline)
+                        || !isDeepStrictEqual(await this.#majority(this.#models.Enrollment, { _id: enrollment._id }, deadline), enrollment)) throw failure();
+                    const current = await this.#majority(this.#models.Binding, { _id: selected._id }, deadline);
+                    this.#checkRow(current, enrollment, expected);
+                    if (!isDeepStrictEqual(current, selected) || current.maintenanceId !== receipt.maintenanceId) throw failure();
+                    if (predecessor) {
+                        if (!isDeepStrictEqual(await this.#majority(this.#models.Binding, { _id: predecessor._id }, deadline), predecessor)
+                            || !isDeepStrictEqual(current.predecessorReceipt, receipt.predecessorReceipt)) throw failure();
+                        const priorOperation = await this.#majority(this.#models.Operation, this.#terminalOperationFilter(predecessor), deadline);
+                        this.#checkOperationRow(priorOperation, predecessor);
+                    }
+                    validUntil = deadline;
+                    assertFresh(); ensureOpen();
+                    return recordProjection(current);
+                }
                 let ownerEvidence;
                 const confirmedRecord = await this.#transaction(async session => {
                     ensureOpen();
@@ -533,6 +566,11 @@ class TopologyExecutionBindingStore {
             if (!isDeepStrictEqual(record, verifiedBinding)) throw failure();
             return freeze({ binding: record, connection: this.#held.getStore().connection });
         });
+    }
+    // Read-only exact-ID status recovery; never substitutes for mutation authority.
+    async withReadOnlyVerifiedBinding(expected, work) {
+        if (typeof work !== 'function') throw failure();
+        return this.#binding('probe', expected, work);
     }
     // Hold external exclusion through close, fresh status and final exact DB readback.
     async withVerifiedBinding(expected, work) {

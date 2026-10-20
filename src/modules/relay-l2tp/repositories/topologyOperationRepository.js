@@ -382,6 +382,7 @@ class TopologyOperationRepository {
         const claimed = await this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
+            v2Terminal: { $exists: false },
             $or: [
                 { status: 'queued' },
                 {
@@ -412,6 +413,7 @@ class TopologyOperationRepository {
         return this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
+            v2Terminal: { $exists: false },
             status: { $in: [...ACTIVE_STATUSES] },
             leaseUntil: { $lte: now },
         }, {

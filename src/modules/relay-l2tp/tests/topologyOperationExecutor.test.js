@@ -10,6 +10,87 @@ const {
     TopologyOperationExecutorError,
 } = require('../services/topologyOperationExecutor');
 
+test('real V2 worker settles only after held proofs and keeps failure recovery read-only', async t => {
+    for (const fault of ['none', 'users', 'ppp', 'close', 'persist', 'settle']) await t.test(fault, async () => {
+        const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
+        const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+        const terminal = { phase: 'closed', terminal: true, terminalOutcome: 'verified', completedCommand: 'close' };
+        const { executor, reader, events } = executorFixture({ responseOverrides: {
+            close: fault === 'close' ? { ...terminal, bootId: 'wrong-boot' } : terminal, status: terminal } });
+        let held = 0, marker = null, claims = 0;
+        // Explicit LOCAL held-authority simulation, not operational attestation.
+        reader.withVerifiedBinding = async (expected, work) => {
+            held++;
+            try { return await work(await reader.readVerified(expected), async () => {}); }
+            finally { held--; }
+        };
+        reader.withReadOnlyVerifiedBinding = reader.withVerifiedBinding;
+        const node = frozenNode();
+        const operation = { _id: prepareContext().operationId, executionContext: TEST,
+            idempotencyKey: 'topology:test:revision-17:host-test.infograd.online:00000000-0000-0000-0000-000000000000',
+            topologyRevision: 17, priorDeployedRevision: 16, attempts: 1, heldTopologyAdmission: true,
+            status: 'preparing', nodes: [{ ...node, state: 'pending', backupId: '' }] };
+        const order = [];
+        const worker = new TopologyOperationWorker({ executionContext: TEST, executor,
+            allowUnprovenTestExecution: true, workerId: executionFence.owner, leaseMs: 30000,
+            clock: { now: () => new Date() },
+            operationRepository: { async claim() { claims++; return operation; }, async renewLease() { return true; },
+                async recordNode() { return true; }, async setPhase() { return true; }, async finishClaimed() { throw new Error('no terminal fallback'); } },
+            lockService: { async acquire() { return { ok: true, lock: { generation: executionFence.generation } }; },
+                async renew() { return { ok: true }; }, async release() { throw new Error('no separate release'); } },
+            userResync: { async resyncPlan() { assert.ok(held); order.push('users'); return { ok: fault !== 'users' }; } },
+            pppReadinessGate: { async verifyPlan() { assert.ok(held); order.push('ppp'); return { ok: fault !== 'ppp', relayRevisions: [] }; } },
+            finalizer: { async finalizeSucceeded() { throw new Error('legacy publish forbidden'); },
+                async probeV2Settlement() { return marker; },
+                async beginV2Closure({ bindings }) {
+                    marker = freeze({ status: 'committing', retained: true, terminal: { bindings } });
+                    order.push('intent'); return true;
+                },
+                async persistV2TerminalProofs({ proofs }) {
+                    assert.equal(require('../services/topologyOperationExecutor').isTopologyTerminalProof(proofs[0]), true);
+                    order.push('persist'); if (fault === 'persist') throw new Error('unknown persistence'); return true;
+                },
+                async finalizeV2Succeeded() { order.push('atomic-settle'); if (fault === 'settle') throw new Error('unknown transaction'); return true; } },
+        });
+        const result = await worker.run(operation._id);
+        if (fault === 'none') {
+            assert.equal(result.status, 'succeeded', JSON.stringify(result));
+            assert.deepEqual(order, ['intent', 'users', 'ppp', 'persist', 'atomic-settle']);
+            assert.deepEqual(events.filter(event => event.method === 'transport').map(event => event.request.command),
+                ['prepare', 'commit', 'verify', 'close', 'status']);
+        } else {
+            assert.equal(result.status, 'committing');
+            assert.equal(result.drainUncertain, true);
+            const before = [...order]; events.length = 0;
+            const recovered = await worker.run(operation._id);
+            assert.equal(recovered.errorCode, 'TOPOLOGY_V2_RECOVERY_REQUIRES_SETTLEMENT_REVIEW');
+            assert.equal(claims, 1);
+            assert.deepEqual(order, before, 'recovery must not retry mutation, close, persistence or settlement');
+            assert.deepEqual(events.map(event => event.method), ['resolve', 'transport']);
+            assert.equal(events[1].request.command, 'status');
+            assert.equal(events[1].request.commandId, marker.terminal.bindings[0].commandIds.close);
+        }
+        assert.equal(held, 0);
+    });
+});
+
+test('V2 recovery probes only the persisted close ID without bootstrap or mutating dispatch', async () => {
+    const terminal = { phase: 'closed', terminal: true, terminalOutcome: 'verified', completedCommand: 'close' };
+    const { executor, reader, events } = executorFixture({ responseOverrides: { close: terminal, status: terminal } });
+    reader.withVerifiedBinding = async (expected, work) => work(await reader.readVerified(expected), async () => {});
+    reader.withReadOnlyVerifiedBinding = reader.withVerifiedBinding;
+    const prepared = await executor.prepare(prepareContext());
+    const context = lifecycleContext(prepared);
+    await executor.commit(context); await executor.verify(context); await executor.close(context);
+    const binding = await reader.readVerified({ nodeId: context.node.node });
+    events.length = 0;
+    const proof = await executor.probeTerminalBinding(binding);
+    assert.equal(proof.commandId, binding.commandIds.close);
+    assert.equal(proof.command, 'status');
+    assert.deepEqual(events.map(event => event.method), ['resolve', 'transport']);
+    assert.equal(events[1].request.command, 'status');
+});
+
 function canonicalize(value) {
     if (Array.isArray(value)) return value.map(canonicalize);
     if (!value || typeof value !== 'object') return value;

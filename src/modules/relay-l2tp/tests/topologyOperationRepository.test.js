@@ -795,6 +795,7 @@ test('claim reads only durable candidates and never resets later active phases',
         query: {
             _id: 'operation-1',
             ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
+            v2Terminal: { $exists: false },
             $or: [
                 { status: 'queued' },
                 {
@@ -891,6 +892,7 @@ test('claim reacquires expired committing and rolling-back phases without resett
         query: {
             _id: 'operation-1',
             ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
+            v2Terminal: { $exists: false },
             status: { $in: ['preparing', 'committing', 'rolling_back'] },
             leaseUntil: { $lte: NOW },
         },

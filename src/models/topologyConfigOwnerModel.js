@@ -31,6 +31,11 @@ const schema = new mongoose.Schema({
     handbackReceipt: { type: receiptSchema },
     // No defaults: an unbound/cloned/legacy row is not an adoption permit.
     owner: { type: String, required: true, enum: ['classic', 'topology'] },
+    // Operation settlement metadata never hands permanent ownership to classic.
+    lastSettledOperation: { type: String },
+    lastSettledGeneration: { type: String },
+    lastSettledRevision: { type: Number, min: 0 },
+    lastSettledCloseId: { type: String },
     // Dormant binding-store CAS nonce, not evidence of remote quiescence.
     executionBindingCheck: { type: String },
     generation: { type: String, required: true, match: /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/ },

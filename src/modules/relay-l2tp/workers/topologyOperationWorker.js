@@ -1037,6 +1037,54 @@ class TopologyOperationWorker {
             ...(fenceReleased ? {} : { drainUncertain: true }) };
     }
 
+    async completeV2(plan, operationId, prepared, heartbeat, acquiredNodeIds) {
+        const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
+        if (!(this.executor instanceof TopologyOperationExecutor)
+            || !this.userResync || !this.pppReadinessGate
+            || ['beginV2Closure', 'persistV2TerminalProofs', 'finalizeV2Succeeded', 'probeV2Settlement']
+                .some(method => typeof this.finalizer[method] !== 'function')) {
+            return { claimed: true, operationId, status: 'committing', stopped: true,
+                drainUncertain: true, errorCode: 'TOPOLOGY_V2_HANDOFF_UNPROVEN' };
+        }
+        try {
+            const contexts = prepared.map(entry => this.context(plan, entry.node, entry.prepared, entry.backupId));
+            const bindings = await this.executor.terminalBindings(contexts);
+            let request = { operationId, owner: this.workerId, leaseUntil: await heartbeat.renew(),
+                topologyRevision: plan.topologyRevision, priorDeployedRevision: plan.priorDeployedRevision };
+            if (!await this.finalizer.beginV2Closure({ ...request, bindings })) throw new Error('Closure intent unconfirmed');
+            const sideEffects = await heartbeat.run(() => this.executor.withVerifiedMutationScope(contexts, async assertCurrent => {
+                await assertCurrent();
+                if ((await this.userResync.resyncPlan(plan))?.ok !== true) throw new Error('User proof unconfirmed');
+                await assertCurrent();
+                const ppp = await this.pppReadinessGate.verifyPlan(plan);
+                if (ppp?.ok !== true || !Array.isArray(ppp.relayRevisions)) throw new Error('PPP proof unconfirmed');
+                await assertCurrent();
+                if (plan.kind === 'link.attach') {
+                    if (!this.attachIngressGate || (await this.attachIngressGate.verifyPlan(plan))?.ok !== true) {
+                        throw new Error('Attach ingress unconfirmed');
+                    }
+                    await assertCurrent();
+                }
+                return { usersVerified: true, pppProof: ppp.relayRevisions, attachVerified: plan.kind === 'link.attach' };
+            }));
+            const proofs = [];
+            for (const context of contexts) proofs.push(await heartbeat.run(() => this.executor.close(context)));
+            request = { ...request, leaseUntil: await heartbeat.renew() };
+            if (!await this.finalizer.persistV2TerminalProofs({ ...request, proofs, sideEffects })) throw new Error('Proof persistence unconfirmed');
+            // Join all renewal before the single transaction deletes exact locks.
+            // There is no release call or remote rollback, including on failure.
+            const leaseUntil = await heartbeat.renew();
+            await heartbeat.stop();
+            if (!await this.finalizer.finalizeV2Succeeded({ ...request, leaseUntil })) throw new Error('Settlement unconfirmed');
+            acquiredNodeIds.length = 0;
+            return { claimed: true, operationId, status: 'succeeded' };
+        } catch (error) {
+            traceWorkerFailure(plan, operationId, 'worker.v2-terminal', error);
+            return { claimed: true, operationId, status: 'committing', stopped: true,
+                drainUncertain: true, errorCode: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' };
+        }
+    }
+
     async run(operationIdentity) {
         const operationId = entityId(operationIdentity);
         if (!SAFE_ID_PATTERN.test(operationId)) {
@@ -1060,6 +1108,29 @@ class TopologyOperationWorker {
         let plan;
         const acquiredNodeIds = [];
         try {
+            if (this.#retainExecutionOwnership && typeof this.finalizer.probeV2Settlement === 'function') {
+                let recovery;
+                try { recovery = await this.finalizer.probeV2Settlement({ operationId }); }
+                catch {
+                    return { claimed: false, operationId, stopped: true, drainUncertain: true,
+                        errorCode: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' };
+                }
+                if (recovery) {
+                    if (recovery.terminal.bindings.some(binding => binding.executionContext !== this.executionContext.hostIdentity)) {
+                        return { claimed: false, operationId, stopped: true, drainUncertain: true,
+                            errorCode: 'TOPOLOGY_OPERATION_EXECUTION_CONTEXT_MISMATCH' };
+                    }
+                    if (recovery.status === 'succeeded' && recovery.retained === false) {
+                        return { claimed: false, operationId, status: 'succeeded' };
+                    }
+                    try {
+                        for (const binding of recovery.terminal.bindings) await this.executor.probeTerminalBinding(binding,
+                            recovery.nodes?.find(node => node.nodeId === binding.nodeId)?.role);
+                    } catch { /* Unknown/expired authority retains all persisted ownership. */ }
+                    return { claimed: false, operationId, status: 'committing', stopped: true, drainUncertain: true,
+                        errorCode: 'TOPOLOGY_V2_RECOVERY_REQUIRES_SETTLEMENT_REVIEW' };
+                }
+            }
             const operation = await this.operationRepository.claim({
                 executionContext: this.executionContext,
                 operationId,
@@ -1299,13 +1370,10 @@ class TopologyOperationWorker {
                 }
             }
 
-            // V2 command completion is not terminal readback and cannot prove
-            // bootstrap/classic writer exclusion or handback. This bounded slice
-            // has no such authority: retain locks/admission, and do not invoke
-            // auxiliary classic writers or publish success from these receipts.
+            // V2 success has its own durable close/proof/atomic-settlement path.
+            // Never use legacy TEST release-before-publication for real receipts.
             if (this.#retainExecutionOwnership) {
-                return { claimed: true, operationId, status: 'committing', stopped: true,
-                    drainUncertain: true, errorCode: 'TOPOLOGY_V2_HANDOFF_UNPROVEN' };
+                return await this.completeV2(plan, operationId, prepared, heartbeat, acquiredNodeIds);
             }
 
             // The candidate restart clears dynamic Xray users. Reconcile and

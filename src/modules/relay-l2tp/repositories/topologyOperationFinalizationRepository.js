@@ -164,7 +164,8 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
 
 class TopologyOperationFinalizationRepository {
     constructor({ TopologyOperation, CascadeTopologyState, CascadeLink,
-        CascadeRouteGroup, RelayL2tpState, transactionRunner } = {}) {
+        CascadeRouteGroup, RelayL2tpState, transactionRunner, NodeOperationLock,
+        TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment } = {}) {
         if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function'
             || typeof TopologyOperation.findById !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
@@ -183,6 +184,26 @@ class TopologyOperationFinalizationRepository {
         this.CascadeRouteGroup = CascadeRouteGroup || null;
         this.RelayL2tpState = RelayL2tpState || null;
         this.transactionRunner = runTransaction;
+        Object.assign(this, { NodeOperationLock, TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment });
+    }
+
+    beginV2Closure(request) {
+        assertFinalizationRequest(request);
+        return require('./topologyV2Settlement').begin(this, request);
+    }
+
+    persistV2TerminalProofs(request) {
+        assertFinalizationRequest(request);
+        return require('./topologyV2Settlement').persist(this, request);
+    }
+
+    finalizeV2Succeeded(request) {
+        assertFinalizationRequest(request);
+        return require('./topologyV2Settlement').settle(this, request);
+    }
+
+    probeV2Settlement({ operationId }) {
+        return require('./topologyV2Settlement').probe(this, operationId);
     }
 
     async finalizeRolledBack({ operationId, topologyRevision, priorDeployedRevision, now }) {
@@ -193,7 +214,8 @@ class TopologyOperationFinalizationRepository {
         }
         return this.transactionRunner(async session => {
             const durable = await this.TopologyOperation.findById(operationId)
-                .select('nodes.state nodes.backupId').session(session).lean();
+                .select('nodes.state nodes.backupId v2Terminal').session(session).lean();
+            if (durable?.v2Terminal) rejectFinalization();
             // Terminal labels alone are not rollback proof. A failed or still
             // prepared/committed node must retain the topology admission.
             if (!Array.isArray(durable?.nodes) || !durable.nodes.length
@@ -237,13 +259,15 @@ class TopologyOperationFinalizationRepository {
             priorDeployedRevision,
             now,
         } = request;
+        const session = request[require('./topologyV2Settlement').SESSION];
+        const run = session ? work => work(session) : this.transactionRunner;
         try {
-            return await this.transactionRunner(async session => {
+            return await run(async session => {
                 const admission = await this.TopologyOperation.findById(operationId)
-                    .select('heldTopologyAdmission pppWait nodes')
+                    .select('heldTopologyAdmission pppWait nodes v2Terminal')
                     .session(session)
                     .lean();
-                if (!admission) rejectFinalization();
+                if (!admission || (admission.v2Terminal && !request[require('./topologyV2Settlement').SESSION])) rejectFinalization();
                 const wait = admission.pppWait;
                 if (wait || request.pppProof !== undefined) {
                     const proof = request.pppProof;

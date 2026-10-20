@@ -106,7 +106,7 @@ const missingInstanceAuthority = async (challenge, work) => {
 function newStore(authority = goodAuthority) {
     return new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
 }
-async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand } = {}) {
+async function assembled(store, { onResolved, onBootstrap, localRunner, onCommand, executionContext = PROD } = {}) {
     const { TopologyOperationExecutor } = require('../services/topologyOperationExecutor');
     const { TopologyNodeExecutionResolver } = require('../services/topologyNodeExecutionResolver');
     const { runnerRequest, v2Receipt } = require('./helpers/topologyV2Fixture');
@@ -130,12 +130,12 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
         }
     }
     class LocalBootstrapper { async ensureRunner() { events.push('local-bootstrap'); await onBootstrap?.(); } }
-    const resolver = new TopologyNodeExecutionResolver({ ...PROD, NodeSSH: LocalSSH,
+    const resolver = new TopologyNodeExecutionResolver({ ...executionContext, NodeSSH: LocalSSH,
         HyNode: { findById(id) { events.push('node-read'); return Node.findById(id); } } });
     // REAL durable connection reader. Only external physical/maintenance
     // attestation and the SSH adapter are simulated locally; no pin wrapper.
     const reader = store;
-    const executor = new TopologyOperationExecutor({ ...PROD, nodeExecutionResolver: {
+    const executor = new TopologyOperationExecutor({ ...executionContext, nodeExecutionResolver: {
         async resolve(request, trustedConnection) {
             const { SIMULATED_TRUSTED_CONNECTION } = require('./helpers/topologyV2Fixture');
             assert.deepEqual(trustedConnection, SIMULATED_TRUSTED_CONNECTION);
@@ -1020,6 +1020,359 @@ async function terminalFixture(t, { authority = goodAuthority, onCommand } = {})
     await executor.commit(lifecycle);
     return { ...state, ...assembledState, row, localRunner, prefix, lifecycle };
 }
+
+async function settlementPrepared(t) {
+    const state = await terminalFixture(t);
+    await state.executor.verify(state.lifecycle);
+    const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology',
+        require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({});
+    await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+    await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed', 'nodes.0.backupId': state.expected.backupId } });
+    const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+    const repository = new Repository({ TopologyOperation: models.Operation, CascadeTopologyState: Topology,
+        NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner,
+        TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment });
+    const request = { operationId: state.expected.operationId, owner: state.expected.owner,
+        leaseUntil: (await models.Operation.findOne().lean()).leaseUntil, topologyRevision: 17, priorDeployedRevision: 16, now: new Date() };
+    await repository.beginV2Closure({ ...request, bindings: [state.row] });
+    const proof = await state.executor.close(state.lifecycle);
+    const sideEffects = { usersVerified: true, pppProof: [], attachVerified: false };
+    return { ...state, Topology, repository, request, proof, sideEffects };
+}
+
+test('assembled TEST worker uses real Mongo finalizer and real runner while PROD quiescence stays closed', async t => {
+    const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../domain/topologyExecutionContext');
+    const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+    const { TopologyOperationFinalizer } = require('../services/topologyOperationFinalizer');
+    const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+    const state = await setup();
+    await state.store.preEnroll(state.enrollment); await state.store.createBinding(state.expected);
+    // TEST-only local inventory. Production binding/enrollment constructors do
+    // not permit TEST; this raw fixture is never an operational enrollment API.
+    await models.Operation.collection.updateOne({}, { $set: { executionContext: TEST, status: 'queued', attempts: 0,
+        idempotencyKey: `topology:test:revision-17:host-${TEST.hostIdentity}:${randomUUID()}`, leaseOwner: '', leaseUntil: null } });
+    await models.Binding.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
+    await models.Enrollment.collection.updateOne({}, { $set: { executionContext: TEST.hostIdentity } });
+    await models.Owner.collection.updateOne({}, { $set: { executionContext: TEST } });
+    await models.Lock.deleteMany({});
+    const { RECORD_KEYS } = require('../models/topologyExecutionBindingContract');
+    const bindingRow = await models.Binding.findOne().lean();
+    const binding = freeze(Object.fromEntries(RECORD_KEYS.map(key => [key, bindingRow[key]])));
+    const lockRepository = new NodeOperationLockRepository({ model: models.Lock });
+    let held = 0;
+    const assertCurrent = async () => {
+        const operation = await models.Operation.findById(binding.operationId).lean();
+        const lock = await models.Lock.findOne().lean();
+        assert.equal(operation.attempts, binding.attempt); assert.equal(operation.leaseOwner, binding.owner);
+        assert.ok(operation.leaseUntil > new Date()); assert.equal(operation.heldTopologyAdmission, true);
+        assert.equal(lock.generation, binding.generation); assert.equal(lock.owner, binding.owner); assert.ok(lock.leaseUntil > new Date());
+    };
+    const reader = {
+        async readVerified() { await assertCurrent(); return binding; },
+        async readVerifiedConnection() { await assertCurrent(); return freeze({ binding,
+            connection: require('./helpers/topologyV2Fixture').SIMULATED_TRUSTED_CONNECTION }); },
+        async withVerifiedBinding(expected, work) {
+            held++; try { await assertCurrent(); const result = await work(binding, assertCurrent); await assertCurrent(); return result; }
+            finally { held--; }
+        },
+    };
+    const runner = require('./helpers/topologyTerminalFakeRunner').fakeRunner(t, BOOT);
+    assert.equal(runner.execute(`runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${binding.candidateHash} --backup-id previous --target-profile xray-main --execution-context ${TEST.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`).code, 0);
+    const { executor, events } = await assembled(reader, { executionContext: TEST, localRunner: runner });
+    const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology', require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({}); await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+    const finalizer = new TopologyOperationFinalizer({ clock: { now: () => new Date() }, repository: new Repository({
+        TopologyOperation: models.Operation, CascadeTopologyState: Topology, NodeOperationLock: models.Lock,
+        TopologyConfigOwner: models.Owner, TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment }) });
+    const worker = new TopologyOperationWorker({ executionContext: TEST, allowUnprovenTestExecution: true,
+        operationRepository: new TopologyOperationRepository({ model: models.Operation }), executor, finalizer,
+        workerId: binding.owner, clock: { now: () => new Date() }, leaseMs: 120000,
+        lockService: { async acquire({ node, owner, operationId, leaseMs }) {
+            const result = await lockRepository.acquireLease({ node, owner, operationId, generation: binding.generation,
+                leaseUntil: new Date(Date.now() + leaseMs) }); return { ok: result.acquired, lock: result.lock };
+        }, async renew(request) { return { ok: await lockRepository.renewLease({ ...request, now: new Date(), leaseUntil: new Date(Date.now() + request.leaseMs) }) }; },
+        async release() { throw new Error('no separate V2 release'); } },
+        userResync: { async resyncPlan() { assert.ok(held); await assertCurrent(); return { ok: true }; } },
+        pppReadinessGate: { async verifyPlan() { assert.ok(held); await assertCurrent(); return { ok: true, relayRevisions: [] }; } } });
+    assert.equal((await worker.run(binding.operationId)).status, 'succeeded');
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, false);
+    assert.equal(await models.Lock.countDocuments(), 0);
+    assert.equal((await Topology.findOne().lean()).topologyAdmissionCount, 0);
+    assert.deepEqual(events.filter(event => typeof event === 'object').map(event => event.command), ['prepare', 'commit', 'verify', 'close', 'status']);
+    const before = [...events];
+    assert.equal((await worker.run(binding.operationId)).status, 'succeeded');
+    assert.deepEqual(events, before, 'settled replay reads durable outcome without SSH');
+});
+
+test('V2 settlement rejects forged proof, changed bindings, ownership and lease fences without partial publication', async t => {
+    for (const fault of ['unbranded', 'close-id', 'boot', 'attempt', 'operation', 'foreign-lock', 'expired-lock',
+        'expired-lease', 'array-status', 'owner-snapshot', 'topology-drift', 'transaction-abort']) await t.test(fault, async t => {
+        const f = await settlementPrepared(t);
+        if (fault === 'unbranded') {
+            await assert.rejects(f.repository.persistV2TerminalProofs({ ...f.request, sideEffects: f.sideEffects, proofs: [{ ...f.proof }] }));
+        } else {
+            await f.repository.persistV2TerminalProofs({ ...f.request, sideEffects: f.sideEffects, proofs: [f.proof] });
+            const proofField = { 'close-id': 'commandId', boot: 'bootId', attempt: 'attemptId', operation: 'operationId' }[fault];
+            if (proofField) await models.Operation.collection.updateOne({}, { $set: { [`v2Terminal.proofs.0.${proofField}`]: randomUUID() } });
+            if (fault === 'foreign-lock') await models.Lock.collection.updateOne({}, { $set: { generation: randomUUID(), owner: 'winner' } });
+            if (fault === 'expired-lock') await models.Lock.updateOne({}, { $set: { leaseUntil: new Date(0) } });
+            if (fault === 'expired-lease') await models.Operation.updateOne({}, { $set: { leaseUntil: new Date(0) } });
+            if (fault === 'array-status') await models.Operation.collection.updateOne({}, { $set: { status: ['committing'] } });
+            if (fault === 'owner-snapshot') await models.Owner.updateOne({}, { $set: { 'originalSnapshot.configSha256': 'f'.repeat(64) } });
+            if (fault === 'topology-drift') await f.Topology.updateOne({}, { $set: { revision: 18 } });
+            const before = await Promise.all([models.Operation, models.Lock, models.Owner, f.Topology].map(model => model.findOne().lean()));
+            const original = f.Topology.updateOne;
+            if (fault === 'transaction-abort') f.Topology.updateOne = async () => { throw new Error('local injected publication failure'); };
+            try { await assert.rejects(f.repository.finalizeV2Succeeded(f.request)); }
+            finally { f.Topology.updateOne = original; }
+            assert.deepEqual(await Promise.all([models.Operation, models.Lock, models.Owner, f.Topology].map(model => model.findOne().lean())), before);
+        }
+        assert.equal(await models.Lock.countDocuments(), 1);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal((await f.Topology.findOne().lean()).topologyAdmissionCount, 1);
+    });
+});
+
+test('V2 relay settlement fences the proved PPP credential revision in the publication transaction', async t => {
+    for (const drift of [false, true]) await t.test(drift ? 'credential drift retains locks and admission' : 'exact PPP revision settles', async t => {
+        const state = await setup();
+        const node = freeze({ ...frozenNode, role: 'relay', nodeRef: 'relay-1', targetProfile: 'xray-bridge',
+            configPath: '/usr/local/etc/xray-bridge/config.json', serviceUnit: 'xray-bridge.service',
+            serviceUnitPath: '/etc/systemd/system/xray-bridge.service' });
+        await models.Operation.collection.updateOne({}, { $set: { 'nodes.0.role': 'relay', 'nodes.0.nodeRef': 'relay-1', 'nodes.0.targetProfile': 'xray-bridge' } });
+        await models.Owner.collection.updateOne({}, { $set: { profile: 'xray-bridge' } });
+        await models.HyNode.updateOne({}, { $set: { cascadeRole: 'relay' } });
+        const context = { ...state.context, node };
+        const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
+        await state.store.preEnroll(freeze({ ...state.enrollment, targetProfile: 'xray-bridge' }));
+        const binding = await state.store.createBinding(freeze(expected));
+        const runner = require('./helpers/topologyTerminalFakeRunner').fakeRunner(t, BOOT);
+        runner.put('usr/local/etc/xray-bridge/config.json', '{"old":true}\n');
+        assert.equal(runner.execute(`runner --command close --operation-id predecessor --node-id ${NODE} --candidate-hash ${expected.candidateHash} --backup-id previous --target-profile xray-bridge --execution-context ${PROD.hostIdentity} --attempt-id previous --generation ${PREDECESSOR} --predecessor-generation none --command-id previous-close`).code, 0);
+        const { executor } = await assembled(state.store, { localRunner: runner });
+        const prepared = await executor.prepare(context);
+        const lifecycle = { ...context, backupId: prepared.backupId, prepared: prepared.prepared };
+        await executor.commit(lifecycle); await executor.verify(lifecycle);
+        await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed', 'nodes.0.backupId': expected.backupId } });
+        const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology', require('../models/cascadeTopologyStateModel').schema);
+        const Relay = connection.models.SettlementRelay || connection.model('SettlementRelay', require('../models/relayL2tpStateModel').schema);
+        await Topology.deleteMany({}); await Relay.deleteMany({});
+        await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+        await Relay.create({ node: NODE, status: 'installed', desiredState: 'installed', secretRevision: 4, routeGroup: new mongoose.Types.ObjectId() });
+        const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+        const repository = new Repository({ TopologyOperation: models.Operation, CascadeTopologyState: Topology, RelayL2tpState: Relay,
+            NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner, TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment });
+        const request = { operationId: expected.operationId, owner: expected.owner,
+            leaseUntil: (await models.Operation.findOne().lean()).leaseUntil, topologyRevision: 17, priorDeployedRevision: 16, now: new Date() };
+        await repository.beginV2Closure({ ...request, bindings: [binding] });
+        const sideEffects = await executor.withVerifiedMutationScope([lifecycle], async assertCurrent => {
+            await assertCurrent();
+            assert.equal((await models.Lock.findOne().lean()).generation, binding.generation);
+            assert.equal((await models.Owner.findOne().lean()).owner, 'topology');
+            return { usersVerified: true, pppProof: [{ relayNode: NODE, credentialRevision: 4 }], attachVerified: false };
+        });
+        const proof = await executor.close(lifecycle);
+        const recoveryCommands = [], observeRecovery = event => recoveryCommands.push(event.commandName);
+        connection.getClient().on('commandStarted', observeRecovery);
+        try { assert.equal((await executor.probeTerminalBinding(binding, 'relay')).commandId, binding.commandIds.close); }
+        finally { connection.getClient().off('commandStarted', observeRecovery); }
+        assert.deepEqual(recoveryCommands.filter(name => ['update', 'insert', 'delete', 'commitTransaction', 'abortTransaction'].includes(name)), [],
+            'terminal recovery must use read-only durable authority checks, not binding CAS transactions');
+        await repository.persistV2TerminalProofs({ ...request, proofs: [proof], sideEffects });
+        if (drift) await Relay.updateOne({}, { $inc: { secretRevision: 1 } });
+        if (drift) {
+            await assert.rejects(repository.finalizeV2Succeeded(request));
+            assert.equal(await models.Lock.countDocuments(), 1);
+            assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+            assert.equal((await Topology.findOne().lean()).topologyAdmissionCount, 1);
+        } else {
+            assert.ok(await repository.finalizeV2Succeeded(request));
+            assert.equal(await models.Lock.countDocuments(), 0);
+            assert.equal((await Relay.findOne().lean()).secretRevision, 4);
+        }
+    });
+});
+
+test('V2 closing intent cannot be reclaimed after expiry and recovery never allocates replacement IDs', async t => {
+    const f = await settlementPrepared(t);
+    await models.Operation.updateOne({}, { $set: { leaseUntil: new Date(0) } });
+    const before = await models.Operation.findOne().lean();
+    const repository = new TopologyOperationRepository({ model: models.Operation });
+    assert.equal(await repository.claim({ operationId: f.request.operationId, executionContext: PROD,
+        owner: 'replacement-worker', now: new Date(), leaseMs: 120000 }), null);
+    assert.deepEqual(await models.Operation.findOne().lean(), before);
+    const bindingBefore = await models.Binding.findOne().lean();
+    const eventsBefore = f.events.length;
+    const recovery = await f.repository.probeV2Settlement({ operationId: f.request.operationId });
+    await assert.rejects(f.executor.probeTerminalBinding(recovery.terminal.bindings[0]));
+    assert.equal(f.events.length, eventsBefore, 'expired authority refuses before connection/bootstrap/transport');
+    assert.deepEqual(await models.Binding.findOne().lean(), bindingBefore);
+    assert.deepEqual(await models.Operation.findOne().lean(), before);
+    assert.equal(await models.Lock.countDocuments(), 1);
+});
+
+test('V2 unknown commit never retries or aborts after the attempted atomic settlement', async t => {
+    const f = await settlementPrepared(t);
+    await f.repository.persistV2TerminalProofs({ ...f.request, sideEffects: f.sideEffects, proofs: [f.proof] });
+    const commands = [], observe = event => commands.push(event.commandName);
+    await connection.getClient().db('admin').command({ configureFailPoint: 'failCommand', mode: { times: 1 },
+        data: { failCommands: ['commitTransaction'], writeConcernError: { code: 64, codeName: 'WriteConcernFailed', errmsg: 'local synthetic uncertainty' },
+            errorLabels: ['UnknownTransactionCommitResult'] } });
+    connection.getClient().on('commandStarted', observe);
+    try { await assert.rejects(f.repository.finalizeV2Succeeded(f.request)); }
+    finally {
+        connection.getClient().off('commandStarted', observe);
+        await connection.getClient().db('admin').command({ configureFailPoint: 'failCommand', mode: 'off' });
+    }
+    assert.equal(commands.filter(name => name === 'commitTransaction').length, 1);
+    assert.equal(commands.includes('abortTransaction'), false);
+    const operation = await models.Operation.findOne().lean();
+    assert.equal((await models.Owner.findOne().lean()).owner, 'topology');
+    if (operation.status === 'committing') {
+        assert.equal(operation.heldTopologyAdmission, true);
+        assert.equal(await models.Lock.countDocuments(), 1);
+        assert.equal((await f.Topology.findOne().lean()).topologyAdmissionCount, 1);
+    } else {
+        assert.equal(operation.status, 'succeeded');
+        assert.equal(operation.heldTopologyAdmission, false);
+        assert.equal(await models.Lock.countDocuments(), 0);
+        assert.equal((await f.Topology.findOne().lean()).topologyAdmissionCount, 0);
+    }
+});
+
+test('V2 settlement readback uncertainty makes one commit and recovery only reads exact durable outcome', async t => {
+    const f = await settlementPrepared(t);
+    await f.repository.persistV2TerminalProofs({ ...f.request, sideEffects: f.sideEffects, proofs: [f.proof] });
+    const commands = [], observe = event => commands.push(event.commandName);
+    const original = models.Operation.findOne;
+    models.Operation.findOne = function (...args) {
+        const query = original.apply(this, args), lean = query.lean;
+        query.lean = function (...args) {
+            if (query.getOptions().readConcern?.level === 'majority') throw new Error('injected primary-majority read failure');
+            return lean.apply(this, args);
+        }; return query;
+    };
+    connection.getClient().on('commandStarted', observe);
+    try { await assert.rejects(f.repository.finalizeV2Succeeded(f.request)); }
+    finally { models.Operation.findOne = original; connection.getClient().off('commandStarted', observe); }
+    assert.equal(commands.filter(name => name === 'commitTransaction').length, 1);
+    assert.equal(commands.includes('abortTransaction'), false);
+    const after = await Promise.all([models.Operation, models.Lock, models.Owner, f.Topology].map(model => model.findOne().lean()));
+    assert.equal(after[0].status, 'succeeded');
+    assert.equal(after[1], null);
+    assert.equal(after[2].owner, 'topology');
+    assert.equal(after[3].topologyAdmissionCount, 0);
+    assert.equal((await f.repository.probeV2Settlement({ operationId: f.request.operationId })).retained, false);
+    assert.equal((await f.repository.probeV2Settlement({ operationId: f.request.operationId })).status, 'succeeded');
+    assert.deepEqual(await Promise.all([models.Operation, models.Lock, models.Owner, f.Topology].map(model => model.findOne().lean())), after);
+});
+
+test('V2 settlement refuses terminal proof without durable user and PPP evidence', async t => {
+    const state = await terminalFixture(t);
+    await state.executor.verify(state.lifecycle);
+    const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology',
+        require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({});
+    await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+    await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed', 'nodes.0.backupId': state.expected.backupId } });
+    const { TopologyOperationFinalizationRepository: Repository } = require('../repositories/topologyOperationFinalizationRepository');
+    const repository = new Repository({ TopologyOperation: models.Operation, CascadeTopologyState: Topology,
+        NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner,
+        TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment });
+    const request = { operationId: state.expected.operationId, owner: state.expected.owner,
+        leaseUntil: (await models.Operation.findOne().lean()).leaseUntil, topologyRevision: 17, priorDeployedRevision: 16, now: new Date() };
+    await repository.beginV2Closure({ ...request, bindings: [state.row] });
+    const proof = await state.executor.close(state.lifecycle);
+    await assert.rejects(repository.persistV2TerminalProofs({ ...request, proofs: [proof] }));
+    assert.equal(await models.Lock.countDocuments(), 1);
+    assert.equal((await models.Operation.findOne().lean()).v2Terminal.state, 'closing');
+});
+
+test('V2 settlement atomically publishes exact real-executor close proofs and retains permanent topology ownership', async t => {
+    const { TopologyOperationFinalizationRepository } = require('../repositories/topologyOperationFinalizationRepository');
+    const { executor, lifecycle, row, expected, localRunner } = await terminalFixture(t);
+    await executor.verify(lifecycle);
+    const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology',
+        require('../models/cascadeTopologyStateModel').schema);
+    await Topology.deleteMany({});
+    await Topology.create({ _id: 'singleton', revision: 17, deployedRevision: 16, topologyAdmissionCount: 1 });
+    await models.Operation.updateOne({}, { $set: { status: 'committing', 'nodes.0.state': 'committed',
+        'nodes.0.backupId': expected.backupId } });
+    const repository = new TopologyOperationFinalizationRepository({ TopologyOperation: models.Operation,
+        CascadeTopologyState: Topology, NodeOperationLock: models.Lock, TopologyConfigOwner: models.Owner,
+        TopologyExecutionBinding: models.Binding, TopologyExecutionEnrollment: models.Enrollment });
+    const request = { operationId: expected.operationId, owner: expected.owner,
+        leaseUntil: (await models.Operation.findOne().lean()).leaseUntil,
+        topologyRevision: 17, priorDeployedRevision: 16, now: new Date() };
+    assert.equal(typeof repository.beginV2Closure, 'function', 'missing durable pre-close boundary');
+    assert.ok(await repository.beginV2Closure({ ...request, bindings: [row] }));
+    const proof = await executor.close(lifecycle);
+    assert.ok(await repository.persistV2TerminalProofs({ ...request, proofs: [proof],
+        sideEffects: { usersVerified: true, pppProof: [], attachVerified: false } }));
+    assert.equal(await models.Lock.countDocuments(), 1, 'proof persistence must not release');
+    assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    assert.ok(await repository.finalizeV2Succeeded(request));
+    const operation = await models.Operation.findOne().lean();
+    assert.equal(operation.status, 'succeeded');
+    assert.equal(operation.heldTopologyAdmission, false);
+    assert.deepEqual(operation.v2Terminal.proofs, [proof]);
+    assert.equal(await models.Lock.countDocuments(), 0);
+    const owner = await models.Owner.findOne().lean();
+    assert.equal(owner.owner, 'topology', 'closing a generation is not classic handback');
+    assert.equal(owner.generation, OWNER_GENERATION);
+    assert.equal(owner.lastSettledOperation, expected.operationId);
+    assert.equal(owner.lastSettledGeneration, expected.generation);
+    assert.equal((await Topology.findById('singleton').lean()).topologyAdmissionCount, 0);
+    assert.equal((await Topology.findById('singleton').lean()).deployedRevision, 17);
+    const firstId = (await models.Binding.findOne().lean())._id;
+    const successorAuthority = async (challenge, work) => work(evidence(challenge, {
+        predecessor: { bindingId: firstId, generation: row.generation, headGeneration: row.generation,
+            bootId: BOOT, status: 'terminal', receipt: proof },
+    }));
+    const store = newStore(successorAuthority);
+    const operationId = new mongoose.Types.ObjectId().toString();
+    const operationRepository = new TopologyOperationRepository({ model: models.Operation });
+    await connection.transaction(async session => {
+        await operationRepository.createFrozen({ operationId, executionContext: PROD,
+            idempotencyKey: `topology:production:revision-18:host-${PROD.hostIdentity}:${randomUUID()}`,
+            topologyRevision: 18, priorDeployedRevision: 17, nodes: [frozenNode], heldTopologyAdmission: true,
+            admissionFingerprint: 'f'.repeat(64), session });
+        await Topology.updateOne({ _id: 'singleton', topologyAdmissionCount: 0 },
+            { $set: { revision: 18, topologyAdmissionCount: 1 } }, { session });
+    });
+    await operationRepository.claim({ operationId, executionContext: PROD, owner: 'worker-18', now: new Date(), leaseMs: 120000 });
+    const generation = randomUUID();
+    await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
+        owner: 'worker-18', generation, leaseUntil: new Date(Date.now() + 120000) });
+    const next = freeze({ ...expected, operationId, owner: 'worker-18', generation, topologyRevision: 18,
+        priorDeployedRevision: 17, backupId: `topology-${createHash('sha256').update([operationId, NODE, expected.candidateHash, expected.targetProfile].join('\0')).digest('hex')}` });
+    const second = await store.createSuccessor(next, firstId);
+    const { executor: nextExecutor } = await assembled(store, { localRunner });
+    const nextContext = { operationId, topologyRevision: 18, priorDeployedRevision: 17, node: frozenNode,
+        executionFence: freeze({ owner: next.owner, attempt: 1, generation }) };
+    const prepared = await nextExecutor.prepare(nextContext);
+    const nextLifecycle = { ...nextContext, ...prepared }; delete nextLifecycle.ok;
+    await nextExecutor.commit(nextLifecycle);
+    await nextExecutor.verify(nextLifecycle);
+    await models.Operation.updateOne({ _id: operationId }, { $set: { status: 'committing',
+        'nodes.0.state': 'committed', 'nodes.0.backupId': next.backupId } });
+    const nextRequest = { ...request, operationId, owner: next.owner, topologyRevision: 18, priorDeployedRevision: 17,
+        leaseUntil: (await models.Operation.findById(operationId).lean()).leaseUntil, now: new Date() };
+    await repository.beginV2Closure({ ...nextRequest, bindings: [second] });
+    const nextProof = await nextExecutor.close(nextLifecycle);
+    await repository.persistV2TerminalProofs({ ...nextRequest, proofs: [nextProof],
+        sideEffects: { usersVerified: true, pppProof: [], attachVerified: false } });
+    await repository.finalizeV2Succeeded(nextRequest);
+    assert.equal(await models.Operation.countDocuments({ status: 'succeeded', heldTopologyAdmission: false }), 2);
+    assert.equal(await models.Enrollment.countDocuments(), 1);
+    assert.equal(await models.Binding.countDocuments(), 2);
+    assert.equal(await models.Lock.countDocuments(), 0);
+    assert.equal(nextProof.commandId, second.commandIds.close);
+    assert.deepEqual((await models.Binding.findOne({ generation }).lean()).predecessorReceipt, proof);
+    assert.equal((await Topology.findById('singleton').lean()).topologyAdmissionCount, 0);
+    assert.equal((await Topology.findById('singleton').lean()).deployedRevision, 18);
+});
 
 test('executor produces terminal proof data after verify or rollback with fresh exact real-runner status and retained Mongo ownership', async t => {
     for (const outcome of ['verify', 'rollback']) await t.test(outcome, async t => {
