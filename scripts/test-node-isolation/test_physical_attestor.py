@@ -188,6 +188,38 @@ class InstallationTests(unittest.TestCase):
                     with self.assertRaises(Exception): a.durable_originals(node.engine, node.module, read=read)
                     node.put(fixture.n.BUNDLE, before)
 
+    def test_runtime_original_metadata_types_match_actual_restore_for_nonselected_profile(self):
+        import test_node_originals as fixture
+        with fixture.DualFixture() as node:
+            node.module.decode_json = fixture.n.decode
+            node.writer.capture()
+            before = node.fs.read(fixture.n.BUNDLE)[0]
+            accepted_before = fixture.n.canonical(node.accepted)
+            self.assertEqual(node.profile, 'xray-bridge')
+            def read(path, directory=False):
+                with node.fs.opened(path, directory=directory) as fd:
+                    st = os.fstat(fd)
+                    return (b'' if directory else node.fs.read(path)[0],
+                            SimpleNamespace(st_uid=0, st_gid=0, st_mode=st.st_mode, st_nlink=st.st_nlink))
+            self.assertEqual(a.durable_originals(node.engine, node.module, read=read)['version'], 1)
+            baseline = json.loads(before)
+            node.writer.check_original('xray-main', baseline['profiles']['xray-main'])
+            for file_name in ('config', 'unit'):
+                for field, value in [('mode', float(baseline['profiles']['xray-main']['files'][file_name]['mode'])),
+                                     ('uid', float(baseline['profiles']['xray-main']['files'][file_name]['uid'])),
+                                     ('gid', float(baseline['profiles']['xray-main']['files'][file_name]['gid']))]:
+                    with self.subTest(file=file_name, field=field):
+                        bundle = json.loads(before)
+                        bundle['profiles']['xray-main']['files'][file_name][field] = value
+                        node.put(fixture.n.BUNDLE, fixture.n.canonical(bundle))
+                        with self.assertRaisesRegex(Exception, 'ORIGINAL_PIN_MISMATCH_RETAINED'):
+                            node.writer.check_original('xray-main', bundle['profiles']['xray-main'])
+                        with self.assertRaisesRegex(RuntimeError, 'ORIGINAL_METADATA_DRIFT'):
+                            a.durable_originals(node.engine, node.module, read=read)
+                        self.assertEqual(fixture.n.canonical(node.accepted), accepted_before)
+                        node.put(fixture.n.BUNDLE, before)
+            self.assertEqual(a.durable_originals(node.engine, node.module, read=read)['version'], 1)
+
     def test_shared_mode_requires_the_actual_installed_shared_engine_hook(self):
         self.assertTrue(hasattr(a, 'select_engine'), 'shared engine selector missing')
         with self.assertRaisesRegex(RuntimeError, 'SHARED_HOST_ATTESTATION_HOOK_REQUIRED'):

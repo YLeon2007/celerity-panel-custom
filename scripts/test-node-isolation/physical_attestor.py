@@ -180,7 +180,8 @@ def durable_originals(engine, m, read=secure_read):
         for name in ('config', 'unit'):
             item = original['files'][name]
             need(set(item) == {'sha256', 'mode', 'uid', 'gid', 'xattrs', 'data'} and
-                 {k: v for k, v in item.items() if k != 'data'} == pins['files'][name], 'ORIGINAL_METADATA_DRIFT')
+                 canonical({k: v for k, v in item.items() if k != 'data'}) == canonical(pins['files'][name]),
+                 'ORIGINAL_METADATA_DRIFT')
             data = base64.b64decode(item['data'], validate=True)
             need(len(data) <= 512 * 1024 and base64.b64encode(data).decode() == item['data'] and sha(data) == item['sha256'],
                  'ORIGINAL_BYTES_DRIFT')
