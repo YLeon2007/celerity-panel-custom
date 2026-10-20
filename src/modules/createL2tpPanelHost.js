@@ -277,6 +277,12 @@ function createL2tpPanelHost({
         moduleEntry: injectedModuleEntry,
         topologyRuntime,
         topologyIntentService,
+        enrollTestOwners() {
+            if (typeof topologyDeploymentService?.enrollTestOwners !== 'function') {
+                throw new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');
+            }
+            return topologyDeploymentService.enrollTestOwners();
+        },
         repository,
         loadPanelOverview,
         stateManagementService: executionRuntime.runtime.stateManagementService,

@@ -99,6 +99,7 @@ function createL2tpRuntimeLifecycleHook({
     createHostDependencies,
     createStartupLifecycle = createL2tpStartupLifecycle,
     activeHostProvider = l2tpActiveHostProvider,
+    startWorkers = true,
 } = {}) {
     const enabled = parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
     const hostDependencies = enabled
@@ -109,7 +110,7 @@ function createL2tpRuntimeLifecycleHook({
         hostDependencies,
         activeHostProvider,
     });
-    lifecycle.start();
+    if (startWorkers) lifecycle.start();
     if (typeof hostDependencies.topologyExecutionAuthority?.close === 'function') {
         const stop = lifecycle.stop.bind(lifecycle);
         let stopping;
@@ -250,9 +251,25 @@ function createL2tpRootLifecycle({
     let startPromise;
     let stopPromise;
     let stopRequested = false;
+    let ownerEnrollmentMode = false;
 
     return {
+        enrollTestOwnersAfterDatabase() {
+            if (startPromise !== undefined || stopRequested) return Promise.reject(new Error('TEST_OWNER_STARTUP_MODE_CONFLICT'));
+            const ownerEnv = Object.freeze({ ...env });
+            require('../../scripts/test-topology-owner').assertTestContext(ownerEnv);
+            ownerEnrollmentMode = true;
+            // The maintenance command requires an already installed schema. Do
+            // not migrate/index or start consumers before durable capture.
+            startPromise = Promise.resolve().then(async () => {
+                if (stopRequested) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
+                lifecycle = createRuntimeLifecycleHook({ env: ownerEnv, createHostDependencies, activeHostProvider, startWorkers: false });
+                return lifecycle.enrollTestOwners();
+            });
+            return startPromise;
+        },
         startAfterDatabase() {
+            if (ownerEnrollmentMode) return Promise.reject(new Error('TEST_OWNER_STARTUP_MODE_CONFLICT'));
             if (startPromise === undefined) {
                 startPromise = Promise.resolve().then(async () => {
                     if (stopRequested) return undefined;
@@ -288,7 +305,7 @@ function createL2tpRootLifecycle({
                     ? Promise.resolve()
                     : startPromise.then(
                         () => lifecycle?.stop(),
-                        () => undefined,
+                        () => lifecycle?.stop(),
                     );
             }
             return stopPromise;

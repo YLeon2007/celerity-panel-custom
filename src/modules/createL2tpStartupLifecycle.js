@@ -177,6 +177,12 @@ function createL2tpStartupLifecycle({
     let stopPromise;
 
     return {
+        enrollTestOwners() {
+            if (started || stopped || typeof host.enrollTestOwners !== 'function') {
+                throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
+            }
+            return host.enrollTestOwners();
+        },
         start() {
             if (enabled && !started && !stopped) {
                 host.start();

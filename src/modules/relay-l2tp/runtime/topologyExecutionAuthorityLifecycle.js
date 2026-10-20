@@ -145,6 +145,36 @@ class TopologyExecutionAuthorityLifecycle {
             if (pending) await pending.catch(() => {});
         }
     }
+    async withCapturedTestOwnerEnrollment(work) {
+        await this.assertHeld();
+        const state = this.#held.getStore();
+        if (typeof state.capability.withCapturedTestOwnerEnrollment !== 'function') {
+            state.revoked = true;
+            throw Object.assign(new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED'), { code: 'TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED' });
+        }
+        let invoked = false, finished = false, open = true, pending, result;
+        const callback = (plan, externalCheck) => {
+            if (!open || invoked || typeof externalCheck !== 'function') { state.revoked = true; throw failure(); }
+            invoked = true;
+            const check = async () => {
+                try {
+                    if (!open) throw failure();
+                    await this.assertHeld(); await externalCheck(); await this.assertHeld();
+                    if (!open) throw failure();
+                } catch { state.revoked = true; throw failure(); }
+            };
+            pending = (async () => {
+                await check(); result = await work(plan, check); await check(); finished = true; return result;
+            })();
+            pending.catch(() => {}); return pending;
+        };
+        try {
+            await state.capability.withCapturedTestOwnerEnrollment(callback);
+            if (!invoked || !finished) throw failure();
+            await this.assertHeld(); return result;
+        } catch { state.revoked = true; throw failure(); }
+        finally { open = false; if (pending) await pending.catch(() => {}); }
+    }
     async withVerifiedAuthority(challenge, work) {
         await this.assertHeld();
         const state = this.#held.getStore();

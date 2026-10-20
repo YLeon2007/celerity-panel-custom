@@ -185,7 +185,8 @@ function createTopologyOperationRuntime(dependencies = {}) {
             NodeSSH,
         })
         : executorFactoryOverride;
-    const executionContext = resolveTopologyExecutionContext(env);
+    const ownerEnrollmentEnv = Object.freeze({ ...env });
+    const executionContext = resolveTopologyExecutionContext(ownerEnrollmentEnv);
     if (!executionContext || typeof executorFactory !== 'function') {
         return unavailableTopologyDeploymentService;
     }
@@ -314,7 +315,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(bindingStore, 'bindingProvisioner'),
             ...optional(bindingLifecycle, 'bindingLifecycle'),
         });
-        return new Coordinator({
+        const coordinator = new Coordinator({
             executionContext,
             topologyRepository,
             planMaterializer,
@@ -325,6 +326,12 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(idFactory, 'idFactory'),
             ...optional(onWorkerError, 'onWorkerError'),
         });
+        // Internal explicit command only; no HTTP/MCP or automatic startup call.
+        coordinator.enrollTestOwners = () => require('../../../../scripts/test-topology-owner').enrollTestOwners({
+            env: ownerEnrollmentEnv, lifecycle: bindingLifecycle, store: bindingStore,
+            TopologyConfigOwner: dependencies.TopologyConfigOwner,
+        });
+        return coordinator;
     } catch {
         return unavailableTopologyDeploymentService;
     }

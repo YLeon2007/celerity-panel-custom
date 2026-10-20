@@ -150,6 +150,10 @@ Remaining parent gates are explicit:
 * independently review/install/pin the shared helper, this helper, all five node
   plans and current guards; maintain all external foreground recovery channels;
 * supported owner adoption and explicit `preEnroll` before worker execution.
+  The explicit [TEST owner command](topology-test-owner-entry.md) now composes
+  that public path through the ordinary root/default binding store without
+  starting consumers. It remains refused by default until the separately trusted
+  all-five crash-durable NodeOriginals capture hook is implemented;
   The controller now implements TEST-only
   `TopologyConfigTransfer.withVerifiedMaintenance` through the held lifecycle;
   see [original-byte maintenance](topology-test-owner-maintenance.md). It requires

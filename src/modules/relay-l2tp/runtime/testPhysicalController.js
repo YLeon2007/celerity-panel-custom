@@ -155,12 +155,12 @@ async function openSshChannel(pin) {
             hostVerifier: raw => Buffer.isBuffer(raw) && createHash('sha256').update(raw).digest('hex') === pin.physical.sshHostKeySha256 });
     });
 }
-function createTestPhysicalController({ config: input, openChannel = openSshChannel } = {}) {
+function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals } = {}) {
     const config = validateConfig(input), channels = new Map();
     // Original secret bytes remain lexical/private and never enter Mongo proofs,
     // logs, error messages or public return values. No recapture after uncertainty.
     const originals = new Map();
-    let opening, busy = false, poisoned = false;
+    let opening, busy = false, poisoned = false, ownerEnrollmentUsed = false;
     const alive = scope => { need(!poisoned && scope?.open && [...channels.values()].every(channel => channel.alive)); };
     const connect = async () => {
         if (!opening) opening = (async () => {
@@ -197,6 +197,47 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
             try {
                 await connect(); await assertHeld();
                 const result = await work(Object.freeze({ assertHeld,
+                    async withCapturedTestOwnerEnrollment(callback) {
+                        // Trusted finite parent hook only. The installed observer
+                        // cannot capture durable originals; no default-positive shim.
+                        need(!ownerEnrollmentUsed && typeof withDurableNodeOriginals === 'function' && typeof callback === 'function');
+                        ownerEnrollmentUsed = true;
+                        const nodes = config.nodes.map(pin => {
+                            need(pin.originalSnapshot);
+                            return { nodeId: pin.nodeId, targetProfile: pin.targetProfile, endpoint: pin.endpoint,
+                                nodeIdentity: { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 },
+                                bootId: pin.physical.bootId, maintenanceId: pin.maintenanceId, planHash: pin.planHash,
+                                guard: pin.guard, originalSnapshot: pin.originalSnapshot };
+                        });
+                        const challenge = freeze({ version: 1, executionContext: TEST, nodes, host: config.host });
+                        let invoked = false, finished = false, open = true, pending, result;
+                        const checkOriginals = () => {
+                            for (const pin of config.nodes) {
+                                const current = configBytes(observations.get(pin.nodeId).configTransfer);
+                                const { proofRef: _ref, ...accepted } = pin.originalSnapshot;
+                                need(equal(current.readback, { source: 'node-readback', ...accepted }));
+                            }
+                        };
+                        const workCaptured = checkDurable => {
+                            need(open && !invoked && typeof checkDurable === 'function'); invoked = true;
+                            const check = async () => {
+                                try {
+                                    need(open); await assertHeld(); alive(scope); need(open); checkOriginals();
+                                    await checkDurable(); await assertHeld(); alive(scope); need(open); checkOriginals();
+                                } catch { poisoned = true; refuse(); }
+                            };
+                            pending = (async () => {
+                                await check(); result = await callback(challenge, check); await check();
+                                finished = true; return result;
+                            })();
+                            pending.catch(() => {}); return pending;
+                        };
+                        try {
+                            await assertHeld(); await withDurableNodeOriginals(challenge, workCaptured);
+                            need(invoked && finished); await assertHeld(); return result;
+                        } catch { poisoned = true; refuse(); }
+                        finally { open = false; if (pending) await pending.catch(() => {}); }
+                    },
                     async withVerifiedMaintenance(challenge, callback) {
                         try {
                             alive(scope);

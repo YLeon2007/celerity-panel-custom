@@ -30,7 +30,11 @@ await lifecycle.run(async () => {
 ```
 
 This example is an internal API composition, not a runnable inventory, HTTP/MCP
-route or automatic startup migration. Parent integration owns when it is invoked.
+route or automatic startup migration. The explicit
+[TEST owner command](topology-test-owner-entry.md) composes it through the actual
+ordinary root/default binding path, but stays refused by default until the parent
+implements the required trusted all-five crash-durable NodeOriginals capture
+protocol. Parent integration still owns real invocation and the physical hold.
 Missing owner/index/accepted evidence still refuses; never raw-seed topology
 ownership or copy a document's `originalSnapshot` to impersonate readback.
 
