@@ -451,6 +451,10 @@ class LinuxKernel:
             time.sleep(.01)
         raise TimeoutError('kernel cgroup acknowledgement timeout')
 
+    def mount_device(self, path):
+        device = path.stat().st_dev
+        return f'{os.major(device)}:{os.minor(device)}'
+
     def assert_classic_activation_safe(self, expected):
         """Finite sealed-container variant, no writable host bind/volume escape.
 
@@ -459,13 +463,19 @@ class LinuxKernel:
         """
         container = next(c for c in expected['containers'] if c['cgroup'] == expected['backend'])
         proc = self.proc / str(container['init']['pid'])
-        namespaces = {ns: os.readlink(proc / 'ns' / ns) for ns in ('mnt','pid','cgroup','net')}
+        if 'classicActivation' not in expected:
+            group = self.group(expected['backend'])
+            need((group / 'cgroup.freeze').read_text().strip() == '1'
+                 and events(group / 'cgroup.events')['frozen'] == 1,
+                 'classic resource inspection requires frozen backend')
+        members = self.members(expected['backend'])
+        namespaces = {ns: os.readlink(proc / 'ns' / ns) for ns in ('mnt','pid','cgroup','net','ipc')}
         for ns in namespaces:
             need(namespaces[ns] != os.readlink(self.proc / '1/ns' / ns),
                  'classic host namespace escape')
         need(os.readlink(proc / 'root/proc/1/ns/pid') == os.readlink(proc / 'ns/pid'),
              'classic host proc escape')
-        for row in self.members(expected['backend']):
+        for row in members:
             payload = self.proc / str(row['pid'])
             for ns in namespaces:
                 need(os.readlink(payload / 'ns' / ns) == namespaces[ns],
@@ -476,21 +486,48 @@ class LinuxKernel:
             forbidden = sum(1 << bit for bit in (21, 19, 22, 16, 17))
             for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'):
                 need(not int(status[key].strip(), 16) & forbidden, 'classic privileged capability escape')
-        roots = 0
+        provenance = container.get('mountProvenance')
+        need(isinstance(provenance, dict)
+             and set(provenance) == {'mounts', 'binds', 'volumesFrom', 'tmpfs', 'ipcMode', 'shmPath'}
+             and provenance['mounts'] == [] and provenance['binds'] in (None, [])
+             and provenance['volumesFrom'] in (None, []) and provenance['tmpfs'] in (None, {})
+             and provenance['ipcMode'] == 'private'
+             and provenance['shmPath'] == '/var/lib/docker/containers/'+container['id']+'/mounts/shm',
+             'classic private mount provenance required; binds/volumes/IPC sharing unsupported')
+        # Device identity, not filesystem name/root, distinguishes a host tmpfs
+        # bind. Refuse even Docker-private shm if its superblock is host-visible.
+        host_mounts = (self.proc / '1/mountinfo').read_text().splitlines()
+        need(bool(host_mounts), 'classic host mount inventory required')
+        host_devices = {line.split()[2] for line in host_mounts}
+        roots, procs, root_device = 0, 0, None
+        targets = set()
         for line in (proc / 'mountinfo').read_text().splitlines():
             fields = line.split(); split = fields.index('-')
             root, target, options, kind = fields[3], fields[4], fields[5].split(','), fields[split+1]
             need('\\' not in root+target, 'unsupported classic mount encoding')
+            need(target not in targets, 'stacked classic mount unsupported')
+            targets.add(target)
+            if kind == 'proc':
+                # One whole read-only proc; no aliases, even at an otherwise
+                # allowed target. PID namespaces do not isolate sysrq.
+                need(root == '/' and target == '/proc' and 'ro' in options and 'rw' not in options,
+                     'classic proc must be whole read-only without aliases')
+            if kind in ('tmpfs', 'devpts', 'mqueue'):
+                need(fields[2] not in host_devices
+                     and self.mount_device(proc / 'root' / target.lstrip('/')) == fields[2],
+                     'classic host-backed or unproven private mount superblock')
             if target == '/':
                 need(kind == 'overlay' and root == '/', 'sealed classic overlay required')
                 roots += 1
+                root_device = fields[2]
             elif target in ('/etc/hosts', '/etc/hostname', '/etc/resolv.conf'):
                 need(root == '/var/lib/docker/containers/'+container['id']+'/'+target.rsplit('/',1)[1],
                      'unreviewed classic host file mount')
-            elif kind in ('proc', 'sysfs', 'cgroup2'):
-                need(target == '/proc' or target.startswith('/proc/') or target == '/sys' or target.startswith('/sys/'),
-                     'classic control mount escape')
-                if kind != 'proc': need('ro' in options, 'classic writable kernel control mount')
+            elif kind == 'proc':
+                procs += 1
+            elif kind in ('sysfs', 'cgroup2'):
+                need(target == '/sys' or target.startswith('/sys/'), 'classic control mount escape')
+                need('ro' in options, 'classic writable kernel control mount')
             elif kind in ('tmpfs', 'devpts', 'mqueue'):
                 need((root == '/' and target in ('/dev', '/dev/pts', '/dev/shm', '/dev/mqueue', '/sys/firmware', '/proc/acpi', '/proc/scsi')) or
                      (root == '/null' and target in ('/proc/kcore', '/proc/keys', '/proc/latency_stats', '/proc/timer_list', '/proc/interrupts')),
@@ -498,6 +535,30 @@ class LinuxKernel:
             else:
                 need(False, 'classic host bind/volume activation unsupported')
         need(roots == 1, 'sealed classic root required')
+        need(procs == 1, 'single read-only classic proc required')
+        if 'classicActivation' in expected:
+            # verify_record also calls this predicate AFTER irreversible enable.
+            # Descriptor-free entry was checked while frozen, before COMMIT and
+            # again before thaw. New private runtime FDs/tasks are not an entry
+            # provenance proof and cannot be retroactively "sealed" or closed.
+            return
+        # Mountinfo says nothing about authority already retained by a payload.
+        # Deliberately support only descriptor-free, single-task processes. Do
+        # not close/repair FDs or infer a socket/anon_inode is harmless. In
+        # particular io_uring/SCM_RIGHTS and hidden per-thread files/fs are not
+        # supported. Ordinary Node/Docker logging layouts are thus ineligible.
+        root_inode = (proc / 'root').stat().st_ino
+        for row in members:
+            payload = self.proc / str(row['pid'])
+            need(sorted(p.name for p in (payload / 'task').iterdir()) == [str(row['pid'])],
+                 'classic multi-task resource provenance unsupported')
+            need(not any((payload / 'fd').iterdir()) and not any((payload / 'fdinfo').iterdir()),
+                 'classic retained descriptor authority unsupported')
+            need(self.mount_device(payload / 'root') == root_device
+                 and (payload / 'root').stat().st_ino == root_inode
+                 and self.mount_device(payload / 'cwd') == root_device,
+                 'classic root/cwd authority outside private overlay')
+        need(self.members(expected['backend']) == members, 'classic resource inventory changed')
 
     def freeze(self, name, value):
         path = self.group(name)
@@ -550,7 +611,11 @@ def capture(kernel):
         need(re.fullmatch('sha256:[0-9a-f]{64}', c['Image']), 'unfixed image identity')
         containers.append({'id': c['Id'], 'name': name, 'image': c['Image'], 'imageRef': c['Config']['Image'],
                            'cgroup': cg, 'init': init, 'project': project, 'service': service, 'startedAt': s['StartedAt'],
-                           'restartCount': c['RestartCount'], 'restartPolicy': cfg['RestartPolicy']})
+                           'restartCount': c['RestartCount'], 'restartPolicy': cfg['RestartPolicy'],
+                           'mountProvenance': copy.deepcopy({'mounts': c.get('Mounts'),
+                               'binds': cfg.get('Binds'), 'volumesFrom': cfg.get('VolumesFrom'),
+                               'tmpfs': cfg.get('Tmpfs'), 'ipcMode': cfg.get('IpcMode'),
+                               'shmPath': c.get('ShmPath')})})
     containers.sort(key=lambda c: c['id'])
     need(NAMES <= {c['name'] for c in containers} and len({c['name'] for c in containers}) == len(containers), 'missing/duplicate role')
     backend = next(c['cgroup'] for c in containers if c['name'] == 'hysteria-backend')

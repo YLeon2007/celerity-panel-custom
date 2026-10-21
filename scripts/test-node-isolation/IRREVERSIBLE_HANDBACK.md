@@ -44,18 +44,51 @@ Xray/PPP restoration and the dual-profile node path remain unchanged.
 ## Narrow supported activation set
 
 Only a still-live accepted classic backend in its existing container can be
-resumed. The safety preflight checks separate mount/PID/cgroup/network namespaces,
-container-local proc, dangerous capability exclusion for every existing payload
-process, and a sealed overlay mount
-allowlist. Host bind/volume mounts, Docker/control socket mounts, writable
-cgroup control mounts, killed backends and missing candidate/relaunch barriers
-refuse **before COMMIT**. There is no dead-backend relaunch, clean-container
-creation, unconditional Docker/updater thaw or COMMIT-to-legacy-restore shortcut.
+resumed. The safety preflight checks separate mount/PID/cgroup/network/**IPC**
+namespaces, container-local proc and dangerous capability exclusion for every
+existing payload process. Eligibility is deliberately narrower than ordinary
+Docker defaults:
 
-This is deliberately not a general host restoration mechanism. An actual
-backend requiring host source/config/control mounts is **not eligible** for this
-variant; a separately reviewed clean activation primitive would be needed.
-No claim is made that the deployed backend satisfies these predicates.
+- Exactly one whole `/proc` mount must be **read-only**. Every other proc mount,
+  subtree or alias is refused, including a read-only alias. Writable unmasked
+  `sysrq-trigger` and `proc/sys` therefore refuse before COMMIT; no complicated
+  mask or LSM inference is used. Duplicate mount targets also refuse.
+- Accepted inventory now retains exact Docker `Mounts`, `Binds`, `VolumesFrom`,
+  `Tmpfs`, `IpcMode` and `ShmPath` provenance. Missing provenance, any explicit
+  bind/volume/tmpfs declaration or non-private IPC refuses. Old inventory pins
+  cannot silently acquire new defaults.
+- Every allowed tmpfs/devpts/mqueue mount must have a device identity absent
+  from the host PID1 mount inventory, and `stat(2)` through the payload's root
+  must confirm that exact major:minor. In particular, a host `/dev/shm` bind
+  refuses even though its mountinfo type is `tmpfs`, root is `/` and target is
+  `/dev/shm`. **Even Docker-private shm is refused if its superblock is visible
+  in the host inventory.** A namespace-private, non-host-visible tmpfs with
+  matching stat and accepted no-bind/private-IPC provenance is the positive case.
+- Before COMMIT, while the backend is acknowledged frozen, **every existing
+  backend process must have exactly one task and zero descriptors** in both
+  `fd` and `fdinfo`; root must be the accepted overlay root and cwd must be on
+  that overlay. No socket, pipe, logging FD, `anon_inode`/io_uring or stdio
+  exception is inferred safe. A retained descriptor to candidate `cgroup.freeze`
+  refuses before activation, without writing or closing that descriptor. The
+  same entry policy is repeated before the irreversible thaw. The internal
+  committed projection skips this entry-only resource check afterward: runtime
+  may legitimately create private descriptors/tasks; there is no retroactive
+  repair, descriptor-closing operation or automatic refreeze.
+
+Host bind/volume mounts, Docker/control sockets, writable cgroup mounts, killed
+backends and missing candidate/relaunch barriers refuse **before COMMIT**. There
+is no dead-backend relaunch, clean-container creation, unconditional
+Docker/updater thaw or COMMIT-to-legacy-restore shortcut.
+
+This is deliberately not a general host restoration mechanism or a full sandbox
+sealing/physical-provenance proof from mountinfo. It relies on independently
+accepted inventory and the existing trusted host-root/held-writer boundary;
+retrospective memory-mapping or already-issued asynchronous kernel-work provenance
+is not established here. Ordinary existing Node backends with threads, open
+listeners or Docker logging FDs are **not eligible** for this variant. We do not
+close their FDs, drop their threads or claim the deployed backend satisfies the
+policy. A useful broader activation of such a backend needs separately reviewed
+resource provenance or a clean activation primitive, outside this local slice.
 
 ## Failure semantics
 

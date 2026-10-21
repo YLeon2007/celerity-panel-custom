@@ -23,14 +23,169 @@ class BoundedActivationTests(unittest.TestCase):
         proc = kernel.proc/str(backend['init']['pid'])
         (proc/'ns').mkdir()
         (kernel.proc/'1/ns').mkdir(parents=True)
-        for ns in ('mnt','pid','cgroup','net'):
+        for ns in ('mnt','pid','cgroup','net','ipc'):
             (kernel.proc/'1/ns'/ns).symlink_to(ns+':[SIMULATED-HOST]')
             (proc/'ns'/ns).symlink_to(ns+':[SIMULATED-CONTAINER]')
         (proc/'root/proc/1/ns').mkdir(parents=True)
         (proc/'root/proc/1/ns/pid').symlink_to('pid:[SIMULATED-CONTAINER]')
         (proc/'status').write_text(''.join(k+': 0000000000000000\n' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')))
-        (proc/'mountinfo').write_text('1 0 0:1 / / rw - overlay overlay rw\n2 1 0:2 / /proc rw - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro - cgroup2 cgroup ro\n')
+        (proc/'mountinfo').write_text('1 0 0:1 / / rw - overlay overlay rw\n2 1 0:2 / /proc ro - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro - cgroup2 cgroup ro\n')
+        provenance = {'mounts': [], 'binds': None, 'volumesFrom': None,
+            'tmpfs': None, 'ipcMode': 'private',
+            'shmPath': '/var/lib/docker/containers/'+backend['id']+'/mounts/shm'}
+        for inventory in (p['hostHold']['expected'], fence.original, fence.expected):
+            next(c for c in inventory['containers'] if c['cgroup'] == inventory['backend'])['mountProvenance'] = json.loads(json.dumps(provenance))
+        (kernel.proc/'1/mountinfo').write_text('10 0 8:1 / / rw - ext4 /dev/sda rw\n11 10 0:33 / /dev/shm rw - tmpfs shm rw\n')
+        # Only superblock facts are SIMULATED; the production seam uses stat(2).
+        kernel.mount_device = lambda path: '0:44' if path.name == 'shm' else '0:1'
+        (proc/'task'/str(backend['init']['pid'])).mkdir(parents=True)
+        (proc/'fd').mkdir()
+        (proc/'fdinfo').mkdir()
+        (proc/'cwd').symlink_to(proc/'root', target_is_directory=True)
         return p,kernel,fence
+
+    def test_retained_host_descriptor_or_unchecked_task_refuses_without_touching_fd(self):
+        for fault in ('host-fd', 'host-fd-child', 'socket', 'anon-inode', 'fdinfo-only',
+                      'thread', 'cwd-host', 'root-host', 'missing-fd-inventory', 'private'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='ih-fd-') as root:
+                _, kernel, fence = self.build(root)
+                fence.close_candidate(fence.owner)
+                backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                proc = kernel.proc/str(backend['init']['pid'])
+                if fault == 'host-fd-child':
+                    pid = 9999
+                    self.put_pid(kernel, pid, backend['init']['pid'], backend['init']['pid'], backend['cgroup'])
+                    child = kernel.proc/str(pid)
+                    (child/'ns').mkdir()
+                    for ns in ('mnt','pid','cgroup','net','ipc'):
+                        (child/'ns'/ns).symlink_to(ns+':[SIMULATED-CONTAINER]')
+                    (child/'status').write_bytes((proc/'status').read_bytes())
+                    (child/'root').symlink_to(proc/'root', target_is_directory=True)
+                    (child/'cwd').symlink_to(proc/'root', target_is_directory=True)
+                    (child/'task'/str(pid)).mkdir(parents=True)
+                    (child/'fd').mkdir(); (child/'fdinfo').mkdir()
+                    (kernel.group(backend['cgroup'])/'cgroup.procs').write_text(str(backend['init']['pid'])+'\n'+str(pid))
+                    proc = child
+                if fault in ('host-fd', 'host-fd-child'):
+                    target = kernel.group(kernel.candidate)/'cgroup.freeze'
+                    descriptor = os.open(target, os.O_WRONLY)
+                    self.addCleanup(os.close, descriptor)
+                    (proc/'fd/9').symlink_to(target)
+                    (proc/'fdinfo/9').write_text('pos:\t0\nflags:\t0100001\nmnt_id:\t999\n')
+                if fault in ('socket', 'anon-inode'):
+                    (proc/'fd/9').symlink_to('socket:[123]' if fault == 'socket' else 'anon_inode:[io_uring]')
+                if fault == 'fdinfo-only': (proc/'fdinfo/9').write_text('mnt_id:\t999\n')
+                if fault == 'thread': (proc/'task/9999').mkdir()
+                if fault in ('cwd-host', 'root-host'):
+                    kernel.mount_device = lambda path: '8:1' if path.name == fault.split('-')[0] else '0:1'
+                if fault == 'missing-fd-inventory': (proc/'fd').rmdir()
+                before = list(kernel.calls)
+                if fault == 'private':
+                    kernel.assert_classic_activation_safe(fence.expected)
+                else:
+                    with self.assertRaises((RuntimeError, FileNotFoundError)):
+                        kernel.assert_classic_activation_safe(fence.expected)
+                self.assertEqual(kernel.calls,before)
+                self.assertNotIn('classicActivation',fence.expected)
+                self.assertEqual((kernel.group(kernel.candidate)/'cgroup.freeze').read_text(), '1')
+
+    def test_private_tmpfs_requires_superblock_and_mount_provenance(self):
+        for fault in ('host-shm', 'bind-provenance', 'host-ipc', 'missing-provenance',
+                      'stat-mismatch', 'missing-host-inventory', 'host-ipc-namespace', 'private'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='ih-k02-') as root:
+                _, kernel, fence = self.build(root)
+                fence.close_candidate(fence.owner)
+                backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                mounts = kernel.proc / str(backend['init']['pid']) / 'mountinfo'
+                device = '0:33' if fault == 'host-shm' else '0:44'
+                mounts.write_text(mounts.read_text()+f'4 1 {device} / /dev/shm rw,nosuid,nodev - tmpfs shm rw,size=65536k\n')
+                kernel.mount_device = lambda path: (device if fault != 'stat-mismatch' else '0:55') if path.name == 'shm' else '0:1'
+                if fault == 'bind-provenance':
+                    backend['mountProvenance']['mounts'] = [{'Type':'bind','Source':'/dev/shm','Destination':'/dev/shm'}]
+                if fault == 'host-ipc': backend['mountProvenance']['ipcMode'] = 'host'
+                if fault == 'host-ipc-namespace':
+                    ipc = kernel.proc/str(backend['init']['pid'])/'ns/ipc'
+                    ipc.unlink(); ipc.symlink_to('ipc:[SIMULATED-HOST]')
+                if fault == 'missing-provenance': del backend['mountProvenance']
+                if fault == 'missing-host-inventory': (kernel.proc/'1/mountinfo').unlink()
+                before = list(kernel.calls)
+                if fault == 'private':
+                    kernel.assert_classic_activation_safe(fence.expected)
+                    result = fence.activate_classic(fence.owner, 'a'*64)
+                    self.assertEqual(result['code'], 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED')
+                    self.assertEqual(kernel.calls[len(before):], [(backend['cgroup'],False)])
+                else:
+                    with self.assertRaises((RuntimeError, FileNotFoundError)):
+                        kernel.assert_classic_activation_safe(fence.expected)
+                    self.assertEqual(kernel.calls, before)
+                    self.assertNotIn('classicActivation', fence.expected)
+                    self.assertEqual((kernel.group(kernel.candidate)/'cgroup.freeze').read_text(), '1')
+
+    def test_private_mount_check_uses_real_stat_device_not_only_mountinfo(self):
+        with tempfile.TemporaryDirectory(prefix='ih-stat-') as root:
+            _, kernel, fence = self.build(root)
+            backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+            proc = kernel.proc/str(backend['init']['pid'])
+            shm = proc/'root/dev/shm'
+            shm.mkdir(parents=True)
+            del kernel.mount_device  # Exercise the real stat(2) implementation.
+            device = shm.stat().st_dev
+            self.assertEqual(kernel.mount_device(shm), f'{os.major(device)}:{os.minor(device)}')
+            mounts = proc/'mountinfo'
+            unproven = f'{os.major(device)+1}:{os.minor(device)}'
+            mounts.write_text(mounts.read_text()+f'4 1 {unproven} / /dev/shm rw - tmpfs shm rw\n')
+            with self.assertRaisesRegex(RuntimeError, 'superblock'):
+                kernel.assert_classic_activation_safe(fence.expected)
+
+    def test_capture_retains_exact_mount_provenance_not_only_mountinfo_shape(self):
+        import test_panel_host_freezer as ft
+        fixture = ft.CaptureTests()
+        fixture.setUp()
+        try:
+            row = fixture.rows[0]
+            row['HostConfig'].update({'IpcMode':'private','Binds':['/dev/shm:/dev/shm'],
+                'VolumesFrom':['foreign'], 'Tmpfs':{'/run':'rw'}})
+            row['Mounts'] = [{'Type':'bind','Source':'/dev/shm','Destination':'/dev/shm'}]
+            row['ShmPath'] = '/var/lib/docker/containers/'+row['Id']+'/mounts/shm'
+            result = fixture.f.m.capture(fixture.f.k)
+            captured = next(c for c in result['containers'] if c['id'] == row['Id'])
+            self.assertEqual(captured.get('mountProvenance'), {'mounts':row['Mounts'],
+                'binds':row['HostConfig']['Binds'], 'volumesFrom':['foreign'], 'tmpfs':{'/run':'rw'},
+                'ipcMode':'private', 'shmPath':row['ShmPath']})
+            row['Mounts'][0]['Source'] = '/changed'
+            self.assertEqual(captured['mountProvenance']['mounts'][0]['Source'], '/dev/shm')
+        finally:
+            fixture.doCleanups()
+
+    def test_proc_controls_and_aliases_refuse_before_precommit_eligibility(self):
+        faults = {
+            'writable-proc': None,
+            'sysrq': '4 2 0:2 /sysrq-trigger /proc/sysrq-trigger rw - proc proc rw\n',
+            'sysctl': '4 2 0:2 /sys /proc/sys rw - proc proc rw\n',
+            'readonly-alias': '4 1 0:2 / /sys/alias ro - proc proc rw\n',
+            'writable-alias': '4 1 0:2 /sysrq-trigger /sys/alias rw - proc proc rw\n',
+            'missing-proc': '',
+        }
+        for fault, extra in faults.items():
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='ih-k01-') as root:
+                _, kernel, fence = self.build(root)
+                fence.close_candidate(fence.owner)
+                backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                mountinfo = kernel.proc / str(backend['init']['pid']) / 'mountinfo'
+                safe = mountinfo.read_text().replace('/ /proc rw', '/ /proc ro')
+                if fault == 'writable-proc':
+                    safe = safe.replace('/ /proc ro', '/ /proc rw')
+                if fault == 'missing-proc':
+                    safe = ''.join(line+'\n' for line in safe.splitlines() if ' - proc ' not in line)
+                mountinfo.write_text(safe + (extra or ''))
+                before = list(kernel.calls)
+                journal = fence.journal.path.joinpath('hold.json').read_bytes()
+                # Same predicate is called by prepare-classic before COMMIT.
+                with self.assertRaisesRegex(RuntimeError, 'proc'):
+                    kernel.assert_classic_activation_safe(fence.expected)
+                self.assertEqual(kernel.calls, before)
+                self.assertEqual(fence.journal.path.joinpath('hold.json').read_bytes(), journal)
+                self.assertNotIn('classicActivation', fence.expected)
 
     def test_host_network_or_privileged_existing_child_refuse_activation_safety(self):
         for fault in ('host-network', 'privileged-child', 'host-network-child'):
@@ -44,7 +199,7 @@ class BoundedActivationTests(unittest.TestCase):
                     pid = 9999
                     self.put_pid(kernel,pid,backend['init']['pid'],backend['init']['pid'],backend['cgroup'])
                     child = kernel.proc/str(pid); (child/'ns').mkdir()
-                    for ns in ('mnt','pid','cgroup','net'):
+                    for ns in ('mnt','pid','cgroup','net','ipc'):
                         (child/'ns'/ns).symlink_to(ns+':[SIMULATED-CONTAINER]')
                     caps = '0000000000200000' if fault == 'privileged-child' else '0000000000000000'
                     (child/'status').write_text(''.join(k+': '+caps+'\n' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')))
@@ -329,6 +484,14 @@ class RootGuardActivationTests(unittest.TestCase):
     put_pid = BoundedActivationTests.put_pid
 
     def test_actual_shared_root_guard_dispatches_only_same_holder_committed_backend(self):
+        self.exercise_guard()
+
+    def test_actual_prepare_classic_refuses_kernel_faults_before_commit_exists(self):
+        for fault in ('proc-control', 'host-shm', 'host-fd'):
+            with self.subTest(fault=fault):
+                self.exercise_guard(fault)
+
+    def exercise_guard(self, fault=None):
         import multiprocessing
         import time
         s,m,freezer = closure.s,closure.m,closure.f
@@ -342,6 +505,20 @@ class RootGuardActivationTests(unittest.TestCase):
             def guard_check(self,*args): pass
         with tempfile.TemporaryDirectory(prefix='ihg-') as root:
             p,kernel,_ = self.build(root,arm=False)
+            backend = next(c for c in p['hostHold']['expected']['containers'] if c['cgroup'] == p['hostHold']['expected']['backend'])
+            proc = kernel.proc/str(backend['init']['pid'])
+            if fault == 'proc-control':
+                mounts = proc/'mountinfo'
+                mounts.write_text(mounts.read_text()+'4 2 0:2 /sysrq-trigger /proc/sysrq-trigger rw - proc proc rw\n')
+            if fault == 'host-shm':
+                mounts = proc/'mountinfo'
+                mounts.write_text(mounts.read_text()+'4 1 0:33 / /dev/shm rw - tmpfs shm rw\n')
+            if fault == 'host-fd':
+                target = kernel.group(kernel.candidate)/'cgroup.freeze'
+                descriptor = os.open(target,os.O_WRONLY)
+                self.addCleanup(os.close,descriptor)
+                (proc/'fd/9').symlink_to(target)
+                (proc/'fdinfo/9').write_text('flags:\t0100001\nmnt_id:\t999\n')
             kernel.journal_path=Path(root)/'host/hold.json'
             m.atomic_json(root,'guard.json',{'fixture':True})
             readfd,writefd=os.pipe()
@@ -353,6 +530,9 @@ class RootGuardActivationTests(unittest.TestCase):
                     try: s.serve_hold(p,root,m,freezer,kernel,Host(),readfd)
                     except m.Refusal as e:
                         if str(e) != 'HOST_CONTROLLER_CHANNEL_LOST': raise
+                    except RuntimeError as e:
+                        if fault is None: raise
+                        (Path(root)/'kernel-refusal').write_text(str(e))
             child=multiprocessing.get_context('fork').Process(target=guard)
             child.start();os.close(readfd)
             try:
@@ -364,6 +544,17 @@ class RootGuardActivationTests(unittest.TestCase):
                      patch.object(s,'load_freezer',return_value=(freezer,kernel)), \
                      patch.object(m,'secure_file',side_effect=lambda path:Path(path).read_bytes()):
                     s.check_hold(p,root,m,command='close-candidate')
+                    if fault:
+                        with self.assertRaisesRegex(m.Refusal,'HOST_GUARD_LOST'):
+                            s.check_hold(p,root,m,command='prepare-classic')
+                        child.join(5)
+                        self.assertFalse(child.is_alive()); self.assertEqual(child.exitcode,0)
+                        self.assertRegex((Path(root)/'kernel-refusal').read_text(), 'proc|host-backed|descriptor')
+                        self.assertFalse((Path(root)/'handoff-commit.json').exists())
+                        self.assertEqual(json.loads(kernel.journal_path.read_bytes())['phase'],'unknown')
+                        for group in [*p['hostHold']['expected']['freezeOrder'],kernel.candidate]:
+                            self.assertEqual((kernel.group(group)/'cgroup.freeze').read_text(),'1')
+                        return
                     s.check_hold(p,root,m,command='prepare-classic')
                     # This unit fixture isolates same-peer/commit-file dispatch;
                     # separate five-node tests produce the actual durable COMMIT.
