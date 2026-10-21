@@ -486,6 +486,34 @@ class SupervisorFiles:
             finally: os.close(fd)
 
 
+class PreparationSupervisorFiles(SupervisorFiles):
+    """Separate fixed preparer only: one self-stop while supervise holds lock.
+
+    Root installation independently observes this stopped process and finalizes
+    policy/mount/fd pins before resuming it. No inventory is generated or accepted
+    here. The ordinary supervisor CLI does not instantiate this class.
+    """
+    def __init__(self, bootstrap_files):
+        need(type(bootstrap_files) is dict and 0 < len(bootstrap_files) <= 50000 and
+             {c.SELF, c.FRESH} <= bootstrap_files.keys() and
+             all(type(pin) is str and c.DIGEST.fullmatch(pin) for pin in bootstrap_files.values()),
+             'FRESH_PREPARATION_BOOTSTRAP_REQUIRED')
+        self._bootstrap_files = dict(bootstrap_files)
+        self._preparation_consumed = False
+
+    def read_json(self, path):
+        need(path == POLICY, 'FIXED_SUPERVISOR_POLICY_ONLY')
+        need(not self._preparation_consumed, 'FRESH_PREPARATION_REPLAY_FORBIDDEN')
+        self._preparation_consumed = True
+        # No temporary pipe, receipt, socket exchange or extra inherited FD.
+        # SIGCONT is not GO: every original Platform check still follows.
+        os.kill(os.getpid(), c.signal.SIGSTOP)
+        policy = super().read_json(path)
+        need(type(policy) is dict and policy.get('files') == self._bootstrap_files,
+             'FRESH_PREPARATION_SOURCE_DRIFT')
+        return policy
+
+
 @contextmanager
 def commit_frame(conn):
     """Own every installed rights FD before rejecting any ancillary semantics."""
