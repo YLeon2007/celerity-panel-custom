@@ -830,34 +830,47 @@ def main():
     fs.private(STATE)
     need(fs.info(KEY)['mode'] == 0o600 and sha(fs.read(KEY)[0]) == config['keySha256'], 'OPERATOR_KEY_PIN_DRIFT_RETAINED')
     # Fixed lock must be independently provisioned, never create/adopt a lock.
-    with fs.lock(LOCK):
-        need(fs.absent(KNOWN) and fs.absent(KNOWN + '.next') and fs.absent(SOCKET), 'STALE_COORDINATOR_RETAINED')
-        known = ''.join('[' + p['identity']['endpointIp'] + ']:2222 ssh-ed25519 ' + p['hostKey'] + '\n' for p in config['nodes'].values())
-        fs.atomic(KNOWN, known.encode(), new=True)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        held = None
-        primary = None
-        try:
-            listener.bind(SOCKET); os.chmod(SOCKET, 0o600); listener.listen(1)
-            def spawn(node):
-                need(sha(fs.read(KEY)[0]) == config['keySha256'] and fs.read(KNOWN)[0] == known.encode())
-                local_origin(config)
-                return subprocess.Popen(ssh_argv(config, node), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
-            held = Coordinator(config, fs, spawn, origin=origin)
-            with held.restore_scope():
-                held.serve_owner(listener)
-        except BaseException as error:
-            primary = error
-            error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
-            raise
-        finally:
-            code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
-            dispose_socket(listener, code, primary)
-            # Leave socket/known/intents as sticky operator reconciliation state.
-            # Never unlink unknown paths or reopen admission in a finally block.
-        print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held.handoff_completed else
-                          'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}))
+    # The outer flock's readback/FD close is required cleanup too. Keep its
+    # context exit inside the same frozen phase classifier as inner resources.
+    held = None
+    primary = None
+    try:
+        with fs.lock(LOCK):
+            need(fs.absent(KNOWN) and fs.absent(KNOWN + '.next') and fs.absent(SOCKET), 'STALE_COORDINATOR_RETAINED')
+            known = ''.join('[' + p['identity']['endpointIp'] + ']:2222 ssh-ed25519 ' + p['hostKey'] + '\n' for p in config['nodes'].values())
+            fs.atomic(KNOWN, known.encode(), new=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(SOCKET); os.chmod(SOCKET, 0o600); listener.listen(1)
+                def spawn(node):
+                    need(sha(fs.read(KEY)[0]) == config['keySha256'] and fs.read(KNOWN)[0] == known.encode())
+                    local_origin(config)
+                    return subprocess.Popen(ssh_argv(config, node), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
+                held = Coordinator(config, fs, spawn, origin=origin)
+                with held.restore_scope():
+                    held.serve_owner(listener)
+            except BaseException as error:
+                primary = error
+                error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+                raise
+            finally:
+                code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+                dispose_socket(listener, code, primary)
+                # Leave socket/known/intents as sticky reconciliation state.
+                # Never unlink unknown paths or reopen admission during cleanup.
+        # Success is observable only after required outer lock teardown/readback.
+        # Flush inside the classifier: a broken result pipe is postcommit unknown.
+        print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held is not None and held.handoff_completed else
+                          'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}), flush=True)
+    except BaseException as error:
+        failure = primary if primary is not None else error
+        setattr(failure, 'code', held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED')
+        if error is not primary:
+            setattr(failure, 'cleanup_errors', (*getattr(failure, 'cleanup_errors', ()), error))
+        if failure is not error:
+            raise failure from error
+        raise
 
 
 if __name__ == '__main__':

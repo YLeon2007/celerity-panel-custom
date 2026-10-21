@@ -230,6 +230,87 @@ finally:
                     self.assertEqual(output.getvalue(), '', 'no success result before listener cleanup')
                     self.assertFalse(f.fs.absent(c.COMMIT))
 
+    def test_main_outer_real_lock_close_preserves_phase_and_precedes_success(self):
+        from contextlib import contextmanager, redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        for phase in ('completed', 'committed-primary', 'commit-unknown', 'precommit-primary', 'output-failed'):
+            with self.subTest(phase=phase):
+                c = ct.load_c()
+                with it.combined_fixture(c) as f:
+                    key = b'SIMULATED operator key; never used for SSH'
+                    f.config['keySha256'] = c.sha(key)
+                    f.fs.atomic(c.CONFIG, c.canonical(f.config))
+                    for node in f.fixtures: node.put(c.CONFIG, c.canonical(f.config))
+                    (f.root / c.KEY.lstrip('/')).parent.mkdir(mode=0o700)
+                    f.fs.atomic(c.KEY, key, new=True)
+                    f.fs.atomic(c.LOCK, b'', new=True)
+                    path = str(f.root / 'lock.sock')
+                    primary = RuntimeError('SIMULATED primary phase acknowledgement loss')
+                    instances, target, disposed = [], [None], []
+                    base = c.Coordinator
+                    class LocalCoordinator(base):
+                        def __init__(self, config, fs, spawn, *, origin):
+                            super().__init__(config, fs, f.spawn, origin=origin)
+                            instances.append(self)
+                        def serve_owner(self, listener):
+                            if phase == 'precommit-primary': raise primary
+                            if phase == 'commit-unknown':
+                                atomic = f.fs.atomic
+                                def lost_ack(name, *args, **kwargs):
+                                    result = atomic(name, *args, **kwargs)
+                                    if name == c.COMMIT: raise primary
+                                    return result
+                                f.fs.atomic = lost_ack
+                            self.commit_handoff(it.settlement_proof(f, c))
+                            self.activate_classic()
+                            if phase == 'committed-primary': raise primary
+                            self.finish_handoff()
+                    originals = (ct.HERE / 'node_originals.py').read_bytes()
+                    source = (ct.HERE / 'coordinated_restore.py').read_bytes()
+                    def trusted(name):
+                        return c.canonical(f.config) if name == c.CONFIG else originals if name == c.ORIGINALS else source
+                    real_lock, close = f.fs.lock, os.close
+                    @contextmanager
+                    def tracked_lock(name):
+                        with real_lock(name) as fd:
+                            target[0] = fd
+                            yield fd
+                    def eio(fd):
+                        wanted = phase != 'output-failed' and not disposed and fd == target[0] and bool(instances)
+                        close(fd)  # Real exact outer lock descriptor is closed, then acknowledgement is lost.
+                        if wanted:
+                            disposed.append(fd)
+                            raise OSError(errno.EIO, 'SIMULATED outer lock close acknowledgement EIO')
+                    class BrokenOutput(StringIO):
+                        def write(self, text):
+                            raise BrokenPipeError(errno.EPIPE, 'SIMULATED final result output loss')
+                    absent = f.fs.absent
+                    output = BrokenOutput() if phase == 'output-failed' else StringIO()
+                    def fixture_absent(name):
+                        return not os.path.exists(path) if name == path else absent(name)
+                    with patch.object(f.fs, 'absent', fixture_absent), patch.object(f.fs, 'lock', tracked_lock), \
+                         patch.object(c, 'trusted_read', trusted), \
+                         patch.object(c, 'load_module', return_value=SimpleNamespace(Files=lambda: f.fs)), \
+                         patch.object(c, 'local_origin', return_value=f.origin), \
+                         patch.object(c, 'Coordinator', LocalCoordinator), patch.object(c, 'SOCKET', path), \
+                         patch.object(c.os, 'geteuid', return_value=0), \
+                         patch.object(c.sys, 'argv', ['SIMULATED-coordinator', 'restore']), \
+                         patch.object(c.signal, 'signal'), patch.object(c.signal, 'alarm'), \
+                         patch.object(os, 'close', eio), redirect_stdout(output):
+                        with self.assertRaises(BaseException) as failed: c.main()
+                    expected = ('COORDINATED_RESTORE_UNKNOWN_RETAINED' if phase == 'precommit-primary' else
+                                'COMMIT_UNKNOWN_NO_ACTIVATION' if phase == 'commit-unknown' else
+                                'COMMITTED_ACTIVATION_UNKNOWN')
+                    self.assertEqual(getattr(failed.exception, 'code', None), expected)
+                    if phase not in ('completed', 'output-failed'): self.assertIs(failed.exception, primary)
+                    self.assertTrue(getattr(failed.exception, 'cleanup_errors', ()))
+                    self.assertEqual(len(disposed), 0 if phase == 'output-failed' else 1)
+                    self.assertEqual(output.getvalue(), '', 'no success JSON before outer lock disposal')
+                    self.assertTrue(all(p.poll() is not None for p in f.children))
+                    if phase != 'precommit-primary': self.assertFalse(f.fs.absent(c.COMMIT))
+                    if phase == 'commit-unknown': self.assertTrue(f.fs.absent(c.ACTIVATION))
+
     def test_real_process_disposal_is_bounded_through_terminate_wait_and_kill_errors(self):
         c = ct.load_c()
         for fault in ('terminate', 'wait', 'kill', 'timeout'):
