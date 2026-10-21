@@ -3,6 +3,8 @@
  * by Click Connect
  */
 
+// Validate opt-in file settings before importing application dependencies/timers.
+const classicSettings = require('./src/classicSettings');
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -49,6 +51,7 @@ const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
 const helmet = require('helmet');
 const app = express();
+let classicStartupComplete = false;
 const l2tpRootLifecycle = createL2tpRootLifecycle();
 
 app.set('trust proxy', 1);
@@ -179,6 +182,24 @@ app.use((req, res, next) => {
 });
 
 // ==================== HEALTH CHECK ====================
+
+// A separate opt-in serving witness: never replace the ordinary dynamic /health.
+// Pinned body bytes prove serving + completed boot + current DB/cache replies,
+// not node/dataplane health, physical isolation, or ownership handback.
+if (classicSettings) app.get('/classic-ready', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        if (!classicStartupComplete || shutdownPromise !== undefined
+            || mongoose.connection.readyState !== 1 || cacheService.redis?.status !== 'ready') {
+            return res.status(503).type('text/plain').end('c3-classic-not-ready-v1\n');
+        }
+        await Promise.all([mongoose.connection.db.command({ ping: 1 }, { timeoutMS: 1000 }), cacheService.redis.ping()]);
+        if (shutdownPromise !== undefined) return res.status(503).type('text/plain').end('c3-classic-not-ready-v1\n');
+        res.type('text/plain').end('c3-classic-ready-v1\n');
+    } catch (_) {
+        res.status(503).type('text/plain').end('c3-classic-not-ready-v1\n');
+    }
+});
 
 app.get('/health', async (req, res) => {
     const cacheStats = await cacheService.getStats();
@@ -661,7 +682,7 @@ async function startServer() {
             setupWebSocketServer(server);
             activeServers.push(server);
             
-            server.listen(PORT, () => {
+            server.listen(...(classicSettings ? [PORT, classicSettings.listenAddress] : [PORT]), () => {
                 logger.info(`[Server] HTTP listening on port ${PORT} (behind Caddy)`);
                 logger.info(`[Server] Panel: https://${config.PANEL_DOMAIN}/panel`);
             });
@@ -771,6 +792,7 @@ async function startServer() {
                 logger.warn(`[AccessLogs] boot reconcile skipped: ${e.message}`);
             }
         }, 30 * 1000);
+        classicStartupComplete = true;
 
     } catch (err) {
         logger.error(`[Server] Startup failed: ${err.message}`);
@@ -1135,7 +1157,7 @@ function setupCronJobs() {
  */
 function cleanOldLogs(days) {
     try {
-        const logsDir = path.join(__dirname, 'logs');
+        const logsDir = classicSettings?.logsDirectory || path.join(__dirname, 'logs');
         
         if (!fs.existsSync(logsDir)) {
             return;

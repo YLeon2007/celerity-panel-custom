@@ -1,4 +1,5 @@
-require('dotenv').config();
+const classicSettings = require('./src/classicSettings');
+if (!classicSettings) require('dotenv').config();
 
 // Required environment variables check
 const requiredEnv = ['PANEL_DOMAIN', 'ACME_EMAIL', 'ENCRYPTION_KEY', 'SESSION_SECRET'];

@@ -1,6 +1,11 @@
+const classicSettings = require('../classicSettings');
 const winston = require('winston');
 const path = require('path');
 const EventEmitter = require('events');
+const logsDirectory = classicSettings?.logsDirectory || path.join(__dirname, '../../logs');
+if (classicSettings) {
+    require('fs').mkdirSync(logsDirectory, { recursive: true, mode: 0o700 });
+}
 
 // Event emitter for real-time log streaming
 const logEmitter = new EventEmitter();
@@ -61,14 +66,14 @@ const logger = winston.createLogger({
     transports: [
         new winston.transports.Console({ format: consoleFormat }),
         new winston.transports.File({
-            filename: path.join(__dirname, '../../logs/error.log'),
+            filename: path.join(logsDirectory, 'error.log'),
             level: 'error',
             format: fileFormat,
             maxsize: 5242880,
             maxFiles: 5,
         }),
         new winston.transports.File({
-            filename: path.join(__dirname, '../../logs/combined.log'),
+            filename: path.join(logsDirectory, 'combined.log'),
             format: fileFormat,
             maxsize: 5242880,
             maxFiles: 5,
