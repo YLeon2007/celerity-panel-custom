@@ -37,9 +37,9 @@ class FreshCompositionTests(unittest.TestCase):
         import subprocess
         import threading
         from pathlib import Path
-        from test_fresh_classic_launch import launch_fixture
+        from test_prepared_resume import prepared_fixture
         m = fresh
-        with launch_fixture(m, bridge=True) as f:
+        with prepared_fixture(m) as f:
             listener_path = f.outer.root / 'owner.sock'
             listener = socket.socket(socket.AF_UNIX); listener.bind(str(listener_path)); listener.listen(1)
             code = '''import os,sys
@@ -61,7 +61,18 @@ finally: channel.close()
                 try:
                     for op in ('check', 'fresh-handback'):
                         request = {'version': 1, 'op': op, 'nonce': os.urandom(32).hex()}
-                        if op == 'fresh-handback': request['proof'] = f.proof
+                        if op == 'fresh-handback':
+                            # Model a slow public DB phase beyond the ordinary
+                            # accept budget; the real preparer must still be T.
+                            import time, fcntl
+                            time.sleep(5.1)
+                            self.assertEqual(Path(f'/proc/{f.supervisor.pid}/stat').read_text().rsplit(')',1)[1].split()[0], 'T')
+                            for node in f.fixtures:
+                                for path in node.writer.lock_paths:
+                                    with node.path(path).open('rb') as lock:
+                                        with self.assertRaises(BlockingIOError):
+                                            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                            request['proof'] = f.proof
                         child.stdin.write(json.dumps(request, separators=(',', ':')).encode() + b'\n'); child.stdin.flush()
                         reply = json.loads(child.stdout.readline())
                         self.assertEqual(reply['op'], 'checked' if op == 'check' else 'fresh-handback-ack')

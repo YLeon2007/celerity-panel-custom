@@ -319,6 +319,36 @@ class Platform:
                         'ControlGroup':CGROUP,'NeedDaemonReload':'no','RestartForceExitStatus':''}, 'LOADED_SUPERVISOR_DRIFT')
         return expected
 
+    def prepared(self, policy, pid):
+        """Controller readback of the accepted stopped generation, never capture."""
+        self.supervisor(policy, pid)  # source/files, namespaces, sole cgroup, loaded unit
+        proc=Path('/proc')/str(pid)
+        status=dict(line.split(':',1) for line in (proc/'status').read_text().splitlines() if ':' in line)
+        need(status['State'].split()[0] == 'T' and
+             [p.name for p in (proc/'task').iterdir()] == [str(pid)], 'STOPPED_SINGLE_SUPERVISOR_REQUIRED')
+        need(status['Uid'].split() == ['65531']*4 and status['Gid'].split() == ['65531']*4 and
+             not status['Groups'].split(), 'DEDICATED_SUPERVISOR_IDENTITY_REQUIRED')
+        need(all(int(status[k],16) == 0 for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')) and
+             status['NoNewPrivs'].strip() == '1', 'CAPABILITY_FREE_NNP_REQUIRED')
+        self.root_mount(policy,proc)
+        need(digest((proc/'net/route').read_bytes()+(proc/'net/fib_trie').read_bytes()) ==
+             policy['inventory']['routesSha256'], 'INGRESS_ROUTE_DRIFT')
+        with (proc/'root'/POLICY.lstrip('/')).open('rb') as stream:
+            raw=stream.read(8388609)
+        need(len(raw) <= 8388608 and c.canonical(c.decode(raw)) == c.canonical(policy),
+             'SUPERVISOR_POLICY_DRIFT')
+        actual={}
+        for leaf in (proc/'fd').iterdir():
+            info=leaf.stat()
+            actual[leaf.name]=[info.st_dev,info.st_ino,stat.S_IFMT(info.st_mode)]
+        need(actual == policy['inventory']['fdPins'] and {'0','1','2','3'} <= actual.keys() and
+             actual['3'][2] == stat.S_IFSOCK, 'INDEPENDENT_FRESH_DESCRIPTOR_PINS_REQUIRED')
+        for fd in ('0','1','2'):
+            need(actual[fd][2] == stat.S_IFREG and
+                 os.readlink(proc/'fd'/fd).startswith('/memfd:c3-supervisor-stdio'),
+                 'FRESH_ANONYMOUS_STDIO_REQUIRED')
+        need(start(pid) == policy['inventory']['supervisor']['start'], 'ACCEPTED_SUPERVISOR_REQUIRED')
+
     def endpoint(self, policy):
         return policy['ingress']['ip'],policy['ingress']['port']
 
@@ -367,9 +397,70 @@ class FreshLaunch:
         self.held=held; self.platform=platform or Platform(); self.path=socket_path or SOCKET
         self.used=False
 
+    def _control_listening(self, policy):
+        """Observe fd3's kernel AF_UNIX row; NEVER probe-connect the sole accept."""
+        pid=policy['inventory']['supervisor']['pid']; proc=Path('/proc')/str(pid)
+        info=(proc/'fd/3').stat(); pin=policy['inventory']['fdPins'].get('3')
+        need(pin == [info.st_dev,info.st_ino,stat.S_IFMT(info.st_mode)] and
+             stat.S_ISSOCK(info.st_mode) and os.readlink(proc/'fd/3') == f'socket:[{info.st_ino}]',
+             'PREPARED_CONTROL_FD_DRIFT')
+        with (proc/'net/unix').open('rb') as stream: raw=stream.read(1048577)
+        need(len(raw) <= 1048576, 'PREPARED_UNIX_TABLE_LIMIT')
+        rows=[line.split(None,7) for line in raw.decode().splitlines()[1:]]
+        matching=[row for row in rows if len(row) >= 7 and row[6] == str(info.st_ino)]
+        need(len(matching) == 1 and len(matching[0]) == 8 and matching[0][7] == self.path and
+             matching[0][4:6] == ['0001','01'] and matching[0][3] in ('00000000','00010000'),
+             'PREPARED_CONTROL_SOCKET_REQUIRED')
+        return matching[0][3] == '00010000'
+
+    def _resume_prepared(self, policy):
+        h=self.held
+        need(not h.prepared_resume_attempted, 'PREPARED_RESUME_REPLAY_FORBIDDEN')
+        h.prepared_resume_attempted=True  # latch even validation/readiness faults
+        pid=policy['inventory']['supervisor']['pid']; fd=None
+        try:
+            fd=os.pidfd_open(pid,0)  # no PID-based signal fallback
+            def identity():
+                need(not c.select.select([fd],[],[],0)[0] and
+                     start(pid) == policy['inventory']['supervisor']['start'], 'PREPARED_SUPERVISOR_LOST')
+            identity(); self.platform.prepared(policy,pid)
+            need((Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()[0] == 'T',
+                 'STOPPED_SINGLE_SUPERVISOR_REQUIRED')
+            need(not self._control_listening(policy), 'PREPARED_SOCKET_ALREADY_LISTENING')
+            h.check(); identity()
+            c.signal.pidfd_send_signal(fd,c.signal.SIGCONT,None,0)  # exactly one attempt
+            deadline=min(h.deadline,time.monotonic()+3)
+            deadlines=[(channel.wire,channel.wire.deadline) for channel in h.nodes]
+            try:
+                # All-five checkpoints share the readiness budget too; a silent
+                # peer cannot stretch this wait to the outer restoration lease.
+                for wire,old in deadlines: wire.deadline=min(old,deadline)
+                while True:
+                    h.check(); identity()
+                    need(time.monotonic() < deadline, 'PREPARED_LISTEN_TIMEOUT')
+                    listening=self._control_listening(policy)
+                    identity()
+                    if listening: return fd
+                    time.sleep(min(.01,max(0,deadline-time.monotonic())))
+            finally:
+                for wire,old in deadlines: wire.deadline=old
+        except BaseException as primary:
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error:
+                    primary.cleanup_errors=(*getattr(primary,'cleanup_errors',()),error)
+            raise
+
+    def run_prepared(self, proof):
+        """Fixed fresh-owner composition only, after public all-five settlement."""
+        return self._run(proof, prepared=True)
+
     def run(self, proof):
+        return self._run(proof, prepared=False)  # ordinary supervisor path unchanged
+
+    def _run(self, proof, *, prepared):
         need(not self.used, 'FRESH_LAUNCH_REPLAY_FORBIDDEN'); self.used=True
-        h=self.held; fs=h.fs; conn=None; primary=None
+        h=self.held; fs=h.fs; conn=None; primary=None; lifetime=None
         try:
             h.check(); settlement(h,proof)
             need(not h.commit_attempted and all(fs.absent(p) and fs.absent(p+'.next')
@@ -382,15 +473,25 @@ class FreshLaunch:
                     s=os.stat(Path(SOCKET).name,dir_fd=fd,follow_symlinks=False)
                     need(stat.S_ISSOCK(s.st_mode) and s.st_uid == s.st_gid == 0 and
                          stat.S_IMODE(s.st_mode) == 0o600, 'ROOT_PREPROVISIONED_SOCKET_REQUIRED')
+            if prepared:
+                need(globals().get('_LOADED_SOURCE_SHA256') == policy['files'].get(c.FRESH) and
+                     policy['files'].get(c.SELF) == policy['inventory']['sourceSha256'],
+                     'EXECUTED_FRESH_SOURCE_DRIFT')
+                lifetime=self._resume_prepared(policy)
             conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); conn.settimeout(3); conn.connect(self.path)
             pid,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
             need(uid == (os.getuid() if fs.fixture else 65531), 'SUPERVISOR_UID_REQUIRED')
             supervisor=self.platform.supervisor(policy,pid)
+            if prepared:
+                need(supervisor == policy['inventory']['supervisor'] and
+                     not c.select.select([lifetime],[],[],0)[0], 'PREPARED_SUPERVISOR_LOST')
             wire=c.Wire(conn.fileno(),conn.fileno(),time.monotonic()+5)
             hello=wire.receive()
             need(set(hello) == {'op','nonce','policySha256'} and hello['op'] == 'prepared' and
                  c.DIGEST.fullmatch(hello['nonce']) and hello['policySha256'] == pin, 'SOURCE_PREFLIGHT_REQUIRED')
             h.check()
+            if prepared:
+                need(c.canonical(fs.read_json(POLICY)) == c.canonical(policy), 'ACCEPTED_FRESH_POLICY_DRIFT')
             row={'version':1,'context':h.config['context'],'nonce':h.nonce,
                  'configSha256':c.sha(c.canonical(h.config)), 'restoreIntent':h.intent,
                  'nodePins':h.config['nodes'], 'nodePeers':{x.node:{'pid':x.hello['pid'],'start':x.hello['start']} for x in h.nodes},
@@ -421,7 +522,19 @@ class FreshLaunch:
         except BaseException as error:
             primary=error; error.code=h.failure_code(); raise
         finally:
-            c.dispose_socket(conn,h.failure_code(),primary)
+            try:
+                c.dispose_socket(conn,h.failure_code(),primary)
+            except BaseException as error:
+                primary=primary or error
+                raise
+            finally:
+                if lifetime is not None:
+                    try: os.close(lifetime)
+                    except BaseException as error:
+                        failure=primary if primary is not None else error
+                        failure.code=h.failure_code()
+                        failure.cleanup_errors=(*getattr(failure,'cleanup_errors',()),error)
+                        if primary is None: raise
 
 
 class SupervisorFiles:

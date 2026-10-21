@@ -12,7 +12,11 @@ No installed/live files or policies are modified by these sources or tests.
 - `Coordinator.serve_fresh_owner` loads only the fixed fresh launcher bytes pinned
   by `files['/usr/local/libexec/c3-test-fresh-classic.py']`. It injects its exact
   currently running coordinator module (including `__main__` identity), and calls
-  `FreshLaunch(self).run(proof)` without a substitute Coordinator or client channel.
+  `FreshLaunch(self).run_prepared(proof)` without a substitute Coordinator or
+  client channel. This fixed path verifies the stopped generation, resumes it
+  once via pidfd and waits non-consumingly for its fd3 LISTEN before the existing
+  sole authenticated connect. Ordinary `FreshLaunch.run` and sealed legacy
+  activation remain separate and unchanged.
   Exact `type(held) is c.Coordinator` validation remains enforced.
 - `fresh_owner_restoration_channel.py` verifies the separate root-owned fresh
   settlement config's `freshBridgeSha256` and legacy `bridgeSha256`, then runs
@@ -63,10 +67,24 @@ holds and stale generations, post-terminal reply loss, real deadline expiry,
 required cleanup failure, exactly one exec and no service-level channel reopen.
 Physical/root/UID/SSH/systemd/namespace/cgroup inventory is explicitly simulated.
 
-The bridge fixture starts its supervisor before public Mongo provisioning. Its
-listener's preparation wait is modeled at 70 seconds; production's five-second
-prepared accept remains unchanged. Actual operational supervisor scheduling is
-therefore an explicit unproven prerequisite, not a widened product timeout.
+The former already-listening bridge fixture modeled preparation at 70 seconds;
+that is historical evidence, not prepared-resume acceptance. The focused
+`test_fresh_owner_bridge.py` now uses `test_prepared_resume.prepared_fixture`:
+real self-SIGSTOP under flock, a public-phase delay exceeding five seconds, real
+all-five held channels, one pidfd SIGCONT, delayed listen and the unchanged
+five-second accept. Its executable/HTTP witness is disposable **Python**, not
+proof of the actual Node application in a physical root. Root/UID/systemd/
+namespace facts remain simulated.
+
+The separately owned `fresh_owner_fixture.py` still imports the historical
+`launch_fixture`. For assembled Mongo replay it must be pointed at the focused
+prepared fixture (a test-only import adapter, never a production scheduling
+fallback). The local evidence adapter does this without editing that unowned
+file: actual public initialize/adopt/preEnroll, five owner CAS/majority readbacks,
+real same-held root protocol and stopped subprocess then run unchanged. A
+six-second pre-settlement delay and actual five-commit monitor are additional
+assertions, not extensions of the supervisor accept timeout. Unadapted old
+fixtures are not a passing proof of the new path.
 
 Separate real-application tests execute the actual index twice with disposable
 Mongo/Redis, read-only source permissions and lock-exact dependencies. That

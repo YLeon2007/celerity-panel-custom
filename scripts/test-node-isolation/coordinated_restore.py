@@ -395,6 +395,7 @@ class Coordinator:
         self.cleanup_attempted = False
         self.cleanup_errors = ()
         self.fresh_reply = None
+        self.prepared_resume_attempted = False
 
     def failure_code(self):
         # Frozen irreversible state; cleanup never infers rollback from EOF.
@@ -630,7 +631,7 @@ class Coordinator:
                                      ('check-restoration', 'finish', 'commit-handoff', 'activate-classic', 'complete-handoff')))
                 self.check()
                 if frame['op'] == 'fresh-handback':
-                    fresh.run(frame['proof'])  # actual pinned FreshLaunch(self), same process/module
+                    fresh.run_prepared(frame['proof'])  # fixed same-PID resume after public settlement
                     need(self.handoff_completed and self.commit_sha, 'FRESH_COMPLETION_REQUIRED')
                     reply = {k: v for k, v in {**frame, 'op': 'fresh-handback-ack',
                              'commitSha256': self.commit_sha, 'nextNonce': secrets.token_hex(32)}.items() if k != 'proof'}
@@ -871,6 +872,7 @@ def load_fresh(fs=None):
     module = types.ModuleType('c3_held_fresh_launch')
     module.__file__ = FRESH
     module.c = sys.modules[__name__]
+    module._LOADED_SOURCE_SHA256 = sha(raw)
     exec(compile(raw, FRESH, 'exec'), module.__dict__)
     need(module.c is sys.modules[__name__] and module.c.Coordinator is Coordinator,
          'SAME_COORDINATOR_MODULE_REQUIRED')

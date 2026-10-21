@@ -51,16 +51,38 @@ This is a sequencing contract, **not a runnable installer or authorization**:
    abandon/dispose it before COMMIT; never begin the irreversible hold and hope
    someone wakes up. Do not resume or automatically adopt an abandoned generation.
 5. After independent physical acceptance and complete all-five admission plans,
-   root controls SIGCONT of this exact still-live process, coordinated with the
-   finite fresh handback. SIGCONT is NOT GO: every original policy, identity,
-   full filesystem, mapping, capability, private mount and fd check runs before
-   listen/prepared and again before exec. The original **five-second** accept
-   timeout and post-COMMIT unknown/no-retry behavior are unchanged.
+   the fixed fresh root composition keeps this supervisor stopped throughout the
+   public all-five owner settlement. In the **same live Coordinator**, terminal
+   `fresh-handback` calls `FreshLaunch.run_prepared` only after the public CAS /
+   majority-readback phase. It rechecks all five holds and the accepted stopped
+   PID/start, source closure, root/mount/routes/namespaces, descriptors, dedicated
+   identity and loaded one-shot unit. A pidfd is opened before these checks; no
+   PID-based signal fallback exists. One SIGCONT attempt is latched on that
+   Coordinator, including any later readiness failure. Existing sticky restore
+   intent prevents a new Coordinator from replaying the attempt.
+6. A guarded, at-most-three-second wait (also capped by the Coordinator deadline)
+   observes the **same pinned fd3 inode** in `/proc/PID/net/unix`: stream, bound
+   pathname, unconnected state, and kernel `SO_ACCEPTCON`/LISTEN flag. The pidfd
+   must remain live and PID/start equal before and after observation. Neither
+   pathname existence, leaving `T`, nor a consumptive probe connect is readiness.
+   Only then does the existing single authenticated connect / prepared / durable
+   COMMIT / SCM_RIGHTS / exec protocol proceed. The pidfd remains owned through
+   this finite protocol and is closed on every path, preserving the primary error.
+   Host policy and executed source pins are checked again before COMMIT.
+   SIGCONT is NOT GO: the supervisor's original full policy/filesystem/mapping/
+   capability/mount/fd checks still run before listen and again before exec.
+   The ordinary **five-second** accept is unchanged, not restarted or extended.
 
-The exact installer/controller scheduling and installed unit/resources remain
-unimplemented/unaccepted. Merely receiving a stopped PID is not physical GO.
-This addition does not provision mounts/namespaces/ingress, widen host admission,
-open candidate, restore classic or authorize TEST/PROD operations.
+The fixed local scheduler is implemented; physical installation, preparation
+lifetime enforcement, unit/resources/ingress and independent acceptance remain
+unimplemented/unaccepted. A resume/readiness failure never retries, reconnects,
+re-stops, adopts, opens candidate admission or invokes sealed classic thaw.
+After possible exec, all result/fsync/cleanup uncertainty remains committed
+activation unknown. No held check is made after terminal handoff releases holds.
+Merely receiving a stopped PID is not physical GO. This addition does not
+provision mounts/namespaces/ingress, widen host admission, or authorize live
+TEST/PROD operations. Changed coordinator/launcher bytes invalidate previous
+candidate/source-pack pins; a separately reviewed rebuild is required.
 
 ## Local tests
 
@@ -72,3 +94,14 @@ unprivileged/argument entry refusal. Root ownership/path reading is modeled only
 inside the test child, explicitly not a physical positive. Full existing launch
 regressions are run separately; no actual installed root is claimed by these
 unit tests.
+
+`test_prepared_resume.py` additionally exercises pidfd-only continuation, actual
+fd3 kernel LISTEN observation without consuming accept, live same-start checks,
+flock retention, death/identity/fd mismatch, pidfd absence, each nonselected hold,
+remaining-budget expiry and silent checkpoint pipes. The controller's real
+predicates run against explicitly modeled proc/cgroup/unit/route/root topology
+with real file hashes and O_PATH/fstat/fdinfo. Postexec EOF/fsync/cleanup remain
+unknown, with one signal/exec and candidate exclusion unchanged. The owner-bridge
+positive test holds the preparer stopped beyond five seconds before its terminal
+proof. These tests do not perform physical acceptance, installation, mounts,
+namespace changes, live service/SSH/TEST/PROD operations or actual-app acceptance.
