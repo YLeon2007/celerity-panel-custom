@@ -42,7 +42,7 @@ Serving evidence is actual PID/start/cgroup, PID-owned listening socket inode,
 and an HTTP response with an established reverse-tuple socket actually owned
 by that PID while the keepalive connection remains open. A digest or readiness
 reply alone is insufficient. The fixed source ingress is direct TEST
-`212.119.42.100:3000`, `/health`; this is **not** a claim that existing HTTPS/Caddy
+`212.119.42.100:3000`, `/classic-ready`; this is **not** a claim that existing HTTPS/Caddy
 TEST ingress has been restored. A separately accepted direct mapping must be
 physically established before this construction can be used. The source does
 not create or repair it.

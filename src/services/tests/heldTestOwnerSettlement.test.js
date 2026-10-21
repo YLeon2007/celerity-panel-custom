@@ -64,7 +64,7 @@ test.after(async () => {
 async function fixture(options = {}) {
     // Administrative fixture cleanup is isolated to this owned scratch database.
     for (const model of Object.values(m)) await model.collection.deleteMany({});
-    const pins = Object.entries(api.NODES).map(([nodeId, targetProfile], i) => ({ nodeId, targetProfile,
+    const pins = options.pins || Object.entries(api.NODES).map(([nodeId, targetProfile], i) => ({ nodeId, targetProfile,
         nodeIdentity: { machineId: String(i + 1).repeat(32), sshHostKeySha256: String(i + 1).repeat(64) },
         endpoint: { ip: `192.0.2.${i + 1}`, port: 22, username: 'synthetic' },
         maintenanceId: randomUUID(), bootId: randomUUID(),
@@ -94,7 +94,7 @@ async function fixture(options = {}) {
     const plan = { revision: 7, deployedRevision: 6, nodes: [] };
     for (const p of pins) {
         await m.HyNode.create({ _id: p.nodeId, ip: p.endpoint.ip, name: 'SIMULATED', type: 'xray', active: true,
-            cascadeRole: p.targetProfile === 'xray-main' ? 'portal' : 'bridge', ssh: { port: 22, username: 'synthetic', privateKey: 'SIMULATED-not-a-key' } });
+            cascadeRole: p.targetProfile === 'xray-main' ? 'portal' : 'bridge', ssh: { port: p.endpoint.port, username: p.endpoint.username, privateKey: 'SIMULATED-not-a-key' } });
         const classic = await transfer.initializeClassic({ node: p.nodeId, profile: p.targetProfile, nodeIdentity: p.nodeIdentity });
         const adopted = await transfer.adopt({ node: p.nodeId, profile: p.targetProfile, generation: classic.generation, proofRef: 'SIMULATED-original' });
         const enrollment = await store.preEnroll({ nodeId: p.nodeId, targetProfile: p.targetProfile, endpoint: p.endpoint,
@@ -154,6 +154,79 @@ async function fixture(options = {}) {
     };
     return { plan, pins, store, authority, operationalAuthority, journal, journalDirectory, revoke() { alive = false; }, held: () => alive, checks: () => checks };
 }
+
+async function sameHeldFreshFixture(fault = '') {
+    const here = path.join(__dirname, '../../../scripts/test-node-isolation');
+    const process = spawn('/usr/bin/python3', ['-B', 'fresh_owner_fixture.py', fault],
+        { cwd: here, env: { ...global.process.env, PYTHONDONTWRITEBYTECODE: '1' }, stdio: ['pipe','pipe','pipe'] });
+    let stderr = ''; process.stderr.on('data', raw => { stderr += raw; });
+    const exited = new Promise(resolve => process.once('close', (code, signal) => resolve({ code, signal })));
+    const lines = require('node:readline').createInterface({ input: process.stdout })[Symbol.asyncIterator]();
+    const next = async () => { const r = await lines.next(); assert.equal(r.done, false, stderr); return JSON.parse(r.value); };
+    try {
+        const meta = await next();
+        const source = await fsp.readFile(path.join(here, 'fresh_owner_fixture.py'), 'utf8');
+        const quote = String.fromCharCode(39).repeat(3);
+        const bridge = source.split('BRIDGE_CODE = ' + quote)[1].split(quote)[0];
+        const f = await fixture({ pins: meta.pins });
+        const { withFreshOperationalRestoration } = require('../heldRestorationChannel');
+        const inputs = { pins: meta.pins.map(p => ({ ...p, ...f.plan.nodes.find(n => n.nodeId === p.nodeId) })),
+            config: { oldBackend: { instanceId: 'SIMULATED-old-test', pid: 42, processStartTime: '1234' } }, assertPins() {} };
+        return { ...f, next, meta, authority: work => withFreshOperationalRestoration(inputs, work,
+            { openBridge: () => spawn('/usr/bin/python3', ['-B','-c',bridge,meta.root,meta.socket],
+                { cwd: here, env: global.process.env, stdio: ['pipe','pipe','pipe'] }) }),
+            async close() { process.stdin.end(); const status = await exited; if (!fault) assert.deepEqual(status, {code:0,signal:null}, stderr); } };
+    } catch (error) { process.kill(); await exited; throw error; }
+}
+
+test('fresh same-held JS/Python/FreshLaunch actual exec follows public five-owner Mongo CAS/readbacks', {timeout:90000}, async () => {
+    const f = await sameHeldFreshFixture();
+    try {
+        let opens = 0;
+        const service = new api.HeldTestOwnerSettlement({ withRestorationScope:work => { opens++; return f.authority(work); }, models:m, journal:f.journal });
+        const result = await service.freshHandback(f.plan);
+        assert.equal(result.code, 'COMMITTED_FRESH_ACTIVATION_CONFIRMED');
+        const physical = await f.next();
+        assert.equal(physical.count,1); assert.equal(physical.completed,true); assert.equal(physical.candidateFrozen,true);
+        assert.equal(physical.active,false);
+        assert.equal(await m.Owner.countDocuments({owner:'classic'}),5);
+        for (const n of physical.commit.settlement.nodes) {
+            assert.deepEqual(n.owner, JSON.parse(JSON.stringify(await m.Owner.findOne({node:n.nodeId}).lean())));
+            assert.equal(n.priorOwnerGeneration,f.plan.nodes.find(p=>p.nodeId===n.nodeId).ownerGeneration);
+        }
+        await assert.rejects(service.freshHandback(f.plan));
+        assert.equal(opens,1,'terminal fresh service must not reopen a restoration channel');
+    } finally { await f.close(); }
+});
+
+test('fresh terminal ack loss, timeout and required cleanup remain unknown with exactly one actual exec', {timeout:180000}, async t => {
+    for (const fault of ['ack-loss','terminal-timeout','cleanup']) await t.test(fault, async () => {
+        const f = await sameHeldFreshFixture(fault);
+        try {
+            let opens=0;
+            const service=new api.HeldTestOwnerSettlement({withRestorationScope:work=>{opens++;return f.authority(work);},models:m,journal:f.journal});
+            await assert.rejects(service.freshHandback(f.plan), {code:'COMMITTED_ACTIVATION_UNKNOWN'});
+            const physical=await f.next();
+            assert.equal(physical.count,1);assert.equal(physical.candidateFrozen,true);
+            assert.equal(await m.Owner.countDocuments({owner:'classic'}),5);
+            await assert.rejects(service.freshHandback(f.plan));assert.equal(opens,1);
+        } finally { await f.close(); }
+    });
+});
+
+test('fresh all-five guardloss and stale generations refuse before terminal exec or owner CAS', {timeout:220000}, async t => {
+    for (const node of Object.keys(api.NODES)) for (const kind of ['guardloss','generation']) await t.test(kind+':'+node,async()=>{
+        const f=await sameHeldFreshFixture(kind+':'+node);
+        try {
+            if(kind==='generation') f.plan.nodes.find(n=>n.nodeId===node).ownerGeneration=randomUUID();
+            const owners=await m.Owner.find().lean();
+            const service=new api.HeldTestOwnerSettlement({withRestorationScope:f.authority,models:m,journal:f.journal});
+            await assert.rejects(service.freshHandback(f.plan));
+            assert.deepEqual(await m.Owner.find().lean(),owners);
+            const physical=await f.next();assert.equal(physical.count,0);assert.equal(physical.candidateFrozen,true);
+        } finally {await f.close();}
+    });
+});
 
 test('SIMULATED physical restoration: actual JS/Python bridge and public five-node handback prove zero locks/admissions without thaw', async () => {
     const f = await fixture(); f.authority = f.operationalAuthority;

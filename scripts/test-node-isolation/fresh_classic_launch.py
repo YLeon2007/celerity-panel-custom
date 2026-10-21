@@ -22,7 +22,9 @@ from contextlib import contextmanager
 
 # The isolated installed CLI never imports from cwd/PYTHONPATH or executes .pyc.
 # Programmatic local tests use the ordinary sibling module explicitly.
-if __name__ != '__main__':
+if 'c' in globals():
+    pass  # Trusted coordinator loader injects its exact live module identity.
+elif __name__ != '__main__':
     import coordinated_restore as c
 else:
     import types
@@ -52,6 +54,7 @@ ATTEMPT = c.STATE + '/fresh-launch-attempt.json'
 SUPERVISOR_ATTEMPT = '/state/launch.json'
 LOCK = '/state/launch.lock'
 ACTIVATION = ['fresh-classic-process']
+READY_BODY_SHA256 = '437210538daa3691735d03ab798dbba7bef28404e621f17ea569a6b28c370da6'
 CGROUP = '/system.slice/c3-test-fresh-classic.service'
 ENV = {'C3_SETTINGS':'/etc/classic.json', 'NODE_ENV':'production'}
 
@@ -72,7 +75,7 @@ def start(pid):
 def http_probe(ip, port):
     conn = http.client.HTTPConnection(ip, port, timeout=.5)
     try:
-        conn.request('GET', '/health', headers={'Connection':'close'})
+        conn.request('GET', '/classic-ready', headers={'Connection':'close'})
         response = conn.getresponse()
         body = response.read(65537)
         need(response.status == 200 and len(body) <= 65536, 'SERVING_HTTP_REFUSED')
@@ -84,7 +87,7 @@ def http_probe(ip, port):
 def bound_http_probe(pid,ip,port):
     conn=http.client.HTTPConnection(ip,port,timeout=.5)
     try:
-        conn.request('GET','/health',headers={'Connection':'keep-alive'})
+        conn.request('GET','/classic-ready',headers={'Connection':'keep-alive'})
         response=conn.getresponse(); body=response.read(65537)
         need(response.status == 200 and len(body) <= 65536 and conn.sock is not None, 'KEEPALIVE_SERVING_PROOF_REQUIRED')
         clientip,clientport=conn.sock.getsockname()
@@ -141,8 +144,8 @@ def validate(policy):
              str(Path(path)) == path and type(pin) is str and c.DIGEST.fullmatch(pin), 'INVALID_CLOSURE_PIN')
     ingress = policy['ingress']
     need(type(ingress) is dict and set(ingress) == {'ip','port','path','bodySha256'} and ingress['ip'] == '212.119.42.100' and
-         type(ingress['port']) is int and ingress['port'] == 3000 and ingress['path'] == '/health' and
-         type(ingress['bodySha256']) is str and c.DIGEST.fullmatch(ingress['bodySha256']), 'FIXED_TEST_INGRESS_REQUIRED')
+         type(ingress['port']) is int and ingress['port'] == 3000 and ingress['path'] == '/classic-ready' and
+         type(ingress['bodySha256']) is str and ingress['bodySha256'] == READY_BODY_SHA256, 'FIXED_TEST_INGRESS_REQUIRED')
     inv=policy['inventory']
     need(type(inv) is dict and set(inv) == {'supervisor','root','namespaces','mountinfoSha256','routesSha256',
          'coordinatorSha256','sourceSha256','unitSha256','fdPins','hostNamespaces'}, 'INDEPENDENT_RESOURCE_INVENTORY_REQUIRED')
@@ -354,7 +357,8 @@ class FreshLaunch:
     """Internal trusted-root composition; no caller launch callback or public CLI.
 
     Requires the actual already-open Coordinator; neither a bool nor JSON receipt
-    supplies its live lexical authority. CLI/owner-bridge activation stays dormant.
+    supplies its live lexical authority. Only the separate fixed fresh root
+    composition admits the terminal bridge; no application/request/env selection.
     """
     def __init__(self, held, platform=None, *, socket_path=None):
         need(type(held) is c.Coordinator, 'ACTUAL_HELD_COORDINATOR_REQUIRED')

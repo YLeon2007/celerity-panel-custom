@@ -17,7 +17,7 @@ const OPT = { maxTimeMS: 5000, timeoutMS: 5000 };
 function need(ok) { if (!ok) throw Object.assign(new Error('TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED'), { code: 'TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED' }); }
 const uuid = value => typeof value === 'string' && UUID.test(value);
 class HeldTestOwnerSettlement {
-    #models; #authority; #journal;
+    #models; #authority; #journal; #freshUsed = false;
     constructor({ withRestorationScope, models, journal } = {}) {
         if (typeof withRestorationScope !== 'function') throw new TypeError('Trusted continuously-live restoration scope required');
         const names = ['Owner', 'Enrollment', 'Binding', 'Operation', 'Lock', 'Topology', 'Intent', 'Queue', 'Link', 'L2tpOperation'];
@@ -30,6 +30,11 @@ class HeldTestOwnerSettlement {
     }
     async settle(input) { return this.#run(input, false); }
     async handback(input) { return this.#run(input, true); }
+    async freshHandback(input) {
+        if (this.#freshUsed) throw Object.assign(new Error('FRESH_REPLAY_FORBIDDEN'), { code: 'FRESH_REPLAY_FORBIDDEN' });
+        this.#freshUsed = true;
+        return this.#run(input, 'fresh');
+    }
     async #run(input, combined) {
         need(exact(input, ['nodes', 'revision', 'deployedRevision'])
             && Array.isArray(input.nodes) && input.nodes.length === 5
@@ -129,7 +134,8 @@ class HeldTestOwnerSettlement {
                     handbackAllowed: false, externalAdmission: 'closed' });
                 await check();
                 if (combined) {
-                    need(['commitHandoff', 'activateClassic', 'completeHandoff'].every(k => typeof scope[k] === 'function')
+                    need((combined === 'fresh' ? typeof scope.freshHandback === 'function' :
+                        ['commitHandoff', 'activateClassic', 'completeHandoff'].every(k => typeof scope[k] === 'function'))
                         && typeof this.#journal.committed === 'function');
                     await quiet();
                     const proof = JSON.parse(JSON.stringify({ context: TEST.hostIdentity,
@@ -137,6 +143,22 @@ class HeldTestOwnerSettlement {
                         nodes: plan.nodes.map((n, i) => ({ nodeId: n.nodeId, targetProfile: n.targetProfile,
                             enrollmentId: n.enrollmentId, enrollmentSha256: sha(enrollments[i]),
                             priorOwnerGeneration: n.ownerGeneration, owner: confirmed[i] })) }));
+                    if (combined === 'fresh') {
+                        // One terminal capability after the unchanged all-five CAS/readbacks.
+                        // It releases h: NO subsequent check/legacy activation/complete call.
+                        try {
+                            const commitSha256 = await scope.freshHandback(freeze(proof));
+                            need(typeof commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(commitSha256));
+                            await this.#journal.committed(commitSha256);
+                            result = freeze({ code: 'COMMITTED_FRESH_ACTIVATION_CONFIRMED', ownerCount: 5,
+                                externalAdmission: 'closed', activationSet: ['fresh-classic-process'],
+                                retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256 });
+                            finished = true; return result;
+                        } catch (error) {
+                            error.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+                            throw error; // sent terminal may have executed; never no-activation
+                        }
+                    }
                     let committed = false, attempted = false;
                     try {
                         attempted = true;

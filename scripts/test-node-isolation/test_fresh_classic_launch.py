@@ -47,7 +47,7 @@ class FreshLaunchTests(unittest.TestCase):
             self.assertTrue(result['serving']['socketInode'].isdigit())
             self.assertIsNone(f.supervisor.poll(), 'independent serving supervisor must outlive finite controller')
             self.assertTrue(Path(f'/proc/{pid}').exists(), 'finite controller exit must not kill serving child')
-            self.assertEqual(m.http_probe('127.0.0.1', f.port), b'fresh-classic-fixture')
+            self.assertEqual(m.http_probe('127.0.0.1', f.port), b'c3-classic-ready-v1\n')
             self.assertEqual(f.fs.read_json(m.ATTEMPT)['phase'], 'confirmed')
             self.assertEqual(f.count(), 1)
 
@@ -102,12 +102,12 @@ class FreshLaunchTests(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def launch_fixture(m, fault=None):
+def launch_fixture(m, fault=None, *, bridge=False):
     """Disposable Node source/settings, no credentials or physical operations."""
     import types
     import test_coordinated_restore as ct
     import coordinated_restore as c
-    with ct.cfixture(c) as outer:
+    with ct.cfixture(c, maintenance_id='12345678-1234-4234-8234-123456789abc' if bridge else None) as outer:
         root = outer.root/'fresh'
         root.mkdir()
         (outer.root/'state').mkdir(mode=0o700)
@@ -115,7 +115,7 @@ def launch_fixture(m, fault=None):
         (outer.root/'state/launch.lock').chmod(0o600)
         probe = socket.socket(); probe.bind(('127.0.0.1', 0)); port = probe.getsockname()[1]; probe.close()
         source = root/'index.js'
-        source.write_text("const fs=require('fs'),http=require('http'); const s=JSON.parse(fs.readFileSync(process.env.C3_SETTINGS)); fs.appendFileSync(s.count,'exec\\n'); http.createServer((q,r)=>r.end('fresh-classic-fixture')).listen(s.port,'127.0.0.1');\n")
+        source.write_text("const fs=require('fs'),http=require('http'); const s=JSON.parse(fs.readFileSync(process.env.C3_SETTINGS)); fs.appendFileSync(s.count,'exec\\n'); http.createServer((q,r)=>r.end('c3-classic-ready-v1\\n')).listen(s.port,'127.0.0.1');\n")
         settings = root/'settings.json'; settings.write_text(json.dumps({'port':port, 'count':str(root/'executions')}))
         policy = {'version':1, 'context':'test.infograd.online', 'executable':'/runtime/node',
                   'source':'/app/index.js', 'settings':'/etc/classic.json',
@@ -123,7 +123,7 @@ def launch_fixture(m, fault=None):
                            '/app/index.js':m.digest(source.read_bytes()), '/etc/classic.json':m.digest(settings.read_bytes())},
                   'environment':{'C3_SETTINGS':'/etc/classic.json', 'NODE_ENV':'production'},
                   'uid':65531, 'gid':65531, 'cgroup':'/system.slice/c3-test-fresh-classic.service',
-                  'ingress':{'ip':'212.119.42.100', 'port':3000, 'path':'/health', 'bodySha256':m.digest(b'fresh-classic-fixture')},
+                  'ingress':{'ip':'212.119.42.100', 'port':3000, 'path':'/classic-ready', 'bodySha256':m.digest(b'c3-classic-ready-v1\n')},
                   'inventory':inventory_fixture(m,outer.config)}
         if fault in ('root-alias','root-drift'):
             proc=root/'modeled-proc'; proc.mkdir(); (proc/'root').symlink_to(root)
@@ -135,6 +135,15 @@ def launch_fixture(m, fault=None):
             mounts=modeled_mounts(mid+int(fault=='root-alias')); (proc/'mountinfo').write_bytes(mounts)
             policy['inventory'].update(root=[info.st_dev,info.st_ino],mountinfoSha256=m.digest(mounts))
         if fault == 'config-pin': policy['inventory']['coordinatorSha256']='f'*64
+        if bridge:
+            fresh_path = outer.root / c.FRESH.lstrip('/')
+            fresh_path.parent.mkdir(parents=True, exist_ok=True)
+            for parent in (fresh_path.parent, *fresh_path.parent.parents):
+                if parent == outer.root.parent: break
+                parent.chmod(0o700)
+            fresh_raw = (HERE/'fresh_classic_launch.py').read_bytes()
+            outer.fs.atomic(c.FRESH, fresh_raw, new=True)
+            policy['files'][c.FRESH] = m.digest(fresh_raw)
         outer.fs.atomic(m.POLICY, c.canonical(policy), new=True)
         sock = root/'s.sock'
         listener = socket.socket(socket.AF_UNIX); listener.bind(str(sock)); listener.listen(1)
@@ -157,20 +166,30 @@ class Simulated(m.Platform):
     lines[0]=' '.join(fields); path.write_text('\\n'.join(lines)+'\\n')
     policy['inventory']['mountinfoSha256']=m.digest(path.read_bytes())
    m.Platform().root_mount(policy,root/'fresh/modeled-proc')
-  m.verify_files(policy,lambda name: sys.argv[3] if name=='/runtime/node' else root/'fresh'/('index.js' if name=='/app/index.js' else 'settings.json'))
+  m.verify_files(policy,lambda name: sys.argv[3] if name=='/runtime/node' else (root/name.lstrip('/') if name==m.c.FRESH else root/'fresh'/('index.js' if name=='/app/index.js' else 'settings.json')))
  def paths(self,policy):
   base=root/'fresh'
   return [sys.argv[3],str(base/'index.js')],{'C3_SETTINGS':str(base/'settings.json'),'NODE_ENV':'production'},str(base)
  def observe(self,policy,pid): return m.observe(pid,'127.0.0.1',int(sys.argv[4]))
 listener=socket.socket(fileno=int(sys.argv[2]))
+if sys.argv[6] == 'bridge':
+ # Fixture starts before public Mongo provisioning. Model separately scheduled
+ # supervisor startup; production's five-second prepared accept is unchanged.
+ raw_listener=listener
+ class FixtureListener:
+  def listen(self,value): raw_listener.listen(value)
+  def settimeout(self,value): raw_listener.settimeout(70)
+  def accept(self): return raw_listener.accept()
+  def close(self): raw_listener.close()
+ listener=FixtureListener()
 m.supervise(listener,fs,Simulated(),fault=sys.argv[5] or None)
 '''
-        supervisor = subprocess.Popen([sys.executable,'-B','-c',code,str(outer.root),str(listener.fileno()),shutil.which('node'),str(port),fault or ''],
+        supervisor = subprocess.Popen([sys.executable,'-B','-c',code,str(outer.root),str(listener.fileno()),shutil.which('node'),str(port),fault or '', 'bridge' if bridge else ''],
             cwd=HERE, pass_fds=(listener.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         listener.close()
         class Simulated(m.Platform):
             def check(self, policy):
-                m.verify_files(policy,lambda name: shutil.which('node') if name=='/runtime/node' else root/('index.js' if name=='/app/index.js' else 'settings.json'))
+                m.verify_files(policy,lambda name: shutil.which('node') if name=='/runtime/node' else (outer.root/name.lstrip('/') if name==c.FRESH else root/('index.js' if name=='/app/index.js' else 'settings.json')))
             def supervisor(self, policy, pid):
                 self.check(policy)
                 return {'pid':pid, 'start':m.start(pid)}
@@ -183,6 +202,7 @@ m.supervise(listener,fs,Simulated(),fault=sys.argv[5] or None)
             scope=c.Coordinator(outer.config,outer.fs,outer.spawn,origin=outer.origin).restore_scope()
             held=scope.__enter__()
             try:
+                f.outer=outer; f.platform=Simulated(); f.socket=str(sock)
                 f.held=held
                 f.client=m.FreshLaunch(held,Simulated(),socket_path=str(sock))
                 import test_irreversible_handback as ih
@@ -222,7 +242,7 @@ class PolicyBoundaryTests(unittest.TestCase):
             'source':'/app/index.js','settings':'/etc/classic.json',
             'files':{n:'0'*64 for n in ('/runtime/node','/app/index.js','/etc/classic.json')},
             'environment':dict(m.ENV),'uid':65531,'gid':65531,'cgroup':m.CGROUP,
-            'ingress':{'ip':'212.119.42.100','port':3000,'path':'/health','bodySha256':'0'*64},
+            'ingress':{'ip':'212.119.42.100','port':3000,'path':'/classic-ready','bodySha256':m.READY_BODY_SHA256},
             'inventory':inventory_fixture(m,{})}
 
     def test_strict_scalars_and_minimal_structures(self):

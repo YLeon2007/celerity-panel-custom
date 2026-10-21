@@ -12,6 +12,8 @@ const { NODES } = require('./heldTestOwnerSettlement');
 const CONFIG = '/etc/celerity/topology-test-owner-settlement.json';
 const BRIDGE = '/usr/local/libexec/c3-test-owner-restoration-channel.py';
 const COORDINATOR = '/usr/local/libexec/c3-test-coordinated-restore.py';
+const FRESH_CONFIG = '/etc/celerity/topology-test-fresh-owner-settlement.json';
+const FRESH_BRIDGE = '/usr/local/libexec/c3-test-fresh-owner-restoration-channel.py';
 const RESTORE_CONFIG = '/etc/c3-test-coordinated-restore.json';
 function need(ok) { if (!ok) throw new Error('HELD_OWNER_RESTORATION_UNKNOWN_RETAINED'); }
 const sha = raw => createHash('sha256').update(raw).digest('hex');
@@ -24,14 +26,18 @@ function trustedRead(file) {
     try { const st = fs.fstatSync(fd); need(st.isFile() && st.nlink === 1 && st.size <= 8 * 1024 * 1024 && !(st.mode & 0o007)); return fs.readFileSync(fd); }
     finally { fs.closeSync(fd); }
 }
-function operationalInputs() {
+function operationalInputs() { return readOperationalInputs(false); }
+function freshOperationalInputs() { return readOperationalInputs(true); }
+function readOperationalInputs(fresh) {
     need(process.getuid() === 0);
-    const raw = trustedRead(CONFIG), config = JSON.parse(raw), restoreRaw = trustedRead(RESTORE_CONFIG), restore = JSON.parse(restoreRaw);
-    need(exact(config, ['version', 'mongoUri', 'bridgeSha256', 'coordinatorSha256', 'plan', 'acceptedOriginalsBase64', 'oldBackend'])
+    const configPath = fresh ? FRESH_CONFIG : CONFIG;
+    const raw = trustedRead(configPath), config = JSON.parse(raw), restoreRaw = trustedRead(RESTORE_CONFIG), restore = JSON.parse(restoreRaw);
+    need(exact(config, ['version', 'mongoUri', 'bridgeSha256', 'coordinatorSha256', 'plan', 'acceptedOriginalsBase64', 'oldBackend', ...(fresh ? ['freshBridgeSha256'] : [])])
         && config.version === 1 && typeof config.mongoUri === 'string' && config.mongoUri.startsWith('mongodb://')
         && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256
         && restore.context === TEST.hostIdentity && same(Object.keys(restore.nodes).sort(), Object.keys(NODES).sort())
         && same(Object.keys(config.acceptedOriginalsBase64).sort(), Object.keys(NODES).sort()));
+    if (fresh) need(sha(trustedRead(FRESH_BRIDGE)) === config.freshBridgeSha256);
     const old = config.oldBackend;
     need(exact(old, ['instanceId', 'pid', 'processStartTime']) && typeof old.instanceId === 'string' && old.instanceId
         && Number.isSafeInteger(old.pid) && old.pid > 1 && typeof old.processStartTime === 'string' && /^\d+$/.test(old.processStartTime));
@@ -52,13 +58,14 @@ function operationalInputs() {
             originalSnapshot: { configSha256: p.files.config.sha256, unitSha256: p.files.unit.sha256,
                 serviceActive: p.service.ActiveState, serviceEnabled: p.service.UnitFileState } });
     });
-    return { config: freeze(config), pins: freeze(pins), assertPins() { need(trustedRead(CONFIG).equals(raw) && trustedRead(RESTORE_CONFIG).equals(restoreRaw)
-        && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256); } };
+    return { config: freeze(config), pins: freeze(pins), assertPins() { need(trustedRead(configPath).equals(raw) && trustedRead(RESTORE_CONFIG).equals(restoreRaw)
+        && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256
+        && (!fresh || sha(trustedRead(FRESH_BRIDGE)) === config.freshBridgeSha256)); } };
 }
 class RestorationPipe {
-    #child; #closed = false; #pending; #buffer = ''; #tail = Promise.resolve(); #finishing = false; #exit;
-    constructor(child) {
-        this.#child = child;
+    #child; #closed = false; #pending; #buffer = ''; #tail = Promise.resolve(); #finishing = false; #exit; #fresh;
+    constructor(child, { fresh = false } = {}) {
+        this.#child = child; this.#fresh = fresh;
         const lost = () => this.close();
         this.#exit = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
         child.on('error', lost); child.on('exit', lost); child.stderr.on('data', lost);
@@ -80,13 +87,13 @@ class RestorationPipe {
     }
     check() { return this.request('check'); }
     request(op, proof) {
-        need(['check', 'commit-handoff', 'activate-classic', 'complete-handoff'].includes(op));
+        need((this.#fresh ? ['check', 'fresh-handback'] : ['check', 'commit-handoff', 'activate-classic', 'complete-handoff']).includes(op));
         const run = () => new Promise((resolve, reject) => {
             if (this.#closed) return reject(new Error('RESTORATION_PIPE_REVOKED'));
             const nonce = randomBytes(32).toString('hex');
-            if (op === 'complete-handoff') this.#finishing = true;
+            if (op === 'complete-handoff' || op === 'fresh-handback') this.#finishing = true;
             this.#pending = { nonce, op, resolve, reject, timer: setTimeout(() => this.close(), 15000) };
-            const request = { version: 1, op, nonce, ...(op === 'commit-handoff' ? { proof } : {}) };
+            const request = { version: 1, op, nonce, ...(['commit-handoff', 'fresh-handback'].includes(op) ? { proof } : {}) };
             const raw = JSON.stringify(request) + '\n'; need(Buffer.byteLength(raw) <= 131072);
             this.#child.stdin.write(raw);
         });
@@ -109,25 +116,34 @@ class RestorationPipe {
         this.#child.stdin.destroy(); this.#child.stdout.destroy(); this.#child.kill('SIGTERM');
     }
 }
-async function withOperationalRestoration(inputs, work, { openBridge } = {}) {
+async function withOperationalRestoration(inputs, work, options = {}) { return withRestoration(inputs, work, options, false); }
+async function withFreshOperationalRestoration(inputs, work, options = {}) { return withRestoration(inputs, work, options, true); }
+async function withRestoration(inputs, work, { openBridge } = {}, fresh) {
     // openBridge is an internal programmatic SIMULATED fixture seam only; the
     // fixed root executable supplies neither flags, commands nor callbacks.
     inputs.assertPins();
-    const child = openBridge ? openBridge() : spawn('/usr/bin/python3', ['-I', BRIDGE], { stdio: ['pipe', 'pipe', 'pipe'],
+    const child = openBridge ? openBridge() : spawn('/usr/bin/python3', ['-I', fresh ? FRESH_BRIDGE : BRIDGE], { stdio: ['pipe', 'pipe', 'pipe'],
         env: { PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C', LC_ALL: 'C', HOME: '/root' } });
-    const pipe = new RestorationPipe(child);
-    let open = true, poisoned = false, committed = false, completed = false, commitAttempted = false;
+    const pipe = new RestorationPipe(child, { fresh });
+    let open = true, poisoned = false, committed = false, completed = false, commitAttempted = false, terminalAttempted = false, primary;
     const check = async () => { try { need(open && !poisoned); inputs.assertPins(); await pipe.check(); need(open && !poisoned); inputs.assertPins(); } catch (e) { poisoned = true; throw e; } };
     const guarded = work => async (...args) => { try { return await work(...args); } catch (error) { poisoned = true; throw error; } };
     const scope = Object.freeze({ check,
+        ...(fresh ? { freshHandback: guarded(async proof => {
+            await check(); need(!terminalAttempted); terminalAttempted = true;
+            const digest = await pipe.request('fresh-handback', proof);
+            committed = true;
+            await pipe.waitNatural(); completed = true;
+            return digest; // terminal: h is released; no all-five check
+        }) } : {}),
         commitHandoff: guarded(async proof => {
-            await check(); need(!commitAttempted); commitAttempted = true;
+            need(!fresh); await check(); need(!commitAttempted); commitAttempted = true;
             const digest = await pipe.request('commit-handoff', proof); committed = true;
             await check(); return digest;
         }),
-        activateClassic: guarded(async () => { await check(); need(committed); await pipe.request('activate-classic'); await check(); }),
+        activateClassic: guarded(async () => { need(!fresh); await check(); need(committed); await pipe.request('activate-classic'); await check(); }),
         completeHandoff: guarded(async () => {
-            await check(); need(committed); await pipe.request('complete-handoff');
+            need(!fresh); await check(); need(committed); await pipe.request('complete-handoff');
             await pipe.waitNatural(); completed = true;
         }),
         verifyEnrollment: guarded(async e => {
@@ -158,9 +174,17 @@ async function withOperationalRestoration(inputs, work, { openBridge } = {}) {
     });
     try { await check(); const result = await work(scope); if (!completed) await check(); return result; }
     catch (error) {
-        if (committed) error.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+        primary = error;
+        if (terminalAttempted || committed) error.code = 'COMMITTED_ACTIVATION_UNKNOWN';
         else if (commitAttempted) error.code = 'COMMIT_UNKNOWN_NO_ACTIVATION';
         throw error;
-    } finally { open = false; await pipe.dispose(); }
+    } finally {
+        open = false;
+        try { await pipe.dispose(); } catch (error) {
+            if (terminalAttempted || committed) error.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+            if (primary) { (primary.cleanupErrors ||= []).push(error); }
+            else throw error;
+        }
+    }
 }
-module.exports = { operationalInputs, withOperationalRestoration, RestorationPipe };
+module.exports = { operationalInputs, freshOperationalInputs, withOperationalRestoration, withFreshOperationalRestoration, RestorationPipe };

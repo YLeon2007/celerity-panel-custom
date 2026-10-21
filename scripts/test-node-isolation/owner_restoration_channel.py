@@ -46,7 +46,11 @@ def trusted_read(path):
         os.close(fd)
 
 
-def serve(channel, reader=0, writer=1, *, lifetime=115):
+def serve_fresh(channel, reader=0, writer=1, *, lifetime=115):
+    return serve(channel, reader, writer, lifetime=lifetime, fresh=True)
+
+
+def serve(channel, reader=0, writer=1, *, lifetime=115, fresh=False):
     """Injection is programmatic only, for explicitly SIMULATED channel tests."""
     deadline, buffer = time.monotonic() + lifetime, b''
     while time.monotonic() < deadline:
@@ -68,26 +72,26 @@ def serve(channel, reader=0, writer=1, *, lifetime=115):
                 result[k] = v
             return result
         request = json.loads(line, object_pairs_hook=pairs)
-        need(set(request) == ({'version', 'op', 'nonce', 'proof'} if request.get('op') == 'commit-handoff' else {'version', 'op', 'nonce'}) and type(request['version']) is int and
-             request['version'] == 1 and request['op'] in ('check', 'commit-handoff', 'activate-classic', 'complete-handoff') and
+        need(set(request) == ({'version', 'op', 'nonce', 'proof'} if request.get('op') in ('commit-handoff', 'fresh-handback') else {'version', 'op', 'nonce'}) and type(request['version']) is int and
+             request['version'] == 1 and request['op'] in (('check', 'fresh-handback') if fresh else ('check', 'commit-handoff', 'activate-classic', 'complete-handoff')) and
              isinstance(request['nonce'], str) and len(request['nonce']) == 64 and
              all(c in '0123456789abcdef' for c in request['nonce']))
         if request['op'] == 'check':
             channel.check()
             answer = {**request, 'op': 'checked'}
         else:
-            digest = channel.handoff(request['op'], request.get('proof'))
+            digest = channel.fresh_handoff(request['proof']) if fresh else channel.handoff(request['op'], request.get('proof'))
             answer = {k: v for k, v in {**request, 'op': request['op']+'-ack', 'commitSha256': digest}.items() if k != 'proof'}
         reply = json.dumps(answer, separators=(',', ':')).encode() + b'\n'
         need(os.write(writer, reply) == len(reply))
-        if request['op'] == 'complete-handoff':
+        if request['op'] in ('complete-handoff', 'fresh-handback'):
             return
     need(False)
 
 
-def main():
+def main(*, fresh=False):
     need(os.geteuid() == 0 and len(sys.argv) == 1)
-    config = json.loads(trusted_read(CONFIG))
+    config = json.loads(trusted_read('/etc/celerity/topology-test-fresh-owner-settlement.json' if fresh else CONFIG))
     source = trusted_read(COORDINATOR)
     need(hashlib.sha256(source).hexdigest() == config['coordinatorSha256'] and
          hashlib.sha256(trusted_read(SELF)).hexdigest() == config['bridgeSha256'])
@@ -103,10 +107,13 @@ def main():
     primary = None
     try:
         channel.__enter__()
-        serve(channel)
+        if fresh:
+            serve_fresh(channel)
+        else:
+            serve(channel)
     except BaseException as error:
         primary = error
-        error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if channel.committed else
+        error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if channel.committed or channel.fresh_attempted else
                       'COMMIT_UNKNOWN_NO_ACTIVATION' if channel.commit_attempted else
                       'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED')
         raise

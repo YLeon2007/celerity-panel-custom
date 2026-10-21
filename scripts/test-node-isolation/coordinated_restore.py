@@ -26,6 +26,8 @@ SELF = '/usr/local/libexec/c3-test-coordinated-restore.py'
 ORIGINALS = '/usr/local/libexec/c3-test-node-originals.py'
 SHARED = '/usr/local/libexec/c3-test-shared-host.py'
 FREEZER = '/usr/local/libexec/c3-panel-host-freezer.py'
+FRESH = '/usr/local/libexec/c3-test-fresh-classic.py'
+FRESH_POLICY = '/etc/c3-test-fresh-classic.json'
 CONFIG = '/etc/c3-test-coordinated-restore.json'
 STATE = '/var/lib/c3-test-node-isolation'
 INTENT = STATE + '/coordinated-restore.json'
@@ -392,6 +394,7 @@ class Coordinator:
         self.handoff_completed = False
         self.cleanup_attempted = False
         self.cleanup_errors = ()
+        self.fresh_reply = None
 
     def failure_code(self):
         # Frozen irreversible state; cleanup never infers rollback from EOF.
@@ -562,7 +565,35 @@ class Coordinator:
         finally:
             self.cleanup_channels(primary)
 
+    def serve_fresh_owner(self, listener, *, platform=None, socket_path=None):
+        """Distinct trusted-root composition, never legacy activate/thaw."""
+        need((platform is None and socket_path is None) or self.fs.fixture is not None,
+             'FRESH_FIXTURE_INJECTION_FORBIDDEN')
+        module = load_fresh(self.fs if self.fs.fixture is not None else None)
+        launch = module.FreshLaunch(self, platform, socket_path=socket_path)
+        return self._serve_owner(listener, fresh=launch)
+
+    def complete_fresh_owner(self, primary=None):
+        """Only after restore_scope + listener + outer lock required cleanup."""
+        pending, self.fresh_reply = self.fresh_reply, None
+        if pending is None:
+            return
+        conn, wire, reply = pending
+        try:
+            if primary is None:
+                need(self.handoff_completed and not self.active, 'FRESH_COMPLETION_REQUIRED')
+                wire.send(reply)
+        except BaseException as error:
+            primary = error
+            error.code = self.failure_code()
+            raise
+        finally:
+            dispose_socket(conn, self.failure_code(), primary)
+
     def serve_owner(self, listener):
+        return self._serve_owner(listener)
+
+    def _serve_owner(self, listener, *, fresh=None):
         """Finite root-peer UDS. Diagnostics valid only during this live channel.
 
         No DB settlement, arbitrary callback, runner dispatch or transferable GO.
@@ -592,11 +623,21 @@ class Coordinator:
                     continue
                 assert wire is not None and peer is not None
                 frame = wire.receive(self.watch())
-                need(set(frame) == ({'version', 'op', 'nonce', 'peer', 'challenge', 'proof'} if frame.get('op') == 'commit-handoff' else {'version', 'op', 'nonce', 'peer', 'challenge'}) and type(frame['version']) is int and
+                need(set(frame) == ({'version', 'op', 'nonce', 'peer', 'challenge', 'proof'} if frame.get('op') in ('commit-handoff', 'fresh-handback') else {'version', 'op', 'nonce', 'peer', 'challenge'}) and type(frame['version']) is int and
                      frame['version'] == 1 and frame['nonce'] == nonce and frame['peer'] == peer and
                      proc_start(peer['pid']) == peer['start'] and isinstance(frame['challenge'], str) and DIGEST.fullmatch(frame['challenge']) and
-                     frame['op'] in ('check-restoration', 'finish', 'commit-handoff', 'activate-classic', 'complete-handoff'))
+                     frame['op'] in (('check-restoration', 'fresh-handback') if fresh is not None else
+                                     ('check-restoration', 'finish', 'commit-handoff', 'activate-classic', 'complete-handoff')))
                 self.check()
+                if frame['op'] == 'fresh-handback':
+                    fresh.run(frame['proof'])  # actual pinned FreshLaunch(self), same process/module
+                    need(self.handoff_completed and self.commit_sha, 'FRESH_COMPLETION_REQUIRED')
+                    reply = {k: v for k, v in {**frame, 'op': 'fresh-handback-ack',
+                             'commitSha256': self.commit_sha, 'nextNonce': secrets.token_hex(32)}.items() if k != 'proof'}
+                    self.fresh_reply = (conn, wire, reply)
+                    conn = None  # defer positive ack until root's required cleanup finishes
+                    completed = True
+                    return
                 if frame['op'] == 'finish':
                     need(not self.commit_attempted, 'COMMITTED_ACTIVATION_UNKNOWN')
                     completed = True
@@ -653,6 +694,7 @@ class RestorationChannel:
         self.peer = None
         self.commit_attempted = False
         self.committed = False
+        self.fresh_attempted = False
 
     def state(self):
         need(self.active and self.conn is not None, 'RESTORATION_CHANNEL_REVOKED')
@@ -716,6 +758,29 @@ class RestorationChannel:
             self.close(error)
             raise
 
+    def fresh_handoff(self, proof):
+        """One terminal send. Lost reply may have executed: never replay/check."""
+        try:
+            self.state()
+            need(not self.fresh_attempted and not self.commit_attempted, 'FRESH_REPLAY_FORBIDDEN')
+            request = {**self.frame('fresh-handback'), 'proof': proof}
+            self.fresh_attempted = True
+            self.wire.send(request)
+            reply = self.wire.receive()
+            expected = {k: v for k, v in request.items() if k != 'proof'}
+            need(set(reply) == set(expected) | {'commitSha256', 'nextNonce'} and
+                 {k: reply[k] for k in expected} == {**expected, 'op': 'fresh-handback-ack'} and
+                 isinstance(reply['commitSha256'], str) and DIGEST.fullmatch(reply['commitSha256']) and
+                 isinstance(reply['nextNonce'], str) and DIGEST.fullmatch(reply['nextNonce']))
+            self.committed = True
+            self.close()  # terminal; no state()/h.check after released holds
+            return reply['commitSha256']
+        except BaseException as error:
+            if self.fresh_attempted:
+                error.code = 'COMMITTED_ACTIVATION_UNKNOWN'
+            self.close(error)
+            raise
+
     def handoff(self, op, proof=None):
         try:
             need(op in ('commit-handoff', 'activate-classic', 'complete-handoff'))
@@ -745,7 +810,7 @@ class RestorationChannel:
     def close(self, primary=None):
         self.active = False
         conn, self.conn = self.conn, None  # no second attempt after an unknown close
-        code = ('COMMITTED_ACTIVATION_UNKNOWN' if self.committed else
+        code = ('COMMITTED_ACTIVATION_UNKNOWN' if self.committed or self.fresh_attempted else
                 'COMMIT_UNKNOWN_NO_ACTIVATION' if self.commit_attempted else
                 'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED')
         dispose_socket(conn, code, primary)
@@ -795,9 +860,29 @@ def load_module(name, path, expected):
     return module
 
 
-def main():
+def load_fresh(fs=None):
+    """Fixed trusted closure; inject THIS module even when it is __main__."""
+    import types
+    need(fs is None or fs.fixture is not None, 'FRESH_FIXTURE_INJECTION_FORBIDDEN')
+    read = trusted_read if fs is None else lambda path: fs.read(path)[0]
+    accepted = decode(read(FRESH_POLICY))
+    raw = read(FRESH)
+    need(sha(raw) == accepted['files'][FRESH], 'FRESH_SOURCE_PIN_REQUIRED')
+    module = types.ModuleType('c3_held_fresh_launch')
+    module.__file__ = FRESH
+    module.c = sys.modules[__name__]
+    exec(compile(raw, FRESH, 'exec'), module.__dict__)
+    need(module.c is sys.modules[__name__] and module.c.Coordinator is Coordinator,
+         'SAME_COORDINATOR_MODULE_REQUIRED')
+    return module
+
+
+def main(*, fresh=False):
     need(os.geteuid() == 0 and len(sys.argv) == 2 and sys.argv[1] in ('restore', 'node-hold'), 'ROOT_FIXED_CLI_REQUIRED')
+    need(not fresh or sys.argv[1] == 'restore', 'FRESH_ROOT_RESTORE_ONLY')
     config = validate(decode(trusted_read(CONFIG)))
+    if fresh:
+        load_fresh()  # pin before any operational action
     raw = trusted_read(ORIGINALS)
     need(all(sha(raw) == p['files']['originals'] for p in config['nodes'].values()), 'ORIGINALS_SOURCE_PIN_REQUIRED')
     own = trusted_read(SELF)
@@ -850,7 +935,10 @@ def main():
                                                 stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
                     held = Coordinator(config, fs, spawn, origin=origin)
                     with held.restore_scope():
-                        held.serve_owner(listener)
+                        if fresh:
+                            held.serve_fresh_owner(listener)
+                        else:
+                            held.serve_owner(listener)
                 except BaseException as error:
                     primary = error
                     error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
@@ -866,12 +954,16 @@ def main():
                 if primary is None:
                     primary = error
                 raise
+        if fresh:
+            held.complete_fresh_owner()
         # Success is observable only after required outer lock teardown/readback.
         # Flush inside the classifier: a broken result pipe is postcommit unknown.
-        print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held is not None and held.handoff_completed else
+        print(json.dumps({'code': ('COMMITTED_FRESH_ACTIVATION_CONFIRMED' if fresh else 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED') if held is not None and held.handoff_completed else
                           'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}), flush=True)
     except BaseException as error:
         failure = primary if primary is not None else error
+        if fresh and held is not None:
+            held.complete_fresh_owner(failure)
         setattr(failure, 'code', held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED')
         if error is not primary:
             setattr(failure, 'cleanup_errors', (*getattr(failure, 'cleanup_errors', ()), error))

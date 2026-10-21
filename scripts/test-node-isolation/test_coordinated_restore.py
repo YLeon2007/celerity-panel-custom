@@ -73,8 +73,9 @@ from types import SimpleNamespace
 
 class cfixture:
     """Real subprocess channels and files; UID/SSH/physical/systemd/kernel simulated."""
-    def __init__(self, c):
+    def __init__(self, c, *, maintenance_id=None):
         self.c = c
+        self.maintenance_id = maintenance_id
 
     def __enter__(self):
         c = self.c
@@ -91,6 +92,8 @@ class cfixture:
         for index, (node, (endpoint, profile)) in enumerate(c.NODES.items()):
             f = self.stack.enter_context(t.DualFixture() if endpoint == '104.143.201.72' else t.Fixture())
             f.node, f.profile = node, profile
+            if self.maintenance_id is not None:
+                f.plan['maintenanceId'] = self.maintenance_id
             f.plan.update(nodeId=node, endpointIp=endpoint, targetProfile=profile, machineId=c.sha(node.encode())[:32])
             key = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + bytes([index+1])*32
             f.plan['sshHostKeySha256'] = c.sha(key)
