@@ -46,8 +46,18 @@ function node(role = 'portal') {
         ssh: { password: 'test' }, xray: { agentToken: 'test', transport: 'tcp', security: 'reality' } };
 }
 
-function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [], operations = [] } = {}) {
-    const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0 };
+function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [], operations = [], owners = [] } = {}) {
+    const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0, ownerReads: [] };
+    // Fake native persistence only: no Mongo, model initialization or DDL.
+    const priorDb = TopologyOperation.db.db;
+    TopologyOperation.db.db = { collection(name) {
+        assert.equal(name, 'topologyconfigowners');
+        return { find(query, options) {
+            calls.ownerReads.push({ query, options });
+            return { toArray: async () => owners.filter(row => String(row.node) === String(query.node)) };
+        } };
+    } };
+    t.after(() => { TopologyOperation.db.db = priorDb; });
     t.mock.method(TopologyOperation, 'exists', async query => operations.find(sift(query)) || null);
     t.mock.method(CascadeLink, 'exists', async query => {
         calls.queries.push(query);
@@ -447,4 +457,179 @@ for (const writer of ['sync', 'cascade']) {
         assert.equal(calls.sshConnections, 0);
         assert.deepEqual(calls.agent, []);
     });
+}
+
+const { randomUUID } = require('node:crypto');
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD }
+    = require('../../modules/relay-l2tp/domain/topologyExecutionContext');
+function adoptedOwner(context = PROD, profile = 'xray-main') {
+    return { node: node()._id, profile, executionContext: context, owner: 'topology', generation: randomUUID(),
+        nodeIdentity: { machineId: '1'.repeat(32), sshHostKeySha256: '2'.repeat(64) } };
+}
+function fakeTransfer(owners, context = PROD) {
+    // Actual public transfer code; persistence/transactions and physical authority
+    // below are explicitly simulated, not real Mongo or writer exclusion proof.
+    const matches = query => row => Object.entries(query).every(([key, value]) =>
+        require('node:util').isDeepStrictEqual(row[key], value));
+    const Model = {
+        collection: { indexes: async () => [{ key: { node: 1, profile: 1 }, unique: true }] },
+        db: { transaction: async work => work({ simulatedSession: true }) },
+        create: async rows => { owners.push(...structuredClone(rows)); },
+        findOne(query) {
+            const chain = { read: () => chain, readConcern: () => chain, maxTimeMS: () => chain,
+                lean: async () => structuredClone(owners.find(matches(query)) || null) };
+            return chain;
+        },
+        async findOneAndUpdate(query, update) {
+            const row = owners.find(matches(query));
+            if (!row) return null;
+            Object.assign(row, structuredClone(update.$set));
+            for (const key of Object.keys(update.$unset || {})) delete row[key];
+            return structuredClone(row);
+        },
+    };
+    const { TopologyConfigTransfer } = require('../topologyConfigTransfer');
+    return new TopologyConfigTransfer({ executionContext: context, TopologyConfigOwner: Model,
+        withVerifiedMaintenance: async ({ binding }, work) => work({ binding, status: 'verified',
+            authority: 'external-maintenance-v1', proofId: randomUUID(), maintenanceId: randomUUID(),
+            maintenance: 'held', allWriters: 'drained', oldBackend: { instanceId: 'simulated-old-backend',
+                pid: 42, processStartTime: 'simulated-start', processTree: 'stopped', dispatch: 'disabled' },
+            readback: { source: 'node-readback', configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64),
+                serviceActive: 'active', serviceEnabled: 'enabled' } }) });
+}
+async function writeClassic(writer, target = node('standalone')) {
+    return writer === 'sync' ? syncService.updateXrayNodeConfig(target) : cascadeService._deployPortalConfig(target);
+}
+for (const writer of ['sync', 'cascade']) {
+    test(writer + ': uncertain persisted owner fields cannot authorize classic rewrites', async t => {
+        const owners = [];
+        const calls = stubSync(t, { connected: false, owners });
+        const service = fakeTransfer(owners);
+        const initial = await service.initializeClassic({ node: node()._id, profile: 'xray-main',
+            nodeIdentity: adoptedOwner().nodeIdentity });
+        const adopted = await service.adopt({ node: node()._id, profile: 'xray-main',
+            generation: initial.generation, proofRef: 'simulated-originals' });
+        const restored = await service.handback({ node: node()._id, profile: 'xray-main',
+            generation: adopted.generation, proofRef: 'simulated-restoration' });
+        const corruptions = [
+            row => { row.owner = 'foreign'; }, row => { delete row.owner; },
+            row => { row.executionContext = TEST; }, row => { delete row.executionContext; },
+            row => { row.executionContext = { ...PROD, clone: true }; },
+            row => { row.executionContext = { target: 'production', hostIdentity: TEST.hostIdentity }; },
+            row => { row.generation = [row.generation]; }, row => { row.generation = 'invalid'; },
+            row => { row.nodeIdentity.machineId = ['1'.repeat(32)]; },
+            row => { delete row.nodeIdentity.sshHostKeySha256; },
+            row => { row.profile = 'unknown'; }, row => { row.profile = ['xray-main']; },
+            row => { row.handbackReceipt.fromGeneration = randomUUID(); },
+            row => { row.handbackReceipt.toGeneration = randomUUID(); },
+            row => { row.adoptionReceipt.fromGeneration = row.adoptionReceipt.toGeneration; },
+            row => { row.handbackReceipt.proofId = ['00000000-0000-0000-0000-000000000000']; },
+            row => { row.handbackReceipt.verifiedAt = 'unknown'; },
+            row => { row.handbackReceipt.oldPid = 0; },
+            row => { row.originalSnapshot.configSha256 = ['3'.repeat(64)]; },
+            row => { delete row.adoptionReceipt; }, row => { delete row.originalSnapshot; },
+        ];
+        await withEnv({ PANEL_DOMAIN: PROD.hostIdentity }, async () => {
+            for (const corrupt of corruptions) {
+                owners.splice(0, owners.length, structuredClone(restored));
+                corrupt(owners[0]);
+                await assert.rejects(writeClassic(writer), /CONFIG_OWNERSHIP_UNCERTAIN/, corrupt.toString());
+            }
+            owners.splice(0, owners.length, structuredClone(restored), structuredClone(restored));
+            await assert.rejects(writeClassic(writer), /CONFIG_OWNERSHIP_UNCERTAIN/);
+        });
+        assert.equal(calls.generated, 0);
+        assert.deepEqual(calls.uploads, []);
+        assert.deepEqual(calls.agent, []);
+    });
+
+    test(writer + ': absent owner namespace remains read-only classic; both profiles conservatively veto', async t => {
+        const owners = [];
+        const calls = stubSync(t, { connected: false, owners });
+        await withEnv({ PANEL_DOMAIN: PROD.hostIdentity }, async () => {
+            assert.equal(require('mongoose').models.TopologyConfigOwner, undefined, 'reader must not register auto-DDL model');
+            await writeClassic(writer);
+            assert.equal(calls.uploads.length, 1);
+            owners.push(adoptedOwner(PROD, 'xray-bridge'));
+            await writeClassic(writer);
+            assert.equal(calls.uploads.length, 1, 'unspecified writer profile must not ignore adopted bridge');
+            assert.equal(require('mongoose').models.TopologyConfigOwner, undefined);
+        });
+        for (const { query, options } of calls.ownerReads) {
+            assert.deepEqual(Object.keys(query), ['node'], 'do not filter out foreign or malformed profile/context');
+            assert.equal(String(query.node), node()._id);
+            assert.equal(options.readPreference, 'primary');
+            assert.deepEqual(options.readConcern, { level: 'majority' });
+            assert.equal(options.maxTimeMS, 5000);
+            assert.equal(options.timeoutMS, 5000);
+            assert.equal(options.limit, 3);
+        }
+    });
+
+    test(writer + ': owner read failure and unknown result refuse all generation and transport', async t => {
+        const calls = stubSync(t, { connected: false });
+        for (const result of [undefined, null, {}]) {
+            TopologyOperation.db.db.collection = () => ({ find: () => ({ toArray: async () => result }) });
+            await assert.rejects(writeClassic(writer));
+        }
+        TopologyOperation.db.db.collection = () => { throw new Error('owner read unavailable'); };
+        await assert.rejects(writeClassic(writer), /owner read unavailable/);
+        assert.equal(calls.generated, 0);
+        assert.deepEqual(calls.uploads, []);
+        assert.deepEqual(calls.agent, []);
+    });
+
+    test(writer + ': owner context is selected before awaited operation read', async t => {
+        const owners = [];
+        const calls = stubSync(t, { connected: false, owners });
+        await fakeTransfer(owners).initializeClassic({ node: node()._id, profile: 'xray-main',
+            nodeIdentity: adoptedOwner().nodeIdentity });
+        t.mock.method(TopologyOperation, 'exists', async () => {
+            process.env.PANEL_DOMAIN = TEST.hostIdentity;
+            return null;
+        });
+        await withEnv({ PANEL_DOMAIN: PROD.hostIdentity }, () => writeClassic(writer));
+        assert.equal(calls.uploads.length, 1);
+    });
+}
+
+for (const writer of ['sync', 'cascade']) {
+    for (const context of [TEST, PROD]) {
+        test(writer + ': public paired ' + context.target + ' handback, not a forged classic label, permits config rewrite', async t => {
+            const owners = [];
+            const calls = stubSync(t, { connected: false, owners });
+            const service = fakeTransfer(owners, context);
+            const classic = await service.initializeClassic({ node: node()._id, profile: 'xray-main',
+                nodeIdentity: adoptedOwner().nodeIdentity });
+            const adopted = await service.adopt({ node: node()._id, profile: 'xray-main',
+                generation: classic.generation, proofRef: 'simulated-originals' });
+            owners[0].owner = 'classic';
+            await withFlags([false, false, false], () => withEnv({ PANEL_DOMAIN: context.hostIdentity }, async () => {
+                await assert.rejects(writeClassic(writer), /CONFIG_OWNERSHIP_UNCERTAIN/);
+                assert.equal(calls.generated, 0);
+                owners[0].owner = 'topology';
+                const handedBack = await service.handback({ node: node()._id, profile: 'xray-main',
+                    generation: adopted.generation, proofRef: 'simulated-restoration' });
+                assert.equal(handedBack.handbackReceipt.fromGeneration, adopted.generation);
+                assert.equal(handedBack.handbackReceipt.toGeneration, handedBack.generation);
+                await writeClassic(writer);
+                assert.equal(calls.uploads.length, 1);
+            }));
+        });
+    }
+}
+
+for (const writer of ['sync', 'cascade']) {
+    for (const context of [TEST, PROD]) {
+        test(writer + ': adopted ' + context.target + ' without operations survives flags off and edited roles', async t => {
+            const calls = stubSync(t, { connected: false, owners: [adoptedOwner(context)],
+                operations: [{ status: 'succeeded', nodes: [{ node: node()._id, state: 'pending' }] }] });
+            await withFlags([false, false, false], () => withEnv({ PANEL_DOMAIN: context.hostIdentity,
+                TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' }, () => writeClassic(writer)));
+            assert.equal(calls.generated, 0);
+            assert.deepEqual(calls.uploads, []);
+            assert.equal(calls.sshConnections, 0);
+            assert.deepEqual(calls.agent.map(call => call.path), writer === 'sync' ? ['/sync'] : []);
+        });
+    }
 }
