@@ -16,6 +16,7 @@ const cache = require('../../services/cacheService');
 const backupService = require('../../services/backupService');
 const hostMetrics = require('../../services/hostMetricsService');
 const logger = require('../../utils/logger');
+const classicSettings = require('../../classicSettings');
 const { backupUpload } = require('./helpers');
 
 // ─── Log Helpers ─────────────────────────────────────────────────────────────
@@ -128,7 +129,7 @@ router.get('/system-stats', async (req, res) => {
 // GET /panel/logs
 router.get('/logs', async (req, res) => {
     try {
-        const logsDir = path.join(__dirname, '../../../logs');
+        const logsDir = classicSettings?.logsDirectory || path.join(__dirname, '../../../logs');
         let logs = [];
 
         const files = await getCombinedLogFiles(logsDir);
@@ -154,7 +155,7 @@ router.get('/logs/search', async (req, res) => {
             return res.json({ matches: [], total: 0 });
         }
 
-        const logsDir = path.join(__dirname, '../../../logs');
+        const logsDir = classicSettings?.logsDirectory || path.join(__dirname, '../../../logs');
         const files = await getCombinedLogFiles(logsDir);
 
         const qLower = q.toLowerCase();

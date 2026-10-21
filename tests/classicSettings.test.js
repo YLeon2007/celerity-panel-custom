@@ -40,6 +40,40 @@ test('strict TEST schema refuses flags, unknown keys and malformed values withou
         assert.doesNotMatch(r.stdout + r.stderr, /secret-canary|eeeeeeee|ssssssss|mongodb:/);
     }
 });
+test('single-host Mongo settings reject literal and encoded seed lists before publication', () => {
+    for (const uri of ['mongodb://127.0.0.1,127.0.0.2/classic_local',
+        'mongodb://host-one%2chost-two/classic_local']) {
+        const s = settings(); s.environment.MONGO_URI = uri;
+        const r = run(s);
+        assert.notEqual(r.status, 0, 'seed lists must refuse');
+        assert.match(r.stderr, /CLASSIC_SETTINGS_REFUSED/);
+        assert.doesNotMatch(r.stdout + r.stderr, /mongodb:|host-one/);
+    }
+});
+test('panel log readers use the actual private writer and upload staging stays in state', () => {
+    const r = run(settings(), `(async () => {
+        const assert = require('node:assert/strict');
+        const fs = require('node:fs');
+        const path = require('node:path');
+        const settings = require('./src/classicSettings');
+        const logger = require('./src/utils/logger');
+        logger.info('classic-route-log-witness');
+        await new Promise(r => setTimeout(r, 150));
+        const router = require('./src/routes/panel/system');
+        for (const url of ['/logs', '/logs/search']) {
+            let body;
+            const route = router.stack.find(layer => layer.route?.path === url).route;
+            await route.stack[0].handle({ query: { q: 'classic-route-log-witness' } }, { json(value) { body = value; } });
+            assert.ok((body.logs || body.matches).some(line => line.includes('classic-route-log-witness')), url + ' must read private log');
+        }
+        const { backupUpload } = require('./src/routes/panel/helpers');
+        const dest = await new Promise((resolve, reject) => backupUpload.storage.getDestination({}, {}, (err, value) => err ? reject(err) : resolve(value)));
+        assert.equal(dest, path.join(settings.stateDirectory, 'backup-uploads'));
+        assert.ok(fs.statSync(dest).isDirectory());
+        logger.close();
+    })().catch(error => { console.error(error); process.exitCode = 1; });`);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+});
 test('ordinary config still accepts env and dotenv without selecting file mode', () => {
     const cwd = fs.mkdtempSync(path.join(dir, 'legacy-'));
     fs.writeFileSync(path.join(cwd, '.env'), 'PANEL_DOMAIN=dotenv.invalid\nACME_EMAIL=dotenv@example.invalid\nENCRYPTION_KEY=' + 'd'.repeat(32) + '\nSESSION_SECRET=legacy\n');

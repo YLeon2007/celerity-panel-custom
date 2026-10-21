@@ -16,6 +16,7 @@ const cryptoService = require('../../services/cryptoService');
 const totpService = require('../../services/totpService');
 const config = require('../../../config');
 const logger = require('../../utils/logger');
+const classicSettings = require('../../classicSettings');
 const { parseDurationSeconds } = require('../../utils/helpers');
 const { version: appVersion } = require('../../../package.json');
 
@@ -24,7 +25,7 @@ const templateCache = new Map();
 
 // Multer for backup file uploads
 const backupUpload = multer({
-    dest: '/tmp/backup-uploads/',
+    dest: classicSettings ? path.join(classicSettings.stateDirectory, 'backup-uploads') : '/tmp/backup-uploads/',
     limits: { fileSize: 500 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         if (file.originalname.endsWith('.tar.gz') || file.originalname.endsWith('.tgz')) {

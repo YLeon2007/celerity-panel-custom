@@ -53,8 +53,14 @@ of the ordinary config API, a new sandbox, or an execution-authority capability.
 Private Mongo/Redis credentials may be present in the pinned private file but must
 not be copied into public manifests, test logs or issue reports.
 
-Selected logging and log cleanup use `<stateDirectory>/logs`; the access-log spool
-and temporary paths are also projected beneath that state directory. No source
+Selected logging, panel log viewing/search, and log cleanup use
+`<stateDirectory>/logs`; the access-log spool and temporary paths are also projected
+beneath that state directory. Multer backup upload staging is
+`<stateDirectory>/backup-uploads` in selected mode (ordinary startup keeps its
+existing `/tmp/backup-uploads/`). This removes the eager import-time mkdir outside
+private state; it does not accept backup/restore operations. Mongo seed lists,
+including percent-encoded host separators, are refused before env publication.
+No source
 `/app/logs`, Greenlock directory, or dotenv write is needed for this startup. This
 is still the real **classic** startup: its existing Mongo settings/index/backfill
 work and background jobs have not been redesigned or disabled. It is not a
@@ -77,17 +83,13 @@ It is a serving/dependency witness, not topology readiness, traffic proof, physi
 isolation, or ownership settlement. `/health` retains its dynamic uptime/cache
 response, including in file mode; it must not be pinned as constant bytes.
 
-**Parent handoff; launcher is not edited by this slice:** in
-`scripts/test-node-isolation/fresh_classic_launch.py`, change only the two HTTP
-probe request paths (`http_probe`, `bound_http_probe`) and the exact
-`validate(... ingress['path'] ...)` literal from `/health` to `/classic-ready`.
-Update the separately accepted ingress body pin to the digest above and the
-corresponding parent-owned fixture/docs expectations. Keep `ENV` exactly
-`{'C3_SETTINGS':'/etc/classic.json', 'NODE_ENV':'production'}` and all other
-coordinator/guard/activation predicates unchanged. This is **not** authorization
-to create or revise a live accepted policy. Until parent review/integration of that
-path change, the unchanged launcher still probes dynamic `/health` and is not
-compatible with the new deterministic pin.
+The source bridge composition in `317bd903` applies this parent-owned launcher
+handoff: both HTTP probes and ingress validation use `/classic-ready`, and the
+body digest is fixed to the value above. `ENV` remains exactly
+`{'C3_SETTINGS':'/etc/classic.json', 'NODE_ENV':'production'}` and the sealed-thaw
+and physical eligibility predicates are unchanged. This is **not** authorization
+to revise a live accepted policy. See `FRESH_OWNER_BRIDGE.md` for the distinct
+composition and unperformed physical prerequisites.
 
 ## Evidence and focused verification
 
