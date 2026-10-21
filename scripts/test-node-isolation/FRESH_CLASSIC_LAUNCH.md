@@ -113,3 +113,57 @@ Only UID/root/kernel/resource/namespace/cgroup/ingress placement and SSH/systemd
 inventory are simulated; executable invocation and success are not. Existing
 irreversible and coordinator regression tests are also run. RED and final GREEN
 logs and hashes are recorded in the external `fresh-launch/result.json`.
+
+## Bounded review corrections (source only)
+
+Five accepted source blockers are addressed without changing existing sealed
+thaw/coordinator files or widening any operational gate:
+
+- The controller compares the independently accepted `inventory.coordinatorSha256`
+  with canonical `held.config` before connection/COMMIT/attempt. The supervisor
+  independently repeats the config-pin check, including in the simulated positive
+  fixture; that fixture now supplies a real canonical config digest.
+- UID, GID and ingress port require exact integer scalars, not floats or booleans.
+  The directly consumed policy/inventory/proof containers and digest types are
+  checked before use; the inherited ownership proof protocol is not redesigned.
+- Loaded systemd properties require both `Restart=no` and an empty
+  `RestartForceExitStatus`. A pinned unit containing a force-restart override is
+  insufficient even if its ordinary restart policy says no.
+- COMMIT reception collects rights from every ancillary record before semantic
+  rejection. All collected descriptors are disposed despite earlier close errors;
+  disposal preserves a primary refusal rather than replacing its classification.
+- Root admission opens the actual retained proc root magic link with
+  `O_PATH|O_DIRECTORY|O_CLOEXEC`, obtains `fstat` and its owned `fdinfo` mount ID,
+  and keeps that FD open through comparison with the unique checked `/` mount
+  record. Device/inode matching is still necessary but is never a mount-ID
+  fallback. The same check runs before `prepared` and again before exec.
+  Its owned FD is disposed on stat/read/parse/check failures; a cleanup error
+  cannot replace the primary error. There is no extra inherited-cwd requirement:
+  the child explicitly replaces cwd.
+
+The bounded correction run uses only `python3 -B -m unittest -v
+ test_fresh_classic_launch`, with bytecode disabled and TMPDIR set to the Hermes
+scratch directory, and exits naturally. It includes the existing four fresh tests
+and eight regression tests (12 total), without a full/heavy/Mongo/privileged
+suite. Actual socketpair `SO_PASSCRED` delivers credentials before received rights;
+multiple-rights records and close-error disposal also have focused coverage.
+Ordinary scratch directories and proc magic links exercise real O_PATH/fstat/
+fdinfo and FD disposal; root mount topology and physical flags remain modeled.
+A same-device/inode different-mount-ID fixture refuses before COMMIT/exec;
+post-prepared mount-ID drift retains committed-unknown/no-replay semantics.
+No mount, namespace, service or live host operation was performed.
+
+Initial RED/FAIL logs are preserved, not overwritten by GREEN logs. The first
+config-pin probe exposed an asynchronous fixture-policy mismatch; a consistent
+both-peer fixture and in-memory baseline controller replay additionally reproduce
+actual irreversible COMMIT before config refusal. Root RED initially demonstrates
+the absent retained-root enforcement method; subsequent real-FD and assembled
+protocol assertions exercise its positive, alias, failure-cleanup and drift paths.
+The unchanged review probe is characterization, not a green regression test.
+Exact source commit/tree/parent, log hashes, closed IDs, evidence qualifications
+and unresolved gates are in external `fresh-launch/fix-result.json`.
+
+These are source fixes, **not operational closure**. Real application/settings
+compatibility, independently accepted resources/pins/loaded service, physical
+acceptance, direct TEST mapping, same-held allowlists and distinct trusted-root
+owner/HTTP-JS bridge composition remain separately unresolved.

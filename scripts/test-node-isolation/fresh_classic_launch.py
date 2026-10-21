@@ -125,13 +125,14 @@ def observe(pid, ip, port):
 
 
 def validate(policy):
-    need(set(policy) == {'version','context','executable','source','settings','files',
+    need(type(policy) is dict and set(policy) == {'version','context','executable','source','settings','files',
                          'environment','uid','gid','cgroup','ingress','inventory'}, 'EXACT_FRESH_POLICY_REQUIRED')
     need(type(policy['version']) is int and policy['version'] == 1 and
          policy['context'] == 'test.infograd.online' and
          (policy['executable'],policy['source'],policy['settings']) ==
          ('/runtime/node','/app/index.js','/etc/classic.json') and
-         policy['environment'] == ENV and policy['uid'] == policy['gid'] == 65531 and
+         type(policy['environment']) is dict and policy['environment'] == ENV and
+         type(policy['uid']) is int and type(policy['gid']) is int and policy['uid'] == policy['gid'] == 65531 and
          policy['cgroup'] == CGROUP, 'FIXED_FRESH_CONSTRUCTION_REQUIRED')
     need(type(policy['files']) is dict and len(policy['files']) <= 50000 and
          {policy['executable'],policy['source'],policy['settings']} <= policy['files'].keys(), 'SOURCE_SETTINGS_CLOSURE_REQUIRED')
@@ -139,9 +140,26 @@ def validate(policy):
         need(type(path) is str and path.startswith('/') and '..' not in Path(path).parts and
              str(Path(path)) == path and type(pin) is str and c.DIGEST.fullmatch(pin), 'INVALID_CLOSURE_PIN')
     ingress = policy['ingress']
-    need(set(ingress) == {'ip','port','path','bodySha256'} and ingress['ip'] == '212.119.42.100' and
-         ingress['port'] == 3000 and ingress['path'] == '/health' and
+    need(type(ingress) is dict and set(ingress) == {'ip','port','path','bodySha256'} and ingress['ip'] == '212.119.42.100' and
+         type(ingress['port']) is int and ingress['port'] == 3000 and ingress['path'] == '/health' and
          type(ingress['bodySha256']) is str and c.DIGEST.fullmatch(ingress['bodySha256']), 'FIXED_TEST_INGRESS_REQUIRED')
+    inv=policy['inventory']
+    need(type(inv) is dict and set(inv) == {'supervisor','root','namespaces','mountinfoSha256','routesSha256',
+         'coordinatorSha256','sourceSha256','unitSha256','fdPins','hostNamespaces'}, 'INDEPENDENT_RESOURCE_INVENTORY_REQUIRED')
+    need(all(type(inv[k]) is str and c.DIGEST.fullmatch(inv[k]) for k in
+         ('mountinfoSha256','routesSha256','coordinatorSha256','sourceSha256','unitSha256')), 'INVALID_INVENTORY_PIN')
+    supervisor=inv['supervisor']
+    need(type(supervisor) is dict and set(supervisor) == {'pid','start'} and
+         type(supervisor['pid']) is int and supervisor['pid'] > 0 and
+         type(supervisor['start']) is str and re.fullmatch(r'[0-9]+',supervisor['start']), 'INVALID_SUPERVISOR_PIN')
+    need(type(inv['root']) is list and len(inv['root']) == 2 and
+         all(type(x) is int and x >= 0 for x in inv['root']), 'INVALID_ROOT_PIN')
+    for key in ('namespaces','hostNamespaces'):
+        need(type(inv[key]) is dict and set(inv[key]) == {'mnt','net','ipc','uts'} and
+             all(type(x) is str and x for x in inv[key].values()), 'INVALID_NAMESPACE_PIN')
+    need(type(inv['fdPins']) is dict and all(type(k) is str and re.fullmatch(r'[0-9]+',k) and
+         type(v) is list and len(v) == 3 and all(type(x) is int and x >= 0 for x in v)
+         for k,v in inv['fdPins'].items()), 'INVALID_DESCRIPTOR_PIN')
     return policy
 
 
@@ -161,6 +179,25 @@ def verify_files(policy, paths):
         need((before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns) ==
              (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) and
              hasher.hexdigest() == expected, 'EXECUTABLE_SOURCE_SETTINGS_CLOSURE_DRIFT')
+
+
+@contextmanager
+def retained_path_identity(path):
+    # Follow the proc root magic link deliberately, not a pathname/stat fallback.
+    fd=os.open(path,os.O_PATH|os.O_DIRECTORY|os.O_CLOEXEC); primary=None
+    try:
+        info=os.fstat(fd)
+        need(stat.S_ISDIR(info.st_mode), 'FRESH_ROOT_DIRECTORY_REQUIRED')
+        raw=(Path('/proc/self/fdinfo')/str(fd)).read_bytes()
+        rows=[line.split(':',1)[1].strip() for line in raw.decode().splitlines() if line.startswith('mnt_id:')]
+        need(len(raw) <= 65536 and len(rows) == 1 and re.fullmatch(r'[1-9][0-9]*',rows[0]), 'ROOT_FDINFO_MOUNT_ID_REQUIRED')
+        yield info,int(rows[0])  # retain ownership through mountinfo comparison
+    except BaseException as error:
+        primary=error; raise
+    finally:
+        try: os.close(fd)
+        except BaseException:
+            if primary is None: raise
 
 
 class Platform:
@@ -185,20 +222,7 @@ class Platform:
         need(set(inv['namespaces']) == {'mnt','net','ipc','uts'}, 'EXACT_NAMESPACES_REQUIRED')
         for ns, pin in inv['namespaces'].items():
             need(os.readlink(p/'ns'/ns) == pin and pin != inv['hostNamespaces'][ns], 'PRIVATE_NAMESPACE_REQUIRED')
-        root = os.stat('/')
-        need([root.st_dev,root.st_ino] == inv['root'], 'FRESH_ROOT_IDENTITY_REQUIRED')
-        mounts = (p/'mountinfo').read_bytes()
-        need(len(mounts) <= 1048576 and digest(mounts) == inv['mountinfoSha256'], 'MOUNT_INVENTORY_DRIFT')
-        targets = set()
-        for line in mounts.decode().splitlines():
-            fields = line.split(); sep = fields.index('-'); target = fields[4]; opts=set(fields[5].split(','))
-            need(target not in targets and target in ('/','/proc','/state') and
-                 {'nodev','nosuid'} <= opts and not any(':' in x for x in fields[6:sep]), 'EXACT_NO_DEVICE_PRIVATE_MOUNTS_REQUIRED')
-            need(('rw' in opts and fields[sep+1] == 'tmpfs' and 'noexec' in opts) if target == '/state'
-                 else ('ro' in opts and 'rw' not in opts), 'READ_ONLY_SOURCE_ROOT_REQUIRED')
-            if target == '/proc': need(fields[sep+1] == 'proc' and fields[3] == '/', 'WHOLE_READONLY_PROC_REQUIRED')
-            targets.add(target)
-        need(targets == {'/','/proc','/state'}, 'EXACT_RESOURCE_MOUNTS_REQUIRED')
+        self.root_mount(policy,p)
         need(digest((p/'net/route').read_bytes()+(p/'net/fib_trie').read_bytes()) == inv['routesSha256'], 'INGRESS_ROUTE_DRIFT')
         # Full root closure, not just node/index.js. No symlink, hardlink, device,
         # socket, writable file, xattr, or unlisted application/library is admitted.
@@ -229,6 +253,24 @@ class Platform:
                 need(str(mapped.st_ino) == fields[4] and device == fields[3], 'STALE_MAPPED_FILE_IDENTITY')
             elif 'x' in fields[1]:
                 need(len(fields) == 6 and fields[5] in ('[vdso]','[vsyscall]'), 'ANONYMOUS_EXECUTABLE_MAPPING')
+
+    def root_mount(self, policy, p):
+        inv=policy['inventory']
+        with retained_path_identity(p/'root') as (root,mount_id):
+            need([root.st_dev,root.st_ino] == inv['root'], 'FRESH_ROOT_IDENTITY_REQUIRED')
+            mounts = (p/'mountinfo').read_bytes()
+            need(len(mounts) <= 1048576 and digest(mounts) == inv['mountinfoSha256'], 'MOUNT_INVENTORY_DRIFT')
+            targets = set()
+            for line in mounts.decode().splitlines():
+                fields = line.split(); sep = fields.index('-'); target = fields[4]; opts=set(fields[5].split(','))
+                need(target not in targets and target in ('/','/proc','/state') and
+                     {'nodev','nosuid'} <= opts and not any(':' in x for x in fields[6:sep]), 'EXACT_NO_DEVICE_PRIVATE_MOUNTS_REQUIRED')
+                need(('rw' in opts and fields[sep+1] == 'tmpfs' and 'noexec' in opts) if target == '/state'
+                     else ('ro' in opts and 'rw' not in opts), 'READ_ONLY_SOURCE_ROOT_REQUIRED')
+                if target == '/proc': need(fields[sep+1] == 'proc' and fields[3] == '/', 'WHOLE_READONLY_PROC_REQUIRED')
+                if target == '/': need(fields[0] == str(mount_id), 'FRESH_ROOT_MOUNT_IDENTITY_REQUIRED')
+                targets.add(target)
+            need(targets == {'/','/proc','/state'}, 'EXACT_RESOURCE_MOUNTS_REQUIRED')
 
     def entry_fds(self, policy):
         actual={}
@@ -267,11 +309,11 @@ class Platform:
              b'KillMode=process\n' in unit, 'ONE_SHOT_INDEPENDENT_SUPERVISOR_REQUIRED')
         # Read actual loaded properties; a file pin alone cannot exclude Restart.
         r=subprocess.run(['/usr/bin/systemctl','show','c3-test-fresh-classic.service',
-                          '--property=MainPID,Restart,KillMode,ControlGroup,NeedDaemonReload'],
+                          '--property=MainPID,Restart,KillMode,ControlGroup,NeedDaemonReload,RestartForceExitStatus'],
                          env=c.CLEAN_ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2,check=True)
         values=dict(line.split('=',1) for line in r.stdout.decode().splitlines())
         need(values == {'MainPID':str(pid),'Restart':'no','KillMode':'process',
-                        'ControlGroup':CGROUP,'NeedDaemonReload':'no'}, 'LOADED_SUPERVISOR_DRIFT')
+                        'ControlGroup':CGROUP,'NeedDaemonReload':'no','RestartForceExitStatus':''}, 'LOADED_SUPERVISOR_DRIFT')
         return expected
 
     def endpoint(self, policy):
@@ -286,11 +328,19 @@ class Platform:
 def settlement(held, proof):
     # Same current all-five ownership contract as the existing irreversible path;
     # distinct activation set. No existing-backend permit is accepted or relabeled.
-    need(set(proof) == {'context','revision','deployedRevision','quietSha256','nodes'} and
-         proof['context'] == held.config['context'] and c.DIGEST.fullmatch(proof['quietSha256']) and
+    need(type(proof) is dict and set(proof) == {'context','revision','deployedRevision','quietSha256','nodes'} and
+         proof['context'] == held.config['context'] and type(proof['quietSha256']) is str and c.DIGEST.fullmatch(proof['quietSha256']) and
          all(type(proof[k]) is int and proof[k] >= 0 for k in ('revision','deployedRevision')), 'SETTLEMENT_REQUIRED')
-    need(len(proof['nodes']) == 5 and {n['nodeId'] for n in proof['nodes']} == set(c.NODES), 'EXACT_FIVE_OWNERS_REQUIRED')
+    need(type(proof['nodes']) is list and len(proof['nodes']) == 5 and
+         all(type(n) is dict and type(n.get('nodeId')) is str for n in proof['nodes']) and
+         {n['nodeId'] for n in proof['nodes']} == set(c.NODES), 'EXACT_FIVE_OWNERS_REQUIRED')
     for item in proof['nodes']:
+        need(set(item) == {'nodeId','targetProfile','enrollmentId','enrollmentSha256','priorOwnerGeneration','owner'} and
+             type(item['enrollmentSha256']) is str and type(item['owner']) is dict and
+             {'owner','generation','handbackReceipt','nodeIdentity'} <= item['owner'].keys() and
+             type(item['owner']['handbackReceipt']) is dict and
+             {'fromGeneration','toGeneration'} <= item['owner']['handbackReceipt'].keys() and
+             type(item['owner']['nodeIdentity']) is dict, 'EXACT_GENERATION_REQUIRED')
         pin=held.config['nodes'][item['nodeId']]; owner=item['owner']
         need(set(item) == {'nodeId','targetProfile','enrollmentId','enrollmentSha256','priorOwnerGeneration','owner'} and
              item['targetProfile'] == pin['identity']['targetProfile'] and c.DIGEST.fullmatch(item['enrollmentSha256']) and
@@ -321,6 +371,8 @@ class FreshLaunch:
             need(not h.commit_attempted and all(fs.absent(p) and fs.absent(p+'.next')
                  for p in (c.COMMIT,c.ACTIVATION,ATTEMPT)), 'HANDOFF_REPLAY_FORBIDDEN')
             policy=validate(fs.read_json(POLICY)); pin=digest(c.canonical(policy))
+            need(policy['inventory']['coordinatorSha256'] == digest(c.canonical(h.config)),
+                 'ACCEPTED_COORDINATOR_REQUIRED')
             if fs.fixture is None:
                 with fs.opened('/run',directory=True) as fd:
                     s=os.stat(Path(SOCKET).name,dir_fd=fd,follow_symlinks=False)
@@ -430,6 +482,30 @@ class SupervisorFiles:
             finally: os.close(fd)
 
 
+@contextmanager
+def commit_frame(conn):
+    """Own every installed rights FD before rejecting any ancillary semantics."""
+    fds=array.array('i'); primary=None
+    try:
+        raw,anc,flags,_=conn.recvmsg(4096,socket.CMSG_SPACE(12)+socket.CMSG_SPACE(256*fds.itemsize))
+        for level,kind,data in anc:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                # Even malformed framing must dispose all complete installed FDs.
+                fds.frombytes(data[:len(data)-len(data)%fds.itemsize])
+        need(all(level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS and
+                 len(data)%fds.itemsize == 0 for level,kind,data in anc), 'COMMIT_FD_REQUIRED')
+        need(not flags and len(fds) == 1 and raw.endswith(b'\n'), 'EXACT_COMMIT_FRAME_REQUIRED')
+        yield raw,fds[0]
+    except BaseException as error:
+        primary=error; raise
+    finally:
+        errors=[]
+        for fd in fds:
+            try: os.close(fd)
+            except BaseException as error: errors.append(error)
+        if errors and primary is None: raise errors[0]
+
+
 def supervise(listener, fs, platform=None, *, fault=None):
     """One-shot accepted service, never restarted by this code, child not rolled back.
 
@@ -453,16 +529,10 @@ def supervise(listener, fs, platform=None, *, fault=None):
             conn.settimeout(5); wire=c.Wire(conn.fileno(),conn.fileno(),time.monotonic()+8)
             nonce=os.urandom(32).hex(); pin=digest(c.canonical(policy))
             wire.send({'op':'prepared','nonce':nonce,'policySha256':pin})
-            raw,anc,flags,_=conn.recvmsg(4096,socket.CMSG_SPACE(array.array('i').itemsize))
-            fds=array.array('i')
-            try:
-                for level,kind,data in anc:
-                    need(level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS,'COMMIT_FD_REQUIRED')
-                    fds.frombytes(data)
-                need(not flags and len(fds) == 1 and raw.endswith(b'\n'), 'EXACT_COMMIT_FRAME_REQUIRED')
+            with commit_frame(conn) as (raw,fd):
                 req=c.decode(raw)
                 need(set(req) == {'op','nonce','commitSha256'} and req['op'] == 'exec' and req['nonce'] == nonce,'ONE_SHOT_EXEC_FRAME_REQUIRED')
-                fd=fds[0]; info=os.fstat(fd)
+                info=os.fstat(fd)
                 need(stat.S_ISREG(info.st_mode) and info.st_uid == fs.uid and stat.S_IMODE(info.st_mode) == 0o600 and
                      info.st_nlink == 1 and info.st_size <= 131072,'ROOT_DURABLE_COMMIT_REQUIRED')
                 commitraw=os.pread(fd,131073,0); commit=c.decode(commitraw)
@@ -471,11 +541,8 @@ def supervise(listener, fs, platform=None, *, fault=None):
                      commit['supervisor'] == {'pid':os.getpid(),'start':start(os.getpid())} and
                      commit['restoreIntent']['origin']['pid'] == pid and commit['restoreIntent']['origin']['start'] == start(pid) and
                      set(commit['nodePeers']) == set(c.NODES),'SAME_HELD_PEER_FRESH_COMMIT_REQUIRED')
-                if fs.fixture is None:
-                    need(commit['configSha256'] == policy['inventory']['coordinatorSha256'], 'ACCEPTED_COORDINATOR_REQUIRED')
+                need(commit['configSha256'] == policy['inventory']['coordinatorSha256'], 'ACCEPTED_COORDINATOR_REQUIRED')
                 committed=True
-            finally:
-                for fd in fds: os.close(fd)
             platform.check(policy)
             row={'phase':'exec-attempted','commitSha256':req['commitSha256'],'serving':None}
             fs.atomic(SUPERVISOR_ATTEMPT,c.canonical(row),new=True)
