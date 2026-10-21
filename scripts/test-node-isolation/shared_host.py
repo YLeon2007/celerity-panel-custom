@@ -62,7 +62,7 @@ def verify_record(row, p, kernel, m):
     """Journal is a pin source, not proof: always perform a fresh kernel read."""
     original = p['hostHold']['expected']
     m.need(isinstance(row, dict) and set(row) == {'phase', 'owner', 'pending', 'originalExpected',
-           'expected', 'frozen', 'dead'} and row['phase'] in ('held', 'empty') and
+           'expected', 'frozen', 'dead'} and row['phase'] in ('held', 'empty', 'committed-backend-active') and
            row['owner'] == p['hostHold']['owner'] and row['pending'] is None and
            row['originalExpected'] == original and type(row['dead']) is bool and
            row['dead'] == (row['phase'] == 'empty'),
@@ -105,10 +105,20 @@ def verify_record(row, p, kernel, m):
         m.need(isinstance(members, list) and 1 <= len(members) <= 4096, 'HOST_POLICY_DRIFT_RETAINED')
         expected['groups'][group]['members'] = copy.deepcopy(members)
         frozen.append(group)
+    if row['phase'] == 'committed-backend-active':
+        activation = current.get('classicActivation')
+        m.need(isinstance(activation, dict) and set(activation) == {'commitSha256', 'group'} and
+               re.fullmatch('[a-f0-9]{64}', activation['commitSha256']) and
+               activation['group'] == original['backend'] and 'candidateClosure' in current and not row['dead'],
+               'HOST_COMMITTED_BINDING_REQUIRED')
+        expected['classicActivation'] = copy.deepcopy(activation)
+        frozen.remove(original['backend'])
     m.need(row['frozen'] == frozen, 'HOST_STATE_UNKNOWN_RETAINED')
     m.need(current == expected, 'HOST_POLICY_DRIFT_RETAINED')
     try:
         kernel.verify(current, row['frozen'], row['dead'])
+        if row['phase'] == 'committed-backend-active':
+            kernel.assert_classic_activation_safe(current)
         assert_payload_lineage(current, kernel, m)
         kernel.verify(current, row['frozen'], row['dead'])
     except (RuntimeError, OSError, ValueError, KeyError, TypeError):
@@ -180,10 +190,10 @@ def peer_identity(conn):
     return struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
 
 
-def check_hold(p, directory, m, *, command='check'):
+def check_hold(p, directory, m, *, command='check', commit_sha=None):
     """Real UDS roundtrip + SO_PEERCRED + independent current kernel verification."""
     import socket
-    m.need(command in ('check', 'close-candidate'), 'INVALID_HOST_OPERATION')
+    m.need(command in ('check', 'close-candidate', 'activate-classic', 'prepare-classic'), 'INVALID_HOST_OPERATION')
     identity = m.decode_json(m.secure_file(pathlib.Path(directory) / 'host-guard.json'))
     check_identity(identity, p, directory, m)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -194,6 +204,9 @@ def check_hold(p, directory, m, *, command='check'):
         nonce = os.urandom(32).hex()
         frame = nonce if command == 'check' else m.json.dumps({
             'nonce': nonce, 'command': command, 'owner': identity['owner'], 'planHash': identity['planHash']})
+        if command == 'activate-classic':
+            m.need(isinstance(commit_sha, str) and re.fullmatch('[a-f0-9]{64}', commit_sha), 'COMMIT_BINDING_REQUIRED')
+            frame = m.json.dumps({**m.json.loads(frame), 'commitSha256': commit_sha})
         conn.sendall((frame + '\n').encode())
         reply = b''
         while not reply.endswith(b'\n') and len(reply) <= 8192:
@@ -276,10 +289,11 @@ def make_engine(directory, p, m, host=None):
 
 
 def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
-    """Foreground owner of the REAL Fence; EOF/signal/lost recovery retains hold.
+    """Foreground owner of the REAL Fence; EOF/signal retains candidate/control holds.
 
     Injectable adapters are Python-only local test seams. CLI has no fake root.
-    No destructive kill, thaw, adoption of old journals, or mask restore API.
+    No destructive kill, legacy restore, journal adoption or mask restore API.
+    Only the same-peer committed bridge may enable the accepted classic backend.
     """
     import select
     import signal
@@ -332,7 +346,7 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     continue
                 with server.accept()[0] as conn:
                     conn.settimeout(3)
-                    _, uid, _ = peer_identity(conn)
+                    peer_pid, uid, _ = peer_identity(conn)
                     m.need(uid == 0, 'ROOT_HOST_GUARD_CLIENT_REQUIRED')
                     request = b''
                     while not request.endswith(b'\n') and len(request) <= 1024:
@@ -340,13 +354,14 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                         m.need(bool(chunk), 'HOST_CLIENT_LOST')
                         request += chunk
                     m.need(len(request) <= 1024 and request.endswith(b'\n'), 'HOST_GUARD_FRAME_LIMIT')
+                    frame = {}
                     if re.fullmatch(rb'[a-f0-9]{64}\n', request):
                         nonce = request.decode().strip()
                         command = 'check'
                     else:
                         frame = m.decode_json(request)
-                        m.need(isinstance(frame, dict) and set(frame) == {'nonce', 'command', 'owner', 'planHash'}
-                               and frame['command'] == 'close-candidate' and frame['owner'] == identity['owner']
+                        m.need(isinstance(frame, dict) and set(frame) == ({'nonce', 'command', 'owner', 'planHash', 'commitSha256'} if frame.get('command') == 'activate-classic' else {'nonce', 'command', 'owner', 'planHash'})
+                               and frame['command'] in ('close-candidate', 'activate-classic', 'prepare-classic') and frame['owner'] == identity['owner']
                                and frame['planHash'] == identity['planHash'] and isinstance(frame['nonce'], str)
                                and re.fullmatch('[a-f0-9]{64}', frame['nonce']), 'INVALID_HOST_CHALLENGE')
                         nonce, command = frame['nonce'], frame['command']
@@ -354,11 +369,30 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     if command == 'close-candidate':
                         fence.close_candidate(identity['owner'])
                         check()
+                    if command == 'prepare-classic':
+                        fence.require(('held',), identity['owner'])
+                        kernel.assert_classic_activation_safe(fence.expected)
+                        m.need('candidateClosure' in fence.expected and 'relaunch' in fence.expected and not fence.dead,
+                               'BOUNDED_CLASSIC_ACTIVATION_UNAVAILABLE')
+                    if command == 'activate-classic':
+                        # Shared LocalXray aliases the panel host, not a sixth
+                        # host. Read its real same-run COMMIT, never a JSON GO.
+                        raw_commit = m.secure_file(pathlib.Path(directory) / 'handoff-commit.json')
+                        commit = m.decode_json(raw_commit)
+                        expected_peer = commit['nodePeers'][NODE]
+                        m.need(m.digest(raw_commit) == frame['commitSha256'] and
+                               commit['context'] == p['context'] and
+                               commit['activationSet'] == ['existing-classic-backend'] and
+                               expected_peer == {k: m.proc_identity(peer_pid)[k] for k in ('pid', 'start')} and
+                               commit['nodePins'][NODE]['identity']['planHash'] == plan_hash(p, m),
+                               'SAME_HOLDER_COMMIT_REQUIRED')
+                        fence.activate_classic(identity['owner'], frame['commitSha256'])
+                        check()
                     raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
                     conn.sendall((m.json.dumps({'nonce': nonce, 'identity': identity,
                                               'recordSha256': m.digest(raw)}) + '\n').encode())
     except BaseException:
-        fence.unknown()  # No finally-thaw; old dispatch remains kernel-fenced.
+        fence.unknown()  # No finally-thaw; candidate/control dispatch stays fenced.
         raise
     finally:
         os.close(journal.fd)

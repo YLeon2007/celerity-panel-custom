@@ -56,12 +56,13 @@ function operationalInputs() {
         && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256); } };
 }
 class RestorationPipe {
-    #child; #closed = false; #pending; #buffer = ''; #tail = Promise.resolve();
+    #child; #closed = false; #pending; #buffer = ''; #tail = Promise.resolve(); #finishing = false; #exit;
     constructor(child) {
         this.#child = child;
         const lost = () => this.close();
+        this.#exit = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
         child.on('error', lost); child.on('exit', lost); child.stderr.on('data', lost);
-        child.stdin.on('error', lost); child.stdout.on('error', lost); child.stdout.on('end', lost);
+        child.stdin.on('error', lost); child.stdout.on('error', lost); child.stdout.on('end', () => { if (!this.#finishing) lost(); });
         child.stdout.on('data', raw => {
             if (this.#closed) return;
             this.#buffer += raw.toString('utf8');
@@ -70,19 +71,36 @@ class RestorationPipe {
             try {
                 const [line, extra] = this.#buffer.split('\n'); need(!extra && this.#buffer.indexOf('\n') === this.#buffer.length - 1);
                 this.#buffer = ''; const reply = JSON.parse(line), pending = this.#pending;
-                need(pending && exact(reply, ['version', 'op', 'nonce']) && reply.version === 1 && reply.op === 'checked' && reply.nonce === pending.nonce);
-                this.#pending = undefined; clearTimeout(pending.timer); pending.resolve();
+                need(pending && exact(reply, pending.op === 'check' ? ['version', 'op', 'nonce'] : ['version', 'op', 'nonce', 'commitSha256']) && reply.version === 1
+                    && reply.op === (pending.op === 'check' ? 'checked' : pending.op+'-ack') && reply.nonce === pending.nonce);
+                if (pending.op !== 'check') need(typeof reply.commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(reply.commitSha256));
+                this.#pending = undefined; clearTimeout(pending.timer); pending.resolve(reply.commitSha256);
             } catch { lost(); }
         });
     }
-    check() {
+    check() { return this.request('check'); }
+    request(op, proof) {
+        need(['check', 'commit-handoff', 'activate-classic', 'complete-handoff'].includes(op));
         const run = () => new Promise((resolve, reject) => {
             if (this.#closed) return reject(new Error('RESTORATION_PIPE_REVOKED'));
             const nonce = randomBytes(32).toString('hex');
-            this.#pending = { nonce, resolve, reject, timer: setTimeout(() => this.close(), 15000) };
-            this.#child.stdin.write(JSON.stringify({ version: 1, op: 'check', nonce }) + '\n');
+            if (op === 'complete-handoff') this.#finishing = true;
+            this.#pending = { nonce, op, resolve, reject, timer: setTimeout(() => this.close(), 15000) };
+            const request = { version: 1, op, nonce, ...(op === 'commit-handoff' ? { proof } : {}) };
+            const raw = JSON.stringify(request) + '\n'; need(Buffer.byteLength(raw) <= 131072);
+            this.#child.stdin.write(raw);
         });
         const result = this.#tail.then(run); this.#tail = result.catch(() => {}); return result;
+    }
+    async waitNatural() {
+        const timer = setTimeout(() => { this.close(); this.#child.kill('SIGKILL'); }, 5000);
+        try { const exit = await this.#exit; need(exit.code === 0 && exit.signal === null); }
+        finally { clearTimeout(timer); }
+    }
+    async dispose() {
+        this.close();
+        const timer = setTimeout(() => this.#child.kill('SIGKILL'), 3000);
+        try { await this.#exit; } finally { clearTimeout(timer); }
     }
     close() {
         if (this.#closed) return;
@@ -98,10 +116,20 @@ async function withOperationalRestoration(inputs, work, { openBridge } = {}) {
     const child = openBridge ? openBridge() : spawn('/usr/bin/python3', ['-I', BRIDGE], { stdio: ['pipe', 'pipe', 'pipe'],
         env: { PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C', LC_ALL: 'C', HOME: '/root' } });
     const pipe = new RestorationPipe(child);
-    let open = true, poisoned = false;
+    let open = true, poisoned = false, committed = false, completed = false, commitAttempted = false;
     const check = async () => { try { need(open && !poisoned); inputs.assertPins(); await pipe.check(); need(open && !poisoned); inputs.assertPins(); } catch (e) { poisoned = true; throw e; } };
     const guarded = work => async (...args) => { try { return await work(...args); } catch (error) { poisoned = true; throw error; } };
     const scope = Object.freeze({ check,
+        commitHandoff: guarded(async proof => {
+            await check(); need(!commitAttempted); commitAttempted = true;
+            const digest = await pipe.request('commit-handoff', proof); committed = true;
+            await check(); return digest;
+        }),
+        activateClassic: guarded(async () => { await check(); need(committed); await pipe.request('activate-classic'); await check(); }),
+        completeHandoff: guarded(async () => {
+            await check(); need(committed); await pipe.request('complete-handoff');
+            await pipe.waitNatural(); completed = true;
+        }),
         verifyEnrollment: guarded(async e => {
             await check();
             const n = inputs.pins.find(p => p.nodeId === e.nodeId);
@@ -128,7 +156,11 @@ async function withOperationalRestoration(inputs, work, { openBridge } = {}) {
         }),
         async retain() { while (open) { await check(); await new Promise(resolve => setTimeout(resolve, 250)); } },
     });
-    try { await check(); const result = await work(scope); await check(); return result; }
-    finally { open = false; pipe.close(); }
+    try { await check(); const result = await work(scope); if (!completed) await check(); return result; }
+    catch (error) {
+        if (committed) error.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+        else if (commitAttempted) error.code = 'COMMIT_UNKNOWN_NO_ACTIVATION';
+        throw error;
+    } finally { open = false; await pipe.dispose(); }
 }
 module.exports = { operationalInputs, withOperationalRestoration, RestorationPipe };

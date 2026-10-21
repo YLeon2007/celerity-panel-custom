@@ -11,6 +11,7 @@ async function main() {
     const db = await mongoose.createConnection(inputs.config.mongoUri, { autoCreate: false, autoIndex: false,
         serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000, socketTimeoutMS: 5000, retryWrites: false }).asPromise();
     const bind = (name, location) => db.model(name, require(location).schema);
+    let result, failure;
     try {
         const models = {
             Owner: bind('TopologyConfigOwner', '../../src/models/topologyConfigOwnerModel'),
@@ -26,21 +27,23 @@ async function main() {
         };
         const journal = new HeldOwnerSettlementJournal();
         const service = new HeldTestOwnerSettlement({ models, journal,
-            withRestorationScope: work => withOperationalRestoration(inputs, async scope => {
-                const checkpoint = await work(scope);
-                // This is a checkpoint WHILE all five original flock scopes and
-                // external fences remain held, never transferable release/GO.
-                process.stdout.write(JSON.stringify(checkpoint) + '\n');
-                // No finish/release verb exists here. Keep the actual channel
-                // live for its finite original deadline; expiry/error remains
-                // unknown-retained and requires independent reconciliation.
-                await scope.retain();
-            }) });
-        await service.settle(inputs.config.plan);
-    } finally { await db.close(); }
+            withRestorationScope: work => withOperationalRestoration(inputs, work) });
+        result = await service.handback(inputs.config.plan);
+    } catch (error) { failure = error; }
+    finally {
+        try { await db.close(); } catch (error) {
+            // Cleanup after committed completion cannot become a precommit
+            // retained-exclusion claim or mask an earlier precise failure.
+            failure ||= error;
+            if (result?.code === 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED') failure.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+        }
+    }
+    if (failure) throw failure;
+    process.stdout.write(JSON.stringify(result) + '\n');
 }
-if (require.main === module) main().catch(() => {
-    process.stderr.write('TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED; no external handback\n');
+if (require.main === module) main().catch(error => {
+    const code = ['COMMITTED_ACTIVATION_UNKNOWN', 'COMMIT_UNKNOWN_NO_ACTIVATION'].includes(error.code) ? error.code : 'TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED';
+    process.stderr.write(code + '; no automatic retry or ownership rollback\n');
     process.exitCode = 75;
 });
 module.exports = { main };

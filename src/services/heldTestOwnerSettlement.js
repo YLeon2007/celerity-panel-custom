@@ -1,6 +1,9 @@
 'use strict';
 // Explicit internal TEST entry. Uses the existing public handback CAS unchanged.
-// Does not clear an uncertain lock/admission, rewrite history, or release hosts.
+// Never clears uncertain locks/admissions or history; handback enables only
+// the explicitly bounded classic backend after the durable all-five commit.
+const { createHash } = require('node:crypto');
+const sha = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const { isDeepStrictEqual: same } = require('node:util');
 const { TopologyConfigTransfer } = require('./topologyConfigTransfer');
 const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
@@ -25,7 +28,9 @@ class HeldTestOwnerSettlement {
         need(journal && ['start', 'beforeNode', 'afterNode', 'complete'].every(key => typeof journal[key] === 'function'));
         this.#models = Object.freeze({ ...models }); this.#authority = withRestorationScope; this.#journal = journal;
     }
-    async settle(input) {
+    async settle(input) { return this.#run(input, false); }
+    async handback(input) { return this.#run(input, true); }
+    async #run(input, combined) {
         need(exact(input, ['nodes', 'revision', 'deployedRevision'])
             && Array.isArray(input.nodes) && input.nodes.length === 5
             && new Set(input.nodes.map(n => n.nodeId)).size === 5
@@ -47,6 +52,7 @@ class HeldTestOwnerSettlement {
                 const m = this.#models;
                 const rows = (Model, filter = {}) => Model.find(filter).read('primary').readConcern('majority').setOptions(OPT).limit(1001).lean()
                     .then(found => { need(found.length <= 1000); return found; });
+                let quietSha256;
                 const quiet = async () => {
                     await check();
                     // One awaited read-only batch, followed immediately by a
@@ -71,6 +77,7 @@ class HeldTestOwnerSettlement {
                     need(links.every(link => typeof link.active === 'boolean'
                         && (!link.active || ['deployed', 'online', 'offline'].includes(link.status))));
                     need(queues.length === 1 && queues[0]._id === 'create-v1' && queues[0].outstanding === 0);
+                    quietSha256 = sha([states, locks, operations, intents, l2tp, links, queues]);
                     await check();
                 };
                 await quiet();
@@ -120,7 +127,38 @@ class HeldTestOwnerSettlement {
                 result = freeze({ code: 'TEST_DB_SETTLED_ALL_EXTERNAL_HOLDS_RETAINED', ownerCount: 5,
                     outstandingLocks: 0, topologyAdmissionCount: 0, remoteAdmissionCount: 0,
                     handbackAllowed: false, externalAdmission: 'closed' });
-                await check(); finished = true; return result;
+                await check();
+                if (combined) {
+                    need(['commitHandoff', 'activateClassic', 'completeHandoff'].every(k => typeof scope[k] === 'function')
+                        && typeof this.#journal.committed === 'function');
+                    await quiet();
+                    const proof = JSON.parse(JSON.stringify({ context: TEST.hostIdentity,
+                        revision: plan.revision, deployedRevision: plan.deployedRevision, quietSha256,
+                        nodes: plan.nodes.map((n, i) => ({ nodeId: n.nodeId, targetProfile: n.targetProfile,
+                            enrollmentId: n.enrollmentId, enrollmentSha256: sha(enrollments[i]),
+                            priorOwnerGeneration: n.ownerGeneration, owner: confirmed[i] })) }));
+                    let committed = false, attempted = false;
+                    try {
+                        attempted = true;
+                        const commitSha256 = await scope.commitHandoff(freeze(proof));
+                        need(typeof commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(commitSha256));
+                        committed = true; // file/parent fsync + exact readback, before writer enable
+                        await check();
+                        await this.#journal.committed(commitSha256);
+                        await check();
+                        await scope.activateClassic();
+                        await check();
+                        await scope.completeHandoff();
+                        result = freeze({ code: 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED', ownerCount: 5,
+                            externalAdmission: 'closed', activationSet: ['existing-classic-backend'],
+                            retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256 });
+                    } catch (error) {
+                        error.code = committed ? 'COMMITTED_ACTIVATION_UNKNOWN' :
+                            (attempted ? 'COMMIT_UNKNOWN_NO_ACTIVATION' : 'TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED');
+                        throw error;
+                    }
+                }
+                finished = true; return result;
             })();
             pending.catch(() => {}); return pending;
         };

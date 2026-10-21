@@ -1,7 +1,9 @@
 #!/usr/bin/python3 -I
 """Finite root-only bridge to the EXISTING RestorationChannel protocol.
 
-No finish/release verb. EOF/error closes the owner channel as UNKNOWN_RETAINED.
+No legacy finish/release verb. The explicit committed completion is finite.
+Before COMMIT, EOF/error retains classic exclusion; afterwards activation may
+have executed, so report committed uncertainty, never ownership rollback.
 The five live node holds stay owned by the coordinator while checks are served.
 """
 import hashlib
@@ -51,10 +53,10 @@ def serve(channel, reader=0, writer=1, *, lifetime=115):
         if not select.select([reader], [], [], .25)[0]:
             channel.check()
             continue
-        raw = os.read(reader, 4097)
+        raw = os.read(reader, 131073)
         need(raw)
         buffer += raw
-        need(len(buffer) <= 4096)
+        need(len(buffer) <= 131072)
         if b'\n' not in buffer:
             continue
         line, buffer = buffer.split(b'\n', 1)
@@ -66,13 +68,20 @@ def serve(channel, reader=0, writer=1, *, lifetime=115):
                 result[k] = v
             return result
         request = json.loads(line, object_pairs_hook=pairs)
-        need(set(request) == {'version', 'op', 'nonce'} and type(request['version']) is int and
-             request['version'] == 1 and request['op'] == 'check' and
+        need(set(request) == ({'version', 'op', 'nonce', 'proof'} if request.get('op') == 'commit-handoff' else {'version', 'op', 'nonce'}) and type(request['version']) is int and
+             request['version'] == 1 and request['op'] in ('check', 'commit-handoff', 'activate-classic', 'complete-handoff') and
              isinstance(request['nonce'], str) and len(request['nonce']) == 64 and
              all(c in '0123456789abcdef' for c in request['nonce']))
-        channel.check()  # returns no receipt, boolean, GO or authority
-        reply = json.dumps({**request, 'op': 'checked'}, separators=(',', ':')).encode() + b'\n'
+        if request['op'] == 'check':
+            channel.check()
+            answer = {**request, 'op': 'checked'}
+        else:
+            digest = channel.handoff(request['op'], request.get('proof'))
+            answer = {k: v for k, v in {**request, 'op': request['op']+'-ack', 'commitSha256': digest}.items() if k != 'proof'}
+        reply = json.dumps(answer, separators=(',', ':')).encode() + b'\n'
         need(os.write(writer, reply) == len(reply))
+        if request['op'] == 'complete-handoff':
+            return
     need(False)
 
 
@@ -94,15 +103,20 @@ def main():
     try:
         channel.__enter__()
         serve(channel)
+    except BaseException as error:
+        error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if channel.committed else
+                      'COMMIT_UNKNOWN_NO_ACTIVATION' if channel.commit_attempted else
+                      'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED')
+        raise
     finally:
         # Deliberately NOT __exit__: it sends finish, which would drop the
-        # coordinator's actual flocks. This entry cannot request any handback.
+        # coordinator's actual flocks before the explicit committed completion.
         channel.close()
 
 
 if __name__ == '__main__':
     try:
         main()
-    except BaseException:
-        print('OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED', file=sys.stderr)
+    except BaseException as error:
+        print(getattr(error, 'code', 'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED'), file=sys.stderr)
         raise SystemExit(75)

@@ -177,6 +177,103 @@ test('SIMULATED physical restoration: actual JS/Python bridge and public five-no
     const progress = JSON.parse(await fsp.readFile(path.join(f.journalDirectory, 'owner-settlement.json')));
     assert.equal(progress.phase, 'settled-held'); assert.equal(progress.settled.length, 5); assert.equal(progress.inFlightNode, null);
 });
+test('combined TEST handback commits exact all-five readbacks before its bounded activation', async () => {
+    const f = await fixture(); const events = [];
+    const authority = work => f.authority(async scope => work({ ...scope,
+        async commitHandoff(proof) {
+            events.push('commit');
+            assert.equal(await m.Owner.countDocuments({ owner: 'classic' }), 5);
+            assert.equal(proof.nodes.length, 5); assert.equal(proof.context, TEST.hostIdentity);
+            for (const n of proof.nodes) {
+                assert.deepEqual(n.owner, JSON.parse(JSON.stringify(await m.Owner.findOne({ node: n.nodeId }).lean())));
+                assert.equal(n.enrollmentSha256.length, 64);
+            }
+            assert.equal(proof.quietSha256.length, 64);
+            return 'a'.repeat(64);
+        },
+        async activateClassic() { events.push('activate'); },
+        async completeHandoff() { events.push('complete'); },
+    }));
+    assert.equal(typeof api.HeldTestOwnerSettlement.prototype.handback, 'function', 'actual combined handback missing');
+    const result = await new api.HeldTestOwnerSettlement({ withRestorationScope: authority, models: m, journal: f.journal }).handback(f.plan);
+    assert.deepEqual(events, ['commit', 'activate', 'complete']);
+    assert.equal(result.code, 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED');
+    assert.equal(result.externalAdmission, 'closed');
+    assert.deepEqual(result.activationSet, ['existing-classic-backend']);
+    await assert.rejects(new api.HeldTestOwnerSettlement({ withRestorationScope: authority, models: m, journal: f.journal }).handback(f.plan));
+    assert.deepEqual(events, ['commit', 'activate', 'complete']);
+});
+
+test('combined postcommit fsync, activation EOF and completion EOF never rollback or retry', async () => {
+    for (const fault of ['commit-ack', 'journal-fsync', 'activation-EOF', 'completion-EOF']) {
+        const f = await fixture(); const events = [];
+        if (fault === 'journal-fsync') {
+            const committed = f.journal.committed.bind(f.journal);
+            f.journal.committed = digest => {
+                const sync = fs.fsyncSync;
+                fs.fsyncSync = () => { throw new Error('SIMULATED fsync syscall refusal'); };
+                try { return committed(digest); } finally { fs.fsyncSync = sync; }
+            };
+        }
+        const authority = work => f.authority(scope => work({ ...scope,
+            async commitHandoff() { events.push('commit'); if (fault === 'commit-ack') throw new Error('EOF'); return 'a'.repeat(64); },
+            async activateClassic() { events.push('activate'); if (fault === 'activation-EOF') throw new Error('EOF'); },
+            async completeHandoff() { events.push('complete'); throw new Error('EOF'); },
+        }));
+        const service = new api.HeldTestOwnerSettlement({ withRestorationScope: authority, models: m, journal: f.journal });
+        await assert.rejects(service.handback(f.plan), { code: fault === 'commit-ack' ? 'COMMIT_UNKNOWN_NO_ACTIVATION' : 'COMMITTED_ACTIVATION_UNKNOWN' });
+        assert.deepEqual(events, fault === 'commit-ack' || fault === 'journal-fsync' ? ['commit'] : fault === 'activation-EOF' ? ['commit','activate'] : ['commit','activate','complete']);
+        assert.equal(await m.Owner.countDocuments({ owner: 'classic' }), 5);
+        assert.equal(await m.Enrollment.countDocuments(), 5); assert.equal(await m.Binding.countDocuments(), 5);
+        await assert.rejects(service.handback(f.plan));
+        assert.equal(events.filter(e => e === 'commit').length, 1);
+        if (fault === 'journal-fsync') assert.equal(fs.existsSync(path.join(f.journalDirectory,'owner-settlement.json.next')),true);
+    }
+});
+
+test('SIMULATED root/physical: actual finite operator CLI, real Mongo and Python codec exit naturally', async t => {
+    for (const closeFailure of [false, true]) await t.test(closeFailure ? 'postcommit Mongo cleanup EOF is unknown' : 'confirmed natural exit', async () => {
+    const f = await fixture();
+    const inputs = { config: { mongoUri: `mongodb://${db.getClient().options.hosts[0]}/${db.name}?replicaSet=ownerSettlement`, plan: f.plan,
+            oldBackend: { instanceId: 'SIMULATED-old-test', pid: 42, processStartTime: '1234' } },
+        pins: f.pins.map(p => ({ ...p, ...f.plan.nodes.find(n => n.nodeId === p.nodeId) })) };
+    const file = path.join(directory,'cli-input.json'); await fsp.writeFile(file,JSON.stringify(inputs));
+    const python = `import hashlib,json,os\nimport owner_restoration_channel as b\nclass SIMULATED:\n def check(self): pass\n def handoff(self,op,proof=None):\n  if op=='commit-handoff':\n   raw=json.dumps(proof).encode()\n   self.digest=hashlib.sha256(raw).hexdigest()\n  return self.digest\nb.serve(SIMULATED(),lifetime=30)`;
+    const code = `const fs=require('fs'),path=require('path'),Module=require('module');
+const inputs=JSON.parse(fs.readFileSync(${JSON.stringify(file)}));inputs.assertPins=()=>{};
+const channel=require('./src/services/heldRestorationChannel');
+const Journal=require('./src/services/heldOwnerSettlementJournal').HeldOwnerSettlementJournal;
+const journal=new Journal({directory:${JSON.stringify(f.journalDirectory)},uid:process.getuid(),fixtureRoot:${JSON.stringify(directory)}});
+const load=Module._load;
+Module._load=function(request,parent,isMain){
+ if(request.endsWith('/heldRestorationChannel'))return {...channel,operationalInputs:()=>inputs,
+  withOperationalRestoration:(i,work)=>channel.withOperationalRestoration(i,work,{openBridge:()=>require('child_process').spawn('/usr/bin/python3',['-B','-c',${JSON.stringify(python)}],
+  {cwd:path.resolve('scripts/test-node-isolation'),stdio:['pipe','pipe','pipe'],env:process.env})})};
+ if(request.endsWith('/heldOwnerSettlementJournal'))return {HeldOwnerSettlementJournal:function(){return journal}};
+ return load.call(this,request,parent,isMain);
+};
+if(${closeFailure}){
+ const mongo=require('mongoose'),connect=mongo.createConnection.bind(mongo);
+ mongo.createConnection=(...args)=>{const conn=connect(...args),close=conn.close.bind(conn);
+  conn.close=async()=>{await close();throw new Error('SIMULATED postcommit Mongo cleanup EOF')};return conn;};
+}
+process.getuid=()=>0; // SIMULATED root only, never a CLI switch
+process.argv=[process.execPath,path.resolve('scripts/test-node-isolation/settle-held-owner.js')];
+require('./scripts/test-node-isolation/settle-held-owner').main().catch(e=>{console.error(e);process.exitCode=75});`;
+    const { execFile } = require('node:child_process');
+    const result = await new Promise(resolve => execFile(process.execPath,['-e',code],{cwd:path.join(__dirname,'../../..'),env:process.env,timeout:20000},
+        (error,stdout,stderr)=>resolve({error,stdout,stderr})));
+    if (closeFailure) {
+        assert.equal(result.error?.code,75); assert.match(result.stderr,/COMMITTED_ACTIVATION_UNKNOWN/);
+        assert.equal(result.stdout,'');
+    } else {
+        assert.equal(result.error,null,result.stderr); assert.equal(result.stderr,'');
+        assert.equal(JSON.parse(result.stdout).code,'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED');
+    }
+    assert.equal(await m.Owner.countDocuments({owner:'classic'}),5);
+    });
+});
+
 const run = f => new api.HeldTestOwnerSettlement({ withRestorationScope: f.authority, models: m, journal: f.journal }).settle(f.plan);
 async function unchangedRefusal(f) {
     const owners = await m.Owner.find().lean(), locks = await m.Lock.find().lean(), topology = await m.Topology.find().lean();
@@ -307,5 +404,5 @@ test('fixed operational CLI refuses non-root before Mongo, files or network', as
     const { execFile } = require('node:child_process');
     const result = await new Promise(resolve => execFile(process.execPath, [path.join(__dirname, '../../../scripts/test-node-isolation/settle-held-owner.js')],
         { env: process.env }, (error, stdout, stderr) => resolve({ error, stdout, stderr })));
-    assert.equal(result.error.code, 75); assert.equal(result.stdout, ''); assert.match(result.stderr, /UNKNOWN_RETAINED; no external handback/);
+    assert.equal(result.error.code, 75); assert.equal(result.stdout, ''); assert.match(result.stderr, /UNKNOWN_RETAINED; no automatic retry or ownership rollback/);
 });

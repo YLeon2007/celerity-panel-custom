@@ -365,6 +365,12 @@ class LinuxKernel:
                     # A frozen shim cannot reap its dead child. A zombie has no
                     # execution capability; do not claim its /proc row vanished.
                     need(fields[19] != row['startTicks'] or fields[0] == 'Z', 'old process still exists')
+            elif group == expected['backend'] and 'classicActivation' in expected:
+                # Only the pre-existing accepted classic payload may run. Runtime,
+                # updater, candidate and relaunch barriers remain independently held.
+                init = next(c['init'] for c in expected['containers'] if c['cgroup'] == group)
+                need(self.pid(init['pid']) == init, 'classic init identity drift')
+                survivors.update(self.survivor_descendants(group, init))
             elif group in controls or group in expected['freezeOrder'] or group == expected.get('proxyGroup') or group == expected.get('relaunch', {}).get('cgroup'):
                 need(self.members(group) == pin['members'], 'pinned executor tree drift')
             else:
@@ -444,6 +450,54 @@ class LinuxKernel:
                 return
             time.sleep(.01)
         raise TimeoutError('kernel cgroup acknowledgement timeout')
+
+    def assert_classic_activation_safe(self, expected):
+        """Finite sealed-container variant, no writable host bind/volume escape.
+
+        Deliberately refuses legacy backends needing host mounts. Such a backend
+        needs separately reviewed clean activation, NOT Docker/updater thaw.
+        """
+        container = next(c for c in expected['containers'] if c['cgroup'] == expected['backend'])
+        proc = self.proc / str(container['init']['pid'])
+        namespaces = {ns: os.readlink(proc / 'ns' / ns) for ns in ('mnt','pid','cgroup','net')}
+        for ns in namespaces:
+            need(namespaces[ns] != os.readlink(self.proc / '1/ns' / ns),
+                 'classic host namespace escape')
+        need(os.readlink(proc / 'root/proc/1/ns/pid') == os.readlink(proc / 'ns/pid'),
+             'classic host proc escape')
+        for row in self.members(expected['backend']):
+            payload = self.proc / str(row['pid'])
+            for ns in namespaces:
+                need(os.readlink(payload / 'ns' / ns) == namespaces[ns],
+                     'classic child namespace escape')
+            status = dict(line.split(':', 1) for line in (payload / 'status').read_text().splitlines() if ':' in line)
+            # Check existing descendants too: init may have dropped a capability
+            # after spawning an already-more-privileged child.
+            forbidden = sum(1 << bit for bit in (21, 19, 22, 16, 17))
+            for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'):
+                need(not int(status[key].strip(), 16) & forbidden, 'classic privileged capability escape')
+        roots = 0
+        for line in (proc / 'mountinfo').read_text().splitlines():
+            fields = line.split(); split = fields.index('-')
+            root, target, options, kind = fields[3], fields[4], fields[5].split(','), fields[split+1]
+            need('\\' not in root+target, 'unsupported classic mount encoding')
+            if target == '/':
+                need(kind == 'overlay' and root == '/', 'sealed classic overlay required')
+                roots += 1
+            elif target in ('/etc/hosts', '/etc/hostname', '/etc/resolv.conf'):
+                need(root == '/var/lib/docker/containers/'+container['id']+'/'+target.rsplit('/',1)[1],
+                     'unreviewed classic host file mount')
+            elif kind in ('proc', 'sysfs', 'cgroup2'):
+                need(target == '/proc' or target.startswith('/proc/') or target == '/sys' or target.startswith('/sys/'),
+                     'classic control mount escape')
+                if kind != 'proc': need('ro' in options, 'classic writable kernel control mount')
+            elif kind in ('tmpfs', 'devpts', 'mqueue'):
+                need((root == '/' and target in ('/dev', '/dev/pts', '/dev/shm', '/dev/mqueue', '/sys/firmware', '/proc/acpi', '/proc/scsi')) or
+                     (root == '/null' and target in ('/proc/kcore', '/proc/keys', '/proc/latency_stats', '/proc/timer_list', '/proc/interrupts')),
+                     'classic host mount escape')
+            else:
+                need(False, 'classic host bind/volume activation unsupported')
+        need(roots == 1, 'sealed classic root required')
 
     def freeze(self, name, value):
         path = self.group(name)
@@ -574,7 +628,7 @@ class Fence:
         self.phase = phase
         if phase == 'intent':
             self.pending = copy.deepcopy(extra)
-        elif phase != 'unknown':
+        elif phase not in ('unknown', 'committed-activation-unknown'):
             self.pending = None
         self.journal.save({'phase': phase, 'owner': self.owner, 'pending': self.pending,
                            'originalExpected': self.original, 'expected': self.expected, 'frozen': self.frozen[:],
@@ -582,8 +636,9 @@ class Fence:
 
     def unknown(self):
         # Never thaw in any failure path, including signals, EOF or journal failure.
-        self.phase = 'unknown'
-        self.record('unknown')
+        phase = 'committed-activation-unknown' if 'classicActivation' in self.expected else 'unknown'
+        self.phase = phase
+        self.record(phase)
 
     def require(self, phases, owner=None):
         if self.phase not in phases or (owner is not None and owner != self.owner):
@@ -612,12 +667,18 @@ class Fence:
             raise
 
     def check(self):
-        self.require(('held', 'empty'))
+        self.require(('held', 'empty', 'committed-backend-active'))
         try:
             self.kernel.verify(self.expected, self.frozen, self.dead)
         except BaseException:
-            self.unknown()
+            if 'classicActivation' in self.expected:
+                self.record('committed-activation-unknown')
+            else:
+                self.unknown()
             raise
+        if self.phase == 'committed-backend-active':
+            return {'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED', 'candidate': 'closed',
+                    'activationSet': ['existing-classic-backend'], 'owner': self.owner}
         return {'hostFence': 'held', 'oldExecutor': 'empty' if self.dead else 'frozen',
                 'nodeState': 'unknown', 'owner': self.owner,
                 **({'candidate': 'closed'} if 'candidateClosure' in self.expected else {})}
@@ -662,6 +723,36 @@ class Fence:
             return self.check()
         except BaseException:
             self.unknown()
+            raise
+
+    def activate_classic(self, owner, commit_sha256):
+        """Internal primitive, only called by the same-peer committed root bridge.
+
+        Not in legacy CLI grammar. NO relaunch, Docker/updater thaw, mask return,
+        dead-backend fallback, candidate reopening, or automatic retry.
+        """
+        self.require(('held',), owner)
+        need(isinstance(commit_sha256, str) and HEX64.fullmatch(commit_sha256), 'commit binding required')
+        need('candidateClosure' in self.expected and 'relaunch' in self.expected and not self.dead,
+             'live classic backend and closed candidate required')
+        self.check()
+        self.kernel.assert_classic_activation_safe(self.expected)
+        group = self.expected['backend']
+        need(group in self.frozen and set(self.expected['controls']) <= set(self.frozen), 'runtime hold required')
+        try:
+            self.expected['classicActivation'] = {'commitSha256': commit_sha256, 'group': group}
+            self.record('intent', action='activate-classic-backend', group=group)
+            self.kernel.freeze(group, False)  # irreversible write precedes fallible ack
+            self.frozen.remove(group)
+            self.kernel.verify(self.expected, self.frozen, self.dead)
+            self.record('committed-backend-active')
+            return {'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED', 'candidate': 'closed',
+                    'activationSet': ['existing-classic-backend'], 'owner': self.owner}
+        except BaseException:
+            # The durable all-five ownership COMMIT is not rolled back. Even a
+            # failed ack may have run classic. Never claim retained classic hold.
+            self.phase = 'committed-activation-unknown'
+            self.record('committed-activation-unknown')
             raise
 
     def restore(self, owner):

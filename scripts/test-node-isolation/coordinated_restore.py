@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Finite root-only five-node restoration hold. Never DB handback or thaw.
+"""Finite root-only five-node restoration, irreversible commit and bounded activation.
 
 Only main() builds operational authority from fixed root-owned accepted pins.
 Programmatic constructor injection is for explicitly simulated local tests.
@@ -31,6 +31,9 @@ STATE = '/var/lib/c3-test-node-isolation'
 INTENT = STATE + '/coordinated-restore.json'
 SOCKET = STATE + '/coordinated-restore.sock'
 LOCK = STATE + '/coordinated-restore.lock'
+COMMIT = STATE + '/handoff-commit.json'
+ACTIVATION = STATE + '/handoff-activation.json'
+SHARED_NODE = '6ab189dc63913ebd4a917399'
 KEY = '/etc/c3-test-coordinated-restore/operator-key'
 KNOWN = STATE + '/coordinated-known-hosts'
 COMMAND = 'sudo -n /usr/local/libexec/c3-test-coordinated-restore.py node-hold'
@@ -130,8 +133,9 @@ class Wire:
 
     def send(self, value):
         raw = canonical(value) + b'\n'
-        need(len(raw) <= 16384)
-        # Every frame is bounded below PIPE_BUF on ordinary replies; root UDS
+        need(len(raw) <= 131072)
+        # Ordinary replies are below PIPE_BUF; settlement proofs are bounded
+        # separately at 128 KiB. A partial send is unknown, never retried. Root UDS
         # sockets have a timeout. Detect partial writes, never retry an effect.
         need(os.write(self.writer, raw) == len(raw), 'FRAME_WRITE_UNKNOWN_RETAINED')
 
@@ -143,10 +147,10 @@ class Wire:
             need(not any(fd in ready for fd in watch), 'OTHER_CHANNEL_LOST_RETAINED')
             if self.reader not in ready:
                 continue
-            part = os.read(self.reader, 16385)
+            part = os.read(self.reader, 131073)
             need(part, 'CHANNEL_EOF_RETAINED')
             self.buffer += part
-            need(len(self.buffer) <= 16384, 'FRAME_LIMIT_RETAINED')
+            need(len(self.buffer) <= 131072, 'FRAME_LIMIT_RETAINED')
         raw, self.buffer = self.buffer.split(b'\n', 1)
         need(not self.buffer, 'PIPELINED_FRAME_RETAINED')
         value = decode(raw)
@@ -205,26 +209,44 @@ class NodeServer:
              {k: origin[k] for k in self.config['origin']} == self.config['origin'] and
              type(origin['pid']) is int and origin['pid'] > 1 and isinstance(origin['start'], str) and origin['start'].isdigit())
         need(isinstance(first['coordinatorNonce'], str) and DIGEST.fullmatch(first['coordinatorNonce']))
-        seq, restored = 0, False
+        seq, restored, committed = 0, False, None
         self.writer.checkpoint = self.checkpoint
         try:
             with self.writer.restoration_hold() as held:
                 frame = first
                 while True:
-                    need(set(frame) == BASE and type(frame['version']) is int and frame['version'] == 1 and
+                    need(set(frame) == (BASE | {'commitSha256'} if frame.get('op') in ('activate-classic', 'commit-phase') else BASE) and type(frame['version']) is int and frame['version'] == 1 and
                          frame['nodeId'] == self.node and frame['nodeNonce'] == self.nonce and
                          frame['coordinatorNonce'] == first['coordinatorNonce'] and frame['origin'] == origin and
                          type(frame['seq']) is int and frame['seq'] == seq and
                          isinstance(frame['challenge'], str) and DIGEST.fullmatch(frame['challenge']))
                     op = frame['op']
-                    need(op in (('open',) if seq == 0 else ('check', 'restore', 'verify', 'release')))
+                    need(op in (('open',) if seq == 0 else ('check', 'restore', 'verify', 'release', 'activate-classic', 'commit-phase', 'activation-preflight')))
                     self.busy = True
                     held.check()
+                    if op == 'activation-preflight':
+                        need(self.node == SHARED_NODE and restored and not committed)
+                        assert self.shared is not None
+                        self.shared.check_hold(self.writer.engine.plan, STATE, self.writer.module, command='prepare-classic')
+                    if op == 'commit-phase':
+                        need(restored and not committed and DIGEST.fullmatch(frame['commitSha256']))
+                        held.verify()
+                        committed = frame['commitSha256']
+                    if op == 'activate-classic':
+                        need(committed == frame['commitSha256'] and self.node == SHARED_NODE and restored, 'SHARED_COMMITTED_ACTIVATION_ONLY')
+                        held.verify()
+                        assert self.shared is not None
+                        raw = self.writer.fs.read(COMMIT)[0]
+                        commit = decode(raw)
+                        need(sha(raw) == frame['commitSha256'] and commit['nodePeers'][self.node] == self.root_process and
+                             commit['configSha256'] == sha(canonical(self.config)), 'SAME_HOLDER_COMMIT_REQUIRED')
+                        self.shared.check_hold(self.writer.engine.plan, STATE, self.writer.module,
+                                               command='activate-classic', commit_sha=frame['commitSha256'])
                     if op == 'restore':
-                        need(not restored, 'NODE_RESTORE_REPLAY_FORBIDDEN')
+                        need(not committed and not restored, 'NODE_RESTORE_REPLAY_FORBIDDEN')
                         held.restore()
                         restored = True
-                    if op == 'verify' or (op == 'check' and restored):
+                    if not committed and (op == 'verify' or (op == 'check' and restored)):
                         held.verify()
                     self.checkpoint()
                     self.busy = False
@@ -277,18 +299,21 @@ class Channel:
         self.hello = hello
         self.request('open', watch)
 
-    def request(self, op, watch):
+    def request(self, op, watch, *, commit_sha=None):
         need(self.hello is not None and self.process.poll() is None, 'NODE_PROCESS_LOST_RETAINED')
         assert self.hello is not None
         frame = {'version': 1, 'op': op, 'nodeId': self.node, 'nodeNonce': self.hello['nodeNonce'],
                  'coordinatorNonce': self.nonce, 'seq': self.seq, 'challenge': secrets.token_hex(32), 'origin': self.origin}
+        if op in ('activate-classic', 'commit-phase'):
+            need((op != 'activate-classic' or self.node == SHARED_NODE) and isinstance(commit_sha, str) and DIGEST.fullmatch(commit_sha))
+            frame['commitSha256'] = commit_sha
         self.wire.send(frame)
         if op == 'release':
             return
         reply = self.wire.receive(watch)
-        need(set(reply) == BASE | {'pinSha256', 'guardSha256', 'restored', 'operator', 'pid', 'start'})
+        need(set(reply) == set(frame) | {'pinSha256', 'guardSha256', 'restored', 'operator', 'pid', 'start'})
         need(type(reply['version']) is int and type(reply['seq']) is int and type(reply['pid']) is int)
-        need({k: reply[k] for k in BASE} == {**frame, 'op': op + '-held'} and
+        need({k: reply[k] for k in frame} == {**frame, 'op': op + '-held'} and
              reply['pinSha256'] == sha(canonical(self.pin)) and reply['guardSha256'] == sha(canonical(self.pin['guard'])) and
              (reply['pid'], reply['start']) == (self.hello['pid'], self.hello['start']) and type(reply['restored']) is bool)
         need(isinstance(reply['operator'], dict) and set(reply['operator']) == {'pid', 'start'} and
@@ -327,6 +352,11 @@ class Coordinator:
         self.nonce = secrets.token_hex(32)
         self.active = False
         self.intent = None
+        self.commit_attempted = False
+        self.commit_sha = None
+        self.activation_attempted = False
+        self.activation_confirmed = False
+        self.handoff_completed = False
 
     def watch(self, except_node=None):
         return [c.wire.reader for c in self.nodes if c is not except_node]
@@ -352,6 +382,75 @@ class Coordinator:
         except BaseException:
             self.active = False
             raise
+
+    def commit_handoff(self, proof):
+        """Same root peer, current all-five holds; not a bearer receipt or retry."""
+        need(not self.commit_attempted and self.commit_sha is None, 'HANDOFF_REPLAY_FORBIDDEN')
+        self.check()
+        need(set(proof) == {'context', 'revision', 'deployedRevision', 'quietSha256', 'nodes'} and
+             proof['context'] == self.config['context'] and DIGEST.fullmatch(proof['quietSha256']) and
+             all(type(proof[k]) is int and proof[k] >= 0 for k in ('revision','deployedRevision')))
+        need(len(proof['nodes']) == 5 and {n['nodeId'] for n in proof['nodes']} == set(NODES))
+        for item in proof['nodes']:
+            need(set(item) == {'nodeId','targetProfile','enrollmentId','enrollmentSha256','priorOwnerGeneration','owner'})
+            pin, owner = self.config['nodes'][item['nodeId']], item['owner']
+            need(item['targetProfile'] == pin['identity']['targetProfile'] and DIGEST.fullmatch(item['enrollmentSha256']))
+            need(owner['owner'] == 'classic' and owner['generation'] != item['priorOwnerGeneration'] and
+                 owner['handbackReceipt']['fromGeneration'] == item['priorOwnerGeneration'] and
+                 owner['handbackReceipt']['toGeneration'] == owner['generation'] and
+                 owner['nodeIdentity'] == {k: pin['identity'][k] for k in ('machineId','sshHostKeySha256')})
+        need(self.fs.absent(COMMIT) and self.fs.absent(COMMIT+'.next') and
+             self.fs.absent(ACTIVATION) and self.fs.absent(ACTIVATION+'.next'), 'HANDOFF_REPLAY_FORBIDDEN')
+        row = {'version': 1, 'context': self.config['context'], 'nonce': self.nonce,
+               'configSha256': sha(canonical(self.config)), 'restoreIntent': self.intent,
+               'nodePins': self.config['nodes'], 'nodePeers': {c.node: {'pid': c.hello['pid'], 'start': c.hello['start']} for c in self.nodes},
+               'settlement': proof, 'activationSet': ['existing-classic-backend']}
+        self.check()
+        shared = next(c for c in self.nodes if c.node == SHARED_NODE)
+        shared.request('activation-preflight', self.watch(shared))
+        self.check()
+        self.commit_attempted = True  # unknown file/parent fsync must NEVER activate
+        self.fs.atomic(COMMIT, canonical(row), new=True)
+        need(self.fs.read_json(COMMIT) == row, 'COMMIT_UNKNOWN_NO_ACTIVATION')
+        self.commit_sha = sha(canonical(row))
+        self.check()  # guard loss here is committed, never an ownership rollback
+        return self.commit_sha
+
+    def activate_classic(self):
+        need(self.commit_sha and not self.activation_attempted, 'HANDOFF_ACTIVATION_REPLAY_FORBIDDEN')
+        self.check()
+        need(sha(self.fs.read(COMMIT)[0]) == self.commit_sha, 'COMMITTED_ACTIVATION_UNKNOWN')
+        self.activation_attempted = True
+        for c in self.nodes:
+            c.request('commit-phase', self.watch(c), commit_sha=self.commit_sha)
+        self.check()
+        row = {'version': 1, 'commitSha256': self.commit_sha, 'attempted': [SHARED_NODE], 'confirmed': []}
+        self.fs.atomic(ACTIVATION, canonical(row), new=True)
+        self.check()
+        channel = next(c for c in self.nodes if c.node == SHARED_NODE)
+        channel.request('activate-classic', self.watch(channel), commit_sha=self.commit_sha)
+        self.check()
+        row['confirmed'] = [SHARED_NODE]
+        self.fs.atomic(ACTIVATION, canonical(row))
+        need(self.fs.read_json(ACTIVATION) == row)
+        self.check()
+        self.activation_confirmed = True
+
+    def finish_handoff(self):
+        need(self.activation_confirmed and not self.handoff_completed, 'COMMITTED_ACTIVATION_UNKNOWN')
+        self.check()
+        for index, channel in enumerate(self.nodes):
+            remaining = self.nodes[index:]
+            for other in remaining:
+                other.request('check', [c.wire.reader for c in remaining if c is not other])
+            # Explicit committed transition, never reacquire a released OFD.
+            channel.request('release', [])
+            need(channel.process.wait(timeout=3) == 0, 'COMMITTED_ACTIVATION_UNKNOWN')
+        self.intent['phase'] = 'handoff-completed'
+        self.fs.atomic(INTENT, canonical(self.intent))
+        need(self.fs.read_json(INTENT) == self.intent, 'COMMITTED_ACTIVATION_UNKNOWN')
+        self.handoff_completed = True
+        self.active = False
 
     @contextmanager
     def restore_scope(self):
@@ -388,9 +487,15 @@ class Coordinator:
             self.fs.atomic(INTENT, canonical(self.intent))
             self.check()
             yield self
-            self.check()
-            self.intent['phase'] = 'scope-closed-retained'
-            self.fs.atomic(INTENT, canonical(self.intent))
+            if not self.handoff_completed:
+                self.check()
+                self.intent['phase'] = 'scope-closed-retained'
+                self.fs.atomic(INTENT, canonical(self.intent))
+        except BaseException as error:
+            error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if self.commit_sha else
+                          'COMMIT_UNKNOWN_NO_ACTIVATION' if self.commit_attempted else
+                          'COORDINATED_RESTORE_UNKNOWN_RETAINED')
+            raise
         finally:
             self.active = False
             for channel in self.nodes:
@@ -425,14 +530,30 @@ class Coordinator:
                     continue
                 assert wire is not None and peer is not None
                 frame = wire.receive(self.watch())
-                need(set(frame) == {'version', 'op', 'nonce', 'peer', 'challenge'} and type(frame['version']) is int and
+                need(set(frame) == ({'version', 'op', 'nonce', 'peer', 'challenge', 'proof'} if frame.get('op') == 'commit-handoff' else {'version', 'op', 'nonce', 'peer', 'challenge'}) and type(frame['version']) is int and
                      frame['version'] == 1 and frame['nonce'] == nonce and frame['peer'] == peer and
                      proc_start(peer['pid']) == peer['start'] and isinstance(frame['challenge'], str) and DIGEST.fullmatch(frame['challenge']) and
-                     frame['op'] in ('check-restoration', 'finish'))
+                     frame['op'] in ('check-restoration', 'finish', 'commit-handoff', 'activate-classic', 'complete-handoff'))
                 self.check()
                 if frame['op'] == 'finish':
+                    need(not self.commit_attempted, 'COMMITTED_ACTIVATION_UNKNOWN')
                     completed = True
                     return
+                if frame['op'] != 'check-restoration':
+                    if frame['op'] == 'commit-handoff':
+                        self.commit_handoff(frame['proof'])
+                    elif frame['op'] == 'activate-classic':
+                        self.activate_classic()
+                    else:
+                        self.finish_handoff()
+                    next_nonce = secrets.token_hex(32)
+                    wire.send({k: v for k, v in {**frame, 'op': frame['op']+'-ack',
+                               'commitSha256': self.commit_sha, 'nextNonce': next_nonce}.items() if k != 'proof'})
+                    nonce = next_nonce
+                    if self.handoff_completed:
+                        completed = True
+                        return
+                    continue
                 next_nonce = secrets.token_hex(32)
                 wire.send({**frame, 'op': 'restoration-held', 'nodeCount': 5,
                            'handbackAllowed': False, 'nextNonce': next_nonce})
@@ -463,6 +584,8 @@ class RestorationChannel:
         self.active = False
         self.nonce = None
         self.peer = None
+        self.commit_attempted = False
+        self.committed = False
 
     def state(self):
         need(self.active and self.conn is not None, 'RESTORATION_CHANNEL_REVOKED')
@@ -522,6 +645,32 @@ class RestorationChannel:
             self.nonce = reply['nextNonce']
             self.state()
             # Deliberately no JSON / bool / transferable permission returned.
+        except BaseException:
+            self.close()
+            raise
+
+    def handoff(self, op, proof=None):
+        try:
+            need(op in ('commit-handoff', 'activate-classic', 'complete-handoff'))
+            self.state()
+            request = self.frame(op)
+            if op == 'commit-handoff':
+                self.commit_attempted = True
+                request['proof'] = proof
+            self.wire.send(request)
+            reply = self.wire.receive()
+            expected = {k: v for k, v in request.items() if k != 'proof'}
+            need(set(reply) == set(expected) | {'commitSha256', 'nextNonce'} and
+                 {k: reply[k] for k in expected} == {**expected, 'op': op+'-ack'} and
+                 isinstance(reply['commitSha256'], str) and DIGEST.fullmatch(reply['commitSha256']) and
+                 isinstance(reply['nextNonce'], str) and DIGEST.fullmatch(reply['nextNonce']))
+            self.nonce = reply['nextNonce']
+            self.committed = True
+            if op == 'complete-handoff':
+                self.close()
+            else:
+                self.state()
+            return reply['commitSha256']
         except BaseException:
             self.close()
             raise
@@ -622,7 +771,8 @@ def main():
                                         stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
             with Coordinator(config, fs, spawn, origin=origin).restore_scope() as held:
                 held.serve_owner(listener)
-            print(json.dumps({'code': 'RESTORATION_SCOPE_CLOSED_RETAINED', 'handbackAllowed': False, 'admission': 'closed'}))
+            print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held.handoff_completed else
+                              'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}))
         finally:
             listener.close()
             # Leave socket/known/intents as sticky operator reconciliation state.
@@ -632,7 +782,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except BaseException:
-        print(json.dumps({'ok': False, 'code': 'COORDINATED_RESTORE_UNKNOWN_RETAINED',
-                          'handbackAllowed': False, 'ownershipRetained': True}), file=sys.stderr)
+    except BaseException as error:
+        print(json.dumps({'ok': False, 'code': getattr(error, 'code', 'COORDINATED_RESTORE_UNKNOWN_RETAINED'),
+                          'automaticRetryAllowed': False}), file=sys.stderr)
         raise SystemExit(75)

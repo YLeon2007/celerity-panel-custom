@@ -59,6 +59,10 @@ class HeldOwnerSettlementJournal {
         need(this.#expected?.inFlightNode === nodeId);
         this.#write({ ...this.#expected, inFlightNode: null, settled: [...this.#expected.settled, { nodeId, generation }] });
     }
+    committed(commitSha256) {
+        need(this.#expected?.phase === 'settled-held' && typeof commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(commitSha256));
+        this.#write({ ...this.#expected, phase: 'irreversibly-committed', commitSha256 });
+    }
     complete() {
         need(this.#expected?.phase === 'settling-held' && this.#expected.inFlightNode === null && this.#expected.settled.length === 5);
         this.#write({ ...this.#expected, phase: 'settled-held' });
