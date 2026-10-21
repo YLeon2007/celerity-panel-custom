@@ -100,10 +100,12 @@ def main():
     signal.signal(signal.SIGHUP, lambda *_: need(False))
     signal.alarm(118)
     channel = module.RestorationChannel()
+    primary = None
     try:
         channel.__enter__()
         serve(channel)
     except BaseException as error:
+        primary = error
         error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if channel.committed else
                       'COMMIT_UNKNOWN_NO_ACTIVATION' if channel.commit_attempted else
                       'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED')
@@ -111,7 +113,7 @@ def main():
     finally:
         # Deliberately NOT __exit__: it sends finish, which would drop the
         # coordinator's actual flocks before the explicit committed completion.
-        channel.close()
+        channel.close(primary)
 
 
 if __name__ == '__main__':

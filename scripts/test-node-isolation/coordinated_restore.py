@@ -58,6 +58,19 @@ def need(ok, code='COORDINATED_RESTORE_UNKNOWN_RETAINED'):
         raise Refusal(code)
 
 
+def dispose_socket(conn, code, primary=None):
+    """One local disposal attempt; never replace an in-flight protocol failure."""
+    if conn is not None:
+        try:
+            conn.close()
+        except BaseException as error:
+            failure = primary if primary is not None else error
+            failure.code = code
+            failure.cleanup_errors = (*getattr(failure, 'cleanup_errors', ()), error)
+            if primary is None:
+                raise
+
+
 def canonical(obj):
     return json.dumps(obj, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
 
@@ -330,16 +343,36 @@ class Channel:
         return reply
 
     def close(self):
-        # Closing pipes revokes the remote lexical hold; no thaw or reopen path.
+        # Disposal only: never thaw/reopen/replay. A failed close or signal must
+        # not skip the other pipe, bounded reap, or final kill/reap attempt.
+        errors = []
         for stream in (self.process.stdin, self.process.stdout):
             if stream:
-                stream.close()
-        if self.process.poll() is None:
-            self.process.terminate()
+                try:
+                    stream.close()
+                except BaseException as error:
+                    errors.append(error)
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+        except BaseException as error:
+            errors.append(error)
         try:
             self.process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.process.kill(); self.process.wait(timeout=3)
+        except BaseException as error:
+            errors.append(error)
+            try:
+                self.process.kill()
+            except BaseException as error:
+                errors.append(error)
+            try:
+                self.process.wait(timeout=3)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            failure = Refusal('CHANNEL_CLEANUP_FAILED')
+            failure.cleanup_errors = tuple(errors)
+            raise failure from errors[0]
 
 
 class Coordinator:
@@ -357,6 +390,33 @@ class Coordinator:
         self.activation_attempted = False
         self.activation_confirmed = False
         self.handoff_completed = False
+        self.cleanup_attempted = False
+        self.cleanup_errors = ()
+
+    def failure_code(self):
+        # Frozen irreversible state; cleanup never infers rollback from EOF.
+        return ('COMMITTED_ACTIVATION_UNKNOWN' if self.commit_sha else
+                'COMMIT_UNKNOWN_NO_ACTIVATION' if self.commit_attempted else
+                'COORDINATED_RESTORE_UNKNOWN_RETAINED')
+
+    def cleanup_channels(self, primary=None):
+        self.active = False
+        if not self.cleanup_attempted:
+            self.cleanup_attempted = True
+            errors = []
+            for channel in self.nodes:
+                try:
+                    channel.close()
+                except BaseException as error:
+                    errors.append(error)
+            self.cleanup_errors = tuple(errors)
+        if self.cleanup_errors:
+            failure = primary if primary is not None else Refusal(self.failure_code())
+            failure.code = self.failure_code()
+            failure.cleanup_errors = (*getattr(failure, 'cleanup_errors', ()),
+                                      *(e for e in self.cleanup_errors if e not in getattr(failure, 'cleanup_errors', ())))
+            if primary is None:
+                raise failure from self.cleanup_errors[0]
 
     def watch(self, except_node=None):
         return [c.wire.reader for c in self.nodes if c is not except_node]
@@ -446,6 +506,9 @@ class Coordinator:
             # Explicit committed transition, never reacquire a released OFD.
             channel.request('release', [])
             need(channel.process.wait(timeout=3) == 0, 'COMMITTED_ACTIVATION_UNKNOWN')
+        # Required coordinator pipe/process disposal precedes durable completion
+        # and the owner's complete-handoff-ack, not restore_scope's finally.
+        self.cleanup_channels()
         self.intent['phase'] = 'handoff-completed'
         self.fs.atomic(INTENT, canonical(self.intent))
         need(self.fs.read_json(INTENT) == self.intent, 'COMMITTED_ACTIVATION_UNKNOWN')
@@ -462,6 +525,7 @@ class Coordinator:
                        'origin': self.origin, 'phase': 'acquiring-retained', 'restoredNodes': [], 'inFlightNode': None}
         self.fs.atomic(INTENT, canonical(self.intent), new=True)
         need(self.fs.read_json(INTENT) == self.intent, 'COORDINATOR_INTENT_READBACK_REQUIRED')
+        primary = None
         try:
             for node, pin in self.config['nodes'].items():
                 channel = Channel(self.spawn(node), node, pin, self.nonce, self.origin, self.deadline)
@@ -492,14 +556,11 @@ class Coordinator:
                 self.intent['phase'] = 'scope-closed-retained'
                 self.fs.atomic(INTENT, canonical(self.intent))
         except BaseException as error:
-            error.code = ('COMMITTED_ACTIVATION_UNKNOWN' if self.commit_sha else
-                          'COMMIT_UNKNOWN_NO_ACTIVATION' if self.commit_attempted else
-                          'COORDINATED_RESTORE_UNKNOWN_RETAINED')
+            primary = error
+            error.code = self.failure_code()
             raise
         finally:
-            self.active = False
-            for channel in self.nodes:
-                channel.close()
+            self.cleanup_channels(primary)
 
     def serve_owner(self, listener):
         """Finite root-peer UDS. Diagnostics valid only during this live channel.
@@ -512,6 +573,7 @@ class Coordinator:
         wire = None
         completed = False
         nonce, peer = secrets.token_hex(32), None
+        primary = None
         try:
             while True:
                 self.check()
@@ -558,11 +620,16 @@ class Coordinator:
                 wire.send({**frame, 'op': 'restoration-held', 'nodeCount': 5,
                            'handbackAllowed': False, 'nextNonce': next_nonce})
                 nonce = next_nonce
+        except BaseException as error:
+            primary = error
+            error.code = self.failure_code()
+            raise
         finally:
             if not completed:
                 self.active = False
-            if conn:
-                conn.close()
+            # The reply covers required node cleanup. A later local transport
+            # disposal failure still reports committed uncertainty, never retained.
+            dispose_socket(conn, self.failure_code(), primary)
 
 
 class RestorationChannel:
@@ -624,8 +691,8 @@ class RestorationChannel:
             self.nonce, self.peer = hello['nonce'], hello['peer']
             self.check()
             return self
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            self.close(error)
             raise
 
     def frame(self, op):
@@ -645,8 +712,8 @@ class RestorationChannel:
             self.nonce = reply['nextNonce']
             self.state()
             # Deliberately no JSON / bool / transferable permission returned.
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            self.close(error)
             raise
 
     def handoff(self, op, proof=None):
@@ -671,23 +738,29 @@ class RestorationChannel:
             else:
                 self.state()
             return reply['commitSha256']
-        except BaseException:
-            self.close()
+        except BaseException as error:
+            self.close(error)
             raise
 
-    def close(self):
+    def close(self, primary=None):
         self.active = False
-        if self.conn is not None:
-            self.conn.close()
-            self.conn = None
+        conn, self.conn = self.conn, None  # no second attempt after an unknown close
+        code = ('COMMITTED_ACTIVATION_UNKNOWN' if self.committed else
+                'COMMIT_UNKNOWN_NO_ACTIVATION' if self.commit_attempted else
+                'OWNER_RESTORATION_CHANNEL_UNKNOWN_RETAINED')
+        dispose_socket(conn, code, primary)
 
     def __exit__(self, kind, value, traceback):
+        primary = value
         try:
             if kind is None:
                 self.check()
                 self.wire.send(self.frame('finish'))
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            self.close()
+            self.close(primary)
 
 
 def trusted_read(path):
@@ -762,6 +835,8 @@ def main():
         known = ''.join('[' + p['identity']['endpointIp'] + ']:2222 ssh-ed25519 ' + p['hostKey'] + '\n' for p in config['nodes'].values())
         fs.atomic(KNOWN, known.encode(), new=True)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        held = None
+        primary = None
         try:
             listener.bind(SOCKET); os.chmod(SOCKET, 0o600); listener.listen(1)
             def spawn(node):
@@ -769,14 +844,20 @@ def main():
                 local_origin(config)
                 return subprocess.Popen(ssh_argv(config, node), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
-            with Coordinator(config, fs, spawn, origin=origin).restore_scope() as held:
+            held = Coordinator(config, fs, spawn, origin=origin)
+            with held.restore_scope():
                 held.serve_owner(listener)
-            print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held.handoff_completed else
-                              'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}))
+        except BaseException as error:
+            primary = error
+            error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+            raise
         finally:
-            listener.close()
+            code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+            dispose_socket(listener, code, primary)
             # Leave socket/known/intents as sticky operator reconciliation state.
             # Never unlink unknown paths or reopen admission in a finally block.
+        print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held.handoff_completed else
+                          'RESTORATION_SCOPE_CLOSED_RETAINED', 'admission': 'closed'}))
 
 
 if __name__ == '__main__':
