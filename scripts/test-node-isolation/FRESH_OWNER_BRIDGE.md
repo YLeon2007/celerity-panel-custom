@@ -76,20 +76,21 @@ five-second accept. Its executable/HTTP witness is disposable **Python**, not
 proof of the actual Node application in a physical root. Root/UID/systemd/
 namespace facts remain simulated.
 
-The separately owned `fresh_owner_fixture.py` still imports the historical
-`launch_fixture`. For assembled Mongo replay it must be pointed at the focused
-prepared fixture (a test-only import adapter, never a production scheduling
-fallback). The local evidence adapter does this without editing that unowned
-file: actual public initialize/adopt/preEnroll, five owner CAS/majority readbacks,
-real same-held root protocol and stopped subprocess then run unchanged. A
-six-second pre-settlement delay and actual five-commit monitor are additional
-assertions, not extensions of the supervisor accept timeout. Unadapted old
-fixtures are not a passing proof of the new path.
+The committed `fresh_owner_fixture.py` now imports the prepared fixture directly;
+assembled Mongo replay requires no external runtime import adapter. The positive
+JS test observes the actual supervisor PID/start in state `T` before and after
+6100ms, before public settlement. It counts exactly five sent owner CAS commands;
+that count alone is not a transaction-commit proof. Public majority handback and
+exact final owner-document/commit-settlement readbacks provide separate durable
+outcome checks. Real same-held protocol, terminal uncertainty and all-five
+hold/generation faults remain exercised. These assertions do not extend the
+ordinary five-second supervisor accept timeout.
 
 Separate real-application tests execute the actual index twice with disposable
 Mongo/Redis, read-only source permissions and lock-exact dependencies. That
 application proof is not execution of the real application inside the fresh
-physical root. Accepted root construction, UID/namespace/mount/fd inventory,
-independent producer acceptance, physical ingress, restored operational database
-compatibility, root installation/policy acceptance and live TEST/PROD activation
-remain unperformed. Source success is not physical GO.
+physical root. Offline producer source review and full-candidate replay are
+local evidence only. Accepted physical root construction, UID/namespace/mount/fd
+inventory, ingress, restored operational database compatibility, root
+installation/policy acceptance and live TEST/PROD activation remain unperformed.
+Source success is not physical GO.
