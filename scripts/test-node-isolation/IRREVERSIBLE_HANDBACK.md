@@ -96,8 +96,17 @@ Docker defaults:
   postactivation verification; no policy is installed or repaired by the guard.
 - Before COMMIT, while the backend is acknowledged frozen, **every existing
   backend process must have exactly one task and zero descriptors** in both
-  `fd` and `fdinfo`; root must be the accepted overlay root and cwd must be on
-  that overlay. No socket, pipe, logging FD, `anon_inode`/io_uring or stdio
+  `fd` and `fdinfo`. For each process, **both root and cwd must have the exact
+  mount ID of the unique checked overlay `/` mount**; same `st_dev`, inode or
+  pathname is not mount identity. The guard follows each proc magic link with
+  `O_PATH|O_CLOEXEC`, reads `mnt_id` from its own exact still-open
+  `/proc/self/fdinfo/FD` and uses `fstat` on that same FD. Missing, malformed,
+  duplicate inventory or unknown IDs refuse; detached/hidden same-superblock
+  bind aliases refuse even with identical inode/device. Owned path FDs close in
+  `finally`, including stat/read/parse failure; fdinfo reads are bounded to 4 KiB
+  and only one path FD is held at a time. There is no `st_dev` fallback.
+  Root inode and overlay device checks remain additional constraints.
+  No socket, pipe, logging FD, `anon_inode`/io_uring or stdio
   exception is inferred safe. A retained descriptor to candidate `cgroup.freeze`
   refuses before activation, without writing or closing that descriptor. The
   same entry policy is repeated before the irreversible thaw. The internal
@@ -160,6 +169,13 @@ mount/capability/default-device facts. A constrained positive still reaches
 actual `Fence.activate_classic`, retains all other fences and permits ordinary
 file IO/new private runtime FDs/tasks. No device is created or opened, and no
 Docker command, root operation, install or live activation is exercised.
+The retained-mount regression additionally executes real Linux read-only
+`O_PATH`/`fstat`/owned-fdinfo against an ordinary scratch directory through a
+proc magic link, checks FD closure on malformed/missing IDs and read/stat faults,
+models init/child root/cwd aliases at both entry boundaries, and exercises the
+actual root guard's refusal with no COMMIT plus bounded positive activation.
+The payload mount/proc topology remains simulated; no bind/detach mount or
+physical device-denial experiment is claimed.
 
 `heldTestOwnerSettlement.test.js` exercises public generation-fenced transfers
 and exact all-five readbacks against isolated local MongoDB, including partial

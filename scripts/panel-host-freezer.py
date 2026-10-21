@@ -455,6 +455,24 @@ class LinuxKernel:
         device = path.stat().st_dev
         return f'{os.major(device)}:{os.minor(device)}'
 
+    def retained_path_identity(self, path):
+        # Follow proc's magic root/cwd link: O_NOFOLLOW would pin the proc link,
+        # not the retained vfsmount. Inspect only our exact, still-owned FD.
+        fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        try:
+            snapshot = os.fstat(fd)
+            with Path(f'/proc/self/fdinfo/{fd}').open('rb') as source:
+                data = source.read(4097)
+            need(len(data) <= 4096, 'classic retained mount fdinfo limit')
+            ids = [line for line in data.decode('ascii').splitlines() if line.startswith('mnt_id:')]
+            need(len(ids) == 1 and re.fullmatch(r'mnt_id:\s+([1-9][0-9]{0,19})', ids[0]) is not None,
+                 'classic retained mount ID missing or malformed')
+            mount_id = int(ids[0].split(':', 1)[1])
+            need(mount_id <= 2**64-1, 'classic retained mount ID malformed')
+            return mount_id, snapshot
+        finally:
+            os.close(fd)
+
     def assert_classic_activation_safe(self, expected):
         """Finite sealed-container variant, no writable host bind/volume escape.
 
@@ -505,8 +523,8 @@ class LinuxKernel:
         host_mounts = (self.proc / '1/mountinfo').read_text().splitlines()
         need(bool(host_mounts), 'classic host mount inventory required')
         host_devices = {line.split()[2] for line in host_mounts}
-        roots, procs, root_device = 0, 0, None
-        targets = set()
+        roots, procs, root_device, root_mount_id = 0, 0, None, None
+        targets, mount_ids = set(), set()
         with (proc / 'mountinfo').open('rb') as source:
             raw_mountinfo = source.read(1024 * 1024 + 1)
         need(len(raw_mountinfo) <= 1024 * 1024, 'classic device mount inventory limit')
@@ -514,6 +532,12 @@ class LinuxKernel:
         need(len(mountinfo.splitlines()) <= 4096, 'classic device mount inventory limit')
         for line in mountinfo.splitlines():
             fields = line.split(); split = fields.index('-')
+            need(re.fullmatch(r'[1-9][0-9]{0,19}', fields[0]) is not None,
+                 'classic mount inventory ID malformed')
+            mount_id = int(fields[0])
+            need(mount_id <= 2**64-1 and mount_id not in mount_ids,
+                 'classic mount inventory ID duplicate or malformed')
+            mount_ids.add(mount_id)
             root, target, options, kind = fields[3], fields[4], fields[5].split(','), fields[split+1]
             need('\\' not in root+target, 'unsupported classic mount encoding')
             need(target not in targets, 'stacked classic mount unsupported')
@@ -530,7 +554,7 @@ class LinuxKernel:
             if target == '/':
                 need(kind == 'overlay' and root == '/', 'sealed classic overlay required')
                 roots += 1
-                root_device = fields[2]
+                root_device, root_mount_id = fields[2], mount_id
             elif target in ('/etc/hosts', '/etc/hostname', '/etc/resolv.conf'):
                 need(root == '/var/lib/docker/containers/'+container['id']+'/'+target.rsplit('/',1)[1],
                      'unreviewed classic host file mount')
@@ -568,17 +592,24 @@ class LinuxKernel:
         # not close/repair FDs or infer a socket/anon_inode is harmless. In
         # particular io_uring/SCM_RIGHTS and hidden per-thread files/fs are not
         # supported. Ordinary Node/Docker logging layouts are thus ineligible.
-        root_inode = (proc / 'root').stat().st_ino
+        init_mount_id, init_root = self.retained_path_identity(proc / 'root')
+        need(init_mount_id == root_mount_id, 'classic root/cwd retained mount outside checked overlay')
         for row in members:
             payload = self.proc / str(row['pid'])
             need(sorted(p.name for p in (payload / 'task').iterdir()) == [str(row['pid'])],
                  'classic multi-task resource provenance unsupported')
             need(not any((payload / 'fd').iterdir()) and not any((payload / 'fdinfo').iterdir()),
                  'classic retained descriptor authority unsupported')
-            need(self.mount_device(payload / 'root') == root_device
-                 and (payload / 'root').stat().st_ino == root_inode
-                 and self.mount_device(payload / 'cwd') == root_device,
-                 'classic root/cwd authority outside private overlay')
+            # st_dev/inode cannot distinguish a detached or hidden same-overlay
+            # bind alias. Both retained paths must name the EXACT checked root
+            # vfsmount, not merely any listed mount with the same superblock.
+            for name in ('root', 'cwd'):
+                mount_id, snapshot = self.retained_path_identity(payload / name)
+                need(mount_id == root_mount_id, 'classic root/cwd retained mount outside checked overlay')
+                need(stat.S_ISDIR(snapshot.st_mode)
+                     and f'{os.major(snapshot.st_dev)}:{os.minor(snapshot.st_dev)}' == root_device
+                     and (name != 'root' or snapshot.st_ino == init_root.st_ino),
+                     'classic root/cwd authority outside private overlay')
         need(self.members(expected['backend']) == members, 'classic resource inventory changed')
 
     def freeze(self, name, value):

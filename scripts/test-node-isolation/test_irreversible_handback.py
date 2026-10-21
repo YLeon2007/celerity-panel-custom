@@ -14,6 +14,65 @@ sys.path.insert(0, str(HERE.parent / 'tests'))
 import test_candidate_closure as closure
 
 
+class RetainedMountIdentityTests(unittest.TestCase):
+    def test_real_opath_fstat_fdinfo_follows_magic_link_and_closes_owned_fd(self):
+        import fcntl
+        kernel = closure.f.LinuxKernel()
+        with tempfile.TemporaryDirectory(prefix='retained-mount-fix-primitive-') as root:
+            reference = os.open(root, os.O_PATH | os.O_CLOEXEC)
+            self.addCleanup(os.close, reference)
+            with Path(f'/proc/self/fdinfo/{reference}').open() as source:
+                expected_id = int(next(line.split(':', 1)[1] for line in source if line.startswith('mnt_id:')))
+            real_open = os.open
+            opened = []
+            def tracked_open(path, flags):
+                self.assertEqual(flags, os.O_PATH | os.O_CLOEXEC)
+                fd = real_open(path, flags)
+                opened.append(fd)
+                self.assertTrue(fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC)
+                return fd
+            with patch.object(closure.f.os, 'open', side_effect=tracked_open), patch.object(closure.f.os, 'fstat', wraps=os.fstat) as observed:
+                mount_id, snapshot = kernel.retained_path_identity(Path(f'/proc/self/fd/{reference}'))
+            self.assertEqual(mount_id, expected_id)
+            self.assertEqual((snapshot.st_dev, snapshot.st_ino), (os.fstat(reference).st_dev, os.fstat(reference).st_ino))
+            self.assertEqual(observed.call_args.args, (opened[0],))
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError): os.fstat(opened[0])
+
+    def test_owned_fd_closes_on_id_stat_and_read_fault_without_device_fallback(self):
+        import io
+        kernel = closure.f.LinuxKernel()
+        records = (b'', b'mnt_id:\t0\n', b'mnt_id:\t-1\n', b'mnt_id:\tgarbage\n',
+                   b'mnt_id:\t01\n', b'mnt_id:\t1\nmnt_id:\t2\n',
+                   b'mnt_id:\t18446744073709551616\n', b'mnt_id:\t1\n'+b'x'*4096,
+                   b'mnt_id:\t\xff\n', 'read-failure', 'stat-failure')
+        with tempfile.TemporaryDirectory(prefix='retained-mount-fix-fault-') as root:
+            real_open, real_path_open = os.open, Path.open
+            for record in records:
+                with self.subTest(record=repr(record)[:90]):
+                    opened = []
+                    def tracked_open(path, flags):
+                        fd = real_open(path, flags); opened.append(fd); return fd
+                    def fdinfo(path, *args, **kwargs):
+                        if str(path) == f'/proc/self/fdinfo/{opened[-1]}':
+                            if record == 'read-failure':
+                                class BrokenRead(io.BytesIO):
+                                    def read(self, *args):
+                                        raise OSError('SIMULATED owned fdinfo read failure')
+                                return BrokenRead()
+                            assert isinstance(record, bytes)
+                            return io.BytesIO(record)
+                        return real_path_open(path, *args, **kwargs)
+                    with patch.object(closure.f.os, 'open', side_effect=tracked_open), patch.object(Path, 'open', fdinfo), patch.object(kernel, 'mount_device', side_effect=AssertionError('no st_dev fallback')):
+                        with self.assertRaises((RuntimeError, OSError, UnicodeError)):
+                            if record == 'stat-failure':
+                                with patch.object(closure.f.os, 'fstat', side_effect=OSError('SIMULATED fstat failure')):
+                                    kernel.retained_path_identity(Path(root))
+                            else: kernel.retained_path_identity(Path(root))
+                    self.assertEqual(len(opened), 1)
+                    with self.assertRaises(OSError): os.fstat(opened[0])
+
+
 class BoundedActivationTests(unittest.TestCase):
     put_pid = closure.CandidateClosureTests.put_pid
 
@@ -29,7 +88,14 @@ class BoundedActivationTests(unittest.TestCase):
         (proc/'root/proc/1/ns').mkdir(parents=True)
         (proc/'root/proc/1/ns/pid').symlink_to('pid:[SIMULATED-CONTAINER]')
         (proc/'status').write_text(''.join(k+': 0000000000000000\n' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))+'NoNewPrivs: 1\n')
-        (proc/'mountinfo').write_text('1 0 0:1 / / rw,nodev - overlay overlay rw\n2 1 0:2 / /proc ro,nodev - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro,nodev - cgroup2 cgroup ro\n')
+        kernel.overlay_device = closure.f.LinuxKernel.mount_device(kernel, proc/'root')
+        (proc/'mountinfo').write_text(f'1 0 {kernel.overlay_device} / / rw,nodev - overlay overlay rw\n2 1 0:2 / /proc ro,nodev - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro,nodev - cgroup2 cgroup ro\n')
+        # Only payload proc/mount topology is SIMULATED. The primitive still
+        # opens an ordinary directory, fstats its owned FD and reads real fdinfo.
+        def identity(path):
+            _, snapshot = closure.f.LinuxKernel.retained_path_identity(kernel, path)
+            return 1, snapshot  # modeled payload overlay vfsmount
+        kernel.retained_path_identity = identity
         provenance = {'mounts': [], 'binds': None, 'volumesFrom': None,
             'tmpfs': None, 'ipcMode': 'private',
             'shmPath': '/var/lib/docker/containers/'+backend['id']+'/mounts/shm'}
@@ -40,12 +106,74 @@ class BoundedActivationTests(unittest.TestCase):
             c['devicePolicy']['Privileged'] = False
         (kernel.proc/'1/mountinfo').write_text('10 0 8:1 / / rw - ext4 /dev/sda rw\n11 10 0:33 / /dev/shm rw - tmpfs shm rw\n')
         # Only superblock facts are SIMULATED; the production seam uses stat(2).
-        kernel.mount_device = lambda path: '0:44' if path.name == 'shm' else '0:1'
+        kernel.mount_device = lambda path: '0:44' if path.name == 'shm' else kernel.overlay_device
         (proc/'task'/str(backend['init']['pid'])).mkdir(parents=True)
         (proc/'fd').mkdir()
         (proc/'fdinfo').mkdir()
         (proc/'cwd').symlink_to(proc/'root', target_is_directory=True)
         return p,kernel,fence
+
+    def test_retained_same_superblock_mount_alias_refuses_before_commit_and_thaw(self):
+        for who in ('init', 'child'):
+            for retained in ('root', 'cwd'):
+                for mount_id in (999999, 2):
+                    for boundary in ('prepare', 'activate'):
+                        with self.subTest(who=who, retained=retained, mount_id=mount_id, boundary=boundary), tempfile.TemporaryDirectory(prefix='retained-mount-fix-') as root:
+                            _, kernel, fence = self.build(root)
+                            fence.close_candidate(fence.owner)
+                            backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                            proc = kernel.proc/str(backend['init']['pid'])
+                            payload = proc
+                            if who == 'child':
+                                pid = 9999
+                                self.put_pid(kernel, pid, backend['init']['pid'], backend['init']['pid'], backend['cgroup'])
+                                payload = kernel.proc/str(pid)
+                                (payload/'ns').mkdir()
+                                for ns in ('mnt','pid','cgroup','net','ipc'):
+                                    (payload/'ns'/ns).symlink_to(ns+':[SIMULATED-CONTAINER]')
+                                (payload/'status').write_bytes((proc/'status').read_bytes())
+                                for name in ('root', 'cwd'):
+                                    (payload/name).symlink_to(proc/'root', target_is_directory=True)
+                                (payload/'task'/str(pid)).mkdir(parents=True)
+                                (payload/'fd').mkdir(); (payload/'fdinfo').mkdir()
+                                (kernel.group(backend['cgroup'])/'cgroup.procs').write_text(str(backend['init']['pid'])+'\n'+str(pid))
+                                fence.expected['groups'][backend['cgroup']]['members'] = kernel.members(backend['cgroup'])
+                            # Same actual directory/inode/superblock: ONLY the
+                            # retained vfsmount identity differs in this model.
+                            self.assertEqual((payload/retained).stat().st_dev, (proc/'root').stat().st_dev)
+                            self.assertEqual((payload/'root').stat().st_ino, (proc/'root').stat().st_ino)
+                            kernel.assert_classic_activation_safe(fence.expected)
+                            original = kernel.retained_path_identity
+                            def identity(path):
+                                value, snapshot = original(path)
+                                return (mount_id if path == payload/retained else value), snapshot
+                            # Exercise the actual admission predicate, not a
+                            # standalone identity-comparison mock.
+                            kernel.retained_path_identity = identity
+                            before = list(kernel.calls)
+                            journal = fence.journal.path.joinpath('hold.json').read_bytes()
+                            with self.assertRaisesRegex(RuntimeError, 'root/cwd.*mount'):
+                                if boundary == 'prepare': kernel.assert_classic_activation_safe(fence.expected)
+                                else: fence.activate_classic(fence.owner, 'a'*64)
+                            self.assertEqual(kernel.calls, before)
+                            self.assertEqual(fence.journal.path.joinpath('hold.json').read_bytes(), journal)
+                            self.assertNotIn('classicActivation', fence.expected)
+                            self.assertEqual((kernel.group(kernel.candidate)/'cgroup.freeze').read_text(), '1')
+
+    def test_retained_mount_inventory_ids_and_frozen_inspection_fail_closed(self):
+        for fault in ('missing-id', 'zero-id', 'malformed-id', 'duplicate-id', 'unfrozen'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='retained-mount-fix-inventory-') as root:
+                _, kernel, fence = self.build(root)
+                backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                mounts = kernel.proc/str(backend['init']['pid'])/'mountinfo'
+                if fault == 'unfrozen':
+                    (kernel.group(backend['cgroup'])/'cgroup.freeze').write_text('0')
+                else:
+                    replacement = {'missing-id':'', 'zero-id':'0', 'malformed-id':'unknown', 'duplicate-id':'2'}[fault]
+                    mounts.write_text(mounts.read_text().replace('1 0 ', replacement+' 0 ', 1))
+                with patch.object(kernel, 'retained_path_identity', side_effect=AssertionError('must refuse before owned FD inspection')):
+                    with self.assertRaisesRegex(RuntimeError, 'mount.*ID|frozen'):
+                        kernel.assert_classic_activation_safe(fence.expected)
 
     def test_capture_rejects_device_grants_and_pins_exact_empty_policy(self):
         import test_panel_host_freezer as ft
@@ -105,7 +233,7 @@ class BoundedActivationTests(unittest.TestCase):
                     if fault == 'proc-dev': mounts.write_text(mounts.read_text().replace('/proc ro,nodev', '/proc ro'))
                     if fault == 'private-dev':
                         mounts.write_text(mounts.read_text()+'4 1 0:44 / /dev rw - tmpfs tmpfs rw,nodev\n')
-                        kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else '0:1'
+                        kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else kernel.overlay_device
                     if fault == 'superblock-nodev-only':
                         mounts.write_text(mounts.read_text().replace('/ / rw,nodev - overlay overlay rw', '/ / rw - overlay overlay rw,nodev'))
                     status = proc/'status'
@@ -151,7 +279,7 @@ class BoundedActivationTests(unittest.TestCase):
                 node.write_text('SIMULATED block st_rdev=8:0; ordinary scratch file')
             mounts = proc/'mountinfo'
             mounts.write_text(mounts.read_text()+'4 1 0:44 / /dev rw,nodev - tmpfs tmpfs rw\n')
-            kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else '0:1'
+            kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else kernel.overlay_device
             kernel.assert_classic_activation_safe(fence.expected)
             result = fence.activate_classic(fence.owner, 'a'*64)
             self.assertEqual(result['code'], 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED')
@@ -194,7 +322,11 @@ class BoundedActivationTests(unittest.TestCase):
                 if fault == 'fdinfo-only': (proc/'fdinfo/9').write_text('mnt_id:\t999\n')
                 if fault == 'thread': (proc/'task/9999').mkdir()
                 if fault in ('cwd-host', 'root-host'):
-                    kernel.mount_device = lambda path: '8:1' if path.name == fault.split('-')[0] else '0:1'
+                    identity = kernel.retained_path_identity
+                    def host_identity(path):
+                        mount_id, snapshot = identity(path)
+                        return (999999 if path.name == fault.split('-')[0] else mount_id), snapshot
+                    kernel.retained_path_identity = host_identity
                 if fault == 'missing-fd-inventory': (proc/'fd').rmdir()
                 before = list(kernel.calls)
                 if fault == 'private':
@@ -216,7 +348,7 @@ class BoundedActivationTests(unittest.TestCase):
                 mounts = kernel.proc / str(backend['init']['pid']) / 'mountinfo'
                 device = '0:33' if fault == 'host-shm' else '0:44'
                 mounts.write_text(mounts.read_text()+f'4 1 {device} / /dev/shm rw,nosuid,nodev - tmpfs shm rw,size=65536k\n')
-                kernel.mount_device = lambda path: (device if fault != 'stat-mismatch' else '0:55') if path.name == 'shm' else '0:1'
+                kernel.mount_device = lambda path: (device if fault != 'stat-mismatch' else '0:55') if path.name == 'shm' else kernel.overlay_device
                 if fault == 'bind-provenance':
                     backend['mountProvenance']['mounts'] = [{'Type':'bind','Source':'/dev/shm','Destination':'/dev/shm'}]
                 if fault == 'host-ipc': backend['mountProvenance']['ipcMode'] = 'host'
@@ -608,6 +740,11 @@ class RootGuardActivationTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 self.exercise_guard(fault)
 
+    def test_actual_prepare_classic_refuses_retained_mount_alias_without_commit(self):
+        for fault in ('root-mount-alias', 'cwd-mount-alias', 'retained-mount-read'):
+            with self.subTest(fault=fault):
+                self.exercise_guard(fault)
+
     def exercise_guard(self, fault=None):
         import multiprocessing
         import time
@@ -646,6 +783,20 @@ class RootGuardActivationTests(unittest.TestCase):
             if fault == 'device-nodev':
                 mounts = proc/'mountinfo'
                 mounts.write_text(mounts.read_text().replace('/ / rw,nodev', '/ / rw'))
+            if fault in ('root-mount-alias', 'cwd-mount-alias', 'retained-mount-read'):
+                identity = kernel.retained_path_identity
+                def retained_identity(path):
+                    if fault == 'retained-mount-read':
+                        real_open = Path.open
+                        def broken_fdinfo(target, *args, **kwargs):
+                            if str(target).startswith('/proc/self/fdinfo/'):
+                                raise OSError('SIMULATED retained mount fdinfo read failure')
+                            return real_open(target, *args, **kwargs)
+                        with patch.object(Path, 'open', broken_fdinfo):
+                            return identity(path)
+                    mount_id, snapshot = identity(path)
+                    return (999999 if path.name == fault.split('-')[0] else mount_id), snapshot
+                kernel.retained_path_identity = retained_identity
             kernel.journal_path=Path(root)/'host/hold.json'
             m.atomic_json(root,'guard.json',{'fixture':True})
             readfd,writefd=os.pipe()
@@ -657,7 +808,7 @@ class RootGuardActivationTests(unittest.TestCase):
                     try: s.serve_hold(p,root,m,freezer,kernel,Host(),readfd)
                     except m.Refusal as e:
                         if str(e) != 'HOST_CONTROLLER_CHANNEL_LOST': raise
-                    except RuntimeError as e:
+                    except (RuntimeError, OSError) as e:
                         if fault is None: raise
                         (Path(root)/'kernel-refusal').write_text(str(e))
             child=multiprocessing.get_context('fork').Process(target=guard)
@@ -676,7 +827,7 @@ class RootGuardActivationTests(unittest.TestCase):
                             s.check_hold(p,root,m,command='prepare-classic')
                         child.join(5)
                         self.assertFalse(child.is_alive()); self.assertEqual(child.exitcode,0)
-                        self.assertRegex((Path(root)/'kernel-refusal').read_text(), 'proc|host-backed|descriptor|device')
+                        self.assertRegex((Path(root)/'kernel-refusal').read_text(), 'proc|host-backed|descriptor|device|retained mount')
                         self.assertFalse((Path(root)/'handoff-commit.json').exists())
                         self.assertEqual(json.loads(kernel.journal_path.read_bytes())['phase'],'unknown')
                         for group in [*p['hostHold']['expected']['freezeOrder'],kernel.candidate]:
