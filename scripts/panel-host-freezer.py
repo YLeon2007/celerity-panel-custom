@@ -463,6 +463,10 @@ class LinuxKernel:
         """
         container = next(c for c in expected['containers'] if c['cgroup'] == expected['backend'])
         proc = self.proc / str(container['init']['pid'])
+        policy = container.get('devicePolicy')
+        need(isinstance(policy, dict) and set(policy) == set(DEVICE_POLICY_KEYS),
+             'classic exact device policy required')
+        device_policy(policy)  # Old inventories and subsequently added grants refuse.
         if 'classicActivation' not in expected:
             group = self.group(expected['backend'])
             need((group / 'cgroup.freeze').read_text().strip() == '1'
@@ -481,11 +485,13 @@ class LinuxKernel:
                 need(os.readlink(payload / 'ns' / ns) == namespaces[ns],
                      'classic child namespace escape')
             status = dict(line.split(':', 1) for line in (payload / 'status').read_text().splitlines() if ':' in line)
-            # Check existing descendants too: init may have dropped a capability
-            # after spawning an already-more-privileged child.
-            forbidden = sum(1 << bit for bit in (21, 19, 22, 16, 17))
+            # No device creation/remount or capability mutation, including on
+            # exec: empty bounding/inheritable/ambient sets plus irrevocable NNP.
+            # All descendants inherit this restriction. A new user namespace
+            # cannot unlock inherited nodev mounts or create host device authority.
             for key in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'):
-                need(not int(status[key].strip(), 16) & forbidden, 'classic privileged capability escape')
+                need(int(status[key].strip(), 16) == 0, 'classic capability-free device policy required')
+            need(status.get('NoNewPrivs', '').strip() == '1', 'classic NoNewPrivs device policy required')
         provenance = container.get('mountProvenance')
         need(isinstance(provenance, dict)
              and set(provenance) == {'mounts', 'binds', 'volumesFrom', 'tmpfs', 'ipcMode', 'shmPath'}
@@ -501,7 +507,12 @@ class LinuxKernel:
         host_devices = {line.split()[2] for line in host_mounts}
         roots, procs, root_device = 0, 0, None
         targets = set()
-        for line in (proc / 'mountinfo').read_text().splitlines():
+        with (proc / 'mountinfo').open('rb') as source:
+            raw_mountinfo = source.read(1024 * 1024 + 1)
+        need(len(raw_mountinfo) <= 1024 * 1024, 'classic device mount inventory limit')
+        mountinfo = raw_mountinfo.decode('ascii')
+        need(len(mountinfo.splitlines()) <= 4096, 'classic device mount inventory limit')
+        for line in mountinfo.splitlines():
             fields = line.split(); split = fields.index('-')
             root, target, options, kind = fields[3], fields[4], fields[5].split(','), fields[split+1]
             need('\\' not in root+target, 'unsupported classic mount encoding')
@@ -534,6 +545,16 @@ class LinuxKernel:
                      'classic host mount escape')
             else:
                 need(False, 'classic host bind/volume activation unsupported')
+            # Enforceable no-device alternative to a recursive special-file
+            # allowlist/device-BPF decoder. VFS per-mount nodev denies char/block
+            # open for ANY st_rdev, even preexisting overlay files and private
+            # /dev nodes; st_dev does not establish that. No default-device
+            # exception (including /dev/null/pts). Check the mount options before
+            # '-', not merely superblock options. All aliases must satisfy it.
+            need('nodev' in options and 'dev' not in options,
+                 'classic effective nodev device policy required on every mount')
+            need(all(option == 'unbindable' for option in fields[6:split]),
+                 'classic device mount propagation unsupported')
         need(roots == 1, 'sealed classic root required')
         need(procs == 1, 'single read-only classic proc required')
         if 'classicActivation' in expected:
@@ -583,6 +604,19 @@ def docker_read(args):
     return result.stdout
 
 
+DEVICE_POLICY_KEYS = ('Devices', 'DeviceCgroupRules', 'DeviceRequests',
+                      'Privileged', 'CapAdd', 'CapDrop', 'SecurityOpt', 'Runtime')
+
+
+def device_policy(cfg):
+    # Preserve absent/null versus explicit empty declarations in accepted pins.
+    policy = copy.deepcopy({key: cfg.get(key) for key in DEVICE_POLICY_KEYS})
+    need(all(policy[key] is None or (type(policy[key]) is list and not policy[key])
+             for key in ('Devices', 'DeviceCgroupRules', 'DeviceRequests', 'CapAdd'))
+         and policy['Privileged'] is False, 'container device grants unsupported')
+    return policy
+
+
 def capture(kernel):
     ids = docker_read(['container', 'ls', '--all', '--quiet', '--no-trunc']).decode().split()
     need(5 <= len(ids) <= 6 and all(HEX64.fullmatch(x) for x in ids), 'unknown container count')
@@ -612,6 +646,7 @@ def capture(kernel):
         containers.append({'id': c['Id'], 'name': name, 'image': c['Image'], 'imageRef': c['Config']['Image'],
                            'cgroup': cg, 'init': init, 'project': project, 'service': service, 'startedAt': s['StartedAt'],
                            'restartCount': c['RestartCount'], 'restartPolicy': cfg['RestartPolicy'],
+                           'devicePolicy': device_policy(cfg),
                            'mountProvenance': copy.deepcopy({'mounts': c.get('Mounts'),
                                'binds': cfg.get('Binds'), 'volumesFrom': cfg.get('VolumesFrom'),
                                'tmpfs': cfg.get('Tmpfs'), 'ipcMode': cfg.get('IpcMode'),

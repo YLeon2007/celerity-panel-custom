@@ -64,6 +64,36 @@ Docker defaults:
   `/dev/shm`. **Even Docker-private shm is refused if its superblock is visible
   in the host inventory.** A namespace-private, non-host-visible tmpfs with
   matching stat and accepted no-bind/private-IPC provenance is the positive case.
+- Exact accepted inventory also pins `Devices`, `DeviceCgroupRules`,
+  `DeviceRequests`, `Privileged`, `CapAdd`, `CapDrop`, `SecurityOpt` and `Runtime`.
+  Device grants and added capabilities must be absent/null or explicitly empty
+  lists (not arbitrary falsey values); privileged mode must be false. Missing
+  `devicePolicy` in an old inventory refuses activation. These declarations are
+  **not** treated as proof of Docker's effective device-cgroup/BPF defaults.
+- The finite effective device policy is **no usable character/block devices**,
+  not Docker's usual default-device allowlist. Every mount in the payload's
+  current mount namespace, including the overlay root, private `/dev`, proc,
+  masked files and any allowed file mount, must expose the **per-mount `nodev`**
+  flag in actual `/proc/PID/mountinfo` (before `-`, not superblock options).
+  Mount inventory is bounded to 1 MiB / 4096 records and fails closed on excess
+  or read failure. Mounts must be private/unbindable: shared, slave/master and
+  propagation tags refuse, preventing later incoming device mounts.
+  This is an enforceable alternative to a recursive node scan or decoding
+  device-cgroup BPF: it denies opening every device `st_rdev`, including
+  preexisting nodes buried anywhere in the overlay or on a private tmpfs.
+  `st_dev` alone proves none of this. There are **no exceptions for `/dev/null`,
+  random devices or PTYs**; ordinary Docker `/dev` and overlay defaults refuse.
+- All five actual per-process capability sets (`CapInh`, `CapPrm`, `CapEff`,
+  `CapBnd`, `CapAmb`) must be zero and `NoNewPrivs` must be exactly 1. This
+  excludes `CAP_MKNOD`, `CAP_SYS_ADMIN`, `CAP_SETPCAP` and capability regain by
+  exec, UID changes or capset in the existing user namespace. NNP is inherited
+  and irreversible. A new subordinate user namespace cannot unlock inherited
+  `nodev` mounts; new superblocks owned by a noninitial user namespace are
+  kernel-marked `SB_I_NODEV`. No claim is made that subordinate namespaces can
+  never acquire their own namespace-local capability bits. Effective host
+  device access remains denied even if new nodes are subsequently introduced.
+  These capability/mount checks run before COMMIT, again before thaw, and in
+  postactivation verification; no policy is installed or repaired by the guard.
 - Before COMMIT, while the backend is acknowledged frozen, **every existing
   backend process must have exactly one task and zero descriptors** in both
   `fd` and `fdinfo`; root must be the accepted overlay root and cwd must be on
@@ -117,6 +147,19 @@ disposable proc/cgroup filesystem. An independent subprocess records execution
 after the actual `freeze=0` file write; timeout and SIGKILL preserve durable
 attempt/no-replay evidence without pretending the classic writer stayed frozen.
 Kernel scheduling, physical host facts, UID/root and SSH are **SIMULATED**.
+
+Kernel policy references: [`mount(2)` MS_NODEV/per-mount flags](https://man7.org/linux/man-pages/man2/mount.2.html),
+[`PR_SET_NO_NEW_PRIVS`](https://man7.org/linux/man-pages/man2/PR_SET_NO_NEW_PRIVS.2const.html),
+and Linux v6.12 `fs/namespace.c` (`lock_mnt_tree`, `can_change_locked_flags`),
+`fs/super.c` (`SB_I_NODEV` for noninitial user namespaces), `fs/namei.c`
+(`may_open_dev` and character/block open refusal). Retrieved source excerpts
+are retained as `device-fix-kernel-reference.txt` alongside the test evidence.
+Those references explain the alternative; local fixtures do not demonstrate
+physical device denial. Tests create only ordinary scratch files and simulate
+mount/capability/default-device facts. A constrained positive still reaches
+actual `Fence.activate_classic`, retains all other fences and permits ordinary
+file IO/new private runtime FDs/tasks. No device is created or opened, and no
+Docker command, root operation, install or live activation is exercised.
 
 `heldTestOwnerSettlement.test.js` exercises public generation-fenced transfers
 and exact all-five readbacks against isolated local MongoDB, including partial

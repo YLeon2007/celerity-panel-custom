@@ -28,13 +28,16 @@ class BoundedActivationTests(unittest.TestCase):
             (proc/'ns'/ns).symlink_to(ns+':[SIMULATED-CONTAINER]')
         (proc/'root/proc/1/ns').mkdir(parents=True)
         (proc/'root/proc/1/ns/pid').symlink_to('pid:[SIMULATED-CONTAINER]')
-        (proc/'status').write_text(''.join(k+': 0000000000000000\n' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')))
-        (proc/'mountinfo').write_text('1 0 0:1 / / rw - overlay overlay rw\n2 1 0:2 / /proc ro - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro - cgroup2 cgroup ro\n')
+        (proc/'status').write_text(''.join(k+': 0000000000000000\n' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))+'NoNewPrivs: 1\n')
+        (proc/'mountinfo').write_text('1 0 0:1 / / rw,nodev - overlay overlay rw\n2 1 0:2 / /proc ro,nodev - proc proc rw\n3 1 0:3 / /sys/fs/cgroup ro,nodev - cgroup2 cgroup ro\n')
         provenance = {'mounts': [], 'binds': None, 'volumesFrom': None,
             'tmpfs': None, 'ipcMode': 'private',
             'shmPath': '/var/lib/docker/containers/'+backend['id']+'/mounts/shm'}
         for inventory in (p['hostHold']['expected'], fence.original, fence.expected):
-            next(c for c in inventory['containers'] if c['cgroup'] == inventory['backend'])['mountProvenance'] = json.loads(json.dumps(provenance))
+            c = next(c for c in inventory['containers'] if c['cgroup'] == inventory['backend'])
+            c['mountProvenance'] = json.loads(json.dumps(provenance))
+            c['devicePolicy'] = {key: None for key in closure.f.DEVICE_POLICY_KEYS}
+            c['devicePolicy']['Privileged'] = False
         (kernel.proc/'1/mountinfo').write_text('10 0 8:1 / / rw - ext4 /dev/sda rw\n11 10 0:33 / /dev/shm rw - tmpfs shm rw\n')
         # Only superblock facts are SIMULATED; the production seam uses stat(2).
         kernel.mount_device = lambda path: '0:44' if path.name == 'shm' else '0:1'
@@ -43,6 +46,120 @@ class BoundedActivationTests(unittest.TestCase):
         (proc/'fdinfo').mkdir()
         (proc/'cwd').symlink_to(proc/'root', target_is_directory=True)
         return p,kernel,fence
+
+    def test_capture_rejects_device_grants_and_pins_exact_empty_policy(self):
+        import test_panel_host_freezer as ft
+        fixture = ft.CaptureTests(); fixture.setUp()
+        try:
+            row = next(c for c in fixture.rows if c['Name'] == '/hysteria-backend')
+            cfg = row['HostConfig']
+            for key, grant in (
+                ('Devices', [{'PathOnHost':'/dev/SIMULATED-host-block',
+                    'PathInContainer':'/dev/SIMULATED-host-block', 'CgroupPermissions':'rwm'}]),
+                ('DeviceCgroupRules', ['a *:* rwm']),
+                ('DeviceRequests', [{'Driver':'SIMULATED', 'Count':-1, 'Capabilities':[['gpu']]}]),
+            ):
+                cfg[key] = grant
+                with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, 'device'):
+                    fixture.f.m.capture(fixture.f.k)
+                cfg.pop(key)
+            for key in ('Devices','DeviceCgroupRules','DeviceRequests'):
+                for malformed in ('', False, 0, {}):
+                    cfg[key] = malformed
+                    with self.subTest(key=key, malformed=malformed), self.assertRaisesRegex(RuntimeError, 'device'):
+                        fixture.f.m.capture(fixture.f.k)
+                cfg.pop(key)
+            cfg.update(Devices=[], DeviceCgroupRules=None, DeviceRequests=[],
+                CapDrop=['ALL'], SecurityOpt=['no-new-privileges:true'], Runtime='runc')
+            captured = fixture.f.m.capture(fixture.f.k)
+            policy = next(c for c in captured['containers'] if c['id'] == row['Id']).get('devicePolicy')
+            self.assertEqual(policy, {key:cfg.get(key) for key in (
+                'Devices','DeviceCgroupRules','DeviceRequests','Privileged','CapAdd',
+                'CapDrop','SecurityOpt','Runtime')})
+            cfg['Devices'].append({'PathOnHost':'/changed'})
+            self.assertEqual(policy['Devices'], [])
+        finally:
+            fixture.doCleanups()
+
+    def test_effective_no_device_policy_refuses_before_commit_and_again_before_thaw(self):
+        faults = ('missing-policy', 'Devices', 'DeviceCgroupRules', 'DeviceRequests',
+                  'CapAdd', 'Privileged', 'root-dev', 'private-dev', 'proc-dev',
+                  'superblock-nodev-only', 'nnp-missing', 'nnp-zero', 'cap-setpcap',
+                  *('mknod-'+key for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')))
+        for fault in faults:
+            for boundary in ('prepare', 'activate'):
+                with self.subTest(fault=fault, boundary=boundary), tempfile.TemporaryDirectory(prefix='ih-device-') as root:
+                    _, kernel, fence = self.build(root)
+                    fence.close_candidate(fence.owner)
+                    backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                    proc = kernel.proc/str(backend['init']['pid'])
+                    # Same proof first succeeds, then mutate immediately before
+                    # the selected precommit/prethaw boundary. Never create nodes.
+                    kernel.assert_classic_activation_safe(fence.expected)
+                    if fault == 'missing-policy': del backend['devicePolicy']
+                    if fault in ('Devices','DeviceCgroupRules','DeviceRequests','CapAdd'):
+                        backend['devicePolicy'][fault] = ['SIMULATED-HOST-DEVICE-GRANT']
+                    if fault == 'Privileged': backend['devicePolicy']['Privileged'] = True
+                    mounts = proc/'mountinfo'
+                    if fault == 'root-dev': mounts.write_text(mounts.read_text().replace('/ / rw,nodev', '/ / rw'))
+                    if fault == 'proc-dev': mounts.write_text(mounts.read_text().replace('/proc ro,nodev', '/proc ro'))
+                    if fault == 'private-dev':
+                        mounts.write_text(mounts.read_text()+'4 1 0:44 / /dev rw - tmpfs tmpfs rw,nodev\n')
+                        kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else '0:1'
+                    if fault == 'superblock-nodev-only':
+                        mounts.write_text(mounts.read_text().replace('/ / rw,nodev - overlay overlay rw', '/ / rw - overlay overlay rw,nodev'))
+                    status = proc/'status'
+                    if fault.startswith('mknod-') or fault == 'cap-setpcap':
+                        key = fault[6:] if fault.startswith('mknod-') else 'CapPrm'
+                        bit = 27 if fault.startswith('mknod-') else 8
+                        status.write_text(status.read_text().replace(key+': 0000000000000000', key+': '+f'{1<<bit:016x}'))
+                    if fault == 'nnp-missing': status.write_text(status.read_text().replace('NoNewPrivs: 1\n',''))
+                    if fault == 'nnp-zero': status.write_text(status.read_text().replace('NoNewPrivs: 1','NoNewPrivs: 0'))
+                    before = list(kernel.calls)
+                    journal = fence.journal.path.joinpath('hold.json').read_bytes()
+                    with self.assertRaisesRegex(RuntimeError, 'device|capability|NoNewPrivs'):
+                        if boundary == 'prepare': kernel.assert_classic_activation_safe(fence.expected)
+                        else: fence.activate_classic(fence.owner, 'a'*64)
+                    self.assertEqual(kernel.calls, before)
+                    self.assertEqual(fence.journal.path.joinpath('hold.json').read_bytes(), journal)
+                    self.assertNotIn('classicActivation', fence.expected)
+                    self.assertEqual((kernel.group(kernel.candidate)/'cgroup.freeze').read_text(), '1')
+
+    def test_device_policy_cannot_gain_mounts_by_propagation_or_hide_inventory_overflow(self):
+        for fault in ('shared:99', 'master:99', 'propagate_from:99', 'mount-count', 'mount-bytes'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix='ih-device-mount-') as root:
+                _, kernel, fence = self.build(root)
+                backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+                mounts = kernel.proc/str(backend['init']['pid'])/'mountinfo'
+                if fault == 'mount-count': mounts.write_text(mounts.read_text()+'\n'*4096)
+                elif fault == 'mount-bytes': mounts.write_text(mounts.read_text()+' '*1024*1024)
+                else: mounts.write_text(mounts.read_text().replace('rw,nodev - overlay', 'rw,nodev '+fault+' - overlay'))
+                with self.assertRaisesRegex(RuntimeError, 'device.*(propagation|limit)'):
+                    kernel.assert_classic_activation_safe(fence.expected)
+
+    def test_nodev_policy_is_effective_for_entire_namespace_not_device_node_inventory(self):
+        with tempfile.TemporaryDirectory(prefix='ih-nodev-') as root:
+            _, kernel, fence = self.build(root)
+            fence.close_candidate(fence.owner)
+            backend = next(c for c in fence.expected['containers'] if c['cgroup'] == fence.expected['backend'])
+            proc = kernel.proc/str(backend['init']['pid'])
+            # Ordinary files only. A device's (simulated) st_rdev would be host
+            # 8:0 whether in private tmpfs or buried in overlay. nodev denies
+            # both without opening, lstat-scanning or trusting st_dev/st_rdev.
+            for relative in ('dev/host-block', 'deep/preexisting-host-block'):
+                node = proc/'root'/relative; node.parent.mkdir(parents=True, exist_ok=True)
+                node.write_text('SIMULATED block st_rdev=8:0; ordinary scratch file')
+            mounts = proc/'mountinfo'
+            mounts.write_text(mounts.read_text()+'4 1 0:44 / /dev rw,nodev - tmpfs tmpfs rw\n')
+            kernel.mount_device = lambda path: '0:44' if path.name == 'dev' else '0:1'
+            kernel.assert_classic_activation_safe(fence.expected)
+            result = fence.activate_classic(fence.owner, 'a'*64)
+            self.assertEqual(result['code'], 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED')
+            # A legitimate new runtime FD/task must not fail the entry-only gate.
+            (proc/'fd/9').symlink_to(proc/'root/deep/preexisting-host-block')
+            (proc/'task/9999').mkdir()
+            (proc/'root/ordinary-output').write_text('useful regular-file IO remains supported')
+            kernel.assert_classic_activation_safe(fence.expected)
 
     def test_retained_host_descriptor_or_unchecked_task_refuses_without_touching_fd(self):
         for fault in ('host-fd', 'host-fd-child', 'socket', 'anon-inode', 'fdinfo-only',
@@ -487,7 +604,7 @@ class RootGuardActivationTests(unittest.TestCase):
         self.exercise_guard()
 
     def test_actual_prepare_classic_refuses_kernel_faults_before_commit_exists(self):
-        for fault in ('proc-control', 'host-shm', 'host-fd'):
+        for fault in ('proc-control', 'host-shm', 'host-fd', 'device-grant', 'device-mknod', 'device-nodev', 'device-nnp'):
             with self.subTest(fault=fault):
                 self.exercise_guard(fault)
 
@@ -519,6 +636,16 @@ class RootGuardActivationTests(unittest.TestCase):
                 self.addCleanup(os.close,descriptor)
                 (proc/'fd/9').symlink_to(target)
                 (proc/'fdinfo/9').write_text('flags:\t0100001\nmnt_id:\t999\n')
+            if fault == 'device-grant': backend['devicePolicy']['DeviceCgroupRules'] = ['a *:* rwm']
+            if fault == 'device-mknod':
+                status = proc/'status'
+                status.write_text(status.read_text().replace('CapBnd: 0000000000000000', 'CapBnd: 0000000008000000'))
+            if fault == 'device-nnp':
+                status = proc/'status'
+                status.write_text(status.read_text().replace('NoNewPrivs: 1', 'NoNewPrivs: 0'))
+            if fault == 'device-nodev':
+                mounts = proc/'mountinfo'
+                mounts.write_text(mounts.read_text().replace('/ / rw,nodev', '/ / rw'))
             kernel.journal_path=Path(root)/'host/hold.json'
             m.atomic_json(root,'guard.json',{'fixture':True})
             readfd,writefd=os.pipe()
@@ -549,7 +676,7 @@ class RootGuardActivationTests(unittest.TestCase):
                             s.check_hold(p,root,m,command='prepare-classic')
                         child.join(5)
                         self.assertFalse(child.is_alive()); self.assertEqual(child.exitcode,0)
-                        self.assertRegex((Path(root)/'kernel-refusal').read_text(), 'proc|host-backed|descriptor')
+                        self.assertRegex((Path(root)/'kernel-refusal').read_text(), 'proc|host-backed|descriptor|device')
                         self.assertFalse((Path(root)/'handoff-commit.json').exists())
                         self.assertEqual(json.loads(kernel.journal_path.read_bytes())['phase'],'unknown')
                         for group in [*p['hostHold']['expected']['freezeOrder'],kernel.candidate]:
