@@ -234,7 +234,8 @@ finally:
         from contextlib import contextmanager, redirect_stdout
         from io import StringIO
         from types import SimpleNamespace
-        for phase in ('completed', 'committed-primary', 'commit-unknown', 'precommit-primary', 'output-failed'):
+        for phase in ('completed', 'committed-primary', 'commit-unknown', 'precommit-primary', 'output-failed',
+                      'listener-and-lock', 'prelistener-primary'):
             with self.subTest(phase=phase):
                 c = ct.load_c()
                 with it.combined_fixture(c) as f:
@@ -247,6 +248,16 @@ finally:
                     f.fs.atomic(c.LOCK, b'', new=True)
                     path = str(f.root / 'lock.sock')
                     primary = RuntimeError('SIMULATED primary phase acknowledgement loss')
+                    secondary = OSError(errno.EIO, 'SIMULATED outer lock close acknowledgement EIO')
+                    atomic, socket_close = f.fs.atomic, socket.socket.close
+                    def early_fault(name, *args, **kwargs):
+                        if phase == 'prelistener-primary' and name == c.KNOWN: raise primary
+                        return atomic(name, *args, **kwargs)
+                    def listener_fault(sock):
+                        try: wanted = sock.getsockname() == path
+                        except OSError: wanted = False
+                        socket_close(sock)  # Real listener disposal before lost acknowledgement.
+                        if wanted and phase == 'listener-and-lock': raise primary
                     instances, target, disposed = [], [None], []
                     base = c.Coordinator
                     class LocalCoordinator(base):
@@ -277,11 +288,11 @@ finally:
                             target[0] = fd
                             yield fd
                     def eio(fd):
-                        wanted = phase != 'output-failed' and not disposed and fd == target[0] and bool(instances)
+                        wanted = phase != 'output-failed' and not disposed and fd == target[0]
                         close(fd)  # Real exact outer lock descriptor is closed, then acknowledgement is lost.
                         if wanted:
                             disposed.append(fd)
-                            raise OSError(errno.EIO, 'SIMULATED outer lock close acknowledgement EIO')
+                            raise secondary
                     class BrokenOutput(StringIO):
                         def write(self, text):
                             raise BrokenPipeError(errno.EPIPE, 'SIMULATED final result output loss')
@@ -297,18 +308,21 @@ finally:
                          patch.object(c.os, 'geteuid', return_value=0), \
                          patch.object(c.sys, 'argv', ['SIMULATED-coordinator', 'restore']), \
                          patch.object(c.signal, 'signal'), patch.object(c.signal, 'alarm'), \
+                         patch.object(f.fs, 'atomic', early_fault), patch.object(socket.socket, 'close', listener_fault), \
                          patch.object(os, 'close', eio), redirect_stdout(output):
                         with self.assertRaises(BaseException) as failed: c.main()
-                    expected = ('COORDINATED_RESTORE_UNKNOWN_RETAINED' if phase == 'precommit-primary' else
+                    expected = ('COORDINATED_RESTORE_UNKNOWN_RETAINED' if phase in ('precommit-primary', 'prelistener-primary') else
                                 'COMMIT_UNKNOWN_NO_ACTIVATION' if phase == 'commit-unknown' else
                                 'COMMITTED_ACTIVATION_UNKNOWN')
                     self.assertEqual(getattr(failed.exception, 'code', None), expected)
-                    if phase not in ('completed', 'output-failed'): self.assertIs(failed.exception, primary)
+                    if phase not in ('completed', 'output-failed'):
+                        self.assertIs(failed.exception, primary)
+                        self.assertIn(secondary, failed.exception.cleanup_errors)
                     self.assertTrue(getattr(failed.exception, 'cleanup_errors', ()))
                     self.assertEqual(len(disposed), 0 if phase == 'output-failed' else 1)
                     self.assertEqual(output.getvalue(), '', 'no success JSON before outer lock disposal')
                     self.assertTrue(all(p.poll() is not None for p in f.children))
-                    if phase != 'precommit-primary': self.assertFalse(f.fs.absent(c.COMMIT))
+                    if phase not in ('precommit-primary', 'prelistener-primary'): self.assertFalse(f.fs.absent(c.COMMIT))
                     if phase == 'commit-unknown': self.assertTrue(f.fs.absent(c.ACTIVATION))
 
     def test_real_process_disposal_is_bounded_through_terminate_wait_and_kill_errors(self):

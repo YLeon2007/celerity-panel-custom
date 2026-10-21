@@ -836,29 +836,36 @@ def main():
     primary = None
     try:
         with fs.lock(LOCK):
-            need(fs.absent(KNOWN) and fs.absent(KNOWN + '.next') and fs.absent(SOCKET), 'STALE_COORDINATOR_RETAINED')
-            known = ''.join('[' + p['identity']['endpointIp'] + ']:2222 ssh-ed25519 ' + p['hostKey'] + '\n' for p in config['nodes'].values())
-            fs.atomic(KNOWN, known.encode(), new=True)
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                listener.bind(SOCKET); os.chmod(SOCKET, 0o600); listener.listen(1)
-                def spawn(node):
-                    need(sha(fs.read(KEY)[0]) == config['keySha256'] and fs.read(KNOWN)[0] == known.encode())
-                    local_origin(config)
-                    return subprocess.Popen(ssh_argv(config, node), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                            stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
-                held = Coordinator(config, fs, spawn, origin=origin)
-                with held.restore_scope():
-                    held.serve_owner(listener)
+                need(fs.absent(KNOWN) and fs.absent(KNOWN + '.next') and fs.absent(SOCKET), 'STALE_COORDINATOR_RETAINED')
+                known = ''.join('[' + p['identity']['endpointIp'] + ']:2222 ssh-ed25519 ' + p['hostKey'] + '\n' for p in config['nodes'].values())
+                fs.atomic(KNOWN, known.encode(), new=True)
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    listener.bind(SOCKET); os.chmod(SOCKET, 0o600); listener.listen(1)
+                    def spawn(node):
+                        need(sha(fs.read(KEY)[0]) == config['keySha256'] and fs.read(KNOWN)[0] == known.encode())
+                        local_origin(config)
+                        return subprocess.Popen(ssh_argv(config, node), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                stderr=subprocess.DEVNULL, env=CLEAN_ENV, bufsize=0)
+                    held = Coordinator(config, fs, spawn, origin=origin)
+                    with held.restore_scope():
+                        held.serve_owner(listener)
+                except BaseException as error:
+                    primary = error
+                    error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+                    raise
+                finally:
+                    code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+                    dispose_socket(listener, code, primary)
+                    # Leave socket/known/intents as sticky reconciliation state.
+                    # Never unlink unknown paths or reopen admission during cleanup.
             except BaseException as error:
-                primary = error
-                error.code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
+                # Latch the entire region, including setup and listener finally,
+                # before outer lock teardown can replace its first failure.
+                if primary is None:
+                    primary = error
                 raise
-            finally:
-                code = held.failure_code() if held is not None else 'COORDINATED_RESTORE_UNKNOWN_RETAINED'
-                dispose_socket(listener, code, primary)
-                # Leave socket/known/intents as sticky reconciliation state.
-                # Never unlink unknown paths or reopen admission during cleanup.
         # Success is observable only after required outer lock teardown/readback.
         # Flush inside the classifier: a broken result pipe is postcommit unknown.
         print(json.dumps({'code': 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED' if held is not None and held.handoff_completed else
