@@ -181,7 +181,24 @@ async function sameHeldFreshFixture(fault = '') {
 
 test('fresh same-held JS/Python/FreshLaunch actual exec follows public five-owner Mongo CAS/readbacks', {timeout:90000}, async () => {
     const f = await sameHeldFreshFixture();
+    let handbackCommits = 0;
+    const monitor = event => {
+        if (event.commandName === 'findAndModify' && event.command.findAndModify === m.Owner.collection.name &&
+            event.command.update?.$set?.handbackReceipt) handbackCommits++;
+    };
+    db.getClient().on('commandStarted', monitor);
     try {
+        // The real accepted generation must survive longer than the unchanged
+        // ordinary five-second accept window while public settlement is pending.
+        const stopped = async () => {
+            const {pid, start} = f.meta.preparedSupervisor;
+            const fields = (await fsp.readFile(`/proc/${pid}/stat`, 'utf8')).split(') ').slice(1).join(') ').trim().split(/\s+/);
+            assert.equal(fields[0], 'T'); assert.equal(fields[19], start);
+        };
+        await stopped();
+        await new Promise(resolve => setTimeout(resolve, 6100));
+        await stopped();
+        assert.equal(handbackCommits, 0);
         let opens = 0;
         const service = new api.HeldTestOwnerSettlement({ withRestorationScope:work => { opens++; return f.authority(work); }, models:m, journal:f.journal });
         const result = await service.freshHandback(f.plan);
@@ -196,7 +213,8 @@ test('fresh same-held JS/Python/FreshLaunch actual exec follows public five-owne
         }
         await assert.rejects(service.freshHandback(f.plan));
         assert.equal(opens,1,'terminal fresh service must not reopen a restoration channel');
-    } finally { await f.close(); }
+        assert.equal(handbackCommits,5,'exactly one durable handback CAS per owner');
+    } finally { db.getClient().off('commandStarted',monitor); await f.close(); }
 });
 
 test('fresh terminal ack loss, timeout and required cleanup remain unknown with exactly one actual exec', {timeout:180000}, async t => {

@@ -7,7 +7,7 @@ import sys
 
 import coordinated_restore as c
 import fresh_classic_launch as fresh
-from test_fresh_classic_launch import launch_fixture
+from test_prepared_resume import prepared_fixture as launch_fixture
 
 BRIDGE_CODE = '''import os,sys
 from pathlib import Path
@@ -53,6 +53,7 @@ def main():
         sock = f.outer.root/'o.sock'
         listener = socket.socket(socket.AF_UNIX); listener.bind(str(sock)); listener.listen(1)
         print(json.dumps({'root':str(f.outer.root), 'socket':str(sock), 'pins':prepare(f),
+                          'preparedSupervisor':{'pid':f.supervisor.pid,'start':fresh.start(f.supervisor.pid)},
                           'proof':f.proof, 'port':f.port}), flush=True)
         if fault.startswith('guardloss:'):
             node = next(n for n in f.fixtures if n.node == fault.split(':', 1)[1])
