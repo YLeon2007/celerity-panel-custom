@@ -11,12 +11,6 @@ const logger = require('./src/utils/logger');
 const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('./src/modules/l2tpRuntimeLifecycleHook');
 const l2tpRootLifecycle = createL2tpRootLifecycle();
 const HyUser = require('./src/models/hyUserModel');
-if (classicSettings) {
-    // Start the longest independent index chains first when Mongo opens;
-    // otherwise these late catalog entries determine the cold-start tail.
-    require('./src/modules/relay-l2tp/models/topologyExecutionEnrollmentModel');
-    require('./src/modules/relay-l2tp/models/topologyExecutionBindingModel');
-}
 const HyNode = require('./src/models/hyNodeModel');
 
 // Start the existing automatic schema work before the remaining synchronous
@@ -48,10 +42,6 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 minPoolSize: 2,
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
-                // Cold schema startup immediately fills the existing ten-slot
-                // pool. Do not serialize its connection handshakes in pairs
-                // while synchronous route compilation occupies the event loop.
-                ...(classicSettings ? { maxConnecting: 10 } : {}),
                 ...productionSchemaConnectionOptions(process.env),
             });
             return;
