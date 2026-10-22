@@ -26,6 +26,43 @@ HERE = Path(__file__).resolve().parent
 
 
 @contextlib.contextmanager
+def trace_replay(root):
+    """Observe only the two real operations, never profile every Python call.
+
+    The prior global profiler charged every path/hash/hold checkpoint against
+    the unchanged finite protocol deadlines. Scoped forwarding wrappers retain
+    the same LISTEN and sendmsg witnesses, including the actual SCM_RIGHTS call.
+    They neither replace an effect nor change any result, exception or deadline.
+    """
+    import json
+    real_load = c.load_fresh
+    real_sendmsg = socket.socket.sendmsg
+
+    def record(event, value=None):
+        with (root/'controller.jsonl').open('a') as out:
+            out.write(json.dumps({'event': event, 'value': value, 'at': time.monotonic()})+'\n')
+
+    with contextlib.ExitStack() as stack:
+        def load(*args, **kwargs):
+            module = real_load(*args, **kwargs)
+            real_listening = module.FreshLaunch._control_listening
+            def listening(self, *a, **kw):
+                result = real_listening(self, *a, **kw)
+                record('_control_listening', result)
+                return result
+            stack.enter_context(patch.object(module.FreshLaunch, '_control_listening', listening))
+            return module
+
+        def sendmsg(self, *args, **kwargs):
+            record('sendmsg')
+            return real_sendmsg(self, *args, **kwargs)
+
+        stack.enter_context(patch.object(c, 'load_fresh', load))
+        stack.enter_context(patch.object(socket.socket, 'sendmsg', sendmsg))
+        yield
+
+
+@contextlib.contextmanager
 def stopped_listener(delay=.12, fault=''):
     with tempfile.TemporaryDirectory(prefix='pr-') as temp:
         root = Path(temp)
@@ -319,19 +356,12 @@ m.supervise(listener,Paused(bootstrap['files']),Simulated(),fault=sys.argv[4] or
             f.count=lambda:len((root/'executions').read_text().splitlines()) if (root/'executions').exists() else 0
             if replay is not None:
                 f.count=lambda:len((root/'spawns.jsonl').read_text().splitlines()) if (root/'spawns.jsonl').exists() else 0
-                def trace(frame,event,arg):
-                    name=frame.f_code.co_name
-                    if event=='return' and name=='_control_listening' or event=='c_call' and getattr(arg,'__name__','')=='sendmsg':
-                        with (root/'controller.jsonl').open('a') as out:
-                            out.write(json.dumps({'event':name if event=='return' else 'sendmsg','value':arg if event=='return' else None,'at':time.monotonic()})+'\n')
                 real_send=signal.pidfd_send_signal
                 def send(fd,sig,*args):
                     with (root/'signals.jsonl').open('a') as out: out.write(json.dumps({'signal':sig,'at':time.monotonic()})+'\n')
                     return real_send(fd,sig,*args)
-                prior=sys.getprofile(); sys.setprofile(trace)
-                try:
-                    with patch.object(signal,'pidfd_send_signal',side_effect=send): yield f
-                finally: sys.setprofile(prior)
+                with trace_replay(root), patch.object(signal,'pidfd_send_signal',side_effect=send):
+                    yield f
             else: yield f
         finally:
             if scope is not None and held is not None:
