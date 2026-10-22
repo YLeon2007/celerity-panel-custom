@@ -5,8 +5,71 @@
 
 // Validate opt-in file settings before importing application dependencies/timers.
 const classicSettings = require('./src/classicSettings');
-const express = require('express');
 const mongoose = require('mongoose');
+const config = require('./config');
+const logger = require('./src/utils/logger');
+const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('./src/modules/l2tpRuntimeLifecycleHook');
+const l2tpRootLifecycle = createL2tpRootLifecycle();
+const HyUser = require('./src/models/hyUserModel');
+const HyNode = require('./src/models/hyNodeModel');
+
+// Start the existing automatic schema work before the remaining synchronous
+// route/service imports. Cold Mongo DDL and module compilation are independent;
+// HTTP still waits for the same complete readiness/migration/runtime barriers.
+if (classicSettings) {
+    require('./src/modules/relay-l2tp').registerModels();
+    // Compile the complete ordinary schema catalog before opening Mongo. This
+    // lets automatic DDL progress during route assembly instead of admitting
+    // late model/index work after the long synchronous dependency imports.
+    for (const model of ['settingsModel', 'serverGroupModel', 'statsSnapshotModel',
+        'userDeviceModel', 'cascadeLinkModel', 'uaSnapshotModel', 'adminModel', 'apiKeyModel']) {
+        require(`./src/models/${model}`);
+    }
+}
+let bootstrapSignal;
+const stopBootstrap = signal => { bootstrapSignal ||= signal; };
+const bootstrapSignalHandlers = new Map(['SIGTERM', 'SIGINT'].map(signal => {
+    const handler = () => stopBootstrap(signal);
+    process.on(signal, handler);
+    return [signal, handler];
+}));
+
+async function connectMongo(retries = 5, delayMs = 3000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await mongoose.connect(config.MONGO_URI, {
+                maxPoolSize: 10,
+                minPoolSize: 2,
+                serverSelectionTimeoutMS: 10000,
+                socketTimeoutMS: 45000,
+                ...productionSchemaConnectionOptions(process.env),
+            });
+            return;
+        } catch (err) {
+            if (attempt === retries) throw err;
+            logger.warn(`[MongoDB] Connection attempt ${attempt}/${retries} failed: ${err.message}. Retrying in ${delayMs / 1000}s...`);
+            await new Promise(r => setTimeout(r, delayMs));
+            delayMs = Math.min(delayMs * 2, 30000);
+        }
+    }
+}
+
+async function assembleApplication() {
+const databaseReady = classicSettings ? connectMongo() : null;
+if (databaseReady) {
+    await databaseReady;
+    // Give admitted automatic initialization an I/O turn before compiling
+    // the route graph. Ordinary environment-based startup is unchanged.
+    await new Promise(resolve => setImmediate(resolve));
+}
+if (bootstrapSignal) {
+    await Promise.allSettled(Object.values(mongoose.models).map(model => model.init()));
+    await l2tpRootLifecycle.stop();
+    await mongoose.disconnect();
+    for (const [signal, handler] of bootstrapSignalHandlers) process.off(signal, handler);
+    return;
+}
+const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
@@ -17,53 +80,41 @@ const path = require('path');
 const fs = require('fs');
 const { WebSocketServer } = require('ws');
 
-const config = require('./config');
-const logger = require('./src/utils/logger');
 const requireAuth = require('./src/middleware/auth');
 const { requireScope } = requireAuth;
 const { i18nMiddleware, LANGUAGE_OPTIONS, normalizeLanguage } = require('./src/middleware/i18n');
 const { countRequest } = require('./src/middleware/rpsCounter');
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const syncService = require('./src/services/syncService');
 const sshPool = require('./src/services/sshPoolService');
 const expireScheduler = require('./src/services/expireScheduler');
 const cacheService = require('./src/services/cacheService');
 const statsService = require('./src/services/statsService');
-const HyUser = require('./src/models/hyUserModel');
-const HyNode = require('./src/models/hyNodeModel');
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const backupService = require('./src/services/backupService');
 const homepageService = require('./src/services/homepageService');
-const { createL2tpRootLifecycle, productionSchemaConnectionOptions } = require('./src/modules/l2tpRuntimeLifecycleHook');
-
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const usersRoutes = require('./src/routes/users');
 const nodesRoutes = require('./src/routes/nodes');
 const cascadeRoutes = require('./src/routes/cascade');
 const cascadeRouteGroupsRoutes = require('./src/routes/cascadeRouteGroups');
 const topologyTransferDraftsRoutes = require('./src/routes/topologyTransferDrafts');
 const cascadeTopologyDeployRoutes = require('./src/routes/cascadeTopologyDeploy');
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const groupsRoutes = require('./src/routes/groups');
 const subscriptionRoutes = require('./src/routes/subscription');
 const authRoutes = require('./src/routes/auth');
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const panelRoutes = require('./src/routes/panel');
 const mcpRoutes = require('./src/routes/mcp');
 const marzbanCompat = require('./src/routes/marzbanCompat');
 const { subscriptionLimiter, authLimiter, applyRateLimits } = require('./src/utils/rateLimiters');
 const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 
+if (databaseReady) await new Promise(resolve => setImmediate(resolve));
 const helmet = require('helmet');
 const app = express();
 let classicStartupComplete = false;
-const l2tpRootLifecycle = createL2tpRootLifecycle(classicSettings ? {
-    // The fixed classic launch owns all schema readiness before HTTP admission.
-    // Suppress automatic per-index commands, not required indexes: prove the
-    // entire imported classic + topology catalog with complete per-collection DDL.
-    ensureModelIndexes: () => require('./src/modules/l2tpModelIndexReadiness').ensureL2tpModelIndexes({
-        batchIndexes: true,
-        loadModels: () => {
-            require('./src/modules/relay-l2tp').registerModels();
-            return mongoose.models;
-        },
-    }),
-} : undefined);
 
 app.set('trust proxy', 1);
 
@@ -523,30 +574,9 @@ app.use((err, req, res, next) => {
 
 // ==================== START SERVER ====================
 
-async function connectMongo(retries = 5, delayMs = 3000) {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            await mongoose.connect(config.MONGO_URI, {
-                maxPoolSize: 10,
-                minPoolSize: 2,
-                serverSelectionTimeoutMS: 10000,
-                socketTimeoutMS: 45000,
-                ...(classicSettings ? { autoIndex: false, autoCreate: false } : {}),
-                ...productionSchemaConnectionOptions(process.env),
-            });
-            return;
-        } catch (err) {
-            if (attempt === retries) throw err;
-            logger.warn(`[MongoDB] Connection attempt ${attempt}/${retries} failed: ${err.message}. Retrying in ${delayMs / 1000}s...`);
-            await new Promise(r => setTimeout(r, delayMs));
-            delayMs = Math.min(delayMs * 2, 30000);
-        }
-    }
-}
-
 async function startServer() {
     try {
-        await connectMongo();
+        await (databaseReady || connectMongo());
         if (shutdownPromise !== undefined) return;
         logger.info('[MongoDB] Connected');
 
@@ -1278,6 +1308,7 @@ function shutdown(signal) {
     return shutdownPromise;
 }
 
+for (const [signal, handler] of bootstrapSignalHandlers) process.off(signal, handler);
 for (const sig of ['SIGTERM', 'SIGINT']) {
     // Repeated signals join the same bounded drain rather than bypassing it.
     process.on(sig, () => { shutdown(sig); });
@@ -1292,4 +1323,13 @@ process.on('uncaughtException', (err) => {
     shutdown('uncaughtException').catch(() => process.exit(1));
 });
 
-startServer();
+if (bootstrapSignal) await shutdown(bootstrapSignal);
+else await startServer();
+}
+
+assembleApplication().catch(async error => {
+    logger.error('[Server] Application assembly failed:', error);
+    await l2tpRootLifecycle.stop().catch(() => {});
+    await mongoose.disconnect().catch(() => {});
+    process.exit(1);
+});

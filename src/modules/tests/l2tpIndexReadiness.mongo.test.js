@@ -88,27 +88,6 @@ test('real Mongo: all 15 public model schemas automatically build each of 27 req
     assert.equal(commands.slice(before).filter(c => c.name === 'listIndexes').length, 15);
 }));
 
-test('real Mongo: explicit batched startup submits each complete public schema once and proves all metadata', async () => isolated(async (db, commands) => {
-    const source = require('../relay-l2tp').registerModels();
-    const models = Object.fromEntries(Object.entries(source).map(([name, m]) => {
-        const schema = m.schema.clone(); schema.set('autoCreate', false); schema.set('autoIndex', false);
-        return [name, db.model(name, schema)];
-    }));
-    await ensureL2tpModelIndexes({ loadModels: () => models, batchIndexes: true });
-    const builds = commands.filter(c => c.name === 'createIndexes');
-    assert.equal(builds.length, Object.values(models).filter(m => m.schema.indexes().length).length,
-        'one command per indexed collection, not one command per individual index');
-    assert.equal(builds.reduce((n, c) => n + c.command.indexes.length, 0), 27);
-    assert.equal(commands.filter(c => c.name === 'create').length,
-        Object.values(models).filter(m => m.schema.indexes().length === 0).length,
-        'new ordinary indexed namespaces are created atomically with their full index set');
-    for (const m of Object.values(models)) prove(m, await m.collection.indexes());
-    const before = commands.length;
-    await ensureL2tpModelIndexes({ loadModels: () => models, batchIndexes: true });
-    assert.equal(commands.slice(before).filter(c => ['create', 'createIndexes'].includes(c.name)).length, 0);
-    assert.equal(commands.slice(before).filter(c => c.name === 'listIndexes').length, 15);
-}));
-
 test('real Mongo: disabled automatic flags still build and prove all 15 public schemas and 27 indexes', async () => isolated(async (db, commands) => {
     const source = require('../relay-l2tp').registerModels();
     const models = Object.fromEntries(Object.entries(source).map(([name, m]) => {

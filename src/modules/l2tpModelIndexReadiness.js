@@ -16,7 +16,6 @@ function matchesIndex(actual, key, options) {
 // flags: HTTP queue admission also requires database uniqueness to be ready.
 async function ensureL2tpModelIndexes({
     loadModels = () => require('./relay-l2tp').registerModels(),
-    batchIndexes = false,
 } = {}) {
     const entries = Object.entries(loadModels());
     // Independent collections can progress together without unbounded DDL fan-out.
@@ -24,11 +23,6 @@ async function ensureL2tpModelIndexes({
         // allSettled is also a shutdown barrier: an early rejection must not
         // leave an admitted collection/index build running after startup fails.
         const results = await Promise.allSettled(entries.slice(offset, offset + 2).map(async ([modelName, model]) => {
-            // Batched DDL must be selected before connection/model initialization,
-            // never race an automatic per-index build or mask its failure.
-            if (batchIndexes && (model.schema.options.autoIndex ?? model.db?.config.autoIndex) !== false) {
-                throw new Error(`L2TP batched index startup requires disabled autoIndex for ${modelName}`);
-            }
             // Public, memoized init joins Mongoose's already-started automatic DDL.
             // Its rejection is authoritative: never mask a failed automatic build.
             await model.init();
@@ -56,25 +50,8 @@ async function ensureL2tpModelIndexes({
             // autoCreate/autoIndex may be disabled, or required indexes missing.
             // Add all declared indexes and prove the complete metadata again.
             // Do not syncIndexes(): readiness must never drop an operator's indexes.
-            const options = model.schema.options || {};
-            const needsCollectionOptions = ['collectionOptions', 'collation', 'capped', 'timeseries', 'clusteredIndex']
-                .some(key => options[key] != null && options[key] !== false);
-            // Mongo creates an absent ordinary namespace and its complete index
-            // set in one command. Avoid separate empty-collection index-build
-            // coordinators; preserve special collection options and model hooks.
-            if (!batchIndexes || (!actual && (!required.length || needsCollectionOptions
-                || model.hooks?.hasHooks('createCollection')))) await model.createCollection();
-            if (batchIndexes) {
-                // One Mongo build per collection retains every declared spec,
-                // rather than serializing a build/commit for each individual index.
-                const specifications = required.map(([key, options]) => ({
-                    ...(model.schema.options.collation ? { collation: model.schema.options.collation } : {}),
-                    ...options, key,
-                }));
-                if (specifications.length) await model.collection.createIndexes(specifications);
-            } else {
-                await model.createIndexes();
-            }
+            await model.createCollection();
+            await model.createIndexes();
             const error = refusal(await model.collection.indexes());
             if (error) throw error;
         }));
