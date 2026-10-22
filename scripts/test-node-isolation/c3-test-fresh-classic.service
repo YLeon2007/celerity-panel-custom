@@ -1,0 +1,17 @@
+[Unit]
+Description=Fixed TEST fresh classic preparer (independent acceptance required)
+Requires=c3-test-fresh-prepare-watch.service
+After=c3-test-fresh-prepare-watch.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-physical-exec.py
+Restart=no
+KillMode=process
+RestartForceExitStatus=
+UMask=0077
+LimitCORE=0
+TimeoutStopSec=5
+PrivateMounts=no

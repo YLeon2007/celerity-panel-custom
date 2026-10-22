@@ -59,6 +59,9 @@ PYTHON_SOURCES = {
     'coordinated_capture.py': 'c3-test-coordinated-capture.py',
     'fresh_classic_launch.py': 'c3-test-fresh-classic.py',
     'prepare_fresh_supervisor.py': 'c3-test-fresh-prepare.py',
+    'fresh_physical.py': 'c3-test-fresh-physical.py',
+    'fresh_physical_exec.py': 'c3-test-fresh-physical-exec.py',
+    'fresh_physical_watch.py': 'c3-test-fresh-physical-watch.py',
     'fresh_owner_restoration_channel.py': 'c3-test-fresh-owner-restoration-channel.py',
     'owner_restoration_channel.py': 'c3-test-owner-restoration-channel.py',
     'node_originals.py': 'c3-test-node-originals.py',
@@ -93,6 +96,17 @@ HOST_SOURCES.update({
     'src/modules/relay-l2tp/node-artifacts/topology/runner.sh': '/usr/local/bin/celerity-topology-node-runner',
     'src/modules/relay-l2tp/node-artifacts/l2tp/verify-users.sh': '/usr/local/lib/celerity/relay-l2tp/verify-users.sh',
 })
+HOST_SOURCES.update({PREFIX + name: '/etc/systemd/system/' + name for name in
+                     ('c3-test-fresh-classic.service', 'c3-test-fresh-prepare-watch.service')})
+# New constructor closure is byte-pinned independently of the unchanged old BASE.
+# These are reviewed SOURCE pins only, never accepted installed/physical pins.
+PHYSICAL_SOURCE_PINS = {
+    'scripts/test-node-isolation/fresh_physical.py': '5a568eaa6ec890f937ca800a71e2747b2c9bc5c67d6ffed98f2abeed7f8f7405',
+    'scripts/test-node-isolation/fresh_physical_exec.py': 'f0afc496fc9ff7bda4b4649d4053cf636d8a2d288b7f61eca128d26d47d88179',
+    'scripts/test-node-isolation/fresh_physical_watch.py': '463fb63c9ce8715e5343770fa9d939dec545be637b1dbf2dd2844086106820c0',
+    'scripts/test-node-isolation/c3-test-fresh-classic.service': '03009f943c76e1675c7f2488962c9a223c9ba0901d302fa11fc4873f63812c6d',
+    'scripts/test-node-isolation/c3-test-fresh-prepare-watch.service': '97b16b9583f7da3a59ae0569e05006384a07aaa7bac6973c43052350505e92f7',
+}
 HOST_SOURCES.update({source: OWNER_ROOT + source for source in (*JS_SOURCES, 'package.json', 'package-lock.json')})
 SUPERVISORS = {'/usr/local/libexec/' + PYTHON_SOURCES[n]: PREFIX + n for n in
                ('coordinated_restore.py', 'fresh_classic_launch.py', 'prepare_fresh_supervisor.py')}
@@ -275,7 +289,10 @@ def committed(repo, revision, relative):
 
 def source_bytes(repo, repo_fd, head, relative):
     raw, mode = committed(repo, head, relative)
-    need(raw == committed(repo, BASE, relative)[0], 'BASE_SOURCE_DRIFT')
+    if relative in PHYSICAL_SOURCE_PINS:
+        need(sha(raw) == PHYSICAL_SOURCE_PINS[relative], 'PHYSICAL_SOURCE_DRIFT')
+    else:
+        need(raw == committed(repo, BASE, relative)[0], 'BASE_SOURCE_DRIFT')
     actual, info = read_file(repo_fd, relative, worktree=True)
     need(actual == raw and bool(info.st_mode & 0o111) == bool(mode & 0o111), 'SOURCE_WORKTREE_DRIFT')
     return raw
@@ -451,7 +468,8 @@ def build(repo, candidate, output):
             installed = HOST_SOURCES[source]
             target = 'host-source' + installed
             write_file(stage_fd, target, raw)
-            mode = 0o750 if installed.startswith('/usr/') else 0o640
+            mode = (0o750 if installed.startswith('/usr/') else
+                    0o644 if installed.startswith('/etc/systemd/system/') else 0o640)
             host_intents[source] = intent(target, installed, sha(raw), mode)
         dependency_intents = {}
         for relative, mode in sorted(directory_modes(root_snapshot).items()):
@@ -481,14 +499,17 @@ def build(repo, candidate, output):
                       candidateManifestSha256=MANIFEST_PIN, candidateReportSha256=REPORT_PIN,
                       candidateModeSha256=MODE_PIN, candidateDirectoriesSha256=DIRECTORY_PIN,
                       counts={**COUNTS, 'hostSources': len(host), 'hostDependencyIntents': len(dependency_intents)},
-                      unitIncluded=False, resourcePolicyIncluded=False, provisioningImplemented=False,
+                      unitIncluded=True, resourceConstructorIncluded=True,
+                      preparationLifecycleImplemented=True, resourcePolicyIncluded=False,
+                      provisioningImplemented=False,
                       directIngressAccepted=False,
                       bootstrap='files map only; not a policy, inventory or accepted authority',
                       hostRuntime='Host Python/Node/OS tools and their loaders are NOT provisioned or accepted; candidate runtime is only fresh-root input.',
-                      unimplemented=['fixed resource helper and fresh unit', 'root ownership and loaded units',
-                                     'private root/proc/state mounts, UID/capabilities/namespaces/fds',
-                                     'independent final policy and before-hold cgroup/unit admission',
-                                     'direct literal ingress, physical network/data facts and finite preparation deadline'])
+                      unimplemented=['independently installed fixed inputs and loaded units',
+                                     'physical exercise/acceptance of root/proc/state mounts, UID/capabilities/namespaces/fds',
+                                     'separately provisioned pinned private TEST network namespace and literal ingress',
+                                     'independent final policy/acceptance and before-hold cgroup/unit admission',
+                                     'host runtime closure, physical network/data facts and crash recovery'])
         write_file(stage_fd, 'report.json', encode(report))
         files, snapshot = scan(stage_fd)
         write_file(stage_fd, 'pack-manifest.json', encode(dict(schema='c3-fixed-install-source-pack/v1',

@@ -1,0 +1,15 @@
+[Unit]
+Description=Finite external owner of fixed TEST fresh preparation resources
+Before=c3-test-fresh-classic.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-physical-watch.py
+Restart=no
+RemainAfterExit=yes
+KillMode=process
+UMask=0077
+LimitCORE=0
+TimeoutStopSec=10
