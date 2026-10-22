@@ -5,17 +5,82 @@ const { createL2tpRootLifecycle } = require('../l2tpRuntimeLifecycleHook');
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 
+test('already initialized exact indexes are proved without duplicate DDL', async () => {
+    const { ensureL2tpModelIndexes } = require('../l2tpModelIndexReadiness');
+    const calls = [];
+    const model = {
+        async init() { calls.push('init'); },
+        async createCollection() { calls.push('duplicate collection'); },
+        async createIndexes() { calls.push('duplicate indexes'); },
+        schema: { indexes: () => [[{ operationId: 1 }, { unique: true }]] },
+        collection: { async indexes() { calls.push('readback'); return [
+            { key: { _id: 1 } }, { key: { operationId: 1 }, unique: true },
+        ]; } },
+    };
+    await ensureL2tpModelIndexes({ loadModels: () => ({ Ready: model }) });
+    assert.deepEqual(calls, ['init', 'readback']);
+});
+
+test('initial metadata proof joins init and drains a bounded batch without any explicit DDL', async () => {
+    const { ensureL2tpModelIndexes } = require('../l2tpModelIndexReadiness');
+    const calls = [], controls = Array.from({ length: 5 }, (_, i) => controlledModel(`M${i}`, calls));
+    for (const control of controls) {
+        control.model.collection.indexes = async () => { calls.push('proof'); await control.stages.probe.promise; return control.actual; };
+    }
+    let settled = false;
+    const start = ensureL2tpModelIndexes({ loadModels: () => Object.fromEntries(controls.map((c, i) => [`M${i}`, c.model])) })
+        .finally(() => { settled = true; });
+    try {
+        await tick(); assert.deepEqual(calls, ['M0:init', 'M1:init']);
+        for (const offset of [0, 2, 4]) {
+            const batch = controls.slice(offset, offset + 2);
+            batch.forEach(c => c.stages.init.resolve()); await tick();
+            assert.equal(calls.filter(c => c === 'proof').length, offset + batch.length);
+            assert.equal(settled, false);
+            batch[0].stages.probe.resolve(); await tick();
+            if (batch.length === 2) {
+                assert.equal(calls.filter(c => c.endsWith(':init')).length, offset + 2);
+                assert.equal(settled, false); batch[1].stages.probe.resolve(); await tick();
+            }
+        }
+        await start;
+        assert.equal(calls.length, 10, 'only init + exact proof per model');
+    } finally { controls.forEach(c => c.release()); await start; }
+});
+
+test('only numeric NamespaceNotFound permits a read-error fallback', async () => {
+    const { ensureL2tpModelIndexes } = require('../l2tpModelIndexReadiness');
+    for (const code of [26, 13, 89, undefined]) {
+        const calls = [], error = Object.assign(new Error('read failed'), { code });
+        let reads = 0;
+        const model = { async init() { calls.push('init'); },
+            async createCollection() { calls.push('collection'); }, async createIndexes() { calls.push('build'); },
+            schema: { indexes: () => [[{ token: 1 }, { unique: true }]] },
+            collection: { async indexes() { calls.push('read'); if (++reads === 1) throw error;
+                return [{ key: { _id: 1 } }, { key: { token: 1 }, unique: true }]; } } };
+        const ready = ensureL2tpModelIndexes({ loadModels: () => ({ Model: model }) });
+        if (code === 26) { await ready; assert.deepEqual(calls, ['init', 'read', 'collection', 'build', 'read']); }
+        else { await assert.rejects(ready, e => e === error); assert.deepEqual(calls, ['init', 'read']); }
+    }
+});
+
 // Deferred Mongo model APIs expose ordering without database or wall-clock races.
 function controlledModel(name, calls) {
-    const stages = { collection: deferred(), build: deferred(), readback: deferred() };
+    const stages = { init: deferred(), probe: deferred(), collection: deferred(), build: deferred(), readback: deferred() };
+    let reads = 0;
     const actual = [{ key: { _id: 1 } }, { key: { operationId: 1 }, unique: true, sparse: true }];
     return {
         stages, actual,
         model: {
+            async init() { calls.push(`${name}:init`); await stages.init.promise; },
             async createCollection() { calls.push(`${name}:collection`); await stages.collection.promise; },
             async createIndexes() { calls.push(`${name}:build`); await stages.build.promise; },
             schema: { indexes: () => [[{ operationId: 1 }, { unique: true, sparse: true }]] },
-            collection: { async indexes() { calls.push(`${name}:readback`); await stages.readback.promise; return actual; } },
+            collection: { async indexes() {
+                const stage = ++reads === 1 ? 'probe' : 'readback';
+                calls.push(`${name}:${stage}`); await stages[stage].promise;
+                return stage === 'probe' ? [{ key: { _id: 1 } }] : actual;
+            } },
         },
         release() { for (const stage of Object.values(stages)) stage.resolve(); },
     };
@@ -32,11 +97,17 @@ test('readiness runs at most two complete ordered model pipelines and awaits the
     try {
         for (let offset = 0; offset < controls.length; offset += 2) {
             const batch = controls.slice(offset, offset + 2);
-            expected.push(...batch.map((_, i) => `Model${offset + i}:collection`));
+            expected.push(...batch.map((_, i) => `Model${offset + i}:init`));
             await tick();
-            assert.deepEqual(calls, expected, 'exactly this batch may enter createCollection');
+            assert.deepEqual(calls, expected, 'exactly this batch may join init');
             assert.equal(settled, false);
             for (const [i, control] of batch.entries()) {
+                control.stages.init.resolve(); await tick();
+                expected.push(`Model${offset + i}:probe`);
+                assert.deepEqual(calls, expected, 'readback must await automatic init');
+                control.stages.probe.resolve(); await tick();
+                expected.push(`Model${offset + i}:collection`);
+                assert.deepEqual(calls, expected, 'fallback only after missing metadata');
                 control.stages.collection.resolve(); await tick();
                 expected.push(`Model${offset + i}:build`);
                 assert.deepEqual(calls, expected, 'build must wait for its own collection');
@@ -62,7 +133,7 @@ test('readiness runs at most two complete ordered model pipelines and awaits the
 
 test('failed readiness drains both admitted pipelines before rejecting or stopping and admits no later models', async t => {
     const { ensureL2tpModelIndexes } = require('../l2tpModelIndexReadiness');
-    for (const stage of ['collection', 'build', 'readback']) {
+    for (const stage of ['init', 'probe', 'collection', 'build', 'readback']) {
         for (const failedIndex of [0, 1]) {
             await t.test(`${stage} failure in pipeline ${failedIndex}`, async () => {
                 const calls = [];
@@ -85,7 +156,7 @@ test('failed readiness drains both admitted pipelines before rejecting or stoppi
                 let stop;
                 try {
                     await tick();
-                    assert.deepEqual([...calls], ['Model0:collection', 'Model1:collection']);
+                    assert.deepEqual([...calls], ['Model0:init', 'Model1:init']);
                     for (const [name, gate] of Object.entries(failed.stages)) {
                         if (name === stage) { gate.reject(error); break; }
                         gate.resolve(); await tick();
@@ -108,7 +179,7 @@ test('failed readiness drains both admitted pipelines before rejecting or stoppi
                     assert.equal(stopped, true);
                     assert.equal(runtimeStarts, 0);
                     assert.ok(calls.every(call => !/^Model[23]:/.test(call)));
-                    const stageNames = ['collection', 'build', 'readback'];
+                    const stageNames = ['init', 'probe', 'collection', 'build', 'readback'];
                     assert.deepEqual(calls.filter(call => call.startsWith(`Model${failedIndex}:`)),
                         stageNames.slice(0, stageNames.indexOf(stage) + 1).map(name => `Model${failedIndex}:${name}`));
                     assert.deepEqual(calls.filter(call => call.startsWith(`Model${1 - failedIndex}:`)),
@@ -150,7 +221,7 @@ test('every existing metadata gate remains exact after concurrent builds', async
         ['missing collation', indexes => { delete indexes[1].collation; }],
     ];
     const modelFor = indexes => ({
-        async createCollection() {}, async createIndexes() {},
+        async init() {}, async createCollection() {}, async createIndexes() {},
         schema: { indexes: () => [[key, options], [{ requestKey: 1 }, { unique: true, sparse: true }],
             [{ expireAt: 1 }, { expireAfterSeconds: 300 }]] },
         collection: { async indexes() { return indexes; } },
@@ -186,11 +257,11 @@ test('metadata refusal drains the sibling before rejection without admitting a l
             try {
                 bad.release(); await tick();
                 assert.equal(settled, false);
-                assert.deepEqual([...calls], ['Bad:collection', 'Peer:collection', 'Bad:build', 'Bad:readback']);
+                assert.deepEqual([...calls], ['Bad:init', 'Peer:init', 'Bad:probe', 'Bad:collection', 'Bad:build', 'Bad:readback']);
                 peer.release();
                 await Promise.all([observed, rejected]);
                 assert.equal(settled, true);
-                assert.deepEqual(calls, ['Bad:collection', 'Peer:collection', 'Bad:build', 'Bad:readback', 'Peer:build', 'Peer:readback']);
+                assert.deepEqual(calls, ['Bad:init', 'Peer:init', 'Bad:probe', 'Bad:collection', 'Bad:build', 'Bad:readback', 'Peer:probe', 'Peer:collection', 'Peer:build', 'Peer:readback']);
             } finally {
                 [bad, peer, later].forEach(control => control.release());
                 await Promise.all([observed, rejected]);
@@ -205,7 +276,7 @@ test('synchronous and asynchronous failures in one batch are both drained and re
     const peer = controlledModel('Peer', calls), later = controlledModel('Later', calls);
     let settled = false;
     const start = ensureL2tpModelIndexes({ loadModels: () => ({
-        First: { createCollection() { calls.push('First:collection'); throw original; } },
+        First: { init() { calls.push('First:init'); throw original; } },
         Peer: peer.model, Later: later.model,
     }) });
     const observed = start.then(() => { settled = true; }, () => { settled = true; });
@@ -213,12 +284,12 @@ test('synchronous and asynchronous failures in one batch are both drained and re
     try {
         await tick();
         assert.equal(settled, false);
-        assert.deepEqual([...calls], ['First:collection', 'Peer:collection']);
-        peer.stages.collection.resolve(); await tick();
+        assert.deepEqual([...calls], ['First:init', 'Peer:init']);
+        for (const stage of ['init', 'probe', 'collection']) { peer.stages[stage].resolve(); await tick(); }
         assert.equal(settled, false);
         peer.stages.build.reject(new Error('second index build failed'));
         await Promise.all([observed, rejected]);
-        assert.deepEqual(calls, ['First:collection', 'Peer:collection', 'Peer:build']);
+        assert.deepEqual(calls, ['First:init', 'Peer:init', 'Peer:probe', 'Peer:collection', 'Peer:build']);
     } finally {
         [peer, later].forEach(control => control.release());
         await Promise.all([observed, rejected]);
@@ -248,7 +319,7 @@ test('readiness rejects a missing or weaker persisted unique/sparse index even a
         [{ key: { operationId: 1 }, unique: true }],
         [{ key: { operationId: 1 }, unique: true, sparse: true, partialFilterExpression: { status: 'waiting' } }]]) {
         const model = {
-            async createCollection() {}, async createIndexes() {},
+            async init() {}, async createCollection() {}, async createIndexes() {},
             schema: { indexes: () => [[{ operationId: 1 }, { unique: true, sparse: true }]] },
             collection: { async indexes() { return [{ key: { _id: 1 } }, ...actual]; } },
         };

@@ -23,18 +23,37 @@ async function ensureL2tpModelIndexes({
         // allSettled is also a shutdown barrier: an early rejection must not
         // leave an admitted collection/index build running after startup fails.
         const results = await Promise.allSettled(entries.slice(offset, offset + 2).map(async ([modelName, model]) => {
-            await model.createCollection();
-            // Do not syncIndexes(): readiness must never drop an operator's indexes.
-            await model.createIndexes();
-            const actual = await model.collection.indexes();
-            if (!actual.some(index => isDeepStrictEqual(Object.entries(index.key), [['_id', 1]]))) {
-                throw new Error(`L2TP index readiness failed for ${modelName}: missing _id index`);
-            }
-            for (const [key, options] of model.schema.indexes()) {
-                if (!actual.some(index => matchesIndex(index, key, options))) {
-                    throw new Error(`L2TP index readiness failed for ${modelName}: ${JSON.stringify(key)}`);
+            // Public, memoized init joins Mongoose's already-started automatic DDL.
+            // Its rejection is authoritative: never mask a failed automatic build.
+            await model.init();
+            const required = model.schema.indexes();
+            const refusal = actual => {
+                if (!actual.some(index => isDeepStrictEqual(Object.entries(index.key), [['_id', 1]]))) {
+                    return new Error(`L2TP index readiness failed for ${modelName}: missing _id index`);
                 }
+                for (const [key, options] of required) {
+                    if (!actual.some(index => matchesIndex(index, key, options))) {
+                        return new Error(`L2TP index readiness failed for ${modelName}: ${JSON.stringify(key)}`);
+                    }
+                }
+                return null;
+            };
+            let actual;
+            try {
+                actual = await model.collection.indexes();
+            } catch (error) {
+                // Only an absent namespace permits creation; network/auth/read
+                // failures must refuse, not silently turn into a rebuild attempt.
+                if (error.code !== 26) throw error;
             }
+            if (actual && !refusal(actual)) return;
+            // autoCreate/autoIndex may be disabled, or required indexes missing.
+            // Add all declared indexes and prove the complete metadata again.
+            // Do not syncIndexes(): readiness must never drop an operator's indexes.
+            await model.createCollection();
+            await model.createIndexes();
+            const error = refusal(await model.collection.indexes());
+            if (error) throw error;
         }));
         const failed = results.find(result => result.status === 'rejected');
         if (failed) throw failed.reason; // No later batch may start after failure.
