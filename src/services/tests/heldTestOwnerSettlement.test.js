@@ -32,7 +32,8 @@ test.before(async () => {
     directory = await fsp.mkdtemp(path.join(process.env.TMPDIR, 'c3-os-'));
     const port = await new Promise(resolve => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
     child = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1',
-        '--setParameter', 'enableTestCommands=1', '--replSet', 'ownerSettlement', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+        '--setParameter', 'enableTestCommands=1', '--replSet', 'ownerSettlement', '--logpath', path.join(directory, 'mongo.log'),
+        ...(process.env.C3_STARTUP_DIAGNOSTIC === '1' ? ['--slowms', '0'] : [])], { stdio: 'ignore' });
     const uri = `mongodb://127.0.0.1:${port}/owner_settlement_scratch`;
     const client = new mongoose.mongo.MongoClient(uri + '?directConnection=true', { serverSelectionTimeoutMS: 100 });
     try {
@@ -59,7 +60,10 @@ test.before(async () => {
 });
 test.after(async () => {
     try { if (db) { await db.dropDatabase(); assert.equal((await db.getClient().db('admin').admin().listDatabases()).databases.some(d => d.name === 'owner_settlement_scratch'), false); await db.close(); } }
-    finally { if (child?.exitCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill('SIGTERM'); await exit; } if (directory) await fsp.rm(directory, { recursive: true, force: true }); }
+    finally { if (child?.exitCode === null) { const exit = new Promise(r => child.once('exit', r)); child.kill('SIGTERM'); await exit; } if (directory) {
+        if (process.env.C3_STARTUP_DIAGNOSTIC === '1') await fsp.copyFile(path.join(directory, 'mongo.log'), path.join(process.env.C3_REAL_EVIDENCE, 'mongo-diagnostic.log'));
+        await fsp.rm(directory, { recursive: true, force: true });
+    } }
 });
 async function fixture(options = {}) {
     // Administrative fixture cleanup is isolated to this owned scratch database.
@@ -235,7 +239,8 @@ async function actualBundle(t, name) {
         REDIS_URL:`redis://127.0.0.1:${rp}`,USE_CADDY:'true',PORT:String(port),L2TP_EXECUTION_ENABLED:'false',L2TP_MIGRATIONS_ENABLED:'false',
         TOPOLOGY_TEST_EXECUTION_ENABLED:'false',TOPOLOGY_PRODUCTION_EXECUTION_ENABLED:'false',L2TP_PRODUCTION_EXECUTION_ENABLED:'false'}};
     const file=path.join(local,'local.json');await fsp.writeFile(file,JSON.stringify(settings),{mode:0o600});
-    const bundle={candidate,manifestSha256:sha(manifestRaw),settings:file,settingsSha256:sha(await fsp.readFile(file)),port,evidence};
+    const bundle={candidate,manifestSha256:sha(manifestRaw),settings:file,settingsSha256:sha(await fsp.readFile(file)),port,evidence,
+        startupDiagnostic:process.env.C3_STARTUP_DIAGNOSTIC === '1'};
     return {bundle,evidence,root,appDb,async record(f,physical){
         await fsp.writeFile(path.join(evidence,'result.json'),JSON.stringify({physicalAccepted:false,operationalGO:false,
             limits:['SIMULATED physical root/mount/UID/unit/cgroup/namespace authority','loopback and disposable empty app database, not direct212 or operational data'],

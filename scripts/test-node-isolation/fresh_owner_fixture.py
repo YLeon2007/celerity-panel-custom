@@ -81,6 +81,26 @@ def replay_readback(f):
         try: row['serving']['observed']=fresh.observe(pid,'127.0.0.1',f.port)
         except BaseException as error:
             row['serving']['observeError']=str(error)
+            if getattr(f, 'bundle', {}).get('startupDiagnostic'):
+                # After the irreversible bounded failure ONLY. Never feeds the
+                # accepted serving result, journal, supervisor, or protocol.
+                diagnostic={'accepted':False,'initialFailureAt':time.monotonic(),
+                            'initialError':str(error),'eventualReady':None}
+                end=time.monotonic()+15
+                while time.monotonic()<end:
+                    try:
+                        observed=fresh.observe(pid,'127.0.0.1',f.port)
+                        diagnostic['eventualReady']={'at':time.monotonic(),'serving':observed}
+                        break
+                    except (OSError,RuntimeError,http.client.HTTPException) as later:
+                        diagnostic['lastError']=str(later)
+                    time.sleep(.05)
+                diagnostic['elapsedSincePopen']=time.monotonic()-row['spawns'][0]['at']
+                diagnostic['supervisorJournalAfter']=optional(fresh.SUPERVISOR_ATTEMPT)
+                row['startupDiagnostic']=diagnostic
+                for fd,name in ((1,'application.stdout.log'),(2,'application.stderr.log')):
+                    try: (Path(f.bundle['evidence'])/name).write_bytes(Path(f'/proc/{pid}/fd/{fd}').read_bytes())
+                    except OSError: pass
             return row
         for name,url in (('ready','/classic-ready'),('health','/health')):
             conn=http.client.HTTPConnection('127.0.0.1',f.port,timeout=.5)
