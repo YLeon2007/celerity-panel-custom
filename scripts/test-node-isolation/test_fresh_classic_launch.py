@@ -102,7 +102,7 @@ class FreshLaunchTests(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def launch_fixture(m, fault=None, *, bridge=False):
+def launch_fixture(m, fault=None, *, bridge=False, startup_fault=None):
     """Disposable Node source/settings, no credentials or physical operations."""
     import types
     import test_coordinated_restore as ct
@@ -182,9 +182,12 @@ if sys.argv[6] == 'bridge':
   def accept(self): return raw_listener.accept()
   def close(self): raw_listener.close()
  listener=FixtureListener()
+if sys.argv[7]:
+ from test_strict_startup_deadline import inject_startup_fault
+ inject_startup_fault(m,Simulated,root,sys.argv[7])
 m.supervise(listener,fs,Simulated(),fault=sys.argv[5] or None)
 '''
-        supervisor = subprocess.Popen([sys.executable,'-B','-c',code,str(outer.root),str(listener.fileno()),shutil.which('node'),str(port),fault or '', 'bridge' if bridge else ''],
+        supervisor = subprocess.Popen([sys.executable,'-B','-c',code,str(outer.root),str(listener.fileno()),shutil.which('node'),str(port),fault or '', 'bridge' if bridge else '', startup_fault or ''],
             cwd=HERE, pass_fds=(listener.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         listener.close()
         class Simulated(m.Platform):
@@ -216,10 +219,28 @@ m.supervise(listener,fs,Simulated(),fault=sys.argv[5] or None)
                     scope.__exit__(RuntimeError,error,None)
         finally:
             # Test-only disposal, NEVER implementation recovery/rollback.
+            owned=[]
             for entry in root.glob('serving-*.json'):
                 pid=json.loads(entry.read_text())['pid']
-                try: os.kill(pid,15)
+                owned.append(pid)
+                try:
+                    if startup_fault:
+                        import signal
+                        rows=[json.loads(line) for line in (root/'deadline.jsonl').read_text().splitlines()]
+                        pin=next(row for row in rows if row['event']=='popen' and row['pid']==pid)
+                        fd=os.pidfd_open(pid,0)
+                        try:
+                            if m.start(pid) != pin['start']: raise AssertionError('owned child identity drift')
+                            signal.pidfd_send_signal(fd,signal.SIGTERM,None,0)
+                        finally: os.close(fd)
+                    else: os.kill(pid,15)
                 except ProcessLookupError: pass
+            if startup_fault:
+                # The injected harness reaps the exact launched child even on
+                # unknown; this is disposable-fixture cleanup, not recovery.
+                supervisor.wait(timeout=3)
+                if any(Path(f'/proc/{pid}').exists() for pid in owned):
+                    raise AssertionError('owned startup-fault child survived teardown')
             if supervisor.poll() is None: supervisor.kill()
             out,err=supervisor.communicate(timeout=3)
             if err and not fault: raise AssertionError(err.decode())

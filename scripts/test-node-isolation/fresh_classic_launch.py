@@ -699,6 +699,9 @@ def supervise(listener, fs, platform=None, *, fault=None):
                 def limits():
                     resource.setrlimit(resource.RLIMIT_CORE,(0,0))
                     resource.setrlimit(resource.RLIMIT_FSIZE,(1048576,1048576))
+                # One unchanged startup budget includes Popen itself. A late
+                # successful probe is unknown, never authority to confirm.
+                deadline=time.monotonic()+3
                 child=subprocess.Popen(argv,cwd=cwd,env=env,stdin=stdio[0],stdout=stdio[1],stderr=stdio[2],
                                        close_fds=True,start_new_session=True,preexec_fn=limits)
             finally:
@@ -707,15 +710,20 @@ def supervise(listener, fs, platform=None, *, fault=None):
             # deliberately lost results without adding any production recovery.
             if fs.fixture is not None:
                 (fs.fixture.root/'fresh'/f'serving-{child.pid}.json').write_text(json.dumps({'pid':child.pid}))
-            deadline=time.monotonic()+3
             while True:
+                need(child.poll() is None and time.monotonic() < deadline,'POSTEXEC_SERVING_UNKNOWN')
                 try:
                     serving=platform.observe(policy,child.pid)
                     need(serving['bodySha256'] == policy['ingress']['bodySha256'],'SERVING_RESPONSE_DRIFT')
-                    break
                 except (OSError,RuntimeError,http.client.HTTPException):
                     need(child.poll() is None and time.monotonic() < deadline,'POSTEXEC_SERVING_UNKNOWN')
                     time.sleep(.02)  # observation only, NEVER repeat exec
+                    continue
+                # Blocking observation can finish outside the budget or after
+                # child death. Preserve the full proof but refuse late success;
+                # these guards do not bound HTTP/proc syscall return latency.
+                need(child.poll() is None and time.monotonic() < deadline,'POSTEXEC_SERVING_UNKNOWN')
+                break
             if fault == 'eof': return
             if fault == 'timeout': time.sleep(6)
             if fault == 'death': os.kill(os.getpid(),9)
