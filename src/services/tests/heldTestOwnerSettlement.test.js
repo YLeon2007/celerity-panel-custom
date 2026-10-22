@@ -155,9 +155,9 @@ async function fixture(options = {}) {
     return { plan, pins, store, authority, operationalAuthority, journal, journalDirectory, revoke() { alive = false; }, held: () => alive, checks: () => checks };
 }
 
-async function sameHeldFreshFixture(fault = '') {
+async function sameHeldFreshFixture(fault = '', bundle = null) {
     const here = path.join(__dirname, '../../../scripts/test-node-isolation');
-    const process = spawn('/usr/bin/python3', ['-B', 'fresh_owner_fixture.py', fault],
+    const process = spawn('/usr/bin/python3', ['-B', 'fresh_owner_fixture.py', fault, ...(bundle ? [JSON.stringify(bundle)] : [])],
         { cwd: here, env: { ...global.process.env, PYTHONDONTWRITEBYTECODE: '1' }, stdio: ['pipe','pipe','pipe'] });
     let stderr = ''; process.stderr.on('data', raw => { stderr += raw; });
     const exited = new Promise(resolve => process.once('close', (code, signal) => resolve({ code, signal })));
@@ -175,9 +175,143 @@ async function sameHeldFreshFixture(fault = '') {
         return { ...f, next, meta, authority: work => withFreshOperationalRestoration(inputs, work,
             { openBridge: () => spawn('/usr/bin/python3', ['-B','-c',bridge,meta.root,meta.socket],
                 { cwd: here, env: global.process.env, stdio: ['pipe','pipe','pipe'] }) }),
-            async close() { process.stdin.end(); const status = await exited; if (!fault) assert.deepEqual(status, {code:0,signal:null}, stderr); } };
+            async close() {
+                process.stdin.end();
+                const cleanup=bundle ? (await next()).cleanup : null;
+                const status=await exited;
+                if (!fault||bundle) assert.deepEqual(status,{code:0,signal:null},stderr);
+                if(bundle){assert.equal(cleanup.servingPidsAbsent,true);if(cleanup.supervisorNaturalExit)assert.equal(cleanup.supervisorExit,0);}
+                return cleanup;
+            } };
     } catch (error) { process.kill(); await exited; throw error; }
 }
+
+// Opt-in actual payload replay. Physical root/UID/unit/cgroup/namespaces and
+// direct TEST212 ingress remain SIMULATED; no application runs in the owner DB.
+async function freePort() {
+    return new Promise(resolve => { const s=net.createServer(); s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>resolve(p));}); });
+}
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+async function actualBundle(t, name) {
+    assert.ok(process.env.C3_ACTUAL_CANDIDATE); assert.ok(process.env.C3_REDIS_SERVER); assert.ok(process.env.C3_REAL_EVIDENCE);
+    const candidate=await fsp.realpath(process.env.C3_ACTUAL_CANDIDATE), root=path.join(candidate,'root');
+    const manifestRaw=await fsp.readFile(path.join(candidate,'manifest.json')), manifest=JSON.parse(manifestRaw);
+    assert.equal(sha(manifestRaw),'b9793014e4fda7a53034394f2d02a077d645b49af9d08e70679e13ce85a614f6');
+    const inventory=async()=>{
+        const result={};
+        async function walk(dir) { for(const entry of await fsp.readdir(dir,{withFileTypes:true})) {
+            const file=path.join(dir,entry.name); assert.equal(entry.isSymbolicLink(),false);
+            if(entry.isDirectory()) await walk(file); else {const s=await fsp.stat(file);assert.ok(s.isFile()&&s.nlink===1);result['/'+path.relative(root,file)]=sha(await fsp.readFile(file));}
+        }}
+        await walk(root); return result;
+    };
+    assert.deepEqual(await inventory(),manifest);
+    const evidence=path.join(process.env.C3_REAL_EVIDENCE,name); await fsp.mkdir(evidence,{recursive:true,mode:0o700});
+    const local=await fsp.mkdtemp(path.join(process.env.TMPDIR,'ab-')), state=path.join(local,'state'); await fsp.mkdir(state,{mode:0o700});
+    const rp=await freePort(), port=await freePort();
+    const log=fs.openSync(path.join(evidence,'redis.log'),'w',0o600);
+    const redis=spawn(process.env.C3_REDIS_SERVER,['--bind','127.0.0.1','--port',String(rp),'--save','','--appendonly','no','--dir',local],
+        {cwd:local,env:{PATH:'/usr/bin:/bin',LC_ALL:'C',TMPDIR:process.env.TMPDIR},stdio:['ignore',log,log]});fs.closeSync(log);
+    const redisExit=new Promise(resolve=>redis.once('exit',(code,signal)=>resolve({code,signal})));
+    const bundled=require('node:module').createRequire(path.join(root,'app/package.json'));
+    for(const mod of ['mongodb','ioredis','mongoose','express'])assert.ok(bundled.resolve(mod).startsWith(path.join(root,'app/node_modules/')));
+    const Redis=bundled('ioredis'); const rc=new Redis(`redis://127.0.0.1:${rp}`,{lazyConnect:true,retryStrategy:()=>50});
+    const redisErrors=[];rc.on('error',error=>redisErrors.push(error.message));
+    const appName='actual_app_'+randomUUID().replaceAll('-','');
+    const appDb=db.getClient().db(appName);assert.notEqual(appName,db.name);
+    t.after(async()=>{
+        rc.disconnect();
+        if(redis.exitCode===null&&redis.signalCode===null)redis.kill('SIGTERM');
+        assert.deepEqual(await redisExit,{code:0,signal:null});
+        await appDb.dropDatabase();assert.equal((await db.getClient().db('admin').admin().listDatabases()).databases.some(d=>d.name===appName),false);
+        assert.deepEqual(await inventory(),manifest,'payload and original settings unchanged');
+        await fsp.rm(local,{recursive:true,force:true});
+    });
+    await until(async()=>{if(rc.status==='wait')await rc.connect();assert.equal(await rc.ping(),'PONG');});
+    assert.equal(await rc.dbsize(),0);assert.deepEqual(await appDb.listCollections().toArray(),[]);
+    const settings={version:1,context:'test.infograd.online',stateDirectory:state,listenAddress:'127.0.0.1',environment:{
+        PANEL_DOMAIN:'test.infograd.online',ACME_EMAIL:'local@example.invalid',ENCRYPTION_KEY:createHash('sha256').update(randomUUID()).digest('hex'),
+        SESSION_SECRET:randomUUID(),MONGO_URI:`mongodb://${db.getClient().options.hosts[0]}/${appName}?replicaSet=ownerSettlement`,
+        REDIS_URL:`redis://127.0.0.1:${rp}`,USE_CADDY:'true',PORT:String(port),L2TP_EXECUTION_ENABLED:'false',L2TP_MIGRATIONS_ENABLED:'false',
+        TOPOLOGY_TEST_EXECUTION_ENABLED:'false',TOPOLOGY_PRODUCTION_EXECUTION_ENABLED:'false',L2TP_PRODUCTION_EXECUTION_ENABLED:'false'}};
+    const file=path.join(local,'local.json');await fsp.writeFile(file,JSON.stringify(settings),{mode:0o600});
+    const bundle={candidate,manifestSha256:sha(manifestRaw),settings:file,settingsSha256:sha(await fsp.readFile(file)),port,evidence};
+    return {bundle,evidence,root,appDb,async record(f,physical){
+        await fsp.writeFile(path.join(evidence,'result.json'),JSON.stringify({physicalAccepted:false,operationalGO:false,
+            limits:['SIMULATED physical root/mount/UID/unit/cgroup/namespace authority','loopback and disposable empty app database, not direct212 or operational data'],
+            manifestSha256:bundle.manifestSha256,originalSettingsSha256:manifest['/etc/classic.json'],localSettingsSha256:bundle.settingsSha256,
+            meta:f.meta,physical},null,2));
+        for(const name of ['controller.jsonl','signals.jsonl','spawns.jsonl','observed.jsonl']){
+            const from=path.join(f.meta.root,'fresh',name);if(fs.existsSync(from))await fsp.copyFile(from,path.join(evidence,name));
+        }
+    }};
+}
+async function ownerReadbacks(f, physical) {
+    const options={readPreference:'primary',readConcern:{level:'majority'},maxTimeMS:1000};
+    const owners=await m.Owner.collection.find({},options).toArray();assert.equal(owners.length,5);
+    for(const n of physical.commit.settlement.nodes){
+        const owner=owners.find(o=>String(o.node)===n.nodeId);
+        assert.deepEqual(n.owner,JSON.parse(JSON.stringify(owner)));
+        assert.equal(n.priorOwnerGeneration,f.plan.nodes.find(p=>p.nodeId===n.nodeId).ownerGeneration);
+        const enrollment=await m.Enrollment.collection.findOne({_id:n.enrollmentId},options);
+        assert.equal(sha(Buffer.from(JSON.stringify(enrollment))),n.enrollmentSha256);
+    }
+    assert.equal(await m.Lock.countDocuments(),0);
+    const state=await m.Topology.findById('singleton').lean();assert.equal(state.topologyAdmissionCount,0);assert.equal(state.remoteAdmissionCount,0);
+    assert.equal((await m.Queue.findById('create-v1')).outstanding,0);
+}
+for(const scenario of ['positive','stale-generation','settings-pin-drift','postexec-ack-loss'])
+    test('actual bundled same-live handback: '+scenario,{skip:!process.env.C3_ACTUAL_CANDIDATE,timeout:90000},async t=>{
+        const a=await actualBundle(t,scenario);
+        const f=await sameHeldFreshFixture(scenario==='settings-pin-drift'?'settings-pin-drift':scenario==='postexec-ack-loss'?'ack-loss':'',a.bundle);
+        let cas=0,opens=0,passed=false;const commands=[];
+        const monitor=e=>{commands.push(e);if(e.commandName==='findAndModify'&&e.command.findAndModify===m.Owner.collection.name&&e.command.update?.$set?.handbackReceipt)cas++;};
+        db.getClient().on('commandStarted',monitor);
+        try {
+            const stopped=async()=>{const fields=(await fsp.readFile(`/proc/${f.meta.preparedSupervisor.pid}/stat`,'utf8')).split(') ').slice(1).join(') ').trim().split(/\s+/);assert.equal(fields[0],'T');assert.equal(fields[19],f.meta.preparedSupervisor.start);};
+            await stopped();assert.equal(f.meta.preparedFlockHeld,true);
+            if(scenario==='positive'){await new Promise(r=>setTimeout(r,6100));await stopped();assert.equal(cas,0);}
+            if(scenario==='stale-generation')f.plan.nodes[0].ownerGeneration=randomUUID();
+            const owners=await m.Owner.find().lean(),enrollments=await m.Enrollment.find().lean(),bindings=await m.Binding.find().lean();
+            const service=new api.HeldTestOwnerSettlement({withRestorationScope:work=>{opens++;return f.authority(work);},models:m,journal:f.journal});
+            let result, failure;
+            try { result=await service.freshHandback(f.plan); } catch(error) {failure=error;}
+            const p=await f.next();
+            if(p.commit){await ownerReadbacks(f,p);assert.equal(cas,5);}
+            assert.deepEqual(await m.Enrollment.find().lean(),enrollments);assert.deepEqual(await m.Binding.find().lean(),bindings);
+            assert.equal(await a.appDb.collection('hynodes').countDocuments(),0);assert.equal(await a.appDb.collection('hyusers').countDocuments(),0);
+            await assert.rejects(service.freshHandback(f.plan));assert.equal(opens,1);
+            await a.record(f,{...p,serviceCode:failure?.code||result?.code,handbackCasCommands:cas,replayOpenCount:opens});
+            if(scenario==='positive'){assert.ifError(failure);assert.equal(result.code,'COMMITTED_FRESH_ACTIVATION_CONFIRMED');}
+            else {assert.ok(failure);if(scenario!=='stale-generation')assert.equal(failure.code,'COMMITTED_ACTIVATION_UNKNOWN');}
+            assert.equal(f.meta.bundle?.manifestSha256,a.bundle.manifestSha256,'fixture must explicitly select actual bundled replay');
+            assert.equal(p.candidateFrozen,true);
+            const launched=scenario==='positive'||scenario==='postexec-ack-loss';
+            assert.equal(p.count,launched?1:0);assert.equal(p.signals.length,launched?1:0);assert.equal(p.commitsSent,launched?1:0);
+            assert.equal(p.commit!==null,launched);assert.equal(p.flockHeld,true);
+            if(launched){
+                assert.equal(p.serving.exe,path.join(a.root,'runtime/node'));assert.equal(p.serving.pid,p.supervisorJournal.serving.pid);
+                assert.equal(p.serving.start,p.supervisorJournal.serving.start);assert.equal(p.serving.observed.socketInode,p.supervisorJournal.serving.socketInode);
+                assert.equal(p.spawns.length,1);assert.deepEqual(p.spawns[0].argv,[path.join(a.root,'runtime/node'),path.join(a.root,'app/index.js')]);
+                assert.deepEqual(p.spawns[0].env,{C3_SETTINGS:a.bundle.settings,NODE_ENV:'production'});assert.equal(p.spawns[0].cwd,path.join(a.root,'app'));
+                assert.equal(p.ready.status,200);assert.equal(p.ready.body,'c3-classic-ready-v1\n');assert.equal(p.health.status,200);assert.equal(JSON.parse(p.health.body).status,'ok');
+                assert.ok(p.bootSeconds>=0&&p.bootSeconds<3,'actual application startup within unchanged deadline');
+                assert.ok(p.listenSeconds>=0&&p.listenSeconds<3);assert.equal(p.supervisorJournal.phase,'completed');assert.equal(p.attempt.phase,'confirmed');
+                await ownerReadbacks(f,p);assert.equal(cas,5);
+            } else {
+                assert.equal(p.supervisorState,'T');assert.equal(p.serving,null);
+                if(scenario==='stale-generation'){assert.deepEqual(await m.Owner.find().lean(),owners);assert.equal(cas,0);}
+                else {assert.equal(cas,5);assert.match(p.cause,/EXECUTABLE_SOURCE_SETTINGS_CLOSURE_DRIFT/);}
+            }
+            const majority=commands.filter(e=>e.commandName==='find'&&e.command.readConcern?.level==='majority');assert.ok(majority.length>0);
+            passed=true;
+        } finally {
+            db.getClient().off('commandStarted',monitor);
+            const cleanup=await f.close();
+            if(cleanup)await fsp.writeFile(path.join(a.evidence,'cleanup.json'),JSON.stringify(cleanup));
+            if(passed&&(scenario==='positive'||scenario==='postexec-ack-loss'))assert.equal(cleanup.supervisorNaturalExit,true,'finite natural supervisor child.wait exit');
+        }
+    });
 
 test('fresh same-held JS/Python/FreshLaunch actual exec follows public five-owner Mongo CAS/readbacks', {timeout:90000}, async () => {
     const f = await sameHeldFreshFixture();

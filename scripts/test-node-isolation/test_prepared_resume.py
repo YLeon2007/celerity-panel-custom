@@ -1,6 +1,7 @@
 """Local real stopped PID/flock/UDS; physical root/unit authority SIMULATED.
 
-No Node, Mongo, privileged operations or production acceptance in this suite.
+Default suite uses Python HTTP; optional bundle input is TEST-only actual Node
+replay with separate disposable settings. Neither mode proves physical authority.
 """
 import contextlib
 import fcntl
@@ -176,7 +177,7 @@ class PreparedResumeTests(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def prepared_fixture(m=fresh, fault=None, *, bridge=True):
+def prepared_fixture(m=fresh, fault=None, *, bridge=True, bundle=None):
     """Real preparer/flocks/five channels/protocol/Python exec, modeled platform.
 
     Python HTTP is an unprivileged protocol witness, NOT actual Node/app evidence.
@@ -192,7 +193,7 @@ def prepared_fixture(m=fresh, fault=None, *, bridge=True):
         (outer.root/'state/launch.lock').write_bytes(b'')
         (outer.root/'state/launch.lock').chmod(0o600)
         source=root/'index.py'
-        source.write_text('''import http.server,json,os
+        if bundle is None: source.write_text('''import http.server,json,os
 from pathlib import Path
 settings=json.loads(Path(os.environ['C3_SETTINGS']).read_text())
 with open(settings['count'],'a') as out: out.write('exec\\n')
@@ -206,6 +207,22 @@ http.server.HTTPServer(('127.0.0.1',settings['port']),Handler).serve_forever()
 ''')
         probe=socket.socket(); probe.bind(('127.0.0.1',0)); port=probe.getsockname()[1]; probe.close()
         settings=root/'settings.json'; settings.write_text(json.dumps({'port':port,'count':str(root/'executions')}))
+        replay = None; manifest = {}; f = None
+        if bundle is not None:
+            candidate=Path(bundle['candidate']).resolve()
+            payload=candidate/'root'
+            manifest=json.loads((candidate/'manifest.json').read_text())
+            fresh.need(fresh.digest((candidate/'manifest.json').read_bytes()) == bundle['manifestSha256'], 'BUNDLE_MANIFEST_DRIFT')
+            actual={'/'+str(p.relative_to(payload)):fresh.digest(p.read_bytes()) for p in payload.rglob('*') if p.is_file()}
+            fresh.need(actual == manifest, 'BUNDLE_PAYLOAD_DRIFT')
+            fresh.need(all(not p.is_symlink() for p in payload.rglob('*')), 'MATERIALIZED_BUNDLE_REQUIRED')
+            settings=Path(bundle['settings']).resolve(); port=bundle['port']
+            fresh.need(fresh.digest(settings.read_bytes()) == bundle['settingsSha256'], 'LOCAL_SETTINGS_PIN_DRIFT')
+            replay={'mapping':{k:str(payload/k.lstrip('/')) for k in manifest},
+                    'argv':[str(payload/'runtime/node'),str(payload/'app/index.js')],
+                    'env':{'C3_SETTINGS':str(settings),'NODE_ENV':'production'},'cwd':str(payload/'app')}
+            replay['mapping']['/etc/classic.json']=str(settings)
+            (root/'replay.json').write_text(json.dumps(replay))
         installed=outer.root/c.FRESH.lstrip('/')
         installed.parent.mkdir(parents=True,mode=0o700)
         for parent in installed.parent.parents:
@@ -217,18 +234,31 @@ http.server.HTTPServer(('127.0.0.1',settings['port']),Handler).serve_forever()
                  '/etc/classic.json':settings, c.FRESH:outer.root/c.FRESH.lstrip('/'),
                  c.SELF:outer.root/c.SELF.lstrip('/')}
         policy=PolicyBoundaryTests().policy()[1]
-        policy['files']={name:fresh.digest(path.read_bytes()) for name,path in mapping.items()}
+        policy['files']={name:fresh.digest(path.read_bytes()) for name,path in mapping.items()} if replay is None else {}
+        if bundle is not None:
+            assert replay is not None
+            mapping={k:Path(v) for k,v in replay['mapping'].items()}
+            fresh.need(all(mapping[k].read_bytes() == (HERE/name).read_bytes() for k,name in
+                           ((c.SELF,'coordinated_restore.py'),(c.FRESH,'fresh_classic_launch.py'))), 'RUNNING_SOURCE_PIN_DRIFT')
+            policy['files']={**manifest,'/etc/classic.json':bundle['settingsSha256']}
         policy['inventory']=inventory_fixture(fresh,outer.config)
         policy['inventory']['sourceSha256']=policy['files'][c.SELF]
         outer.fs.atomic(fresh.POLICY,c.canonical(policy),new=True)
         sock=root/'s'
         listener=socket.socket(socket.AF_UNIX); listener.bind(str(sock))  # NOT listening
-        code='''import os,socket,sys,time
+        code='''import json,os,socket,sys,time
 from pathlib import Path
 import fresh_classic_launch as m
 import test_node_originals as t
 root=Path(sys.argv[1]); fs=t.n.Files(t.n.Fixture(root,os.getuid(),os.getgid(),None))
 bootstrap=fs.read_json(m.POLICY)
+replay=json.loads((root/'fresh/replay.json').read_text()) if (root/'fresh/replay.json').exists() else None
+if replay:
+ def audit(event,args):
+  if event=='subprocess.Popen':
+   with (root/'fresh/spawns.jsonl').open('a') as out:
+    out.write(json.dumps({'argv':args[1],'cwd':args[2],'env':args[3],'at':time.monotonic()})+'\\n')
+ sys.addaudithook(audit)
 m.c.trusted_read=lambda name:fs.read(name)[0]
 class Paused(m.PreparationSupervisorFiles):
  fixture=fs.fixture; uid=fs.uid
@@ -238,9 +268,16 @@ class Simulated(m.Platform):
   time.sleep(.12)  # delay between real SIGCONT and listen, not accept widening
   mapping={'/runtime/node':Path(sys.executable).resolve(),'/app/index.js':root/'fresh/index.py',
    '/etc/classic.json':root/'fresh/settings.json',m.c.FRESH:root/m.c.FRESH.lstrip('/'),m.c.SELF:root/m.c.SELF.lstrip('/')}
+  if replay: mapping={k:Path(v) for k,v in replay['mapping'].items()}
   m.verify_files(policy,lambda name:mapping[name])
- def paths(self,policy): return [sys.executable,'-B',str(root/'fresh/index.py')],{'C3_SETTINGS':str(root/'fresh/settings.json'),'NODE_ENV':'production'},str(root/'fresh')
- def observe(self,policy,pid): return m.observe(pid,'127.0.0.1',int(sys.argv[3]))
+ def paths(self,policy):
+  if replay: return replay['argv'],replay['env'],replay['cwd']
+  return [sys.executable,'-B',str(root/'fresh/index.py')],{'C3_SETTINGS':str(root/'fresh/settings.json'),'NODE_ENV':'production'},str(root/'fresh')
+ def observe(self,policy,pid):
+  result=m.observe(pid,'127.0.0.1',int(sys.argv[3]))
+  if replay:
+   with (root/'fresh/observed.jsonl').open('a') as out: out.write(json.dumps({'at':time.monotonic(),'serving':result})+'\\n')
+  return result
 listener=socket.socket(fileno=int(sys.argv[2]))
 if listener.fileno()!=3:
  os.dup2(listener.fileno(),3); listener.close(); listener=socket.socket(fileno=3)
@@ -280,17 +317,56 @@ m.supervise(listener,Paused(bootstrap['files']),Simulated(),fault=sys.argv[4] or
                               fixtures=outer.fixtures,held=held,platform=Simulated(),socket=str(sock),
                               proof=settlement_proof(outer,c))
             f.count=lambda:len((root/'executions').read_text().splitlines()) if (root/'executions').exists() else 0
-            yield f
+            if replay is not None:
+                f.count=lambda:len((root/'spawns.jsonl').read_text().splitlines()) if (root/'spawns.jsonl').exists() else 0
+                def trace(frame,event,arg):
+                    name=frame.f_code.co_name
+                    if event=='return' and name=='_control_listening' or event=='c_call' and getattr(arg,'__name__','')=='sendmsg':
+                        with (root/'controller.jsonl').open('a') as out:
+                            out.write(json.dumps({'event':name if event=='return' else 'sendmsg','value':arg if event=='return' else None,'at':time.monotonic()})+'\n')
+                real_send=signal.pidfd_send_signal
+                def send(fd,sig,*args):
+                    with (root/'signals.jsonl').open('a') as out: out.write(json.dumps({'signal':sig,'at':time.monotonic()})+'\n')
+                    return real_send(fd,sig,*args)
+                prior=sys.getprofile(); sys.setprofile(trace)
+                try:
+                    with patch.object(signal,'pidfd_send_signal',side_effect=send): yield f
+                finally: sys.setprofile(prior)
+            else: yield f
         finally:
             if scope is not None and held is not None:
                 if held.handoff_completed: scope.__exit__(None,None,None)
                 else: scope.__exit__(RuntimeError,RuntimeError('test-only retained disposal'),None)
             for path in root.glob('serving-*.json'):
-                try: os.kill(json.loads(path.read_text())['pid'],signal.SIGTERM)
+                pid=json.loads(path.read_text())['pid']
+                try:
+                    if replay is None: os.kill(pid,signal.SIGTERM)
+                    else:
+                        fd=os.pidfd_open(pid,0)
+                        try:
+                            fresh.need(os.readlink(f'/proc/{pid}/exe') == replay['argv'][0], 'OWNED_APP_CLEANUP_IDENTITY_REQUIRED')
+                            signal.pidfd_send_signal(fd,signal.SIGTERM,None,0)
+                            # Disposal budget only; never changes a protocol deadline.
+                            if not c.select.select([fd],[],[],12)[0]:
+                                signal.pidfd_send_signal(fd,signal.SIGKILL,None,0)
+                                fresh.need(c.select.select([fd],[],[],3)[0], 'OWNED_APP_DISPOSAL_TIMEOUT')
+                        finally: os.close(fd)
                 except ProcessLookupError: pass
+            natural=False
+            if replay is not None and f is not None and f.count():
+                try:
+                    child.wait(timeout=12); natural=True
+                except subprocess.TimeoutExpired: pass
             if child.poll() is None: child.kill()
             out,err=child.communicate(timeout=3)
-            if err and not fault: raise AssertionError(err.decode())
+            if replay is not None and f is not None:
+                end=time.monotonic()+3
+                while any(Path('/proc',str(json.loads(p.read_text())['pid'])).exists() for p in root.glob('serving-*.json')) and time.monotonic()<end:
+                    time.sleep(.01)
+                f.cleanup={'supervisorNaturalExit':natural and child.returncode == 0,'supervisorExit':child.returncode,
+                           'supervisorStderr':err.decode(),
+                           'servingPidsAbsent':all(not Path('/proc',str(json.loads(p.read_text())['pid'])).exists() for p in root.glob('serving-*.json'))}
+            if err and not fault and replay is None: raise AssertionError(err.decode())
 
 
 class PreparedControllerTests(unittest.TestCase):

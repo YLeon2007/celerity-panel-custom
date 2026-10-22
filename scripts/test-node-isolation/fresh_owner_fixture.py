@@ -4,6 +4,9 @@ import os
 from pathlib import Path
 import socket
 import sys
+import fcntl
+import http.client
+import time
 
 import coordinated_restore as c
 import fresh_classic_launch as fresh
@@ -47,14 +50,65 @@ def prepare(f):
     return pins
 
 
+def launch_flock_held(f):
+    with (f.outer.root/'state/launch.lock').open('rb') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return True
+    return False
+
+
+def replay_readback(f):
+    """Read actual proc/protocol witnesses, never fabricate an application writer."""
+    def rows(name):
+        file=f.root/name
+        return [json.loads(line) for line in file.read_text().splitlines()] if file.exists() else []
+    def optional(name): return None if f.fs.absent(name) else f.fs.read_json(name)
+    controller=rows('controller.jsonl'); signals=rows('signals.jsonl')
+    row={'signals':signals,'spawns':rows('spawns.jsonl'),'commitsSent':sum(e['event']=='sendmsg' for e in controller),
+         'flockHeld':launch_flock_held(f),'supervisorState':Path(f'/proc/{f.supervisor.pid}/stat').read_text().rsplit(')',1)[1].split()[0],
+         'commit':optional(c.COMMIT),'attempt':optional(fresh.ATTEMPT),'supervisorJournal':optional(fresh.SUPERVISOR_ATTEMPT),
+         'serving':None}
+    markers=list(f.root.glob('serving-*.json'))
+    if markers:
+        pid=json.loads(markers[0].read_text())['pid']
+        row['serving']={'pid':pid,'start':fresh.start(pid),'exe':os.readlink(f'/proc/{pid}/exe')}
+        if hasattr(f,'bundle'):
+            evidence=Path(f.bundle['evidence']); evidence.mkdir(parents=True,exist_ok=True)
+            for fd,name in ((1,'application.stdout.log'),(2,'application.stderr.log')):
+                try: (evidence/name).write_bytes(Path(f'/proc/{pid}/fd/{fd}').read_bytes())
+                except OSError: pass
+        row['elapsedSincePopen']=time.monotonic()-row['spawns'][0]['at']
+        try: row['serving']['observed']=fresh.observe(pid,'127.0.0.1',f.port)
+        except BaseException as error:
+            row['serving']['observeError']=str(error)
+            return row
+        for name,url in (('ready','/classic-ready'),('health','/health')):
+            conn=http.client.HTTPConnection('127.0.0.1',f.port,timeout=.5)
+            try:
+                conn.request('GET',url); reply=conn.getresponse()
+                row[name]={'status':reply.status,'body':reply.read(65537).decode()}
+            finally: conn.close()
+        observed=rows('observed.jsonl')
+        row['bootSeconds']=observed[0]['at']-row['spawns'][0]['at']
+        listening=next(e for e in controller if e['event']=='_control_listening' and e['value'] is True)
+        row['listenSeconds']=listening['at']-signals[0]['at']
+    return row
+
+
 def main():
     fault = sys.argv[1] if len(sys.argv) > 1 else ''
-    with launch_fixture(fresh, fault=fault or None, bridge=True) as f:
+    bundle = json.loads(sys.argv[2]) if len(sys.argv) > 2 else None
+    with launch_fixture(fresh, fault=fault or None, bridge=True, bundle=bundle) as f:
+        if bundle: f.bundle=bundle
         sock = f.outer.root/'o.sock'
         listener = socket.socket(socket.AF_UNIX); listener.bind(str(sock)); listener.listen(1)
         print(json.dumps({'root':str(f.outer.root), 'socket':str(sock), 'pins':prepare(f),
                           'preparedSupervisor':{'pid':f.supervisor.pid,'start':fresh.start(f.supervisor.pid)},
-                          'proof':f.proof, 'port':f.port}), flush=True)
+                          'proof':f.proof, 'port':f.port,
+                          **({'bundle':{'manifestSha256':bundle['manifestSha256'],'settingsSha256':bundle['settingsSha256']},
+                              'preparedFlockHeld':launch_flock_held(f)} if bundle else {})}), flush=True)
+        if bundle and fault == 'settings-pin-drift':
+            with Path(bundle['settings']).open('ab') as out: out.write(b'\n')  # same JSON, changed exact pinned bytes
         if fault.startswith('guardloss:'):
             node = next(n for n in f.fixtures if n.node == fault.split(':', 1)[1])
             node.put('/fixture-live.json', c.canonical({'held': False, 'candidateFrozen': True}))
@@ -75,17 +129,21 @@ def main():
             else:
                 f.held.complete_fresh_owner()
             print(json.dumps({'count':f.count(),'active':f.held.active,'completed':f.held.handoff_completed,
-                              'commit':f.fs.read_json(c.COMMIT), 'candidateFrozen':all(n.fs.read_json('/fixture-live.json')['candidateFrozen'] for n in f.fixtures)}), flush=True)
+                              'commit':f.fs.read_json(c.COMMIT), 'candidateFrozen':all(n.fs.read_json('/fixture-live.json')['candidateFrozen'] for n in f.fixtures),
+                              **(replay_readback(f) if bundle else {})}), flush=True)
             # Test harness keeps the actual child alive until explicit disposal.
             sys.stdin.readline()
         except BaseException as error:
             f.held.complete_fresh_owner(error)
-            print(json.dumps({'count':f.count(),'error':getattr(error,'code',str(error)),
-                              'candidateFrozen':all(n.fs.read_json('/fixture-live.json')['candidateFrozen'] for n in f.fixtures)}), flush=True)
-            raise
+            print(json.dumps({'count':f.count(),'error':getattr(error,'code',str(error)),'cause':str(error),
+                              'candidateFrozen':all(n.fs.read_json('/fixture-live.json')['candidateFrozen'] for n in f.fixtures),
+                              **(replay_readback(f) if bundle else {})}), flush=True)
+            if bundle: sys.stdin.readline()
+            else: raise
         finally:
             listener.close()
             if fault == 'cleanup': f.held.cleanup_channels = original
+    if bundle: print(json.dumps({'cleanup':f.cleanup}),flush=True)
 
 if __name__ == '__main__':
     main()
