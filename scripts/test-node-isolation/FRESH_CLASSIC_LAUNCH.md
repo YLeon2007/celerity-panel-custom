@@ -114,6 +114,77 @@ inventory are simulated; executable invocation and success are not. Existing
 irreversible and coordinator regression tests are also run. RED and final GREEN
 logs and hashes are recorded in the external `fresh-launch/result.json`.
 
+## Controller-only accepted-netns observation
+
+This is a later **source-only** correction to the reachable `FreshLaunch._run`
+caller, not an installation, publisher or operator architecture decision. The
+reviewed **9e full pack remains frozen**: changed launcher bytes require a NEW,
+later independently reviewed artifact and installation policy. No profile,
+accepted pin, resource-plan producer or previous candidate is updated here.
+
+Before either prepared SIGCONT or COMMIT, the original host-side controller
+retains the fixed `/run/netns/c3-test-fresh-classic` FD, opened through a trusted
+parent with `O_NOFOLLOW|O_CLOEXEC`. It compares `fstat` with the independently
+accepted positive exact-int `networkNamespace.device/inode` in the trusted fixed
+`/var/lib/c3-test-fresh-input/resource-plan.json`; bool/float pins do not qualify.
+The plan's files must equal the accepted policy closure. `NS_GET_NSTYPE` must be
+`CLONE_NEWNET`, the identity must be non-host, and accepted policy net plus live
+accepted supervisor PID/start/net must agree. No scan produces acceptance. Raw
+policy/plan bytes and inode metadata, retained FD, fixed pathname identity and
+supervisor pidfd are checked before/after observation and final confirmation.
+In-memory policy drift is also refusal, not a new acceptance.
+
+Only the root-controller observation is replaced by a fixed probe-only fork.
+There is no callback, executable/path/command dispatcher or new CLI. Before any
+work, it closes every inherited FD except its exact result writer, retained net
+FD and supervisor/serving liveness pidfds, including inherited stdio, SSH/owner/
+lease/lock/hold descriptors. It rechecks root/host PID/mount view, joins ONLY NET,
+and verifies membership and unchanged non-net namespaces BEFORE creating a new
+TCP connection. It then runs the existing unchanged literal listener-inode,
+PID/start/cgroup, owned reverse ESTABLISHED tuple and keepalive HTTP-body proof.
+It neither checks a copied Coordinator nor acts as network holder, signals a
+supervisor, dispatches exec, writes source acceptance, or enters mount/PID/user
+namespaces. The original parent PID/start, five original channels, COMMIT origin,
+path UDS and SCM_RIGHTS dispatch remain host-side. Supervisor `Platform.observe`
+is still direct in its already-fresh namespace: no added root/CAP or resource-plan
+lookup.
+
+Probe IPC is at most 4096 bytes. EOF, malformed/oversize result, nonzero exit,
+timeout, inherited/owned close error and reap uncertainty refuse. IO reserves a
+small portion of the EXISTING minimum wire/Coordinator/all-five deadline for
+owned-child kill/reap; a child timer shares that budget. No deadline is extended.
+A stuck uninterruptible kernel task can yield REAP_UNKNOWN; no unbounded wait or
+success is inferred. Filesystem/proc/close/fsync syscall return latency is not a
+hard real-time guarantee. Strict startup still begins BEFORE Popen with `<deadline`
+and 3 seconds; prepared LISTEN still has 3 seconds, accept still 5 seconds. Wire,
+lease, durable COMMIT/readback, fsync and one-shot rules are unchanged.
+
+Any postexec failure stays `COMMITTED_ACTIVATION_UNKNOWN`, never retry, rollback
+or a success reply. Confirmation is checked on both sides of durable readback;
+retained-FD/lifetime closes must succeed before handoff. On later failure the
+controller latches unconfirmed and attempts to persist an unknown journal. A
+failed fsync may leave the earlier on-disk phase visible: that phase is never
+terminal authority and cannot override the unknown exception/one-shot state.
+
+`test_controller_namespace_probe.py` exercises the actual same-held prepared
+caller with real stopped PID, five fixture channels, UDS, SCM_RIGHTS, fork/pipe,
+FD disposal, reaping, HTTP and proc socket ownership. Namespace topology, nsfs,
+CAP/root/UID and cgroup placement are explicitly MODELED; tests perform no setns,
+mount, Docker, SSH, DNS, live database, route/firewall or service action. Existing
+fixture updates only publish the newly mandatory independently modeled plan and
+real supervisor PID before launch, and supply the fixture-gated kernel boundary;
+no previous assertion or production timeout is weakened. Owner-bridge and
+strict-deadline regressions are separate named tests, not physical evidence.
+The owner-bridge fixture's operator thread triggers Python's fork-from-threaded-
+process DeprecationWarning; its real fork/protocol passes, but this is not a
+claim of general multithreaded fork safety or hard real-time syscall completion.
+
+Independent review is required before parent integration. Real nsfs/setns/CAP,
+privileged fixed literal ingress, independent installation/runtime/resource/lease
+publishers and exclusion, all-five operational acceptance, remote SSH/DNS and
+public ingress remain unexercised. **strict 3s repeatability is NOT proven**.
+No physical acceptance, active TEST/PROD mission or PROD GO is claimed.
+
 ## Bounded review corrections (source only)
 
 Five accepted source blockers are addressed without changing existing sealed

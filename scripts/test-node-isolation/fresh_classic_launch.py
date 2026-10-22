@@ -6,6 +6,11 @@ Platform is the read-only root/kernel inventory boundary; tests explicitly model
 that boundary, never Popen/exec, HTTP, proc socket identity, journals or flocks.
 """
 import array
+import ctypes
+import errno
+import fcntl
+import select
+import signal
 import hashlib
 import http.client
 import json
@@ -203,6 +208,271 @@ def retained_path_identity(path):
             if primary is None: raise
 
 
+RESOURCE_PLAN = '/var/lib/c3-test-fresh-input/resource-plan.json'
+NETNS = '/run/netns/c3-test-fresh-classic'
+_NEWNET = 0x40000000
+_PROBE_LIMIT = 4096
+
+
+def _input_snapshot(fs, path):
+    # Trusted descriptor walk; retain raw bytes AND identity, not JSON equality
+    # (which admits true/1). Replacements with identical bytes also refuse.
+    with fs.opened(path) as fd:
+        before=os.fstat(fd)
+        need(before.st_size <= 8388608, 'CONTROLLER_INPUT_LIMIT')
+        raw=os.pread(fd,8388609,0); after=os.fstat(fd)
+        fields=('st_dev','st_ino','st_mode','st_uid','st_gid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        identity=tuple(getattr(before,k) for k in fields)
+        need(len(raw) == before.st_size and len(raw) <= 8388608 and
+             identity == tuple(getattr(after,k) for k in fields),
+             'CONTROLLER_INPUT_DRIFT')
+        return raw,identity
+
+
+class _ControllerNamespace:
+    """Private fixed read-only probe boundary, never an owner or constructor.
+
+    No callbacks/commands/paths from requests, environment, policy or CLI. Only
+    the fixture-gated Platform injection can model kernel facts in local tests.
+    """
+    def __init__(self, fs, policy):
+        self.fs=fs; self.policy=policy; self.fd=None; self.supervisor_fd=None
+        self.serving_fd=None; self.serving=None
+
+    def _host(self):
+        need(os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 0,
+             'ROOT_CONTROLLER_PROBE_REQUIRED')
+        for ns in ('pid','mnt','net'):
+            need(os.readlink('/proc/self/ns/'+ns) == os.readlink('/proc/1/ns/'+ns),
+                 'HOST_CONTROLLER_VIEW_REQUIRED')
+
+    def _host_net(self):
+        return os.readlink('/proc/1/ns/net')
+
+    def _open_net(self):
+        fd=None
+        try:
+            with self.fs.opened('/run/netns',directory=True) as parent:
+                fd=os.open('c3-test-fresh-classic',os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+            return fd
+        except BaseException as primary:
+            # Own the leaf even if directory-context disposal fails AFTER open.
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error:
+                    primary.cleanup_errors=(*getattr(primary,'cleanup_errors',()),error)
+            raise
+
+    def _type(self):
+        return fcntl.ioctl(self.fd,0xb703)  # NS_GET_NSTYPE also proves nsfs
+
+    def _net(self, pid):
+        info=os.stat('/proc/'+str(pid)+'/ns/net')
+        return info.st_dev,info.st_ino
+
+    def _join(self):
+        libc=ctypes.CDLL(None,use_errno=True)
+        if libc.setns(self.fd,_NEWNET) != 0:
+            raise OSError(ctypes.get_errno(),'CONTROLLER_NET_SETNS_REFUSED')
+
+    def _serving_group(self):
+        return '0::'+CGROUP
+
+    def _observe(self, pid):
+        return observe(pid,'212.119.42.100',3000)  # existing literal proof unchanged
+
+    def acquire(self):
+        self._host()
+        self.inputs={path:_input_snapshot(self.fs,path) for path in (POLICY,RESOURCE_PLAN)}
+        self.policy_bytes=c.canonical(self.policy)
+        need(c.canonical(c.decode(self.inputs[POLICY][0])) == self.policy_bytes,
+             'ACCEPTED_FRESH_POLICY_DRIFT')
+        plan=c.decode(self.inputs[RESOURCE_PLAN][0])
+        need(type(plan) is dict and set(plan) == {'version','context','files','networkNamespace'} and
+             type(plan['version']) is int and plan['version'] == 1 and
+             plan['context'] == 'test.infograd.online' and
+             c.canonical(plan['files']) == c.canonical(self.policy['files']),
+             'ACCEPTED_RESOURCE_PLAN_REQUIRED')
+        pin=plan['networkNamespace']
+        need(type(pin) is dict and set(pin) == {'device','inode'} and
+             all(type(pin[k]) is int and pin[k] > 0 for k in pin), 'ACCEPTED_NETNS_PIN_REQUIRED')
+        self.identity=(pin['device'],pin['inode'])
+        self.fd=self._open_net()
+        supervisor=self.policy['inventory']['supervisor']
+        self.supervisor_fd=os.pidfd_open(supervisor['pid'],0)
+        self.check()
+        return self
+
+    def check(self):
+        self._host()
+        need(c.canonical(self.policy) == self.policy_bytes, 'CONTROLLER_POLICY_MEMORY_DRIFT')
+        need(all(_input_snapshot(self.fs,path) == value for path,value in self.inputs.items()),
+             'CONTROLLER_ACCEPTED_INPUT_DRIFT')
+        info=os.fstat(self.fd)
+        need((info.st_dev,info.st_ino) == self.identity and
+             info.st_uid == self.fs.uid and info.st_gid == self.fs.gid and not info.st_mode & 0o022 and
+             self._type() == _NEWNET and
+             self.identity != self._net(1), 'ACCEPTED_PRIVATE_NETNS_REQUIRED')
+        # Opening is never authority: the fixed path must still name the retained
+        # accepted object, but is NEVER substituted for the retained FD.
+        other=self._open_net(); primary=None
+        try:
+            now=os.fstat(other)
+            need((now.st_dev,now.st_ino) == self.identity,'ACCEPTED_NETNS_REPLACED')
+        except BaseException as error:
+            primary=error; raise
+        finally:
+            try: os.close(other)
+            except BaseException as error:
+                if primary is None: raise
+                primary.cleanup_errors=(*getattr(primary,'cleanup_errors',()),error)
+        supervisor=self.policy['inventory']['supervisor']
+        need(not select.select([self.supervisor_fd],[],[],0)[0] and
+             start(supervisor['pid']) == supervisor['start'] and
+             self._net(supervisor['pid']) == self.identity and
+             self.policy['inventory']['namespaces']['net'] == f'net:[{self.identity[1]}]' and
+             self.policy['inventory']['hostNamespaces']['net'] == self._host_net(),
+             'ACCEPTED_SUPERVISOR_NETNS_DRIFT')
+        self._serving_identity()
+
+    def bind_serving(self, expected):
+        self.serving=dict(expected)
+        self.serving_fd=os.pidfd_open(expected['pid'],0)
+        self._serving_identity()
+
+    def _serving_identity(self):
+        if self.serving is None: return
+        pid=self.serving['pid']
+        need(not select.select([self.serving_fd],[],[],0)[0] and
+             start(pid) == self.serving['start'] and self._net(pid) == self.identity and
+             (Path('/proc')/str(pid)/'cgroup').read_text().strip() == self._serving_group(),
+             'SERVING_IDENTITY_DRIFT')
+
+    def child_observe(self, pid, expected):
+        # Inherited authority descriptors have already closed. No fs/h/lease
+        # method is called here; this is observation, not fresh acceptance.
+        self._host()
+        need(not select.select([self.supervisor_fd],[],[],0)[0], 'PROBE_SUPERVISOR_LOST')
+        before={ns:os.readlink('/proc/self/ns/'+ns) for ns in ('pid','mnt','user','ipc','uts','cgroup')}
+        info=os.fstat(self.fd)
+        need((info.st_dev,info.st_ino) == self.identity and self._type() == _NEWNET,
+             'RETAINED_PROBE_NETNS_DRIFT')
+        self._join()
+        need(self._net('self') == self.identity and
+             before == {ns:os.readlink('/proc/self/ns/'+ns) for ns in before},
+             'PROBE_NET_MEMBERSHIP_REQUIRED')
+        self._serving_identity()
+        need(self._net(pid) == self.identity, 'SERVING_NETNS_DRIFT')
+        result=self._observe(pid)
+        self._serving_identity()
+        need(self._net(pid) == self.identity and result == expected and
+             result['cgroup'] == self._serving_group() and
+             result['bodySha256'] == self.policy['ingress']['bodySha256'], 'ACTUAL_SERVING_REQUIRED')
+        return result
+
+    def close(self):
+        errors=[]
+        for name in ('fd','supervisor_fd','serving_fd'):
+            fd=getattr(self,name); setattr(self,name,None)
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error: errors.append(error)
+        if errors: raise errors[0]
+
+
+def _probe_child(target, writer, pid, expected, deadline):
+    # fork inherits ALL root authority, including OFD flocks and pipe writers.
+    # Close it before setns/TCP, not just on exec (this child never execs).
+    status=1
+    try:
+        def expired(*_): raise c.Refusal('CONTROLLER_PROBE_TIMEOUT')
+        signal.signal(signal.SIGALRM,expired)
+        remaining=deadline-time.monotonic()
+        need(remaining > 0,'CONTROLLER_PROBE_TIMEOUT')
+        signal.setitimer(signal.ITIMER_REAL,remaining)
+        keep={writer,target.fd,target.supervisor_fd,target.serving_fd}
+        fds=[int(x) for x in os.listdir('/proc/self/fd')]
+        for fd in fds:
+            if fd in keep: continue
+            try: os.fstat(fd)
+            except OSError as error:
+                if error.errno == errno.EBADF: continue  # closed fd-directory iterator
+                raise
+            os.close(fd)  # close errors are refusal, never a success frame
+        result=target.child_observe(pid,expected)
+        target.close()  # checked owned-fd disposal BEFORE publishing success
+        raw=c.canonical(result)
+        need(len(raw) <= _PROBE_LIMIT, 'PROBE_RESULT_LIMIT')
+        need(os.write(writer,raw) == len(raw), 'PROBE_WRITE_UNKNOWN')
+        os.close(writer); status=0
+    except BaseException:
+        pass  # bounded EOF/nonzero status, no untrusted exception serialization
+    os._exit(status)
+
+
+def _controller_observe(target, expected, held, deadline):
+    need(type(expected) is dict and set(expected) == {'pid','start','cgroup','socketInode','bodySha256'} and
+         type(expected['pid']) is int and expected['pid'] > 0 and
+         all(type(expected[k]) is str for k in ('start','cgroup','socketInode','bodySha256')),
+         'EXACT_SERVING_RESULT_REQUIRED')
+    target.bind_serving(expected)
+    target.check(); held.check()
+    # Reserve cleanup inside (never after) the enclosing wire/hold budget.
+    # A stuck kernel task can still refuse REAP_UNKNOWN; no unbounded wait.
+    now=time.monotonic()
+    io_deadline=deadline-min(.1,max(0,(deadline-now)/4))
+    reader,writer=os.pipe2(os.O_CLOEXEC|os.O_NONBLOCK); child=None; reaped=False; primary=None
+    try:
+        need(time.monotonic() < deadline,'CONTROLLER_PROBE_TIMEOUT')
+        child=os.fork()
+        if child == 0: _probe_child(target,writer,expected['pid'],expected,io_deadline)
+        os.close(writer); writer=None
+        raw=b''
+        while True:
+            remaining=io_deadline-time.monotonic()
+            need(remaining > 0,'CONTROLLER_PROBE_TIMEOUT')
+            ready=select.select([reader,*held.watch()],[],[],remaining)[0]
+            need(ready and all(fd == reader for fd in ready),'CONTROLLER_PROBE_HOLD_LOST')
+            part=os.read(reader,_PROBE_LIMIT+1-len(raw)); raw+=part
+            need(len(raw) <= _PROBE_LIMIT,'PROBE_RESULT_LIMIT')
+            if not part: break
+        while True:
+            got,status=os.waitpid(child,os.WNOHANG)
+            if got: reaped=True; break
+            need(time.monotonic() < io_deadline,'CONTROLLER_PROBE_REAP_TIMEOUT')
+            time.sleep(min(.001,max(0,io_deadline-time.monotonic())))
+        need(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0,'CONTROLLER_PROBE_FAILED')
+        result=c.decode(raw)
+        need(c.canonical(result) == c.canonical(expected),'CONTROLLER_PROBE_RESULT_REFUSED')
+        target.check(); held.check()
+        need(time.monotonic() < deadline,'CONTROLLER_PROBE_TIMEOUT')
+        return result
+    except BaseException as error:
+        primary=error; raise
+    finally:
+        errors=[]
+        if child and not reaped:
+            try: os.kill(child,signal.SIGKILL)
+            except ProcessLookupError: pass
+            except BaseException as error: errors.append(error)
+            # No unbounded wait, even on a stuck kernel task. Only this exact
+            # owned child is signaled; never the serving/supervisor processes.
+            try:
+                while True:
+                    got,_=os.waitpid(child,os.WNOHANG)
+                    if got: break
+                    need(time.monotonic() < deadline,'CONTROLLER_PROBE_REAP_UNKNOWN')
+                    time.sleep(min(.001,max(0,deadline-time.monotonic())))
+            except BaseException as error: errors.append(error)
+        for fd in (reader,writer):
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error: errors.append(error)
+        if errors:
+            if primary is None: raise errors[0]
+            primary.cleanup_errors=(*getattr(primary,'cleanup_errors',()),*errors)
+
+
 class Platform:
     """Read-only enforcement, NOT construction or attestation from a receipt.
 
@@ -349,6 +619,9 @@ class Platform:
                  'FRESH_ANONYMOUS_STDIO_REQUIRED')
         need(start(pid) == policy['inventory']['supervisor']['start'], 'ACCEPTED_SUPERVISOR_REQUIRED')
 
+    def controller_namespace(self, fs, policy):
+        return _ControllerNamespace(fs,policy)
+
     def endpoint(self, policy):
         return policy['ingress']['ip'],policy['ingress']['port']
 
@@ -460,7 +733,8 @@ class FreshLaunch:
 
     def _run(self, proof, *, prepared):
         need(not self.used, 'FRESH_LAUNCH_REPLAY_FORBIDDEN'); self.used=True
-        h=self.held; fs=h.fs; conn=None; primary=None; lifetime=None
+        h=self.held; fs=h.fs; conn=None; primary=None; lifetime=None; target=None
+        confirmation_attempted=False
         try:
             h.check(); settlement(h,proof)
             need(not h.commit_attempted and all(fs.absent(p) and fs.absent(p+'.next')
@@ -477,6 +751,9 @@ class FreshLaunch:
                 need(globals().get('_LOADED_SOURCE_SHA256') == policy['files'].get(c.FRESH) and
                      policy['files'].get(c.SELF) == policy['inventory']['sourceSha256'],
                      'EXECUTED_FRESH_SOURCE_DRIFT')
+            target=self.platform.controller_namespace(fs,policy)
+            target.acquire()  # BEFORE resume or irreversible COMMIT
+            if prepared:
                 lifetime=self._resume_prepared(policy)
             conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); conn.settimeout(3); conn.connect(self.path)
             pid,uid,_=struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
@@ -492,6 +769,7 @@ class FreshLaunch:
             h.check()
             if prepared:
                 need(c.canonical(fs.read_json(POLICY)) == c.canonical(policy), 'ACCEPTED_FRESH_POLICY_DRIFT')
+            target.check(); h.check()
             row={'version':1,'context':h.config['context'],'nonce':h.nonce,
                  'configSha256':c.sha(c.canonical(h.config)), 'restoreIntent':h.intent,
                  'nodePins':h.config['nodes'], 'nodePeers':{x.node:{'pid':x.hello['pid'],'start':x.hello['start']} for x in h.nodes},
@@ -509,10 +787,20 @@ class FreshLaunch:
                 need(conn.sendmsg([raw],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[fd]))]) == len(raw), 'EXEC_DISPATCH_UNKNOWN')
             reply=wire.receive(h.watch())
             need(set(reply) == {'op','serving'} and reply['op'] == 'serving', 'EXEC_RESULT_UNKNOWN')
-            serving=self.platform.observe(policy,reply['serving']['pid'])
+            deadline=min(h.deadline,wire.deadline,*(x.wire.deadline for x in h.nodes))
+            serving=_controller_observe(target,reply['serving'],h,deadline)
             need(serving == reply['serving'] and serving['bodySha256'] == policy['ingress']['bodySha256'], 'ACTUAL_SERVING_REQUIRED')
-            h.check(); attempt.update(phase='confirmed',serving=serving)
+            target.check(); h.check()
+            need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
+            attempt.update(phase='confirmed',serving=serving)
+            confirmation_attempted=True
             fs.atomic(ATTEMPT,c.canonical(attempt)); need(fs.read_json(ATTEMPT) == attempt,'CONFIRMATION_FSYNC_UNKNOWN')
+            target.check(); h.check()
+            need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
+            if lifetime is not None:
+                fd=lifetime; lifetime=None; os.close(fd)
+            target.close(); target=None
+            need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
             h.activation_confirmed=True; h.finish_handoff()
             wire.send({'op':'complete','commitSha256':h.commit_sha})
             need(wire.receive() == {'op':'complete-ack'}, 'SUPERVISOR_COMPLETION_UNKNOWN')
@@ -520,7 +808,15 @@ class FreshLaunch:
             return {'code':'COMMITTED_FRESH_ACTIVATION_CONFIRMED','activationSet':ACTIVATION,
                     'candidate':'closed','serving':serving}
         except BaseException as error:
-            primary=error; error.code=h.failure_code(); raise
+            primary=error; error.code=h.failure_code()
+            if h.commit_sha and confirmation_attempted:
+                # A prior confirmation write is not a terminal success if any
+                # subsequent identity/close/hold/ack boundary fails. No rollback.
+                h.activation_confirmed=False
+                try: fs.atomic(ATTEMPT,c.canonical({'commitSha256':h.commit_sha,'phase':'committed-activation-unknown','serving':None}))
+                except BaseException as cleanup:
+                    error.cleanup_errors=(*getattr(error,'cleanup_errors',()),cleanup)
+            raise
         finally:
             try:
                 c.dispose_socket(conn,h.failure_code(),primary)
@@ -528,13 +824,18 @@ class FreshLaunch:
                 primary=primary or error
                 raise
             finally:
+                errors=[]
+                if target is not None:
+                    try: target.close()
+                    except BaseException as error: errors.append(error)
                 if lifetime is not None:
                     try: os.close(lifetime)
-                    except BaseException as error:
-                        failure=primary if primary is not None else error
-                        failure.code=h.failure_code()
-                        failure.cleanup_errors=(*getattr(failure,'cleanup_errors',()),error)
-                        if primary is None: raise
+                    except BaseException as error: errors.append(error)
+                if errors:
+                    failure=primary if primary is not None else errors[0]
+                    failure.code=h.failure_code()
+                    failure.cleanup_errors=(*getattr(failure,'cleanup_errors',()),*errors)
+                    if primary is None: raise failure
 
 
 class SupervisorFiles:

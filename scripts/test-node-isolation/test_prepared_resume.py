@@ -336,7 +336,8 @@ m.supervise(listener,Paused(bootstrap['files']),Simulated(),fault=sys.argv[4] or
             policy['inventory']['supervisor']={'pid':child.pid,'start':fresh.start(child.pid)}
             policy['inventory']['fdPins']={leaf.name:[(s:=leaf.stat()).st_dev,s.st_ino,stat.S_IFMT(s.st_mode)]
                                           for leaf in Path(f'/proc/{child.pid}/fd').iterdir()}
-            outer.fs.atomic(fresh.POLICY,c.canonical(policy))
+            from test_controller_namespace_probe import install_modeled_namespace, modeled_namespace
+            install_modeled_namespace(fresh,outer.fs,policy,child.pid)
             class Simulated(fresh.Platform):
                 def supervisor(self,p,pid):
                     fresh.need(p['inventory']['supervisor']=={'pid':pid,'start':fresh.start(pid)},'ACCEPTED_SUPERVISOR_REQUIRED')
@@ -347,6 +348,7 @@ m.supervise(listener,Paused(bootstrap['files']),Simulated(),fault=sys.argv[4] or
                     fresh.need(p==outer.fs.read_json(fresh.POLICY),'SUPERVISOR_POLICY_DRIFT')
                     actual={leaf.name:[(s:=leaf.stat()).st_dev,s.st_ino,stat.S_IFMT(s.st_mode)] for leaf in Path(f'/proc/{pid}/fd').iterdir()}
                     fresh.need(actual==p['inventory']['fdPins'],'INDEPENDENT_FRESH_DESCRIPTOR_PINS_REQUIRED')
+                def controller_namespace(self, fs, policy): return modeled_namespace(fresh,fs,policy,port)
                 def observe(self,p,pid): return fresh.observe(pid,'127.0.0.1',port)
             scope=c.Coordinator(outer.config,outer.fs,outer.spawn,origin=outer.origin).restore_scope()
             held=scope.__enter__()

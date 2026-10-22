@@ -154,6 +154,8 @@ from pathlib import Path
 import fresh_classic_launch as m
 import test_node_originals as t
 root=Path(sys.argv[1]); fs=t.n.Files(t.n.Fixture(root,os.getuid(),os.getgid(),None))
+import time
+while not (root/'fresh/namespace-ready').exists(): time.sleep(.005)
 p=fs.read_json(m.POLICY)
 class Simulated(m.Platform):
  checks=0
@@ -190,12 +192,16 @@ m.supervise(listener,fs,Simulated(),fault=sys.argv[5] or None)
         supervisor = subprocess.Popen([sys.executable,'-B','-c',code,str(outer.root),str(listener.fileno()),shutil.which('node'),str(port),fault or '', 'bridge' if bridge else '', startup_fault or ''],
             cwd=HERE, pass_fds=(listener.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         listener.close()
+        from test_controller_namespace_probe import install_modeled_namespace, modeled_namespace
+        install_modeled_namespace(m,outer.fs,policy,supervisor.pid)
+        (root/'namespace-ready').write_bytes(b'fixture publication complete')
         class Simulated(m.Platform):
             def check(self, policy):
                 m.verify_files(policy,lambda name: shutil.which('node') if name=='/runtime/node' else (outer.root/name.lstrip('/') if name==c.FRESH else root/('index.js' if name=='/app/index.js' else 'settings.json')))
             def supervisor(self, policy, pid):
                 self.check(policy)
                 return {'pid':pid, 'start':m.start(pid)}
+            def controller_namespace(self, fs, policy): return modeled_namespace(m,fs,policy,port)
             def endpoint(self, policy): return '127.0.0.1',port
             def observe(self, policy, pid): return m.observe(pid, '127.0.0.1',port)
         f=types.SimpleNamespace(fs=outer.fs,root=root,port=port,supervisor=supervisor,fixtures=outer.fixtures)
