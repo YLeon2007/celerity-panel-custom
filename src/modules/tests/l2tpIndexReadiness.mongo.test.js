@@ -88,6 +88,21 @@ test('real Mongo: all 15 public model schemas automatically build each of 27 req
     assert.equal(commands.slice(before).filter(c => c.name === 'listIndexes').length, 15);
 }));
 
+test('real Mongo: disabled automatic flags still build and prove all 15 public schemas and 27 indexes', async () => isolated(async (db, commands) => {
+    const source = require('../relay-l2tp').registerModels();
+    const models = Object.fromEntries(Object.entries(source).map(([name, m]) => {
+        const schema = m.schema.clone(); schema.set('autoCreate', false); schema.set('autoIndex', false);
+        return [name, db.model(name, schema)];
+    }));
+    await Promise.all(Object.values(models).map(m => m.init()));
+    assert.deepEqual(await db.db.listCollections().toArray(), []);
+    await ensureL2tpModelIndexes({ loadModels: () => models });
+    assert.equal(commands.filter(c => c.name === 'create').length, 15);
+    assert.equal(commands.filter(c => c.name === 'createIndexes').length, 27);
+    assert.equal(commands.filter(c => c.name === 'listIndexes').length, 30, 'absent read then complete reread for each model');
+    for (const m of Object.values(models)) prove(m, await m.collection.indexes());
+}));
+
 test('real Mongo: disabled automatic DDL and absent namespace still build and reread every required index', async () => isolated(async (db, commands) => {
     const m = model(db, { autoCreate: false, autoIndex: false }); await m.init();
     assert.equal((await db.db.listCollections().toArray()).length, 0);
