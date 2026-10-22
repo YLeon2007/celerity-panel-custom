@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+from unittest.mock import patch
 import os
 from pathlib import Path
 import unittest
@@ -211,5 +212,82 @@ class FullArtifactAdversarialTests(unittest.TestCase):
         self.assertEqual(r.returncode,2)
         self.assertEqual(r.stderr,b'REFUSAL OUTPUT_EXISTS\n')
         self.assertIs(product.verify_pack(str(PACK))['operationalGO'],False)
+
+
+class FullArtifactPublicationFaultTests(unittest.TestCase):
+    """Only IO fault injection; no acceptance pin/source/profile replacement."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='fixed9e-publication-',dir=SCRATCH)
+        self.output=Path(self.temp.name)/'pack'
+
+    def tearDown(self):self.temp.cleanup()
+
+    def build(self):return product.build(str(REPO),str(CANDIDATE),str(self.output))
+
+    def absent(self):
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(Path(self.temp.name).glob('.pack.partial-*')),[])
+
+    def test_actual_noreplace_preserves_racing_empty_destination(self):
+        original=product.publish_noreplace
+        winner=[]
+        def race(parent,stage,target):
+            self.output.mkdir(mode=0o700)
+            winner.append(self.output.stat().st_ino)
+            return original(parent,stage,target)
+        with patch.object(product,'publish_noreplace',race):
+            with self.assertRaisesRegex(product.Refusal,'^OUTPUT_EXISTS$'):self.build()
+        self.assertEqual(self.output.stat().st_ino,winner[0])
+        self.assertEqual(list(self.output.iterdir()),[])
+        self.assertEqual(list(Path(self.temp.name).glob('.pack.partial-*')),[])
+
+    def test_actual_partial_report_fault_never_publishes(self):
+        original=product.write_file
+        def fault(fd,name,raw,mode=0o600):
+            original(fd,name,raw,mode)
+            if name=='report.json':raise OSError('private-fault-text-never-returned')
+        with patch.object(product,'write_file',fault):
+            with self.assertRaisesRegex(product.Refusal,'^PACK_BUILD_REFUSED$'):self.build()
+        self.absent()
+
+    def test_actual_directory_durability_fault_never_publishes(self):
+        original=product.fsync_tree
+        def fault(fd):
+            original(fd)
+            raise OSError('private-fault-text-never-returned')
+        with patch.object(product,'fsync_tree',fault):
+            with self.assertRaisesRegex(product.Refusal,'^PACK_BUILD_REFUSED$'):self.build()
+        self.absent()
+
+    def test_actual_postrename_parent_fsync_fault_retains_unknown_output(self):
+        original=os.fsync
+        parent=Path(self.temp.name).stat()
+        def fault(fd):
+            st=os.fstat(fd)
+            if (st.st_dev,st.st_ino)==(parent.st_dev,parent.st_ino):
+                raise OSError('private-durability-fault')
+            return original(fd)
+        with patch.object(os,'fsync',fault):
+            with self.assertRaisesRegex(product.Refusal,'^PACK_PUBLICATION_DURABILITY_OR_READBACK_UNKNOWN$'):self.build()
+        self.assertTrue(self.output.is_dir())
+        self.assertIs(product.verify_pack(str(self.output))['operationalGO'],False)
+
+    def test_actual_lost_rename_reply_retains_unknown_output(self):
+        original=product.publish_noreplace
+        def fault(parent,stage,target):
+            original(parent,stage,target)
+            raise OSError('lost-reply')
+        with patch.object(product,'publish_noreplace',fault):
+            with self.assertRaisesRegex(product.Refusal,'^PACK_PUBLICATION_DURABILITY_OR_READBACK_UNKNOWN$'):self.build()
+        self.assertIs(product.verify_pack(str(self.output))['physicalAccepted'],False)
+
+    def test_actual_published_readback_fault_retains_unknown_output(self):
+        original=product.verify_pack_fd
+        def fault(fd):
+            if self.output.exists():raise product.Refusal('INJECTED_READBACK_REFUSAL')
+            return original(fd)
+        with patch.object(product,'verify_pack_fd',fault):
+            with self.assertRaisesRegex(product.Refusal,'^PACK_PUBLICATION_DURABILITY_OR_READBACK_UNKNOWN$'):self.build()
+        self.assertIs(product.verify_pack(str(self.output))['operationalGO'],False)
 
 if __name__=='__main__':unittest.main()
