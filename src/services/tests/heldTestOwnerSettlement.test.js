@@ -201,7 +201,7 @@ async function actualBundle(t, name) {
     const candidate=await fsp.realpath(process.env.C3_ACTUAL_CANDIDATE), root=path.join(candidate,'root');
     const manifestRaw=await fsp.readFile(path.join(candidate,'manifest.json')), manifest=JSON.parse(manifestRaw);
     // Explicitly repinned NEW cold-start candidate; the prior payload is unchanged.
-    assert.equal(sha(manifestRaw),'b3870ac83f0b4f8b2378a481580e91fc835a416432cd0c3dc6d137681f5c65af');
+    assert.equal(sha(manifestRaw),'4f281375e1a1bae4621961e89ca80d6d41b0f9922dc35565e60bc8185ea2cbb6');
     const inventory=async()=>{
         const result={};
         async function walk(dir) { for(const entry of await fsp.readdir(dir,{withFileTypes:true})) {
