@@ -200,7 +200,8 @@ async function actualBundle(t, name) {
     assert.ok(process.env.C3_ACTUAL_CANDIDATE); assert.ok(process.env.C3_REDIS_SERVER); assert.ok(process.env.C3_REAL_EVIDENCE);
     const candidate=await fsp.realpath(process.env.C3_ACTUAL_CANDIDATE), root=path.join(candidate,'root');
     const manifestRaw=await fsp.readFile(path.join(candidate,'manifest.json')), manifest=JSON.parse(manifestRaw);
-    assert.equal(sha(manifestRaw),'b9793014e4fda7a53034394f2d02a077d645b49af9d08e70679e13ce85a614f6');
+    // Explicitly repinned NEW cold-start candidate; the prior payload is unchanged.
+    assert.equal(sha(manifestRaw),'625328a995d52aed8fcfa9b3fb3e431478584d92a489727060fe59d5a15fc2bd');
     const inventory=async()=>{
         const result={};
         async function walk(dir) { for(const entry of await fsp.readdir(dir,{withFileTypes:true})) {
