@@ -166,11 +166,47 @@ class Wire:
             need(part, 'CHANNEL_EOF_RETAINED')
             self.buffer += part
             need(len(self.buffer) <= 131072, 'FRAME_LIMIT_RETAINED')
+        return self._frame()
+
+    def _frame(self):
         raw, self.buffer = self.buffer.split(b'\n', 1)
         need(not self.buffer, 'PIPELINED_FRAME_RETAINED')
         value = decode(raw)
         need(isinstance(value, dict))
         return value
+
+    @staticmethod
+    def receive_many(wires):
+        """One reply per pending wire; completed peers remain loss watchers.
+
+        Read only ready descriptors, one bounded chunk at a time: a partial
+        frame must never hide EOF or an unsolicited frame on another channel.
+        Every original deadline bounds the entire round, including completed
+        peers. Yield immediately so the ordinary verifier rejects bad proofs
+        before waiting for a different silent peer.
+        """
+        pending = {wire.reader: wire for wire in wires}
+        need(len(pending) == len(wires) and pending)
+        need(all(not wire.buffer for wire in wires), 'PIPELINED_FRAME_RETAINED')
+        completed = []
+        while pending:
+            remaining = min(wire.deadline for wire in wires) - time.monotonic()
+            need(remaining > 0, 'CHANNEL_TIMEOUT_RETAINED')
+            ready, _, _ = select.select([*pending, *completed], [], [], min(remaining, .25))
+            need(not any(fd in ready for fd in completed), 'OTHER_CHANNEL_LOST_RETAINED')
+            for fd in ready:
+                wire = pending[fd]
+                part = os.read(fd, 131073)
+                need(part, 'CHANNEL_EOF_RETAINED')
+                wire.buffer += part
+                need(len(wire.buffer) <= 131072, 'FRAME_LIMIT_RETAINED')
+                if b'\n' in wire.buffer:
+                    value = wire._frame()
+                    del pending[fd]
+                    completed.append(fd)
+                    yield wire, value
+        for wire in wires:
+            wire.quiet()
 
     def quiet(self):
         need(not self.buffer and not select.select([self.reader], [], [], 0)[0], 'CHANNEL_LOST_OR_UNSOLICITED_RETAINED')
@@ -315,6 +351,12 @@ class Channel:
         self.request('open', watch)
 
     def request(self, op, watch, *, commit_sha=None):
+        frame = self._send_request(op, commit_sha=commit_sha)
+        if op == 'release':
+            return
+        return self._validate_reply(frame, self.wire.receive(watch))
+
+    def _send_request(self, op, *, commit_sha=None):
         need(self.hello is not None and self.process.poll() is None, 'NODE_PROCESS_LOST_RETAINED')
         assert self.hello is not None
         frame = {'version': 1, 'op': op, 'nodeId': self.node, 'nodeNonce': self.hello['nodeNonce'],
@@ -323,9 +365,11 @@ class Channel:
             need((op != 'activate-classic' or self.node == SHARED_NODE) and isinstance(commit_sha, str) and DIGEST.fullmatch(commit_sha))
             frame['commitSha256'] = commit_sha
         self.wire.send(frame)
-        if op == 'release':
-            return
-        reply = self.wire.receive(watch)
+        return frame
+
+    def _validate_reply(self, frame, reply):
+        assert self.hello is not None
+        op = frame['op']
         need(set(reply) == set(frame) | {'pinSha256', 'guardSha256', 'restored', 'operator', 'pid', 'start'})
         need(type(reply['version']) is int and type(reply['seq']) is int and type(reply['pid']) is int)
         need({k: reply[k] for k in frame} == {**frame, 'op': op + '-held'} and
@@ -436,12 +480,24 @@ class Coordinator:
             need(c.process.poll() is None, 'NODE_PROCESS_LOST_RETAINED')
             c.wire.quiet()
 
+    def _check_channels(self, channels):
+        """Parallelize read-only checks only; effects/releases stay sequential."""
+        try:
+            frames = {channel.wire: (channel, channel._send_request('check')) for channel in channels}
+            for wire, reply in Wire.receive_many(list(frames)):
+                channel, frame = frames[wire]
+                channel._validate_reply(frame, reply)
+            for channel in channels:
+                need(channel.process.poll() is None, 'NODE_PROCESS_LOST_RETAINED')
+        except BaseException:
+            self.active = False
+            raise
+
     def check(self):
         try:
             self.live()
             need(len(self.nodes) == 5, 'EXACT_FIVE_ACTIVE_HOLDS_REQUIRED')
-            for channel in self.nodes:
-                channel.request('check', self.watch(channel))
+            self._check_channels(self.nodes)
             self.live()
         except BaseException:
             self.active = False
@@ -505,8 +561,7 @@ class Coordinator:
         self.check()
         for index, channel in enumerate(self.nodes):
             remaining = self.nodes[index:]
-            for other in remaining:
-                other.request('check', [c.wire.reader for c in remaining if c is not other])
+            self._check_channels(remaining)
             # Explicit committed transition, never reacquire a released OFD.
             channel.request('release', [])
             need(channel.process.wait(timeout=3) == 0, 'COMMITTED_ACTIVATION_UNKNOWN')
