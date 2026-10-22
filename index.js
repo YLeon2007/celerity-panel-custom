@@ -54,6 +54,52 @@ async function connectMongo(retries = 5, delayMs = 3000) {
     }
 }
 
+// Bootstrap can fail after connect has already admitted automatic Model.init
+// work, but before the runtime lifecycle has started. Its stop() alone cannot
+// join that DDL. Keep this local drain bounded just like the runtime shutdown.
+const BOOTSTRAP_DRAIN_DEADLINE_MS = 30 * 60 * 1000;
+let bootstrapDrainPromise;
+function drainBootstrap(failed = false) {
+    if (bootstrapDrainPromise !== undefined) return bootstrapDrainPromise;
+    // Mongoose 8.24.1 caches every admitted init in $init, and deletes it on
+    // disconnect. Snapshot NOW, including models imported during async route
+    // assembly. Never call init() here: dormant models must not start new DDL.
+    const admittedInits = Object.values(mongoose.models).map(model => model.$init).filter(Boolean);
+    let expired = false;
+    const deadline = setTimeout(() => {
+        expired = true;
+        logger.error('[Server] Bootstrap drain deadline exceeded; admitted schema/runtime completion is uncertain. Retain durable admissions/locks for authoritative recovery.');
+        process.exit(1);
+    }, BOOTSTRAP_DRAIN_DEADLINE_MS);
+    bootstrapDrainPromise = Promise.resolve().then(async () => {
+        const [inits, runtime] = await Promise.allSettled([
+            Promise.allSettled(admittedInits),
+            Promise.resolve().then(() => l2tpRootLifecycle.stop()),
+        ]);
+        if (expired) return;
+        const rejectedInit = inits.value.find(result => result.status === 'rejected');
+        if (rejectedInit) {
+            failed = true;
+            logger.error('[Server] Admitted schema initialization failed during bootstrap drain:', rejectedInit.reason);
+        }
+        if (runtime.status === 'rejected') throw runtime.reason;
+        if (runtime.value?.drainUncertain === true) {
+            failed = true;
+            logger.error('[Server] Bootstrap runtime drain joined with unresolved ownership; retain durable admissions/locks for authoritative recovery.');
+        }
+        await mongoose.disconnect();
+        if (!expired) process.exit(failed ? 1 : 0);
+    }).catch(error => {
+        if (expired) return;
+        logger.error('[Server] Bootstrap drain failed; completion is uncertain; retain durable admissions/locks:', error);
+        process.exit(1);
+    }).finally(() => {
+        clearTimeout(deadline);
+        for (const [signal, handler] of bootstrapSignalHandlers) process.off(signal, handler);
+    });
+    return bootstrapDrainPromise;
+}
+
 async function assembleApplication() {
 const databaseReady = classicSettings ? connectMongo() : null;
 if (databaseReady) {
@@ -63,10 +109,7 @@ if (databaseReady) {
     await new Promise(resolve => setImmediate(resolve));
 }
 if (bootstrapSignal) {
-    await Promise.allSettled(Object.values(mongoose.models).map(model => model.init()));
-    await l2tpRootLifecycle.stop();
-    await mongoose.disconnect();
-    for (const [signal, handler] of bootstrapSignalHandlers) process.off(signal, handler);
+    await drainBootstrap();
     return;
 }
 const express = require('express');
@@ -1254,6 +1297,9 @@ let shutdownExitCode = 0;
 function shutdown(signal) {
     if (signal === 'uncaughtException' || signal === 'startupFailure') shutdownExitCode = 1;
     if (shutdownPromise !== undefined) return shutdownPromise;
+    // A bootstrap signal can arrive during route-import yields, before the
+    // lifecycle starts. Join the same admitted automatic DDL on this path too.
+    const admittedInits = Object.values(mongoose.models).map(model => model.$init).filter(Boolean);
     logger.info(`[Server] ${signal} received, shutting down...`);
     let expired = false;
     const deadline = setTimeout(() => {
@@ -1285,13 +1331,20 @@ function shutdown(signal) {
         })));
         // Stop worker admission immediately, not after HTTP keepalives or WS
         // clients close. Keep Mongo/Redis open until the supervised drain joins.
-        const drains = await Promise.allSettled([serversClosed, l2tpRootLifecycle.stop()]);
+        const drains = await Promise.allSettled([
+            serversClosed, l2tpRootLifecycle.stop(), Promise.allSettled(admittedInits),
+        ]);
         if (expired) return;
         // SSH is a dependency of the worker drain, not an independent signal
         // subscriber. A joined failed drain still must never report success.
         sshPool.closeAll();
         const failedDrain = drains.find(result => result.status === 'rejected');
         if (failedDrain) throw failedDrain.reason;
+        const rejectedInit = drains[2].value.find(result => result.status === 'rejected');
+        if (rejectedInit) {
+            shutdownExitCode = 1;
+            logger.error('[Server] Admitted schema initialization failed during shutdown:', rejectedInit.reason);
+        }
         if (drains[1].value?.drainUncertain === true) {
             shutdownExitCode = 1;
             logger.error('[Server] Worker drain joined with unresolved ownership; retain durable admissions/locks for authoritative recovery.');
@@ -1323,13 +1376,12 @@ process.on('uncaughtException', (err) => {
     shutdown('uncaughtException').catch(() => process.exit(1));
 });
 
+// End graceful shutdown registration; application bootstrap remains async.
 if (bootstrapSignal) await shutdown(bootstrapSignal);
 else await startServer();
 }
 
 assembleApplication().catch(async error => {
     logger.error('[Server] Application assembly failed:', error);
-    await l2tpRootLifecycle.stop().catch(() => {});
-    await mongoose.disconnect().catch(() => {});
-    process.exit(1);
+    await drainBootstrap(true);
 });

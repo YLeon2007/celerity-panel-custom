@@ -45,11 +45,15 @@ function harness({ httpPending = false, httpError = null, realPool = false } = {
         logger: { info() {}, error(...args) { calls.push(`error:${args.join(' ')}`); }, warn() {} },
         l2tpRootLifecycle: { stop() { calls.push('worker-stop'); return drain.promise; } },
         cacheService: { isConnected: () => true, redis: { async quit() { calls.push('redis-quit'); } } },
-        mongoose: { async disconnect() { calls.push('mongo-disconnect'); } },
-        startServer() {},
+        mongoose: { models: {}, async disconnect() { calls.push('mongo-disconnect'); } },
+        startServer() {}, databaseReady: null, bootstrapSignal: undefined,
+        bootstrapSignalHandlers: new Map(),
     };
     vm.createContext(context);
-    vm.runInContext(source.slice(source.indexOf('// Graceful shutdown')).replace('const activeServers = [];', 'const activeServers = [server];'), Object.assign(context, { server }));
+    const shutdownStart = source.indexOf('// Graceful shutdown');
+    const shutdownEnd = source.indexOf('// End graceful shutdown registration;');
+    assert.ok(shutdownStart >= 0 && shutdownEnd > shutdownStart, 'exact synchronous shutdown section must exist');
+    vm.runInContext(source.slice(shutdownStart, shutdownEnd).replace('const activeServers = [];', 'const activeServers = [server];'), Object.assign(context, { server }));
     return { calls, drain, process, timers, context, start() {
         vm.runInContext(source.slice(source.indexOf('async function startServer()'), source.indexOf('function setupWebSocketServer(')), context);
         return context.startServer();
@@ -272,6 +276,25 @@ test('actual pooled exec timeout stays uncertain after the local drain joins and
     assert.equal(h.calls.at(-1), 'exit:1', h.calls.join(','));
     assert.equal(h.calls.filter(c => c === 'client-end').length, 1);
     assert.equal(h.calls.some(c => c.includes('retain durable admissions/locks')), true);
+});
+
+test('shutdown after route assembly joins admitted init siblings even when the runtime never started', async () => {
+    const h = harness(); const init = deferred();
+    h.context.mongoose.models = {
+        FirstRejected: { $init: Promise.reject(new Error('first auto-init failed')) },
+        Pending: { $init: init.promise, init() { assert.fail('must not admit fresh DDL'); } },
+        Dormant: { init() { assert.fail('must not initialize dormant production models'); } },
+    };
+    // Model.init observes its own automatic rejection before root cleanup.
+    h.context.mongoose.models.FirstRejected.$init.catch(() => {});
+    h.process.emit('SIGTERM'); h.drain.resolve(); await flush();
+    try {
+        assert.equal(h.calls.includes('mongo-disconnect'), false, h.calls.join(','));
+        assert.equal(h.calls.some(call => call.startsWith('exit:')), false);
+    } finally { init.resolve(); await flush(); }
+    assert.equal(h.calls.at(-1), 'exit:1');
+    assert.equal(h.calls.includes('mongo-disconnect'), true);
+    assert.equal(h.timers.size, 0);
 });
 
 test('startup failure joins the supervised shutdown instead of bypassing a pending drain', async () => {
