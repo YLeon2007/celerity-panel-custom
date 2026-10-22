@@ -42,6 +42,11 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 minPoolSize: 2,
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
+                // Index creation already creates ordinary indexed namespaces.
+                // Avoid an extra empty collection DDL/build phase per model;
+                // the unchanged readiness helper creates index-free namespaces
+                // and still joins init + proves every required persisted index.
+                ...(classicSettings ? { autoCreate: false } : {}),
                 ...productionSchemaConnectionOptions(process.env),
             });
             return;

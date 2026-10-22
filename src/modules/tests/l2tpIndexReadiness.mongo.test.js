@@ -88,6 +88,21 @@ test('real Mongo: all 15 public model schemas automatically build each of 27 req
     assert.equal(commands.slice(before).filter(c => c.name === 'listIndexes').length, 15);
 }));
 
+test('real Mongo: automatic indexes create indexed namespaces without a redundant empty collection phase', async () => isolated(async (db, commands) => {
+    const source = require('../relay-l2tp').registerModels();
+    const models = Object.fromEntries(Object.entries(source).map(([name, m]) => {
+        const schema = m.schema.clone(); schema.set('autoCreate', false);
+        return [name, db.model(name, schema)];
+    }));
+    await ensureL2tpModelIndexes({ loadModels: () => models });
+    assert.equal(commands.filter(c => c.name === 'create').length, 4,
+        'only schemas without declared indexes need explicit collection creation');
+    const built = commands.filter(c => c.name === 'createIndexes')
+        .flatMap(c => c.command.indexes.map(i => `${c.command.createIndexes}:${JSON.stringify(i.key)}`));
+    assert.equal(built.length, 27); assert.equal(new Set(built).size, 27);
+    for (const m of Object.values(models)) prove(m, await m.collection.indexes());
+}));
+
 test('real Mongo: disabled automatic flags still build and prove all 15 public schemas and 27 indexes', async () => isolated(async (db, commands) => {
     const source = require('../relay-l2tp').registerModels();
     const models = Object.fromEntries(Object.entries(source).map(([name, m]) => {
