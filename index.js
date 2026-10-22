@@ -624,6 +624,15 @@ async function startServer() {
         logger.info('[MongoDB] Connected');
 
         await l2tpRootLifecycle.startAfterDatabase();
+        if (classicSettings) {
+            // The topology proof joins its own catalog, but classic models also
+            // own required indexes. Join every admitted init before HTTP, even
+            // when Mongo is still processing automatic DDL. allSettled retains
+            // the drain barrier on failure; never initialize dormant models.
+            const inits = await Promise.allSettled(Object.values(mongoose.models).map(model => model.$init).filter(Boolean));
+            const failed = inits.find(result => result.status === 'rejected');
+            if (failed) throw failed.reason;
+        }
         if (shutdownPromise !== undefined) return;
         
         await cacheService.connect();
