@@ -99,6 +99,9 @@ test('real Mongo: explicit batched startup submits each complete public schema o
     assert.equal(builds.length, Object.values(models).filter(m => m.schema.indexes().length).length,
         'one command per indexed collection, not one command per individual index');
     assert.equal(builds.reduce((n, c) => n + c.command.indexes.length, 0), 27);
+    assert.equal(commands.filter(c => c.name === 'create').length,
+        Object.values(models).filter(m => m.schema.indexes().length === 0).length,
+        'new ordinary indexed namespaces are created atomically with their full index set');
     for (const m of Object.values(models)) prove(m, await m.collection.indexes());
     const before = commands.length;
     await ensureL2tpModelIndexes({ loadModels: () => models, batchIndexes: true });

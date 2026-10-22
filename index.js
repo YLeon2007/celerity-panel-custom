@@ -531,7 +531,7 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 minPoolSize: 2,
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
-                ...(classicSettings ? { autoIndex: false } : {}),
+                ...(classicSettings ? { autoIndex: false, autoCreate: false } : {}),
                 ...productionSchemaConnectionOptions(process.env),
             });
             return;

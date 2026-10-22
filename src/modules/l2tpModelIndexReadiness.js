@@ -56,7 +56,14 @@ async function ensureL2tpModelIndexes({
             // autoCreate/autoIndex may be disabled, or required indexes missing.
             // Add all declared indexes and prove the complete metadata again.
             // Do not syncIndexes(): readiness must never drop an operator's indexes.
-            if (!batchIndexes || !actual) await model.createCollection();
+            const options = model.schema.options || {};
+            const needsCollectionOptions = ['collectionOptions', 'collation', 'capped', 'timeseries', 'clusteredIndex']
+                .some(key => options[key] != null && options[key] !== false);
+            // Mongo creates an absent ordinary namespace and its complete index
+            // set in one command. Avoid separate empty-collection index-build
+            // coordinators; preserve special collection options and model hooks.
+            if (!batchIndexes || (!actual && (!required.length || needsCollectionOptions
+                || model.hooks?.hasHooks('createCollection')))) await model.createCollection();
             if (batchIndexes) {
                 // One Mongo build per collection retains every declared spec,
                 // rather than serializing a build/commit for each individual index.
