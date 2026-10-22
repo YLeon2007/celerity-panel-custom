@@ -1,0 +1,1943 @@
+{
+  "builtFrom": "9e1b9897539750c3fef02b98055967d1a7edbbec",
+  "counts": {
+    "dependencyFiles": 9509,
+    "elfFiles": 0,
+    "expectedOptionalAbsences": 10,
+    "installedPackages": 399,
+    "lockPackages": 409,
+    "payloadFiles": 10518,
+    "runtimeFiles": 680,
+    "sourceFiles": 328
+  },
+  "directoryPin": "fbe8f45b5d7db3dace90086462af7f5b5338ea25bb1bf1402e5cf869980b9ac5",
+  "fourSourceChanges": {
+    "index.js": {
+      "current": "f991dc50765eb96104cb666c79005d1c0e4a55c393ca12635826108c13918c4d",
+      "legacyBase": "fdf437284bf99dcd8c928c4432b95a546e1ef59c27b9b37172948a112644b87a"
+    },
+    "scripts/test-node-isolation/coordinated_restore.py": {
+      "current": "8b8f8565b1d337a1f44a6554115b0e60f0a3d86dd24bfc3853e003dd481b2a76",
+      "legacyBase": "183e10f4fcccecb5c5b7dc0e616934f901a2c670da79a9e8d7bb9c9978b82e24"
+    },
+    "scripts/test-node-isolation/fresh_classic_launch.py": {
+      "current": "63004840c16663d3c436866d8822b7a50d74de10076fdd5f897ccd8d04bd9e8d",
+      "legacyBase": "1b679e809ea35de986150ef457d9cf4866a148f7bd86e9407d6e8cd2ba43dec4"
+    },
+    "src/modules/l2tpModelIndexReadiness.js": {
+      "current": "bf094ba8c6197ed39516b0ec197655ab256028e2cc5f5f124028b0d408c07f60",
+      "legacyBase": "12374c8a1c40bbeb4d7db9980f5f4d5e2523f0b8438be68d3c8dff80b10c2d04"
+    }
+  },
+  "hostSources": {
+    "package-lock.json": {
+      "installed": "/opt/celerity-fresh-owner/package-lock.json",
+      "modeIntent": 416,
+      "sha256": "5298202cf6ca2ce8da44f0578bd54c1146def29fd698c41bc62ac3b5982e6eac"
+    },
+    "package.json": {
+      "installed": "/opt/celerity-fresh-owner/package.json",
+      "modeIntent": 416,
+      "sha256": "ecba6c481b539cd69f29781f56198c4b5f8789e0356c7314eecccb913c593165"
+    },
+    "scripts/panel-host-freezer.py": {
+      "installed": "/usr/local/libexec/c3-panel-host-freezer.py",
+      "modeIntent": 488,
+      "sha256": "6de3ab01a789b7d9b5e2121af43834e06b46e1419af0dbbc5ecc3f12cb473b9c"
+    },
+    "scripts/test-node-isolation/c3-test-fresh-classic.service": {
+      "installed": "/etc/systemd/system/c3-test-fresh-classic.service",
+      "modeIntent": 420,
+      "sha256": "03009f943c76e1675c7f2488962c9a223c9ba0901d302fa11fc4873f63812c6d"
+    },
+    "scripts/test-node-isolation/c3-test-fresh-network.service": {
+      "installed": "/etc/systemd/system/c3-test-fresh-network.service",
+      "modeIntent": 420,
+      "sha256": "c137ec5e3b156276cf4953bb866a03c8cd565cd5c913e3fc6426e9eebc3b9a1a"
+    },
+    "scripts/test-node-isolation/c3-test-fresh-prepare-watch.service": {
+      "installed": "/etc/systemd/system/c3-test-fresh-prepare-watch.service",
+      "modeIntent": 420,
+      "sha256": "97b16b9583f7da3a59ae0569e05006384a07aaa7bac6973c43052350505e92f7"
+    },
+    "scripts/test-node-isolation/coordinated_capture.py": {
+      "installed": "/usr/local/libexec/c3-test-coordinated-capture.py",
+      "modeIntent": 488,
+      "sha256": "2b5a16db2da4a68e37f9edaaba2883d8fe366dd7e9625a06dbe62da2f29b8d7f"
+    },
+    "scripts/test-node-isolation/coordinated_fresh_restore.py": {
+      "installed": "/usr/local/libexec/c3-test-coordinated-fresh-restore.py",
+      "modeIntent": 488,
+      "sha256": "1b49c832dd2473ffb23b0bb320ada453a5acb23a8b043da189f6643a3d8a808f"
+    },
+    "scripts/test-node-isolation/coordinated_restore.py": {
+      "installed": "/usr/local/libexec/c3-test-coordinated-restore.py",
+      "modeIntent": 488,
+      "sha256": "8b8f8565b1d337a1f44a6554115b0e60f0a3d86dd24bfc3853e003dd481b2a76"
+    },
+    "scripts/test-node-isolation/fresh_classic_launch.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-classic.py",
+      "modeIntent": 488,
+      "sha256": "63004840c16663d3c436866d8822b7a50d74de10076fdd5f897ccd8d04bd9e8d"
+    },
+    "scripts/test-node-isolation/fresh_network.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-network.py",
+      "modeIntent": 488,
+      "sha256": "6c6c5e3b528f12e5c2d578922c50fa2982906c1e97389948ecff7d55c4cb08ec"
+    },
+    "scripts/test-node-isolation/fresh_network_control.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-network-control.py",
+      "modeIntent": 488,
+      "sha256": "ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac"
+    },
+    "scripts/test-node-isolation/fresh_network_exec.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-network-exec.py",
+      "modeIntent": 488,
+      "sha256": "5fdb07e09177ce1b616d8506d325089e48e50560fee9a03757e4bc0850760167"
+    },
+    "scripts/test-node-isolation/fresh_owner_restoration_channel.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-owner-restoration-channel.py",
+      "modeIntent": 488,
+      "sha256": "953c98c7f7da31e875d55dc1cb694ad775cd0e8e77e760b1826cb4c5e5ce538d"
+    },
+    "scripts/test-node-isolation/fresh_physical.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-physical.py",
+      "modeIntent": 488,
+      "sha256": "5a568eaa6ec890f937ca800a71e2747b2c9bc5c67d6ffed98f2abeed7f8f7405"
+    },
+    "scripts/test-node-isolation/fresh_physical_exec.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-physical-exec.py",
+      "modeIntent": 488,
+      "sha256": "f0afc496fc9ff7bda4b4649d4053cf636d8a2d288b7f61eca128d26d47d88179"
+    },
+    "scripts/test-node-isolation/fresh_physical_watch.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-physical-watch.py",
+      "modeIntent": 488,
+      "sha256": "463fb63c9ce8715e5343770fa9d939dec545be637b1dbf2dd2844086106820c0"
+    },
+    "scripts/test-node-isolation/isolation.py": {
+      "installed": "/usr/local/libexec/c3-test-node-isolation",
+      "modeIntent": 488,
+      "sha256": "709dbc4c30b3a8fd8b740a3de4813afc1d1038f4cbb6045a68e82f1d30260c15"
+    },
+    "scripts/test-node-isolation/node_originals.py": {
+      "installed": "/usr/local/libexec/c3-test-node-originals.py",
+      "modeIntent": 488,
+      "sha256": "3209aa8b38cd870efff6967ccfabc3825c097e6150ab824048fca0af78d38451"
+    },
+    "scripts/test-node-isolation/owner_restoration_channel.py": {
+      "installed": "/usr/local/libexec/c3-test-owner-restoration-channel.py",
+      "modeIntent": 488,
+      "sha256": "151c0a59a068f362838e6a3e449f854ccb29a4e8939b65baba1f61396122cfaa"
+    },
+    "scripts/test-node-isolation/physical_attestor.py": {
+      "installed": "/usr/local/libexec/c3-test-physical-attestor",
+      "modeIntent": 488,
+      "sha256": "8901a2df9e73ac570fd017a76a479d59a4aded49596966f10da9565731b5a672"
+    },
+    "scripts/test-node-isolation/prepare_fresh_supervisor.py": {
+      "installed": "/usr/local/libexec/c3-test-fresh-prepare.py",
+      "modeIntent": 488,
+      "sha256": "db2535c68d26b1b5bf1cc302408f5f2d0d356d8d2ec70e1241be148b234b92ff"
+    },
+    "scripts/test-node-isolation/settle-fresh-held-owner.js": {
+      "installed": "/opt/celerity-fresh-owner/scripts/test-node-isolation/settle-fresh-held-owner.js",
+      "modeIntent": 416,
+      "sha256": "45a532a09e859e8166453c75a5d096f4c771ca390b27fe3c2892b440aa57e2e5"
+    },
+    "scripts/test-node-isolation/shared_host.py": {
+      "installed": "/usr/local/libexec/c3-test-shared-host.py",
+      "modeIntent": 488,
+      "sha256": "4f40023eb6f9da121ab29231cf0a3c354d5ad71d5f7cccf12d44df09bbf253a4"
+    },
+    "src/models/cascadeLinkModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/models/cascadeLinkModel.js",
+      "modeIntent": 416,
+      "sha256": "153649b5c2d1c3cd11d5f56f4c589472c920c7cd7f73c7ddd5f26b2f6fda7b10"
+    },
+    "src/models/topologyConfigOwnerModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/models/topologyConfigOwnerModel.js",
+      "modeIntent": 416,
+      "sha256": "37d8b33e0c0be200543b4dc0ab2d8e7f09f3def928ba90731c7344d20a6a054d"
+    },
+    "src/modules/relay-l2tp/domain/l2tpExecutionAuthorization.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/domain/l2tpExecutionAuthorization.js",
+      "modeIntent": 416,
+      "sha256": "436b271837dc3fc96416cc6686d5a791f82e801501b07e145b5e9e748f5116d1"
+    },
+    "src/modules/relay-l2tp/domain/topologyExecutionContext.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/domain/topologyExecutionContext.js",
+      "modeIntent": 416,
+      "sha256": "3bb0caee53633a680a0d658a0497f77df692afc6d6858c76284c5f4d84f97527"
+    },
+    "src/modules/relay-l2tp/models/cascadeTopologyStateModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/cascadeTopologyStateModel.js",
+      "modeIntent": 416,
+      "sha256": "2f8b007a862344c4c36be66ce01e0a40690bae1063cae6d558f53b2fb7e3e1d3"
+    },
+    "src/modules/relay-l2tp/models/l2tpOperationModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/l2tpOperationModel.js",
+      "modeIntent": 416,
+      "sha256": "bb8df083d788647d3c61b11963788ff3017d5ac3d023b5d79545a17c08385432"
+    },
+    "src/modules/relay-l2tp/models/nodeOperationLockModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/nodeOperationLockModel.js",
+      "modeIntent": 416,
+      "sha256": "42e4051b7980fa899633d9f8d2cb2c5fe407558c8046ee453e6c296726165eeb"
+    },
+    "src/modules/relay-l2tp/models/topologyCreateIntentModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyCreateIntentModel.js",
+      "modeIntent": 416,
+      "sha256": "d0b3d3d0d15ecedc71fe8b97ec941a43689d7e35548f9ec7b1ee231240f9c3a7"
+    },
+    "src/modules/relay-l2tp/models/topologyExecutionBindingContract.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyExecutionBindingContract.js",
+      "modeIntent": 416,
+      "sha256": "621f4a16083be066d5d3e960ff574715698bad3e55fd53a0afaf4a1ef2f29ed7"
+    },
+    "src/modules/relay-l2tp/models/topologyExecutionBindingModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyExecutionBindingModel.js",
+      "modeIntent": 416,
+      "sha256": "e9bdb17cc715372a2008e141c463d030965d5f00ceddf82b599cc8cf8cea36cc"
+    },
+    "src/modules/relay-l2tp/models/topologyExecutionContextSchema.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyExecutionContextSchema.js",
+      "modeIntent": 416,
+      "sha256": "c3eb7a3c949e395481f3f7d847b6d4b7ad81d7e461c435904528982d3700db8a"
+    },
+    "src/modules/relay-l2tp/models/topologyExecutionEnrollmentModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyExecutionEnrollmentModel.js",
+      "modeIntent": 416,
+      "sha256": "878da971da3a63c5d770273de0c60909636b567799d01f5e43b86287223f0ef9"
+    },
+    "src/modules/relay-l2tp/models/topologyIntentQueueStateModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyIntentQueueStateModel.js",
+      "modeIntent": 416,
+      "sha256": "d934e22a08fe0ac0a8a292696ca54d04854c64359a6b3199f14f091aa648931d"
+    },
+    "src/modules/relay-l2tp/models/topologyOperationModel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/models/topologyOperationModel.js",
+      "modeIntent": 416,
+      "sha256": "9aaaf7990a18f4bbf4910eb39597ebbfad900b66cfe4a5b7ec7130aaa8ff9f1d"
+    },
+    "src/modules/relay-l2tp/node-artifacts/l2tp/verify-users.sh": {
+      "installed": "/usr/local/lib/celerity/relay-l2tp/verify-users.sh",
+      "modeIntent": 488,
+      "sha256": "135a366b9cebcdbc3c08b0c605b91f14db39c61d7190f758dab4707eca22d6d3"
+    },
+    "src/modules/relay-l2tp/node-artifacts/topology/runner.sh": {
+      "installed": "/usr/local/bin/celerity-topology-node-runner",
+      "modeIntent": 488,
+      "sha256": "442663660ec974646b7969c457efd94cc17c57fe0e7a518be8a494480cf26765"
+    },
+    "src/modules/relay-l2tp/services/topologyNodeRef.js": {
+      "installed": "/opt/celerity-fresh-owner/src/modules/relay-l2tp/services/topologyNodeRef.js",
+      "modeIntent": 416,
+      "sha256": "c2bb125ae08752925816a007d7430a776d34d46e2cf04aef15ae5de1e48f068b"
+    },
+    "src/services/heldOwnerSettlementJournal.js": {
+      "installed": "/opt/celerity-fresh-owner/src/services/heldOwnerSettlementJournal.js",
+      "modeIntent": 416,
+      "sha256": "e5300d91560659bfef6129f777ba57136fda5f5eeab18b1a668565ecd25a9bdf"
+    },
+    "src/services/heldRestorationChannel.js": {
+      "installed": "/opt/celerity-fresh-owner/src/services/heldRestorationChannel.js",
+      "modeIntent": 416,
+      "sha256": "5cc40794490438bdfe2c05be9ea7fb15eb00b8ad97749a4398520c960ab6850d"
+    },
+    "src/services/heldTestOwnerSettlement.js": {
+      "installed": "/opt/celerity-fresh-owner/src/services/heldTestOwnerSettlement.js",
+      "modeIntent": 416,
+      "sha256": "f4772ac3cc5e7274beb406cffa793f237039fa941d914153d3c8c99885e0c68c"
+    },
+    "src/services/topologyConfigTransfer.js": {
+      "installed": "/opt/celerity-fresh-owner/src/services/topologyConfigTransfer.js",
+      "modeIntent": 416,
+      "sha256": "41d615c073cb082907db791b98b1cf6595d0126fcbc0b8301192ac4ae9581132"
+    }
+  },
+  "inputs": {
+    "builder": {
+      "path": "/home/leon/c3-current-source-pack-profile-20261022/scripts/test-node-isolation/classic_root_bundle.py",
+      "sha256": "b5ab31238790df6dd1adb49623c4117503700c5666bf7fde1d10185ebf071f40"
+    },
+    "elf": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-current-root-jaxwrjtj/elf.json",
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    "lock": {
+      "path": "/home/leon/c3-current-source-pack-profile-20261022/package-lock.json",
+      "sha256": "5298202cf6ca2ce8da44f0578bd54c1146def29fd698c41bc62ac3b5982e6eac"
+    },
+    "node": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-current-root-jaxwrjtj/candidate/root/runtime/node",
+      "sha256": "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068"
+    },
+    "runtime": {
+      "path": "/home/leon/celerity-prod-release-20261019/active-enable-20261021/runtime-inputs/actual-runtime-inputs.json",
+      "sha256": "8c3296c27e685172515cad07e162342622a04f5c4dcf901ee8a1336dddc6ad9a"
+    },
+    "runtimeVerifier": {
+      "path": "/home/leon/c3-current-source-pack-profile-20261022/scripts/test-node-isolation/classic_runtime_inputs.py",
+      "sha256": "13ade2c6a18535fb54f3a90a06044d9f5d781ee92a868ea72c0ffd1d6ed93fdb"
+    },
+    "settings": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-current-root-jaxwrjtj/candidate/root/etc/classic.json",
+      "sha256": "74b94aed1a5999234aa6102e77f84c86cb1d0599a780a614016454a493d05d38"
+    },
+    "snapshot": {
+      "path": "/home/leon/.hermes/cache/scratch/c3-classic-full-20261022-z_dbakn6/snapshot.json",
+      "sha256": "eaf043c033aab204a839d3c8236fd3ff584fce313f9f2524ed91d9fdb0de59f0"
+    }
+  },
+  "manifestPin": "32b3c0fa25a490113e5c2ad8f96d805d2e0e33c651c4ee22b62ee45718e4802e",
+  "modePin": "297212bda303017252f3a1e1a4cfd0fcfe045ff29fd407dbb9bc5f07867e02cf",
+  "operationalGO": false,
+  "physicalAccepted": false,
+  "reportPin": "3e83bdca1e347a0936610e23f63871638ef839a9121d9224378a3fe61408469b",
+  "schema": "c3-fixed9e-offline-profile/v1",
+  "sourceCommit": "9e1b9897539750c3fef02b98055967d1a7edbbec",
+  "sourceFiles": {
+    "/app/config.js": {
+      "mode": 420,
+      "sha256": "d6c3c565970fed0fe177d1be992ad763e55fc1983391477aeb3b4f9ade81a1d7",
+      "source": "config.js"
+    },
+    "/app/index.js": {
+      "mode": 420,
+      "sha256": "f991dc50765eb96104cb666c79005d1c0e4a55c393ca12635826108c13918c4d",
+      "source": "index.js"
+    },
+    "/app/package-lock.json": {
+      "mode": 420,
+      "sha256": "5298202cf6ca2ce8da44f0578bd54c1146def29fd698c41bc62ac3b5982e6eac",
+      "source": "package-lock.json"
+    },
+    "/app/package.json": {
+      "mode": 420,
+      "sha256": "ecba6c481b539cd69f29781f56198c4b5f8789e0356c7314eecccb913c593165",
+      "source": "package.json"
+    },
+    "/app/public/css/network.css": {
+      "mode": 420,
+      "sha256": "f0492fd45475ea51c6a97d4556e4eca6be8d90103ceb27e6426e047dd920986d",
+      "source": "public/css/network.css"
+    },
+    "/app/public/css/network.min.css": {
+      "mode": 420,
+      "sha256": "628a4b1ecf75cb275329994f0309bf8f8a9a0a35591b59daef5f1b2d8ac3ec29",
+      "source": "public/css/network.min.css"
+    },
+    "/app/public/css/style.css": {
+      "mode": 420,
+      "sha256": "64da4569f4580ccbd3dac4bb53ac5b890b7dcec9fa1fc156c4f2b756d35ebe40",
+      "source": "public/css/style.css"
+    },
+    "/app/public/css/style.min.css": {
+      "mode": 420,
+      "sha256": "c1aee737e0935240f40f1dfcb6f53b560cd17277ee07a4081df5c6658fee3d5f",
+      "source": "public/css/style.min.css"
+    },
+    "/app/public/img/favicon.svg": {
+      "mode": 420,
+      "sha256": "5d8eb011bff83b7984fff58aa2e86b834a69eb52d871a71deff0f9feaa8d7669",
+      "source": "public/img/favicon.svg"
+    },
+    "/app/public/img/hysteria.svg": {
+      "mode": 420,
+      "sha256": "65503a6eed5592e0e653c2d124952890dfff8f29a28de61eac216f0e20b91e68",
+      "source": "public/img/hysteria.svg"
+    },
+    "/app/public/img/xray.svg": {
+      "mode": 420,
+      "sha256": "68aae155e5606630e68cd9714588f1908dbc346541285bce49615ef10511f221",
+      "source": "public/img/xray.svg"
+    },
+    "/app/public/js/access-logs.js": {
+      "mode": 420,
+      "sha256": "0432ce706a4aa79fe82f67908d5009aaf8d368365f45cb8be5bbbd03a8446f55",
+      "source": "public/js/access-logs.js"
+    },
+    "/app/public/js/app.js": {
+      "mode": 420,
+      "sha256": "929f550d2a92bb978158d79bab61b31a2bdb10804cc27a8d958725a4e2d106fa",
+      "source": "public/js/app.js"
+    },
+    "/app/public/js/backup-actions.js": {
+      "mode": 420,
+      "sha256": "efd3e5910debbdc5c29b8252d5020c6e9cf1e21bb2644b4e1f8b4c2fc64e11c1",
+      "source": "public/js/backup-actions.js"
+    },
+    "/app/public/js/network.js": {
+      "mode": 420,
+      "sha256": "52833ce82e3023a085d93f8f40db919148b234af6eab367002c99a2d68d233f5",
+      "source": "public/js/network.js"
+    },
+    "/app/public/js/network.min.js": {
+      "mode": 420,
+      "sha256": "6b31d25243e4d0eb5ab62976a7fa1dcf4be7ba3a6d1a929a21847901f4c74aac",
+      "source": "public/js/network.min.js"
+    },
+    "/app/public/js/vendor/Sortable.min.js": {
+      "mode": 420,
+      "sha256": "72aa2c4f9f7cb2b8b3268052d6d2daa9d952f209b7fc5cc247ff9e1153db1f16",
+      "source": "public/js/vendor/Sortable.min.js"
+    },
+    "/app/public/robots.txt": {
+      "mode": 420,
+      "sha256": "331ea9090db0c9f6f597bd9840fd5b171830f6e0b3ba1cb24dfa91f0c95aedc1",
+      "source": "public/robots.txt"
+    },
+    "/app/scripts/build-relay-l2tp-artifact.js": {
+      "mode": 420,
+      "sha256": "9e46586f1e3140d4615023ba80689b25a19bb645f1c94d8c293a1437bb1954af",
+      "source": "scripts/build-relay-l2tp-artifact.js"
+    },
+    "/app/scripts/install.sh": {
+      "mode": 493,
+      "sha256": "79b3ea258f6b24d309f9324cd4c06a6164ea42d5cbf53164d4d00d775f64a4e8",
+      "source": "scripts/install.sh"
+    },
+    "/app/scripts/relay-l2tp-artifact/install.js": {
+      "mode": 420,
+      "sha256": "e7bd3c2c37832635b7ea811faf0f89644e21bdd77f4307a04bce404af366315c",
+      "source": "scripts/relay-l2tp-artifact/install.js"
+    },
+    "/app/scripts/relay-l2tp-artifact/topology-transfer.js": {
+      "mode": 420,
+      "sha256": "88e43bf96e28b5591a70c9d03061b427f4661fe17d648b27002892da92503563",
+      "source": "scripts/relay-l2tp-artifact/topology-transfer.js"
+    },
+    "/app/scripts/relay-l2tp-artifact/topology.schema.json": {
+      "mode": 420,
+      "sha256": "2f4a8fa2e8e43990323e14995aa67da1282bc186d2600e0dd7d4a100fbe33725",
+      "source": "scripts/relay-l2tp-artifact/topology.schema.json"
+    },
+    "/app/scripts/self-update.sh": {
+      "mode": 420,
+      "sha256": "90fcff83b5e707e80120194fbef4c5bf9188a24ac3925d4ac77986a8bdd5706e",
+      "source": "scripts/self-update.sh"
+    },
+    "/app/src/classicSettings.js": {
+      "mode": 420,
+      "sha256": "fecc71dab63308994ae9d47d24653f2cc3403e0296b54f4fa40b1c80c538f89a",
+      "source": "src/classicSettings.js"
+    },
+    "/app/src/docs/i18n.js": {
+      "mode": 420,
+      "sha256": "9e6170069700da4b168c30c492abd8d2455bda7b69244d172c24ab4dc4cf75a5",
+      "source": "src/docs/i18n.js"
+    },
+    "/app/src/docs/openapi.js": {
+      "mode": 420,
+      "sha256": "0af802eab2f9eb84c9394ba7670ec1ef6061f96a45c21b16b91574b533513275",
+      "source": "src/docs/openapi.js"
+    },
+    "/app/src/locales/en.json": {
+      "mode": 420,
+      "sha256": "8c19fb9f0d26b631835d5c1a81e51a8c35fccd7836c473cfaac9c56a7c7e9c40",
+      "source": "src/locales/en.json"
+    },
+    "/app/src/locales/ru.json": {
+      "mode": 420,
+      "sha256": "0b38aeeb47835553d6064faae71fc6ec3d60e09497748b861c52508a70530536",
+      "source": "src/locales/ru.json"
+    },
+    "/app/src/locales/zh-CN.json": {
+      "mode": 420,
+      "sha256": "8c9ae92e0fe411f5a9260255f123e350b57ec54030ba96657dbe790e2dd962e7",
+      "source": "src/locales/zh-CN.json"
+    },
+    "/app/src/mcp/prompts.js": {
+      "mode": 420,
+      "sha256": "e2e7f0f4465ae084ffb6fbaa9f5704cb195b91edead82925fa2baa8c2b55cde7",
+      "source": "src/mcp/prompts.js"
+    },
+    "/app/src/mcp/tools/cascade.js": {
+      "mode": 420,
+      "sha256": "263b7966cd25bcab70752282d2f983e57f0e64a3a4f632dab9250cecb9f7e6bd",
+      "source": "src/mcp/tools/cascade.js"
+    },
+    "/app/src/mcp/tools/groups.js": {
+      "mode": 420,
+      "sha256": "b6f71190067ed7ebadc8f1df464b6358f2f0f62132dab121dbb9e8d35ed4b82d",
+      "source": "src/mcp/tools/groups.js"
+    },
+    "/app/src/mcp/tools/logs.js": {
+      "mode": 420,
+      "sha256": "d1e6ee6103faaa700c6ea33c4fe056307ae4d76cb716d35bd3ba0c40a157f47f",
+      "source": "src/mcp/tools/logs.js"
+    },
+    "/app/src/mcp/tools/nodes.js": {
+      "mode": 420,
+      "sha256": "020ed2cfbe9af4a5abf75290ddbccae5a04a2309432092e41e8e286cd6cbf31d",
+      "source": "src/mcp/tools/nodes.js"
+    },
+    "/app/src/mcp/tools/stats.js": {
+      "mode": 420,
+      "sha256": "2163d0504764b162bdd0ee8550642d203535fd7cc3caf2d18c877e4254387534",
+      "source": "src/mcp/tools/stats.js"
+    },
+    "/app/src/mcp/tools/system.js": {
+      "mode": 420,
+      "sha256": "cb0fe3ce70e061a10081e5fe28ddb389bd7835d08d3701d4394b6eb5315de06e",
+      "source": "src/mcp/tools/system.js"
+    },
+    "/app/src/mcp/tools/users.js": {
+      "mode": 420,
+      "sha256": "d28773b3845b2b5c9137451efc81f212ef37453a67ad3ef7dcf02cf01304c55f",
+      "source": "src/mcp/tools/users.js"
+    },
+    "/app/src/middleware/auth.js": {
+      "mode": 420,
+      "sha256": "d4003483ead9b4b89ddf01ae7d3fddf4f98c287bc53df43811452f62ff82bc22",
+      "source": "src/middleware/auth.js"
+    },
+    "/app/src/middleware/i18n.js": {
+      "mode": 420,
+      "sha256": "73f56b8ba2f870ca76ee5d47b74f9d535d5ddda06b34c6ed01b6b68999e7ba5b",
+      "source": "src/middleware/i18n.js"
+    },
+    "/app/src/middleware/rpsCounter.js": {
+      "mode": 420,
+      "sha256": "5c0cbb20a03d8d7442be61908e56aa701bb3f9fb6a348ae84927c67f6d3a4160",
+      "source": "src/middleware/rpsCounter.js"
+    },
+    "/app/src/models/adminModel.js": {
+      "mode": 420,
+      "sha256": "bbeb208f1d15ef3e36df2586c5dcf46da0c49fdbd575299e5c5cf2035070fb33",
+      "source": "src/models/adminModel.js"
+    },
+    "/app/src/models/apiKeyModel.js": {
+      "mode": 420,
+      "sha256": "c9f137de53f6435f590424f97b75c42f6463ec3ca2aec3bbe4497ef832d7852e",
+      "source": "src/models/apiKeyModel.js"
+    },
+    "/app/src/models/cascadeLinkModel.js": {
+      "mode": 420,
+      "sha256": "153649b5c2d1c3cd11d5f56f4c589472c920c7cd7f73c7ddd5f26b2f6fda7b10",
+      "source": "src/models/cascadeLinkModel.js"
+    },
+    "/app/src/models/hyNodeModel.js": {
+      "mode": 420,
+      "sha256": "c0cda3ea557fedb529895d8bbc0280c81a82e15f65759e373d347da821d2690d",
+      "source": "src/models/hyNodeModel.js"
+    },
+    "/app/src/models/hyUserModel.js": {
+      "mode": 420,
+      "sha256": "f017bba4d0df68c5ae2c340fbf9a068e0c816f2ae050cefc529806f273fcfa07",
+      "source": "src/models/hyUserModel.js"
+    },
+    "/app/src/models/serverGroupModel.js": {
+      "mode": 420,
+      "sha256": "dc31042fedc10bcf89433d7d22f17b09103f8910e3f81d033882bb6272c1ddca",
+      "source": "src/models/serverGroupModel.js"
+    },
+    "/app/src/models/settingsModel.js": {
+      "mode": 420,
+      "sha256": "4d6514d9c85370c7021031700fecc8918b051d35a67f8ca2c10d5150caebc077",
+      "source": "src/models/settingsModel.js"
+    },
+    "/app/src/models/statsSnapshotModel.js": {
+      "mode": 420,
+      "sha256": "44b99688e16f4052a075194bd240d0e830fdd3c10cc1c2fdca7a11e1995be55d",
+      "source": "src/models/statsSnapshotModel.js"
+    },
+    "/app/src/models/topologyConfigOwnerModel.js": {
+      "mode": 420,
+      "sha256": "37d8b33e0c0be200543b4dc0ab2d8e7f09f3def928ba90731c7344d20a6a054d",
+      "source": "src/models/topologyConfigOwnerModel.js"
+    },
+    "/app/src/models/uaSnapshotModel.js": {
+      "mode": 420,
+      "sha256": "d332f22818d6402ccda352828df2eb0afb7f52743ef5b14bd3909e81e308e7fe",
+      "source": "src/models/uaSnapshotModel.js"
+    },
+    "/app/src/models/userDeviceModel.js": {
+      "mode": 420,
+      "sha256": "da43d89112b226eec040fae5a548368acc2eeaf06b8a8b68e56fe7c23ffe7de6",
+      "source": "src/models/userDeviceModel.js"
+    },
+    "/app/src/modules/bootstrapModules.js": {
+      "mode": 420,
+      "sha256": "54636c677682f939474a32cdc92e09e108f66ecac3b445e4c9a6410d18ac5ccd",
+      "source": "src/modules/bootstrapModules.js"
+    },
+    "/app/src/modules/createL2tpPanelHost.js": {
+      "mode": 420,
+      "sha256": "46cace251aaf1d2b0a3145cdc4f23cd3a052af5b801ef406eec540812d5f254a",
+      "source": "src/modules/createL2tpPanelHost.js"
+    },
+    "/app/src/modules/createL2tpStartupLifecycle.js": {
+      "mode": 420,
+      "sha256": "02ada1547dc3c0d0871154b6832004d011e4620e23cc7ba547e3586f8bdf21bd",
+      "source": "src/modules/createL2tpStartupLifecycle.js"
+    },
+    "/app/src/modules/l2tpActiveHostProvider.js": {
+      "mode": 420,
+      "sha256": "a04c1f7d331532e90ca8353994327d39b55ca4e5ab84fc22c2e58b4b00065e7a",
+      "source": "src/modules/l2tpActiveHostProvider.js"
+    },
+    "/app/src/modules/l2tpMigrationBootstrap.js": {
+      "mode": 420,
+      "sha256": "a5b1f22a5d6865a6d408f2901c3961130a10481d7319758fec7a6d53f2ae7821",
+      "source": "src/modules/l2tpMigrationBootstrap.js"
+    },
+    "/app/src/modules/l2tpModelIndexReadiness.js": {
+      "mode": 420,
+      "sha256": "bf094ba8c6197ed39516b0ec197655ab256028e2cc5f5f124028b0d408c07f60",
+      "source": "src/modules/l2tpModelIndexReadiness.js"
+    },
+    "/app/src/modules/l2tpRuntimeLifecycleHook.js": {
+      "mode": 420,
+      "sha256": "6f88254291c23f7623ebc2c9b57519c1af849e479cdeb79920055648d5347748",
+      "source": "src/modules/l2tpRuntimeLifecycleHook.js"
+    },
+    "/app/src/modules/loadModules.js": {
+      "mode": 420,
+      "sha256": "711e0ca107a303f76e935d6061c3928d735ad82706702afa417bf665e7eeb44a",
+      "source": "src/modules/loadModules.js"
+    },
+    "/app/src/modules/moduleRegistry.js": {
+      "mode": 420,
+      "sha256": "82ddec103f8056321173fa9b1ae66b8d673606c8bd26bb5a8c5665a5f7d4fbf5",
+      "source": "src/modules/moduleRegistry.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/cascadePathIngress.js": {
+      "mode": 420,
+      "sha256": "c02a6a6a8ce6e9b2055a5d91fb11f9897f36aab9dc7514270581e647cbdf3c9f",
+      "source": "src/modules/relay-l2tp/domain/cascadePathIngress.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/defaultChainPath.js": {
+      "mode": 420,
+      "sha256": "211fec789fa8b58363bae360cb9e87721de6deea8ad3e99abd96ca42e38caa09",
+      "source": "src/modules/relay-l2tp/domain/defaultChainPath.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/l2tpExecutionAuthorization.js": {
+      "mode": 420,
+      "sha256": "436b271837dc3fc96416cc6686d5a791f82e801501b07e145b5e9e748f5116d1",
+      "source": "src/modules/relay-l2tp/domain/l2tpExecutionAuthorization.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/l2tpXrayConfigMerge.js": {
+      "mode": 420,
+      "sha256": "09e435803b08aab5fda000ec3a795b391b1d01bcb7bc98e0e1322e49850914d6",
+      "source": "src/modules/relay-l2tp/domain/l2tpXrayConfigMerge.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/routePolicy.js": {
+      "mode": 420,
+      "sha256": "a9a6650d395cb12831a7004c499c5800871f7b82610ec1d1f1abd9448a3b4786",
+      "source": "src/modules/relay-l2tp/domain/routePolicy.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyCompiler.js": {
+      "mode": 420,
+      "sha256": "3c92dafcbfddd2633e36823316a150193fda515766da72e5a42a316c396eee4f",
+      "source": "src/modules/relay-l2tp/domain/topologyCompiler.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyDomains.js": {
+      "mode": 420,
+      "sha256": "e15b51ce974bd3d3994de57d124f8a0ba92d46acf344b594c4d784a061315206",
+      "source": "src/modules/relay-l2tp/domain/topologyDomains.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyDraft.js": {
+      "mode": 420,
+      "sha256": "c0ffd6d7cb424325c4696c1a75fd44a57ec1b9dcd749a0ee42a188d7844abb4c",
+      "source": "src/modules/relay-l2tp/domain/topologyDraft.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyExecutionContext.js": {
+      "mode": 420,
+      "sha256": "3bb0caee53633a680a0d658a0497f77df692afc6d6858c76284c5f4d84f97527",
+      "source": "src/modules/relay-l2tp/domain/topologyExecutionContext.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyOperationClaimBinding.js": {
+      "mode": 420,
+      "sha256": "3ed4079b664b69988a0a48ac3d788a4bbe5e565ab0ca9d443c5d09582d820fd7",
+      "source": "src/modules/relay-l2tp/domain/topologyOperationClaimBinding.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyReplacement.js": {
+      "mode": 420,
+      "sha256": "c4466de4ddfc2464183e2ad30a27151124e370f6387f542501b85a8f4f3a44f9",
+      "source": "src/modules/relay-l2tp/domain/topologyReplacement.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyTransfer.js": {
+      "mode": 420,
+      "sha256": "9ea4633335c6b774d2743fc65ef0e3fb336597af74c44000b4a30d8c1d319cab",
+      "source": "src/modules/relay-l2tp/domain/topologyTransfer.js"
+    },
+    "/app/src/modules/relay-l2tp/domain/topologyValidator.js": {
+      "mode": 420,
+      "sha256": "c37f8023a8dd5570e0523989cbdb8c85d91c77f8c6b082178bee8c1d0dfa86b9",
+      "source": "src/modules/relay-l2tp/domain/topologyValidator.js"
+    },
+    "/app/src/modules/relay-l2tp/index.js": {
+      "mode": 420,
+      "sha256": "5dc1337cc87e6f4347153c6068ede16b184f292ab0639a1476f713f0b10a132a",
+      "source": "src/modules/relay-l2tp/index.js"
+    },
+    "/app/src/modules/relay-l2tp/manifest.json": {
+      "mode": 420,
+      "sha256": "8797830abdde96abc305a89e6f8248ff125f8c06e4b43b5068b16b93852ac068",
+      "source": "src/modules/relay-l2tp/manifest.json"
+    },
+    "/app/src/modules/relay-l2tp/migrations/002-ensure-queue-admission-indexes.js": {
+      "mode": 420,
+      "sha256": "70453699f15c9b344f00985f7606de6a2596ad057c5008a35e5f7ab12f3888f5",
+      "source": "src/modules/relay-l2tp/migrations/002-ensure-queue-admission-indexes.js"
+    },
+    "/app/src/modules/relay-l2tp/migrations/index.js": {
+      "mode": 420,
+      "sha256": "b3583a8e7dbbe327a492c1de4de89ccf090f4f7cde47ec58b0be8ebca11e2383",
+      "source": "src/modules/relay-l2tp/migrations/index.js"
+    },
+    "/app/src/modules/relay-l2tp/migrations/migrationRunner.js": {
+      "mode": 420,
+      "sha256": "6296603c8269f8ff0a3fcd479b0c298c01ddf9124ac86daafaa1e42699c59e38",
+      "source": "src/modules/relay-l2tp/migrations/migrationRunner.js"
+    },
+    "/app/src/modules/relay-l2tp/migrations/migrationStateRepository.js": {
+      "mode": 420,
+      "sha256": "0990bf01add13a478876f764a7f5fce496a00753d0c8748020a73e24113c22e9",
+      "source": "src/modules/relay-l2tp/migrations/migrationStateRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/models/cascadeRouteGroupModel.js": {
+      "mode": 420,
+      "sha256": "10bb37e668ba7b3480e799a156942a60ae94bedc79f56b2b322eec413bc029c3",
+      "source": "src/modules/relay-l2tp/models/cascadeRouteGroupModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/cascadeTopologyStateModel.js": {
+      "mode": 420,
+      "sha256": "2f8b007a862344c4c36be66ce01e0a40690bae1063cae6d558f53b2fb7e3e1d3",
+      "source": "src/modules/relay-l2tp/models/cascadeTopologyStateModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/l2tpOperationModel.js": {
+      "mode": 420,
+      "sha256": "bb8df083d788647d3c61b11963788ff3017d5ac3d023b5d79545a17c08385432",
+      "source": "src/modules/relay-l2tp/models/l2tpOperationModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/l2tpUserModel.js": {
+      "mode": 420,
+      "sha256": "821202b162316b76242b9e99f6ec2c8df754a1142d8d5880f4abc428488b7e74",
+      "source": "src/modules/relay-l2tp/models/l2tpUserModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/nodeOperationLockModel.js": {
+      "mode": 420,
+      "sha256": "42e4051b7980fa899633d9f8d2cb2c5fe407558c8046ee453e6c296726165eeb",
+      "source": "src/modules/relay-l2tp/models/nodeOperationLockModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/relayL2tpMigrationStateModel.js": {
+      "mode": 420,
+      "sha256": "f257094f2ad484eab7b342c06bf951e2345e862c142788f43452322192ae2b2e",
+      "source": "src/modules/relay-l2tp/models/relayL2tpMigrationStateModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/relayL2tpStateModel.js": {
+      "mode": 420,
+      "sha256": "f3aebd447993d268735700ac750fdb1735dfc2b7ba1a7db9a414f7f473f3ffdd",
+      "source": "src/modules/relay-l2tp/models/relayL2tpStateModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/relayL2tpTopologyTransferDraftModel.js": {
+      "mode": 420,
+      "sha256": "40e6692ea9e6767cd63ab6292072c746afce0ec5c85b55900e75294a582d911c",
+      "source": "src/modules/relay-l2tp/models/relayL2tpTopologyTransferDraftModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/remoteAdmissionModel.js": {
+      "mode": 420,
+      "sha256": "3a8a30eb3ad5282e1211858b52a40b40fef9d95be018b9eee5908bea7e1ab635",
+      "source": "src/modules/relay-l2tp/models/remoteAdmissionModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyCreateIntentModel.js": {
+      "mode": 420,
+      "sha256": "d0b3d3d0d15ecedc71fe8b97ec941a43689d7e35548f9ec7b1ee231240f9c3a7",
+      "source": "src/modules/relay-l2tp/models/topologyCreateIntentModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyExecutionBindingContract.js": {
+      "mode": 420,
+      "sha256": "621f4a16083be066d5d3e960ff574715698bad3e55fd53a0afaf4a1ef2f29ed7",
+      "source": "src/modules/relay-l2tp/models/topologyExecutionBindingContract.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyExecutionBindingModel.js": {
+      "mode": 420,
+      "sha256": "e9bdb17cc715372a2008e141c463d030965d5f00ceddf82b599cc8cf8cea36cc",
+      "source": "src/modules/relay-l2tp/models/topologyExecutionBindingModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyExecutionContextSchema.js": {
+      "mode": 420,
+      "sha256": "c3eb7a3c949e395481f3f7d847b6d4b7ad81d7e461c435904528982d3700db8a",
+      "source": "src/modules/relay-l2tp/models/topologyExecutionContextSchema.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyExecutionEnrollmentModel.js": {
+      "mode": 420,
+      "sha256": "878da971da3a63c5d770273de0c60909636b567799d01f5e43b86287223f0ef9",
+      "source": "src/modules/relay-l2tp/models/topologyExecutionEnrollmentModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyIntentQueueStateModel.js": {
+      "mode": 420,
+      "sha256": "d934e22a08fe0ac0a8a292696ca54d04854c64359a6b3199f14f091aa648931d",
+      "source": "src/modules/relay-l2tp/models/topologyIntentQueueStateModel.js"
+    },
+    "/app/src/modules/relay-l2tp/models/topologyOperationModel.js": {
+      "mode": 420,
+      "sha256": "9aaaf7990a18f4bbf4910eb39597ebbfad900b66cfe4a5b7ec7130aaa8ff9f1d",
+      "source": "src/modules/relay-l2tp/models/topologyOperationModel.js"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/fence/README.md": {
+      "mode": 420,
+      "sha256": "d89580b688c7c96bbfb03623ead20d1d18f950fc3a42b97a2b777ca6bbe4f8e5",
+      "source": "src/modules/relay-l2tp/node-artifacts/fence/README.md"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/fence/journal.py": {
+      "mode": 420,
+      "sha256": "6ea706adbd3a5674855c8037ba075570db81e76016370f0ddc5c9dfe1b4221b7",
+      "source": "src/modules/relay-l2tp/node-artifacts/fence/journal.py"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/activate-xray.sh": {
+      "mode": 493,
+      "sha256": "31abe9e6c98148e56ce449284956a298a1e04107cb734a30003a1332de4de6f1",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/activate-xray.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/apply-firewall-policy.sh": {
+      "mode": 493,
+      "sha256": "cacbbf8e6c6b2f6ef740d669aae7303a408f8ec4c09e289321fbe5987ebd6294",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/apply-firewall-policy.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/apply.sh": {
+      "mode": 493,
+      "sha256": "dfd396096bd85c2e931682f05840d2f6cce5246212288f6f2b91e2e660ccbe95",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/apply.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/backup.sh": {
+      "mode": 493,
+      "sha256": "4aa837b461ae85627dd8f4b06fb785939b3bb6942fc85fe605c8aa7d4548b9eb",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/backup.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/commit.sh": {
+      "mode": 493,
+      "sha256": "bd846dbaf50051dbdc58d9c3832a9b45b9043579598d1235a97826b231841a1b",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/commit.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/compose-xray-fragment.sh": {
+      "mode": 493,
+      "sha256": "11e4f6707bdfd6957e22af4e0ad178cccd559d9a99785c3011fba017d3bc5d02",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/compose-xray-fragment.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/install-runtime.sh": {
+      "mode": 493,
+      "sha256": "3f315843577198826ab5fe2dd40742f90bbcf5b73c88f799d72f5db19fd1a297",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/install-runtime.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/install.sh": {
+      "mode": 493,
+      "sha256": "2453ead8d7cb238677592f671cb6d02761c7a380a7d76c45a3761f6d1ec30977",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/install.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/materialize-nft-candidate.sh": {
+      "mode": 493,
+      "sha256": "2ce54eded17460e7a4a0d53748a9f177036b4656e4b6a265f18c32f04c63f6d3",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/materialize-nft-candidate.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/preflight.sh": {
+      "mode": 493,
+      "sha256": "a5f2c845beb4cdc781688efee00745f4edca98f7e5599a78007e411d9b2d709e",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/preflight.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/receive-artifact.py": {
+      "mode": 493,
+      "sha256": "e4a107d0220284c358534ea0a7f2b8ec8a7f3952956eeebb33a7a68450988f4b",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/receive-artifact.py"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/rollback.sh": {
+      "mode": 493,
+      "sha256": "63620d8d25bc9217875738bba993febc89b6217f7c21de26b7cb2c832ba73091",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/rollback.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/runner.sh": {
+      "mode": 493,
+      "sha256": "990bb2d0ceb4dd2a0d35e48f3f83153ac456e381e4a3f7b06d6c1f56af917eef",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/runner.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/start-l2tp.sh": {
+      "mode": 493,
+      "sha256": "bdf8d600f5a46e1e58b953618cf25dbd8d24cb8804b636e275e9b8026e262981",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/start-l2tp.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/sync-users.sh": {
+      "mode": 493,
+      "sha256": "3ff96565d57fc26772dabbf1a116e79fe322f1255f9680ccd6562f15a4759970",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/sync-users.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/validate-nft.sh": {
+      "mode": 493,
+      "sha256": "a2bf9aa6a76371a7e42448f50c6b0bb070b0599100c6587a0b9324e3553cd970",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/validate-nft.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/validate-xray.sh": {
+      "mode": 493,
+      "sha256": "ee454b49fc898072f8b7a0b712c6c20f81fa51b7fe18c9e2d132460c4fc62c59",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/validate-xray.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/verify-users.sh": {
+      "mode": 493,
+      "sha256": "135a366b9cebcdbc3c08b0c605b91f14db39c61d7190f758dab4707eca22d6d3",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/verify-users.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/l2tp/verify.sh": {
+      "mode": 493,
+      "sha256": "e0d42b1a4be2b537da2042967fa13b4d38da6b4bf1c700d8cbcf7184df28491a",
+      "source": "src/modules/relay-l2tp/node-artifacts/l2tp/verify.sh"
+    },
+    "/app/src/modules/relay-l2tp/node-artifacts/topology/runner.sh": {
+      "mode": 493,
+      "sha256": "442663660ec974646b7969c457efd94cc17c57fe0e7a518be8a494480cf26765",
+      "source": "src/modules/relay-l2tp/node-artifacts/topology/runner.sh"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpPppDriftSyncRepository.js": {
+      "mode": 420,
+      "sha256": "6a1cb813d8d28f1caed5cb49dfa10f3566a0d8191d3ee68dd6332e840d0bec9d",
+      "source": "src/modules/relay-l2tp/repositories/l2tpPppDriftSyncRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpStateManagementRepository.js": {
+      "mode": 420,
+      "sha256": "e576baace37a445d67a67bffe7604ef524e7715aea34826abe0fce358d46ba66",
+      "source": "src/modules/relay-l2tp/repositories/l2tpStateManagementRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpStateRepository.js": {
+      "mode": 420,
+      "sha256": "ec27decc23aa6eb9e77838ed46ac508f105bff4933a5ff8820c7ae8c0e552c60",
+      "source": "src/modules/relay-l2tp/repositories/l2tpStateRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpUserExecutionRepository.js": {
+      "mode": 420,
+      "sha256": "623b9151cffa0989b4915527dddb002081fa42279a32ae65be44e6614804e1f0",
+      "source": "src/modules/relay-l2tp/repositories/l2tpUserExecutionRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpUserManagementRepository.js": {
+      "mode": 420,
+      "sha256": "cb96b15d4e3062f4f780a702c2c1bbf32bbd8032bd312a7fcdaf31191f088729",
+      "source": "src/modules/relay-l2tp/repositories/l2tpUserManagementRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/l2tpUserSyncRepository.js": {
+      "mode": 420,
+      "sha256": "9aad407bf1cdebb7cc486ad812c427f28392087fbeea80b1233cc0459185afd8",
+      "source": "src/modules/relay-l2tp/repositories/l2tpUserSyncRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/remoteAdmissionRepository.js": {
+      "mode": 420,
+      "sha256": "41931277e59d9ed37af1b514e91e6f19be373d9061f863c532a9b007b97e2a40",
+      "source": "src/modules/relay-l2tp/repositories/remoteAdmissionRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyDeploymentRepository.js": {
+      "mode": 420,
+      "sha256": "5b3d80e35168d82e8857af145d88d41d48fd62b419f951ef0aca5c5fa8fa93fa",
+      "source": "src/modules/relay-l2tp/repositories/topologyDeploymentRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyDraftRepository.js": {
+      "mode": 420,
+      "sha256": "cd051e4a56ba8602c0b33b391e3810f18e92811e808c229b5628bf43e5bd86ce",
+      "source": "src/modules/relay-l2tp/repositories/topologyDraftRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyExecutionBindingStore.js": {
+      "mode": 420,
+      "sha256": "ec734d591f9644194fc51b6a8794d0cd82e6de7fd624b57caabfed7b7ad0ead6",
+      "source": "src/modules/relay-l2tp/repositories/topologyExecutionBindingStore.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyOperationFinalizationRepository.js": {
+      "mode": 420,
+      "sha256": "bbbe05df595b622070cf52088e745329f1f2274b31fdd25758acb18191e478ed",
+      "source": "src/modules/relay-l2tp/repositories/topologyOperationFinalizationRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyOperationRepository.js": {
+      "mode": 420,
+      "sha256": "1c9ab352454381a78c2dc06dc579e1e466b7ee930fd2ed818ae1379d3d43a1c5",
+      "source": "src/modules/relay-l2tp/repositories/topologyOperationRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyTransferDraftRepository.js": {
+      "mode": 420,
+      "sha256": "03897854c880487381213fc76fad19868d65fcdeb51abf9defae2eda62360ed8",
+      "source": "src/modules/relay-l2tp/repositories/topologyTransferDraftRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/repositories/topologyV2Settlement.js": {
+      "mode": 420,
+      "sha256": "68e129f2fb50348b7a2e1e47166e5085ae4c4cc320dd51d23a9cd607c0ecef0c",
+      "source": "src/modules/relay-l2tp/repositories/topologyV2Settlement.js"
+    },
+    "/app/src/modules/relay-l2tp/routes/panel.js": {
+      "mode": 420,
+      "sha256": "9f5ccf964a91f24bdf39133920dbc4241dc3c9acd2e507b7057a51aa55f365df",
+      "source": "src/modules/relay-l2tp/routes/panel.js"
+    },
+    "/app/src/modules/relay-l2tp/routes/panelOverview.js": {
+      "mode": 420,
+      "sha256": "7774b03a3dac8365c9e3f5729713b979c277c8e8b93595c094b92fe76e1cc716",
+      "source": "src/modules/relay-l2tp/routes/panelOverview.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/createL2tpExecutionRuntime.js": {
+      "mode": 420,
+      "sha256": "555da27c1022645c0ae2cf3b6ce7b953869a37da24b92852eabf8ddba54d6019",
+      "source": "src/modules/relay-l2tp/runtime/createL2tpExecutionRuntime.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/createL2tpRuntime.js": {
+      "mode": 420,
+      "sha256": "f9012e283bde762069afbe8ab9605f68d3bded2968e210864109e6689bf2e802",
+      "source": "src/modules/relay-l2tp/runtime/createL2tpRuntime.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/createL2tpWorkerLifecycle.js": {
+      "mode": 420,
+      "sha256": "72333c1d7c4ce4c4e410701f2d302e9acbd4571a48183033d2cdd9122f7724d7",
+      "source": "src/modules/relay-l2tp/runtime/createL2tpWorkerLifecycle.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle.js": {
+      "mode": 420,
+      "sha256": "8f0266cafe1399ff5b4abd714c75174e78dc4b47f9208c16ebe934cdf363b25d",
+      "source": "src/modules/relay-l2tp/runtime/createTopologyOperationRecoveryLifecycle.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/createTopologyOperationRuntime.js": {
+      "mode": 420,
+      "sha256": "73e745eb692b01f721af55bb6f7887663304fe18bd07b0209f2514f16d845930",
+      "source": "src/modules/relay-l2tp/runtime/createTopologyOperationRuntime.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/productionAdmissionMaintenanceEntry.js": {
+      "mode": 420,
+      "sha256": "1f86853972ecdeccb8555d07cbb6f4e0453f23bd12a3f726fc3cf374bbb1082e",
+      "source": "src/modules/relay-l2tp/runtime/productionAdmissionMaintenanceEntry.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/productionMaintenanceAuthority.js": {
+      "mode": 420,
+      "sha256": "0a6506e6261bcc0d54b4307b0dec27800b5def5fc77953f4c395a2f0dfb3bb6f",
+      "source": "src/modules/relay-l2tp/runtime/productionMaintenanceAuthority.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/testDurableOriginals.js": {
+      "mode": 420,
+      "sha256": "f536a61a9460f1c19107f6df26f0d8fd85585ffd2649fa67a6107c511a2b1e4a",
+      "source": "src/modules/relay-l2tp/runtime/testDurableOriginals.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/testPhysicalController.js": {
+      "mode": 420,
+      "sha256": "4c300f0e3348d099ea7776ac35a4c515a31a244bc90d8eb3aacae7bb781c666e",
+      "source": "src/modules/relay-l2tp/runtime/testPhysicalController.js"
+    },
+    "/app/src/modules/relay-l2tp/runtime/topologyExecutionAuthorityLifecycle.js": {
+      "mode": 420,
+      "sha256": "96ae48f164db26a3aea3e54828eb129a5ade7741660223a621972bb3c54630f1",
+      "source": "src/modules/relay-l2tp/runtime/topologyExecutionAuthorityLifecycle.js"
+    },
+    "/app/src/modules/relay-l2tp/services/autoL2tpPathMaintenance.js": {
+      "mode": 420,
+      "sha256": "216d9c1980cb51ca40e5f47a16366e0e0cca826c774a7e2955a227e177ffe4ba",
+      "source": "src/modules/relay-l2tp/services/autoL2tpPathMaintenance.js"
+    },
+    "/app/src/modules/relay-l2tp/services/frozenTopologyDeploymentPlanComposer.js": {
+      "mode": 420,
+      "sha256": "4a8c964f2a7a714c646e7de671685439902040127372a4761eb8a053a549eb24",
+      "source": "src/modules/relay-l2tp/services/frozenTopologyDeploymentPlanComposer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpArtifactBootstrapper.js": {
+      "mode": 420,
+      "sha256": "bf7d4c6a6c817ecce220d41b52c63a17c4d8e042857f7c58dbcbf7fdc61e4397",
+      "source": "src/modules/relay-l2tp/services/l2tpArtifactBootstrapper.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpConfigService.js": {
+      "mode": 420,
+      "sha256": "b85c8b54278e1892c6cbdf651b788649f0bf9f718ca5394250aacf947016b8db",
+      "source": "src/modules/relay-l2tp/services/l2tpConfigService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpNodeExecutionResolver.js": {
+      "mode": 420,
+      "sha256": "b80c0f642754b1afef314c55ca0bb67c0b15a9bcf7606b4160fbb6b35b35532a",
+      "source": "src/modules/relay-l2tp/services/l2tpNodeExecutionResolver.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpNodeTransport.js": {
+      "mode": 420,
+      "sha256": "e20502ec8a6eb1bf992f6442ad9fe6983e332b7b49e6098c8e6a9f5f07ee1939",
+      "source": "src/modules/relay-l2tp/services/l2tpNodeTransport.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpNodeTransportFactory.js": {
+      "mode": 420,
+      "sha256": "1105698eacd7832f15b6d3cb19ef5697c05cf4b07823ea7124410d07ac7fef75",
+      "source": "src/modules/relay-l2tp/services/l2tpNodeTransportFactory.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpOperationMaterializer.js": {
+      "mode": 420,
+      "sha256": "bcea5bec99b203c5f7ded0df0af78969566197ef15d62353feac7817c5c9cabb",
+      "source": "src/modules/relay-l2tp/services/l2tpOperationMaterializer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpOperationRepository.js": {
+      "mode": 420,
+      "sha256": "6faaf52290ca794a22c1f7c047935432b313affe2942678f74063d01b0a56e71",
+      "source": "src/modules/relay-l2tp/services/l2tpOperationRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpPppUserReadiness.js": {
+      "mode": 420,
+      "sha256": "24cf98a41c7bdd79acaf7a415cc1b744e0b8e48e89cabc4dba351f7778a88c96",
+      "source": "src/modules/relay-l2tp/services/l2tpPppUserReadiness.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpPreflightResult.js": {
+      "mode": 420,
+      "sha256": "4f28ebe941007f2fc6b9d31a5cc702780336ec2747aba55d1059729ecf89f05f",
+      "source": "src/modules/relay-l2tp/services/l2tpPreflightResult.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpPreflightRunner.js": {
+      "mode": 420,
+      "sha256": "e0add38499bbf1fb14277b8d07be55ee77146ed0a6a42191b71c095864cb6793",
+      "source": "src/modules/relay-l2tp/services/l2tpPreflightRunner.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpProvisionPlanService.js": {
+      "mode": 420,
+      "sha256": "ed376564597b0d8c80149cd63e874288e91509ba798e86792d0407ff0025aa78",
+      "source": "src/modules/relay-l2tp/services/l2tpProvisionPlanService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpRemoteExecutor.js": {
+      "mode": 420,
+      "sha256": "111f5686b3c467e9564b2e66f1cfb8cde9a06c153828844d1320df0e03bfd70e",
+      "source": "src/modules/relay-l2tp/services/l2tpRemoteExecutor.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpService.js": {
+      "mode": 420,
+      "sha256": "b4b1d077c045959e0e594ee541d688c592ed47828970162fad1ffcd3e82e3035",
+      "source": "src/modules/relay-l2tp/services/l2tpService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpSimpleService.js": {
+      "mode": 420,
+      "sha256": "5ab199e64ba4931337b901a2861350fd643c4460075d4023fcd93deb1eb5b0a1",
+      "source": "src/modules/relay-l2tp/services/l2tpSimpleService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpStateManagementService.js": {
+      "mode": 420,
+      "sha256": "adac173ed156bb1f9cd32c93bc7fca0d3e6cfa1b26a6664c6c0cd6fa8a07c025",
+      "source": "src/modules/relay-l2tp/services/l2tpStateManagementService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpUserManagementService.js": {
+      "mode": 420,
+      "sha256": "b3dbc1fa4eb12be89b6b162c057ef5ddae1f90d9c4d04e596257bcca2ece14ff",
+      "source": "src/modules/relay-l2tp/services/l2tpUserManagementService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpUserResolver.js": {
+      "mode": 420,
+      "sha256": "b467301b5b9d7543439d845d63ba5229298bdd2a56991b67377b14baa1b8fe7a",
+      "source": "src/modules/relay-l2tp/services/l2tpUserResolver.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpUserSyncReconciler.js": {
+      "mode": 420,
+      "sha256": "8c41fa5e2ca5b162c70d9ec6e573f86c1aa72c3574a4fd06098183f01871175f",
+      "source": "src/modules/relay-l2tp/services/l2tpUserSyncReconciler.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpUserSyncService.js": {
+      "mode": 420,
+      "sha256": "fbfe500aa6ba4e378b8123de1a1842747414d10926a16e716164a6cfe174a39d",
+      "source": "src/modules/relay-l2tp/services/l2tpUserSyncService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpXrayCandidateService.js": {
+      "mode": 420,
+      "sha256": "3dbc06474b8623cf1f7200851ae1bc6d9b2d6a5b79b95db49cb0ef85d31f5217",
+      "source": "src/modules/relay-l2tp/services/l2tpXrayCandidateService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/l2tpXrayFragmentProvider.js": {
+      "mode": 420,
+      "sha256": "5bcde7564922afe1e33152d47761ac01043c3235bc11a0ffedf8612cb2cf0a34",
+      "source": "src/modules/relay-l2tp/services/l2tpXrayFragmentProvider.js"
+    },
+    "/app/src/modules/relay-l2tp/services/legacyCascadeUndeploy.js": {
+      "mode": 420,
+      "sha256": "8e85fa1e9fcddaa75a1ae135d4651ec6f5b4289083b7dc1a53dd8ab297f430e2",
+      "source": "src/modules/relay-l2tp/services/legacyCascadeUndeploy.js"
+    },
+    "/app/src/modules/relay-l2tp/services/nodeOperationLockRepository.js": {
+      "mode": 420,
+      "sha256": "2bbd4ee9466dc9b20f04456e602f21e74d3631bea5f78e3f6f105d05baed6daa",
+      "source": "src/modules/relay-l2tp/services/nodeOperationLockRepository.js"
+    },
+    "/app/src/modules/relay-l2tp/services/nodeOperationLockService.js": {
+      "mode": 420,
+      "sha256": "096c218b6869e8b932cb14f874289f7e9ce184bbd70ec003c4e1ed4fcec6d556",
+      "source": "src/modules/relay-l2tp/services/nodeOperationLockService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/productionAdmissionInitializationPreflight.js": {
+      "mode": 420,
+      "sha256": "15c54e2461a7b1867d0b3f79648871664903d30f64192558eed868d77200637e",
+      "source": "src/modules/relay-l2tp/services/productionAdmissionInitializationPreflight.js"
+    },
+    "/app/src/modules/relay-l2tp/services/productionAdmissionInitializer.js": {
+      "mode": 420,
+      "sha256": "825fb4eb4789bb6b7455b2220de673449408e710bbc3020171eaef21c34313bc",
+      "source": "src/modules/relay-l2tp/services/productionAdmissionInitializer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/secretBoxService.js": {
+      "mode": 420,
+      "sha256": "84f0f5f61ef987ef0479d702912fbadcbaac81aae272fc29079144e7b970f6bf",
+      "source": "src/modules/relay-l2tp/services/secretBoxService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyAttachIngressGate.js": {
+      "mode": 420,
+      "sha256": "698cd8073c0d1b3ec24695714fa2269a6d55c20aa1af9a4eec1e6166205e1de4",
+      "source": "src/modules/relay-l2tp/services/topologyAttachIngressGate.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyClientProfileProbe.js": {
+      "mode": 420,
+      "sha256": "3ebc64da5cc733c59801dcaff6d3363a5845e855b10769af244b27b3a3b55c7d",
+      "source": "src/modules/relay-l2tp/services/topologyClientProfileProbe.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyClientProofExecutor.js": {
+      "mode": 420,
+      "sha256": "9cb971bdcb6957903f119bb07fccba7e534e2ab6fc26332a8e7210bb0bdf516f",
+      "source": "src/modules/relay-l2tp/services/topologyClientProofExecutor.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyDeploymentService.js": {
+      "mode": 420,
+      "sha256": "8dc2326cba281d0a7e95f718da578691693468cfaca770f85a0570730efdfc20",
+      "source": "src/modules/relay-l2tp/services/topologyDeploymentService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyDomainSyncPlanner.js": {
+      "mode": 420,
+      "sha256": "5f3a34147c09c806b063045e96ec80a6ebc1d75e6407680662ba121f6f6fef4e",
+      "source": "src/modules/relay-l2tp/services/topologyDomainSyncPlanner.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyDraftWriteService.js": {
+      "mode": 420,
+      "sha256": "0bf00e6fc6c4eb8a0f3443d0d94caf26b9e4934d6f71d692400d943998fdb0ed",
+      "source": "src/modules/relay-l2tp/services/topologyDraftWriteService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyHealthSource.js": {
+      "mode": 420,
+      "sha256": "ead3b64c83796f6312fd877a2a1f3a29ea48f24ce3cd5f15bea862dc09752526",
+      "source": "src/modules/relay-l2tp/services/topologyHealthSource.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyIntentConsumer.js": {
+      "mode": 420,
+      "sha256": "aaefcf9b0ef5ba58e0e4401098527c7754ef5a67089d6579577f48e8c851e91c",
+      "source": "src/modules/relay-l2tp/services/topologyIntentConsumer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyIntentService.js": {
+      "mode": 420,
+      "sha256": "774c3e29f1355325fd74a57345ecc1254fdfd3820015dcef24da30e7d2b1d83d",
+      "source": "src/modules/relay-l2tp/services/topologyIntentService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyNodeExecutionResolver.js": {
+      "mode": 420,
+      "sha256": "e3fe28c107bdd71f01e1ff97a5e0cb76526ef35d0e3711ef011a51843d7114ca",
+      "source": "src/modules/relay-l2tp/services/topologyNodeExecutionResolver.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyNodeRef.js": {
+      "mode": 420,
+      "sha256": "c2bb125ae08752925816a007d7430a776d34d46e2cf04aef15ae5de1e48f068b",
+      "source": "src/modules/relay-l2tp/services/topologyNodeRef.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyNodeTransport.js": {
+      "mode": 420,
+      "sha256": "bf83ffba2a12bba6c2c589a622c75fc39cce0162ae30df2423603ee7eade766f",
+      "source": "src/modules/relay-l2tp/services/topologyNodeTransport.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyNodeTransportFactory.js": {
+      "mode": 420,
+      "sha256": "8029f7642a99a29510e4fd40e3d30ab4f44b66ca5d32c019b66711ffccd79fde",
+      "source": "src/modules/relay-l2tp/services/topologyNodeTransportFactory.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyOperationCoordinator.js": {
+      "mode": 420,
+      "sha256": "663282c85093134e29b68c30d1c959f4e442fe7a00f68a556e75be559db39524",
+      "source": "src/modules/relay-l2tp/services/topologyOperationCoordinator.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyOperationExecutor.js": {
+      "mode": 420,
+      "sha256": "9366497c12d8e26b1cfb859ea6602f7fbcb0f07185dc537bd7c9501e89f9d026",
+      "source": "src/modules/relay-l2tp/services/topologyOperationExecutor.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyOperationFinalizer.js": {
+      "mode": 420,
+      "sha256": "de07243ffa45caa2fee4ac3db36fa253fdc2f4cc66d41b2b040e84d72e196882",
+      "source": "src/modules/relay-l2tp/services/topologyOperationFinalizer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyOperationPlanMaterializer.js": {
+      "mode": 420,
+      "sha256": "75e6a804da3926f9a881387f039aa87cd38e4c827f9d4ca0f4216c36407d718d",
+      "source": "src/modules/relay-l2tp/services/topologyOperationPlanMaterializer.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyPppReadinessGate.js": {
+      "mode": 420,
+      "sha256": "cee0088d6291af33717fb4c3eb1bc1963f9bb8b9cd340b4ac285ec80d8135b7e",
+      "source": "src/modules/relay-l2tp/services/topologyPppReadinessGate.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyPublishedProfileSource.js": {
+      "mode": 420,
+      "sha256": "df2a668742714d0e61f49660ccc45aaf2bdca4c10eb625ec19ec3dd028cc2fc8",
+      "source": "src/modules/relay-l2tp/services/topologyPublishedProfileSource.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyReadinessProtocol.js": {
+      "mode": 420,
+      "sha256": "c5279cf4a80877238b3da5152dabb045d9dda336e620d97e1384a26f37e457f9",
+      "source": "src/modules/relay-l2tp/services/topologyReadinessProtocol.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyReadinessScope.js": {
+      "mode": 420,
+      "sha256": "fc8f979ef3d0affabeaeae128f5a6fa5a4eb1a65bc633f33ebccca0a6f8047de",
+      "source": "src/modules/relay-l2tp/services/topologyReadinessScope.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyRunnerBootstrapper.js": {
+      "mode": 420,
+      "sha256": "786574965bede6331990879636486837d3f55fd3b1ee35d2b8f5e242f86ad6e2",
+      "source": "src/modules/relay-l2tp/services/topologyRunnerBootstrapper.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyRuntimeService.js": {
+      "mode": 420,
+      "sha256": "c91015bb7341c1798d7ad107b67360f90f67cf46846f1addcb677ff1582486e0",
+      "source": "src/modules/relay-l2tp/services/topologyRuntimeService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyTransferDraftService.js": {
+      "mode": 420,
+      "sha256": "0a1361e13cabb2f45f49fa2388f234ce411f1ebcc4d1ff56aa15319be890dbad",
+      "source": "src/modules/relay-l2tp/services/topologyTransferDraftService.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyUserResync.js": {
+      "mode": 420,
+      "sha256": "ef613a26b8a6d24b97bfa429be7c9c31cf28d469c0c49c00d94dd7520217c6b5",
+      "source": "src/modules/relay-l2tp/services/topologyUserResync.js"
+    },
+    "/app/src/modules/relay-l2tp/services/topologyXrayCandidate.js": {
+      "mode": 420,
+      "sha256": "9db3f7ba7ad716c971cdd90d9a5f50e9e6bbc287110b61c25b9541d838891561",
+      "source": "src/modules/relay-l2tp/services/topologyXrayCandidate.js"
+    },
+    "/app/src/modules/relay-l2tp/services/xrayConfigComposer.js": {
+      "mode": 420,
+      "sha256": "8295056afa9878171675a6b98635127aa3196e36fccc18d2611a9c9c0077d8d4",
+      "source": "src/modules/relay-l2tp/services/xrayConfigComposer.js"
+    },
+    "/app/src/modules/relay-l2tp/workers/l2tpOperationWorker.js": {
+      "mode": 420,
+      "sha256": "c0a7177421e57d6aa3c484894597728994b2e0e34fabdada9db87d750dec6294",
+      "source": "src/modules/relay-l2tp/workers/l2tpOperationWorker.js"
+    },
+    "/app/src/modules/relay-l2tp/workers/topologyClientReadinessWorker.js": {
+      "mode": 420,
+      "sha256": "a109f56637a1eec88bfcfa0dcfcc16cb6859136d0847db97b8b5fac5b5fee21f",
+      "source": "src/modules/relay-l2tp/workers/topologyClientReadinessWorker.js"
+    },
+    "/app/src/modules/relay-l2tp/workers/topologyOperationWorker.js": {
+      "mode": 420,
+      "sha256": "04cfe8568168824645383f21c1a38045e95e8aaf27147d5a398edf7b328909bc",
+      "source": "src/modules/relay-l2tp/workers/topologyOperationWorker.js"
+    },
+    "/app/src/routes/accessLogsIngest.js": {
+      "mode": 420,
+      "sha256": "d6546e76eb58b604a536731d22bdcb87c75b1d06ec8cd93ba22c6483e149c8a6",
+      "source": "src/routes/accessLogsIngest.js"
+    },
+    "/app/src/routes/auth.js": {
+      "mode": 420,
+      "sha256": "a6909c872490bb90772c6662646b24d9e763407ca26d3fe8b0431fc255775c37",
+      "source": "src/routes/auth.js"
+    },
+    "/app/src/routes/cascade.js": {
+      "mode": 420,
+      "sha256": "0ad8c86a87587f99401aebcd5720a000524c82602d095cde84142d76b2a13e1c",
+      "source": "src/routes/cascade.js"
+    },
+    "/app/src/routes/cascadeLinks.js": {
+      "mode": 420,
+      "sha256": "d2b9cedb949015b3df906d73dae0dda53ca7bdb9d345c9425e0030c602391c2f",
+      "source": "src/routes/cascadeLinks.js"
+    },
+    "/app/src/routes/cascadeRouteGroups.js": {
+      "mode": 420,
+      "sha256": "9f3604fa7883ac82e58b9a3abaa598074fdaff2fc7d776e7957a2ff654e21c3a",
+      "source": "src/routes/cascadeRouteGroups.js"
+    },
+    "/app/src/routes/cascadeTopologyDeploy.js": {
+      "mode": 420,
+      "sha256": "0961cf52bb1befa72e998d8242bceafd2ddd58f68105ec1447144a17f6d978f3",
+      "source": "src/routes/cascadeTopologyDeploy.js"
+    },
+    "/app/src/routes/groups.js": {
+      "mode": 420,
+      "sha256": "2f58cba69f22a4ce499237dc660697ffb9919344fb9e79a7468ab57a2993e16a",
+      "source": "src/routes/groups.js"
+    },
+    "/app/src/routes/marzbanCompat.js": {
+      "mode": 420,
+      "sha256": "7690030cbdf07de18cbeaabfc22d4b68b40f0f069af2bb12501e7954ff58a11e",
+      "source": "src/routes/marzbanCompat.js"
+    },
+    "/app/src/routes/mcp.js": {
+      "mode": 420,
+      "sha256": "0f7c2bd6f29cd79c5ba2b4aa4825f43793aeb2a88d40ea0bedbad7536bd227f9",
+      "source": "src/routes/mcp.js"
+    },
+    "/app/src/routes/nodes.js": {
+      "mode": 420,
+      "sha256": "1ba9101a98970ea76611a55193032b29062dddd21d1e7b65cd11755e647462cb",
+      "source": "src/routes/nodes.js"
+    },
+    "/app/src/routes/panel/accessLogs.js": {
+      "mode": 420,
+      "sha256": "edb2224664ffb2ca811d08b6d1653ed164d144eadadba7c9dfedaa58223b591d",
+      "source": "src/routes/panel/accessLogs.js"
+    },
+    "/app/src/routes/panel/auth.js": {
+      "mode": 420,
+      "sha256": "95fbe7020d3a6a6b1a81aaa3f74513ff753e481549907aa16089153bd1ed17d2",
+      "source": "src/routes/panel/auth.js"
+    },
+    "/app/src/routes/panel/csrf.js": {
+      "mode": 420,
+      "sha256": "3f1dc05433a88ae4754de9820d050559e864e177e2dad2fc38e66747e77c01f9",
+      "source": "src/routes/panel/csrf.js"
+    },
+    "/app/src/routes/panel/helpers.js": {
+      "mode": 420,
+      "sha256": "a05f0884e5f8fe6abf37c9f9539bb4c36690067935b0d690ff7099b928ee4286",
+      "source": "src/routes/panel/helpers.js"
+    },
+    "/app/src/routes/panel/index.js": {
+      "mode": 420,
+      "sha256": "608014905a3ba702c945c86eace9fab81e102d68bb5660dfadd54c763826f362",
+      "source": "src/routes/panel/index.js"
+    },
+    "/app/src/routes/panel/migration.js": {
+      "mode": 420,
+      "sha256": "4555891e2740bb4c516e3223b0b5ec57ecb6da0d5ad04b292acc4c2c53627bdf",
+      "source": "src/routes/panel/migration.js"
+    },
+    "/app/src/routes/panel/nodes.js": {
+      "mode": 420,
+      "sha256": "8d48bc722612fbdb9610bd8eb2c91cc1c57fe729b585f097cfe63301e650ff90",
+      "source": "src/routes/panel/nodes.js"
+    },
+    "/app/src/routes/panel/settings.js": {
+      "mode": 420,
+      "sha256": "f5d3a10bfe129617b3bfbe8a11099b414697fffb459f144236886bc0475f1242",
+      "source": "src/routes/panel/settings.js"
+    },
+    "/app/src/routes/panel/system.js": {
+      "mode": 420,
+      "sha256": "17a6274bab8dac62f012ff86c0d25565c995efbe6b08e92fa485397841fefd0b",
+      "source": "src/routes/panel/system.js"
+    },
+    "/app/src/routes/panel/update.js": {
+      "mode": 420,
+      "sha256": "f43a9c338439fefe183f9ed3e2c61fae339da9ec7a5b814f45a47a8808e1502c",
+      "source": "src/routes/panel/update.js"
+    },
+    "/app/src/routes/panel/users.js": {
+      "mode": 420,
+      "sha256": "d95aff6e1ba1f51928025ee993ec65a4c8aabc3e1a21283f49d2d6c1bafbd0f6",
+      "source": "src/routes/panel/users.js"
+    },
+    "/app/src/routes/panel/wizard.js": {
+      "mode": 420,
+      "sha256": "d762cb9b27a732b95ba37f6fca9da5c1f4231bce46935274301ed870ab913264",
+      "source": "src/routes/panel/wizard.js"
+    },
+    "/app/src/routes/subscription.js": {
+      "mode": 420,
+      "sha256": "8883e1ae324534cc1168d62952f4f25d35788d4f14b3cd94fcaecb01ac9ca149",
+      "source": "src/routes/subscription.js"
+    },
+    "/app/src/routes/topologyTestDiagnostics.js": {
+      "mode": 420,
+      "sha256": "09257835b0d2f5f580799b88c172a8566a29fed0d82fcae454fb299feb7b956b",
+      "source": "src/routes/topologyTestDiagnostics.js"
+    },
+    "/app/src/routes/topologyTransferDrafts.js": {
+      "mode": 420,
+      "sha256": "06c113b6da222598c931bde2cae6e0fef7a4576df36e04e8464cb0a957a630e3",
+      "source": "src/routes/topologyTransferDrafts.js"
+    },
+    "/app/src/routes/users.js": {
+      "mode": 420,
+      "sha256": "1add870ad626a38acfde75fa6ec50ecff7b3286e94ab1ff16f3d3f895305441b",
+      "source": "src/routes/users.js"
+    },
+    "/app/src/services/accessLogs/clickhouseService.js": {
+      "mode": 420,
+      "sha256": "8dd8fe76235e37216f6109cc54c82b6ebeeb24511d4b6b55d8a84a4652a4cf1f",
+      "source": "src/services/accessLogs/clickhouseService.js"
+    },
+    "/app/src/services/accessLogs/credentialService.js": {
+      "mode": 420,
+      "sha256": "ec7319c6d106f44bb9c9755b23ade0dd0f25fa6d2cccaefa5902cb897c3a50e0",
+      "source": "src/services/accessLogs/credentialService.js"
+    },
+    "/app/src/services/accessLogs/paths.js": {
+      "mode": 420,
+      "sha256": "916bb919f2d6bf446ae8ed0232dab04c48e7b7bc774d1a82462be5097d6f9250",
+      "source": "src/services/accessLogs/paths.js"
+    },
+    "/app/src/services/accessLogs/processService.js": {
+      "mode": 420,
+      "sha256": "f0053ab191380845b334861047a932cb30b420d646a6bae0737b07e1773cd5fc",
+      "source": "src/services/accessLogs/processService.js"
+    },
+    "/app/src/services/accessLogs/provisionService.js": {
+      "mode": 420,
+      "sha256": "acff5e5c6d7eb3d11124e320db5bcefc5ed46fee272e728983062e9a8efdac8c",
+      "source": "src/services/accessLogs/provisionService.js"
+    },
+    "/app/src/services/accessLogs/searchService.js": {
+      "mode": 420,
+      "sha256": "7b54880ee306fc87c03a1550d3346d0323c588a6a119501fe2961429f28232e5",
+      "source": "src/services/accessLogs/searchService.js"
+    },
+    "/app/src/services/accessLogs/spoolService.js": {
+      "mode": 420,
+      "sha256": "5e2c0c9a7c582b64a77161885714f0555ce9200714718eadcee63926cea55fde",
+      "source": "src/services/accessLogs/spoolService.js"
+    },
+    "/app/src/services/backupService.js": {
+      "mode": 420,
+      "sha256": "9dcb9351a74bf99f7f95b8a22781e51c5b432ba25589c6eb39e8b00eafb30450",
+      "source": "src/services/backupService.js"
+    },
+    "/app/src/services/broadcastTerminal.js": {
+      "mode": 420,
+      "sha256": "f5945e5f8c60a9194873214025e1326e7555f7c84443e3f186bf7e7455d1aad4",
+      "source": "src/services/broadcastTerminal.js"
+    },
+    "/app/src/services/cacheService.js": {
+      "mode": 420,
+      "sha256": "4e4cac1c229170001409a0693afc648a5d9cfa826231cd588d5b67c6e8e4f60b",
+      "source": "src/services/cacheService.js"
+    },
+    "/app/src/services/cascadeService.js": {
+      "mode": 420,
+      "sha256": "8ef1c01b692cd9b7c0f66f6d7e0eee249977b28e15399c32905174b62eca2630",
+      "source": "src/services/cascadeService.js"
+    },
+    "/app/src/services/configFragmentRegistry.js": {
+      "mode": 420,
+      "sha256": "a62d026dc5e99e17b900b1da5339bc95c84cca54078301492a237f6ee7ba8679",
+      "source": "src/services/configFragmentRegistry.js"
+    },
+    "/app/src/services/configGenerator.js": {
+      "mode": 420,
+      "sha256": "2019b4cd0e2d3dad5d44969af721d15b0ab68df108312d6aa0dd91f92ca2353b",
+      "source": "src/services/configGenerator.js"
+    },
+    "/app/src/services/cryptoService.js": {
+      "mode": 420,
+      "sha256": "a60a06540ba4b87c5eb9e7ec368f2754367ee05221c731e5c2a2d7a086c3a4bc",
+      "source": "src/services/cryptoService.js"
+    },
+    "/app/src/services/diskMonitorService.js": {
+      "mode": 420,
+      "sha256": "5aed09298654026f92e6b48e3db57d5736bdd7e5c790eeb22be714e8508dc1d9",
+      "source": "src/services/diskMonitorService.js"
+    },
+    "/app/src/services/expireScheduler.js": {
+      "mode": 420,
+      "sha256": "261d6445e2df25595429332749a1a3fd57d479585189f04b6fa63b19cdaf8338",
+      "source": "src/services/expireScheduler.js"
+    },
+    "/app/src/services/heldOwnerSettlementJournal.js": {
+      "mode": 420,
+      "sha256": "e5300d91560659bfef6129f777ba57136fda5f5eeab18b1a668565ecd25a9bdf",
+      "source": "src/services/heldOwnerSettlementJournal.js"
+    },
+    "/app/src/services/heldRestorationChannel.js": {
+      "mode": 420,
+      "sha256": "5cc40794490438bdfe2c05be9ea7fb15eb00b8ad97749a4398520c960ab6850d",
+      "source": "src/services/heldRestorationChannel.js"
+    },
+    "/app/src/services/heldTestOwnerSettlement.js": {
+      "mode": 420,
+      "sha256": "f4772ac3cc5e7274beb406cffa793f237039fa941d914153d3c8c99885e0c68c",
+      "source": "src/services/heldTestOwnerSettlement.js"
+    },
+    "/app/src/services/heldTestOwnerSettlement.md": {
+      "mode": 420,
+      "sha256": "4df96c76e6b04a5107432d7c8aa0e254061ae487a17287def35a095c2d020589",
+      "source": "src/services/heldTestOwnerSettlement.md"
+    },
+    "/app/src/services/homepageService.js": {
+      "mode": 420,
+      "sha256": "c49a004607eeab3afc7ffeacb89284318331c42ad6cb9e4836e036fdde684217",
+      "source": "src/services/homepageService.js"
+    },
+    "/app/src/services/hostMetricsService.js": {
+      "mode": 420,
+      "sha256": "93af99c8164c918fdc4506a88d5486e0e807fb379c8241e7ccd90103f12bf4ea",
+      "source": "src/services/hostMetricsService.js"
+    },
+    "/app/src/services/hwidDeviceService.js": {
+      "mode": 420,
+      "sha256": "83a667e076720f5947dc1027ee1611b128ca07d066fe95a0211e1ac3cf56e5a6",
+      "source": "src/services/hwidDeviceService.js"
+    },
+    "/app/src/services/marzbanMigrationService.js": {
+      "mode": 420,
+      "sha256": "27480a9b153da43f46cb3462c20e66caef0d927c5d567ba5f67ea04f4e4337ff",
+      "source": "src/services/marzbanMigrationService.js"
+    },
+    "/app/src/services/mcpService.js": {
+      "mode": 420,
+      "sha256": "e6840761b29d1f4bb9148f2af68fa151a636a7a00966852a1f1cfa7650f26c56",
+      "source": "src/services/mcpService.js"
+    },
+    "/app/src/services/nodeSSH.js": {
+      "mode": 420,
+      "sha256": "edf9e8fef944f345a5d24a8124b1b9d68bd0e169e3ddad6ba2556e4bd6b7e766",
+      "source": "src/services/nodeSSH.js"
+    },
+    "/app/src/services/nodeSetup.js": {
+      "mode": 420,
+      "sha256": "8558143f0624c69862001fd42e357c570960cc3579c1a3aaf54cbb088bf0ca69",
+      "source": "src/services/nodeSetup.js"
+    },
+    "/app/src/services/sniScanner.js": {
+      "mode": 420,
+      "sha256": "622b2f55ed97eb5136256d6ffad5afbd1b93dfdef0a47403e9a93f678d1e7d46",
+      "source": "src/services/sniScanner.js"
+    },
+    "/app/src/services/sshExecStdin.js": {
+      "mode": 420,
+      "sha256": "2ece7c81f6ae963ba45d23709b86f4671b3483a00f584ee16b2d9062793c8c18",
+      "source": "src/services/sshExecStdin.js"
+    },
+    "/app/src/services/sshKeyService.js": {
+      "mode": 420,
+      "sha256": "98e1510bbf7916f347f78874f7e74c507960f44d3946c536673cfffd1deec2a2",
+      "source": "src/services/sshKeyService.js"
+    },
+    "/app/src/services/sshPoolService.js": {
+      "mode": 420,
+      "sha256": "33b693e99d151a5c50dd8175c8b1e157c56b4fac5a96831915b04db71456c5a9",
+      "source": "src/services/sshPoolService.js"
+    },
+    "/app/src/services/sshTerminal.js": {
+      "mode": 420,
+      "sha256": "c71260f2a9c687df5054da29529ed98e922f1b6248abf8d08c564bc6d5a42818",
+      "source": "src/services/sshTerminal.js"
+    },
+    "/app/src/services/statsService.js": {
+      "mode": 420,
+      "sha256": "f82843cdb9bdd192b773e06fe454cdf8b0dc7e8371575e33a1515d379e4ed470",
+      "source": "src/services/statsService.js"
+    },
+    "/app/src/services/syncService.js": {
+      "mode": 420,
+      "sha256": "a4ad3f06ee2ae8ad5c1c5c7540f874f254e06c9ad6c59b7c79ae25e7071de1dd",
+      "source": "src/services/syncService.js"
+    },
+    "/app/src/services/topologyConfigOwnership.js": {
+      "mode": 420,
+      "sha256": "fc40338a267d6ef7afe07c9abbc0e3588b3ae6284568f84b6ad58770d138923b",
+      "source": "src/services/topologyConfigOwnership.js"
+    },
+    "/app/src/services/topologyConfigTransfer.js": {
+      "mode": 420,
+      "sha256": "41d615c073cb082907db791b98b1cf6595d0126fcbc0b8301192ac4ae9581132",
+      "source": "src/services/topologyConfigTransfer.js"
+    },
+    "/app/src/services/topologyConfigTransfer.md": {
+      "mode": 420,
+      "sha256": "a418df34640f3a3c8f54b7d6ddd3e24996b94bdc4fd7543bb42d7df1af7f32b0",
+      "source": "src/services/topologyConfigTransfer.md"
+    },
+    "/app/src/services/totpService.js": {
+      "mode": 420,
+      "sha256": "e6f798c1a9730d1afe556ae7ef649eb0e220ff55c9f4ae4db945d19d05dfeb8f",
+      "source": "src/services/totpService.js"
+    },
+    "/app/src/services/uaStatsService.js": {
+      "mode": 420,
+      "sha256": "86559a7f5e9bdc5e6453e94fda3b8b892b40ec2146ccb16a0d6ff5deaca5e4a3",
+      "source": "src/services/uaStatsService.js"
+    },
+    "/app/src/services/updateService.js": {
+      "mode": 420,
+      "sha256": "6c7c330782ffd97050984b442c72fca9e67035347ba2fd736b3833e7715c110a",
+      "source": "src/services/updateService.js"
+    },
+    "/app/src/services/webhookService.js": {
+      "mode": 420,
+      "sha256": "6a470534b858918137b55329eba365ae97d4c7a6d180c2c38b9931e1d46ccc20",
+      "source": "src/services/webhookService.js"
+    },
+    "/app/src/utils/agentOnlineState.js": {
+      "mode": 420,
+      "sha256": "b2c9526c605730ec7c3a2083cf214070dc73847d874d373ae990c3fbe5821f4d",
+      "source": "src/utils/agentOnlineState.js"
+    },
+    "/app/src/utils/clientIp.js": {
+      "mode": 420,
+      "sha256": "b680ccf4f5fe472beca14fa1aaec3e2e25cd612ae565b8e9ec7524fb792184dc",
+      "source": "src/utils/clientIp.js"
+    },
+    "/app/src/utils/helpers.js": {
+      "mode": 420,
+      "sha256": "7901ac2e0e57c61ac0cc702093a8afbe23a6ebf90fa25a464f4dee26a06e041d",
+      "source": "src/utils/helpers.js"
+    },
+    "/app/src/utils/hwidHeaders.js": {
+      "mode": 420,
+      "sha256": "a688f90e90144ec77074bf13b579437af34a0bb994b99d3e8729998a78f8ee1b",
+      "source": "src/utils/hwidHeaders.js"
+    },
+    "/app/src/utils/logger.js": {
+      "mode": 420,
+      "sha256": "e7a39417ec13da45531581eb6cd194548b18166182c36f71d2b9c1996fc9adf8",
+      "source": "src/utils/logger.js"
+    },
+    "/app/src/utils/marzbanToken.js": {
+      "mode": 420,
+      "sha256": "10ec972918da9c18a8039e1ff0098e2b7678e94d4094c6cd46e8bbd64d275fa8",
+      "source": "src/utils/marzbanToken.js"
+    },
+    "/app/src/utils/nodeUi.js": {
+      "mode": 420,
+      "sha256": "331841af29a913ff5f29324acc62497eea437c978f0522dbb975e3507e933170",
+      "source": "src/utils/nodeUi.js"
+    },
+    "/app/src/utils/rateLimiters.js": {
+      "mode": 420,
+      "sha256": "eca0796047c053386a6fa32ca85c235c648ecd3014962eaf1b41d06f0e8da305",
+      "source": "src/utils/rateLimiters.js"
+    },
+    "/app/src/utils/sessionCookie.js": {
+      "mode": 420,
+      "sha256": "af75accefefb8103efbecaa9cb241ab0196f3ebc9f22301fd0e1d600ac09ecb3",
+      "source": "src/utils/sessionCookie.js"
+    },
+    "/app/src/utils/userActivity.js": {
+      "mode": 420,
+      "sha256": "a209a5d3a7ebb3956e45637d5c3858258775b217678f3488d6f75b3652339e31",
+      "source": "src/utils/userActivity.js"
+    },
+    "/app/src/utils/userClientStats.js": {
+      "mode": 420,
+      "sha256": "6c44d4696d8a4d9ce1985780838ffbe3a1a4154d7abbbb163fe3a3f200ebadcc",
+      "source": "src/utils/userClientStats.js"
+    },
+    "/app/templates/node-config-http-auth.yaml": {
+      "mode": 420,
+      "sha256": "3277495d207235318676202eb44ed399767f1a7c1b7feb11780fe045cecbee6e",
+      "source": "templates/node-config-http-auth.yaml"
+    },
+    "/app/views/access-logs.ejs": {
+      "mode": 420,
+      "sha256": "f9858a17cf9906fe4973c335ce3d5defdd3bcd019b0761d88eeb5a9fcc984270",
+      "source": "views/access-logs.ejs"
+    },
+    "/app/views/broadcast-terminal.ejs": {
+      "mode": 420,
+      "sha256": "2bfb66b22113c3bf6ce071fd866895f8f87cc98b4c2715290218925514109369",
+      "source": "views/broadcast-terminal.ejs"
+    },
+    "/app/views/dashboard.ejs": {
+      "mode": 420,
+      "sha256": "fad2aa6b3ff7ecb3de50631df16e8a20fa336d9f02e51c0563e85a3aae02f368",
+      "source": "views/dashboard.ejs"
+    },
+    "/app/views/groups.ejs": {
+      "mode": 420,
+      "sha256": "b5cc4a2df088f10e2a3fa31c671e4a1cbaa50429abb02283c46c76f69a16a2bd",
+      "source": "views/groups.ejs"
+    },
+    "/app/views/l2tp.ejs": {
+      "mode": 420,
+      "sha256": "d5242e10979e2b5e0a2fb33a744091436c442483a3cd128bdb002c8fc850728d",
+      "source": "views/l2tp.ejs"
+    },
+    "/app/views/layout.ejs": {
+      "mode": 420,
+      "sha256": "b3d5cdc2a90b9f4d898852c91c5e3e5d5e981fcfcb6ec7b83e5f2da3aa75cd04",
+      "source": "views/layout.ejs"
+    },
+    "/app/views/login.ejs": {
+      "mode": 420,
+      "sha256": "bd59a4c289e77c9ed5edef9b874d2d6a43638c862051ec6b361892ef5d46a7be",
+      "source": "views/login.ejs"
+    },
+    "/app/views/network.ejs": {
+      "mode": 420,
+      "sha256": "fdf1e6127e11db00499cf46bc88e9f26188e2de796f00d37d70471cea7d0f7f0",
+      "source": "views/network.ejs"
+    },
+    "/app/views/node-form.ejs": {
+      "mode": 420,
+      "sha256": "30ab9904af8d08d7f59293890e4072f9125653c4801af72d40d31133299b462b",
+      "source": "views/node-form.ejs"
+    },
+    "/app/views/node-outbounds.ejs": {
+      "mode": 420,
+      "sha256": "335cc345baad3022ee1f9bad8cd37c634607013236d2764debb1d0cb2b94ee10",
+      "source": "views/node-outbounds.ejs"
+    },
+    "/app/views/nodes.ejs": {
+      "mode": 420,
+      "sha256": "ba2b22122791522743c7cf38386dc428afc2c545e4b72f5e701fd9b65d4a086c",
+      "source": "views/nodes.ejs"
+    },
+    "/app/views/partials/favicon.ejs": {
+      "mode": 420,
+      "sha256": "f7dbea85251d5870163675d1a47da923e12423c03be3a5df5bfc6506fbbdee21",
+      "source": "views/partials/favicon.ejs"
+    },
+    "/app/views/partials/node-form/basic.ejs": {
+      "mode": 420,
+      "sha256": "b3287eb8bb52efc7b35f3dd19129a1d36d7b6d61400d20cfb1950572a38ced98",
+      "source": "views/partials/node-form/basic.ejs"
+    },
+    "/app/views/partials/node-form/hysteria.ejs": {
+      "mode": 420,
+      "sha256": "272248715b269750c8832312df3b644793b46d9346b475fcefd36ff22de79ec5",
+      "source": "views/partials/node-form/hysteria.ejs"
+    },
+    "/app/views/partials/node-form/init-script.ejs": {
+      "mode": 420,
+      "sha256": "ae3eaaa6b073f9e56b1ddb4a947653761f21ba5fdf1e62de75a266093c2caa19",
+      "source": "views/partials/node-form/init-script.ejs"
+    },
+    "/app/views/partials/node-form/management.ejs": {
+      "mode": 420,
+      "sha256": "ec2ea8eedba1af5f16a9845e2988c74b9e8573978d34a2fc3b950bf730e8d4e3",
+      "source": "views/partials/node-form/management.ejs"
+    },
+    "/app/views/partials/node-form/network.ejs": {
+      "mode": 420,
+      "sha256": "dfb50eec9bd0b3589c5eee8a74eeaae2061b24f985d038f8166f4af597d4af01",
+      "source": "views/partials/node-form/network.ejs"
+    },
+    "/app/views/partials/node-form/scripts.ejs": {
+      "mode": 420,
+      "sha256": "8006cb22aaf37174bc10990c2a7321d6a5454158408e070e7633d90fa0a13218",
+      "source": "views/partials/node-form/scripts.ejs"
+    },
+    "/app/views/partials/node-form/ssh.ejs": {
+      "mode": 420,
+      "sha256": "8c715d8aa7e9cc8d7988e743011b4b2c8b5b571b7f40c0f1d7736f834a709f24",
+      "source": "views/partials/node-form/ssh.ejs"
+    },
+    "/app/views/partials/node-form/virtual.ejs": {
+      "mode": 420,
+      "sha256": "30c367686a0248d1dbcd62b1f6c47138329c3d83d5fb5ad82dfd5cd4b6786e6f",
+      "source": "views/partials/node-form/virtual.ejs"
+    },
+    "/app/views/partials/node-form/xray-extra-inbound.ejs": {
+      "mode": 420,
+      "sha256": "084867f439da9ab0a9c771f20e567c8084bc715f7eff1bce05b1098ef8d2625f",
+      "source": "views/partials/node-form/xray-extra-inbound.ejs"
+    },
+    "/app/views/partials/node-form/xray.ejs": {
+      "mode": 420,
+      "sha256": "1125584aa8256d200c81221288966f0bed9634381d019ceb570d06af7e031885",
+      "source": "views/partials/node-form/xray.ejs"
+    },
+    "/app/views/partials/settings/access-logs.ejs": {
+      "mode": 420,
+      "sha256": "d1cb84f3fafe9df4d8d8f9bdd8da85832e27a097c6bbb075fd87b5874bcfba8d",
+      "source": "views/partials/settings/access-logs.ejs"
+    },
+    "/app/views/partials/settings/backup.ejs": {
+      "mode": 420,
+      "sha256": "25223d99aa90a40f3b4e3709c4e901dc9ade6ea5d48146c5ce4dc76184d8e7e5",
+      "source": "views/partials/settings/backup.ejs"
+    },
+    "/app/views/partials/settings/happ.ejs": {
+      "mode": 420,
+      "sha256": "f64b8b5f0bf369d2934d6acc7ee52ee1a38798b646a4b600da9eceb280d4dac9",
+      "source": "views/partials/settings/happ.ejs"
+    },
+    "/app/views/partials/settings/hysteria-limit.ejs": {
+      "mode": 420,
+      "sha256": "797dfb297cf23b5f83214b10dd2b6eb6b718c48ad77f4e8285a3f39f0dccfac4",
+      "source": "views/partials/settings/hysteria-limit.ejs"
+    },
+    "/app/views/partials/settings/maintenance.ejs": {
+      "mode": 420,
+      "sha256": "235b209c5f77e60ea9fb5d40d42d827b1189c18e9e236348fabad9078f418bb0",
+      "source": "views/partials/settings/maintenance.ejs"
+    },
+    "/app/views/partials/settings/migration.ejs": {
+      "mode": 420,
+      "sha256": "99cf270ab8e1cb6896a1a4f267d715e3f6541bcd1a2c6f50faaac81eea2f83c6",
+      "source": "views/partials/settings/migration.ejs"
+    },
+    "/app/views/partials/settings/routing-ios.ejs": {
+      "mode": 420,
+      "sha256": "3059a0a9453ab5a3246e9854895149c2a49003e9bf53e4ac318852166475cdaa",
+      "source": "views/partials/settings/routing-ios.ejs"
+    },
+    "/app/views/partials/settings/routing.ejs": {
+      "mode": 420,
+      "sha256": "9d6a4486a6ad5a35a77c7975255d0e0e5c820e470ac654c5aaa242ec2de5a666",
+      "source": "views/partials/settings/routing.ejs"
+    },
+    "/app/views/partials/settings/security.ejs": {
+      "mode": 420,
+      "sha256": "f2065b7a7ea024b70de6bd67668463e7ed51412a039275ce0188a9c465bb0df9",
+      "source": "views/partials/settings/security.ejs"
+    },
+    "/app/views/partials/settings/softblock.ejs": {
+      "mode": 420,
+      "sha256": "b5f52de8b9659c8cbc3dfcc307278b0e05a772d108b6454bdbd245c863fb9f07",
+      "source": "views/partials/settings/softblock.ejs"
+    },
+    "/app/views/partials/settings/subscription.ejs": {
+      "mode": 420,
+      "sha256": "aaa19449b8e31de05e5f1074f01a24c0df8f19b5245d4d35189b6d7cd0b1b2a4",
+      "source": "views/partials/settings/subscription.ejs"
+    },
+    "/app/views/partials/settings/system.ejs": {
+      "mode": 420,
+      "sha256": "f49a8f5029666489a7431f25c06f8b9fb9da22af563dc7e6debeee6fa54bc2f2",
+      "source": "views/partials/settings/system.ejs"
+    },
+    "/app/views/settings.ejs": {
+      "mode": 420,
+      "sha256": "2ca4c25c2538fa8f6407ffa105764419c483020229ae114f64ed832726a825c1",
+      "source": "views/settings.ejs"
+    },
+    "/app/views/setup.ejs": {
+      "mode": 420,
+      "sha256": "47b80c4e6da64265e32dbbd5b7427138d5aec7b97ec697135e610b61d31a33a2",
+      "source": "views/setup.ejs"
+    },
+    "/app/views/stats.ejs": {
+      "mode": 420,
+      "sha256": "d4c690870f7063beb3fed3b4141b6986e75b6d9086d667236e6f50646c6192cb",
+      "source": "views/stats.ejs"
+    },
+    "/app/views/terminal.ejs": {
+      "mode": 420,
+      "sha256": "53bbb6fe895a0caeb9428c6a754d2da5f24fcda21dbf11ec64f27ca8d5602876",
+      "source": "views/terminal.ejs"
+    },
+    "/app/views/totp-verify.ejs": {
+      "mode": 420,
+      "sha256": "187ae1e5a4d82440657bb8bdd3806a2a009fce6caec0c2750b0860076e7b6943",
+      "source": "views/totp-verify.ejs"
+    },
+    "/app/views/user-detail.ejs": {
+      "mode": 420,
+      "sha256": "6c09a6529c955e37c7d8007e31f9e3d385de830b5c8ae6cf6be2e4e3d80b7454",
+      "source": "views/user-detail.ejs"
+    },
+    "/app/views/user-form.ejs": {
+      "mode": 420,
+      "sha256": "8a50ecb74c2838a721bfae086a9d55437e87c8d18764244a2ec7338c261e42ed",
+      "source": "views/user-form.ejs"
+    },
+    "/app/views/users.ejs": {
+      "mode": 420,
+      "sha256": "7dfcbab7a6f6bf58d622d5dec7bc7853c3cf0a06abd5177c00c56a6e10f5b97a",
+      "source": "views/users.ejs"
+    },
+    "/app/views/wizard.ejs": {
+      "mode": 420,
+      "sha256": "d7e0256390776d6771460b9740e867fa70ee4cf007151fa7086e7cadad47c764",
+      "source": "views/wizard.ejs"
+    },
+    "/usr/local/libexec/c3-test-coordinated-restore.py": {
+      "mode": 493,
+      "sha256": "8b8f8565b1d337a1f44a6554115b0e60f0a3d86dd24bfc3853e003dd481b2a76",
+      "source": "scripts/test-node-isolation/coordinated_restore.py"
+    },
+    "/usr/local/libexec/c3-test-fresh-classic.py": {
+      "mode": 420,
+      "sha256": "63004840c16663d3c436866d8822b7a50d74de10076fdd5f897ccd8d04bd9e8d",
+      "source": "scripts/test-node-isolation/fresh_classic_launch.py"
+    },
+    "/usr/local/libexec/c3-test-fresh-prepare.py": {
+      "mode": 420,
+      "sha256": "db2535c68d26b1b5bf1cc302408f5f2d0d356d8d2ec70e1241be148b234b92ff",
+      "source": "scripts/test-node-isolation/prepare_fresh_supervisor.py"
+    }
+  },
+  "sourceTree": "97c29e780e82a9cf8f102f984b7dc5deb872a368"
+}
