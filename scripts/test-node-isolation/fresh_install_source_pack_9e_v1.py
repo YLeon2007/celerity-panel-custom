@@ -250,6 +250,8 @@ def build(repo, candidate, output):
                     0o644 if installed.startswith('/etc/systemd/system/') else 0o640)
             host_intents[source] = intent(target, installed, sha(raw), mode)
         dependency_intents = {}
+        # Keep the control ancestor private; root payload traversal is 0755.
+        make_directory(stage_fd, 'candidate', 0o700)
         for relative, mode in sorted(directory_modes(root_snapshot).items()):
             make_directory(stage_fd, 'candidate/root' + ('/' + relative[:-1] if relative else ''), mode)
         root_fd = os.open('root', DIR_FLAGS, dir_fd=candidate_fd)

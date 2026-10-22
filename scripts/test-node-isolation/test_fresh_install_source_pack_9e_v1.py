@@ -13,6 +13,13 @@ except ModuleNotFoundError:
     product=None
 
 class Fixed9eTests(unittest.TestCase):
+    def test_public_full_pack_readback(self):
+        self.assertIsNotNone(product)
+        report=product.verify_pack(str(CANDIDATE.parent/'pack-fixed9e-v1'))
+        self.assertIs(report['physicalAccepted'],False)
+        self.assertIs(report['operationalGO'],False)
+        self.assertEqual(report['counts']['payloadFiles'],10518)
+
     def test_verified_fixed9e_candidate(self):
         self.assertIsNotNone(product, 'explicit versioned fixed9e product is missing')
         self.assertEqual(product.PROFILE['sourceCommit'], '9e1b9897539750c3fef02b98055967d1a7edbbec')
