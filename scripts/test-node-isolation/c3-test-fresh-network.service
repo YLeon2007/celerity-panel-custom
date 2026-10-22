@@ -1,0 +1,17 @@
+[Unit]
+Description=Fixed TEST private network constructor (manual, independent authority required)
+AssertFileNotEmpty=/etc/c3-test-fresh-network.json
+AssertFileNotEmpty=/etc/c3-test-fresh-network-lease.json
+AssertPathIsDirectory=/var/lib/c3-test-fresh-network
+AssertPathIsDirectory=/run/netns
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-network-exec.py
+UMask=0077
+LimitCORE=0
+KillMode=process
+TimeoutStopSec=5
+PrivateMounts=no

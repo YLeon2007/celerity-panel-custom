@@ -62,6 +62,9 @@ PYTHON_SOURCES = {
     'fresh_physical.py': 'c3-test-fresh-physical.py',
     'fresh_physical_exec.py': 'c3-test-fresh-physical-exec.py',
     'fresh_physical_watch.py': 'c3-test-fresh-physical-watch.py',
+    'fresh_network.py': 'c3-test-fresh-network.py',
+    'fresh_network_control.py': 'c3-test-fresh-network-control.py',
+    'fresh_network_exec.py': 'c3-test-fresh-network-exec.py',
     'fresh_owner_restoration_channel.py': 'c3-test-fresh-owner-restoration-channel.py',
     'owner_restoration_channel.py': 'c3-test-owner-restoration-channel.py',
     'node_originals.py': 'c3-test-node-originals.py',
@@ -97,7 +100,8 @@ HOST_SOURCES.update({
     'src/modules/relay-l2tp/node-artifacts/l2tp/verify-users.sh': '/usr/local/lib/celerity/relay-l2tp/verify-users.sh',
 })
 HOST_SOURCES.update({PREFIX + name: '/etc/systemd/system/' + name for name in
-                     ('c3-test-fresh-classic.service', 'c3-test-fresh-prepare-watch.service')})
+                     ('c3-test-fresh-classic.service', 'c3-test-fresh-prepare-watch.service',
+                      'c3-test-fresh-network.service')})
 # New constructor closure is byte-pinned independently of the unchanged old BASE.
 # These are reviewed SOURCE pins only, never accepted installed/physical pins.
 PHYSICAL_SOURCE_PINS = {
@@ -106,6 +110,13 @@ PHYSICAL_SOURCE_PINS = {
     'scripts/test-node-isolation/fresh_physical_watch.py': '463fb63c9ce8715e5343770fa9d939dec545be637b1dbf2dd2844086106820c0',
     'scripts/test-node-isolation/c3-test-fresh-classic.service': '03009f943c76e1675c7f2488962c9a223c9ba0901d302fa11fc4873f63812c6d',
     'scripts/test-node-isolation/c3-test-fresh-prepare-watch.service': '97b16b9583f7da3a59ae0569e05006384a07aaa7bac6973c43052350505e92f7',
+}
+# Separate reviewed network SOURCE authority; never modifies payload/physical pins.
+NETWORK_SOURCE_PINS = {
+    PREFIX + 'fresh_network.py': '6c6c5e3b528f12e5c2d578922c50fa2982906c1e97389948ecff7d55c4cb08ec',
+    PREFIX + 'fresh_network_control.py': 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
+    PREFIX + 'fresh_network_exec.py': '5fdb07e09177ce1b616d8506d325089e48e50560fee9a03757e4bc0850760167',
+    PREFIX + 'c3-test-fresh-network.service': 'c137ec5e3b156276cf4953bb866a03c8cd565cd5c913e3fc6426e9eebc3b9a1a',
 }
 HOST_SOURCES.update({source: OWNER_ROOT + source for source in (*JS_SOURCES, 'package.json', 'package-lock.json')})
 SUPERVISORS = {'/usr/local/libexec/' + PYTHON_SOURCES[n]: PREFIX + n for n in
@@ -289,7 +300,9 @@ def committed(repo, revision, relative):
 
 def source_bytes(repo, repo_fd, head, relative):
     raw, mode = committed(repo, head, relative)
-    if relative in PHYSICAL_SOURCE_PINS:
+    if relative in NETWORK_SOURCE_PINS:
+        need(sha(raw) == NETWORK_SOURCE_PINS[relative], 'NETWORK_SOURCE_DRIFT')
+    elif relative in PHYSICAL_SOURCE_PINS:
         need(sha(raw) == PHYSICAL_SOURCE_PINS[relative], 'PHYSICAL_SOURCE_DRIFT')
     else:
         need(raw == committed(repo, BASE, relative)[0], 'BASE_SOURCE_DRIFT')
@@ -409,6 +422,21 @@ def verify_pack_fd(fd):
     files, snapshot = scan(fd)
     del files['pack-manifest.json']  # The control manifest cannot hash itself.
     need(files == doc.get('files') and directory_modes(snapshot) == doc.get('directories'), 'PACK_CONTENT_DRIFT')
+    # The self-excluded control manifest is integrity metadata, not authority to
+    # replace reviewed network bytes or redirect their fixed installation intent.
+    need(decode(read_file(fd, 'network-source-pins.json')[0]) == NETWORK_SOURCE_PINS,
+         'NETWORK_PACK_PIN_DRIFT')
+    host_intents = decode(read_file(fd, 'host-intents.json')[0])
+    need(type(host_intents) is dict, 'NETWORK_PACK_INTENT_DRIFT')
+    for source, pin in NETWORK_SOURCE_PINS.items():
+        installed = HOST_SOURCES[source]
+        target = 'host-source' + installed
+        raw, info = read_file(fd, target)
+        need(sha(raw) == pin and stat.S_IMODE(info.st_mode) == 0o600,
+             'NETWORK_PACK_SOURCE_DRIFT')
+        mode = 0o644 if installed.startswith('/etc/systemd/system/') else 0o750
+        need(encode(host_intents.get(source)) == encode(intent(target, installed, pin, mode)),
+             'NETWORK_PACK_INTENT_DRIFT')
     report = decode(read_file(fd, 'report.json')[0])
     need(report.get('physicalAccepted') is False and report.get('operationalGO') is False, 'PACK_REPORT')
     return report
@@ -491,6 +519,7 @@ def build(repo, candidate, output):
             write_file(stage_fd, 'candidate/' + name, raw)
         write_file(stage_fd, 'bootstrap-files.json', encode(manifest))
         write_file(stage_fd, 'host-intents.json', encode(host_intents))
+        write_file(stage_fd, 'network-source-pins.json', encode(NETWORK_SOURCE_PINS))
         write_file(stage_fd, 'host-dependency-intents.json', encode(dependency_intents))
         report = dict(schema='c3-fixed-install-source-pack-report/v1', physicalAccepted=False,
                       operationalGO=False, installed=False, sourceHead=head, sourceTree=tree,
@@ -500,6 +529,8 @@ def build(repo, candidate, output):
                       candidateModeSha256=MODE_PIN, candidateDirectoriesSha256=DIRECTORY_PIN,
                       counts={**COUNTS, 'hostSources': len(host), 'hostDependencyIntents': len(dependency_intents)},
                       unitIncluded=True, resourceConstructorIncluded=True,
+                      networkSourceIncluded=True, networkUnitIncluded=True,
+                      networkPhysicalAccepted=False,
                       preparationLifecycleImplemented=True, resourcePolicyIncluded=False,
                       provisioningImplemented=False,
                       directIngressAccepted=False,
@@ -507,7 +538,10 @@ def build(repo, candidate, output):
                       hostRuntime='Host Python/Node/OS tools and their loaders are NOT provisioned or accepted; candidate runtime is only fresh-root input.',
                       unimplemented=['independently installed fixed inputs and loaded units',
                                      'physical exercise/acceptance of root/proc/state mounts, UID/capabilities/namespaces/fds',
-                                     'separately provisioned pinned private TEST network namespace and literal ingress',
+                                     'independent network plan/lease/holder and resource acceptance publication',
+                                     'controller entry into the pinned fresh network namespace',
+                                     'privileged network rehearsal and literal ingress acceptance',
+                                     'worker remote SSH, external DNS/egress and all-five hold/handback',
                                      'independent final policy/acceptance and before-hold cgroup/unit admission',
                                      'host runtime closure, physical network/data facts and crash recovery'])
         write_file(stage_fd, 'report.json', encode(report))

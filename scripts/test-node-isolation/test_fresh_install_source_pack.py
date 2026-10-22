@@ -118,6 +118,131 @@ class PublicationTests(unittest.TestCase):
                 os.close(fd)
 
 
+NETWORK_TARGETS = {
+    pack.PREFIX + 'fresh_network.py': '/usr/local/libexec/c3-test-fresh-network.py',
+    pack.PREFIX + 'fresh_network_control.py': '/usr/local/libexec/c3-test-fresh-network-control.py',
+    pack.PREFIX + 'fresh_network_exec.py': '/usr/local/libexec/c3-test-fresh-network-exec.py',
+    pack.PREFIX + 'c3-test-fresh-network.service': '/etc/systemd/system/c3-test-fresh-network.service',
+}
+
+
+class NetworkDeliveryTests(unittest.TestCase):
+    def test_actual_producer_delivers_fixed_network_closure_separate_from_payload(self):
+        self.assertEqual({key: pack.HOST_SOURCES.get(key) for key in NETWORK_TARGETS},
+                         NETWORK_TARGETS, 'network source/unit omitted from actual producer')
+        with Fixture() as f:
+            before = {name: (f.candidate/name).read_bytes() for name in ('manifest.json', 'report.json')}
+            f.build()
+            intents = pack.decode((f.output/'host-intents.json').read_bytes())
+            for source, target in NETWORK_TARGETS.items():
+                raw = (f.repo/source).read_bytes()
+                self.assertEqual((f.output/('host-source' + target)).read_bytes(), raw)
+                self.assertEqual(intents[source], pack.intent('host-source' + target, target,
+                                 pack.sha(raw), 0o644 if target.startswith('/etc/') else 0o750))
+                self.assertEqual(stat.S_IMODE((f.output/('host-source' + target)).stat().st_mode), 0o600)
+                self.assertNotIn(target, f.manifest)
+            for name, raw in before.items():
+                self.assertEqual((f.candidate/name).read_bytes(), raw)
+                self.assertEqual((f.output/'candidate'/name).read_bytes(), raw)
+            self.assertEqual(pack.decode((f.output/'bootstrap-files.json').read_bytes()), f.manifest)
+            self.assertIs(pack.verify_pack(str(f.output))['operationalGO'], False)
+
+    @staticmethod
+    def rehash_pack(output):
+        fd = pack.open_directory(str(output))
+        try:
+            files, snapshot = pack.scan(fd)
+        finally:
+            os.close(fd)
+        files.pop('pack-manifest.json')
+        manifest = pack.decode((output/'pack-manifest.json').read_bytes())
+        manifest.update(files=files, directories=pack.directory_modes(snapshot))
+        (output/'pack-manifest.json').write_bytes(pack.encode(manifest))
+
+    def test_verifier_refuses_type_coerced_network_intents(self):
+        for field, value in (('uidIntent', False), ('installed', 0), ('modeIntent', 488.0)):
+            with self.subTest(field=field), Fixture() as f:
+                f.build()
+                path = f.output/'host-intents.json'
+                doc = pack.decode(path.read_bytes())
+                doc[pack.PREFIX + 'fresh_network_exec.py'][field] = value
+                path.write_bytes(pack.encode(doc))
+                self.rehash_pack(f.output)
+                with self.assertRaisesRegex(pack.Refusal, 'NETWORK_PACK_INTENT_DRIFT'):
+                    pack.verify_pack(str(f.output))
+
+    def test_verifier_refuses_each_network_blob_even_with_rehashed_control_manifest(self):
+        for source, target in NETWORK_TARGETS.items():
+            with self.subTest(source=source), Fixture() as f:
+                f.build()
+                item = f.output/('host-source' + target)
+                item.write_bytes(item.read_bytes() + b'\n# unreviewed drift\n')
+                self.rehash_pack(f.output)
+                with self.assertRaisesRegex(pack.Refusal, 'NETWORK_PACK_SOURCE_DRIFT'):
+                    pack.verify_pack(str(f.output))
+
+    def test_committed_network_drift_refused_by_producer_before_publication(self):
+        for source in NETWORK_TARGETS:
+            with self.subTest(source=source), Fixture() as f:
+                target = f.repo/source
+                target.write_bytes(target.read_bytes() + b'\n# unreviewed committed drift\n')
+                f.git('add', source)
+                f.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid',
+                      'commit', '-qm', 'unreviewed drift')
+                with self.assertRaisesRegex(pack.Refusal, '^NETWORK_SOURCE_DRIFT$'):
+                    f.build()
+                f.assert_no_stage(self)
+
+    def test_pin_map_and_fixed_intent_cannot_be_reauthorized_by_pack_manifest(self):
+        for fault in ('pin-map', 'intent-target', 'intent-missing', 'intent-go'):
+            with self.subTest(fault=fault), Fixture() as f:
+                f.build()
+                name = 'network-source-pins.json' if fault == 'pin-map' else 'host-intents.json'
+                target = f.output/name
+                doc = pack.decode(target.read_bytes())
+                source = pack.PREFIX + 'fresh_network_exec.py'
+                if fault == 'pin-map': doc[source] = '0'*64
+                elif fault == 'intent-target': doc[source]['installedPathIntent'] = '/usr/local/libexec/foreign'
+                elif fault == 'intent-missing': del doc[source]
+                else: doc[source]['installed'] = True
+                target.write_bytes(pack.encode(doc))
+                self.rehash_pack(f.output)
+                with self.assertRaisesRegex(pack.Refusal, 'NETWORK_PACK_(PIN|INTENT)_DRIFT'):
+                    pack.verify_pack(str(f.output))
+
+    def test_exact_entry_pins_and_manual_unit_contract_without_loading_entry(self):
+        import ast
+        import configparser
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(set(pack.NETWORK_SOURCE_PINS), set(NETWORK_TARGETS))
+        for source, pin in pack.NETWORK_SOURCE_PINS.items():
+            self.assertEqual(pack.sha((root/source).read_bytes()), pin)
+        entry = ast.parse((root/pack.PREFIX/'fresh_network_exec.py').read_bytes())
+        assignments = {node.targets[0].id: node.value for node in entry.body
+                       if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
+        self.assertEqual(ast.literal_eval(assignments['PINS']), {
+            NETWORK_TARGETS[source]: pack.NETWORK_SOURCE_PINS[source]
+            for source in (pack.PREFIX + 'fresh_network.py', pack.PREFIX + 'fresh_network_control.py')})
+        class UnitConfig(configparser.ConfigParser):
+            def optionxform(self, optionstr):
+                return optionstr
+        unit = UnitConfig(interpolation=None, strict=False)
+        unit_raw = (root/pack.PREFIX/'c3-test-fresh-network.service').read_text()
+        unit.read_string(unit_raw)
+        self.assertEqual([line for line in unit_raw.splitlines() if line.startswith('Assert')], [
+            'AssertFileNotEmpty=/etc/c3-test-fresh-network.json',
+            'AssertFileNotEmpty=/etc/c3-test-fresh-network-lease.json',
+            'AssertPathIsDirectory=/var/lib/c3-test-fresh-network',
+            'AssertPathIsDirectory=/run/netns'])
+        self.assertEqual(set(unit.sections()), {'Unit', 'Service'})
+        self.assertEqual(dict(unit['Service']), {
+            'Type': 'exec', 'User': 'root', 'Group': 'root',
+            'ExecStart': '/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-network-exec.py',
+            'UMask': '0077', 'LimitCORE': '0', 'KillMode': 'process',
+            'TimeoutStopSec': '5', 'PrivateMounts': 'no'})
+        self.assertEqual(set(unit['Unit']), {'Description', 'AssertFileNotEmpty', 'AssertPathIsDirectory'})
+
+
 class BuildTests(unittest.TestCase):
     def test_private_complete_fixed_pack_has_no_fabricated_policy(self):
         self.assertTrue(hasattr(pack, 'build'), 'fixed pack builder missing')
