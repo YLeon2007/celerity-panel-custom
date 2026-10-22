@@ -113,6 +113,38 @@ install, physical acceptance or GO. Tests use the real full candidate/pack, not
 synthetic tiny acceptance fixtures. Legacy fixture tests remain explicitly
 legacy tests, not proof of this actual artifact.
 
+## Verification and retained first failures
+
+The initial candidate acceptance regression was observed RED before the new
+entry existed, then GREEN on the actual 10,518-file candidate. The first actual
+new public producer invocation exposed a 0755 candidate-control ancestor and
+refused before publication; explicitly creating that new private 0700 ancestor
+made the actual CLI build/readback pass. `publication-orchestrator.diff` in the
+evidence directory exposes this and every other orchestration delta from the
+unchanged legacy implementation.
+
+Final complete run: **58/58 passed** (24 new real-artifact tests and 34 unchanged
+legacy regression tests), with natural process exit zero. New tests reject the
+old candidate and identical-payload/wrong-source diagnostic candidate, rewritten
+inner/outer hashes, payload/dependency/runtime/supervisor/host/network-unit drift,
+non-network host mapping and bool/int/float intent drift, extra/missing files,
+empty-directory and mode changes, symlinks, profile/report/GO drift and arbitrary
+profile/pin CLI arguments. Full real-candidate fault tests retain unknown output
+after lost rename reply, postrename parent fsync failure and published readback
+failure; prepublication report/directory-fsync faults leave no output, and an
+actual racing empty destination wins without replacement. Fault injection never
+changes an acceptance pin, source baseline, candidate or profile. The legacy
+actual CLI still refuses `BASE_SOURCE_DRIFT` and publishes nothing.
+
+An earlier expanded foreground run hit the tool's 400-second timeout and is
+retained as incomplete evidence, not counted as a pass. The successful complete
+background rerun used an explicit finite 1,000-second bound, exclusive heavy
+lock, isolated heavy scope and scratch TMPDIR. The original candidate and 7f47
+candidate full inventories/modes/control bytes are compared before and after;
+legacy producer/test and all fixed build inputs remain unchanged. Final durable
+readback also flushes every new candidate payload inode, since the unchanged
+bundler itself fsyncs its control files but not every copied payload inode.
+
 ## Unexercised gates
 
 No SSH, network request, live database, Docker, sudo, host service activation,
