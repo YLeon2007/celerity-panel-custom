@@ -52,7 +52,18 @@ const { buildSessionCookieOptions } = require('./src/utils/sessionCookie');
 const helmet = require('helmet');
 const app = express();
 let classicStartupComplete = false;
-const l2tpRootLifecycle = createL2tpRootLifecycle();
+const l2tpRootLifecycle = createL2tpRootLifecycle(classicSettings ? {
+    // The fixed classic launch owns all schema readiness before HTTP admission.
+    // Suppress automatic per-index commands, not required indexes: prove the
+    // entire imported classic + topology catalog with complete per-collection DDL.
+    ensureModelIndexes: () => require('./src/modules/l2tpModelIndexReadiness').ensureL2tpModelIndexes({
+        batchIndexes: true,
+        loadModels: () => {
+            require('./src/modules/relay-l2tp').registerModels();
+            return mongoose.models;
+        },
+    }),
+} : undefined);
 
 app.set('trust proxy', 1);
 
@@ -520,6 +531,7 @@ async function connectMongo(retries = 5, delayMs = 3000) {
                 minPoolSize: 2,
                 serverSelectionTimeoutMS: 10000,
                 socketTimeoutMS: 45000,
+                ...(classicSettings ? { autoIndex: false } : {}),
                 ...productionSchemaConnectionOptions(process.env),
             });
             return;
