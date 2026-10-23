@@ -5,7 +5,7 @@ const {
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
 const { topologyExecutionContext, matchesTopologyExecutionContext, matchesTopologyOperationExecutionContext } = require('../domain/topologyExecutionContext');
-const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
+const { topologyOperationClaimBindingFilter, matchesTopologyOperationClaimBinding } = require('../domain/topologyOperationClaimBinding');
 
 const ACTIVE_STATUSES = Object.freeze([
     'preparing',
@@ -307,13 +307,18 @@ class TopologyOperationRepository {
         }
     }
 
-    async claimNextClientProof({ owner, now, leaseMs = 120000, maxAttempts = 3 }) {
+    async claimNextClientProof({ owner, now, executionContext, leaseMs = 120000, maxAttempts = 3 }) {
+        const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!matchesTopologyExecutionContext(executionContext, context)) {
+            throw new TypeError('Client proof claim requires an exact execution context');
+        }
         if (!owner || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3
             || !Number.isSafeInteger(leaseMs) || leaseMs < 1000) {
             throw new TypeError('Invalid client proof claim');
         }
         const leaseUntil = new Date(now.getTime() + leaseMs);
         return this.model.findOneAndUpdate({
+            ...topologyOperationClaimBindingFilter(context),
             status: 'succeeded',
             clientReadiness: 'unverified',
             $nor: [{ kind: 'link.apply', staged: true }],
@@ -331,25 +336,47 @@ class TopologyOperationRepository {
             $inc: { clientProofAttempts: 1 },
         }, {
             new: true, lean: true, runValidators: true, sort: { clientProofRetryAfter: 1 },
-            projection: { _id: 1, status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1,
-                linkId: 1, linkIds: 1, clientProofAttempts: 1,
+            projection: { _id: 1, executionContext: 1, idempotencyKey: 1,
+                status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1, staged: 1, clientReadiness: 1,
+                linkId: 1, linkIds: 1, oldLinkId: 1, oldPathLinkIds: 1, groupId: 1, pathKey: 1,
+                ownerNodeId: 1, ownerTopologyRevision: 1, ownerCredentialRevision: 1, newPathLinkIds: 1,
+                heldTopologyAdmission: 1, pppWait: 1, clientProofAttempts: 1,
                 clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
                 'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1 },
         });
     }
 
-    async completeClientProof({ operation, owner, now, passed, reason, retryMs = 60000,
-        maxAttempts = 3 }) {
+    async completeClientProof({ operation, owner, now, executionContext, passed, reason, retryMs = 60000,
+        maxAttempts = 3, getNow = () => now }) {
+        const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!matchesTopologyExecutionContext(executionContext, context)) {
+            throw new TypeError('Client proof completion requires an exact execution context');
+        }
+        const eligible = () => matchesTopologyOperationClaimBinding(operation, context)
+            && operation.status === 'succeeded' && operation.clientReadiness === 'unverified'
+            && !(operation.kind === 'link.apply' && operation.staged === true)
+            && Number.isSafeInteger(operation.clientProofAttempts)
+            && operation.clientProofAttempts >= 1 && operation.clientProofAttempts <= maxAttempts
+            && operation.clientProofLeaseOwner === owner
+            && operation.clientProofLeaseUntil instanceof Date
+            && operation.clientProofLeaseUntil > getNow();
+        if (!eligible()) return null;
         if (passed !== true && !['probe_failed', 'probe_unavailable', 'revision_stale'].includes(reason)) {
             throw new TypeError('Client proof requires a safe reason code');
         }
         // Check immediately before CAS. Public reads independently recheck live state.
         const live = passed === true && await this.isLiveRevision(operation);
+        // The state read may outlive the lease; never publish using its entry time.
+        if (!eligible()) return null;
+        now = getNow();
         const verified = passed === true && live;
         const safeReason = verified ? undefined : passed === true ? 'revision_stale' : reason;
         const exhausted = operation.clientProofAttempts >= maxAttempts;
         const result = await this.model.updateOne({
             _id: operation._id, status: 'succeeded', clientReadiness: 'unverified',
+            $and: [topologyOperationClaimBindingFilter(context)],
+            idempotencyKey: operation.idempotencyKey,
+            $nor: [{ kind: 'link.apply', staged: true }],
             topologyRevision: operation.topologyRevision,
             clientProofAttempts: operation.clientProofAttempts,
             clientProofLeaseOwner: owner,

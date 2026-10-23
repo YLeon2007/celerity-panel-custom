@@ -216,8 +216,8 @@ function createL2tpPanelHost({
         if (typeof topologyDeploymentService?.operationWorker?.run !== 'function') {
             throw new TypeError('Opted-in topology recovery requires an operation worker');
         }
-        // This separate proof queue is still TEST-only; it has no production
-        // identity fencing. Never enable it just because production opted in.
+        // Context fencing does not activate production client proof. Keep this
+        // separate queue TEST-only even when production execution opted in.
         let clientProofWorker;
         if (testWorkerExecutionAllowed && typeof topologyEnv.TOPOLOGY_PROBE_USER_ID === 'string'
             && topologyEnv.TOPOLOGY_PROBE_USER_ID.trim()) {
@@ -235,6 +235,7 @@ function createL2tpPanelHost({
                 profileSource: new TopologyPublishedProfileSource({ probeUserId: topologyEnv.TOPOLOGY_PROBE_USER_ID }),
             });
             clientProofWorker = new TopologyClientReadinessWorker({
+                executionContext,
                 repository: new TopologyOperationRepository({
                     model: models.TopologyOperation,
                     topologyStateModel: models.CascadeTopologyState,

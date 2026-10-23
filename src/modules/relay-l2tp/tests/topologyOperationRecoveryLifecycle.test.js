@@ -555,6 +555,8 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
     const now = new Date('2026-09-30T12:00:00.000Z');
     const operation = {
         _id: 'proof-op', status: 'succeeded', topologyRevision: 7,
+        executionContext: { ...TEST },
+        idempotencyKey: `topology:test:revision-7:host-${TEST.hostIdentity}:00000000-0000-0000-0000-000000000000`,
         clientReadiness: 'unverified', clientProofAttempts: 0,
         clientProofLeaseUntil: null, clientProofRetryAfter: null,
         nodes: [{ node: '0123456789abcdef01234567', role: 'portal', state: 'committed' }],
@@ -622,7 +624,11 @@ test('assembled TEST host claims one durable client proof per tick and stop wait
     assert.equal(claims.length, 1);
     assert.equal(claims[0].status, 'succeeded');
     assert.equal(claims[0].clientReadiness, 'unverified');
+    assert.equal(claims[0]['executionContext.target'], TEST.target);
+    assert.equal(claims[0]['executionContext.hostIdentity'], TEST.hostIdentity);
     assert.equal(updates.length, 1);
+    assert.equal(updates[0].filter.$and[0]['executionContext.hostIdentity'], TEST.hostIdentity);
+    assert.equal(updates[0].filter.idempotencyKey, operation.idempotencyKey);
     assert.equal(updates[0].update.$set.clientProofReason, 'probe_failed');
     assert.equal(operation.clientReadiness, 'unverified');
     assert.equal(operation.clientProofAttempts, 1);

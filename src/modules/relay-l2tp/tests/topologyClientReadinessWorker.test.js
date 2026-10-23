@@ -5,9 +5,153 @@ const test = require('node:test');
 const { TopologyOperationRepository } = require('../repositories/topologyOperationRepository');
 const { TopologyClientReadinessWorker } = require('../workers/topologyClientReadinessWorker');
 
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD } = require('../domain/topologyExecutionContext');
 const start = new Date('2026-09-30T10:00:00Z');
+const key = (context, revision = 7) => `topology:${context.target}:revision-${revision}:host-${context.hostIdentity}:00000000-0000-0000-0000-000000000000`;
+
+test('client-proof worker requires an exact canonical execution context without a TEST default', () => {
+    const repository = { async claimNextClientProof() {}, async completeClientProof() {} };
+    for (const executionContext of [undefined, null, {}, { target: 'test', hostIdentity: PROD.hostIdentity },
+        { ...TEST, extra: true }, { ...PROD, extra: true }]) {
+        assert.throws(() => new TopologyClientReadinessWorker({ repository, executionContext }), /execution context/i);
+    }
+});
+
+test('client-proof worker snapshots canonical frozen TEST and PROD identities across caller mutation', async () => {
+    for (const context of [TEST, PROD]) {
+        const source = { ...context };
+        const calls = [];
+        const repository = {
+            async claimNextClientProof(input) {
+                calls.push(input.executionContext);
+                Object.assign(source, context === TEST ? PROD : TEST);
+                return { _id: 'op', executionContext: { ...context }, idempotencyKey: key(context),
+                    topologyRevision: 7, status: 'succeeded', clientReadiness: 'unverified',
+                    clientProofAttempts: 1, clientProofLeaseOwner: 'worker-1',
+                    clientProofLeaseUntil: new Date(start.getTime() + 120000) };
+            },
+            async completeClientProof(input) { calls.push(input.executionContext); return 'verified'; },
+        };
+        const runner = worker(repository, async () => ({ passed: true }), { executionContext: source });
+        assert.strictEqual(runner.executionContext, context);
+        assert.ok(Object.isFrozen(runner.executionContext));
+        assert.equal(await runner.runOnce(), 'verified');
+        assert.deepEqual(calls, [context, context]);
+        assert.ok(calls.every(value => value === context));
+    }
+});
+function claimed(context, overrides = {}) {
+    return { _id: 'op', executionContext: { ...context }, idempotencyKey: key(context), topologyRevision: 7,
+        status: 'succeeded', clientReadiness: 'unverified', clientProofAttempts: 1,
+        clientProofLeaseOwner: 'worker-1', clientProofLeaseUntil: new Date(start.getTime() + 120000), ...overrides };
+}
+function rejectedRows(context) {
+    const foreign = context === TEST ? PROD : TEST;
+    return [
+        { executionContext: undefined }, { executionContext: foreign, idempotencyKey: key(foreign) },
+        { executionContext: { ...context, extra: true } }, { executionContext: [{ ...context }] },
+        { executionContext: { target: context.target, hostIdentity: foreign.hostIdentity } },
+        { idempotencyKey: undefined }, { idempotencyKey: key(context, 8) },
+        { idempotencyKey: key(context) + '\n' }, { idempotencyKey: [key(context)] },
+        { idempotencyKey: key(context).replace(':host-', ':unexpected:host-') },
+        { topologyRevision: '7' }, { topologyRevision: [7] }, { topologyRevision: 7.5 },
+        { status: 'queued' }, { clientReadiness: undefined }, { clientReadiness: 'verified' },
+        { kind: 'link.apply', staged: true }, { clientProofAttempts: undefined },
+        { clientProofAttempts: 0 }, { clientProofAttempts: 4 }, { clientProofAttempts: 1.5 },
+        { clientProofLeaseOwner: 'foreign' }, { clientProofLeaseUntil: start },
+        { clientProofLeaseUntil: undefined }, { clientProofLeaseUntil: start.toISOString() },
+    ];
+}
+
+test('bad client-proof claim adapters cannot probe or complete ineligible or malformed returned rows', async () => {
+    for (const context of [TEST, PROD]) {
+        for (const overrides of rejectedRows(context)) {
+            let probes = 0;
+            let completions = 0;
+            const repository = { async claimNextClientProof() { return claimed(context, overrides); },
+                async completeClientProof() { completions += 1; } };
+            assert.equal(await worker(repository, async () => { probes += 1; }, { executionContext: context }).runOnce(), null,
+                JSON.stringify(overrides));
+            assert.equal(probes, 0);
+            assert.equal(completions, 0);
+        }
+    }
+});
+
+test('client-proof binding and lease are rechecked after awaited claim and probe boundaries', async () => {
+    for (const boundary of ['claim', 'probe']) {
+        for (const change of ['expired', 'foreign', 'malformed']) {
+            let current = start;
+            const operation = claimed(TEST);
+            let probes = 0;
+            let completions = 0;
+            const mutate = () => {
+                if (change === 'expired') current = new Date(start.getTime() + 120000);
+                if (change === 'foreign') Object.assign(operation, { executionContext: PROD, idempotencyKey: key(PROD) });
+                if (change === 'malformed') operation.idempotencyKey += '\n';
+            };
+            const repository = {
+                async claimNextClientProof() { await Promise.resolve(); if (boundary === 'claim') mutate(); return operation; },
+                async completeClientProof() { completions += 1; },
+            };
+            assert.equal(await worker(repository, async () => {
+                probes += 1; await Promise.resolve(); mutate(); return { passed: true };
+            }, { now: () => current }).runOnce(), null, `${boundary}/${change}`);
+            assert.equal(probes, boundary === 'claim' ? 0 : 1);
+            assert.equal(completions, 0);
+        }
+    }
+});
+
+test('client-proof repository refuses invalid contexts and returned bindings before state reads or writes', async () => {
+    let accesses = 0;
+    const repository = new TopologyOperationRepository({ model: {
+        async create() {}, async findOneAndUpdate() { accesses += 1; }, async updateOne() { accesses += 1; return { matchedCount: 1 }; },
+    }, topologyStateModel: { findById() { accesses += 1; throw Error('must not read'); } } });
+    for (const executionContext of [undefined, {}, { ...TEST, extra: true }, { target: TEST.target, hostIdentity: PROD.hostIdentity }]) {
+        await assert.rejects(repository.claimNextClientProof({ executionContext, owner: 'worker-1', now: start }), /execution context/i);
+        await assert.rejects(repository.completeClientProof({ operation: claimed(TEST), executionContext,
+            owner: 'worker-1', now: start, passed: true }), /execution context/i);
+    }
+    for (const overrides of rejectedRows(TEST)) {
+        assert.equal(await repository.completeClientProof({ operation: claimed(TEST, overrides), executionContext: TEST,
+            owner: 'worker-1', now: start, passed: true }), null, JSON.stringify(overrides));
+    }
+    assert.equal(accesses, 0);
+});
+
+test('client-proof completion refuses a lease that expires during the awaited live revision read', async () => {
+    let current = start;
+    let updates = 0;
+    const repository = new TopologyOperationRepository({ model: {
+        async create() {}, async findOneAndUpdate() {}, async updateOne() { updates += 1; return { matchedCount: 1 }; },
+    }, topologyStateModel: { findById() { return { select() { return { async lean() {
+        await Promise.resolve(); current = new Date(start.getTime() + 120000);
+        return { revision: 7, deployedRevision: 7 };
+    } }; } }; } } });
+    assert.equal(await repository.completeClientProof({ operation: claimed(TEST), executionContext: TEST,
+        owner: 'worker-1', now: start, getNow: () => current, passed: true }), null);
+    assert.equal(updates, 0);
+});
+
+test('client-proof claim projects execution binding and every proof eligibility field without secrets', async () => {
+    let projection;
+    const repository = new TopologyOperationRepository({ model: {
+        async create() {}, async updateOne() {},
+        async findOneAndUpdate(_filter, _update, options) { projection = options.projection; return null; },
+    } });
+    await repository.claimNextClientProof({ executionContext: TEST, owner: 'worker-1', now: start });
+    for (const field of ['executionContext', 'idempotencyKey', 'staged', 'clientReadiness',
+        'heldTopologyAdmission', 'pppWait', 'oldLinkId', 'oldPathLinkIds', 'groupId', 'pathKey',
+        'ownerNodeId', 'ownerTopologyRevision', 'ownerCredentialRevision', 'newPathLinkIds']) {
+        assert.equal(projection[field], 1, field);
+    }
+    assert.equal(Object.keys(projection).some(field => /candidate|backup|secret|credential(?!Revision)/i.test(field)), false);
+});
+
 function fixture(overrides = {}) {
     const operation = { _id: 'op', status: 'succeeded', topologyRevision: 7,
+        executionContext: { ...TEST }, idempotencyKey: key(TEST, overrides.topologyRevision ?? 7),
         clientReadiness: 'unverified', clientProofAttempts: 0,
         clientProofRetryAfter: null, clientProofLeaseUntil: null,
         clientProofLeaseOwner: '', ...overrides };
@@ -45,7 +189,7 @@ function fixture(overrides = {}) {
 }
 function worker(repository, probeOperation, extras = {}) {
     return new TopologyClientReadinessWorker({ repository, probeOperation,
-        owner: 'worker-1', now: () => start, ...extras });
+        owner: 'worker-1', now: () => start, executionContext: TEST, ...extras });
 }
 
 test('successful explicit client proof becomes verified only for live deployed revision', async () => {
@@ -154,11 +298,11 @@ test('unavailable injector exhausts bounded attempts and exposes only a safe deg
 
 test('expired owner cannot publish a late proof after a new worker reclaims the operation', async () => {
     const f = fixture();
-    const old = await f.repository.claimNextClientProof({ owner: 'old', now: start, leaseMs: 1000 });
+    const old = await f.repository.claimNextClientProof({ executionContext: TEST, owner: 'old', now: start, leaseMs: 1000 });
     const later = new Date(start.getTime() + 1001);
-    const claimed = await f.repository.claimNextClientProof({ owner: 'new', now: later, leaseMs: 1000 });
+    const claimed = await f.repository.claimNextClientProof({ executionContext: TEST, owner: 'new', now: later, leaseMs: 1000 });
     assert.equal(claimed.clientProofAttempts, 2);
-    assert.equal(await f.repository.completeClientProof({ operation: old, owner: 'old',
+    assert.equal(await f.repository.completeClientProof({ operation: old, owner: 'old', executionContext: TEST,
         now: later, passed: true }), null);
     assert.equal(f.operation.clientReadiness, 'unverified');
 });
