@@ -9,7 +9,7 @@ import sys
 import types
 sys.dont_write_bytecode = True
 MODULE = '/usr/local/libexec/c3-test-fresh-physical.py'
-MODULE_SHA256 = '5a568eaa6ec890f937ca800a71e2747b2c9bc5c67d6ffed98f2abeed7f8f7405'
+MODULE_SHA256 = 'f2d0622c796a6e4e549d76bf3a6abb36218ee0402005957bfb7c6cc4b7877d6f'
 
 
 def main():

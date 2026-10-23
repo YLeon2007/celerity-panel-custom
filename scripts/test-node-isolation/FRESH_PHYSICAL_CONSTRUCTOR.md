@@ -51,9 +51,14 @@ and `.old-root` is removed before drop. The lock is explicitly chowned to
 UID/GID65531 with mode `0600`. Never chmod the outer control directory or weaken
 `trusted_read` to make these paths reachable.
 
-The external watcher bounds registration/construction by 120 seconds from its
-start, then allows 600 seconds after observing the actual stopped held-lock
-barrier for independent acceptance. Deadline, unexpected continuation, malformed
+The external watcher consumes the independently installed absolute same-boot run
+plan **before** waiting or creating resources. Registration/construction is bounded
+by the earlier of that original deadline and 120 seconds from entry. Independent
+acceptance and the observer share the **same original deadline**, at most 600
+seconds from initial capture; there is no new 600-second period at the stopped
+barrier. See [FRESH_PHYSICAL_OBSERVATION.md](FRESH_PHYSICAL_OBSERVATION.md) for the
+closed input and unaccepted watcher invocation binding. Deadline, unexpected
+continuation, malformed
 acceptance, source-map drift, process loss or SIGTERM/SIGINT before release
 abandon through the owned pidfd. Cleanup requires observed process death and
 matching resource/socket identities. Unknown death or replacement retains foreign
@@ -62,6 +67,9 @@ handback, inventory capture, GO, rollback, restart or retry exists here.
 
 ## Fixed independently supplied prerequisites (not generated)
 
+- `/etc/c3-test-fresh-physical-run.json`: independently selected, installed before
+  launch, root-owned read-only closed same-boot deadline plan. No default,
+  publisher, renewal, environment override or automatic acceptance is provided.
 - A separate root-owned, non-writable, no-symlink input tree at
   `/var/lib/c3-test-fresh-input/root`, copied from a **new independently staged**
   artifact, never an existing candidate modified in place. It contains exactly
@@ -125,8 +133,16 @@ any all-five hold; release is not physical GO or TEST/PROD activation authority.
 
 ## Verification and remaining gates
 
-`python3 -B -m unittest test_fresh_physical test_fresh_install_source_pack -v`
-uses disposable unprivileged files/processes. Real evidence covers SCM_RIGHTS,
+From the repository root, run the affected tests with isolated Python and no
+bytecode (under the externally prescribed finite heavy-test scope/lock):
+
+```sh
+python3 -I -B -c 'import sys,unittest; sys.path.insert(0,"scripts/test-node-isolation"); unittest.main(module=None,argv=["tests","test_fresh_physical","test_fresh_physical_observe","-v"])'
+```
+
+These tests use disposable unprivileged files/processes. The legacy source-pack
+positive must use its explicitly frozen compatible physical sources, not these
+current changed sources; see the observation document. Real evidence covers SCM_RIGHTS,
 prebound fd3, anonymous stdio, extra-FD exclusion, original preparer SIGSTOP and
 flock, exact separate acceptance, finite pidfd abandon, owned cleanup and source
 pin export/refusal. Constructor copy/bootstrap/lock writes and `umask(0077)` are

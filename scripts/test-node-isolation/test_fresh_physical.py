@@ -20,6 +20,25 @@ HERE = Path(__file__).resolve().parent
 SCRATCH = '/home/leon/.hermes/cache/scratch'
 
 
+FROZEN_PHYSICAL_COMMIT = 'af7cadc5c72369c03ff15949aa44d85c3121466e'
+
+
+def frozen_blob(relative):
+    return subprocess.check_output(['/usr/bin/git', '-C', str(HERE.parents[1]),
+                                    'show', FROZEN_PHYSICAL_COMMIT+':'+relative])
+
+
+def freeze_physical_fixture(f):
+    """Replay OLD frozen compatible source, never repin the old pack to new bytes."""
+    import fresh_install_source_pack as pack
+    for relative, pin in pack.PHYSICAL_SOURCE_PINS.items():
+        raw = frozen_blob(relative)
+        if pack.sha(raw) != pin: raise AssertionError('frozen physical pin mismatch')
+        (f.repo/relative).write_bytes(raw)
+    f.git('add', '.')
+    f.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid', 'commit', '-qm', 'frozen physical source replay')
+
+
 def load():
     spec = importlib.util.spec_from_file_location('physical', HERE/'fresh_physical.py')
     module = importlib.util.module_from_spec(spec)
@@ -119,12 +138,13 @@ class DescriptorTests(unittest.TestCase):
             control, identity = m.bind_owned(path)
             extra = os.open(Path(temp)/'extra', os.O_RDWR|os.O_CREAT, 0o600)
             code = '''import os,signal,socket,sys
+sys.path.insert(0,sys.argv.pop(1))
 import fresh_physical as m
 control=socket.socket(fileno=int(sys.argv[1]))
 m.anonymous_stdio_and_control(control)
 os.kill(os.getpid(),signal.SIGSTOP)
 '''
-            p = subprocess.Popen([sys.executable, '-B', '-c', code, str(control.fileno())],
+            p = subprocess.Popen([sys.executable, '-I', '-B', '-c', code, str(HERE), str(control.fileno())],
                                  cwd=HERE, pass_fds=(control.fileno(), extra))
             try:
                 _, status = os.waitpid(p.pid, os.WUNTRACED)
@@ -175,8 +195,19 @@ class AssembledWatchTests(unittest.TestCase):
                      '/usr/local/libexec/c3-test-fresh-classic.py': 'b'*64}
             for name, value in {'RESOURCE': str(resource), 'CONTROL': str(root/'control'),
                                 'REGISTER': str(root/'register'), 'ACCEPTANCE': str(root/'acceptance'),
-                                'ACCEPT_SECONDS': .3, 'PREPARE_SECONDS': 3}.items():
+                                'RUN_PLAN': str(root/'run-plan'), 'PREPARE_SECONDS': 3}.items():
                 stack.enter_context(patch.object(m, name, value))
+            (root/'run-plan').write_bytes(m.encode(dict(version=1, context=m.CONTEXT, bootId=m.boot_id(),
+                deadlineMonotonicNs=time.monotonic_ns()+700_000_000)))
+            (root/'run-plan').chmod(0o444)
+            stack.enter_context(patch.object(m, 'trusted_open', side_effect=lambda path: os.open(path, m.FILE)))
+            # The invocation query/cgroup is MODELED; real self PID/start is kept.
+            def identity(run, deadline=None):
+                with m.ProcessLease(os.getpid()) as self_lease:
+                    run.check()
+                    return dict(pid=os.getpid(), start=self_lease.start, bootId=run.boot, invocationId='b'*32,
+                                deadlineMonotonicNs=run.deadline_ns, runPlanSha256=run.digest)
+            stack.enter_context(patch.object(m, 'watcher_identity', side_effect=identity))
             # Explicitly MODELED root ownership, input installation and UID/cgroup
             # authority. Channels, rights, memfds, stopped PID/start, flock, deadline,
             # exact independent acceptance, pidfd kill and owned cleanup are REAL.
@@ -212,6 +243,7 @@ class AssembledWatchTests(unittest.TestCase):
             deadline = time.monotonic()+3
             while not (root/'register').exists() and thread.is_alive() and time.monotonic()<deadline: time.sleep(.005)
             code = '''import os,sys,socket,json
+sys.path.insert(0,sys.argv.pop(1))
 from pathlib import Path
 import fresh_physical as m
 import fresh_classic_launch as fresh
@@ -230,7 +262,7 @@ with (root/'lock').open('w+b') as lock:
  fresh.PreparationSupervisorFiles(files).read_json(fresh.POLICY)
 (root/'returned').write_text('returned')
 '''
-            p = subprocess.Popen([sys.executable, '-B', '-c', code, str(root), json.dumps(files)], cwd=HERE)
+            p = subprocess.Popen([sys.executable, '-I', '-B', '-c', code, str(HERE), str(root), json.dumps(files)], cwd=HERE)
             try:
                 stop_deadline = time.monotonic()+3
                 while time.monotonic()<stop_deadline:
@@ -254,7 +286,7 @@ with (root/'lock').open('w+b') as lock:
                     self.assertTrue(resource.exists()); self.assertTrue((root/'control').exists())
                     self.assertFalse((root/'returned').exists())
                 else:
-                    self.assertEqual(len(result), 1); self.assertRegex(str(result[0]), 'ACCEPTANCE_DEADLINE')
+                    self.assertEqual(len(result), 1); self.assertRegex(str(result[0]), 'ACCEPTANCE_DEADLINE|ORIGINAL_RUN_DEADLINE')
                     p.wait(timeout=3); self.assertEqual(p.returncode, -signal.SIGKILL)
                     self.assertFalse(resource.exists()); self.assertFalse((root/'control').exists())
                     self.assertFalse((root/'returned').exists())
@@ -412,7 +444,8 @@ class FixedEntryAndPackTests(unittest.TestCase):
                     any(isinstance(target, ast.Name) and target.id == 'MODULE_SHA256' for target in node.targets)]
             self.assertEqual(pins, [digest])
         for relative, pin in pack.PHYSICAL_SOURCE_PINS.items():
-            self.assertEqual(pack.sha((HERE.parents[1]/relative).read_bytes()), pin)
+            # Immutable accepted source-pack pins remain the old reviewed bytes.
+            self.assertEqual(pack.sha(frozen_blob(relative)), pin)
             self.assertIn(relative, pack.HOST_SOURCES)
         unit = (HERE/'c3-test-fresh-classic.service').read_bytes()
         self.assertIn(b'Restart=no\n', unit); self.assertIn(b'KillMode=process\n', unit)
@@ -422,6 +455,7 @@ class FixedEntryAndPackTests(unittest.TestCase):
         import fresh_install_source_pack as pack
         from test_fresh_install_source_pack import Fixture
         with Fixture() as f:
+            freeze_physical_fixture(f)
             f.build()
             report = pack.verify_pack(str(f.output))
             self.assertTrue(report['unitIncluded']); self.assertTrue(report['resourceConstructorIncluded'])
@@ -433,10 +467,18 @@ class FixedEntryAndPackTests(unittest.TestCase):
                 self.assertEqual(intents[relative]['sha256'], pin)
                 self.assertEqual(pack.sha((f.output/intents[relative]['packPath']).read_bytes()), pin)
 
+    def test_current_source_refuses_immutable_old_pack_without_repin(self):
+        import fresh_install_source_pack as pack
+        from test_fresh_install_source_pack import Fixture
+        with Fixture() as f:
+            with self.assertRaisesRegex(pack.Refusal, '^PHYSICAL_SOURCE_DRIFT$'): f.build()
+            f.assert_no_stage(self)
+
     def test_new_committed_source_drift_refuses_before_export(self):
         import fresh_install_source_pack as pack
         from test_fresh_install_source_pack import Fixture
         with Fixture() as f:
+            freeze_physical_fixture(f)
             name = pack.PREFIX+'fresh_physical.py'
             path = f.repo/name; path.write_bytes(path.read_bytes()+b'\n# unreviewed\n')
             f.git('add', name)

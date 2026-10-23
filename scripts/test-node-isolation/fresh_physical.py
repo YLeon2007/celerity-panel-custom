@@ -102,6 +102,99 @@ def trusted_read(path, limit=8*1024*1024):
     finally: os.close(fd)
 
 
+RUN_PLAN = '/etc/c3-test-fresh-physical-run.json'
+WATCH_UNIT = 'c3-test-fresh-prepare-watch.service'
+WATCH_GROUP = '0::/system.slice/'+WATCH_UNIT
+
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def input_snapshot(path, limit=16384, readonly=False):
+    """Trusted raw bytes plus exact inode/metadata; same-byte replacement refuses."""
+    fd = trusted_open(path)
+    try:
+        before = os.fstat(fd)
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+                  'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        identity = tuple(getattr(before, k) for k in fields)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+             before.st_size <= limit and (not readonly or not before.st_mode & 0o222),
+             'IMMUTABLE_INPUT_REQUIRED')
+        raw = os.pread(fd, limit+1, 0)
+        need(len(raw) == before.st_size and len(raw) <= limit and
+             identity == tuple(getattr(os.fstat(fd), k) for k in fields), 'INPUT_READ_DRIFT')
+        return raw, identity
+    finally: os.close(fd)
+
+
+class RunPlan:
+    """Independent fixed prelaunch ceiling. No deadline choice or renewal here."""
+    def __init__(self):
+        captured = time.monotonic_ns()
+        self.snapshot = input_snapshot(RUN_PLAN, readonly=True)
+        plan = decode(self.snapshot[0])
+        need(type(plan) is dict and set(plan) == {'version', 'context', 'bootId', 'deadlineMonotonicNs'} and
+             type(plan['version']) is int and plan['version'] == 1 and plan['context'] == CONTEXT and
+             plan['bootId'] == boot_id() and type(plan['deadlineMonotonicNs']) is int and
+             0 < plan['deadlineMonotonicNs']-captured <= ACCEPT_SECONDS*1_000_000_000,
+             'FIXED_ORIGINAL_RUN_PLAN_REQUIRED')
+        self.deadline_ns = plan['deadlineMonotonicNs']
+        self.deadline = self.deadline_ns/1_000_000_000
+        self.boot = plan['bootId']
+        self.digest = sha(self.snapshot[0])
+        self.check()
+
+    def check(self):
+        need(input_snapshot(RUN_PLAN, readonly=True) == self.snapshot and boot_id() == self.boot,
+             'RUN_PLAN_DRIFT')
+        need(time.monotonic_ns() < self.deadline_ns, 'ORIGINAL_RUN_DEADLINE')
+
+
+def watcher_properties(deadline):
+    """Fixed read-only query, never shell, environment InvocationID or unit selection."""
+    import subprocess
+    remaining = deadline-time.monotonic()
+    need(remaining > 0, 'ORIGINAL_RUN_DEADLINE')
+    keys = ('MainPID', 'ExecMainPID', 'InvocationID', 'ActiveState', 'SubState',
+            'ExecMainCode', 'ExecMainStatus', 'Result', 'Type', 'Restart', 'RemainAfterExit',
+            'ControlGroup', 'NeedDaemonReload', 'FragmentPath', 'DropInPaths', 'RestartForceExitStatus')
+    r = subprocess.run(['/usr/bin/systemctl', 'show', WATCH_UNIT, '--property='+','.join(keys)],
+                       env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'},
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                       timeout=min(2, remaining), check=True)
+    lines = r.stdout.decode().splitlines()
+    need(len(lines) == len(keys) and all('=' in x for x in lines), 'WATCHER_PROPERTIES_REQUIRED')
+    values = dict(x.split('=', 1) for x in lines)
+    need(set(values) == set(keys) and time.monotonic() < deadline, 'WATCHER_PROPERTIES_REQUIRED')
+    need(all(values[k] == v for k, v in {
+        'Type': 'exec', 'Restart': 'no', 'RemainAfterExit': 'yes',
+        'NeedDaemonReload': 'no',
+        'FragmentPath': '/etc/systemd/system/'+WATCH_UNIT, 'DropInPaths': '',
+        'RestartForceExitStatus': ''}.items()) and
+        (values['ControlGroup'] == '/system.slice/'+WATCH_UNIT or
+         (values['ControlGroup'] == '' and values['MainPID'] == '0' and
+          values['SubState'] in ('exited', 'failed', 'dead'))), 'LOADED_WATCHER_DRIFT')
+    return values
+
+
+def watcher_identity(run, deadline=None):
+    run.check()
+    with ProcessLease(os.getpid()) as self_lease:
+        values = watcher_properties(min(run.deadline, deadline if deadline is not None else run.deadline))
+        need(values['MainPID'] == values['ExecMainPID'] == str(os.getpid()) and
+             values['ActiveState'] == 'active' and values['SubState'] == 'running' and
+             len(values['InvocationID']) == 32 and
+             all(c in '0123456789abcdef' for c in values['InvocationID']) and
+             Path('/proc/self/cgroup').read_text().strip() == WATCH_GROUP,
+             'EXACT_RUNNING_WATCHER_REQUIRED')
+        self_lease.check(); run.check()
+        return {'pid': os.getpid(), 'start': self_lease.start, 'bootId': run.boot,
+                'invocationId': values['InvocationID'], 'deadlineMonotonicNs': run.deadline_ns,
+                'runPlanSha256': run.digest}
+
+
 class OwnedTree:
     """Only a freshly mkdir'd tree; replacement is retained, never adopted."""
     def __init__(self, path, parent, fd, identity):
@@ -440,12 +533,16 @@ def exec_main():
     need(Path('/proc/self/cgroup').read_text().strip() == CGROUP, 'FIXED_FRESH_UNIT_REQUIRED')
     # Register ownership BEFORE the expensive full root scan/copy. The external
     # watcher can terminate this PID even if construction never reaches SIGSTOP.
+    entered = time.monotonic()
+    run = RunPlan()
     plan = decode(trusted_read(INPUT+'/resource-plan.json'))
     need(type(plan) is dict and type(plan.get('files')) is dict, 'FIXED_RESOURCE_PLAN_REQUIRED')
-    deadline = time.monotonic()+PREPARE_SECONDS
+    deadline = min(run.deadline, entered+PREPARE_SECONDS)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
         while True:
+            run.check()
             need(time.monotonic() < deadline, 'WATCHDOG_CONNECTION_DEADLINE')
+            channel.settimeout(min(2, deadline-time.monotonic()))
             try:
                 channel.connect(REGISTER); break
             except (FileNotFoundError, ConnectionRefusedError): time.sleep(.02)
@@ -453,10 +550,15 @@ def exec_main():
         import struct
         _, uid, gid = struct.unpack('3i', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         need(uid == gid == 0, 'ROOT_WATCHDOG_PEER_REQUIRED')
+        run.check()
         need(channel.send(b'PREPARE\n') == 8, 'WATCHDOG_REGISTRATION_REFUSED')
         control = receive_control(channel, plan['files'])
     try:
+        run.check()
+        need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
         need(verify_input() == plan, 'RESOURCE_PLAN_DRIFT')
+        run.check()
+        need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
         construct(plan, control)
     finally: control.close()
 
@@ -497,10 +599,11 @@ def check_prepared_resources(lease, control_inode):
     lease.check(stopped=True)
 
 
-def write_generation(owned, lease, generation, files):
+def write_generation(owned, lease, generation, files, watcher):
     raw = encode({'version': 1, 'context': CONTEXT, 'generation': generation,
                   'supervisor': {'pid': lease.pid, 'start': lease.start},
-                  'filesSha256': sha(encode(files)), 'accepted': False})
+                  'filesSha256': sha(encode(files)), 'accepted': False,
+                  'watcherObservation': watcher})
     fd = os.open('generation.json', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=owned.fd)
     try:
         need(os.write(fd, raw) == len(raw), 'GENERATION_RECORD_SHORT_WRITE')
@@ -525,19 +628,32 @@ def watch_main():
     release this code never signals, removes roots or unlinks the control socket.
     """
     import struct
-    deadline = time.monotonic()+PREPARE_SECONDS
+    entered = time.monotonic()
+    run = RunPlan()  # before any rendezvous or mutation
+    deadline = min(run.deadline, entered+PREPARE_SECONDS)
+    watcher = watcher_identity(run, deadline)
     need(not os.path.lexists(ACCEPTANCE), 'STALE_ACCEPTANCE_PRESENT')
     plan = verify_input()
+    run.check()
+    need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
     owned = OwnedTree.create(RESOURCE)
     listener = control = lease = None
     registered = False
     register_identity = control_identity = None
     primary = None
     try:
+        preparation = True
+        def live_input():
+            run.check()
+            need(watcher_identity(run, deadline if preparation else run.deadline) == watcher,
+                 'WATCHER_INVOCATION_DRIFT')
+            if preparation: need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
+        live_input()
         # AF_UNIX sockets belong to the creator's network namespace. Bind in the
         # SAME pinned namespace as the supervisor or its /proc/PID/net/unix table
         # cannot satisfy the real prepared-listen consumer predicate.
         join_private_network(plan)
+        live_input()
         listener, register_identity = bind_owned(REGISTER, socket.SOCK_SEQPACKET)
         control, control_identity = bind_owned(CONTROL)
         control_inode = os.fstat(control.fileno()).st_ino
@@ -545,20 +661,27 @@ def watch_main():
         listener.settimeout(max(.001, deadline-time.monotonic()))
         channel, _ = listener.accept()
         with channel:
+            live_input()
             pid = constructor_peer(channel)
             registered = True
             lease = ProcessLease(pid)
             generation = os.urandom(32).hex()
-            write_generation(owned, lease, generation, plan['files'])
+            write_generation(owned, lease, generation, plan['files'], watcher)
             channel.settimeout(min(2, max(.001, deadline-time.monotonic())))
             need(channel.recv(4096) == b'PREPARE\n', 'FIXED_PREPARE_REGISTRATION_REQUIRED')
+            live_input()
+            need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
             raw = encode({'generation': generation, 'filesSha256': sha(encode(plan['files']))})
             need(channel.sendmsg([raw], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                          array.array('i', [control.fileno()]))]) == len(raw),
                  'CONTROL_RIGHT_DISPATCH_UNKNOWN')
         control.close(); control = None
-        wait_prepared(lease, deadline, owned.check)
+        def preparing():
+            live_input(); owned.check()
+        wait_prepared(lease, deadline, preparing)
         check_prepared_resources(lease, control_inode)
+        need(time.monotonic() < deadline, 'PREPARATION_DEADLINE')
+        preparation = False
         def acceptance():
             try: return decode(trusted_read(ACCEPTANCE, 16384))
             except FileNotFoundError: return None
@@ -567,8 +690,9 @@ def watch_main():
             # symlink is deliberately not accepted by trusted_open.
             return decode(trusted_read(RESOURCE+'/root'+POLICY))
         def checkpoint():
-            owned.check(); check_prepared_resources(lease, control_inode)
-        wait_acceptance(lease, time.monotonic()+ACCEPT_SECONDS, acceptance,
+            live_input(); owned.check(); check_prepared_resources(lease, control_inode)
+            run.check()
+        wait_acceptance(lease, run.deadline, acceptance,
                         plan['files'], generation, policy, checkpoint)
         # No GO/accepted inventory output. Unit Result=success is release of our
         # own preparation lease only; independent final acceptance is still external.
@@ -595,6 +719,9 @@ def watch_main():
             cleanup(lambda: unlink_owned_socket(REGISTER, register_identity))
         for item in (listener, control, lease, owned):
             if item is not None: cleanup(item.close)
+        # A successful acceptance cannot hide late plan/deadline drift while
+        # finally disposes our own handles. Never recover signal authority here.
+        if primary is None: cleanup(run.check)
         if cleanup_errors:
             if primary is not None: primary.cleanup_errors = cleanup_errors
             else: raise Refusal('PHYSICAL_CLEANUP_UNKNOWN') from None
