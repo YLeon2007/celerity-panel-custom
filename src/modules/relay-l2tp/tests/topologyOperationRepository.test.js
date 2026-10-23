@@ -244,7 +244,7 @@ test('client readiness is durable and separate from execution status', async () 
 });
 
 test('client proof claim skips staged link.apply and claims an eligible nonstaged operation', async () => {
-    const staged = { _id: 'staged', kind: 'link.apply', staged: true,
+    const staged = { ...TEST_BINDING, topologyRevision: 7, _id: 'staged', kind: 'link.apply', staged: true,
         status: 'succeeded', clientReadiness: 'unverified',
         clientProofAttempts: 0, clientProofRetryAfter: null, clientProofLeaseUntil: null };
     const published = { ...staged, _id: 'published', staged: false };
@@ -252,6 +252,10 @@ test('client proof claim skips staged link.apply and claims an eligible nonstage
     const model = {
         async create() {}, async updateOne() {},
         async findOneAndUpdate(query, update) {
+            const binding = topologyOperationClaimBindingFilter(TEST_BINDING.executionContext);
+            for (const [field, expected] of Object.entries(binding)) {
+                assert.deepEqual(query[field], expected, `proof claim binding ${field}`);
+            }
             const eligible = operations.find(op =>
                 op.status === query.status && op.clientReadiness === query.clientReadiness
                 && op.clientProofAttempts >= query.clientProofAttempts.$gte
@@ -267,10 +271,10 @@ test('client proof claim skips staged link.apply and claims an eligible nonstage
         },
     };
     const repository = new TopologyOperationRepository({ model });
-    const first = await repository.claimNextClientProof({ owner: 'worker', now: NOW });
+    const first = await repository.claimNextClientProof({ executionContext: TEST_BINDING.executionContext, owner: 'worker', now: NOW });
     assert.equal(first?._id, 'published');
     assert.equal(published.clientProofAttempts, 1);
-    assert.equal(await repository.claimNextClientProof({ owner: 'worker', now: NOW }), null);
+    assert.equal(await repository.claimNextClientProof({ executionContext: TEST_BINDING.executionContext, owner: 'worker', now: NOW }), null);
     assert.equal(staged.clientProofAttempts, 0);
     assert.equal(staged.clientProofLeaseUntil, null);
 });
@@ -284,10 +288,13 @@ test('client proof claim projects only probe node fields, not candidate or backu
             return null;
         },
     } });
-    await repository.claimNextClientProof({ owner: 'worker', now: NOW });
+    await repository.claimNextClientProof({ executionContext: TEST_BINDING.executionContext, owner: 'worker', now: NOW });
     assert.deepEqual(projection, {
-        _id: 1, status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1,
-        linkId: 1, linkIds: 1, clientProofAttempts: 1,
+        _id: 1, executionContext: 1, idempotencyKey: 1,
+        status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1, staged: 1, clientReadiness: 1,
+        linkId: 1, linkIds: 1, oldLinkId: 1, oldPathLinkIds: 1, groupId: 1, pathKey: 1,
+        ownerNodeId: 1, ownerTopologyRevision: 1, ownerCredentialRevision: 1, newPathLinkIds: 1,
+        heldTopologyAdmission: 1, pppWait: 1, clientProofAttempts: 1,
         clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
         'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1,
     });
