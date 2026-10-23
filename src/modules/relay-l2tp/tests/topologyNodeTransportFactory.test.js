@@ -101,7 +101,7 @@ test('creates a typed role-bound transport over only the fixed topology runner a
     assert.deepEqual(resolverCalls, [{ nodeId: 'portal-node', role: 'portal' }]);
     assert.deepEqual(execCalls, [{
         command: [
-            '/usr/local/bin/celerity-topology-node-runner',
+            '/usr/local/bin/celerity-topology-node-runner-v2',
             '--command prepare',
             '--operation-id topology-operation-17',
             '--node-id portal-node',
@@ -273,22 +273,24 @@ test('rejects raw factory input, non-fixed runner calls, and missing NodeSSH wit
         NodeTransport: CapturingTransport,
     });
     await facadeFactory.create({ nodeId: 'bridge-node', role: 'bridge' });
-    await assert.rejects(
-        fixedFacade('/tmp/request-runner', {
-            command: 'commit',
-            ...fencePlan,
-            operationId: 'topology-operation-19',
-            nodeId: 'bridge-node',
-            candidateHash,
-            backupId: 'topology-backup-19-bridge',
-            targetProfile: 'xray-bridge',
-        }),
-        error => error?.code === 'TOPOLOGY_NODE_TRANSPORT_UNAVAILABLE',
-    );
+    for (const runnerPath of ['/tmp/request-runner', '/usr/local/bin/celerity-topology-node-runner']) {
+        await assert.rejects(
+            fixedFacade(runnerPath, {
+                command: 'commit',
+                ...fencePlan,
+                operationId: 'topology-operation-19',
+                nodeId: 'bridge-node',
+                candidateHash,
+                backupId: 'topology-backup-19-bridge',
+                targetProfile: 'xray-bridge',
+            }),
+            error => error?.code === 'TOPOLOGY_NODE_TRANSPORT_UNAVAILABLE',
+        );
+    }
     assert.equal(facadeExecCalls, 0);
 
     await assert.rejects(
-        fixedFacade('/usr/local/bin/celerity-topology-node-runner', {
+        fixedFacade('/usr/local/bin/celerity-topology-node-runner-v2', {
             command: 'prepare',
             ...fencePlan,
             operationId: 'topology-operation-19',

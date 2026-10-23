@@ -136,7 +136,7 @@ async function fixture(t, fault, executionContext = TEST) {
             : { generation: 'none', bootId: boot, status: 'pre-enrolled' };
         if (challenge.predecessor) {
             assert.ok(first);
-            const request = `/usr/local/bin/celerity-topology-node-runner --command status --operation-id ${first.operationId} --node-id ${NODE} --candidate-hash ${first.candidateHash} --backup-id ${first.backupId} --target-profile xray-main --execution-context ${executionContext.hostIdentity} --attempt-id ${first.attemptId} --generation ${first.generation} --predecessor-generation ${first.predecessorGeneration} --command-id ${first.commandIds.close}`;
+            const request = `/usr/local/bin/celerity-topology-node-runner-v2 --command status --operation-id ${first.operationId} --node-id ${NODE} --candidate-hash ${first.candidateHash} --backup-id ${first.backupId} --target-profile xray-main --execution-context ${executionContext.hostIdentity} --attempt-id ${first.attemptId} --generation ${first.generation} --predecessor-generation ${first.predecessorGeneration} --command-id ${first.commandIds.close}`;
             const receipt = JSON.parse(restrictedExecute(runner, request).stdout);
             const journal = JSON.parse(await fs.readFile(path.join(runner.root, 'var/lib/celerity/topology/fences/xray-main/journal.json'), 'utf8'));
             predecessor = { bindingId: first._id, generation: first.generation, headGeneration: journal.head, bootId: boot, status: 'terminal', receipt };

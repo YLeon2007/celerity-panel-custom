@@ -433,7 +433,7 @@ test('production default bootstrap enters the paired portal preflight before any
         return true;
     });
     assert.equal(calls.length, 1);
-    assert.match(calls[0], /sha256sum.*celerity-topology-node-runner/);
+    assert.match(calls[0], /sha256sum.*celerity-topology-node-runner-v2/);
 });
 
 test('resolves one frozen test node, bootstraps first, and prepares through the role-bound transport', async () => {

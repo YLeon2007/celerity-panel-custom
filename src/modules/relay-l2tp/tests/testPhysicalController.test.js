@@ -28,7 +28,7 @@ function pins() {
         backend: { instanceId: 'a'.repeat(64), pid: 333, processStartTime: '42' } } };
 }
 function observation(config, pin) {
-    return { ...structuredClone(pin), installation: { runner: { path: '/usr/local/bin/celerity-topology-node-runner', sha256: TOPOLOGY_RUNNER_SHA256,
+    return { ...structuredClone(pin), installation: { runner: { path: '/usr/local/bin/celerity-topology-node-runner-v2', sha256: TOPOLOGY_RUNNER_SHA256,
         mode: '0750', owner: 'root', regularFile: true, symlink: false, writableByRunner: false }, profile: {
         targetProfile: pin.targetProfile, configDirectoryReady: true, bridgeUnitSha256: pin.targetProfile === 'xray-main' ? null : api.BRIDGE_SHA256,
         bridgeUnitDropIns: pin.targetProfile === 'xray-main' ? null : 'absent' } },

@@ -21,7 +21,7 @@ import sys
 sys.dont_write_bytecode = True
 
 HELPER = '/usr/local/libexec/c3-test-node-isolation'
-RUNNER = '/usr/local/bin/celerity-topology-node-runner'
+RUNNER = '/usr/local/bin/celerity-topology-node-runner-v2'
 REQUEST_TIMEOUT_SECONDS = 12
 
 

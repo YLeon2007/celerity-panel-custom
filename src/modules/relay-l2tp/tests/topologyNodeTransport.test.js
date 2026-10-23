@@ -84,7 +84,7 @@ test('prepare sends one fixed Xray candidate to the fixed topology runner and re
         },
     });
 
-    assert.equal(TOPOLOGY_NODE_RUNNER_PATH, '/usr/local/bin/celerity-topology-node-runner');
+    assert.equal(TOPOLOGY_NODE_RUNNER_PATH, '/usr/local/bin/celerity-topology-node-runner-v2');
     assert.equal(TOPOLOGY_NODE_ARTIFACT_ID, 'xray-config');
     assert.deepEqual(TOPOLOGY_NODE_COMMANDS, Object.freeze({
         PREPARE: 'prepare',

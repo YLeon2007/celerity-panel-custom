@@ -2,7 +2,7 @@
 
 const { createHash } = require('node:crypto');
 
-const TOPOLOGY_NODE_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
+const TOPOLOGY_NODE_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner-v2';
 const TOPOLOGY_NODE_ARTIFACT_ID = 'xray-config';
 const TOPOLOGY_NODE_COMMANDS = Object.freeze({
     PREPARE: 'prepare',

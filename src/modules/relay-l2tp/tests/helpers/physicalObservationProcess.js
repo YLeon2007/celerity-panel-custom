@@ -10,9 +10,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (process.argv[3]) {
         const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
         const root = process.argv[3];
-        const installed = path.join(root, 'usr/local/bin/celerity-topology-node-runner');
+        const installed = path.join(root, 'usr/local/bin/celerity-topology-node-runner-v2');
         const mode = fs.statSync(installed).mode & 0o777;
-        value.installation = { runner: { path: '/usr/local/bin/celerity-topology-node-runner',
+        value.installation = { runner: { path: '/usr/local/bin/celerity-topology-node-runner-v2',
             sha256: 'sha256:' + crypto.createHash('sha256').update(fs.readFileSync(installed)).digest('hex'),
             mode: mode.toString(8).padStart(4, '0'), owner: 'root', regularFile: fs.lstatSync(installed).isFile(),
             symlink: fs.lstatSync(installed).isSymbolicLink(), writableByRunner: Boolean(mode & 0o022) },

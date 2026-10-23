@@ -23,7 +23,7 @@ function physicalControllerFixture(t, { nodeId, identity, bootId, maintenanceId,
     })), host: { owner: randomUUID(), guard: { pid: 200, start: '321', socket: '/var/lib/c3-test-node-isolation/host.sock',
         owner: '', planHash: 'a'.repeat(64), session: { pid: 201, start: '320' } }, backend: { instanceId: 'a'.repeat(64), pid: 333, processStartTime: '42' } } };
     config.host.guard.owner = config.host.owner;
-    const installed = path.join(runnerRoot, 'usr/local/bin/celerity-topology-node-runner');
+    const installed = path.join(runnerRoot, 'usr/local/bin/celerity-topology-node-runner-v2');
     fs.copyFileSync(path.join(__dirname, '../../node-artifacts/topology/runner.sh'), installed); fs.chmodSync(installed, 0o750);
     fs.chmodSync(path.join(runnerRoot, 'usr/local/etc/xray'), 0o755);
     const children = [];

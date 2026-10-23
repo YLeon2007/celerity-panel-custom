@@ -21,7 +21,7 @@ async function fixture(t, content = '{"inbounds":[],"outbounds":[]}\n') {
     const calls = [], replies = [];
     const nodeSSH = { async exec(command, options = {}) {
         calls.push(command);
-        assert.ok(command.startsWith('/usr/local/bin/celerity-topology-node-runner '));
+        assert.ok(command.startsWith('/usr/local/bin/celerity-topology-node-runner-v2 '));
         const result = spawnSync('unshare', ['--user', '--map-root-user', 'bash', source, ...command.split(' ').slice(1)], {
             env: { ...process.env, CELERITY_TOPOLOGY_ROOT: f.root }, input: options.stdin, encoding: 'utf8', timeout: 10000 });
         replies.push(result);

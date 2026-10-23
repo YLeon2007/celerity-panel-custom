@@ -24,14 +24,19 @@ const TEST_AUTHORIZATION = Object.freeze({
     target: 'test', hostIdentity: 'test.infograd.online', role: 'relay',
 });
 
-const RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
-const UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner.upload';
-const NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner.next';
+const RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner-v2';
+const UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner-v2.upload';
+const NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner-v2.next';
 const RUNNER_DIGEST = '442663660ec974646b7969c457efd94cc17c57fe0e7a518be8a494480cf26765';
 const INSPECT_COMMAND = [
-    `if /usr/bin/test -f ${RUNNER_PATH} && /usr/bin/test ! -L ${RUNNER_PATH}; then`,
+    `if /usr/bin/test -e ${UPLOAD_PATH} || /usr/bin/test -L ${UPLOAD_PATH}`,
+    `|| /usr/bin/test -e ${NEXT_PATH} || /usr/bin/test -L ${NEXT_PATH}; then`,
+    "/usr/bin/printf '%s\\n' unsafe;",
+    `elif /usr/bin/test -f ${RUNNER_PATH} && /usr/bin/test ! -L ${RUNNER_PATH}; then`,
     `/usr/bin/sha256sum -- ${RUNNER_PATH}`,
     `&& /usr/bin/stat -c '%a' -- ${RUNNER_PATH};`,
+    `elif /usr/bin/test -e ${RUNNER_PATH} || /usr/bin/test -L ${RUNNER_PATH}; then`,
+    "/usr/bin/printf '%s\\n' unsafe;",
     'else',
     "/usr/bin/printf '%s\\n' missing;",
     'fi',
@@ -40,7 +45,8 @@ const INSTALL_COMMAND = [
     `/usr/bin/printf '%s  %s\\n' '${RUNNER_DIGEST}' '${UPLOAD_PATH}'`,
     '| /usr/bin/sha256sum --check --status -',
     `&& /usr/bin/install -m 0750 -- ${UPLOAD_PATH} ${NEXT_PATH}`,
-    `&& /usr/bin/mv -fT -- ${NEXT_PATH} ${RUNNER_PATH}`,
+    `&& /usr/bin/mv -nT -- ${NEXT_PATH} ${RUNNER_PATH}`,
+    `&& /usr/bin/test ! -e ${NEXT_PATH} && /usr/bin/test ! -L ${NEXT_PATH}`,
     `&& /usr/bin/rm -f -- ${UPLOAD_PATH}`,
 ].join(' ');
 const BRIDGE_UNIT_PATH = '/etc/systemd/system/xray-bridge.service';
@@ -217,42 +223,16 @@ test('ensureRunner is idempotent when the pinned hash and mode are already insta
     assert.doesNotMatch(JSON.stringify({ bootstrapper }), new RegExp(nodeSecret));
 });
 
-test('ensureRunner upgrades an outdated hash or mode through the same fixed atomic path', async () => {
-    const outdatedStates = [
-        `${'0'.repeat(64)}  ${RUNNER_PATH}\n750\n`,
-        `${RUNNER_DIGEST}  ${RUNNER_PATH}\n755\n`,
-    ];
-
-    for (const outdated of outdatedStates) {
+test('ensureRunner refuses an existing foreign hash or mode before remote writes', async () => {
+    for (const stdout of [`${'0'.repeat(64)}  ${RUNNER_PATH}\n750\n`, `${RUNNER_DIGEST}  ${RUNNER_PATH}\n755\n`]) {
         const calls = [];
-        let inspections = 0;
         const nodeSSH = {
-            async exec(command) {
-                calls.push({ method: 'exec', command });
-                if (command === INSPECT_UNIT_COMMAND) return matchingUnitReadback;
-                if (command === INSTALL_COMMAND || command === ENSURE_DIRS_COMMAND) {
-                    return { code: 0, stdout: '', stderr: '' };
-                }
-                inspections += 1;
-                return inspections === 1
-                    ? { code: 0, stdout: outdated, stderr: '' }
-                    : installedReadback;
-            },
-            async writeFile(remotePath, content) {
-                calls.push({ method: 'writeFile', remotePath, content });
-            },
+            async exec(command) { calls.push(command); return { code: 0, stdout, stderr: '' }; },
+            async writeFile() { assert.fail('foreign V2 runner must not be uploaded over'); },
         };
-        const bootstrapper = new TopologyRunnerBootstrapper({ nodeSSH, ...TEST_AUTHORIZATION });
-
-        assert.equal((await bootstrapper.ensureRunner()).changed, true);
-        assert.deepEqual(calls, [
-            { method: 'exec', command: INSPECT_COMMAND },
-            { method: 'exec', command: INSPECT_UNIT_COMMAND },
-            { method: 'exec', command: ENSURE_DIRS_COMMAND },
-            { method: 'writeFile', remotePath: UPLOAD_PATH, content: runnerSource() },
-            { method: 'exec', command: INSTALL_COMMAND },
-            { method: 'exec', command: INSPECT_COMMAND },
-        ]);
+        await assert.rejects(new TopologyRunnerBootstrapper({ nodeSSH, ...TEST_AUTHORIZATION }).ensureRunner(),
+            { code: 'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE' });
+        assert.deepEqual(calls, [INSPECT_COMMAND]);
     }
 });
 
@@ -312,7 +292,6 @@ test('accepts only a resolved NodeSSH facade, exact options and zero method argu
 
 test('rejects transfer, install, hash, and mode readback failures with one safe error', async () => {
     const remoteSecret = 'remote-bootstrap-secret-canary';
-    const cleanupCommand = `/usr/bin/rm -f -- ${UPLOAD_PATH} ${NEXT_PATH}`;
     const failures = [
         {
             name: 'transfer',
@@ -362,7 +341,7 @@ test('rejects transfer, install, hash, and mode readback failures with one safe 
             async exec(command) {
                 commands.push(command);
                 if (command === INSPECT_UNIT_COMMAND) return matchingUnitReadback;
-                if (command === cleanupCommand || command === ENSURE_DIRS_COMMAND) {
+                if (command === ENSURE_DIRS_COMMAND) {
                     return { code: 0, stdout: '', stderr: '' };
                 }
                 if (command === INSTALL_COMMAND) return failure.install;
@@ -387,14 +366,12 @@ test('rejects transfer, install, hash, and mode readback failures with one safe 
             INSPECT_COMMAND, INSPECT_UNIT_COMMAND, ENSURE_DIRS_COMMAND,
             ...(failure.name === 'transfer' ? [] : [INSTALL_COMMAND]),
             ...(['transfer', 'install hash'].includes(failure.name) ? [] : [INSPECT_COMMAND]),
-            cleanupCommand,
         ], failure.name);
         assert.equal(commands.every(command => [
             INSPECT_COMMAND,
             INSTALL_COMMAND,
             ENSURE_DIRS_COMMAND,
             INSPECT_UNIT_COMMAND,
-            cleanupCommand,
         ].includes(command)), true, failure.name);
     }
 });

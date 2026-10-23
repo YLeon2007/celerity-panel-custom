@@ -60,7 +60,7 @@ The proof has exactly the following shape (all values are strict, not coerced):
   maintenanceId: binding.maintenanceId,
   connection,                      // exact separately enrolled endpoint + raw key
   runner: {
-    path: '/usr/local/bin/celerity-topology-node-runner',
+    path: '/usr/local/bin/celerity-topology-node-runner-v2',
     sha256: TOPOLOGY_RUNNER_SHA256,  // sha256:<digest of shipped runner.sh bytes>
     mode: '0750', owner: 'root', regularFile: true,
     symlink: false, writableByRunner: false
@@ -98,6 +98,22 @@ simulate that external boundary; the additional ordinary-root controller test
 uses real subprocess observations and installed fake-root bytes/journals with
 physical/UID/kernel/systemd/SSH facts still explicitly simulated. No production
 attestor or live deployment is provided.
+
+## Fixed side-by-side V2 path
+
+All current V2 consumers use the compile-time path
+`/usr/local/bin/celerity-topology-node-runner-v2`; requests and environment cannot
+select another path. The legacy `/usr/local/bin/celerity-topology-node-runner`
+12/14-argument entry point is not replaced. The shipped V2 runner payload remains
+SHA-256 `442663660ec974646b7969c457efd94cc17c57fe0e7a518be8a494480cf26765`.
+Bootstrap uses V2-only `.upload`/`.next` staging, refuses existing foreign
+bytes/modes or unsafe targets before writes, and reuses exact installed bytes/mode.
+Publication is no-clobber and checks stage consumption because GNU `mv -n` can
+return zero when it skips. Unknown outcomes retain staging and refuse retries
+until independently reconciled; they never authorize replacing the legacy path.
+The immutable historical source packs and their old install mappings remain
+unchanged. A subsequent separately versioned artifact/install review is required;
+these source changes authorize no install, dispatch, or PROD activation.
 
 ## Dispatch behavior
 

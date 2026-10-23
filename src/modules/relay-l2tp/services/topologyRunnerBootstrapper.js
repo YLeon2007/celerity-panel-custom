@@ -5,9 +5,9 @@ const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
 
-const TOPOLOGY_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner';
-const TOPOLOGY_RUNNER_UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner.upload';
-const TOPOLOGY_RUNNER_NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner.next';
+const TOPOLOGY_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner-v2';
+const TOPOLOGY_RUNNER_UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner-v2.upload';
+const TOPOLOGY_RUNNER_NEXT_PATH = '/usr/local/bin/.celerity-topology-node-runner-v2.next';
 const TOPOLOGY_RUNNER_MODE = '0750';
 const TOPOLOGY_RUNNER_SOURCE = readFileSync(path.join(
     __dirname,
@@ -21,9 +21,14 @@ const TOPOLOGY_RUNNER_DIGEST = createHash('sha256')
     .digest('hex');
 const TOPOLOGY_RUNNER_SHA256 = `sha256:${TOPOLOGY_RUNNER_DIGEST}`;
 const INSPECT_COMMAND = Object.freeze([
-    `if /usr/bin/test -f ${TOPOLOGY_RUNNER_PATH} && /usr/bin/test ! -L ${TOPOLOGY_RUNNER_PATH}; then`,
+    `if /usr/bin/test -e ${TOPOLOGY_RUNNER_UPLOAD_PATH} || /usr/bin/test -L ${TOPOLOGY_RUNNER_UPLOAD_PATH}`,
+    `|| /usr/bin/test -e ${TOPOLOGY_RUNNER_NEXT_PATH} || /usr/bin/test -L ${TOPOLOGY_RUNNER_NEXT_PATH}; then`,
+    "/usr/bin/printf '%s\\n' unsafe;",
+    `elif /usr/bin/test -f ${TOPOLOGY_RUNNER_PATH} && /usr/bin/test ! -L ${TOPOLOGY_RUNNER_PATH}; then`,
     `/usr/bin/sha256sum -- ${TOPOLOGY_RUNNER_PATH}`,
     `&& /usr/bin/stat -c '%a' -- ${TOPOLOGY_RUNNER_PATH};`,
+    `elif /usr/bin/test -e ${TOPOLOGY_RUNNER_PATH} || /usr/bin/test -L ${TOPOLOGY_RUNNER_PATH}; then`,
+    "/usr/bin/printf '%s\\n' unsafe;",
     'else',
     "/usr/bin/printf '%s\\n' missing;",
     'fi',
@@ -32,12 +37,11 @@ const INSTALL_COMMAND = Object.freeze([
     `/usr/bin/printf '%s  %s\\n' '${TOPOLOGY_RUNNER_DIGEST}' '${TOPOLOGY_RUNNER_UPLOAD_PATH}'`,
     '| /usr/bin/sha256sum --check --status -',
     `&& /usr/bin/install -m ${TOPOLOGY_RUNNER_MODE} -- ${TOPOLOGY_RUNNER_UPLOAD_PATH} ${TOPOLOGY_RUNNER_NEXT_PATH}`,
-    `&& /usr/bin/mv -fT -- ${TOPOLOGY_RUNNER_NEXT_PATH} ${TOPOLOGY_RUNNER_PATH}`,
+    `&& /usr/bin/mv -nT -- ${TOPOLOGY_RUNNER_NEXT_PATH} ${TOPOLOGY_RUNNER_PATH}`,
+    // GNU mv -n returns zero on a skipped move: only a consumed stage proves publication.
+    `&& /usr/bin/test ! -e ${TOPOLOGY_RUNNER_NEXT_PATH} && /usr/bin/test ! -L ${TOPOLOGY_RUNNER_NEXT_PATH}`,
     `&& /usr/bin/rm -f -- ${TOPOLOGY_RUNNER_UPLOAD_PATH}`,
 ].join(' '));
-const CLEANUP_COMMAND = Object.freeze(
-    `/usr/bin/rm -f -- ${TOPOLOGY_RUNNER_UPLOAD_PATH} ${TOPOLOGY_RUNNER_NEXT_PATH}`,
-);
 // Only relay/bridge roles own this profile. A portal must never touch it.
 // The runner backs up config only: a differing unit cannot be safely replaced.
 const BRIDGE_UNIT_PATH = '/etc/systemd/system/xray-bridge.service';
@@ -119,7 +123,7 @@ function parseInspection(result) {
     }
     if (result.stdout === 'missing\n') return null;
 
-    const match = /^([a-f0-9]{64})  \/usr\/local\/bin\/celerity-topology-node-runner\n([0-7]{3,4})\n$/.exec(
+    const match = /^([a-f0-9]{64})  \/usr\/local\/bin\/celerity-topology-node-runner-v2\n([0-7]{3,4})\n$/.exec(
         result.stdout,
     );
     if (!match) throw new TopologyRunnerBootstrapperError();
@@ -186,9 +190,12 @@ class TopologyRunnerBootstrapper {
     async ensureRunner() {
         if (arguments.length !== 0) throw new TopologyRunnerBootstrapperError();
 
-        let transferStarted = false;
         try {
             const current = parseInspection(await this.#nodeSSH.exec(INSPECT_COMMAND));
+            if (current && (current.digest !== TOPOLOGY_RUNNER_DIGEST
+                || current.mode !== TOPOLOGY_RUNNER_MODE)) {
+                throw new TopologyRunnerBootstrapperError();
+            }
             // Decide ownership and reject incompatible units before even mkdir/upload.
             const unitMissing = this.#role !== 'portal'
                 && !parseBridgeUnitInspection(await this.#nodeSSH.exec(INSPECT_BRIDGE_UNIT_COMMAND));
@@ -208,7 +215,6 @@ class TopologyRunnerBootstrapper {
                 return success(unitMissing);
             }
 
-            transferStarted = true;
             await this.#nodeSSH.writeFile(
                 TOPOLOGY_RUNNER_UPLOAD_PATH,
                 Buffer.from(TOPOLOGY_RUNNER_SOURCE),
@@ -224,13 +230,8 @@ class TopologyRunnerBootstrapper {
             }
             return success(true);
         } catch {
-            if (transferStarted) {
-                try {
-                    await this.#nodeSSH.exec(CLEANUP_COMMAND);
-                } catch {
-                    // Preserve the one safe public error.
-                }
-            }
+            // Unknown upload/publication outcomes retain staging for reconciliation;
+            // neither a foreign target nor uncertain staging belongs to cleanup.
             throw new TopologyRunnerBootstrapperError();
         }
     }
