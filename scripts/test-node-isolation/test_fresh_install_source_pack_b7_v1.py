@@ -201,7 +201,12 @@ class FullArtifactAdversarialTests(unittest.TestCase):
         for name in ('unexpected-empty','candidate/root/unexpected-empty'):
             p=self.pack/name
             try:
-                p.mkdir(mode=0o700 if name=='unexpected-empty' else 0o755)
+                intended_mode=0o700 if name=='unexpected-empty' else 0o755
+                p.mkdir(mode=intended_mode)
+                # mkdir's mode is filtered by the caller's umask. Reach the
+                # membership guard deliberately; wrong-mode refusal is separate.
+                p.chmod(intended_mode)
+                self.assertEqual(stat.S_IMODE(p.stat().st_mode),intended_mode)
                 self.rehash();self.reject('PACK_DIRECTORY_DRIFT|CANDIDATE_DIRECTORY_PIN_MISMATCH')
             finally:p.rmdir();self.rehash()
         p=self.pack/'candidate/root/app'
