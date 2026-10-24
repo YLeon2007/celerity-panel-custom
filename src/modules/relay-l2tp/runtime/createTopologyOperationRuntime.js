@@ -131,16 +131,16 @@ function createTopologyOperationExecutor({
         target,
         hostIdentity,
     });
-    // Only the TEST runtime may install its real connected store. Absent authority
-    // and every PROD composition retain the executor's pre-SSH refusal.
+    // Forward explicit trusted capabilities for either canonical context; absent
+    // authority retains refusal, and runtime PROD authority assembly stays closed.
     return new TopologyOperationExecutor({
         target,
         hostIdentity,
         nodeExecutionResolver,
         NodeTransportFactory: TopologyNodeTransportFactory,
         RunnerBootstrapper: TopologyRunnerBootstrapper,
-        ...(target === 'test' ? optional(executionBindingReader, 'executionBindingReader') : {}),
-        ...(target === 'test' ? optional(preinstalledRunnerAuthority, 'preinstalledRunnerAuthority') : {}),
+        ...optional(executionBindingReader, 'executionBindingReader'),
+        ...optional(preinstalledRunnerAuthority, 'preinstalledRunnerAuthority'),
     });
 }
 

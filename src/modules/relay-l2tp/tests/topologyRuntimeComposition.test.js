@@ -2,6 +2,12 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { createHash } = require('node:crypto');
+const { executionFence, freeze } = require('./helpers/topologyV2Fixture');
+const {
+    PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: PROD,
+    TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST,
+} = require('../domain/topologyExecutionContext');
 
 const {
     REQUIRED_TEST_RUNTIME_FLAGS,
@@ -242,6 +248,223 @@ test('default typed executor factory constructs TEST and rejects invalid pairs',
             NodeSSH: FakeNodeSSH,
             ...contour,
         }), undefined);
+    }
+});
+
+function factoryPrepareContext() {
+    const content = '{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}\n';
+    const candidateHash = createHash('sha256').update(content).digest('hex');
+    return {
+        operationId: 'factory-proof-17', topologyRevision: 17, priorDeployedRevision: 16,
+        executionFence,
+        node: freeze({ node: 'portal-node', nodeRef: 'portal', role: 'portal',
+            targetProfile: 'xray-main', serviceUnit: 'xray.service',
+            serviceUnitPath: '/etc/systemd/system/xray.service',
+            configPath: '/usr/local/etc/xray/config.json', checks: [], candidateHash,
+            candidate: { mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
+                bytes: [...Buffer.from(content)], sha256: candidateHash },
+        }),
+    };
+}
+
+// Local reader/attestor seams only: no production reader or physical authority.
+test('canonical PROD factory forwards explicit capabilities to the real executor reader with TEST control', async () => {
+    for (const executionContext of [TEST, PROD]) {
+        const externalCalls = [];
+        const reads = [];
+        const reader = {
+            async readVerified(expected) {
+                assert.strictEqual(this, reader);
+                reads.push(expected);
+                throw new Error('simulated authority stops at earliest real reader boundary');
+            },
+        };
+        const executor = createTopologyOperationExecutor({
+            ...executionContext,
+            HyNode: modelWith(['findById'], externalCalls),
+            NodeSSH: class { constructor() { externalCalls.push('ssh'); } },
+            executionBindingReader: reader,
+            preinstalledRunnerAuthority: {
+                async withVerifiedPreinstalledRunner() { assert.fail('reader must refuse first'); },
+            },
+        });
+        assert.ok(executor instanceof TopologyOperationExecutor);
+        const context = factoryPrepareContext();
+        await assert.rejects(executor.prepare(context), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+        });
+        assert.equal(reads.length, 1, `${executionContext.target} explicit reader must not be silently dropped`);
+        assert.deepEqual(reads[0], {
+            executionContext: executionContext.hostIdentity,
+            operationId: context.operationId, nodeId: context.node.node,
+            candidateHash: `sha256:${context.node.candidateHash}`,
+            backupId: `topology-${createHash('sha256').update([
+                context.operationId, context.node.node, `sha256:${context.node.candidateHash}`,
+                context.node.targetProfile,
+            ].join('\0')).digest('hex')}`,
+            targetProfile: context.node.targetProfile,
+            topologyRevision: context.topologyRevision, priorDeployedRevision: context.priorDeployedRevision,
+            ...executionFence,
+        });
+        assert.equal(Object.isFrozen(reads[0]), true);
+        assert.deepEqual(externalCalls, [], 'no credential lookup, SSH, bootstrap or upload');
+    }
+});
+
+test('canonical PROD factory preserves forwarded attestor refusal before credentials without shell or upload fallback', async () => {
+    const { bindingRecord, simulatedConnectionAuthority } = require('./helpers/topologyV2Fixture');
+    const context = factoryPrepareContext();
+    // Explicit simulated binding and endpoint, NOT persistence or physical proof.
+    const record = bindingRecord(context, PROD.hostIdentity);
+    const connection = freeze({ expectedHostKeySha256: '2'.repeat(64),
+        expectedEndpoint: { ip: '192.0.2.17', port: 2222, username: 'c3-test-runner' } });
+    const calls = [];
+    const executor = createTopologyOperationExecutor({ ...PROD,
+        HyNode: modelWith(['findById'], calls),
+        NodeSSH: class { constructor() { calls.push('ssh'); assert.fail('no transport'); } },
+        executionBindingReader: {
+            async readVerified(expected) {
+                calls.push('binding');
+                assert.equal(expected.executionContext, PROD.hostIdentity);
+                return record;
+            },
+            async readVerifiedConnection(expected, verified) {
+                calls.push('connection');
+                assert.strictEqual(verified, record);
+                assert.equal(expected.executionContext, PROD.hostIdentity);
+                return simulatedConnectionAuthority(record, connection);
+            },
+        },
+        preinstalledRunnerAuthority: {
+            async withVerifiedPreinstalledRunner() {
+                calls.push('attestor');
+                assert.fail('unchanged bootstrap policy rejects PROD identity before callback');
+            },
+        },
+    });
+    await assert.rejects(executor.prepare(context), error => {
+        assert.equal(error.code, 'TOPOLOGY_OPERATION_EXECUTION_FAILED');
+        assert.equal(error.cause?.code, 'TOPOLOGY_RUNNER_BOOTSTRAP_UNAVAILABLE');
+        return true;
+    });
+    assert.deepEqual(calls, ['binding', 'connection'], 'no credential lookup, SSH, shell or upload');
+});
+
+test('canonical factories preserve real constructor validation for malformed explicit capabilities', () => {
+    for (const executionContext of [TEST, PROD]) {
+        const calls = [];
+        const dependencies = { ...executionContext, HyNode: modelWith(['findById'], calls),
+            NodeSSH: class { constructor() { calls.push('ssh'); } } };
+        for (const executionBindingReader of [null, {}, [], { readVerified: true }]) {
+            assert.throws(() => createTopologyOperationExecutor({ ...dependencies, executionBindingReader }),
+                { name: 'TypeError', message: 'Topology executor binding reader requires readVerified' });
+        }
+        for (const preinstalledRunnerAuthority of [null, {}, [], { withVerifiedPreinstalledRunner: true }]) {
+            assert.throws(() => createTopologyOperationExecutor({ ...dependencies,
+                executionBindingReader: { async readVerified() { assert.fail('constructor only'); } },
+                preinstalledRunnerAuthority }),
+            { name: 'TypeError', message: 'Preinstalled runner requires server authority' });
+        }
+        assert.deepEqual(calls, []);
+    }
+});
+
+test('canonical factory capability omissions and explicit undefined retain pre-SSH refusal', async () => {
+    for (const executionContext of [TEST, PROD]) {
+        for (const capabilities of [{},
+            { executionBindingReader: undefined, preinstalledRunnerAuthority: undefined },
+            { preinstalledRunnerAuthority: {
+                async withVerifiedPreinstalledRunner() { assert.fail('no binding reader'); },
+            } },
+        ]) {
+            const calls = [];
+            const executor = createTopologyOperationExecutor({ ...executionContext, ...capabilities,
+                HyNode: modelWith(['findById'], calls),
+                NodeSSH: class { constructor() { calls.push('ssh'); } } });
+            assert.ok(executor instanceof TopologyOperationExecutor);
+            await assert.rejects(executor.prepare(factoryPrepareContext()), {
+                code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+            });
+            assert.deepEqual(calls, []);
+        }
+    }
+});
+
+test('canonical factory malformed operation input refuses before explicit reader or credentials', async () => {
+    for (const executionContext of [TEST, PROD]) {
+        const calls = [];
+        const executor = createTopologyOperationExecutor({ ...executionContext,
+            HyNode: modelWith(['findById'], calls),
+            NodeSSH: class { constructor() { calls.push('ssh'); } },
+            executionBindingReader: { async readVerified() { calls.push('binding'); } },
+            preinstalledRunnerAuthority: {
+                async withVerifiedPreinstalledRunner() { calls.push('attestor'); },
+            },
+        });
+        await assert.rejects(executor.prepare({}), {
+            code: 'INVALID_FROZEN_NODE_PLAN', remoteOutcomeUncertain: false,
+        });
+        for (const fence of [undefined, {}, { ...executionFence }, freeze({ ...executionFence, attempt: 0 })]) {
+            await assert.rejects(executor.prepare({ ...factoryPrepareContext(), executionFence: fence }), {
+                code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+            });
+        }
+        assert.deepEqual(calls, []);
+    }
+});
+
+test('factory canonical host guard precedes resolver capability access even with explicit capabilities', () => {
+    let resolverReads = 0;
+    let sshConstructions = 0;
+    const HyNode = { get findById() { resolverReads++; assert.fail('must reject before resolver construction'); } };
+    for (const contour of [{}, { target: PROD.target }, { hostIdentity: PROD.hostIdentity },
+        { target: TEST.target, hostIdentity: PROD.hostIdentity },
+        { target: PROD.target, hostIdentity: TEST.hostIdentity },
+        { ...PROD, hostIdentity: 'foreign.invalid' }, { ...PROD, hostIdentity: PROD.hostIdentity + '.' },
+        { ...PROD, hostIdentity: [PROD.hostIdentity] }, { ...PROD, target: 'Production' },
+    ]) {
+        assert.equal(createTopologyOperationExecutor({ ...contour, HyNode,
+            NodeSSH: class { constructor() { sshConstructions++; } },
+            executionBindingReader: null, preinstalledRunnerAuthority: null,
+        }), undefined);
+    }
+    assert.equal(resolverReads, 0);
+    assert.equal(sshConstructions, 0);
+});
+
+test('PROD runtime still omits authority assembly and refuses before claim despite trusted inputs', async () => {
+    for (const controller of [undefined, null, {}, { executionContext: PROD,
+        get runnerTransport() { assert.fail('PROD authority selection remains closed'); },
+        async withHeldAuthority() { assert.fail('PROD controller must not run'); },
+    }]) {
+        const calls = [];
+        let factoryOptions;
+        const service = createTopologyOperationRuntime({ ...compositionDependencies(calls),
+            env: { ...ENABLED_ENV, PANEL_DOMAIN: PROD.hostIdentity, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' },
+            topologyExecutionAuthority: controller,
+            allowUnprovenTestExecution: true,
+            executionBindingReader: { async readVerified() { assert.fail('not a runtime input'); } },
+            preinstalledRunnerAuthority: {
+                async withVerifiedPreinstalledRunner() { assert.fail('not a runtime input'); },
+            },
+            createTopologyOperationExecutor(options) {
+                factoryOptions = options;
+                return createTopologyOperationExecutor({ ...options,
+                    NodeSSH: class { constructor() { calls.push('ssh'); } } });
+            },
+        });
+        assert.ok(service instanceof TopologyOperationCoordinator);
+        assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
+        assert.equal(Object.hasOwn(factoryOptions, 'executionBindingReader'), false);
+        assert.equal(Object.hasOwn(factoryOptions, 'preinstalledRunnerAuthority'), false);
+        assert.deepEqual(await service.operationWorker.run('factory-proof-17'), {
+            claimed: false, operationId: 'factory-proof-17', stopped: true,
+            errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
+        });
+        await assert.rejects(service.operationWorker.executor.prepare(factoryPrepareContext()), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
+        });
+        assert.deepEqual(calls, []);
     }
 });
 
