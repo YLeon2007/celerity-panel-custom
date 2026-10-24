@@ -80,6 +80,10 @@ class TopologyExecutionBindingStore {
             throw new TypeError('Exact server-owned production context or canonical TEST context required');
         }
         this.#context = selected;
+        Object.defineProperty(this, 'executionContext', {
+            get: () => this.#context,
+            enumerable: true,
+        });
         if (typeof withVerifiedAuthority !== 'function') throw new TypeError('Scoped external authority required');
         const models = { Operation, Lock, Owner, Enrollment, Binding, HyNode };
         if (Object.values(models).some(model => !model?.db || typeof model.findOne !== 'function')

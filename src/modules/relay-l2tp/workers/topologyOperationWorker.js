@@ -289,9 +289,15 @@ class TopologyOperationWorker {
             throw new TypeError('Topology operation worker requires lease identity and clock');
         }
         if ((bindingProvisioner === undefined) !== (bindingLifecycle === undefined)
-            || (bindingProvisioner && (selectedContext.target !== 'test'
-                || typeof bindingProvisioner.reserveBinding !== 'function'
-                || typeof bindingLifecycle.run !== 'function'))) throw new TypeError('Exact TEST binding lifecycle required');
+            || (bindingProvisioner !== undefined && (
+                !matchesTopologyExecutionContext(bindingProvisioner?.executionContext, selectedContext)
+                || !matchesTopologyExecutionContext(bindingLifecycle?.executionContext, selectedContext)
+                || typeof bindingProvisioner?.reserveBinding !== 'function'
+                || typeof bindingLifecycle?.run !== 'function'
+                || typeof bindingLifecycle?.assertHeld !== 'function'
+                || executor.executionProtocolVersion !== 2))) {
+            throw new TypeError('Exact context-paired V2 binding lifecycle required');
+        }
         this.#bindingProvisioner = bindingProvisioner;
         this.#bindingLifecycle = bindingLifecycle;
         this.operationRepository = operationRepository;
@@ -1113,7 +1119,10 @@ class TopologyOperationWorker {
         if (!SAFE_ID_PATTERN.test(operationId)) {
             throw new TypeError('Topology operation worker requires an operation id');
         }
-        if (!this.#allowUnprovenTestExecution) {
+        // A validated pair is a separate V2 route, never the TEST bypass.
+        // Its constructor identity alone grants nothing: live checks below run
+        // only inside the lifecycle callback spanning this entire invocation.
+        if (!this.#bindingLifecycle && !this.#allowUnprovenTestExecution) {
             return {
                 claimed: false,
                 operationId,
@@ -1131,6 +1140,7 @@ class TopologyOperationWorker {
         let plan;
         const acquiredNodeIds = [];
         try {
+            if (this.#bindingLifecycle) await this.#bindingLifecycle.assertHeld();
             if (this.#retainExecutionOwnership && typeof this.finalizer.probeV2Settlement === 'function') {
                 let recovery;
                 try { recovery = await this.finalizer.probeV2Settlement({ operationId }); }
@@ -1154,6 +1164,9 @@ class TopologyOperationWorker {
                         errorCode: 'TOPOLOGY_V2_RECOVERY_REQUIRES_SETTLEMENT_REVIEW' };
                 }
             }
+            // Recovery is awaited; an earlier held observation cannot authorize
+            // the claim after revocation or an early-returning controller.
+            if (this.#bindingLifecycle) await this.#bindingLifecycle.assertHeld();
             const operation = await this.operationRepository.claim({
                 executionContext: this.executionContext,
                 operationId,
