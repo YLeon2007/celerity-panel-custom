@@ -432,39 +432,191 @@ test('factory canonical host guard precedes resolver capability access even with
     assert.equal(sshConstructions, 0);
 });
 
-test('PROD runtime still omits authority assembly and refuses before claim despite trusted inputs', async () => {
-    for (const controller of [undefined, null, {}, { executionContext: PROD,
-        get runnerTransport() { assert.fail('PROD authority selection remains closed'); },
-        async withHeldAuthority() { assert.fail('PROD controller must not run'); },
-    }]) {
-        const calls = [];
-        let factoryOptions;
-        const service = createTopologyOperationRuntime({ ...compositionDependencies(calls),
-            env: { ...ENABLED_ENV, PANEL_DOMAIN: PROD.hostIdentity, TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' },
-            topologyExecutionAuthority: controller,
-            allowUnprovenTestExecution: true,
-            executionBindingReader: { async readVerified() { assert.fail('not a runtime input'); } },
-            preinstalledRunnerAuthority: {
-                async withVerifiedPreinstalledRunner() { assert.fail('not a runtime input'); },
-            },
-            createTopologyOperationExecutor(options) {
-                factoryOptions = options;
-                return createTopologyOperationExecutor({ ...options,
-                    NodeSSH: class { constructor() { calls.push('ssh'); } } });
-            },
+// Actual lifecycle/store/executor/worker/repositories; ONLY persistence and the
+// independent physical hold are modeled. No Mongo, credentials or transport.
+function heldRuntimeFixture(context = PROD) {
+    const deps = compositionDependencies();
+    const trace = [];
+    const state = { held: false, revoked: false, checks: 0, claims: 0 };
+    const deny = () => assert.fail('no persistence, enrollment, transport or background work');
+    const db = { getClient: () => ({ options: { directConnection: false },
+        topology: { description: { type: 'ReplicaSetWithPrimary' } } }) };
+    for (const [name, model] of Object.entries(deps)) {
+        if (!model || typeof model !== 'object' || name === 'env' || name === 'clock') continue;
+        model.db = db;
+        model.findOne ??= deny;
+    }
+    const controller = { executionContext: { ...context }, runnerTransport: 'preinstalled-attested-v1',
+        async withHeldAuthority(selected, work) {
+            assert.ok(selected === context);
+            state.held = true;
+            trace.push('enter');
+            try { return await work({ async assertHeld() {
+                assert.equal(state.held, true);
+                state.checks++;
+                if (state.revoked) throw new Error('simulated hold revoked');
+            }, withVerifiedAuthority: deny, withVerifiedPreinstalledRunner: deny }); }
+            finally { state.held = false; trace.push('leave'); }
+        } };
+    deps.env = { ...ENABLED_ENV, PANEL_DOMAIN: context.hostIdentity,
+        TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' };
+    deps.clock = { now: () => new Date('2026-10-24T00:00:00.000Z') };
+    deps.topologyExecutionAuthority = controller;
+    deps.TopologyOperation.findOne = filter => {
+        assert.equal(state.held, true);
+        assert.deepEqual(filter, { _id: 'factory-proof-17' });
+        trace.push('recovery');
+        const query = { read(value) { assert.equal(value, 'primary'); return query; },
+            readConcern(value) { assert.equal(value, 'majority'); return query; },
+            setOptions() { return query; }, async lean() { return null; } };
+        return query;
+    };
+    deps.TopologyOperation.findOneAndUpdate = async (filter, update, options) => {
+        const { topologyOperationClaimBindingFilter } = require('../domain/topologyOperationClaimBinding');
+        assert.equal(state.held, true);
+        assert.equal(state.revoked, false);
+        assert.equal(filter._id, 'factory-proof-17');
+        for (const [key, value] of Object.entries(topologyOperationClaimBindingFilter(context))) {
+            assert.deepEqual(filter[key], value);
+        }
+        assert.deepEqual(filter.v2Terminal, { $exists: false });
+        assert.equal(update.$inc.attempts, 1);
+        assert.equal(options.runValidators, true);
+        state.claims++;
+        trace.push('claim');
+        return null;
+    };
+    const fixture = { deps, controller, trace, state };
+    deps.OperationWorker = class extends TopologyOperationWorker {
+        constructor(options) { super(options); fixture.options = options; }
+    };
+    return fixture;
+}
+
+function assertHeldRuntime(service, context, options) {
+    const { TopologyExecutionAuthorityLifecycle } = require('../runtime/topologyExecutionAuthorityLifecycle');
+    const { TopologyExecutionBindingStore } = require('../repositories/topologyExecutionBindingStore');
+    assert.ok(service instanceof TopologyOperationCoordinator);
+    assert.ok(service.operationWorker instanceof TopologyOperationWorker);
+    const worker = service.operationWorker;
+    assert.ok(worker.executor instanceof TopologyOperationExecutor);
+    assert.equal(worker.executor.executionProtocolVersion, 2);
+    assert.ok(options.bindingProvisioner instanceof TopologyExecutionBindingStore);
+    assert.ok(options.bindingLifecycle instanceof TopologyExecutionAuthorityLifecycle);
+    assert.ok(options.bindingProvisioner.executionContext === context);
+    assert.ok(options.bindingLifecycle.executionContext === context);
+    assert.equal(options.allowUnprovenTestExecution, context === TEST);
+    assert.equal(worker.userResync.restrictedRunner, true);
+    assert.equal(worker.pppReadinessGate.readOnly, true);
+    return worker;
+}
+
+test('canonical PROD runtime assembles actual held lifecycle/store/default V2 executor through real recovery and null claim (SIMULATED persistence/physical hold)', async () => {
+    for (const context of [PROD, TEST]) {
+        const f = heldRuntimeFixture(context);
+        const service = createTopologyOperationRuntime(f.deps);
+        const worker = assertHeldRuntime(service, context, f.options);
+        assert.deepEqual(f.trace, [], 'assembly does not invoke the controller or models');
+        Object.assign(f.controller.executionContext, context === PROD ? TEST : PROD);
+        f.deps.env.PANEL_DOMAIN = 'foreign.invalid';
+        assert.deepEqual(await worker.run('factory-proof-17'), { claimed: false, operationId: 'factory-proof-17' });
+        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'claim', 'leave']);
+        assert.equal(f.state.claims, 2, 'real repository executes both context-fenced null CAS paths');
+        assert.equal(f.state.held, false);
+        await assert.rejects(f.options.bindingLifecycle.assertHeld(), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        const store = f.options.bindingProvisioner;
+        const readVerified = store.readVerified;
+        let readerCalls = 0;
+        store.readVerified = async function(expected) {
+            assert.ok(this === store);
+            assert.equal(expected.executionContext, context.hostIdentity);
+            readerCalls++;
+            return readVerified.call(this, expected);
+        };
+        await assert.rejects(worker.executor.prepare(factoryPrepareContext()), {
+            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
         });
-        assert.ok(service instanceof TopologyOperationCoordinator);
+        assert.equal(readerCalls, 1, 'default actual executor uses the assembled actual store');
+        assert.deepEqual(f.trace, ['enter', 'recovery', 'claim', 'claim', 'leave'],
+            'actual executor/store cannot use authority outside the worker hold');
+        assert.equal(worker.pppDriftSync === undefined, context === PROD);
+        assert.equal(worker.pppResumeReadinessGate === undefined, context === PROD);
+    }
+});
+
+test('PROD runtime rejects malformed, foreign and cross-paired explicit controllers before invocation or claim', async () => {
+    for (const controller of [null, {}, [], { withHeldAuthority() { assert.fail('undeclared PROD'); } },
+        ...[undefined, null, {}, TEST, { target: TEST.target, hostIdentity: PROD.hostIdentity },
+            { target: PROD.target, hostIdentity: TEST.hostIdentity }, { ...PROD, extra: true },
+            { target: [PROD.target], hostIdentity: PROD.hostIdentity }].map(executionContext => ({
+            executionContext, withHeldAuthority() { assert.fail('invalid pairing'); },
+            get runnerTransport() { assert.fail('pair validation must precede selection'); },
+        })),
+    ]) {
+        const f = heldRuntimeFixture();
+        f.deps.topologyExecutionAuthority = controller;
+        await assertUnavailable(createTopologyOperationRuntime(f.deps));
+        assert.deepEqual(f.trace, []);
+        assert.equal(f.state.claims, 0);
+    }
+});
+
+test('PROD authority omission cannot inherit raw reader/attestor or TEST bypass inputs', async () => {
+    for (const explicitUndefined of [false, true]) {
+        const f = heldRuntimeFixture();
+        if (explicitUndefined) f.deps.topologyExecutionAuthority = undefined;
+        else delete f.deps.topologyExecutionAuthority;
+        f.deps.allowUnprovenTestExecution = true;
+        f.deps.executionBindingReader = { readVerified() { assert.fail('untrusted runtime input'); } };
+        f.deps.preinstalledRunnerAuthority = { withVerifiedPreinstalledRunner() { assert.fail('untrusted runtime input'); } };
+        const service = createTopologyOperationRuntime(f.deps);
         assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
-        assert.equal(Object.hasOwn(factoryOptions, 'executionBindingReader'), false);
-        assert.equal(Object.hasOwn(factoryOptions, 'preinstalledRunnerAuthority'), false);
         assert.deepEqual(await service.operationWorker.run('factory-proof-17'), {
             claimed: false, operationId: 'factory-proof-17', stopped: true,
             errorCode: 'TOPOLOGY_EXECUTION_QUIESCENCE_UNPROVEN',
         });
-        await assert.rejects(service.operationWorker.executor.prepare(factoryPrepareContext()), {
-            code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN', remoteOutcomeUncertain: false,
-        });
-        assert.deepEqual(calls, []);
+        assert.deepEqual(f.trace, []);
+        assert.equal(f.state.claims, 0);
+    }
+});
+
+test('PROD rejects unknown explicit transports and missing/cross-connection/undiscovered store prerequisites', async () => {
+    for (const change of [
+        ...[null, true, 'shell-fallback', 'preinstalled'].map(value => f => { f.controller.runnerTransport = value; }),
+        f => { delete f.deps.TopologyExecutionBinding; },
+        f => { f.deps.TopologyExecutionEnrollment.db = {}; },
+        f => { f.deps.TopologyExecutionBinding.db.getClient = () => ({ options: { directConnection: true } }); },
+        f => { f.deps.TopologyExecutionBinding.db.getClient = () => ({ options: {}, topology: { description: { type: 'Unknown' } } }); },
+    ]) {
+        const f = heldRuntimeFixture();
+        change(f);
+        await assertUnavailable(createTopologyOperationRuntime(f.deps));
+        assert.deepEqual(f.trace, []);
+        assert.equal(f.state.claims, 0);
+    }
+});
+
+test('PROD assembled real lifecycle refuses unheld and revoked recovery before any claim', async () => {
+    for (const mode of ['unheld', 'revoked-recovery']) {
+        const f = heldRuntimeFixture();
+        if (mode === 'unheld') f.controller.withHeldAuthority = async () => {};
+        else {
+            const read = f.deps.TopologyOperation.findOne;
+            f.deps.TopologyOperation.findOne = (...args) => {
+                const query = read(...args);
+                query.lean = async () => { await Promise.resolve(); f.state.revoked = true; return null; };
+                return query;
+            };
+        }
+        const service = createTopologyOperationRuntime(f.deps);
+        const worker = assertHeldRuntime(service, PROD, f.options);
+        const result = await worker.run('factory-proof-17');
+        assert.equal(result.stopped, true);
+        assert.equal(result.drainUncertain, true);
+        assert.equal(result.errorCode, 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN');
+        assert.equal(f.state.claims, 0);
+        assert.equal(f.state.held, false);
+        assert.deepEqual(f.trace, mode === 'unheld' ? [] : ['enter', 'recovery', 'leave']);
     }
 });
 

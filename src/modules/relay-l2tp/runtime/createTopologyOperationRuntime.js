@@ -131,8 +131,8 @@ function createTopologyOperationExecutor({
         target,
         hostIdentity,
     });
-    // Forward explicit trusted capabilities for either canonical context; absent
-    // authority retains refusal, and runtime PROD authority assembly stays closed.
+    // Explicit trusted capabilities only; absence still refuses. Runtime assembly
+    // validates the controller's canonical context through the held lifecycle.
     return new TopologyOperationExecutor({
         target,
         hostIdentity,
@@ -235,7 +235,9 @@ function createTopologyOperationRuntime(dependencies = {}) {
             clock,
         });
         let bindingStore, bindingLifecycle, preinstalledRunnerAuthority;
-        if (executionContext.target === 'test' && dependencies.topologyExecutionAuthority !== undefined) {
+        // Reuse the lifecycle's exact controller-context pairing for either
+        // canonical context; this constructs no controller or physical authority.
+        if (dependencies.topologyExecutionAuthority !== undefined) {
             const { TopologyExecutionAuthorityLifecycle } = require('./topologyExecutionAuthorityLifecycle');
             const { TopologyExecutionBindingStore } = require('../repositories/topologyExecutionBindingStore');
             bindingLifecycle = new TopologyExecutionAuthorityLifecycle({ executionContext,

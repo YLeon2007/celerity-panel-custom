@@ -206,7 +206,7 @@ function createL2tpPanelHost({
             TopologyExecutionBinding: models.TopologyExecutionBinding,
             TopologyExecutionEnrollment: models.TopologyExecutionEnrollment,
             TopologyConfigOwner: models.TopologyConfigOwner,
-            ...(testWorkerExecutionAllowed && topologyExecutionAuthority !== undefined
+            ...(topologyExecutionAuthority !== undefined
                 ? { topologyExecutionAuthority } : {}),
             NodeSSH,
             clock,

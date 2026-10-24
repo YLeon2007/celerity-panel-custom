@@ -54,11 +54,74 @@ function compose(env, mutateSource = () => {}, topologyExecutionAuthority) {
     return { host, captured, worker, intentService };
 }
 
-test('actual panel host forwards only explicit TEST server authority, never PROD authority', () => {
-    const authority = Object.freeze({ withHeldAuthority() { assert.fail('composition only'); } });
-    const { captured } = compose({ ...TEST_ENV }, () => {}, authority);
-    assert.ok(captured.deployment.topologyExecutionAuthority === authority, 'actual host drops the held authority capability');
-    assert.equal(compose({ ...PROD_ENV }, () => {}, authority).captured.deployment.topologyExecutionAuthority, undefined);
+test('actual panel host forwards explicit server authority for either selected canonical context without invoking it', () => {
+    for (const env of [TEST_ENV, PROD_ENV]) {
+        const authority = Object.freeze({ executionContext: env === PROD_ENV ? PROD : TEST,
+            withHeldAuthority() { assert.fail('composition only'); } });
+        const { captured } = compose({ ...env }, () => {}, authority);
+        assert.ok(captured.deployment.topologyExecutionAuthority === authority,
+            'actual host drops the explicit held authority capability');
+        assert.equal(Object.hasOwn(compose({ ...env }).captured.deployment, 'topologyExecutionAuthority'), false);
+    }
+});
+
+test('actual PROD panel host reaches held recovery and null claim through the actual module runtime/default V2 executor (SIMULATED persistence/physical hold)', async () => {
+    const trace = [];
+    let held = false, service, recovery;
+    const deny = () => assert.fail('no enrollment, DDL, transport or background start');
+    const db = { transaction: deny, getClient: () => ({ options: { directConnection: false },
+        topology: { description: { type: 'ReplicaSetWithPrimary' } } }) };
+    const model = () => ({ db, ...Object.fromEntries(['find', 'findOne', 'findById', 'findOneAndUpdate',
+        'updateOne', 'deleteOne', 'create', 'countDocuments'].map(name => [name, deny])) });
+    const models = Object.fromEntries(['CascadeRouteGroup', 'CascadeTopologyState', 'RelayL2tpState',
+        'L2tpUser', 'L2tpOperation', 'TopologyOperation', 'NodeOperationLock', 'TopologyExecutionBinding',
+        'TopologyExecutionEnrollment', 'TopologyConfigOwner'].map(name => [name, model()]));
+    models.TopologyOperation.findOne = filter => {
+        assert.equal(held, true);
+        assert.deepEqual(filter, { _id: 'host-held-null' });
+        trace.push('recovery');
+        const query = { read(value) { assert.equal(value, 'primary'); return query; },
+            readConcern(value) { assert.equal(value, 'majority'); return query; },
+            setOptions() { return query; }, async lean() { return null; } };
+        return query;
+    };
+    models.TopologyOperation.findOneAndUpdate = async filter => {
+        assert.equal(held, true);
+        assert.equal(filter._id, 'host-held-null');
+        assert.equal(filter['executionContext.target'], PROD.target);
+        assert.equal(filter['executionContext.hostIdentity'], PROD.hostIdentity);
+        trace.push('claim');
+        return null;
+    };
+    const controller = { executionContext: PROD, runnerTransport: 'preinstalled-attested-v1',
+        async withHeldAuthority(context, work) {
+            assert.deepEqual(context, PROD);
+            held = true; trace.push('enter');
+            try { return await work({ assertHeld() { assert.equal(held, true); }, withVerifiedAuthority: deny }); }
+            finally { held = false; trace.push('leave'); }
+        } };
+    createL2tpPanelHost({ env: { ...PROD_ENV, TOPOLOGY_PROBE_USER_ID: 'must-not-activate' },
+        topologyExecutionAuthority: controller,
+        moduleEntry: { registerModels: () => models,
+            createTopologyDeploymentService(options) {
+                service = require('../relay-l2tp').createTopologyDeploymentService(options);
+                return service;
+            } },
+        HyNode: model(), CascadeLink: model(), NodeSSH: class { constructor() { deny(); } },
+        topologyRuntime: {}, Repository: class {},
+        createRepositoryAdapters: () => ({}), createPanelOverviewLoader: () => async () => ({}),
+        createExecutionRuntime: () => ({ runtime: { stateManagementService: {} }, start: deny, stop: deny }),
+        createTopologyRecoveryLifecycle(options) { recovery = options; return { start: deny, stop: deny }; },
+        clock: { now: () => new Date('2026-10-24T00:00:00.000Z') },
+    });
+    assert.deepEqual(trace, [], 'host assembly does not call controller, start or read/write storage');
+    const { TopologyOperationExecutor } = require('../relay-l2tp/services/topologyOperationExecutor');
+    assert.ok(service.operationWorker.executor instanceof TopologyOperationExecutor);
+    assert.equal(service.operationWorker.executor.executionProtocolVersion, 2);
+    assert.equal(recovery.clientProofWorker, undefined);
+    assert.deepEqual(await service.operationWorker.run('host-held-null'), { claimed: false, operationId: 'host-held-null' });
+    assert.deepEqual(trace, ['enter', 'recovery', 'claim', 'claim', 'leave']);
+    assert.equal(held, false);
 });
 
 test('production opt-in composes durable intent admission and recovery with the exact server identity', async () => {
