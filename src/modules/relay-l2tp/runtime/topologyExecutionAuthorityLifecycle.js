@@ -1,6 +1,6 @@
 'use strict';
 const { AsyncLocalStorage } = require('node:async_hooks');
-const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
+const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, topologyExecutionContext, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { failure } = require('../models/topologyExecutionBindingContract');
 
 // This holder does NOT implement host exclusion. An external server controller
@@ -10,12 +10,20 @@ const { failure } = require('../models/topologyExecutionBindingContract');
 // independently attested challenge contract. No environment or request adapter.
 class TopologyExecutionAuthorityLifecycle {
     #controller;
+    #context;
     #held = new AsyncLocalStorage();
     constructor({ executionContext, controller } = {}) {
-        if (!matchesTopologyExecutionContext(executionContext, TEST)
-            || typeof controller?.withHeldAuthority !== 'function') throw failure();
+        const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        // Only TEST preserves the legacy undeclared-controller ABI. A declared
+        // context is a server-side pairing contract, not physical attestation.
+        if (!matchesTopologyExecutionContext(executionContext, context)
+            || typeof controller?.withHeldAuthority !== 'function'
+            || ((context !== TEST || 'executionContext' in controller)
+                && !matchesTopologyExecutionContext(controller.executionContext, context))) throw failure();
+        this.#context = context;
         this.#controller = controller;
     }
+    get executionContext() { return this.#context; }
     async run(work) {
         let invoked = false, finished = false, open = true, pending, result, scope;
         const callback = capability => {
@@ -36,7 +44,7 @@ class TopologyExecutionAuthorityLifecycle {
             return pending;
         };
         try {
-            await this.#controller.withHeldAuthority(TEST, callback);
+            await this.#controller.withHeldAuthority(this.#context, callback);
             if (!invoked || !finished) throw failure();
             return result;
         } finally {
@@ -146,6 +154,7 @@ class TopologyExecutionAuthorityLifecycle {
         }
     }
     async withCapturedTestOwnerEnrollment(work) {
+        if (this.#context !== TEST) throw failure();
         await this.assertHeld();
         const state = this.#held.getStore();
         if (typeof state.capability.withCapturedTestOwnerEnrollment !== 'function') {
