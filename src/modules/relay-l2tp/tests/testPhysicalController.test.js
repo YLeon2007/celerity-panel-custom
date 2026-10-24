@@ -14,7 +14,7 @@ const NODES = {
     '6ab93ad2646b4b7d2f43c907': ['94.103.2.186', 'xray-main'],
     '6ab18d9c63913ebd4a917670': ['50.114.160.63', 'xray-bridge'],
     '6ab4b53bc4c0304573e06c72': ['104.143.201.72', 'xray-bridge'],
-    '6ab189dc63913ebd4a917399': ['212.119.42.100', 'xray-main'],
+    '6ab189dc63913ebd4a917399': ['212.119.42.100', 'xray-bridge'],
 };
 function pins() {
     return { version: 1, executionContext: TEST, nodes: Object.entries(NODES).map(([nodeId, [ip, targetProfile]], i) => ({
@@ -51,6 +51,79 @@ function setup(t, mutate = value => value, configure = () => {}) {
     t.after(async () => { controller.close(); for (const child of children) if (child.exitCode === null && child.signalCode === null) { const done = new Promise(r => child.once('exit', r)); child.kill(); await done; } });
     return { controller, config, children, channels };
 }
+test('shared relay plan uses bridge; main remains preserved', async () => {
+    // Synthetic graph/physical facts only; actual composer and held controller.
+    // No setup(): that helper opens subprocesses.
+    const { composeFrozenTopologyDeploymentPlan } = require('../services/frozenTopologyDeploymentPlanComposer');
+    const shared = '6ab189dc63913ebd4a917399';
+    const graph = [
+        ['6ab18adc63913ebd4a917471', 'portal'], [shared, 'relay'],
+        ['6ab18d9c63913ebd4a917670', 'bridge'],
+    ].map(([id, role]) => ({ id, role }));
+    const links = [
+        { id: 'synthetic-portal-relay', source: graph[0].id, target: shared, mode: 'reverse' },
+        { id: 'synthetic-relay-bridge', source: shared, target: graph[2].id, mode: 'reverse' },
+    ];
+    const plan = composeFrozenTopologyDeploymentPlan({
+        snapshot: { nodes: graph, links, groups: [] },
+        nodeMetadata: graph.map((node, i) => ({ ...node, type: 'xray', active: true,
+            cascadeRole: node.role, ip: NODES[node.id][0], port: 24001 + i,
+            xray: { apiPort: 61001 + i, inboundTag: `synthetic-${node.role}`, transport: 'tcp', security: 'none', extraInbounds: [] } })),
+        linkMetadata: links.map((link, i) => ({ id: link.id, tunnelPort: 10101 + i })),
+        compiledTopology: { valid: true, relays: [{ nodeId: shared }] },
+    });
+    const relay = plan.nodes.find(node => node.nodeRef === 'relay-1');
+    assert.equal(relay.role, 'relay');
+    assert.equal(relay.targetProfile, 'xray-bridge');
+    assert.equal(relay.configPath, '/usr/local/etc/xray-bridge/config.json');
+    assert.equal(relay.serviceUnitPath, '/etc/systemd/system/xray-bridge.service');
+    const candidate = JSON.parse(Buffer.from(relay.candidate.bytes));
+    assert.equal(candidate.inbounds.some(inbound => inbound.port === 24002 || inbound.port === 61002), false);
+    const preservedMain = { config: 'independent-main-config', unit: 'independent-main-unit',
+        users: [{ email: 'preserved@example.invalid', id: '11111111-1111-4111-8111-111111111111' }], active: true };
+    const before = structuredClone(preservedMain);
+    const config = pins(); config.host.guard.owner = config.host.owner;
+    const pin = config.nodes.find(node => node.nodeId === shared);
+    pin.targetProfile = relay.targetProfile;
+    let opens = 0, proofs = 0;
+    function controllerFor(input, fault) {
+        return api.createTestPhysicalController({ config: input, openChannel: async observed => {
+            opens++;
+            return { alive: true, close() {}, async request() {
+                const value = observation(input, observed);
+                if (observed.nodeId === shared && fault === 'main-proof') value.targetProfile = 'xray-main';
+                if (observed.nodeId === shared && fault === 'missing') return undefined;
+                return value;
+            } };
+        } });
+    }
+    const controller = controllerFor(config);
+    assert.equal(opens, 0, 'constructor must not dispatch');
+    try {
+        await controller.withHeldAuthority(TEST, capability => capability.withVerifiedAuthority({
+            action: 'enroll', executionContext: TEST,
+            enrollment: { nodeId: shared, targetProfile: relay.targetProfile, endpoint: pin.endpoint,
+                nodeIdentity: { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 },
+                bootId: pin.physical.bootId, predecessorGeneration: 'none' },
+        }, async proof => {
+            proofs++;
+            assert.equal(proof.challenge.enrollment.targetProfile, 'xray-bridge');
+        }));
+    } finally { controller.close(); }
+    assert.equal(proofs, 1);
+    assert.equal(require('../../../services/heldTestOwnerSettlement').NODES[shared], relay.targetProfile);
+    const obsolete = structuredClone(config); obsolete.nodes.find(node => node.nodeId === shared).targetProfile = 'xray-main';
+    const priorOpens = opens;
+    assert.throws(() => controllerFor(obsolete), /TEST_PHYSICAL_AUTHORITY/);
+    assert.equal(opens, priorOpens);
+    for (const fault of ['main-proof', 'missing']) {
+        const bad = controllerFor(config, fault);
+        try { await assert.rejects(() => bad.withHeldAuthority(TEST, () => assert.fail('foreign profile reached work')), /TEST_PHYSICAL_AUTHORITY/); }
+        finally { bad.close(); }
+    }
+    assert.deepEqual(preservedMain, before);
+});
+
 test('real subprocess nonce channel supplies current independent observations to scoped binding/runner proofs', async t => {
     const { controller, config } = setup(t);
     const pin = config.nodes[0]; let escaped;

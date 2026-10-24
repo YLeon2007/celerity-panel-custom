@@ -12,7 +12,7 @@ const nodes = {
     '6ab93ad2646b4b7d2f43c907': ['94.103.2.186', 'xray-main'],
     '6ab18d9c63913ebd4a917670': ['50.114.160.63', 'xray-bridge'],
     '6ab4b53bc4c0304573e06c72': ['104.143.201.72', 'xray-bridge'],
-    '6ab189dc63913ebd4a917399': ['212.119.42.100', 'xray-main'],
+    '6ab189dc63913ebd4a917399': ['212.119.42.100', 'xray-bridge'],
 };
 function physicalControllerFixture(t, { nodeId, identity, bootId, maintenanceId, runnerRoot }) {
     const config = { version: 1, executionContext: TEST, nodes: Object.entries(nodes).map(([id, [ip, targetProfile]], i) => ({

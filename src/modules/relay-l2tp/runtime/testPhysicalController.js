@@ -17,7 +17,7 @@ const NODES = Object.freeze({
     '6ab93ad2646b4b7d2f43c907': ['94.103.2.186', 'xray-main'],
     '6ab18d9c63913ebd4a917670': ['50.114.160.63', 'xray-bridge'],
     '6ab4b53bc4c0304573e06c72': ['104.143.201.72', 'xray-bridge'],
-    [SHARED]: ['212.119.42.100', 'xray-main'],
+    [SHARED]: ['212.119.42.100', 'xray-bridge'],
 });
 function refuse() { throw Object.assign(new Error('TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED'), { code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' }); }
 function need(ok) { if (!ok) refuse(); }

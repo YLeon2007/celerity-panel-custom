@@ -21,7 +21,7 @@ NAMES = PAYLOADS | {'hysteria-backend', 'hysteria-updater'}
 def validate_plan(p, m):
     m.need(isinstance(p, dict) and set(p) == m.PLAN_KEYS | {'mode', 'hostHold'}, 'INVALID_SHARED_PLAN')
     m.need(p['mode'] == 'shared-test' and p['nodeId'] == NODE and
-           p['endpointIp'] == ENDPOINT and p['targetProfile'] == 'xray-main' and
+           p['endpointIp'] == ENDPOINT and p['targetProfile'] == 'xray-bridge' and
            p['machineId'] == MACHINE, 'SHARED_TEST_IDENTITY_REQUIRED')
     m.validate_common_plan({k: p[k] for k in m.PLAN_KEYS})
     hold = p['hostHold']
@@ -53,7 +53,8 @@ def validate_plan(p, m):
     m.need(not any(g in p['keepCgroups'] for g in CONTROLS) and
            not any(u in p['isolateUnits'] for u in ('docker.service', 'containerd.service')),
            'HOST_CONTROL_POLICY_CONFLICT')
-    m.need({'/system.slice/xray.service', '/system.slice/xl2tpd.service'} <= set(p['keepCgroups']),
+    m.need({'/system.slice/xray.service', '/system.slice/xray-bridge.service',
+            '/system.slice/xl2tpd.service'} <= set(p['keepCgroups']),
            'NATIVE_SURVIVORS_REQUIRED')
     return p
 

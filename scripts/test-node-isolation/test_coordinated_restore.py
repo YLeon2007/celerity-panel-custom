@@ -90,8 +90,10 @@ class cfixture:
                        'origin': {k:v for k,v in self.origin.items() if k not in ('pid', 'start')},
                        'keySha256': 'f'*64, 'nodes': {}}
         for index, (node, (endpoint, profile)) in enumerate(c.NODES.items()):
-            f = self.stack.enter_context(t.DualFixture() if endpoint == '104.143.201.72' else t.Fixture())
+            f = self.stack.enter_context(t.DualFixture() if endpoint in ('104.143.201.72', '212.119.42.100') else t.Fixture())
             f.node, f.profile = node, profile
+            if node == c.SHARED_NODE:
+                f.path(t.n.runner_lock('xray-main')).unlink()
             if self.maintenance_id is not None:
                 f.plan['maintenanceId'] = self.maintenance_id
             f.plan.update(nodeId=node, endpointIp=endpoint, targetProfile=profile, machineId=c.sha(node.encode())[:32])
@@ -106,7 +108,7 @@ class cfixture:
                 state.update(Id='xray.service', FragmentPath=f.unit)
                 f.system.states['xray.service'] = state
             f.accepted.update(t.n.identity(f.engine))
-            profiles = ['xray-main','xray-bridge'] if endpoint == '104.143.201.72' else [profile]
+            profiles = ['xray-main','xray-bridge'] if endpoint in ('104.143.201.72', '212.119.42.100') else [profile]
             f.accepted['profiles'] = {p: {'files': {k:f.fs.info(path) for k,path in zip(('config','unit'),t.n.profile_paths(p))},
                   'service': f.system.unit(t.n.service_name(p)), 'runtimeSha256': c.sha(c.canonical({'mode':'none','inbounds':{}}))} for p in profiles}
             f.put(t.n.ACCEPTED, c.canonical(f.accepted))
@@ -439,7 +441,12 @@ else:
                 self.assertEqual(len(held.nodes), 5)
                 for node in f.fixtures:
                     self.assertEqual(node.path(node.config).read_bytes(), node.original)
-                    for path in (t.n.OUTER_LOCK, *(t.n.runner_lock(p) for p in node.writer.profiles)):
+                    for profile in node.writer.profiles:
+                        if node.writer.preserved_profile(profile):
+                            self.assertTrue(node.fs.absent(t.n.runner_lock(profile)))
+                            self.assertTrue(node.fs.absent(t.n.runner_journal(profile)))
+                    for path in (t.n.OUTER_LOCK, *(t.n.runner_lock(p) for p in node.writer.profiles
+                                                 if not node.writer.preserved_profile(p))):
                         with open(node.path(path), 'rb') as other:
                             with self.assertRaises(BlockingIOError):
                                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)

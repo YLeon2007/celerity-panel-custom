@@ -44,7 +44,7 @@ class CaptureFixture:
                        'owner':'11111111-1111-4111-8111-111111111111','planHash':'c'*64,'session':{'pid':202,'start':'322'}},
                        'backend':{'instanceId':'a'*64,'pid':333,'processStartTime':'42'}}}
         for index,(node,(endpoint,profile)) in enumerate(a.NODES.items()):
-            f = self.stack.enter_context(t.DualFixture() if endpoint == '104.143.201.72' else t.Fixture())
+            f = self.stack.enter_context(t.DualFixture() if endpoint in ('104.143.201.72', '212.119.42.100') else t.Fixture())
             f.node,f.profile = node,profile
             f.plan.update(nodeId=node,endpointIp=endpoint,targetProfile=profile,machineId='7fa266f995fe4aa69e96cf7d01359e34' if node == a.SHARED_NODE else str(index+1)*32,
                           maintenanceId=f'11111111-1111-4111-8111-{index+1:012d}')
@@ -57,7 +57,7 @@ class CaptureFixture:
                 state = copy.deepcopy(f.system.states['xray-bridge.service'])
                 state.update(Id='xray.service',FragmentPath=f.unit)
                 f.system.states['xray.service'] = state
-            profiles = ['xray-main','xray-bridge'] if endpoint == '104.143.201.72' else [profile]
+            profiles = ['xray-main','xray-bridge'] if endpoint in ('104.143.201.72', '212.119.42.100') else [profile]
             if self.large:
                 f.original = a.canonical({'inbounds':[],'padding':'x'*20000})
                 for p in profiles: f.put(t.n.profile_paths(p)[0],f.original)

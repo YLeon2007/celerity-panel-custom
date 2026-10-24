@@ -11,7 +11,7 @@ const { UUID, exact, freeze } = require('../modules/relay-l2tp/models/topologyEx
 const NODES = Object.freeze({
     '6ab18adc63913ebd4a917471': 'xray-main', '6ab93ad2646b4b7d2f43c907': 'xray-main',
     '6ab18d9c63913ebd4a917670': 'xray-bridge', '6ab4b53bc4c0304573e06c72': 'xray-bridge',
-    '6ab189dc63913ebd4a917399': 'xray-main',
+    '6ab189dc63913ebd4a917399': 'xray-bridge',
 });
 const OPT = { maxTimeMS: 5000, timeoutMS: 5000 };
 function need(ok) { if (!ok) throw Object.assign(new Error('TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED'), { code: 'TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED' }); }

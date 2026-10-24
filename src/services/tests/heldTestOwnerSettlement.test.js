@@ -21,6 +21,11 @@ const { TopologyExecutionBindingStore } = require('../../modules/relay-l2tp/repo
 const { TopologyOperationRepository } = require('../../modules/relay-l2tp/repositories/topologyOperationRepository');
 const { NodeOperationLockRepository } = require('../../modules/relay-l2tp/services/nodeOperationLockRepository');
 const { freeze } = require('../../modules/relay-l2tp/models/topologyExecutionBindingContract');
+const ROLES = Object.freeze({
+    '6ab18adc63913ebd4a917471': 'portal', '6ab93ad2646b4b7d2f43c907': 'portal',
+    '6ab189dc63913ebd4a917399': 'relay',
+    '6ab18d9c63913ebd4a917670': 'bridge', '6ab4b53bc4c0304573e06c72': 'bridge',
+});
 let db, child, directory, m;
 async function until(fn) {
     let error;
@@ -98,7 +103,7 @@ async function fixture(options = {}) {
     const plan = { revision: 7, deployedRevision: 6, nodes: [] };
     for (const p of pins) {
         await m.HyNode.create({ _id: p.nodeId, ip: p.endpoint.ip, name: 'SIMULATED', type: 'xray', active: true,
-            cascadeRole: p.targetProfile === 'xray-main' ? 'portal' : 'bridge', ssh: { port: p.endpoint.port, username: p.endpoint.username, privateKey: 'SIMULATED-not-a-key' } });
+            cascadeRole: ROLES[p.nodeId], ssh: { port: p.endpoint.port, username: p.endpoint.username, privateKey: 'SIMULATED-not-a-key' } });
         const classic = await transfer.initializeClassic({ node: p.nodeId, profile: p.targetProfile, nodeIdentity: p.nodeIdentity });
         const adopted = await transfer.adopt({ node: p.nodeId, profile: p.targetProfile, generation: classic.generation, proofRef: 'SIMULATED-original' });
         const enrollment = await store.preEnroll({ nodeId: p.nodeId, targetProfile: p.targetProfile, endpoint: p.endpoint,
@@ -107,7 +112,7 @@ async function fixture(options = {}) {
     }
     const bytes = Buffer.from('{"inbounds":[],"outbounds":[],"routing":{"rules":[]}}\n');
     const hash = createHash('sha256').update(bytes).digest('hex');
-    const nodes = pins.map((p, i) => freeze({ node: p.nodeId, nodeRef: `${p.targetProfile === 'xray-main' ? 'portal' : 'bridge'}-${i + 1}`, role: p.targetProfile === 'xray-main' ? 'portal' : 'bridge', targetProfile: p.targetProfile,
+    const nodes = pins.map((p, i) => freeze({ node: p.nodeId, nodeRef: `${ROLES[p.nodeId]}-${i + 1}`, role: ROLES[p.nodeId], targetProfile: p.targetProfile,
         configPath: p.targetProfile === 'xray-main' ? '/usr/local/etc/xray/config.json' : '/usr/local/etc/xray-bridge/config.json',
         serviceUnit: p.targetProfile === 'xray-main' ? 'xray.service' : 'xray-bridge.service',
         serviceUnitPath: p.targetProfile === 'xray-main' ? '/etc/systemd/system/xray.service' : '/etc/systemd/system/xray-bridge.service', checks: [],

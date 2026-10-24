@@ -43,7 +43,7 @@ NODES = {
  '6ab93ad2646b4b7d2f43c907': ('94.103.2.186', 'xray-main'),
  '6ab18d9c63913ebd4a917670': ('50.114.160.63', 'xray-bridge'),
  '6ab4b53bc4c0304573e06c72': ('104.143.201.72', 'xray-bridge'),
- '6ab189dc63913ebd4a917399': ('212.119.42.100', 'xray-main'),
+ '6ab189dc63913ebd4a917399': ('212.119.42.100', 'xray-bridge'),
 }
 SHARED_NODE = '6ab189dc63913ebd4a917399'
 DIGEST = re.compile('[a-f0-9]{64}\\Z')
@@ -97,7 +97,7 @@ def validate(config):
         ident = pin['identity']
         need(set(ident) == {'context','nodeId','endpointIp','targetProfile','machineId','bootId','sshHostKeySha256','maintenanceId','planHash'})
         need(ident['context'] == config['context'] and ident['nodeId'] == node and (ident['endpointIp'],ident['targetProfile']) == NODES[node])
-        profiles = ['xray-main','xray-bridge'] if ident['endpointIp'] == '104.143.201.72' else [ident['targetProfile']]
+        profiles = ['xray-main','xray-bridge'] if ident['endpointIp'] == '104.143.201.72' or node == SHARED_NODE else [ident['targetProfile']]
         need(pin['profiles'] == profiles and isinstance(pin['guard'],dict) and pin['guard'])
         need(re.fullmatch('[a-f0-9]{32}',ident['machineId']) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',ident['bootId'])
              and re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,127}',ident['maintenanceId']))

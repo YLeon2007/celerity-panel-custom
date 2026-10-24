@@ -53,9 +53,10 @@ def plan():
     p = fixtures.PlanTests().plan()
     p.update({'nodeId': '6ab189dc63913ebd4a917399', 'endpointIp': '212.119.42.100',
               'machineId': '7fa266f995fe4aa69e96cf7d01359e34', 'mode': 'shared-test',
+              'targetProfile': 'xray-bridge',
               'hostHold': {'owner': '01234567-89ab-cdef-0123-456789abcdef',
                            'freezerSha256': '2' * 64, 'expected': accepted()}})
-    p['keepCgroups'].append('/system.slice/xl2tpd.service')
+    p['keepCgroups'] += ['/system.slice/xl2tpd.service', '/system.slice/xray-bridge.service']
     return p
 
 

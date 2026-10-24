@@ -608,6 +608,14 @@ class DualFixture(Fixture):
         import subprocess
         super().mutate_and_admit(receipt)
         profile = 'xray-main'
+        if self.node == '6ab189dc63913ebd4a917399':
+            self.restore_pins['profiles'][profile] = {
+                'files': copy.deepcopy(self.accepted['profiles'][profile]['files']),
+                'service': copy.deepcopy(self.accepted['profiles'][profile]['service']),
+                'journalSha256': None,
+            }
+            self.put(n.RESTORE_ACCEPTED,n.canonical(self.restore_pins))
+            return
         config, unit = n.profile_paths(profile)
         self.put(config,b'{"inbounds":[],"candidate-main":"changed"}')
         self.put(unit,b'[Service]\n# accepted candidate main unit\n')

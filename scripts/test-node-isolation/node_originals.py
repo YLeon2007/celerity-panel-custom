@@ -41,7 +41,7 @@ NODES = {
  '6ab93ad2646b4b7d2f43c907':('94.103.2.186','xray-main'),
  '6ab18d9c63913ebd4a917670':('50.114.160.63','xray-bridge'),
  '6ab4b53bc4c0304573e06c72':('104.143.201.72','xray-bridge'),
- '6ab189dc63913ebd4a917399':('212.119.42.100','xray-main'),
+ '6ab189dc63913ebd4a917399':('212.119.42.100','xray-bridge'),
 }
 IDENTITY = ('context','nodeId','endpointIp','targetProfile','machineId','bootId','sshHostKeySha256','maintenanceId')
 SERVICE_KEYS = {'Id','LoadState','FragmentPath','DropInPaths','ActiveState','UnitFileState','Job','NeedDaemonReload'}
@@ -280,7 +280,7 @@ class NodeOriginals:
         plan = engine.plan
         need(plan.get('nodeId') in NODES and (plan.get('endpointIp'),plan.get('targetProfile')) == NODES[plan['nodeId']]
              and plan.get('context') == 'test.infograd.online', 'FIXED_TEST_NODE_REQUIRED')
-        self.profiles = ['xray-main','xray-bridge'] if plan['endpointIp'] == '104.143.201.72' else [plan['targetProfile']]
+        self.profiles = ['xray-main','xray-bridge'] if plan['endpointIp'] == '104.143.201.72' or plan['nodeId'] == '6ab189dc63913ebd4a917399' else [plan['targetProfile']]
         self.accepted = self.fs.read_json(ACCEPTED)
         need(set(self.accepted) == {'version',*identity(engine),'isolationSha256','xraySha256','profiles'} and
              type(self.accepted['version']) is int and self.accepted['version'] == 1 and
@@ -317,6 +317,9 @@ class NodeOriginals:
                 need((a.st_dev,a.st_ino) == (b.st_dev,b.st_ino), 'LOCK_REPLACED_RETAINED')
         need(sha(canonical(self.fs.read_json(ACCEPTED))) == sha(canonical(self.accepted)), 'ACCEPTED_PINS_DRIFT_RETAINED')
         need(sha(self.fs.read(HELPER)[0]) == self.accepted['isolationSha256'], 'INSTALLED_ISOLATION_PIN_DRIFT')
+        for profile in self.profiles:
+            if self.preserved_profile(profile):
+                self.terminal(profile, None)
         if self.current_pins is not None:
             self.admission()
             self.fs.private(STATE)
@@ -434,6 +437,8 @@ class NodeOriginals:
                  and self.fs.absent(RESTORE_STATE+'.next'), 'EXISTING_ORIGINALS_RETAINED')
             profiles = {}
             for profile in self.profiles:
+                if self.preserved_profile(profile):
+                    self.terminal(profile, None)
                 profiles[profile] = self.snapshot(profile)
                 self.check_original(profile,profiles[profile])
             self.checkpoint()
@@ -453,8 +458,21 @@ class NodeOriginals:
         version = getattr(self.module,'RESTORE_ADMISSION_VERSION',None)
         need(type(version) is int and version == 1, 'INSTALLED_DISPATCH_ADMISSION_HOOK_REQUIRED')
 
+    def preserved_profile(self, profile):
+        # The shared relay executes ONLY bridge. Its independent main instance
+        # is captured/checked, never stopped, rewritten, or assigned a runner head.
+        return self.engine.plan['nodeId'] == '6ab189dc63913ebd4a917399' and profile == 'xray-main'
+
     def terminal(self, profile, pin):
         path = runner_journal(profile)
+        if self.preserved_profile(profile):
+            need(pin is None and self.fs.absent(runner_lock(profile)) and self.fs.absent(path) and
+                 self.fs.absent(str(Path(path).with_name('journal.next'))), 'PRESERVED_PROFILE_GENERATION_RETAINED')
+            original = self.accepted['profiles'][profile]
+            need(canonical(self.service(profile)) == canonical(original['service']), 'PRESERVED_SERVICE_DRIFT_RETAINED')
+            for name, fixed in zip(('config', 'unit'), profile_paths(profile)):
+                need(canonical(self.fs.info(fixed)) == canonical(original['files'][name]), 'PRESERVED_FILE_DRIFT_RETAINED')
+            return None
         need(self.fs.absent(str(Path(path).with_name('journal.next'))), 'RUNNER_UNKNOWN_RETAINED')
         raw = self.fs.read(path,4*1024*1024)[0]
         need(sha(raw) == pin, 'RUNNER_HEAD_DRIFT_RETAINED')
@@ -534,7 +552,7 @@ class NodeOriginals:
         scope = _HeldRestoration(self)
         try:
             with ExitStack() as stack:
-                paths = [OUTER_LOCK, *[runner_lock(p) for p in self.profiles]]
+                paths = [OUTER_LOCK, *[runner_lock(p) for p in self.profiles if not self.preserved_profile(p)]]
                 locks = [stack.enter_context(self.fs.lock(path)) for path in paths]
                 self.locks = tuple(locks)
                 self.lock_paths = dict(zip(paths, locks))
@@ -584,6 +602,8 @@ class NodeOriginals:
             current = pins['profiles'][profile]
             need(set(current) == {'files','service','journalSha256'} and set(current['files']) == {'config','unit'}, 'INVALID_RESTORE_PINS')
             self.terminal(profile,current['journalSha256'])
+            if self.preserved_profile(profile):
+                need(self.snapshot(profile) == original, 'PRESERVED_RUNTIME_DRIFT_RETAINED')
             need(canonical(self.service(profile)) == canonical(current['service']), 'CURRENT_SERVICE_DRIFT_RETAINED')
             for name,path in zip(('config','unit'),profile_paths(profile)):
                 need(canonical(self.fs.info(path)) == canonical(current['files'][name]), 'CURRENT_FILE_DRIFT_RETAINED')
@@ -608,6 +628,8 @@ class NodeOriginals:
             self.held(state['guard'])
             self.admission()
             self.terminal(profile,pins['profiles'][profile]['journalSha256'])
+            if self.preserved_profile(profile):
+                continue
             self.effect('stop',service_name(profile))
             need(self.service(profile)['ActiveState'] == 'inactive', 'SERVICE_STOP_UNCONFIRMED_RETAINED')
             self.held(state['guard'])
@@ -661,7 +683,8 @@ class _HeldRestoration:
                  getattr(self._writer, '_held_restore_scope', None) is self and
                  getattr(self._writer, '_restore_active', False) and self._locks and
                  self._locks == self._writer.lock_paths and
-                 set(self._locks) == {OUTER_LOCK, *[runner_lock(p) for p in self._writer.profiles]} and
+                 set(self._locks) == {OUTER_LOCK, *[runner_lock(p) for p in self._writer.profiles
+                                                   if not self._writer.preserved_profile(p)]} and
                  tuple(self._locks.values()) == self._writer.locks, 'RESTORE_HOLD_REVOKED')
             for fd in self._locks.values():
                 # Reuse the same locked open-file description, never a second

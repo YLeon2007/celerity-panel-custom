@@ -163,7 +163,7 @@ def durable_originals(engine, m, read=secure_read):
     identity = {k: engine.plan[k] for k in ('context', 'nodeId', 'endpointIp', 'targetProfile', 'machineId', 'bootId',
                                           'sshHostKeySha256', 'maintenanceId')}
     identity['planHash'] = engine.plan_hash
-    profiles = ['xray-main', 'xray-bridge'] if identity['endpointIp'] == '104.143.201.72' else [identity['targetProfile']]
+    profiles = ['xray-main', 'xray-bridge'] if identity['endpointIp'] == '104.143.201.72' or identity['nodeId'] == '6ab189dc63913ebd4a917399' else [identity['targetProfile']]
     need(set(accepted) == {'version', *identity, 'isolationSha256', 'xraySha256', 'profiles'} and
          type(accepted['version']) is int and accepted['version'] == 1 and
          all(accepted[k] == v for k, v in identity.items()) and set(accepted['profiles']) == set(profiles), 'ORIGINAL_ACCEPTED_IDENTITY_DRIFT')
