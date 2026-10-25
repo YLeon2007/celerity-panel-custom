@@ -1,0 +1,60 @@
+{
+  "schema": "c3-test-native-invocation-contract/1",
+  "context": "TEST-only",
+  "installable": false,
+  "physicalActivation": "REFUSED: constructor/root/cgroup/ns/network enforcement and accepted handback absent",
+  "implementedLocalEntry": "scripts/test-node-isolation/lifecycle_vnext_supervisor.py --local-fixture",
+  "implementedLocalBootstrap": "scripts/test-node-isolation/lifecycle_vnext_bootstrap.cjs",
+  "temporary": {
+    "roles": ["F", "R"],
+    "schedule": "sequential; exact old invocation exit before next; same original owner pidfd, boot and absolute CLOCK_MONOTONIC deadline",
+    "maximumOriginalLifetimeSeconds": 600,
+    "grace": "inside original deadline; SIGTERM then exact child pidfd SIGKILL before expiry; forced app exit is failure",
+    "inheritedSupervisorFds": ["original-owner pidfd", "original peer pidfds", "private AF_UNIX SOCK_SEQPACKET control"],
+    "ownerLoss": "independent supervisor watches original owner pidfd; no owner-finally dependency",
+    "ownerHang": "supervisor starts app termination at original deadline minus grace",
+    "supervisorLoss": "PR_SET_PDEATHSIG SIGKILL installed before exec with parent-race check",
+    "appInheritance": "only stdout/stderr, one-use capsule and bootstrap ack; owner/control/peer/journal FDs closed before exec",
+    "stopAuthority": "STOP with exact invocation and constant-time compared random token over retained private FD; only retained direct-child pidfd is signalled",
+    "authority": "LOCAL SIMULATED temporary invocation admission only; C3_SETTINGS flags=false is not writer-generation authority"
+  },
+  "requiredNativeUnits": {
+    "owner": {
+      "name": "c3-test-lifecycle-vnext.service",
+      "Type": "exec",
+      "Restart": "no",
+      "KillMode": "control-group",
+      "SendSIGKILL": true,
+      "RuntimeMaxSec": "remaining original deadline, including TimeoutStopSec; never a fresh 600s",
+      "User": "dedicated unprivileged TEST identity, not current developer UID",
+      "NoNewPrivileges": true,
+      "CapabilityBoundingSet": [],
+      "Delegate": false,
+      "ReadOnlyPaths": ["pinned native release/runtime"],
+      "ReadWritePaths": ["exact TEST state/backups/log/spool mounts only"],
+      "construction": "F/R and supervisors cannot migrate/fork outside exclusive owner subtree; full task/thread namespace EMPTY required"
+    },
+    "normalD": {
+      "name": "c3-test-app-vnext@redeploy.service",
+      "precommit": "NOT STARTED; artifact/config/storage/normal network constructed and closed beforehand",
+      "startAuthority": "separate accepted proven durable terminal all-five public generation-fenced handback binding; NOT IMPLEMENTED",
+      "Restart": "on-failure only under separate current normal-generation validation",
+      "lifecycleFds": [],
+      "promotion": "never; fresh invocation only",
+      "unknownCommit": "COMMIT_UNKNOWN_NO_ACTIVATION; no start/replay",
+      "lostAckAfterProvenCommit": "COMMITTED_UNKNOWN; no retry/rollback; D may lawfully serve"
+    },
+    "peers": "one separately prepared native Caddy / Mongo7 authenticated rs0 / Redis stack; no peer restart or repin during temporary hold"
+  },
+  "localBudgets": {"nodeOldSpaceMiB": 192, "nodeV8Pool": 1, "uvThreads": 2, "mongoCacheGiB": 0.25, "mongoIndexBuildMiB": 64, "redisMaxmemoryMiB": 32},
+  "physicalPrerequisitesNotProven": [
+    "immutable compatible native artifact/runtime/rootfs closure for true F, previous R, normal D",
+    "native migration/restore/auth/index/history and Redis TTL/session policy",
+    "private exact mounts, cgroup no-escape and complete namespace EMPTY",
+    "independent established-flow network expiry, TCP inode-to-peer-FD topology exclusion",
+    "pre-import actual writer-generation gating for all app/DDL/background effects",
+    "all-five public originals/handback and terminal binding adapter",
+    "normal D/peer restart persistence and native authenticated update adapter",
+    "Caddy external serving, node/config/backup and nonempty Xray/PPP full TZ acceptance"
+  ]
+}

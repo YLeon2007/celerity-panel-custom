@@ -36,10 +36,46 @@ function request(p, url) { return new Promise((resolve,reject) => {
     const q=http.get({hostname:'127.0.0.1',port:p,path:url,agent:false},r=> {let body='';r.on('data',b=>body+=b);r.on('end',()=>resolve({status:r.statusCode,body}));});
     q.setTimeout(1500,()=>q.destroy(new Error('HTTP deadline')));q.on('error',reject);
 }); }
-test('real index consumes file, serves pinned readiness with actual Mongo/Redis, restarts and shuts down finitely', {timeout:100000}, async t => {
+async function runFixtureCleanup(tasks) {
+    const errors=[];
+    for (const task of tasks) { try { await task(); } catch (error) { errors.push(error); } }
+    if (errors.length) throw new AggregateError(errors,'fixture cleanup failed; primary test failure is retained separately');
+}
+function removeFixtureTree(dir) {
+    // Only the mkdtemp-owned disposable tree. Preorder restore owner traversal/
+    // write on directories, never follow symlinks or chmod source/dependencies.
+    const root=fs.realpathSync(process.env.TMPDIR);
+    assert.equal(path.dirname(dir),root);assert.ok(path.basename(dir).startsWith('classic-real-'));
+    function restore(d) {
+        const st=fs.lstatSync(d);
+        if (!st.isDirectory() || st.isSymbolicLink()) return;
+        assert.equal(st.uid,process.getuid(),'foreign directory in disposable tree');
+        fs.chmodSync(d,(st.mode & 0o777)|0o700);
+        for (const e of fs.readdirSync(d)) restore(path.join(d,e));
+    }
+    assert.ok(!fs.lstatSync(dir).isSymbolicLink());restore(dir);fs.rmSync(dir,{recursive:true});
+}
+module.exports={runFixtureCleanup,removeFixtureTree};
+if (require.main === module) test('real index consumes file, serves pinned readiness with actual Mongo/Redis, restarts and shuts down finitely', {timeout:100000}, async t => {
     assert.ok(process.env.C3_MONGOD); assert.ok(process.env.C3_REDIS_SERVER); assert.ok(process.env.C3_REAL_EVIDENCE);
     const dir=fs.mkdtempSync(path.join(process.env.TMPDIR,'classic-real-'));
     const evidence=process.env.C3_REAL_EVIDENCE;
+    const apps=[],clients=[],peers=[];
+    // Registered BEFORE copying/chmod/spawn/connect. A single ordered hook never
+    // skips later cleanup after one error and never masks the primary test error.
+    t.after(async()=>{
+        let failure;
+        try {
+            await runFixtureCleanup([
+                ...apps.slice().reverse().map(p=>async()=>{if(p.exitCode===null && p.signalCode===null){p.kill('SIGKILL');await p.done;throw Error('app required forced fixture cleanup');}}),
+                ...clients.slice().reverse(),
+                ...peers.slice().reverse().map(p=>()=>stop(p)),
+                ()=>{assert.ok([...apps,...peers].every(p=>p.exitCode!==null || p.signalCode!==null || !p.pid),'live owned child: refuse tree removal');removeFixtureTree(dir);}
+            ]);
+        } catch(error) { failure=error; }
+        fs.writeFileSync(path.join(evidence,'fixture-cleanup.json'),JSON.stringify({path:dir,removed:!fs.existsSync(dir),errors:failure?String(failure):null,children:[...apps,...peers].map(p=>({pid:p.pid,exit:p.exitCode,signal:p.signalCode}))},null,2)+'\n');
+        if(failure) throw failure;
+    });
     fs.writeFileSync(path.join(evidence,'last-fixture-path.txt'), dir+'\n');
     const app=path.join(dir,'app');fs.mkdirSync(app);const state=path.join(dir,'state');fs.mkdirSync(state,{mode:0o700});
     // Copy exact tracked source, never mutate the registered source or shared dependencies.
@@ -60,11 +96,12 @@ test('real index consumes file, serves pinned readiness with actual Mongo/Redis,
     const mp=await port(), rp=await port(), hp=await port();
     const mongoDir=path.join(dir,'mongo');fs.mkdirSync(mongoDir);
     const mongo=child(process.env.C3_MONGOD,['--dbpath',mongoDir,'--port',String(mp),'--bind_ip','127.0.0.1','--wiredTigerCacheSizeGB','0.25','--setParameter','enableTestCommands=1'],dir,process.env,path.join(evidence,'mongo.log'));
+    peers.push(mongo);
     const redis=child(process.env.C3_REDIS_SERVER,['--bind','127.0.0.1','--port',String(rp),'--save','','--appendonly','no','--dir',dir],dir,process.env,path.join(evidence,'redis.log'));
-    t.after(async()=>{await stop(redis);await stop(mongo);});
+    peers.push(redis);
     const uri=`mongodb://127.0.0.1:${mp}/classic_local`;
-    const mc=new MongoClient(uri,{serverSelectionTimeoutMS:500});t.after(()=>mc.close());await until(()=>mc.connect());
-    const rc=new Redis(`redis://127.0.0.1:${rp}`,{lazyConnect:true,retryStrategy:()=>null});t.after(()=>rc.disconnect());await until(async()=>{if(rc.status==='end') throw Error('Redis early exit'); if(rc.status==='wait') await rc.connect();assert.equal(await rc.ping(),'PONG');});
+    const mc=new MongoClient(uri,{serverSelectionTimeoutMS:500});clients.push(()=>mc.close());await until(()=>mc.connect());
+    const rc=new Redis(`redis://127.0.0.1:${rp}`,{lazyConnect:true,retryStrategy:()=>null});clients.push(()=>rc.disconnect());await until(async()=>{if(rc.status==='end') throw Error('Redis early exit'); if(rc.status==='wait') await rc.connect();assert.equal(await rc.ping(),'PONG');});
     const settings={version:1,context:'test.infograd.online',stateDirectory:state,listenAddress:'127.0.0.1',environment:{
         PANEL_DOMAIN:'test.infograd.online',ACME_EMAIL:'local@example.invalid',ENCRYPTION_KEY:'e'.repeat(32),SESSION_SECRET:'s'.repeat(32),
         MONGO_URI:uri,REDIS_URL:`redis://127.0.0.1:${rp}`,USE_CADDY:'true',PORT:String(hp),
@@ -73,7 +110,7 @@ test('real index consumes file, serves pinned readiness with actual Mongo/Redis,
     const env={C3_SETTINGS:file,NODE_ENV:'production',NODE_PATH:process.env.NODE_PATH};
     for (let generation=1;generation<=2;generation++) {
         const p=child(process.execPath,[path.join(app,'index.js')],app,env,path.join(evidence,`application-${generation}.log`));
-        t.after(async()=>{if(p.exitCode===null && p.signalCode===null) {p.kill('SIGKILL');await p.done;}});
+        apps.push(p);
         const ready=await until(async()=>{assert.equal(p.exitCode,null,'app remains alive');const r=await request(hp,'/classic-ready');assert.equal(r.status,200);assert.equal(r.body,BODY);return r;});
         const tcp=fs.readFileSync(`/proc/${p.pid}/net/tcp`,'utf8');
         assert.ok(tcp.split('\n').some(line=>line.trim().split(/\s+/)[1]===`0100007F:${hp.toString(16).toUpperCase().padStart(4,'0')}` && line.trim().split(/\s+/)[3]==='0A'), 'listener must bind exact ingress IPv4, not wildcard/IPv6');
@@ -98,6 +135,7 @@ test('real index consumes file, serves pinned readiness with actual Mongo/Redis,
     settings.environment.L2TP_EXECUTION_ENABLED='true';settings.stateDirectory=path.join(dir,'invalid-state');
     fs.writeFileSync(file,JSON.stringify(settings));
     const invalid=child(process.execPath,[path.join(app,'index.js')],app,env,path.join(evidence,'invalid-application.log'));
+    apps.push(invalid);
     const [code,sig]=await invalid.done;assert.equal(sig,null);assert.equal(code,1);
     assert.ok(!fs.existsSync(settings.stateDirectory));assert.deepEqual(await mc.db().listCollections().toArray(),before);
     assert.equal((await mc.db('admin').command({serverStatus:1})).connections.totalCreated,mongoConnections,'invalid startup opened zero Mongo connections');
