@@ -66,6 +66,9 @@ function usesTestTopologyConfig(node, env = process.env) {
 async function topologyManagesNodeConfig(node, env = process.env) {
     const testCompatibility = usesTestTopologyConfig(node, env);
     const context = TOPOLOGY_EXECUTION_CONTEXTS.find(candidate => candidate.hostIdentity === env.PANEL_DOMAIN);
+    const releaseEnv = Object.freeze({ PANEL_DOMAIN: env.PANEL_DOMAIN,
+        TOPOLOGY_TEST_EXECUTION_ENABLED: env.TOPOLOGY_TEST_EXECUTION_ENABLED,
+        TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED });
     if (node?._id) {
         const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
         // A server-persisted plan is a conservative veto of classic writes,
@@ -76,7 +79,17 @@ async function topologyManagesNodeConfig(node, env = process.env) {
             { 'nodes.node': node._id, status: { $in: ['queued', 'preparing', 'committing', 'rolling_back'] } },
             { nodes: { $elemMatch: { node: node._id, state: { $in: ['prepared', 'committed', 'failed'] } } } },
             { 'nodes.node': node._id, heldTopologyAdmission: true },
-        ] })) return true;
+        ] })) {
+            // Never waive active or retained operations. Original history query
+            // stays intact; only the exact finite TEST receipt may retire it.
+            if (await TopologyOperation.exists({ 'nodes.node': node._id, $or: [
+                { status: { $in: ['queued', 'preparing', 'committing', 'rolling_back'] } },
+                { heldTopologyAdmission: true },
+            ] })) return true;
+            const { hasTestLegacyTopologyRelease } = require('./testLegacyTopologyRelease');
+            if (!await hasTestLegacyTopologyRelease({ db: require('mongoose').connection.db,
+                nodeId: String(node._id), env: releaseEnv })) return true;
+        }
     }
     if (node?._id) {
         // Native read only: importing the owner model here would register an

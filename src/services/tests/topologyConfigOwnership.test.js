@@ -650,3 +650,26 @@ for (const writer of ['sync', 'cascade']) {
         });
     }
 }
+
+// Reader wiring only: live receipt validation/retirement and actual guard are
+// exercised in testLegacyTopologyRelease.test.js. No physical authority here.
+for (const writer of ['sync', 'cascade']) {
+    test(writer + ': exact TEST historical handoff recognition still reads the independent native owner veto', async t => {
+        const target = { ...node('standalone'), _id: '6ab189dc63913ebd4a917399' };
+        const owners = [];
+        const calls = stubSync(t, { connected: false, owners, operations: [{ status: 'failed', heldTopologyAdmission: false,
+            nodes: [{ node: target._id, state: 'prepared' }] }] });
+        const reader = require('../testLegacyTopologyRelease');
+        t.mock.method(reader, 'hasTestLegacyTopologyRelease', async ({ nodeId, env }) => {
+            assert.equal(nodeId, target._id); assert.equal(env.TOPOLOGY_TEST_EXECUTION_ENABLED, 'false'); return true;
+        });
+        await withEnv({ PANEL_DOMAIN: 'lm1.infograd.online', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false',
+            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' }, async () => {
+            await writeClassic(writer, target);
+            assert.equal(calls.uploads.length, 1);
+            owners.push({ ...adoptedOwner(PROD), node: target._id });
+            await writeClassic(writer, target);
+            assert.equal(calls.uploads.length, 1, 'historical release must never supersede native topology ownership');
+        });
+    });
+}
