@@ -96,7 +96,8 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
         deployment: { ...expectedDeployment }, acceptedClassicLinks: acceptedClassicLinks.map(pin => ({ ...pin })),
         // Initialization remains dormant and never changes/redeploys classic links.
         // An existing offline link must be independently pinned and explicitly accepted.
-        acceptedOfflineClassicLinkIds: [...acceptedOfflineClassicLinkIds],
+        ...(acceptedOfflineClassicLinkIds.length
+            ? { acceptedOfflineClassicLinkIds: [...acceptedOfflineClassicLinkIds] } : {}),
         initialState: { ...initialState }, manifestSha256: acceptedManifestSha256,
         acceptedMissingCollections: acceptedMissingCollections.map(entry => ({ name: entry.name, options: {} })) });
     let attempted = false;
@@ -266,7 +267,7 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                             || !(row.bridgeNode instanceof mongo.ObjectId) || row.active !== true
                             || !(['online', 'deployed'].includes(row.status)
                                 || (row.status === 'offline'
-                                    && challenge.acceptedOfflineClassicLinkIds.includes(String(row._id))))
+                                    && challenge.acceptedOfflineClassicLinkIds?.includes(String(row._id))))
                             || !challenge.acceptedClassicLinks.some(pin => pin.id === String(row._id) && pin.sha256 === fingerprint(row)))) {
                         fail('PRODUCTION_INITIALIZATION_PIN_DRIFT');
                     }

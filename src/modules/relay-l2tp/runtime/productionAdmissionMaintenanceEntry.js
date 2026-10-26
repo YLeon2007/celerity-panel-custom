@@ -27,6 +27,7 @@ async function runAccepted({ config, authority, createClient }) {
                 initialState: challenge.initialState, acceptedManifestSha256: challenge.manifestSha256,
                 maintenanceGeneration: challenge.maintenanceGeneration,
                 acceptedMissingCollections: challenge.acceptedMissingCollections,
+                acceptedOfflineClassicLinkIds: challenge.acceptedOfflineClassicLinkIds,
                 // Reuse the SAME still-held scope. No nested lock or new helper.
                 maintenanceAuthority: { async withHeldMaintenance(same, work) {
                     if (!equal(same, challenge)) fail();

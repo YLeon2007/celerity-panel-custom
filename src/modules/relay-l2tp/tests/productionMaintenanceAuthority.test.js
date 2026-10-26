@@ -8,6 +8,7 @@ catch (error) { if (error.code !== 'MODULE_NOT_FOUND') throw error; }
 const challenge = Object.freeze({ serverContext: { target: 'production', hostIdentity: 'lm1.infograd.online' } });
 
 test('actual fixed Python helper and guard protocol spans successful real initializer plus DB close', async () => entryCase('success'));
+test('finite entry forwards explicitly pinned offline classic links without changing old challenge shape', async () => entryCase('offlineSuccess'));
 for (const mode of ['connectFailure', 'compositionFailure', 'unknownCommit', 'postcommitReadFailure', 'closeFailure', 'precommitGuardLoss', 'postcommitCleanupGuardLoss']) {
     test(`finite entry retains on ${mode} and naturally disposes real helper`, async () => entryCase(mode));
 }
@@ -25,12 +26,14 @@ async function entryCase(mode) {
     const root = fs.mkdtempSync(path.join(process.env.TMPDIR, 'prod-entry-'));
     const links = Array.from({ length: 10 }, (_, i) => ({ _id: new mongo.ObjectId(), portalNode: new mongo.ObjectId(),
         bridgeNode: new mongo.ObjectId(), mode: i < 8 ? 'reverse' : 'forward', active: true, status: 'online' }));
+    if (mode === 'offlineSuccess') links[9].status = 'offline';
     const accepted = { serverContext: challenge.serverContext, databaseName: 'MODELED_DISPOSABLE_DATABASE',
         maintenanceGeneration: randomUUID(), deployment: { setName: 'modeled', replicaSetId: 'a'.repeat(24) },
         acceptedClassicLinks: links.map(row => ({ id: String(row._id), sha256: fingerprint(row) })),
         initialState: { _id: 'singleton', revision: 7, deployedRevision: 7, stateTransitionRevision: 3,
             replacementEpoch: 2, remoteAdmissionCount: 0, topologyAdmissionCount: 0 },
         manifestSha256: REVIEWED_MANIFEST_SHA256, acceptedMissingCollections: [] };
+    if (mode === 'offlineSuccess') accepted.acceptedOfflineClassicLinkIds = [String(links[9]._id)];
     if (mode === 'compositionFailure') accepted.manifestSha256 = '0'.repeat(64);
     fs.writeFileSync(path.join(root, 'challenge.json'), JSON.stringify(accepted));
     const child = spawn('/usr/bin/python3', ['scripts/prod-maintenance/tests/local_protocol_fixture.py', path.join(root, 'challenge.json')],
@@ -79,7 +82,7 @@ async function entryCase(mode) {
     try {
         const operation = entry.testing.runAccepted({ config: { challenge: accepted, mongoUri: 'mongodb://MODELED-NOT-CONNECTED' },
             authority, createClient: () => client });
-        if (mode === 'success') {
+        if (['success', 'offlineSuccess'].includes(mode)) {
             const result = await operation;
             assert.equal(result.initialized, true); assert.equal(result.ready, false); assert.equal(result.dormant, true);
             assert.equal(child.exitCode, 0);
@@ -88,7 +91,7 @@ async function entryCase(mode) {
             assert.notEqual(child.exitCode, null, 'helper must be reaped naturally');
         }
         assert.equal(closed, true, 'DB disposal runs even when initializer construction refuses');
-        if (['success', 'unknownCommit', 'postcommitReadFailure', 'closeFailure', 'postcommitCleanupGuardLoss'].includes(mode)) {
+        if (['success', 'offlineSuccess', 'unknownCommit', 'postcommitReadFailure', 'closeFailure', 'postcommitCleanupGuardLoss'].includes(mode)) {
             assert.deepEqual(state, accepted.initialState, 'never compensate uncertain insert');
             assert.equal(commands.filter(cmd => cmd.commitTransaction).length, 1, 'never retry commit');
         } else assert.equal(commands.filter(cmd => cmd.commitTransaction).length, 0);
