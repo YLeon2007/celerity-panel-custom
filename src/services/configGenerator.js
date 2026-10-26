@@ -1382,7 +1382,7 @@ function applyCascadePathIngress(config, entries = []) {
  * @param {Array} [cascadePathIngress] - Per-path ingress entries ({pathKey, port, egressTag})
  * @returns {string} JSON string ready to write to config.json
  */
-function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, cascadePathIngress = []) {
+function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, cascadePathIngress = [], additionalUpstreams = []) {
     const upDomain = getCascadeTunnelDomain(upstreamLink);
     const upProtocol = upstreamLink.tunnelProtocol || 'vless';
     const upLinkId = String(upstreamLink._id).slice(-8);
@@ -1544,6 +1544,31 @@ function generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks, casc
         outboundTag: 'blackhole',
     });
 
+    // A local L2TP ingress does not choose one of the existing upstreams.
+    // Preserve every confirmed fan-in tunnel with the same per-link credentials;
+    // reuse this generator's exact handshake and geo/default routing.
+    const upstreamIds = new Set([String(upstreamLink._id)]);
+    for (const { link, portal } of additionalUpstreams) {
+        const linkId = String(link?._id);
+        const suffix = linkId.slice(-8);
+        const bridgeTag = `bridge-up-${suffix}`;
+        const tunnelTag = `tunnel-up-${suffix}`;
+        if (!link?._id || !portal?.ip || upstreamIds.has(linkId)
+            || config.reverse.bridges.some(row => row.tag === bridgeTag)
+            || config.outbounds.some(row => row.tag === tunnelTag)) throw new Error('Invalid relay upstream');
+        upstreamIds.add(linkId);
+        const extra = JSON.parse(generateRelayConfig(link, portal, downstreamLinks));
+        const outbound = extra.outbounds.find(row => row.tag === 'tunnel-up');
+        config.outbounds.push({ ...outbound, tag: tunnelTag });
+        config.reverse.bridges.push({ ...extra.reverse.bridges[0], tag: bridgeTag });
+        const rules = extra.routing.rules.filter(row => row.outboundTag === 'tunnel-up'
+            || row.inboundTag?.includes('bridge-up')).map(row => ({ ...row,
+            ...(row.outboundTag === 'tunnel-up' ? { outboundTag: tunnelTag } : {}),
+            ...(row.inboundTag ? { inboundTag: row.inboundTag.map(tag => tag === 'bridge-up' ? bridgeTag : tag) } : {}),
+        }));
+        const globalBlock = config.routing.rules.findIndex(row => !row.inboundTag && row.ip?.includes('::/0'));
+        config.routing.rules.splice(globalBlock, 0, ...rules);
+    }
     return JSON.stringify(config, null, 2);
 }
 

@@ -273,8 +273,10 @@ function createL2tpRootHostDependencies({
                 } else {
                     const incoming = await CascadeLink.find({ bridgeNode: relay._id, active: true,
                         mode: { $ne: 'forward' }, status: { $in: ['online', 'deployed'] } }).populate('portalNode');
-                    if (incoming.length !== 1 || !incoming[0].portalNode?._id) reject();
-                    if (await cascade._deployBridgeConfig(incoming[0], relay, incoming[0].portalNode) !== true) reject();
+                    if (!incoming.length || incoming.some(row => !row.portalNode?._id)) reject();
+                    if (await cascade._deployBridgeConfig(incoming[0], relay, incoming[0].portalNode, {
+                        additionalUpstreams: incoming.slice(1).map(row => ({ link: row, portal: row.portalNode })),
+                    }) !== true) reject();
                 }
             };
             return service;

@@ -194,6 +194,30 @@ test('assembled root -> real runtime/worker/candidate/classic wrapper installs s
     assert.equal(f.rows.size, 0);
 });
 
+test('assembled reverse preparation preserves both existing fan-in upstreams while selecting exact L2TP egress', async () => {
+    const f = fixture();
+    const other = { ...upstream, _id: '507f1f77bcf86cd799439017',
+        portalNode: { ...head, _id: '507f1f77bcf86cd799439018', ip: '192.0.2.18' },
+        tunnelUuid: '00000000-0000-4000-8000-000000000018' };
+    f.links.push(other);
+    assert.equal((await assembledRuntime(f).worker.runOnce()).status, 'succeeded');
+    const secondary = JSON.parse(f.uploads.find(row => row.path === '/usr/local/etc/xray-bridge/config.json').content);
+    assert.equal(secondary.reverse.bridges.length, 2, 'neither existing upstream may be discarded');
+    const upstreamOutbounds = secondary.outbounds.filter(row => row.protocol === 'vless');
+    assert.deepEqual(upstreamOutbounds.map(row => row.settings.vnext[0].users[0].id).sort(),
+        [upstream.tunnelUuid, other.tunnelUuid].sort());
+    for (const bridge of secondary.reverse.bridges) {
+        assert(secondary.routing.rules.some(row => row.domain?.includes('full:' + bridge.domain)
+            && upstreamOutbounds.some(out => out.tag === row.outboundTag)));
+        assert(secondary.routing.rules.some(row => row.inboundTag?.includes(bridge.tag)
+            && row.outboundTag === 'portal-down-' + DOWN.slice(-8)));
+    }
+    assert(secondary.routing.rules.some(row => row.inboundTag?.includes('cascade-main')
+        && row.outboundTag === 'portal-down-' + DOWN.slice(-8)));
+    assert.equal(f.events.filter(row => row === 'lock').length, 1);
+    assert.equal(f.rows.size, 0);
+});
+
 test('assembled forward preparation deploys MAIN ingress and candidate rereads that prepared MAIN', async () => {
     const f = fixture(); const priorMode = group.mode; group.mode = 'forward';
     f.links.splice(1, 1, { ...downstream, mode: 'forward' });

@@ -1066,7 +1066,7 @@ class CascadeService {
         let bridgeConfig;
         if (isRelay) {
             logger.info(`[Cascade] Node ${bridgeNode.name} is a RELAY (${downstreamLinks.length} downstream link(s))`);
-            bridgeConfig = configGenerator.generateRelayConfig(link, portalNode, downstreamLinks);
+            bridgeConfig = configGenerator.generateRelayConfig(link, portalNode, downstreamLinks, [], opts.additionalUpstreams);
             const relay = JSON.parse(bridgeConfig);
             await this._applyClassicL2tpPathIngress(relay, bridgeNode, { mode: 'reverse', ...opts });
             bridgeConfig = JSON.stringify(relay, null, 2);
