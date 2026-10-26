@@ -15,6 +15,9 @@ const {
 const {
     PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT,
 } = require('./relay-l2tp/domain/topologyExecutionContext');
+const {
+    resolveL2tpExecutionAuthorization,
+} = require('./relay-l2tp/domain/l2tpExecutionAuthorization');
 
 function isProductionSchemaHost(env) {
     return env?.PANEL_DOMAIN === PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT.hostIdentity;
@@ -276,11 +279,14 @@ function createL2tpRootLifecycle({
                 startPromise = Promise.resolve().then(async () => {
                     if (stopRequested) return undefined;
                     parseL2tpExecutionEnabled(env.L2TP_EXECUTION_ENABLED);
-                    const dormantProduction = isProductionSchemaHost(env);
-                    if (dormantProduction && (env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
-                        || env.L2TP_PRODUCTION_EXECUTION_ENABLED === 'true')) {
+                    const productionHost = isProductionSchemaHost(env);
+                    if (productionHost && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true') {
                         throw new TypeError('PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE');
                     }
+                    // L2TP has its own explicit PROD authorization; it does not
+                    // activate topology execution or inherit the TEST bypass.
+                    const dormantProduction = productionHost
+                        && !resolveL2tpExecutionAuthorization(env).enableProductionExecution;
                     if (!dormantProduction) {
                         const migrationBootstrap = createMigrationBootstrap({ env });
                         await migrationBootstrap.run();

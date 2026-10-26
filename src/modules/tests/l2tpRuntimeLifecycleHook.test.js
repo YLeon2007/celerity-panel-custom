@@ -289,17 +289,187 @@ test('dormant PROD skips schema writes and module workers despite inherited TEST
     await root.stop();
 });
 
-test('PROD execution opt-in cannot start before separately held schema/authority gate', async () => {
-    for (const flag of ['TOPOLOGY_PRODUCTION_EXECUTION_ENABLED', 'L2TP_PRODUCTION_EXECUTION_ENABLED']) {
+test('PROD topology opt-in still refuses before schema or host side effects', async () => {
+    for (const l2tpOptIn of [undefined, 'true']) {
+        const flag = 'TOPOLOGY_PRODUCTION_EXECUTION_ENABLED';
         const root = createL2tpRootLifecycle({
             env: { PANEL_DOMAIN: 'lm1.infograd.online', [flag]: 'true',
+                L2TP_PRODUCTION_EXECUTION_ENABLED: l2tpOptIn,
                 L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true' },
+            createRuntimeLifecycleHook() { assert.fail('must not create host'); },
             createMigrationBootstrap() { throw new Error('premature schema write'); },
             async ensureModelIndexes() { throw new Error('premature index build'); },
         });
         await assert.rejects(root.startAfterDatabase(), /PRODUCTION_SCHEMA_AUTHORITY_UNAVAILABLE/);
         await root.stop();
     }
+});
+
+test('explicit PROD L2TP-only startup awaits migrations and indexes before creating the host once', async () => {
+    const env = { PANEL_DOMAIN: 'lm1.infograd.online',
+        L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
+        TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
+    const calls = [];
+    let finishMigration, finishIndexes;
+    const migration = new Promise(resolve => { finishMigration = resolve; });
+    const indexes = new Promise(resolve => { finishIndexes = resolve; });
+    const lifecycle = { async stop() { calls.push('stop'); } };
+    const root = createL2tpRootLifecycle({ env,
+        createMigrationBootstrap({ env: selected }) {
+            assert.strictEqual(selected, env);
+            return { async run() { calls.push('migration'); await migration; } };
+        },
+        async ensureModelIndexes() { calls.push('indexes'); await indexes; },
+        createRuntimeLifecycleHook({ env: selected }) {
+            assert.strictEqual(selected, env);
+            calls.push('host');
+            return lifecycle;
+        },
+    });
+    const started = root.startAfterDatabase();
+    assert.strictEqual(root.startAfterDatabase(), started);
+    await Promise.race([started, new Promise(resolve => setImmediate(resolve))]);
+    assert.deepEqual(calls, ['migration']);
+    finishMigration();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ['migration', 'indexes']);
+    finishIndexes();
+    assert.strictEqual(await started, lifecycle);
+    assert.deepEqual(calls, ['migration', 'indexes', 'host']);
+    await root.stop();
+    assert.deepEqual(calls, ['migration', 'indexes', 'host', 'stop']);
+});
+
+test('PROD remains side-effect free without every exact L2TP-only opt-in', async () => {
+    const base = { PANEL_DOMAIN: 'lm1.infograd.online',
+        L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        L2TP_PRODUCTION_EXECUTION_ENABLED: 'true', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
+    for (const overrides of [
+        { L2TP_PRODUCTION_EXECUTION_ENABLED: undefined },
+        { L2TP_PRODUCTION_EXECUTION_ENABLED: 'false' },
+        { L2TP_PRODUCTION_EXECUTION_ENABLED: 'TRUE' },
+        { L2TP_PRODUCTION_EXECUTION_ENABLED: true },
+        { L2TP_EXECUTION_ENABLED: undefined },
+        { L2TP_EXECUTION_ENABLED: 'false' },
+        { L2TP_MIGRATIONS_ENABLED: undefined },
+        { L2TP_MIGRATIONS_ENABLED: 'false' },
+    ]) {
+        const env = { ...base, ...overrides };
+        const original = { ...env };
+        const deny = () => assert.fail('dormant PROD must have no startup side effects');
+        const root = createL2tpRootLifecycle({ env,
+            createMigrationBootstrap: deny, ensureModelIndexes: deny, createHostDependencies: deny,
+            activeHostProvider: { assertActiveHost: deny, installActiveHost: deny, clearActiveHost: deny },
+        });
+        const lifecycle = await root.startAfterDatabase();
+        assert.equal(lifecycle.start().enabled, false);
+        await root.stop();
+        assert.deepEqual(env, original);
+    }
+});
+
+test('PROD L2TP-only readiness failure blocks host construction and publication', async () => {
+    for (const failingStage of ['migration', 'indexes']) {
+        const events = [];
+        const error = new Error(`failed ${failingStage}`);
+        const deny = () => assert.fail('failed readiness must not construct or publish a host');
+        const root = createL2tpRootLifecycle({
+            env: { PANEL_DOMAIN: 'lm1.infograd.online', L2TP_EXECUTION_ENABLED: 'true',
+                L2TP_MIGRATIONS_ENABLED: 'true', L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
+                TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false' },
+            createMigrationBootstrap: () => ({ async run() {
+                events.push('migration');
+                if (failingStage === 'migration') throw error;
+            } }),
+            async ensureModelIndexes() { events.push('indexes'); throw error; },
+            createHostDependencies: deny, createRuntimeLifecycleHook: deny,
+            activeHostProvider: { installActiveHost: deny },
+        });
+        await assert.rejects(root.startAfterDatabase(), candidate => candidate === error);
+        await root.stop();
+        assert.deepEqual(events, failingStage === 'migration' ? ['migration'] : ['migration', 'indexes']);
+    }
+});
+
+test('PROD L2TP-only root publishes the actual host/runtime without topology or persistence side effects', async () => {
+    const { createL2tpStartupLifecycle } = require('../createL2tpStartupLifecycle');
+    const { createL2tpActiveHostProvider, createL2tpRouteBindings } = require('../l2tpActiveHostProvider');
+    const { L2tpOperationWorker } = require('../relay-l2tp/workers/l2tpOperationWorker');
+    const provider = createL2tpActiveHostProvider();
+    const bindings = createL2tpRouteBindings(provider);
+    const events = [];
+    const deny = () => assert.fail('startup must not access persistence, transport or topology execution');
+    const db = { transaction: deny, startSession: deny };
+    const model = () => ({ db, ...Object.fromEntries(['find', 'findOne', 'findById', 'findOneAndUpdate',
+        'updateOne', 'deleteOne', 'create', 'countDocuments', 'bulkWrite'].map(name => [name, deny])) });
+    const models = Object.fromEntries(['CascadeRouteGroup', 'CascadeTopologyState', 'RelayL2tpState',
+        'L2tpUser', 'L2tpOperation', 'RemoteAdmission', 'NodeOperationLock'].map(name => [name, model()]));
+    const env = { PANEL_DOMAIN: 'lm1.infograd.online',
+        L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+        L2TP_PRODUCTION_EXECUTION_ENABLED: 'true', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'false', TOPOLOGY_PROBE_USER_ID: 'must-stay-dormant' };
+    const handle = {};
+    let host;
+    const root = createL2tpRootLifecycle({ env, activeHostProvider: provider,
+        createMigrationBootstrap: () => ({ async run() { events.push('migration'); } }),
+        async ensureModelIndexes() { events.push('indexes'); },
+        createHostDependencies(options) {
+            events.push('dependencies');
+            return createL2tpRootHostDependencies({ ...options,
+                HyNode: model(), NodeSSH: class { constructor() { deny(); } },
+                NodeTransport: class { constructor() { deny(); } },
+                secretKey: 'local-startup-fixture-key', syncService: { _getUsersForNode: deny },
+                configGenerator: deny, fragmentProvider: deny, operationMaterializer: deny,
+                requireAuth: deny, requireOnboarding: deny, csrf: deny, rateLimiter: deny, renderPage: deny,
+                timer: {
+                    setInterval() { events.push('l2tp-schedule'); return handle; },
+                    clearInterval(value) { assert.strictEqual(value, handle); events.push('l2tp-unschedule'); },
+                },
+                logger: { error: deny },
+            });
+        },
+        createRuntimeLifecycleHook(options) {
+            return createL2tpRuntimeLifecycleHook({ ...options,
+                createStartupLifecycle(options) {
+                    return createL2tpStartupLifecycle({ ...options,
+                        createPanelHost(options) {
+                            host = createL2tpPanelHost({ ...options, CascadeLink: model(), topologyRuntime: {},
+                                moduleEntry: { registerModels: () => models,
+                                    createTopologyDeploymentService: deny, createTopologyIntentService: deny },
+                                createTopologyRecoveryLifecycle: deny,
+                            });
+                            return host;
+                        },
+                    });
+                },
+            });
+        },
+    });
+    assert.equal(provider.getActiveHost(), null);
+    await root.startAfterDatabase();
+    try {
+        assert.strictEqual(provider.getActiveHost(), host);
+        assert.deepEqual(events, ['migration', 'indexes', 'dependencies', 'l2tp-schedule']);
+        assert.ok(host.runtime.worker instanceof L2tpOperationWorker);
+        for (const component of [host.runtime.service, host.runtime.worker, host.runtime.worker.executor]) {
+            assert.deepEqual(component.executionContext, { target: 'production', hostIdentity: env.PANEL_DOMAIN });
+            assert.equal(component.enableProductionExecution, true);
+        }
+        assert.equal(host.runtime.worker.enableUnsafeExecutionForTests, false);
+        assert.equal(host.topologyIntentService, undefined);
+        // A route reaches the real service/repository, not RUNTIME_UNAVAILABLE.
+        host.repository.HyNode.findById = nodeId => {
+            assert.equal(nodeId, 'missing-node');
+            return { select() { return this; }, async lean() { return null; } };
+        };
+        await assert.rejects(bindings.l2tpService.getStatus('missing-node'), { code: 'NODE_NOT_FOUND' });
+    } finally {
+        await root.stop();
+    }
+    assert.equal(provider.getActiveHost(), null);
+    assert.deepEqual(events, ['migration', 'indexes', 'dependencies', 'l2tp-schedule', 'l2tp-unschedule']);
 });
 
 test('PROD Mongo model autoindex/autocreate is disabled before any model startup', () => {
