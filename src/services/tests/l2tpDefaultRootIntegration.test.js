@@ -33,7 +33,25 @@ const exit = { ...relay, _id: EXIT, ip: '192.0.2.3' };
 const upstream = { _id: UP, portalNode: head, bridgeNode: relay, mode: 'reverse', active: true, status: 'online', tunnelUuid: '00000000-0000-4000-8000-000000000002' };
 const downstream = { _id: DOWN, portalNode: relay, bridgeNode: exit, mode: 'reverse', active: true, status: 'online', tunnelUuid: '00000000-0000-4000-8000-000000000003' };
 const group = { _id: GROUP, mode: 'reverse', paths: [{ pathKey: 'main', linkIds: [DOWN], enabled: true }] };
-const query = value => ({ select() { return this; }, lean: async () => value, populate() { return this; }, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } });
+const query = value => {
+    let selected = value;
+    return { select(fields) {
+        if (!value) return this;
+        selected = {};
+        for (const name of ['_id', ...fields.split(/\s+/).map(key => key.replace(/^\+/, ''))]) {
+            const parts = name.split('.');
+            let field = value;
+            for (const part of parts) field = field?.[part];
+            if (field === undefined) continue;
+            let target = selected;
+            for (const part of parts.slice(0, -1)) target = target[part] ||= {};
+            target[parts.at(-1)] = field;
+        }
+        return this;
+    }, lean: async () => selected, populate() { return this; },
+    then(resolve, reject) { return Promise.resolve(selected).then(resolve, reject); } };
+};
+const resolveUsers = node => active.resolveUsers ? active.resolveUsers(node) : users;
 const id = value => String(value?._id ?? value);
 const matches = (row, filter) => Object.entries(filter).every(([key, value]) => {
     if (key === 'paths.linkIds') return row.paths.some(path => path.linkIds.some(linkId => value.$in.map(String).includes(String(linkId))));
@@ -62,7 +80,7 @@ Module._load = function(request, parent, isMain) {
         if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => true };
         if (request === '../models/hyNodeModel' || request === '../models/settingsModel') return {};
         if (request === './nodeSSH') return SSH;
-        if (request === './syncService') return { _getUsersForNode: async () => users,
+        if (request === './syncService') return { _getUsersForNode: async node => resolveUsers(node),
             _agentRequest: async () => { active.events.push('agent-restart'); if (active.agentError) throw active.agentError; return active.agentResult; } };
         if (request === './cacheService' || request === './webhookService') return {};
     }
@@ -113,7 +131,7 @@ function fixture({ conflict = false, veto = false, uploadFailure = false, restar
             'remote/generation must be under the worker node lock'); },
     };
     const root = createL2tpRootHostDependencies({ env: process.env, HyNode: { findById: nodeId => query([relay, head, exit].find(row => id(row) === id(nodeId))) }, NodeSSH: SSH,
-        syncService: { _getUsersForNode: async () => users }, createTopologyExecutionAuthority: () => undefined,
+        syncService: { _getUsersForNode: async node => resolveUsers(node) }, createTopologyExecutionAuthority: () => undefined,
         requireAuth() {}, requireOnboarding() {}, csrf() {}, rateLimiter() {}, renderPage() {},
         createPreflightRunner: () => async () => ({}), secretBox: {}, secretKey: 'fixture',
     });
@@ -216,6 +234,48 @@ test('assembled reverse preparation preserves both existing fan-in upstreams whi
         && row.outboundTag === 'portal-down-' + DOWN.slice(-8)));
     assert.equal(f.events.filter(row => row === 'lock').length, 1);
     assert.equal(f.rows.size, 0);
+});
+
+for (const candidateFailure of [false, true]) test(`forward preparation retains full node routing and actual grouped subscribers with faithful projection: candidateFailure=${candidateFailure}`, async () => {
+    const priorMode = group.mode;
+    const prior = Object.fromEntries(['groups', 'outbounds', 'aclRules', 'domain', 'sni'].map(key => [key, relay[key]]));
+    Object.assign(relay, { groups: ['507f1f77bcf86cd799439099'],
+        outbounds: [{ name: 'operator-egress', type: 'socks5', addr: '192.0.2.99:1080' }],
+        aclRules: ['operator-egress(all)'], domain: 'relay.example.invalid', sni: 'relay.example.invalid' });
+    const f = fixture(); group.mode = 'forward';
+    f.links.splice(1, 1, { ...downstream, mode: 'forward' });
+    // Actual _getUsersForNode implementation, with only its persistence/import
+    // seam modeled. No replacement of the group-vs-ungrouped branch under test.
+    const filename = require.resolve('../syncService');
+    const loaded = new Module(filename, module); loaded.filename = filename;
+    loaded.paths = Module._nodeModulePaths(require('node:path').dirname(filename));
+    const grouped = { ...users[0], userId: 'group-subscriber' };
+    const unrelated = { userId: 'unrelated-ungrouped', xrayUuid: '00000000-0000-4000-8000-000000000099' };
+    loaded.require = request => request.endsWith('/hyUserModel') ? { find: filter => query(filter.nodes ? [] : filter.groups?.$in ? [grouped] : [unrelated]) }
+        : request === 'https' ? require('node:https') : request === '../utils/logger' ? { info() {}, warn() {}, error() {} } : {};
+    loaded._compile(require('node:fs').readFileSync(filename, 'utf8'), filename);
+    active.resolveUsers = node => loaded.exports._getUsersForNode(node);
+    if (candidateFailure) f.candidateService.userResolver = async () => { throw new Error('modeled user resolver failure after checked preparation'); };
+    try {
+        assert(JSON.parse(f.live).outbounds.some(row => row.tag === 'operator-egress'));
+        const result = await assembledRuntime(f).worker.runOnce();
+        assert.equal(result.status, candidateFailure ? 'failed' : 'succeeded');
+        const prepared = JSON.parse(f.uploads.find(row => row.path === '/usr/local/etc/xray/config.json').content);
+        for (const config of [prepared, JSON.parse(active.live)]) {
+            assert(config.outbounds.some(row => row.tag === 'operator-egress'), 'prepared/live MAIN must retain the operator outbound');
+            assert(config.routing.rules.some(row => row.outboundTag === 'operator-egress'), 'prepared/live MAIN must retain ACL routing');
+            assert.deepEqual(config.inbounds.find(row => row.tag === 'vless-in').settings.clients.map(row => row.email), [grouped.userId]);
+            assert(config.inbounds.some(row => row.tag === 'relay-l2tp-other'));
+        }
+        assert(f.commands.some(command => command.includes('systemctl restart xray')));
+        if (candidateFailure) {
+            assert(!f.uploads.some(row => row.path === 'xray-candidate.json'));
+            assert.equal(f.rows.size, 0, 'known completed preparation can release after local candidate refusal without losing prior MAIN settings');
+        }
+    } finally {
+        group.mode = priorMode;
+        for (const [key, value] of Object.entries(prior)) { if (value === undefined) delete relay[key]; else relay[key] = value; }
+    }
 });
 
 test('assembled forward preparation deploys MAIN ingress and candidate rereads that prepared MAIN', async () => {

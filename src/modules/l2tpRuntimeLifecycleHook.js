@@ -213,7 +213,12 @@ function createL2tpRootHostDependencies({
             const { withHeldL2tpNodeConfigWrite, assertHeldL2tpNodeConfigWrite } = require('../services/classicNodeConfigWrite');
             const resolveExecutionNode = async nodeId => {
                 await assertHeldL2tpNodeConfigWrite(nodeId);
-                const node = await HyNode.findById(nodeId).select('_id name type active cascadeRole ip port xray ssh.port ssh.username ssh.privateKey ssh.password').lean();
+                // The same held node also feeds the existing full MAIN writer.
+                // Keep its generation/group/ACL/TLS fields, not just SSH inputs.
+                const node = await HyNode.findById(nodeId).select([
+                    ...CANDIDATE_NODE_XRAY_PROJECTION, 'name', 'xray.agentToken', 'xray.configPath',
+                    'ssh.port', 'ssh.username', 'ssh.privateKey', 'ssh.password',
+                ].join(' ')).lean();
                 if (!node || String(node._id) !== String(nodeId) || node.type !== 'xray'
                     || node.active !== true || node.cascadeRole !== 'relay') throw new Error('NODE_EXECUTION_UNAVAILABLE');
                 return node;
