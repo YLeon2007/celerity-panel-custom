@@ -5,6 +5,7 @@
 const { Client } = require('ssh2');
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const logger = require('../utils/logger');
 const config = require('../../config');
 const cryptoService = require('./cryptoService');
@@ -1690,6 +1691,36 @@ function buildAgentConfig(node, token, agentPort, apiPort, useTls, accessLogs) {
  * @param {Object} node - Node document with xray.agentToken/agentPort/...
  * @param {NodeSSH} ssh - Already-connected NodeSSH wrapper from syncService
  */
+async function waitForCcAgentSocket(host, port) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+        const ready = await new Promise(resolve => {
+            let settled = false, socket, timer;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                socket?.destroy();
+                resolve(value);
+            };
+            timer = setTimeout(() => finish(false), Math.min(500, deadline - Date.now()));
+            try {
+                socket = net.createConnection({ host, port });
+                socket.once('connect', () => finish(true));
+                socket.once('error', () => finish(false));
+            } catch (_) {
+                finish(false);
+            }
+        });
+        if (ready) return;
+        const remaining = deadline - Date.now();
+        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, Math.min(200, remaining)));
+    }
+    const error = new Error('CC_AGENT_API_NOT_READY');
+    error.code = 'CC_AGENT_API_NOT_READY';
+    throw error;
+}
+
 async function reloadCcAgent(node, ssh) {
     const xray = node.xray || {};
     const token = xray.agentToken;
@@ -1699,6 +1730,11 @@ async function reloadCcAgent(node, ssh) {
     const agentPort = xray.agentPort || 62080;
     const apiPort = xray.apiPort || 61000;
     const useTls = xray.agentTls !== false;
+
+    const host = node.ip || node.domain;
+    if (typeof host !== 'string' || !host || !Number.isInteger(agentPort) || agentPort < 1 || agentPort > 65535) {
+        throw new Error('CC_AGENT_API_ENDPOINT_INVALID');
+    }
 
     // Resolve the access-log block for this node (best-effort). When the module
     // is disabled or the credential is missing we still write an explicit
@@ -1730,6 +1766,9 @@ async function reloadCcAgent(node, ssh) {
     if (waitResult && typeof waitResult.code === 'number' && waitResult.code !== 0) {
         logger.warn(`[Agent] Node ${node.name}: cc-agent did not become active within ~5s (will continue anyway)`);
     }
+    // Type=simple being active does not mean the agent has bound its API yet.
+    // Probe only TCP readiness: never retry an ambiguous mutating HTTP request.
+    await waitForCcAgentSocket(host, agentPort);
     logger.info(`[Agent] Node ${node.name}: cc-agent config refreshed (${agentConfig.inbounds.length} inbound(s))`);
 }
 
