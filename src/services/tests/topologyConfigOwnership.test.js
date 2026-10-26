@@ -57,6 +57,7 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
         locks.set(String(row.node), row);
         return row;
     });
+    t.mock.method(Lock, 'findOne', query => ({ lean: async () => locks.get(String(query.node)) || null }));
     t.mock.method(Lock, 'deleteOne', async filter => {
         const row = locks.get(String(filter.node));
         if (!row || !Object.entries(filter).every(([key, value]) => row[key] === value)) return { deletedCount: 0 };
@@ -105,7 +106,7 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
     });
     t.mock.method(syncService, '_agentRequest', async (_node, method, path, payload) => {
         calls.agent.push({ method, path, payload });
-        return { data: {} };
+        return { status: 200, data: {} };
     });
     return calls;
 }
