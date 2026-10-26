@@ -657,7 +657,12 @@ test('root host dependencies provide the exact safe candidate composition requir
         userResolver: candidateUserResolver,
         nodeResolver: dependencies.candidateNodeResolver,
         fragmentProvider,
+        currentConfigResolver: candidateConstructions[0].currentConfigResolver,
     }]);
+    assert.equal(typeof candidateConstructions[0].currentConfigResolver, 'function');
+    assert.equal(typeof candidateService.prepareIngress, 'function');
+    assert.equal(typeof candidateService.withLockedPreparation, 'function');
+    assert.equal(typeof candidateService.assertConfigWriteAllowed, 'function');
     assert.deepEqual(await candidateConstructions[0].userResolver(node), users);
     assert.deepEqual(dependencies.workerLifecycle, {
         intervalMs: 15_000,

@@ -19,6 +19,7 @@ const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel
 const { mergePreservedL2tpConfig } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const { withClassicNodeConfigWrite } = require('./classicNodeConfigWrite');
+const { finishClassicConfigRouting } = require('./classicL2tpConfigComposition');
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
@@ -607,8 +608,8 @@ class SyncService {
                             configGenerator.applyForwardHopInbound(configObj, forwardHopLinks);
                         }
 
-                        // geoip:private block must be last, after all cascade rules
-                        configGenerator.ensurePrivateIpBlock(configObj);
+                        await require('./cascadeService')._applyClassicL2tpPathIngress(configObj, node, { mode: 'forward' });
+                        finishClassicConfigRouting(configObj);
 
                         configContent = JSON.stringify(configObj, null, 2);
                         const total = reverseLinks.length + forwardLinks.length + forwardHopLinks.length;
@@ -616,7 +617,8 @@ class SyncService {
                     } else {
                         // No cascade links, still ensure geoip:private is present
                         const configObj = JSON.parse(configContent);
-                        configGenerator.ensurePrivateIpBlock(configObj);
+                        await require('./cascadeService')._applyClassicL2tpPathIngress(configObj, node, { mode: 'forward' });
+                        finishClassicConfigRouting(configObj);
                         configContent = JSON.stringify(configObj, null, 2);
                     }
                 } catch (cascadeErr) {
@@ -650,7 +652,9 @@ class SyncService {
                             if (merged !== configContent) {
                                 logger.info(`[Xray Sync] Node ${node.name}: preserved L2TP-managed Xray sections`);
                             }
-                            configContent = merged;
+                            const composed = JSON.parse(merged);
+                            finishClassicConfigRouting(composed);
+                            configContent = JSON.stringify(composed, null, 2);
                         }
                     }
                 } catch (l2tpErr) {

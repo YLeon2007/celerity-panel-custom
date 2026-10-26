@@ -597,18 +597,6 @@ class L2tpOperationWorker {
         }
 
         let candidateContent = null;
-        if (preparedInstallPlan) {
-            try {
-                candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
-            } catch {
-                return this.failClaimedOperation({
-                    claim,
-                    operation,
-                    errorCode: 'XRAY_CANDIDATE_FAILED',
-                    errorMessage: 'Failed to build the L2TP Xray candidate',
-                });
-            }
-        }
 
         const lockRequest = {
             node: operation.node,
@@ -700,14 +688,47 @@ class L2tpOperationWorker {
             return !heartbeat.getError();
         };
         try {
+            // The root-owned guard reads durable ownership only after this
+            // generation is acquired/renewed and before any remote read.
+            if (preparedInstallPlan || this.candidateService?.assertConfigWriteAllowed) {
+                await heartbeat.renewNow();
+                if (heartbeat.getError()) return leaseLostResult();
+            }
+            try {
+                await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
+                if (preparedInstallPlan) {
+                    const prepare = async () => {
+                        await this.candidateService?.prepareIngress?.({ plan: preparedInstallPlan });
+                        candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
+                    };
+                    if (this.candidateService?.withLockedPreparation) {
+                        await this.candidateService.withLockedPreparation({ lock: lock.lock,
+                            lockService: this.lockService, clock: this.clock }, prepare);
+                    } else {
+                        await prepare();
+                    }
+                }
+                await heartbeat.waitForIdle();
+                if (heartbeat.getError()) return leaseLostResult();
+            } catch (error) {
+                await heartbeat.waitForIdle();
+                if (heartbeat.getError()) return leaseLostResult();
+                if (error?.remoteOutcomeUncertain === true) {
+                    await this.retainAdmissionForRecovery(operation, claim);
+                    return { claimed: true, operationId, status: 'running', stopped: true,
+                        errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                }
+                return this.failClaimedOperation({ claim, operation, lockGeneration, heartbeat,
+                    errorCode: error?.code || 'XRAY_CANDIDATE_FAILED',
+                    errorMessage: error?.code === 'XRAY_CANDIDATE_FAILED'
+                        ? 'Failed to build the L2TP Xray candidate' : 'L2TP config preparation was refused' });
+            }
             let executionSteps = preparedInstallPlan?.steps
                 ?? preparedSyncUsersPlan?.steps
                 ?? operation.plan.steps;
             let resolvedSyncUsers = null;
             let userVerification = null;
             if (preparedInstallPlan) {
-                await heartbeat.renewNow();
-                if (heartbeat.getError()) return leaseLostResult();
                 try {
                     executionSteps = await this.materializeInstallSteps({
                         operation,

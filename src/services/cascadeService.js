@@ -15,6 +15,7 @@ const { applyClassicL2tpPathIngress, finishClassicConfigRouting } = require('./c
 const { mergePreservedL2tpSections } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const NodeSSH = require('./nodeSSH');
+const { withClassicNodeConfigWrite, assertClassicNodeConfigWriteHeld } = require('./classicNodeConfigWrite');
 const cache = require('./cacheService');
 const logger = require('../utils/logger');
 const webhook = require('./webhookService');
@@ -47,7 +48,16 @@ function undeployUncertain(message) {
 function completionCheckedSSH(node) {
     const ssh = new NodeSSH(node);
     const exec = ssh.exec.bind(ssh);
+    const upload = ssh.uploadContent.bind(ssh);
+    ssh.uploadContent = async (...args) => {
+        await assertClassicNodeConfigWriteHeld(node._id);
+        const result = await upload(...args);
+        if (result !== undefined) throw undeployUncertain('Upload completion refused');
+        await assertClassicNodeConfigWriteHeld(node._id);
+        return result;
+    };
     ssh.exec = async (command, options) => {
+        await assertClassicNodeConfigWriteHeld(node._id);
         const receipt = `C3_LEGACY_DONE_${randomBytes(24).toString('hex')}`;
         const result = await exec(`(
 ${command}
@@ -57,6 +67,7 @@ ${command}
             || typeof result.stderr !== 'string' || !result.stdout.endsWith(suffix)) {
             throw undeployUncertain(`Remote completion not proved for ${node.name}`);
         }
+        await assertClassicNodeConfigWriteHeld(node._id);
         return { ...result, stdout: result.stdout.slice(0, -suffix.length) };
     };
     return ssh;
@@ -444,6 +455,11 @@ class CascadeService {
      * Deploy Relay node config (middle of chain).
      */
     async _deployRelayNode(node, upstreamLink, upstreamPortal, downstreamLinks) {
+        return withClassicNodeConfigWrite({ nodeId: node._id, kind: '_deployRelayNode' }, () =>
+            this.#deployRelayNodeUnfenced(node, upstreamLink, upstreamPortal, downstreamLinks));
+    }
+
+    async #deployRelayNodeUnfenced(node, upstreamLink, upstreamPortal, downstreamLinks) {
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error(`Relay node ${node.name} has no SSH credentials`);
         }
@@ -453,7 +469,7 @@ class CascadeService {
         const relayConfig = JSON.stringify(relay, null, 2);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
-        const ssh = new NodeSSH(node);
+        const ssh = completionCheckedSSH(node);
         try {
             await ssh.connect();
 
@@ -473,6 +489,7 @@ class CascadeService {
             await ssh.exec('systemctl daemon-reload && systemctl enable xray-bridge && systemctl restart xray-bridge');
 
             logger.info(`[Cascade] Relay config deployed to ${node.name}`);
+            return true;
         } finally {
             ssh.disconnect();
         }
@@ -482,6 +499,11 @@ class CascadeService {
      * Deploy pure Bridge node config (tail of chain).
      */
     async _deployPureBridge(node, upstreamLink, upstreamPortal, upstreamLinks = null) {
+        return withClassicNodeConfigWrite({ nodeId: node._id, kind: '_deployPureBridge' }, () =>
+            this.#deployPureBridgeUnfenced(node, upstreamLink, upstreamPortal, upstreamLinks));
+    }
+
+    async #deployPureBridgeUnfenced(node, upstreamLink, upstreamPortal, upstreamLinks = null) {
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error(`Bridge node ${node.name} has no SSH credentials`);
         }
@@ -493,7 +515,7 @@ class CascadeService {
         const bridgeConfig = configGenerator.generateCombinedBridgeConfig(bridgeLinks);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
-        const ssh = new NodeSSH(node);
+        const ssh = completionCheckedSSH(node);
         try {
             await ssh.connect();
 
@@ -513,6 +535,7 @@ class CascadeService {
             await ssh.exec('systemctl daemon-reload && systemctl enable xray-bridge && systemctl restart xray-bridge');
 
             logger.info(`[Cascade] Bridge config deployed to ${node.name}`);
+            return true;
         } finally {
             ssh.disconnect();
         }
@@ -526,21 +549,25 @@ class CascadeService {
      * @param {Array} hopLinks - Array of CascadeLink documents for this node
      */
     async _deployForwardHopConfig(node, hopLinks) {
+        return withClassicNodeConfigWrite({ nodeId: node._id, kind: '_deployForwardHopConfig' }, () =>
+            this.#deployForwardHopConfigUnfenced(node, hopLinks));
+    }
+
+    async #deployForwardHopConfigUnfenced(node, hopLinks) {
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error(`Forward hop node ${node.name} has no SSH credentials`);
         }
 
         // Existing Xray server: cascade inbounds are added via _deployPortalConfig
         if (node.type === 'xray' && node.active && node.status !== 'error') {
-            await this._deployPortalConfig(node);
-            return;
+            return this._deployPortalConfig(node);
         }
 
         // Standalone: generate combined config with all hop inbounds
         const hopConfig = configGenerator.generateForwardHopConfig(hopLinks);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
-        const ssh = new NodeSSH(node);
+        const ssh = completionCheckedSSH(node);
         try {
             await ssh.connect();
 
@@ -566,6 +593,7 @@ class CascadeService {
             }
 
             logger.info(`[Cascade] Forward-hop config deployed to ${node.name}`);
+            return true;
         } finally {
             ssh.disconnect();
         }
@@ -880,6 +908,11 @@ class CascadeService {
      * excludeLinkIds is used by undeploy; no removed cascade is preserved.
      */
     async _deployPortalConfig(portalNode, opts = {}) {
+        return withClassicNodeConfigWrite({ nodeId: portalNode._id, kind: '_deployPortalConfig' }, () =>
+            this.#deployPortalConfigUnfenced(portalNode, opts));
+    }
+
+    async #deployPortalConfigUnfenced(portalNode, opts = {}) {
         // Topology-managed nodes get their full Xray config from the topology
         // deployment; the classic cascade writer would clobber it and uses
         // the persisted link.tunnelUuid, which mismatches the deterministic
@@ -899,7 +932,7 @@ class CascadeService {
             // mutation refusal must not be bypassed through an SSH fallback).
             throw undeployUncertain('Legacy undeploy requires SSH without an agent restart path');
         }
-        const createSSH = opts.requireCompletion ? completionCheckedSSH : node => new NodeSSH(node);
+        const createSSH = completionCheckedSSH;
         const syncService = require('./syncService');
         const users = await syncService._getUsersForNode(portalNode);
 
@@ -982,23 +1015,21 @@ class CascadeService {
             }
         }
 
+        if (!portalNode.ssh?.password && !portalNode.ssh?.privateKey) return false;
         const hasAgent = !!(portalNode.xray?.agentToken);
         if (hasAgent) {
             try {
-                await syncService._agentRequest(portalNode, 'POST', '/restart');
+                const restarted = await syncService._agentRequest(portalNode, 'POST', '/restart');
+                if (!Number.isInteger(restarted?.status) || restarted.status < 200 || restarted.status >= 300
+                    || restarted.data?.ok === false || restarted.data?.success === false) {
+                    throw undeployUncertain('Agent restart completion is unconfirmed');
+                }
                 logger.info(`[Cascade] Portal ${portalNode.name} restarted via agent`);
             } catch (err) {
                 logger.warn(`[Cascade] Portal agent restart: ${err.message}`);
                 // A deliberate agent HTTP refusal must not be overridden by SSH.
                 // The earlier config upload is separate; deployment still fails here.
-                if (err.code === 'AGENT_HTTP_ERROR') throw err;
-                if (portalNode.ssh?.password || portalNode.ssh?.privateKey) {
-                    const ssh = createSSH(portalNode);
-                    try {
-                        await ssh.connect();
-                        await ssh.exec('systemctl restart xray');
-                    } finally { ssh.disconnect(); }
-                }
+                throw err;
             }
         } else if (portalNode.ssh?.password || portalNode.ssh?.privateKey) {
             const ssh = createSSH(portalNode);
@@ -1007,6 +1038,7 @@ class CascadeService {
                 await ssh.exec('systemctl restart xray');
             } finally { ssh.disconnect(); }
         }
+        return true;
     }
 
     /**
@@ -1014,6 +1046,11 @@ class CascadeService {
      * Detects if bridgeNode is also a portal (relay) and generates appropriate config.
      */
     async _deployBridgeConfig(link, bridgeNode, portalNode, opts = {}) {
+        return withClassicNodeConfigWrite({ nodeId: bridgeNode._id, kind: '_deployBridgeConfig' }, () =>
+            this.#deployBridgeConfigUnfenced(link, bridgeNode, portalNode, opts));
+    }
+
+    async #deployBridgeConfigUnfenced(link, bridgeNode, portalNode, opts = {}) {
         if (!bridgeNode.ssh?.password && !bridgeNode.ssh?.privateKey) {
             throw new Error(`Bridge node ${bridgeNode.name} has no SSH credentials`);
         }
@@ -1045,7 +1082,7 @@ class CascadeService {
 
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
-        const ssh = opts.requireCompletion ? completionCheckedSSH(bridgeNode) : new NodeSSH(bridgeNode);
+        const ssh = completionCheckedSSH(bridgeNode);
         try {
             await ssh.connect();
 
@@ -1076,6 +1113,7 @@ class CascadeService {
             }
 
             logger.info(`[Cascade] ${isRelay ? 'Relay' : 'Bridge'} config deployed to ${bridgeNode.name}`);
+            return true;
         } finally {
             ssh.disconnect();
         }

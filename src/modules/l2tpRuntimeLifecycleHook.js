@@ -182,6 +182,7 @@ function createL2tpRootHostDependencies({
         throw new TypeError('L2TP root startup requires syncService._getUsersForNode');
     }
 
+    const configWriteEnv = Object.freeze({ ...env });
     const resolvedCandidateNodeResolver = candidateNodeResolver ?? (async ({ nodeId } = {}) => (
         HyNode.findById(nodeId)
             .select(CANDIDATE_NODE_XRAY_PROJECTION.join(' '))
@@ -209,12 +210,74 @@ function createL2tpRootHostDependencies({
             configGenerator: injectedConfigGenerator = configGenerator,
             fragmentProvider: injectedFragmentProvider = fragmentProvider,
         } = {}) {
-            return new L2tpXrayCandidateService({
+            const { withHeldL2tpNodeConfigWrite, assertHeldL2tpNodeConfigWrite } = require('../services/classicNodeConfigWrite');
+            const resolveExecutionNode = async nodeId => {
+                await assertHeldL2tpNodeConfigWrite(nodeId);
+                const node = await HyNode.findById(nodeId).select('_id name type active cascadeRole ip port xray ssh.port ssh.username ssh.privateKey ssh.password').lean();
+                if (!node || String(node._id) !== String(nodeId) || node.type !== 'xray'
+                    || node.active !== true || node.cascadeRole !== 'relay') throw new Error('NODE_EXECUTION_UNAVAILABLE');
+                return node;
+            };
+            const service = new L2tpXrayCandidateService({
                 configGenerator: injectedConfigGenerator,
                 userResolver,
                 nodeResolver,
                 fragmentProvider: injectedFragmentProvider,
+                currentConfigResolver: async ({ node }) => {
+                    const executionNode = await resolveExecutionNode(node._id);
+                    const ssh = new NodeSSH(executionNode);
+                    try {
+                        await ssh.connect();
+                        await assertHeldL2tpNodeConfigWrite(node._id);
+                        const current = await ssh.exec('cat /usr/local/etc/xray/config.json');
+                        if (current?.code !== 0 || typeof current.stdout !== 'string') throw new Error('CURRENT_XRAY_CONFIG_UNAVAILABLE');
+                        await assertHeldL2tpNodeConfigWrite(node._id);
+                        return current.stdout;
+                    } finally { ssh.disconnect(); }
+                },
             });
+            service.withLockedPreparation = withHeldL2tpNodeConfigWrite;
+            service.assertConfigWriteAllowed = async nodeId => {
+                const { topologyManagesNodeConfig } = require('../services/topologyConfigOwnership');
+                if (await topologyManagesNodeConfig({ _id: nodeId }, configWriteEnv)) {
+                    throw Object.assign(new Error('CLASSIC_CONFIG_WRITE_OWNER_VETO'), { code: 'CLASSIC_CONFIG_WRITE_OWNER_VETO' });
+                }
+            };
+            service.prepareIngress = async ({ plan }) => {
+                const relay = await resolveExecutionNode(plan.relayId);
+                const CascadeRouteGroup = require('./relay-l2tp/models/cascadeRouteGroupModel');
+                const CascadeLink = require('../models/cascadeLinkModel');
+                const group = await CascadeRouteGroup.findById(plan.routeGroupId).lean();
+                const path = group?.paths?.find(row => row.pathKey === plan.selectedPathKey && row.enabled !== false);
+                const reject = () => { throw Object.assign(new Error('CLASSIC_L2TP_PATH_UNAVAILABLE'), { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' }); };
+                if (!path?.linkIds?.length || !['forward', 'reverse'].includes(group.mode)) reject();
+                const links = await CascadeLink.find({ _id: { $in: path.linkIds }, active: true,
+                    status: { $in: ['online', 'deployed'] } }).populate('bridgeNode');
+                const first = links.find(row => String(row._id) === String(path.linkIds[0]));
+                const id = value => String(value?._id ?? value);
+                if (links.length !== path.linkIds.length || !first || id(first.portalNode) !== String(relay._id)
+                    || id(first.bridgeNode) !== plan.nextHopNodeId || (first.mode || 'reverse') !== group.mode) reject();
+                // Refuse an unavailable/sparse MAIN before even the secondary
+                // preparation writes. Candidate construction reads MAIN again
+                // afterwards, so forward preparation is not overwritten.
+                try {
+                    const current = JSON.parse(await service.currentConfigResolver({ node: relay, plan }));
+                    if (!Array.isArray(current?.inbounds) || !Array.isArray(current?.outbounds)
+                        || !Array.isArray(current?.routing?.rules)) throw new Error();
+                } catch {
+                    throw Object.assign(new Error('CURRENT_XRAY_CONFIG_UNAVAILABLE'), { code: 'CURRENT_XRAY_CONFIG_UNAVAILABLE' });
+                }
+                const cascade = require('../services/cascadeService');
+                if (group.mode === 'forward') {
+                    if (await cascade._deployPortalConfig(relay) !== true) reject();
+                } else {
+                    const incoming = await CascadeLink.find({ bridgeNode: relay._id, active: true,
+                        mode: { $ne: 'forward' }, status: { $in: ['online', 'deployed'] } }).populate('portalNode');
+                    if (incoming.length !== 1 || !incoming[0].portalNode?._id) reject();
+                    if (await cascade._deployBridgeConfig(incoming[0], relay, incoming[0].portalNode) !== true) reject();
+                }
+            };
+            return service;
         },
         createPreflightRunner,
         candidateNodeResolver: resolvedCandidateNodeResolver,

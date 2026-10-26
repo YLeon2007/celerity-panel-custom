@@ -11,16 +11,18 @@ const failure = code => Object.assign(new Error(code), { code });
 // dispatched effects. A false/unknown result or throw keeps the uncertain row.
 async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, callback) {
     const selectedEnv = Object.freeze({ ...env });
-    if (!resolveL2tpExecutionAuthorization(selectedEnv).enableInstallAdmission) return callback();
     if (!nodeId || typeof kind !== 'string' || !kind) throw failure('CLASSIC_CONFIG_WRITE_INVALID');
     const key = String(nodeId);
     const parent = heldWrites.getStore();
     const nested = parent?.get(key);
     if (nested && !nested.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+    if (!nested && !resolveL2tpExecutionAuthorization(selectedEnv).enableInstallAdmission) return callback();
     async function run(scope) {
         scope.pending++;
         try {
+            await scope.verify?.();
             const result = await callback();
+            await scope.verify?.();
             if (result !== true) scope.uncertain = true;
             return result;
         } catch (error) {
@@ -48,7 +50,14 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, c
         || typeof lock.generation !== 'string' || !lock.generation || lock.remoteUncertain !== true) {
         throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
     }
-    const scope = { active: true, uncertain: false, pending: 0 };
+    const scope = { active: true, uncertain: false, pending: 0, verify: async () => {
+        if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+        const row = await service.repository.findByNode(nodeId);
+        if (!scope.active || !row || String(row.node) !== key || row.owner !== owner
+            || row.operationId !== operationId || row.generation !== lock.generation
+            || row.remoteUncertain !== true || !(row.leaseUntil instanceof Date)
+            || row.leaseUntil <= service.clock.now()) throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
+    } };
     const scopes = new Map(parent || []);
     scopes.set(key, scope);
     try {
@@ -72,4 +81,55 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, c
     }
 }
 
-module.exports = { withClassicNodeConfigWrite };
+// Internal worker-to-classic bridge. The supplied service is the actual
+// already-acquired worker lock service, not a caller-controlled bypass flag.
+// Never acquires or releases a generation; the worker owns settlement.
+async function withHeldL2tpNodeConfigWrite({ lock: acquiredLock, lockService, clock }, callback) {
+    const lock = Object.freeze({ node: acquiredLock?.node, owner: acquiredLock?.owner,
+        operationId: acquiredLock?.operationId, generation: acquiredLock?.generation });
+    const { NodeOperationLockService } = require('../modules/relay-l2tp/services/nodeOperationLockService');
+    if (!(lockService instanceof NodeOperationLockService) || !lock?.generation
+        || typeof clock?.now !== 'function') throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
+    const key = String(lock.node);
+    const scope = { active: true, uncertain: false, pending: 0, verify: async () => {
+        if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+        const row = await lockService.repository.findByNode(lock.node);
+        if (!scope.active || !row || String(row.node) !== key || row.owner !== lock.owner
+            || row.operationId !== lock.operationId || row.generation !== lock.generation
+            || row.remoteUncertain !== true || !(row.leaseUntil instanceof Date)
+            || row.leaseUntil <= clock.now()) throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
+    } };
+    await scope.verify();
+    const scopes = new Map(heldWrites.getStore() || []);
+    if (scopes.has(key)) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CONFLICT');
+    scopes.set(key, scope);
+    try {
+        return await heldWrites.run(scopes, async () => {
+            const result = await callback();
+            await scope.verify();
+            if (scope.uncertain || scope.pending !== 0) throw failure('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
+            return result;
+        });
+    } catch (error) {
+        // A swallowed/unknown nested classic dispatch cannot authorize release.
+        if (scope.uncertain || scope.pending !== 0) error.remoteOutcomeUncertain = true;
+        throw error;
+    } finally { scope.active = false; }
+}
+
+async function assertHeldL2tpNodeConfigWrite(nodeId) {
+    const scope = heldWrites.getStore()?.get(String(nodeId));
+    if (!scope?.verify || !scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+    await scope.verify();
+}
+
+async function assertClassicNodeConfigWriteHeld(nodeId) {
+    const scope = heldWrites.getStore()?.get(String(nodeId));
+    if (scope) {
+        if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+        await scope.verify?.();
+    }
+}
+
+module.exports = { withClassicNodeConfigWrite, withHeldL2tpNodeConfigWrite,
+    assertHeldL2tpNodeConfigWrite, assertClassicNodeConfigWriteHeld };

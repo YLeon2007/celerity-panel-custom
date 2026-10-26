@@ -144,8 +144,9 @@ test('exact release cannot delete a replacement generation', async () => {
         replacement = { ...f.rows.get(NODE), generation: 'foreign-generation' };
         f.rows.set(NODE, replacement);
         return true;
-    }), { code: 'CLASSIC_CONFIG_WRITE_RELEASE_UNCERTAIN' });
+    }), { code: 'CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN' });
     assert.deepEqual(f.rows.get(NODE), replacement);
+    assert.equal(f.events.includes('release'), false);
 });
 
 test('failed delete acknowledgement never retries or adopts another generation', async () => {
@@ -179,7 +180,7 @@ test('unawaited same-node work keeps lock even when outer callback returns true'
     });
     assert.equal(f.rows.size, 1);
     assert.equal(f.events.includes('release'), false);
-    finish(); await nested;
+    finish(); await assert.rejects(nested, { code: 'CLASSIC_CONFIG_WRITE_SCOPE_CLOSED' });
     assert.equal(f.rows.size, 1);
 });
 
@@ -206,6 +207,10 @@ function syncFixture(options = {}) {
     loaded.paths = Module._nodeModulePaths(path.dirname(syncFilename));
     loaded.require = id => {
         if (id === './classicNodeConfigWrite') return f;
+        if (id === './classicL2tpConfigComposition') return Module.prototype.require.call(loaded, id);
+        // This fixture has no cascade links/groups; the actual composition is
+        // exercised by l2tpDefaultRootIntegration with persisted path records.
+        if (id === './cascadeService') return { _applyClassicL2tpPathIngress: async config => config };
         if (id.endsWith('/l2tpExecutionAuthorization') || id.endsWith('/l2tpXrayConfigMerge')) return Module.prototype.require.call(loaded, id);
         if (id === './topologyConfigOwnership') return { APPLIED_LINK_STATUSES: [], usesTestTopologyConfig: () => false,
             topologyManagesNodeConfig: async () => !!options.initialVeto };
@@ -262,7 +267,7 @@ test('sync acquires before live preservation read/generation and retains L2TP se
     const uploaded = JSON.parse(f.uploaded);
     assert.deepEqual(uploaded.inbounds, [inbound]);
     assert.deepEqual(uploaded.outbounds, [outbound]);
-    assert.deepEqual(uploaded.routing.rules, [rule]);
+    assert.deepEqual(uploaded.routing.rules, [rule, { type: 'field', ip: ['geoip:private'], outboundTag: 'blackhole' }]);
 });
 
 for (const options of [

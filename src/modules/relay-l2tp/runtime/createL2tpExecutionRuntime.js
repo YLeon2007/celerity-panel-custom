@@ -424,6 +424,7 @@ function createL2tpExecutionRuntime({
         nodeSSHFactory: node => new NodeSSH(node),
         remoteAdmissionRepository,
         lockService,
+        configWriteEnv: { PANEL_DOMAIN: authorization.executionContext?.hostIdentity },
         allowRemoteExecution: executionAuthorized(authorization)
             && runtimeDependencies?.enableInstallAdmission === true,
         secretBox,

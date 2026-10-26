@@ -253,6 +253,7 @@ class L2tpSimpleService {
         remoteAdmissionRepository = null,
         lockService = null,
         allowRemoteExecution = false,
+        configWriteEnv = process.env,
         secretBox = null,
         secretKey = null,
     } = {}) {
@@ -299,6 +300,7 @@ class L2tpSimpleService {
         this.remoteAdmissionRepository = remoteAdmissionRepository;
         this.lockService = lockService;
         this.allowRemoteExecution = allowRemoteExecution === true;
+        this.configWriteEnv = Object.freeze({ PANEL_DOMAIN: configWriteEnv.PANEL_DOMAIN });
         this.secretBox = secretBox;
         this.secretKey = secretKey;
     }
@@ -901,6 +903,10 @@ class L2tpSimpleService {
                 throw simpleError('NODE_OPERATION_LOCK_CONFLICT', 'The relay is busy with another operation');
             }
             lock = acquired.lock;
+            const { topologyManagesNodeConfig } = require('../../../services/topologyConfigOwnership');
+            if (await topologyManagesNodeConfig({ _id: selectedNodeId }, this.configWriteEnv)) {
+                throw simpleError('CLASSIC_CONFIG_WRITE_OWNER_VETO', 'Topology owns this relay configuration');
+            }
             const ssh = this.nodeSSHFactory(node);
             try {
                 const result = await ssh.exec(buildTeardownScript(state));

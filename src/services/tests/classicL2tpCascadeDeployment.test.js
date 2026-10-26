@@ -30,8 +30,13 @@ class SSH {
     disconnect() {}
     async uploadContent(content, path) { uploads.push({ content, path }); }
     async exec(command) {
-        if (command.includes('cat /usr/local/etc/xray/config.json')) return { code: 0, stdout: live, stderr: '' };
-        return { code: 0, stdout: command.includes('is-active') ? 'active' : '/usr/local/bin/xray', stderr: '' };
+        if (command.includes('cat /usr/local/etc/xray/config.json')) {
+            const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
+            return { code: 0, stdout: live + (receipt ? '\n' + receipt[0] + '\n' : ''), stderr: '' };
+        }
+        const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
+        const stdout = command.includes('is-active') ? 'active' : '/usr/local/bin/xray';
+        return { code: 0, stdout: stdout + (receipt ? '\n' + receipt[0] + '\n' : ''), stderr: '' };
     }
 }
 const original = Module._load;
