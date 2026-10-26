@@ -18,6 +18,8 @@ const Settings = require('../models/settingsModel');
 const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
 const { mergePreservedL2tpConfig } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
+const { withClassicNodeConfigWrite } = require('./classicNodeConfigWrite');
+const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const NodeSSH = require('./nodeSSH');
 const configGenerator = require('./configGenerator');
 const cache = require('./cacheService');
@@ -484,10 +486,46 @@ class SyncService {
      */
     async updateXrayNodeConfig(node) {
         logger.info(`[Xray Sync] Updating config for node ${node.name} (${node.ip})`);
+        const writerEnv = Object.freeze({ ...process.env });
         const allowedStatuses = usesTestTopologyConfig(node) ? APPLIED_LINK_STATUSES : undefined;
         // Select the server policy before the first async boundary. A failed
         // ownership read must not authorize a classic rewrite.
         const topologyManaged = await this._topologyManagesNode(node);
+        const fenced = !topologyManaged && resolveL2tpExecutionAuthorization(writerEnv).enableInstallAdmission;
+        const update = () => this.#updateXrayNodeConfig(node, { topologyManaged, allowedStatuses, fenced });
+        // Managed nodes keep their existing user-only path. Classic writers
+        // recheck the durable veto inside the acquired generation before work.
+        return topologyManaged ? update() : withClassicNodeConfigWrite({
+            nodeId: node._id, kind: 'sync-xray', env: writerEnv,
+        }, update);
+    }
+
+    async #updateXrayNodeConfig(node, { topologyManaged, allowedStatuses, fenced }) {
+        // Keep the old best-effort behavior dormant, but never turn a swallowed
+        // error/nonzero/unknown remote completion into verified fence release.
+        let completionFailed = false;
+        const createSSH = () => {
+            const ssh = new NodeSSH(node);
+            if (fenced) {
+                const exec = ssh.exec.bind(ssh);
+                ssh.exec = async (...args) => {
+                    try {
+                        const result = await exec(...args);
+                        if (result?.code !== 0) throw new Error('CLASSIC_CONFIG_COMMAND_UNCERTAIN');
+                        return result;
+                    } catch (error) { completionFailed = true; throw error; }
+                };
+                const upload = ssh.uploadContent.bind(ssh);
+                ssh.uploadContent = async (...args) => {
+                    try {
+                        const result = await upload(...args);
+                        // NodeSSH's checked WRITE+CLOSE upload resolves void.
+                        if (result !== undefined) throw new Error('CLASSIC_CONFIG_UPLOAD_UNCERTAIN');
+                    } catch (error) { completionFailed = true; throw error; }
+                };
+            }
+            return ssh;
+        };
         await HyNode.updateOne({ _id: node._id }, { $set: { status: 'syncing' } });
 
         // Resolve ownership before generation: topology config may use a
@@ -529,7 +567,7 @@ class SyncService {
             logger.info(`[Xray Sync] Node ${node.name}: config upload and restart skipped (topology-managed node)`);
         }
         if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
-            const ssh = new NodeSSH(node);
+            const ssh = createSSH();
             try {
                 await ssh.connect();
 
@@ -582,6 +620,7 @@ class SyncService {
                         configContent = JSON.stringify(configObj, null, 2);
                     }
                 } catch (cascadeErr) {
+                    if (fenced) throw cascadeErr;
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
                 }
 
@@ -596,7 +635,17 @@ class SyncService {
                     });
                     if (hasInstalledL2tp) {
                         const current = await ssh.exec('cat /usr/local/etc/xray/config.json 2>/dev/null || true');
+                        if (fenced && !current?.stdout) throw new Error('CLASSIC_CONFIG_L2TP_READ_UNCERTAIN');
                         if (current?.stdout) {
+                            if (fenced) {
+                                // The compatibility merger deliberately returns
+                                // the base on malformed JSON. That is unsafe
+                                // evidence for a fenced preservation write.
+                                const live = JSON.parse(current.stdout);
+                                if (!live || typeof live !== 'object' || Array.isArray(live)) {
+                                    throw new Error('CLASSIC_CONFIG_L2TP_READ_UNCERTAIN');
+                                }
+                            }
                             const merged = mergePreservedL2tpConfig(configContent, current.stdout);
                             if (merged !== configContent) {
                                 logger.info(`[Xray Sync] Node ${node.name}: preserved L2TP-managed Xray sections`);
@@ -605,6 +654,7 @@ class SyncService {
                         }
                     }
                 } catch (l2tpErr) {
+                    if (fenced) throw l2tpErr;
                     logger.warn(`[Xray Sync] Node ${node.name}: L2TP section preservation skipped: ${l2tpErr.message}`);
                 }
 
@@ -621,6 +671,7 @@ class SyncService {
                             + 'touch /var/log/xray/access.log && chown nobody /var/log/xray/access.log 2>/dev/null || true'
                         );
                     } catch (dirErr) {
+                        if (fenced) throw dirErr;
                         logger.warn(`[Xray Sync] Node ${node.name}: access-log dir prep failed: ${dirErr.message}`);
                     }
                 }
@@ -637,15 +688,19 @@ class SyncService {
                     try {
                         await nodeSetup.reloadCcAgent(node, ssh);
                     } catch (reloadErr) {
+                        if (fenced) throw reloadErr;
                         logger.warn(`[Xray Sync] Node ${node.name}: cc-agent reload failed: ${reloadErr.message}`);
                     }
                 }
             } catch (error) {
+                if (fenced) return false;
                 logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
             } finally {
                 ssh.disconnect();
             }
         }
+
+        if (fenced && !topologyManaged && !node.ssh?.password && !node.ssh?.privateKey) return false;
 
         // Step 2: Restart Xray via Agent (preferred) or SSH fallback
         const hasAgent = !!(node.xray?.agentToken);
@@ -664,6 +719,7 @@ class SyncService {
                 await this._agentRequest(node, 'POST', '/restart');
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via agent`);
             } catch (error) {
+                if (fenced) return false;
                 logger.warn(`[Xray Sync] Node ${node.name}: agent restart failed: ${error.message}`);
                 if (error.code === 'AGENT_HTTP_ERROR') {
                     await HyNode.updateOne({ _id: node._id }, {
@@ -674,12 +730,13 @@ class SyncService {
                 }
             }
         } else if (!topologyManaged && (node.ssh?.password || node.ssh?.privateKey)) {
-            const ssh = new NodeSSH(node);
+            const ssh = createSSH();
             try {
                 await ssh.connect();
                 await ssh.exec('systemctl restart xray');
                 logger.info(`[Xray Sync] Node ${node.name}: restarted via SSH`);
             } catch (error) {
+                if (fenced) return false;
                 logger.warn(`[Xray Sync] Node ${node.name}: SSH restart failed: ${error.message}`);
             } finally {
                 ssh.disconnect();
@@ -699,6 +756,7 @@ class SyncService {
                 await this._agentRequest(node, 'POST', '/sync', { users: userPayload });
                 logger.info(`[Xray Sync] Node ${node.name}: synced ${userPayload.length} users via agent`);
             } catch (error) {
+                if (fenced) return false;
                 logger.warn(`[Xray Sync] Node ${node.name}: agent sync failed: ${error.message}`);
                 if (topologyManaged || error.code === 'AGENT_HTTP_ERROR') {
                     await HyNode.updateOne({ _id: node._id }, {
@@ -718,7 +776,9 @@ class SyncService {
                 await invalidateNodesCache();
                 return false;
             }
-        } catch (_) {}
+        } catch (_) { if (fenced) return false; }
+
+        if (completionFailed) return false;
 
         await HyNode.updateOne({ _id: node._id }, {
             $set: { status: 'online', lastSync: new Date(), lastError: '', healthFailures: 0 },

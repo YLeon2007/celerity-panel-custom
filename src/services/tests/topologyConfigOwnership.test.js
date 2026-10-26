@@ -49,6 +49,20 @@ function node(role = 'portal') {
 
 function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [], operations = [], owners = [] } = {}) {
     const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0, ownerReads: [] };
+    // Actual helper/service/repository, local persistence seam only.
+    const Lock = require('../../modules/relay-l2tp/models/nodeOperationLockModel');
+    const locks = new Map();
+    t.mock.method(Lock, 'create', async row => {
+        if (locks.has(String(row.node))) throw Object.assign(new Error('duplicate'), { code: 11000 });
+        locks.set(String(row.node), row);
+        return row;
+    });
+    t.mock.method(Lock, 'deleteOne', async filter => {
+        const row = locks.get(String(filter.node));
+        if (!row || !Object.entries(filter).every(([key, value]) => row[key] === value)) return { deletedCount: 0 };
+        locks.delete(String(filter.node));
+        return { deletedCount: 1 };
+    });
     // Fake native persistence only: no Mongo, model initialization or DDL.
     const priorDb = TopologyOperation.db.db;
     TopologyOperation.db.db = { collection(name) {
@@ -84,7 +98,7 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
     t.mock.method(NodeSSH.prototype, 'connect', async () => { calls.sshConnections++; });
     t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
     t.mock.method(NodeSSH.prototype, 'uploadContent', async (content, path) => { calls.uploads.push({ content, path }); });
-    t.mock.method(NodeSSH.prototype, 'exec', async () => ({ stdout: '' }));
+    t.mock.method(NodeSSH.prototype, 'exec', async () => ({ code: 0, stdout: '' }));
     t.mock.method(configGenerator, 'generateXrayConfigWithApi', () => {
         calls.generated++;
         return JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } });
@@ -235,13 +249,13 @@ test('online applied links retain topology ownership', async t => {
     assert.deepEqual(calls.agent.map(c => c.path), ['/sync']);
 });
 
-test('legacy classic sync preserves its result on failed agent user sync', async t => {
+test('disabled L2TP classic sync preserves its legacy result on failed agent user sync', async t => {
     const calls = stubSync(t, { connected: false });
     t.mock.method(syncService, '_agentRequest', async (_node, _method, path) => {
         if (path === '/sync') throw new Error('agent /sync unavailable');
         return { data: {} };
     });
-    await withFlags([true, true, true], async () => {
+    await withFlags([true, true, false], async () => {
         assert.equal(await syncService.updateXrayNodeConfig(node()), true);
     });
     assert.equal(calls.generated, 1);
