@@ -41,6 +41,18 @@ class SSH {
 }
 const original = Module._load;
 Module._load = function(request, parent, isMain) {
+    if (parent?.filename.endsWith('/syncService.js')) {
+        if (request === '../models/cascadeLinkModel') return { find: filter => query(links.filter(row => matches(row, filter))) };
+        if (request === '../models/hyNodeModel') return { updateOne: async () => ({}) };
+        if (request === '../models/hyUserModel' || request === '../models/settingsModel') return {};
+        if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => true };
+        if (request === './nodeSSH') return SSH;
+        if (request === './topologyConfigOwnership') return { usesTestTopologyConfig: () => false, topologyManagesNodeConfig: async () => false };
+        if (request === './cacheService' || request === './webhookService') return {};
+        if (request === './nodeSetup') return {};
+        if (request === '../utils/helpers') return { invalidateNodesCache: async () => {} };
+        if (request === '../utils/logger') return { info() {}, warn() {}, error() {} };
+    }
     if (parent?.filename.endsWith('/cascadeService.js')) {
         if (request === '../models/cascadeLinkModel') return { find: filter => query(links.filter(row => matches(row, filter))) };
         if (request.endsWith('/cascadeRouteGroupModel')) return { find: filter => query(groups.filter(row => matches(row, filter))) };
@@ -55,6 +67,7 @@ Module._load = function(request, parent, isMain) {
     return original.call(this, request, parent, isMain);
 };
 const cascade = require('../cascadeService');
+const sync = require('../syncService');
 // Dynamic dependencies are loaded during each call as well.
 process.on('exit', () => { Module._load = original; });
 
@@ -70,6 +83,91 @@ test('classic portal regeneration preserves installed L2TP sections and subscrip
     assert(config.inbounds.some(row => row.tag === 'relay-l2tp-group'));
     assert.deepEqual(config.outbounds.find(row => row.tag === 'cascade-main'), fragment.outbounds[0]);
     assert.equal(config.inbounds.find(row => row.tag === 'vless-in').settings.clients[0].id, users[0].xrayUuid);
+});
+
+for (const writer of ['sync', 'cascade']) test(`${writer}: mixed transit relay leaves reverse listeners exclusively in sidecar and preserves ordinary main data`, async t => {
+    const prior = { links, groups, live };
+    const node = { ...relay,
+        outbounds: [{ name: 'operator', type: 'socks5', addr: '192.0.2.99:1080' }],
+        aclRules: ['operator(all)'],
+        xray: { ...relay.xray, extraInbounds: [{ inboundTag: 'extra-vless', port: 8443, transport: 'tcp', security: 'none' }] },
+    };
+    const geo = { ...down, _id: 'down0002', tunnelPort: 10087, tunnelUuid: 'geo-uuid', geoRouting: { enabled: true, domains: ['google'], geoip: ['ru'] } };
+    const forwardOut = { ...down, _id: 'fwdout01', mode: 'forward', tunnelPort: 12000 };
+    const forwardIn = { ...upstream, _id: 'fwdin001', mode: 'forward', tunnelPort: 13000 };
+    const fragment = require('../../modules/relay-l2tp/services/l2tpXrayFragmentProvider').buildL2tpXrayFragment({
+        plan: { relay: { controlPlaneIps: [relay.ip] }, group: { id: 'group' }, paths: [{ pathKey: 'main', healthy: true, outboundTag: 'cascade-main' }], selectedPathKey: 'main' },
+        tags: { inbound: 'relay-l2tp-group', blockOutbound: 'block' }, tproxyPort: 12345,
+    });
+    try {
+        links = [upstream, { ...upstream, _id: 'up000002' }, down, geo, forwardOut, forwardIn];
+        groups = [group];
+        // Faithful old ordinary-Sync shape: duplicated main listeners must not
+        // survive regeneration or the preservation of the installed fragment.
+        const old = JSON.parse(generator.generateXrayConfigWithApi(node, users, { fragments: [fragment] }));
+        generator.applyReversePortal(old, [down, geo], ['vless-in', 'extra-vless']);
+        live = JSON.stringify(old);
+        t.mock.method(sync, '_getUsersForNode', async () => users);
+        t.mock.method(sync, 'checkXrayAgentHealth', async () => ({ online: true }));
+        const secondary = JSON.parse(generator.generateRelayConfig(upstream, upstream.portalNode, [down, geo], [], [{ link: { ...upstream, _id: 'up000002' }, portal: upstream.portalNode }]));
+        const sidecarBefore = JSON.stringify(secondary);
+        for (let repeat = 0; repeat < 2; repeat++) {
+            uploads.length = 0;
+            assert.equal(await (writer === 'sync' ? sync.updateXrayNodeConfig(node) : cascade._deployPortalConfig(node)), true);
+            assert.deepEqual(uploads.map(row => row.path), ['/usr/local/etc/xray/config.json']);
+            const main = JSON.parse(uploads[0].content);
+            assert.equal(main.inbounds.filter(row => [10086, 10087].includes(row.port)).length, 0,
+                'reverse downstream listeners belong only to the transit sidecar');
+            assert.equal(main.reverse?.portals?.length || 0, 0);
+            assert(!main.routing.rules.some(row => row.outboundTag?.startsWith('portal-') || row.balancerTag === 'cascade-balancer'));
+            for (const port of [10086, 10087]) assert.equal([...main.inbounds, ...secondary.inbounds].filter(row => row.port === port).length, 1);
+            for (const tag of ['vless-in', 'extra-vless', 'API_INBOUND', 'relay-l2tp-group']) {
+                assert.deepEqual(main.inbounds.find(row => row.tag === tag), old.inbounds.find(row => row.tag === tag));
+            }
+            for (const tag of ['operator', 'cascade-main']) assert.deepEqual(main.outbounds.find(row => row.tag === tag), old.outbounds.find(row => row.tag === tag));
+            assert(main.inbounds.some(row => row.port === 13000), 'unrelated forward-hop listener remains main-owned');
+            assert(main.outbounds.some(row => row.tag === 'fwd-fwdout01'), 'unrelated forward chain remains main-owned');
+            for (const rule of old.routing.rules.filter(row => row.inboundTag?.includes('relay-l2tp-group') || row.ruleTag === 'acl-catch-all')) {
+                assert(main.routing.rules.some(row => JSON.stringify(row) === JSON.stringify(rule)));
+            }
+            assert.equal(JSON.stringify(secondary), sidecarBefore, 'main regeneration does not mutate or stop the sidecar');
+            assert.equal(secondary.reverse.bridges.length, 2, 'both transit upstreams remain');
+            live = JSON.stringify(main);
+        }
+    } finally { links = prior.links; groups = prior.groups; live = prior.live; }
+});
+
+for (const writer of ['sync', 'cascade']) test(`${writer}: actual upstream mode, not declared node role, determines reverse listener profile`, async t => {
+    const prior = { links, live };
+    const fragment = require('../../modules/relay-l2tp/services/l2tpXrayFragmentProvider').buildL2tpXrayFragment({
+        plan: { relay: { controlPlaneIps: [relay.ip] }, group: { id: 'group' }, paths: [{ pathKey: 'main', healthy: true, outboundTag: 'cascade-main' }], selectedPathKey: 'main' },
+        tags: { inbound: 'relay-l2tp-group', blockOutbound: 'block' }, tproxyPort: 12345,
+    });
+    t.mock.method(sync, '_getUsersForNode', async () => users);
+    t.mock.method(sync, 'checkXrayAgentHealth', async () => ({ online: true }));
+    try {
+        for (const role of ['portal', 'relay', 'bridge', 'standalone']) {
+            for (const incoming of [null, { ...upstream, mode: 'forward' }, upstream, { ...upstream, mode: undefined }, { ...upstream, active: false }]) {
+                const node = { ...relay, cascadeRole: role };
+                links = [down, ...(incoming ? [incoming] : [])];
+                live = generator.generateXrayConfigWithApi(node, users, { fragments: [fragment] });
+                uploads.length = 0;
+                assert.equal(await (writer === 'sync' ? sync.updateXrayNodeConfig(node) : cascade._deployPortalConfig(node)), true);
+                const main = JSON.parse(uploads[0].content);
+                const reverseTransit = incoming?.active === true && incoming.mode !== 'forward';
+                assert.equal(main.inbounds.some(row => row.tag === 'bridge-conn-down0001'), !reverseTransit,
+                    `${role}: only a real active reverse upstream transfers downstream listeners to sidecar`);
+            }
+        }
+        if (writer === 'cascade') {
+            links = [upstream, down];
+            live = generator.generateXrayConfigWithApi(relay, users, { fragments: [fragment] });
+            uploads.length = 0;
+            await cascade._deployPortalConfig(relay, { excludeLinkIds: [upstream._id] });
+            assert(JSON.parse(uploads[0].content).inbounds.some(row => row.tag === 'bridge-conn-down0001'),
+                'removed upstream must not keep the remaining portal sidecar-owned');
+        }
+    } finally { links = prior.links; live = prior.live; }
 });
 
 test('classic forward main upload exposes its accepted path ingress without changing tunnel credentials', async () => {

@@ -947,7 +947,16 @@ class CascadeService {
             ...statusFilter,
         }).populate('bridgeNode')).filter(l => !excludeSet.has(String(l._id)));
 
-        const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
+        const allBridgeLinks = (await CascadeLink.find({
+            bridgeNode: portalNode._id,
+            active: true,
+            ...statusFilter,
+        })).filter(l => !excludeSet.has(String(l._id)));
+        // Reverse transit portals/listeners live in xray-bridge, not main.
+        // Use the actual link modes, not a role label: a forward upstream
+        // alone must not suppress an ordinary main-owned reverse portal.
+        const hasReverseUpstream = allBridgeLinks.some(link => link.mode !== 'forward');
+        const reverseLinks = hasReverseUpstream ? [] : allPortalLinks.filter(l => l.mode !== 'forward');
         const forwardLinks = await this._getForwardChainLinks(portalNode._id, excludeSet, allowedStatuses);
 
         // Cascade routing applies to ALL client-facing inbounds (main + extras).
@@ -965,12 +974,7 @@ class CascadeService {
             configGenerator.applyForwardChain(config, forwardLinks, inboundTags);
         }
 
-        const forwardHopLinks = (await CascadeLink.find({
-            bridgeNode: portalNode._id,
-            mode: 'forward',
-            active: true,
-            ...statusFilter,
-        })).filter(l => !excludeSet.has(String(l._id)));
+        const forwardHopLinks = allBridgeLinks.filter(link => link.mode === 'forward');
         // This path is classic-owned; topology-owned nodes returned before
         // generation. Keep legacy forward listeners in the main config.
         if (forwardHopLinks.length > 0) {

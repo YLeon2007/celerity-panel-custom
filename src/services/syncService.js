@@ -579,7 +579,12 @@ class SyncService {
                     // classic behavior when topology execution is disabled.
                     const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
                     const allPortalLinks = await CascadeLink.find({ portalNode: node._id, active: true, ...statusFilter }).populate('bridgeNode');
-                    const forwardHopLinks = await CascadeLink.find({ bridgeNode: node._id, mode: 'forward', active: true, ...statusFilter });
+                    const allBridgeLinks = await CascadeLink.find({ bridgeNode: node._id, active: true, ...statusFilter });
+                    const forwardHopLinks = allBridgeLinks.filter(link => link.mode === 'forward');
+                    // An actual reverse upstream makes this a transit relay:
+                    // xray-bridge owns its downstream portals/listeners. Main
+                    // must not bind them again (Xray enables SO_REUSEPORT).
+                    const hasReverseUpstream = allBridgeLinks.some(link => link.mode !== 'forward');
 
                     if (allPortalLinks.length > 0 || forwardHopLinks.length > 0) {
                         const configObj = JSON.parse(configContent);
@@ -593,7 +598,7 @@ class SyncService {
                                 .filter(Boolean),
                         ];
 
-                        const reverseLinks = allPortalLinks.filter(l => l.mode !== 'forward');
+                        const reverseLinks = hasReverseUpstream ? [] : allPortalLinks.filter(l => l.mode !== 'forward');
                         const forwardLinks = await this._getForwardChainLinks(node._id, allowedStatuses);
 
                         if (reverseLinks.length > 0) {

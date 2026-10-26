@@ -41,6 +41,34 @@ test('classic ingress refuses missing/unconfirmed/disconnected links, wrong egre
     assert.throws(() => applyClassicL2tpPathIngress(base(), { nodeId: 'relay', groups: [group, { ...group, _id: 'other-group' }], links: [first, second], mode: 'reverse' }), { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' });
 });
 
+const { isIP } = require('node:net');
+
+// Fixed public-target first-match probe for the generator's actual field rules.
+// The target has no reverse-handshake domain or geo classification.
+function publicTargetRoute(config, inboundTag, ip, network) {
+    return config.routing.rules.find(rule => (!rule.inboundTag || rule.inboundTag.includes(inboundTag))
+        && (!rule.network || rule.network.split(',').includes(network))
+        && !rule.domain
+        && (!rule.ip || rule.ip.some(cidr => cidr === '::/0' && isIP(ip) === 6)));
+}
+
+test('canonical classic sidecar selects IPv4 path by first match while retaining fail-closed IPv6/private guards', () => {
+    const config = JSON.parse(generator.generateRelayConfig(upstream, { ip: '192.0.2.1' }, [first, other], [], [
+        { link: { ...upstream, _id: 'up000002' }, portal: { ip: '192.0.2.9' } },
+    ]));
+    const guards = config.routing.rules.filter(rule => !rule.inboundTag && rule.outboundTag === 'blackhole');
+    applyClassicL2tpPathIngress(config, { nodeId: 'relay', groups: [group], links: [first, second, other], mode: 'reverse' });
+    for (const network of ['tcp', 'udp']) {
+        assert.equal(publicTargetRoute(config, 'cascade-chosen', '1.1.1.1', network)?.outboundTag, 'portal-down-down0001');
+        assert.equal(publicTargetRoute(config, 'cascade-chosen', '2606:4700:4700::1111', network)?.outboundTag, 'blackhole');
+    }
+    assert.deepEqual(config.routing.rules.filter(rule => !rule.inboundTag && rule.outboundTag === 'blackhole'), guards,
+        'do not delete or weaken the existing fail-closed rules');
+    assert(!config.routing.rules.some(rule => rule.outboundTag === 'blackhole' && rule.network === 'tcp,udp'
+        && !rule.inboundTag && !rule.ip && !rule.domain), 'canonical generator has no unconditional tcp,udp blackhole before ingress');
+    assert.equal(config.reverse.bridges.length, 2);
+});
+
 test('classic reverse SOCKS ingress routes exactly to accepted first downstream portal, not geo sibling or direct', () => {
     const config = JSON.parse(generator.generateRelayConfig(upstream, { ip: '192.0.2.1' }, [first, other]));
     applyClassicL2tpPathIngress(config, { nodeId: 'relay', groups: [group], links: [first, second, other], mode: 'reverse' });
