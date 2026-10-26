@@ -11,6 +11,7 @@ const syncService = require('../syncService');
 const sshPool = require('../sshPoolService');
 const HyNode = require('../../models/hyNodeModel');
 const CascadeLink = require('../../models/cascadeLinkModel');
+const CascadeRouteGroup = require('../../modules/relay-l2tp/models/cascadeRouteGroupModel');
 const TopologyOperation = require('../../modules/relay-l2tp/models/topologyOperationModel');
 const cascadeService = require('../cascadeService');
 const sift = require('sift').default;
@@ -73,6 +74,7 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
         return Object.assign(Promise.resolve(found), { populate: async () => found });
     });
     t.mock.method(RelayL2tpState, 'exists', async () => null);
+    t.mock.method(CascadeRouteGroup, 'find', () => ({ lean: async () => [] }));
     t.mock.method(nodeSetup, 'reloadCcAgent', async () => {});
     t.mock.method(syncService, '_getUsersForNode', async () => [{ userId: 'u1', xrayUuid: 'uuid-1' }]);
     t.mock.method(syncService, 'checkXrayAgentHealth', async () => ({ online: true }));

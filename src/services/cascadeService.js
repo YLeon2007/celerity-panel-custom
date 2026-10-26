@@ -11,6 +11,8 @@ const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
 const configGenerator = require('./configGenerator');
+const { applyClassicL2tpPathIngress, finishClassicConfigRouting } = require('./classicL2tpConfigComposition');
+const { mergePreservedL2tpSections } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const NodeSSH = require('./nodeSSH');
 const cache = require('./cacheService');
@@ -446,7 +448,9 @@ class CascadeService {
             throw new Error(`Relay node ${node.name} has no SSH credentials`);
         }
 
-        const relayConfig = configGenerator.generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks);
+        const relay = JSON.parse(configGenerator.generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks));
+        await this._applyClassicL2tpPathIngress(relay, node, { mode: 'reverse' });
+        const relayConfig = JSON.stringify(relay, null, 2);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
         const ssh = new NodeSSH(node);
@@ -851,12 +855,29 @@ class CascadeService {
 
     // ==================== INTERNAL HELPERS ====================
 
+    /** Add accepted classic group/path listeners to their existing profile. */
+    async _applyClassicL2tpPathIngress(config, node, { mode, excludeLinkIds = [] } = {}) {
+        if (node.cascadeRole !== 'relay') return config;
+        const excludeSet = new Set(excludeLinkIds.map(String));
+        const outgoing = (await CascadeLink.find({ portalNode: node._id, active: true }))
+            .filter(link => !excludeSet.has(String(link._id)) && (link.mode || 'reverse') === mode);
+        if (outgoing.length === 0) return config;
+        const CascadeRouteGroup = require('../modules/relay-l2tp/models/cascadeRouteGroupModel');
+        const groups = (await CascadeRouteGroup.find({
+            'paths.linkIds': { $in: outgoing.map(link => link._id) },
+        }).lean()).map(group => ({
+            ...group,
+            paths: group.paths.filter(path => !path.linkIds.some(linkId => excludeSet.has(String(linkId)))),
+        }));
+        if (groups.length === 0) return config;
+        const ids = [...new Set(groups.flatMap(group => group.paths.flatMap(path => path.linkIds.map(String))))];
+        const links = await CascadeLink.find({ _id: { $in: ids } }).populate('bridgeNode');
+        return applyClassicL2tpPathIngress(config, { nodeId: node._id, groups, links, mode });
+    }
+
     /**
-     * Regenerate and upload a node's full Xray config, including
-     * reverse-portal and/or forward-chain settings from its active cascade links.
-     * @param {Object} portalNode - HyNode document
-     * @param {Object} [opts]
-     * @param {Array<string>} [opts.excludeLinkIds] - Link IDs to exclude (used during undeploy)
+     * Regenerate the classic full main config, retaining installed L2TP sections.
+     * excludeLinkIds is used by undeploy; no removed cascade is preserved.
      */
     async _deployPortalConfig(portalNode, opts = {}) {
         // Topology-managed nodes get their full Xray config from the topology
@@ -923,10 +944,12 @@ class CascadeService {
             configGenerator.applyForwardHopInbound(config, forwardHopLinks);
         }
 
+        await this._applyClassicL2tpPathIngress(config, portalNode, { mode: 'forward', ...opts });
+
         // geoip:private block must be the very last routing rule
         configGenerator.ensurePrivateIpBlock(config);
 
-        const finalConfig = JSON.stringify(config, null, 2);
+        let finalConfig = JSON.stringify(config, null, 2);
 
         if (portalNode.ssh?.password || portalNode.ssh?.privateKey) {
             const ssh = createSSH(portalNode);
@@ -936,6 +959,22 @@ class CascadeService {
                 const configPath = portalNode.type === 'xray'
                     ? '/usr/local/etc/xray/config.json'
                     : (portalNode.paths?.config || '/etc/hysteria/config.yaml');
+                if (portalNode.type === 'xray' && portalNode.cascadeRole === 'relay') {
+                    const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+                    if (await RelayL2tpState.exists({ node: portalNode._id, desiredState: 'installed' })) {
+                        const live = await ssh.exec('cat /usr/local/etc/xray/config.json');
+                        if (live?.code !== 0) throw new Error('Cannot preserve installed L2TP Xray sections');
+                        const current = JSON.parse(live.stdout);
+                        if (!Array.isArray(current?.inbounds) || !Array.isArray(current?.outbounds)
+                            || !Array.isArray(current?.routing?.rules)
+                            || !current.inbounds.some(row => row.tag?.startsWith('relay-l2tp-'))) {
+                            throw new Error('Installed L2TP Xray sections are unavailable');
+                        }
+                        const merged = mergePreservedL2tpSections(config, current);
+                        finishClassicConfigRouting(merged);
+                        finalConfig = JSON.stringify(merged, null, 2);
+                    }
+                }
                 await ssh.uploadContent(finalConfig, configPath);
                 logger.info(`[Cascade] Portal config uploaded to ${portalNode.name} at ${configPath}`);
             } finally {
@@ -991,6 +1030,9 @@ class CascadeService {
         if (isRelay) {
             logger.info(`[Cascade] Node ${bridgeNode.name} is a RELAY (${downstreamLinks.length} downstream link(s))`);
             bridgeConfig = configGenerator.generateRelayConfig(link, portalNode, downstreamLinks);
+            const relay = JSON.parse(bridgeConfig);
+            await this._applyClassicL2tpPathIngress(relay, bridgeNode, { mode: 'reverse', ...opts });
+            bridgeConfig = JSON.stringify(relay, null, 2);
         } else {
             const bridgeLinks = (await CascadeLink.find({
                 bridgeNode: bridgeNode._id,

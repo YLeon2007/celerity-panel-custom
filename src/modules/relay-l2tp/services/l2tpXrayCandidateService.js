@@ -1,6 +1,7 @@
 'use strict';
 
 const { buildL2tpXrayFragment } = require('./l2tpXrayFragmentProvider');
+const { preserveClassicXraySections } = require('../../../services/classicL2tpConfigComposition');
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -150,6 +151,7 @@ class L2tpXrayCandidateService {
         configGenerator,
         userResolver,
         nodeResolver,
+        currentConfigResolver,
         fragmentProvider = buildL2tpXrayFragment,
     } = {}) {
         if (
@@ -157,6 +159,7 @@ class L2tpXrayCandidateService {
             || typeof userResolver !== 'function'
             || typeof nodeResolver !== 'function'
             || typeof fragmentProvider !== 'function'
+            || (currentConfigResolver !== undefined && typeof currentConfigResolver !== 'function')
         ) {
             throw new TypeError(
                 'L2tpXrayCandidateService requires configGenerator, userResolver, nodeResolver, and fragmentProvider functions',
@@ -166,6 +169,7 @@ class L2tpXrayCandidateService {
         this.userResolver = userResolver;
         this.nodeResolver = nodeResolver;
         this.fragmentProvider = fragmentProvider;
+        this.currentConfigResolver = currentConfigResolver;
     }
 
     async buildCandidate({ plan } = {}) {
@@ -207,7 +211,17 @@ class L2tpXrayCandidateService {
             fail('XRAY_CONFIG_GENERATION_FAILED', 'Failed to generate the Xray candidate');
         }
 
-        const { content, config } = parseCandidate(generated);
+        let { content, config } = parseCandidate(generated);
+        if (this.currentConfigResolver) {
+            try {
+                const live = await this.currentConfigResolver({ node, plan });
+                const current = typeof live === 'string' ? JSON.parse(live) : live;
+                config = preserveClassicXraySections(config, current, { replaceInboundTag: snapshot.tags.inbound });
+                content = JSON.stringify(config, null, 2);
+            } catch {
+                fail('CURRENT_XRAY_CONFIG_UNAVAILABLE', 'The current classic Xray configuration could not be preserved');
+            }
+        }
         assertCandidateConfig(config, snapshot);
         return Object.freeze({ operationId: plan.operationId, content });
     }

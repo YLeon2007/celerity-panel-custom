@@ -181,6 +181,75 @@ test('uses the official generator output without post-generation JSON mutation',
     assert(config.routing.rules.some(rule => rule.outboundTag === 'cascade-primary'));
 });
 
+test('install candidate preserves live reverse/forward cascade and other L2TP sections while refreshing subscription UUIDs', async () => {
+    const generator = require('../../../services/configGenerator');
+    const node = xrayNode();
+    const current = JSON.parse(generator.generateXrayConfigWithApi(node, [{ userId: 'old-user', xrayUuid: 'old-uuid' }]));
+    const link = { _id: 'down0001', tunnelUuid: 'persisted-tunnel-uuid', tunnelPort: 10086, bridgeNode: { ip: '192.0.2.2' } };
+    generator.applyReversePortal(current, [link], ['vless-in']);
+    generator.applyForwardHopInbound(current, [{ ...link, _id: 'up000001' }]);
+    const otherFragment = require('../services/l2tpXrayFragmentProvider').buildL2tpXrayFragment({
+        plan: { relay: { controlPlaneIps: [node.ip] }, group: { id: 'other-group' }, paths: [{ pathKey: 'secondary', healthy: true, outboundTag: 'cascade-secondary' }], selectedPathKey: 'secondary' },
+        tags: { inbound: 'relay-l2tp-other-group', blockOutbound: 'block' }, tproxyPort: 12346,
+    });
+    current.inbounds.push(...otherFragment.inbounds);
+    current.outbounds.push(...otherFragment.outbounds);
+    current.routing.rules.push(...otherFragment.routingRules);
+    let resolved = false;
+    const service = new L2tpXrayCandidateService({
+        nodeResolver: async () => node,
+        userResolver: async () => users,
+        currentConfigResolver: async request => {
+            assert.equal(request.node, node);
+            assert.equal(request.plan.relayId, node._id);
+            resolved = true;
+            return JSON.stringify(current);
+        },
+        configGenerator: generator.generateXrayConfigWithApi,
+    });
+    const candidate = await service.buildCandidate({ plan: safePlan() });
+    const config = JSON.parse(candidate.content);
+    assert.deepEqual(config.reverse, current.reverse);
+    assert.equal(resolved, true);
+    assert.deepEqual(config.inbounds.find(row => row.tag === 'fwd-hop-up000001'), current.inbounds.find(row => row.tag === 'fwd-hop-up000001'));
+    assert.equal(config.inbounds.find(row => row.tag === 'vless-in').settings.clients[0].id, users[0].xrayUuid);
+    assert(config.inbounds.some(row => row.tag === 'relay-l2tp-other-group'));
+    for (const tag of ['relay-l2tp-other-group', 'relay-l2tp-route-group-a']) {
+        const privateIndex = config.routing.rules.findIndex(row => row.inboundTag?.includes(tag) && row.ip?.includes('geoip:private') && row.outboundTag === 'block');
+        const selectedIndex = config.routing.rules.findIndex(row => row.inboundTag?.includes(tag) && row.outboundTag?.startsWith('cascade-'));
+        assert(privateIndex >= 0 && privateIndex < selectedIndex, 'scoped private refusal precedes selected cascade egress');
+    }
+    assert(config.outbounds.some(row => row.tag === 'cascade-secondary'));
+    assert(config.routing.rules.some(row => row.inboundTag?.includes('vless-in') && row.outboundTag?.startsWith('portal-')));
+});
+
+test('classic live-config read failure or malformed content refuses candidate without leaking raw errors', async () => {
+    for (const currentConfigResolver of [
+        async () => { throw new Error('private-credential'); },
+        async () => 'not-json-private-credential',
+        async () => ({}),
+    ]) {
+        const service = new L2tpXrayCandidateService({ nodeResolver: async () => xrayNode(), userResolver: async () => users, configGenerator: generateXrayConfig, currentConfigResolver });
+        await assert.rejects(service.buildCandidate({ plan: safePlan() }), error => {
+            assert.equal(error.code, 'CURRENT_XRAY_CONFIG_UNAVAILABLE');
+            assert.doesNotMatch(JSON.stringify(error), /private-credential/);
+            return true;
+        });
+    }
+});
+
+test('classic reinstall replaces only its own old L2TP rules rather than preserving the old selected path', async () => {
+    const node = xrayNode();
+    const oldPlan = safePlan({ selectedPathKey: 'old-path' });
+    const oldService = new L2tpXrayCandidateService({ nodeResolver: async () => node, userResolver: async () => users, configGenerator: generateXrayConfig });
+    const current = (await oldService.buildCandidate({ plan: oldPlan })).content;
+    const service = new L2tpXrayCandidateService({ nodeResolver: async () => node, userResolver: async () => users, configGenerator: generateXrayConfig, currentConfigResolver: async () => current });
+    const config = JSON.parse((await service.buildCandidate({ plan: safePlan() })).content);
+    const selectedRules = config.routing.rules.filter(rule => rule.inboundTag?.includes('relay-l2tp-route-group-a') && rule.outboundTag?.startsWith('cascade-'));
+    assert.deepEqual(selectedRules.map(rule => rule.outboundTag), ['cascade-primary']);
+    assert.equal(config.inbounds.filter(row => row.tag === 'relay-l2tp-route-group-a').length, 1);
+});
+
 test('keeps building candidates when the node has unrelated operator outbounds', async () => {
     const node = xrayNode({
         outbounds: [{
