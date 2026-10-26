@@ -168,6 +168,63 @@ test('insert-only success uses reviewed explicit fields, leaves ten classic link
     await assert.rejects(initializer.initialize(), { code: 'PRODUCTION_INITIALIZATION_ALREADY_ATTEMPTED' });
 });
 
+test('explicitly pinned offline classic link is preserved by dormant counter initialization', async () => {
+    const pins = await reset();
+    const id = new mongo.ObjectId(pins[9].id);
+    await db.collection('cascadelinks').updateOne({ _id: id }, { $set: { status: 'offline' } });
+    const offline = await db.collection('cascadelinks').findOne({ _id: id });
+    pins[9] = { id: String(id), sha256: fingerprint(offline) };
+    const before = await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray();
+    const acceptedOfflineClassicLinkIds = [String(id)];
+    const initializer = assemble(pins, simulatedAuthority(), { acceptedOfflineClassicLinkIds });
+    acceptedOfflineClassicLinkIds.length = 0;
+    const result = await initializer.initialize();
+    assert.equal(result.initialized, true);
+    assert.equal(result.ready, false);
+    assert.equal(result.dormant, true);
+    assert.deepEqual(await db.collection('cascadelinks').find({}).sort({ _id: 1 }).toArray(), before);
+    assert.deepEqual(await db.collection('cascadetopologystates').findOne({}), initialState);
+});
+
+test('offline classic status is not implicitly accepted and produces zero initializer writes', async () => {
+    const pins = await reset();
+    const id = new mongo.ObjectId(pins[9].id);
+    await db.collection('cascadelinks').updateOne({ _id: id }, { $set: { status: 'offline' } });
+    const offline = await db.collection('cascadelinks').findOne({ _id: id });
+    pins[9] = { id: String(id), sha256: fingerprint(offline) };
+    const start = commands.length;
+    await assert.rejects(assemble(pins).initialize(), { code: 'PRODUCTION_INITIALIZATION_PIN_DRIFT' });
+    assert.equal(commands.slice(start).some(event => ['insert', 'update', 'delete', 'create',
+        'createIndexes', 'commitTransaction'].includes(event.commandName)), false);
+    assert.equal(await db.collection('cascadetopologystates').countDocuments({}), 0);
+    assert.deepEqual(await db.collection('cascadelinks').findOne({ _id: id }), offline);
+});
+
+test('offline acceptance rejects malformed, duplicate and foreign IDs before database access', async () => {
+    const pins = await reset();
+    const start = commands.length;
+    for (const ids of [true, 'all', [pins[0].id, pins[0].id], [new mongo.ObjectId().toString()], [[pins[0].id]]]) {
+        assert.throws(() => assemble(pins, simulatedAuthority(), { acceptedOfflineClassicLinkIds: ids }),
+            { code: 'PRODUCTION_INITIALIZATION_INPUT_REFUSED' });
+    }
+    assert.equal(commands.length, start);
+});
+
+test('explicit offline acceptance still refuses full-record pin drift without writing', async () => {
+    const pins = await reset();
+    const id = new mongo.ObjectId(pins[9].id);
+    await db.collection('cascadelinks').updateOne({ _id: id }, { $set: { status: 'offline' } });
+    pins[9] = { id: String(id), sha256: fingerprint(await db.collection('cascadelinks').findOne({ _id: id })) };
+    const initializer = assemble(pins, simulatedAuthority(), { acceptedOfflineClassicLinkIds: [String(id)] });
+    await db.collection('cascadelinks').updateOne({ _id: id }, { $set: { tunnelPort: 25000 } });
+    const start = commands.length;
+    await assert.rejects(initializer.initialize(), { code: 'PRODUCTION_INITIALIZATION_PIN_DRIFT' });
+    assert.equal(commands.slice(start).some(event => ['insert', 'update', 'delete', 'create',
+        'createIndexes', 'commitTransaction'].includes(event.commandName)), false);
+    assert.equal(await db.collection('cascadetopologystates').countDocuments({}), 0);
+    assert.equal((await db.collection('cascadelinks').findOne({ _id: id })).tunnelPort, 25000);
+});
+
 // Production-like first install: legacy links/locks/L2TP/groups exist; new stores do not.
 const firstInstallMissing = ['cascadetopologystates', 'topologyoperations', 'topologycreateintents',
     'topologyintentqueuestates', 'remoteadmissions', 'topologyexecutionbindings', 'topologyexecutionenrollments'];

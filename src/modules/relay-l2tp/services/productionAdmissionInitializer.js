@@ -55,7 +55,8 @@ function same(a, b) { return fingerprint(a) === fingerprint(b); }
 
 function createProductionAdmissionInitializer({ db, serverContext, expectedDatabaseName,
     expectedDeployment, acceptedClassicLinks, initialState, acceptedManifestSha256,
-    maintenanceAuthority, maintenanceGeneration, acceptedMissingCollections = [] } = {}) {
+    maintenanceAuthority, maintenanceGeneration, acceptedMissingCollections = [],
+    acceptedOfflineClassicLinkIds = [] } = {}) {
     if (serverContext !== PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT
         || typeof expectedDatabaseName !== 'string' || !expectedDatabaseName
         || db?.databaseName !== expectedDatabaseName || !db?.client
@@ -76,6 +77,10 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
             || typeof pin.id !== 'string' || !/^[a-f0-9]{24}$/.test(pin.id)
             || typeof pin.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(pin.sha256))
         || new Set(acceptedClassicLinks.map(pin => pin.id)).size !== 10
+        || !Array.isArray(acceptedOfflineClassicLinkIds)
+        || acceptedOfflineClassicLinkIds.some(id => typeof id !== 'string'
+            || !acceptedClassicLinks.some(pin => pin.id === id))
+        || new Set(acceptedOfflineClassicLinkIds).size !== acceptedOfflineClassicLinkIds.length
         || !exactKeys(initialState, STATE_KEYS) || initialState._id !== 'singleton'
         || STATE_KEYS.slice(1).some(key => !Number.isSafeInteger(initialState[key]) || initialState[key] < 0)
         || initialState.revision !== initialState.deployedRevision
@@ -89,6 +94,9 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
     const hold = maintenanceAuthority.withHeldMaintenance.bind(maintenanceAuthority);
     const challenge = freeze({ serverContext, databaseName: expectedDatabaseName, maintenanceGeneration,
         deployment: { ...expectedDeployment }, acceptedClassicLinks: acceptedClassicLinks.map(pin => ({ ...pin })),
+        // Initialization remains dormant and never changes/redeploys classic links.
+        // An existing offline link must be independently pinned and explicitly accepted.
+        acceptedOfflineClassicLinkIds: [...acceptedOfflineClassicLinkIds],
         initialState: { ...initialState }, manifestSha256: acceptedManifestSha256,
         acceptedMissingCollections: acceptedMissingCollections.map(entry => ({ name: entry.name, options: {} })) });
     let attempted = false;
@@ -256,7 +264,9 @@ function createProductionAdmissionInitializer({ db, serverContext, expectedDatab
                         || links.filter(row => row.mode === 'forward').length !== 2
                         || links.some(row => !(row._id instanceof mongo.ObjectId) || !(row.portalNode instanceof mongo.ObjectId)
                             || !(row.bridgeNode instanceof mongo.ObjectId) || row.active !== true
-                            || !['online', 'deployed'].includes(row.status)
+                            || !(['online', 'deployed'].includes(row.status)
+                                || (row.status === 'offline'
+                                    && challenge.acceptedOfflineClassicLinkIds.includes(String(row._id))))
                             || !challenge.acceptedClassicLinks.some(pin => pin.id === String(row._id) && pin.sha256 === fingerprint(row)))) {
                         fail('PRODUCTION_INITIALIZATION_PIN_DRIFT');
                     }
