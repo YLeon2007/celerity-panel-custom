@@ -72,8 +72,15 @@ async function deployment(db) {
 async function snapshot(db, { maintenance, nodeId } = {}) {
     const names = ['topologyoperations', 'hynodes', 'topologyconfigowners', 'topologyexecutionenrollments',
         'topologyexecutionbindings', 'cascadetopologystates', 'remoteadmissions', 'nodeoperationlocks'];
-    const values = await Promise.all(names.map(name => rows(db, name)));
-    const [history, nodes, owners, enrollments, bindings, states, admissions, locks] = values;
+    // Read history once as raw BSON: ordinary native promotion irreversibly
+    // merges Int32(1), Double(1) and small Long(1). Validators retain their
+    // ordinary semantic view; only the complete fingerprint uses typed values.
+    const rawHistory = await db.collection(names[0]).find({}, { ...OPT, limit: 1001, raw: true }).toArray();
+    need(Array.isArray(rawHistory) && rawHistory.length <= 1000 && rawHistory.every(Buffer.isBuffer));
+    const typedHistory = rawHistory.map(raw => BSON.deserialize(raw, { promoteValues: false, bsonRegExp: true }));
+    need(Buffer.byteLength(canonical(typedHistory)) <= 32 * 1024 * 1024);
+    const history = rawHistory.map(raw => BSON.deserialize(raw));
+    const [nodes, owners, enrollments, bindings, states, admissions, locks] = await Promise.all(names.slice(1).map(name => rows(db, name)));
     need(history.every(o => ['succeeded', 'failed', 'rolled_back'].includes(o.status)
         && (o.executionContext === undefined || matchesTopologyExecutionContext(o.executionContext, TEST))
         && Array.isArray(o.nodes) && o.nodes.every(n => nodeRef(n.node))
@@ -104,10 +111,17 @@ async function snapshot(db, { maintenance, nodeId } = {}) {
         // Recognition is not lock/admission authority. Only an already-held
         // server-owned classic/L2TP scope may pass its OWN current generation.
         need(locks.length === 1 && String(locks[0].node) === nodeId);
-        await require('./classicNodeConfigWrite').assertHeldL2tpNodeConfigWrite(nodeId);
-        need(active.every(a => a.phase === 'running' && a.nodeId === nodeId && a.operationId === locks[0].operationId));
+        const held = await require('./classicNodeConfigWrite').assertHeldL2tpNodeConfigWrite(nodeId);
+        if (held.standaloneAdmissionId !== undefined) {
+            need(active.length === 1 && active[0]._id === held.standaloneAdmissionId
+                && active[0].phase === 'running' && active[0].nodeId === nodeId
+                && active[0].kind === 'standalone_preflight' && active[0].ownerGeneration === 1
+                && !Object.hasOwn(active[0], 'operationId') && !Object.hasOwn(active[0], 'leaseOwner'));
+        } else {
+            need(active.every(a => a.phase === 'running' && a.nodeId === nodeId && a.operationId === locks[0].operationId));
+        }
     }
-    const historySha256 = hash(history.map(canonical).sort());
+    const historySha256 = hash(typedHistory.map(canonical).sort());
     return { deployment: await deployment(db), historySha256, nodeBindings };
 }
 function validReceipt(r) {

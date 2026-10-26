@@ -425,6 +425,9 @@ function createL2tpExecutionRuntime({
         remoteAdmissionRepository,
         lockService,
         configWriteEnv: { PANEL_DOMAIN: authorization.executionContext?.hostIdentity },
+        // Reuse the root's immutable actual-panel policy, not a domain-only
+        // reconstruction that drops receipt flags/aliases on standalone teardown.
+        configWriteGuard: candidateService.assertConfigWriteAllowed?.bind(candidateService),
         allowRemoteExecution: executionAuthorized(authorization)
             && runtimeDependencies?.enableInstallAdmission === true,
         secretBox,

@@ -15,6 +15,7 @@ function chainable(rows) {
         select() { return query; },
         sort() { return query; },
         session() { return query; },
+        setOptions() { return query; },
         lean: async () => rows,
         then: resolve => resolve(rows),
     };
@@ -110,7 +111,41 @@ function createModels({ nodes = [], states = [], users = [], groups = [], links 
     return models;
 }
 
+// SIMULATED persistence/SSH; actual lock/admission services and schema shapes.
+function createFences(models, { admissionRelease, lockRelease } = {}) {
+    const { NodeOperationLockService } = require('../services/nodeOperationLockService');
+    const { NodeOperationLockRepository } = require('../services/nodeOperationLockRepository');
+    const { RemoteAdmissionRepository } = require('../repositories/remoteAdmissionRepository');
+    const rows = [], admissions = [], db = models.RelayL2tpState.db;
+    db.startSession ||= () => {};
+    const match = (row, filter) => require('sift').default(filter)(row);
+    const lockModel = { db, create: async row => { rows.push(row); return row; },
+        findOne: filter => chainable(rows.find(row => match(row, filter)) || null),
+        deleteOne: async filter => { const i = rows.findIndex(row => match(row, filter));
+            if (i < 0) return { deletedCount: 0 }; rows.splice(i, 1); return { deletedCount: 1 }; } };
+    const RemoteAdmission = { db,
+        findOne: filter => chainable(admissions.find(row => match(row, filter)) || null),
+        create: async documents => { admissions.push(...documents); return documents; },
+        updateOne: async (filter, update) => { const row = admissions.find(row => match(row, filter));
+            if (!row) return { matchedCount: 0 }; Object.assign(row, update.$set); return { matchedCount: 1 }; } };
+    const remoteAdmissionRepository = new RemoteAdmissionRepository({
+        CascadeTopologyState: { db, updateOne: async () => ({ matchedCount: 1 }) }, RemoteAdmission,
+        transactionRunner: work => work({}) });
+    const lockService = new NodeOperationLockService({ repository: new NodeOperationLockRepository({ model: lockModel }),
+        clock: { now: () => new Date() } });
+    if (admissionRelease) remoteAdmissionRepository.release = admissionRelease;
+    if (lockRelease) lockService.releaseVerified = lockRelease;
+    return { remoteAdmissionRepository, lockService };
+}
+test.before(t => {
+    t.mock.method(require('../models/topologyOperationModel'), 'exists', async () => null);
+    const mongoose = require('mongoose'), oldDb = mongoose.connection.db;
+    mongoose.connection.db = { collection: () => ({ find: () => ({ toArray: async () => [] }) }) };
+    t.after(() => { mongoose.connection.db = oldDb; });
+});
+
 function createService(overrides = {}, models = createModels()) {
+    const fences = createFences(models);
     return new L2tpSimpleService({
         ...models,
         l2tpService: {
@@ -137,24 +172,17 @@ function createService(overrides = {}, models = createModels()) {
             exec: async () => ({ code: 0, stdout: 'TEARDOWN_OK' }),
             disconnect: () => {},
         })),
-        remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? {
-            acquire: async () => 'admission-1',
-            release: async () => true,
-        },
-        lockService: overrides.lockService ?? {
-            acquire: async ({ node, owner, operationId }) => ({ ok: true,
-                lock: { node, owner, operationId, generation: 'generation-1' } }),
-            releaseVerified: async () => ({ ok: true }),
-        },
+        remoteAdmissionRepository: overrides.remoteAdmissionRepository ?? fences.remoteAdmissionRepository,
+        lockService: overrides.lockService ?? fences.lockService,
         allowRemoteExecution: overrides.allowRemoteExecution ?? true,
         secretBox: overrides.secretBox ?? null,
         secretKey: overrides.secretKey ?? null,
     });
 }
 
-const RELAY = { _id: 'relay-1', name: 'Relay One', cascadeRole: 'relay', status: 'online' };
+const RELAY = { _id: '6ab189dc63913ebd4a917399', name: 'Relay One', cascadeRole: 'relay', status: 'online' };
 const STATE = {
-    node: 'relay-1',
+    node: '6ab189dc63913ebd4a917399',
     desiredState: 'installed',
     status: 'installed',
     clientCidr: '10.255.30.0/24',
@@ -404,8 +432,8 @@ test('overview groups accounts by login and reveals the PSK per installed relay'
         nodes: [RELAY],
         states: [STATE],
         users: [
-            { _id: 'u1', relayNode: 'relay-1', login: 'alice', ip: '10.255.30.10', enabled: true, syncStatus: 'synced' },
-            { _id: 'u2', relayNode: 'relay-1', login: 'bob', ip: '10.255.30.11', enabled: true, syncStatus: 'pending' },
+            { _id: 'u1', relayNode: '6ab189dc63913ebd4a917399', login: 'alice', ip: '10.255.30.10', enabled: true, syncStatus: 'synced' },
+            { _id: 'u2', relayNode: '6ab189dc63913ebd4a917399', login: 'bob', ip: '10.255.30.11', enabled: true, syncStatus: 'pending' },
         ],
     });
     const service = createService({}, models);
@@ -470,7 +498,7 @@ test('installRelay auto-configures defaults, inherits accounts and queues instal
         },
     }, models);
 
-    const result = await service.installRelay('relay-1');
+    const result = await service.installRelay('6ab189dc63913ebd4a917399');
 
     assert.deepEqual(result, { operationId: 'op-9' });
     assert.equal(calls.configure.length, 1);
@@ -517,7 +545,7 @@ test('installRelay reconfigures a state reset by uninstall before installing', a
         },
     }, models);
 
-    const result = await service.installRelay('relay-1');
+    const result = await service.installRelay('6ab189dc63913ebd4a917399');
 
     assert.deepEqual(result, { operationId: 'op-reinstall' });
     assert.equal(calls.configure.length, 1);
@@ -534,7 +562,7 @@ test('installRelay reconfigures a state reset by uninstall before installing', a
 test('installRelay auto-creates a route group from a linear cascade chain', async () => {
     const models = createModels({
         nodes: [RELAY],
-        links: [{ _id: 'link-1', portalNode: 'relay-1', bridgeNode: 'bridge-1' }],
+        links: [{ _id: 'link-1', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'bridge-1' }],
     });
     models.HyNode.findById = id => {
         const node = String(id) === 'bridge-1'
@@ -565,7 +593,7 @@ test('installRelay auto-creates a route group from a linear cascade chain', asyn
         },
     }, models);
 
-    await service.installRelay('relay-1');
+    await service.installRelay('6ab189dc63913ebd4a917399');
 
     assert.equal(createdGroup.name, 'auto-l2tp');
     assert.equal(createdGroup.mode, 'reverse');
@@ -583,13 +611,13 @@ test('installRelay rebuilds paths of an existing route group left empty by link 
         }],
         groups: [{ _id: 'group-empty', name: 'auto-l2tp', mode: 'reverse', paths: [] }],
         links: [
-            { _id: 'link-1', portalNode: 'relay-1', bridgeNode: 'relay-2' },
+            { _id: 'link-1', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'relay-2' },
             { _id: 'link-2', portalNode: 'relay-2', bridgeNode: 'bridge-1' },
         ],
     });
     const service = createService({}, models);
 
-    await service.installRelay('relay-1');
+    await service.installRelay('6ab189dc63913ebd4a917399');
 
     const group = models.CascadeRouteGroup._store.find(entry => entry._id === 'group-empty');
     assert.equal(group.paths.length, 1);
@@ -600,14 +628,14 @@ test('installRelay rejects a branching cascade when no route group exists', asyn
     const models = createModels({
         nodes: [RELAY],
         links: [
-            { _id: 'link-1', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
-            { _id: 'link-2', portalNode: 'relay-1', bridgeNode: 'bridge-2' },
+            { _id: 'link-1', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'bridge-1' },
+            { _id: 'link-2', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'bridge-2' },
         ],
     });
     const service = createService({}, models);
 
     await assert.rejects(
-        () => service.installRelay('relay-1'),
+        () => service.installRelay('6ab189dc63913ebd4a917399'),
         error => error?.code === 'ROUTE_GROUP_AMBIGUOUS',
     );
 });
@@ -616,8 +644,8 @@ test('installRelay follows the default hop past a geoRouting branch', async () =
     const models = createModels({
         nodes: [RELAY],
         links: [
-            { _id: 'link-geo', portalNode: 'relay-1', bridgeNode: 'bridge-ru', geoRouting: { enabled: true, domains: ['category-ru'], geoip: ['ru'] } },
-            { _id: 'link-main', portalNode: 'relay-1', bridgeNode: 'bridge-1' },
+            { _id: 'link-geo', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'bridge-ru', geoRouting: { enabled: true, domains: ['category-ru'], geoip: ['ru'] } },
+            { _id: 'link-main', portalNode: '6ab189dc63913ebd4a917399', bridgeNode: 'bridge-1' },
         ],
     });
     let createdGroup;
@@ -643,7 +671,7 @@ test('installRelay follows the default hop past a geoRouting branch', async () =
         },
     }, models);
 
-    await service.installRelay('relay-1');
+    await service.installRelay('6ab189dc63913ebd4a917399');
 
     assert.ok(createdGroup, 'expected the auto route group to be created');
     assert.deepEqual(createdGroup.paths[0].linkIds.map(String), ['link-main']);
@@ -707,7 +735,7 @@ test('overview reveals account passwords through the secret box', async () => {
         states: [STATE],
         users: [{
             _id: 'u1',
-            relayNode: 'relay-1',
+            relayNode: '6ab189dc63913ebd4a917399',
             login: 'alice',
             ip: '10.255.30.10',
             enabled: true,
@@ -739,7 +767,7 @@ test('deleteAccount queues sync on installed relays and purges stale records els
         nodes: [RELAY],
         states: [STATE],
         users: [
-            { _id: 'u1', relayNode: 'relay-1', login: 'alice', ip: '10.255.30.10' },
+            { _id: 'u1', relayNode: '6ab189dc63913ebd4a917399', login: 'alice', ip: '10.255.30.10' },
             { _id: 'u2', relayNode: 'relay-9', login: 'alice', ip: '10.255.99.10' },
         ],
     });
@@ -757,7 +785,7 @@ test('deleteAccount queues sync on installed relays and purges stale records els
 
     const result = await service.deleteAccount('alice');
 
-    assert.deepEqual(deleted, [{ nodeId: 'relay-1', userId: 'u1' }]);
+    assert.deepEqual(deleted, [{ nodeId: '6ab189dc63913ebd4a917399', userId: 'u1' }]);
     assert.equal(
         models.L2tpUser._store.some(user => user._id === 'u2'),
         false,
@@ -775,7 +803,7 @@ test('deleteAccount purges the record when the pinned node lost its relay role',
     const models = createModels({
         nodes: [RELAY],
         states: [STATE],
-        users: [{ _id: 'u1', relayNode: 'relay-1', login: 'bob', ip: '10.255.30.10' }],
+        users: [{ _id: 'u1', relayNode: '6ab189dc63913ebd4a917399', login: 'bob', ip: '10.255.30.10' }],
     });
     const service = createService({
         userManagementService: {
@@ -796,7 +824,7 @@ test('deleteAccount purges the record when the pinned node lost its relay role',
         false,
         'orphaned account record must be purged',
     );
-    assert.deepEqual(result.results, [{ nodeId: 'relay-1', deleted: true, orphaned: true }]);
+    assert.deepEqual(result.results, [{ nodeId: '6ab189dc63913ebd4a917399', deleted: true, orphaned: true }]);
 });
 
 test('overview keeps listing re-roled nodes that still hold L2TP state', async () => {
@@ -808,7 +836,7 @@ test('overview keeps listing re-roled nodes that still hold L2TP state', async (
 
     const nodes = await service.listRelayNodes();
 
-    assert.deepEqual(nodes.map(node => String(node._id)), ['relay-1'],
+    assert.deepEqual(nodes.map(node => String(node._id)), ['6ab189dc63913ebd4a917399'],
         'a node with installed L2TP state stays manageable after re-role');
 });
 
@@ -871,7 +899,7 @@ test('uninstallRelay still tears down after the node lost its relay role', async
         }),
     }, models);
 
-    const result = await service.uninstallRelay('relay-1');
+    const result = await service.uninstallRelay('6ab189dc63913ebd4a917399');
 
     assert.equal(result.ok, true);
     assert.ok(script, 'teardown script must run on the re-roled node');
@@ -890,7 +918,7 @@ test('uninstallRelay runs the teardown over SSH and resets the desired state', a
         }),
     }, models);
 
-    const result = await service.uninstallRelay('relay-1');
+    const result = await service.uninstallRelay('6ab189dc63913ebd4a917399');
 
     assert.equal(result.ok, true);
     assert.ok(script.includes('celerity_l2tp'));
@@ -907,19 +935,12 @@ test('uninstallRelay does not decrement admission when exact lock release is not
             exec: async () => ({ code: 0, stdout: 'TEARDOWN_OK\n' }),
             disconnect: () => {},
         }),
-        remoteAdmissionRepository: {
-            acquire: async () => 'admission-release-failed',
-            release: async () => { admissionRelease += 1; },
-        },
-        lockService: {
-            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
-                operationId: 'op', generation: 'generation-1' } }),
-            releaseVerified: async () => ({ ok: false }),
-        },
+        ...createFences(models, { admissionRelease: async () => { admissionRelease += 1; },
+            lockRelease: async () => ({ ok: false }) }),
     }, models);
 
     await assert.rejects(
-        () => service.uninstallRelay('relay-1'),
+        () => service.uninstallRelay('6ab189dc63913ebd4a917399'),
         error => error?.code === 'UNINSTALL_FENCE_RELEASE_FAILED'
             && error.remoteOutcomeUncertain === true,
     );
@@ -935,16 +956,12 @@ test('uninstallRelay keeps the state when the node cannot be reached', async () 
             exec: async () => { throw new Error('ssh down'); },
             disconnect: () => {},
         }),
-        remoteAdmissionRepository: { acquire: async () => 'admission-1', release: async () => { admissionRelease += 1; } },
-        lockService: {
-            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
-                operationId: 'op', generation: 'generation-1' } }),
-            releaseVerified: async () => { lockRelease += 1; },
-        },
+        ...createFences(models, { admissionRelease: async () => { admissionRelease += 1; },
+            lockRelease: async () => { lockRelease += 1; return { ok: true }; } }),
     }, models);
 
     await assert.rejects(
-        () => service.uninstallRelay('relay-1'),
+        () => service.uninstallRelay('6ab189dc63913ebd4a917399'),
         error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
     );
     assert.equal(admissionRelease, 0);
@@ -963,8 +980,8 @@ test('simple install and uninstall are blocked before any state or SSH mutation 
         }),
     }, models);
 
-    await assert.rejects(() => service.installRelay('relay-1'), { code: 'REMOTE_EXECUTION_DISABLED' });
-    await assert.rejects(() => service.uninstallRelay('relay-1'), { code: 'REMOTE_EXECUTION_DISABLED' });
+    await assert.rejects(() => service.installRelay('6ab189dc63913ebd4a917399'), { code: 'REMOTE_EXECUTION_DISABLED' });
+    await assert.rejects(() => service.uninstallRelay('6ab189dc63913ebd4a917399'), { code: 'REMOTE_EXECUTION_DISABLED' });
     assert.equal(sshCalls, 0);
     assert.equal(models.RelayL2tpState._store[0].status, 'installed');
 });
@@ -989,7 +1006,7 @@ test('uninstallRelay retains admission when lock acquisition is uncertain', asyn
     }, models);
 
     await assert.rejects(
-        () => service.uninstallRelay('relay-1'),
+        () => service.uninstallRelay('6ab189dc63913ebd4a917399'),
         error => error?.message === 'lock write timeout' && error.remoteOutcomeUncertain === true,
     );
     assert.equal(admissionRelease, 0);
@@ -1005,19 +1022,12 @@ test('uninstallRelay retains fences when teardown exits without proof of cleanup
             exec: async () => ({ code: 1, stdout: 'partial cleanup\\n' }),
             disconnect: () => {},
         }),
-        remoteAdmissionRepository: {
-            acquire: async () => 'admission-teardown-uncertain',
-            release: async () => { admissionRelease += 1; },
-        },
-        lockService: {
-            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
-                operationId: 'op', generation: 'generation-1' } }),
-            releaseVerified: async () => { lockRelease += 1; return { ok: true }; },
-        },
+        ...createFences(models, { admissionRelease: async () => { admissionRelease += 1; },
+            lockRelease: async () => { lockRelease += 1; return { ok: true }; } }),
     }, models);
 
     await assert.rejects(
-        () => service.uninstallRelay('relay-1'),
+        () => service.uninstallRelay('6ab189dc63913ebd4a917399'),
         error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
     );
     assert.equal(admissionRelease, 0);
@@ -1034,19 +1044,12 @@ test('uninstallRelay treats TEARDOWN_OK without an exit code as uncertain', asyn
             exec: async () => ({ stdout: 'TEARDOWN_OK\\n' }),
             disconnect: () => {},
         }),
-        remoteAdmissionRepository: {
-            acquire: async () => 'admission-missing-exit-code',
-            release: async () => { admissionRelease += 1; },
-        },
-        lockService: {
-            acquire: async () => ({ ok: true, lock: { node: 'relay-1', owner: 'owner',
-                operationId: 'op', generation: 'generation-1' } }),
-            releaseVerified: async () => { lockRelease += 1; return { ok: true }; },
-        },
+        ...createFences(models, { admissionRelease: async () => { admissionRelease += 1; },
+            lockRelease: async () => { lockRelease += 1; return { ok: true }; } }),
     }, models);
 
     await assert.rejects(
-        () => service.uninstallRelay('relay-1'),
+        () => service.uninstallRelay('6ab189dc63913ebd4a917399'),
         error => error?.code === 'UNINSTALL_UNCERTAIN' && error.remoteOutcomeUncertain === true,
     );
     assert.equal(admissionRelease, 0);

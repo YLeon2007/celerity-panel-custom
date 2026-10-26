@@ -687,6 +687,10 @@ class L2tpOperationWorker {
             await heartbeat.renewNow();
             return !heartbeat.getError();
         };
+        const withLockedPreparation = callback => this.candidateService?.withLockedPreparation
+            ? this.candidateService.withLockedPreparation({ lock: lock.lock,
+                lockService: this.lockService, clock: this.clock }, callback)
+            : callback();
         try {
             // The root-owned guard reads durable ownership only after this
             // generation is acquired/renewed and before any remote read.
@@ -695,19 +699,15 @@ class L2tpOperationWorker {
                 if (heartbeat.getError()) return leaseLostResult();
             }
             try {
-                await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
-                if (preparedInstallPlan) {
-                    const prepare = async () => {
+                // Recognition requires the actual live held scope, not merely
+                // a persisted lock. Scope exit verifies BEFORE worker settlement.
+                await withLockedPreparation(async () => {
+                    await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
+                    if (preparedInstallPlan) {
                         await this.candidateService?.prepareIngress?.({ plan: preparedInstallPlan });
                         candidateContent = await this.buildInstallCandidate(preparedInstallPlan);
-                    };
-                    if (this.candidateService?.withLockedPreparation) {
-                        await this.candidateService.withLockedPreparation({ lock: lock.lock,
-                            lockService: this.lockService, clock: this.clock }, prepare);
-                    } else {
-                        await prepare();
                     }
-                }
+                });
                 await heartbeat.waitForIdle();
                 if (heartbeat.getError()) return leaseLostResult();
             } catch (error) {
@@ -756,10 +756,10 @@ class L2tpOperationWorker {
                 if (heartbeat.getError()) return leaseLostResult();
                 let snapshot;
                 try {
-                    snapshot = await this.resolveSyncUsersSnapshot({
-                        operation,
-                        operationId,
-                        plan: preparedSyncUsersPlan,
+                    snapshot = await withLockedPreparation(async () => {
+                        await this.candidateService?.assertConfigWriteAllowed?.(operation.node);
+                        return this.resolveSyncUsersSnapshot({ operation, operationId,
+                            plan: preparedSyncUsersPlan });
                     });
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
@@ -771,9 +771,14 @@ class L2tpOperationWorker {
                         snapshot,
                     });
                     resolvedSyncUsers = snapshot.users;
-                } catch {
+                } catch (error) {
                     await heartbeat.waitForIdle();
                     if (heartbeat.getError()) return leaseLostResult();
+                    if (error?.remoteOutcomeUncertain === true) {
+                        await this.retainAdmissionForRecovery(operation, claim);
+                        return { claimed: true, operationId, status: 'running', stopped: true,
+                            errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
+                    }
                     await heartbeat.stop();
                     return this.failClaimedOperation({
                         claim,

@@ -84,15 +84,40 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, c
 // Internal worker-to-classic bridge. The supplied service is the actual
 // already-acquired worker lock service, not a caller-controlled bypass flag.
 // Never acquires or releases a generation; the worker owns settlement.
-async function withHeldL2tpNodeConfigWrite({ lock: acquiredLock, lockService, clock }, callback) {
+async function withHeldL2tpNodeConfigWrite({ lock: acquiredLock, lockService, clock,
+    standaloneAdmission }, callback) {
     const lock = Object.freeze({ node: acquiredLock?.node, owner: acquiredLock?.owner,
         operationId: acquiredLock?.operationId, generation: acquiredLock?.generation });
     const { NodeOperationLockService } = require('../modules/relay-l2tp/services/nodeOperationLockService');
     if (!(lockService instanceof NodeOperationLockService) || !lock?.generation
         || typeof clock?.now !== 'function') throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
     const key = String(lock.node);
-    const scope = { active: true, uncertain: false, pending: 0, verify: async () => {
+    // Standalone acquire() intentionally has no operationId/leaseOwner. Bind
+    // its exact acquired invocation identity, never fabricate a worker link.
+    const admissionId = standaloneAdmission?.id;
+    const admissionRepository = standaloneAdmission?.repository;
+    if (standaloneAdmission !== undefined) {
+        const { RemoteAdmissionRepository } = require('../modules/relay-l2tp/repositories/remoteAdmissionRepository');
+        if (!(admissionRepository instanceof RemoteAdmissionRepository)
+            || typeof admissionId !== 'string' || !admissionId
+            || typeof admissionRepository.RemoteAdmission?.findOne !== 'function'
+            || !admissionRepository.RemoteAdmission.db
+            || admissionRepository.RemoteAdmission.db !== admissionRepository.CascadeTopologyState.db
+            || admissionRepository.RemoteAdmission.db !== lockService.repository.model?.db) {
+            throw Object.assign(failure('CLASSIC_CONFIG_WRITE_ADMISSION_UNCERTAIN'), { remoteOutcomeUncertain: true });
+        }
+    }
+    const scope = { active: true, uncertain: false, pending: 0, standaloneAdmissionId: admissionId, verify: async () => {
         if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+        if (admissionId !== undefined) {
+            const admission = await admissionRepository.RemoteAdmission.findOne({ _id: admissionId })
+                .setOptions({ readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 }).lean()
+                .catch(error => { error.remoteOutcomeUncertain = true; throw error; });
+            if (!scope.active || !admission || admission._id !== admissionId || admission.nodeId !== key
+                || admission.kind !== 'standalone_preflight' || admission.phase !== 'running'
+                || admission.ownerGeneration !== 1 || Object.hasOwn(admission, 'operationId')
+                || Object.hasOwn(admission, 'leaseOwner')) throw Object.assign(failure('CLASSIC_CONFIG_WRITE_ADMISSION_UNCERTAIN'), { remoteOutcomeUncertain: true });
+        }
         const row = await lockService.repository.findByNode(lock.node);
         if (!scope.active || !row || String(row.node) !== key || row.owner !== lock.owner
             || row.operationId !== lock.operationId || row.generation !== lock.generation
@@ -103,16 +128,18 @@ async function withHeldL2tpNodeConfigWrite({ lock: acquiredLock, lockService, cl
     const scopes = new Map(heldWrites.getStore() || []);
     if (scopes.has(key)) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CONFLICT');
     scopes.set(key, scope);
+    let verifyingCompletion = false;
     try {
         return await heldWrites.run(scopes, async () => {
             const result = await callback();
+            verifyingCompletion = true;
             await scope.verify();
             if (scope.uncertain || scope.pending !== 0) throw failure('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
             return result;
         });
     } catch (error) {
         // A swallowed/unknown nested classic dispatch cannot authorize release.
-        if (scope.uncertain || scope.pending !== 0) error.remoteOutcomeUncertain = true;
+        if (verifyingCompletion || scope.uncertain || scope.pending !== 0) error.remoteOutcomeUncertain = true;
         throw error;
     } finally { scope.active = false; }
 }
@@ -121,6 +148,7 @@ async function assertHeldL2tpNodeConfigWrite(nodeId) {
     const scope = heldWrites.getStore()?.get(String(nodeId));
     if (!scope?.verify || !scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
     await scope.verify();
+    return Object.freeze({ standaloneAdmissionId: scope.standaloneAdmissionId });
 }
 
 async function assertClassicNodeConfigWriteHeld(nodeId) {

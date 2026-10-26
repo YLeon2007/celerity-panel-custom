@@ -254,6 +254,7 @@ class L2tpSimpleService {
         lockService = null,
         allowRemoteExecution = false,
         configWriteEnv = process.env,
+        configWriteGuard,
         secretBox = null,
         secretKey = null,
     } = {}) {
@@ -300,7 +301,13 @@ class L2tpSimpleService {
         this.remoteAdmissionRepository = remoteAdmissionRepository;
         this.lockService = lockService;
         this.allowRemoteExecution = allowRemoteExecution === true;
-        this.configWriteEnv = Object.freeze({ PANEL_DOMAIN: configWriteEnv.PANEL_DOMAIN });
+        if (configWriteGuard !== undefined && typeof configWriteGuard !== 'function') {
+            throw new TypeError('L2TP config write guard must be a server-owned function');
+        }
+        this.configWriteGuard = configWriteGuard;
+        this.configWriteEnv = Object.freeze({ PANEL_DOMAIN: configWriteEnv.PANEL_DOMAIN,
+            TOPOLOGY_TEST_EXECUTION_ENABLED: configWriteEnv.TOPOLOGY_TEST_EXECUTION_ENABLED,
+            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: configWriteEnv.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED });
         this.secretBox = secretBox;
         this.secretKey = secretKey;
     }
@@ -903,37 +910,45 @@ class L2tpSimpleService {
                 throw simpleError('NODE_OPERATION_LOCK_CONFLICT', 'The relay is busy with another operation');
             }
             lock = acquired.lock;
-            const { topologyManagesNodeConfig } = require('../../../services/topologyConfigOwnership');
-            if (await topologyManagesNodeConfig({ _id: selectedNodeId }, this.configWriteEnv)) {
-                throw simpleError('CLASSIC_CONFIG_WRITE_OWNER_VETO', 'Topology owns this relay configuration');
-            }
-            const ssh = this.nodeSSHFactory(node);
-            try {
-                const result = await ssh.exec(buildTeardownScript(state));
-                const stdout = typeof result === 'string' ? result : result?.stdout ?? '';
-                const hasExitCode = result !== null
-                    && typeof result === 'object'
-                    && Number.isInteger(result.code);
-                const code = hasExitCode ? result.code : undefined;
-                if (!hasExitCode || code !== 0 || !stdout.includes('TEARDOWN_OK')) {
-                    const failure = simpleError('UNINSTALL_UNCERTAIN', 'The relay L2TP teardown outcome could not be established');
-                    failure.remoteOutcomeUncertain = true;
-                    remoteOutcomeUncertain = true;
-                    throw failure;
+            const { withHeldL2tpNodeConfigWrite } = require('../../../services/classicNodeConfigWrite');
+            await withHeldL2tpNodeConfigWrite({ lock, lockService: this.lockService, clock: this.lockService.clock,
+                standaloneAdmission: { id: admissionId, repository: this.remoteAdmissionRepository } }, async () => {
+                if (this.configWriteGuard) {
+                    await this.configWriteGuard(selectedNodeId);
+                } else {
+                    const { topologyManagesNodeConfig } = require('../../../services/topologyConfigOwnership');
+                    if (await topologyManagesNodeConfig({ _id: selectedNodeId }, this.configWriteEnv)) {
+                        throw simpleError('CLASSIC_CONFIG_WRITE_OWNER_VETO', 'Topology owns this relay configuration');
+                    }
                 }
-                remoteQuiescent = true;
-            } catch (error) {
-                remoteOutcomeUncertain = true;
-                if (error?.remoteOutcomeUncertain === true) throw error;
-                const uncertain = simpleError(
-                    'UNINSTALL_UNCERTAIN',
-                    'The relay L2TP teardown outcome could not be established',
-                );
-                uncertain.remoteOutcomeUncertain = true;
-                throw uncertain;
-            } finally {
-                ssh.disconnect?.();
-            }
+                const ssh = this.nodeSSHFactory(node);
+                try {
+                    const result = await ssh.exec(buildTeardownScript(state));
+                    const stdout = typeof result === 'string' ? result : result?.stdout ?? '';
+                    const hasExitCode = result !== null
+                        && typeof result === 'object'
+                        && Number.isInteger(result.code);
+                    const code = hasExitCode ? result.code : undefined;
+                    if (!hasExitCode || code !== 0 || !stdout.includes('TEARDOWN_OK')) {
+                        const failure = simpleError('UNINSTALL_UNCERTAIN', 'The relay L2TP teardown outcome could not be established');
+                        failure.remoteOutcomeUncertain = true;
+                        remoteOutcomeUncertain = true;
+                        throw failure;
+                    }
+                    remoteQuiescent = true;
+                } catch (error) {
+                    remoteOutcomeUncertain = true;
+                    if (error?.remoteOutcomeUncertain === true) throw error;
+                    const uncertain = simpleError(
+                        'UNINSTALL_UNCERTAIN',
+                        'The relay L2TP teardown outcome could not be established',
+                    );
+                    uncertain.remoteOutcomeUncertain = true;
+                    throw uncertain;
+                } finally {
+                    ssh.disconnect?.();
+                }
+            }); // Final held verification precedes state settlement/exact release.
 
             const stateRepository = new L2tpStateManagementRepository({
                 HyNode: this.HyNode,

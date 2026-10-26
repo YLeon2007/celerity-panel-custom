@@ -20,7 +20,7 @@ const generator = require('../configGenerator');
 const { cascadePathIngressPort } = require('../../modules/relay-l2tp/domain/cascadePathIngress');
 const { buildL2tpXrayFragment } = require('../../modules/relay-l2tp/services/l2tpXrayFragmentProvider');
 const { PRODUCTION_TOPOLOGY_EXECUTION_CONTEXT: context } = require('../../modules/relay-l2tp/domain/topologyExecutionContext');
-const NODE = '507f1f77bcf86cd799439011';
+const NODE = '6ab189dc63913ebd4a917399';
 const HEAD = '507f1f77bcf86cd799439012';
 const EXIT = '507f1f77bcf86cd799439013';
 const GROUP = '507f1f77bcf86cd799439014';
@@ -35,7 +35,7 @@ const downstream = { _id: DOWN, portalNode: relay, bridgeNode: exit, mode: 'reve
 const group = { _id: GROUP, mode: 'reverse', paths: [{ pathKey: 'main', linkIds: [DOWN], enabled: true }] };
 const query = value => {
     let selected = value;
-    return { select(fields) {
+    return { session() { return this; }, setOptions() { return this; }, select(fields) {
         if (!value) return this;
         selected = {};
         for (const name of ['_id', ...fields.split(/\s+/).map(key => key.replace(/^\+/, ''))]) {
@@ -64,10 +64,11 @@ const original = Module._load;
 Module._load = function(request, parent, isMain) {
     const filename = parent?.filename || '';
     if (filename.endsWith('/topologyConfigOwnership.js')) {
-        if (request.endsWith('/topologyOperationModel')) return { exists: async () => { active.events.push('owner-read'); active.assertHeld(); return false; } };
+        if (request.endsWith('/topologyOperationModel')) return { exists: async filter => { active.events.push('owner-read'); active.assertHeld(); return active.legacy
+            ? active.legacy.data.topologyoperations.find(require('sift').default(filter)) || null : false; } };
         if (request === 'mongoose') {
             const real = original.call(this, request, parent, isMain);
-            return { Types: real.Types, connection: { db: { collection: () => ({ find: () => ({ toArray: async () => active.owners }) }) } } };
+            return { Types: real.Types, connection: { db: active.legacy?.db || { collection: () => ({ find: () => ({ toArray: async () => active.owners }) }) } } };
         }
     }
     if (filename.endsWith('/l2tpRuntimeLifecycleHook.js')) {
@@ -89,15 +90,15 @@ Module._load = function(request, parent, isMain) {
 };
 class SSH {
     constructor(node) { this.node = node; }
-    async connect() { active.assertHeld(); active.events.push('connect'); }
+    async connect() { await active.assertScope?.(); active.assertHeld(); active.events.push('connect'); }
     disconnect() {}
     async uploadContent(content, path) {
-        active.assertHeld(); active.events.push('upload:' + path); active.uploads.push({ content, path });
+        await active.assertScope?.(); active.assertHeld(); active.events.push('upload:' + path); active.uploads.push({ content, path });
         if (active.uploadFailure) throw new Error('unknown SFTP');
         if (path === '/usr/local/etc/xray/config.json') active.live = content;
     }
     async exec(command) {
-        active.assertHeld(); active.commands.push(command); active.events.push(command.includes('cat /usr/local/etc/xray/config.json') ? 'live-main' : 'exec');
+        await active.assertScope?.(); active.assertHeld(); active.commands.push(command); active.events.push(command.includes('cat /usr/local/etc/xray/config.json') ? 'live-main' : 'exec');
         let stdout = command.includes('cat /usr/local/etc/xray/config.json') ? active.live : command.includes('is-active') ? 'active' : '/usr/local/bin/xray';
         const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
         if (receipt) stdout += '\n' + receipt[0] + '\n';
@@ -155,27 +156,39 @@ function assembledRuntime(f, kind = 'install') {
     const { createL2tpRuntime } = require('../../modules/relay-l2tp/runtime/createL2tpRuntime');
     let claimed = false;
     const operation = { _id: 'install-op', kind, node: NODE, status: 'running',
-        leaseOwner: 'worker', ownerGeneration: 1, admissionId: 'admitted', executionContext: context,
+        leaseOwner: 'worker', ownerGeneration: 1, admissionId: 'admitted', executionContext: f.executionContext || context,
         plan: kind === 'install' ? f.plan : { ok: true, operationId: 'install-op', relayId: NODE, desired: { credentialRevision: 7 },
             steps: [{ type: 'backup' }, { type: 'sync_users', artifacts: [{ type: 'desired', path: 'desired.json' }] }, { type: 'verify_users' }] } };
     const pass = (_req, _res, next) => next();
+    const settlement = f.legacy ? standaloneRepository(f).repository : null;
+    if (settlement) {
+        settlement.L2tpOperation = { db: settlement.RemoteAdmission.db,
+            findOne: filter => query(require('sift').default(filter)(operation) ? operation : null) };
+        settlement.NodeOperationLock = f.model;
+    }
     const runtime = createL2tpRuntime({
-        executionContext: context, enableProductionExecution: true,
+        executionContext: f.executionContext || context, enableProductionExecution: !f.executionContext,
+        enableUnsafeExecutionForTests: !!f.executionContext,
         operationModel: { updateOne: async (filter, update) => { f.events.push('operation-write');
             assert.equal(filter.leaseOwner, 'worker'); assert.equal(filter.ownerGeneration, 1);
-            if (update.$set?.status) operation.status = update.$set.status;
+            Object.assign(operation, update.$set || {});
             return { matchedCount: 1 }; } },
         operationRepository: {}, nodeRepository: {}, stateRepository: {}, stateManagementService: {}, userManagementService: {},
         preflightRunner: async () => ({}), lockService: f.lockService,
         remoteAdmissionRepository: {
-            claimQueuedInstall: async () => { if (claimed) return null; claimed = true; return operation; },
+            claimQueuedInstall: async () => { if (claimed) return null; claimed = true; if (f.legacy) { f.legacy.data.remoteadmissions = [{ _id: 'admitted', nodeId: NODE, kind,
+                phase: 'running', operationId: 'install-op', leaseOwner: 'worker', ownerGeneration: 1 }];
+                f.legacy.data.cascadetopologystates[0].remoteAdmissionCount = 1; } return operation; },
             claimQueuedSyncUsers: async () => null,
             completeTerminalOperation: async () => { f.events.push('admission-terminal'); return true; },
-            completeVerifiedOperation: async () => { assert.equal(f.rows.size, 0); f.events.push('admission-done'); return true; },
+            completeVerifiedOperation: async request => { assert.equal(f.rows.size, 0);
+                if (settlement) await settlement.completeVerifiedOperation(request);
+                f.events.push('admission-done'); return true; },
             markOperationRecoveryRequired: async () => { f.events.push('retained'); return true; },
         },
         secretResolver: async () => { f.assertHeld(); f.events.push('psk'); return { psk: 'already-stored-psk', users: [] }; },
-        userSnapshotResolver: async () => { f.assertHeld(); f.events.push('user-snapshot'); return { credentialRevision: 7, users: [] }; },
+        userSnapshotResolver: async () => { await active.assertScope?.(); f.assertHeld(); f.events.push('user-snapshot');
+            return f.resolveUserSnapshot ? f.resolveUserSnapshot() : { credentialRevision: 7, users: [] }; },
         userSyncReconciler: { finalizeClaimedVerifiedSync: async () => { f.assertHeld(); return { ok: true }; } }, stateReconciler: async () => f.assertHeld(),
         candidateService: f.candidateService, operationMaterializer: materializeInstallOperation,
         transport: { uploadRootFile: async request => { f.assertHeld(); f.events.push('candidate-upload:' + request.path); f.uploads.push(request); },
@@ -437,21 +450,244 @@ for (const mode of ['success', 'undefined', 'false', 'timeout']) {
 
 test('uninstall checks native durable owner after exact lock and before SSH construction', async () => {
     const f = fixture({ veto: true }); active.teardown = true;
+    f.legacy = { data: { cascadetopologystates: [{ _id: 'singleton', topologyAdmissionCount: 0, remoteAdmissionCount: 0 }] } };
+    const remote = standaloneRepository(f);
+    const release = remote.repository.release.bind(remote.repository);
+    remote.repository.release = async admissionId => { await release(admissionId); f.events.push('admission-released'); };
+    const { service } = uninstallService(f, remote);
+    await assert.rejects(service.uninstallRelay(NODE), { code: 'CLASSIC_CONFIG_WRITE_OWNER_VETO' });
+    assert.deepEqual(f.events, ['lock', 'owner-read', 'release', 'admission-released']);
+    assert.equal(f.rows.size, 0);
+});
+
+// B1: assembled default-root services + actual worker/simple paths, with
+// SIMULATED persistence, SSH and physical authority (no network/database).
+async function releasedFixture() {
+    const f = fixture();
+    const legacy = require('./fixtures/legacyReleaseSimulation').fixture();
+    legacy.data.hynodes[0] = { ...relay };
+    await legacy.service().retire();
+    Object.defineProperty(legacy.data, 'nodeoperationlocks', { get: () => [...f.rows.values()] });
+    f.legacy = active.legacy = legacy;
+    f.executionContext = require('../../modules/relay-l2tp/domain/topologyExecutionContext').TEST_TOPOLOGY_EXECUTION_CONTEXT;
+    active.assertScope = async () => require('../classicNodeConfigWrite').assertHeldL2tpNodeConfigWrite(NODE);
+    const guard = f.candidateService.assertConfigWriteAllowed;
+    f.candidateService.assertConfigWriteAllowed = async node => {
+        await guard(node); await active.assertScope(); f.events.push('guard-held');
+    };
+    return f;
+}
+for (const kind of ['install', 'sync_users']) test('receipt assembled actual worker succeeds inside held pre-remote scope: ' + kind, async () => {
+    const f = await releasedFixture();
+    const history = require('mongodb').BSON.serialize({ rows: f.legacy.data.topologyoperations });
+    const result = await assembledRuntime(f, kind).worker.runOnce();
+    assert.deepEqual(result, { claimed: true, operationId: 'install-op', status: 'succeeded' });
+    assert(f.events.indexOf('guard-held') > f.events.indexOf('lock'));
+    const firstRemote = f.events.findIndex(e => e === 'connect' || e.startsWith('runner:') || e.startsWith('candidate-upload:'));
+    assert(firstRemote > f.events.indexOf('guard-held'));
+    assert(f.events.indexOf('release') < f.events.indexOf('admission-done'));
+    assert.equal(f.rows.size, 0);
+    assert.equal(f.legacy.data.remoteadmissions[0].phase, 'completed');
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 0);
+    assert.deepEqual(require('mongodb').BSON.serialize({ rows: f.legacy.data.topologyoperations }), history);
+});
+// Actual standalone acquire()/release() create their real schema shape, NOT a
+// made-up operationId to satisfy recognition. Only model persistence is fake.
+function standaloneRepository(f) {
+    const { RemoteAdmissionRepository } = require('../../modules/relay-l2tp/repositories/remoteAdmissionRepository');
+    const data = f.legacy.data;
+    const connection = { startSession: async () => ({ withTransaction: work => work({}), endSession: async () => {} }),
+        transaction: work => work({}) };
+    const matches = (row, filter) => require('sift').default(filter)(row);
+    f.model.db = connection;
+    const CascadeTopologyState = { db: connection, findById: () => query({ stateTransitionRevision: 0 }),
+        findOneAndUpdate: () => query({ stateTransitionRevision: 1 }),
+        updateOne: async (filter, update) => {
+            const row = data.cascadetopologystates.find(r => matches(r, filter));
+            if (!row) return { matchedCount: 0 };
+            for (const [key, n] of Object.entries(update.$inc || {})) row[key] = (row[key] || 0) + n;
+            return { matchedCount: 1 };
+        } };
+    const RemoteAdmission = { db: connection,
+        findOne: filter => query((data.remoteadmissions || []).find(row => matches(row, filter)) || null),
+        create: async rows => { (data.remoteadmissions ||= []).push(...rows); return rows; },
+        updateOne: async (filter, update) => { const row = data.remoteadmissions.find(r => matches(r, filter));
+            if (!row) return { matchedCount: 0 }; Object.assign(row, update.$set); return { matchedCount: 1 }; } };
+    return { repository: new RemoteAdmissionRepository({ CascadeTopologyState, RemoteAdmission,
+        transactionRunner: work => work({}) }), connection, CascadeTopologyState, RemoteAdmission };
+}
+function uninstallService(f, remote) {
     const { L2tpSimpleService } = require('../../modules/relay-l2tp/services/l2tpSimpleService');
-    const service = new L2tpSimpleService({
-        configWriteEnv: { PANEL_DOMAIN: context.hostIdentity }, allowRemoteExecution: true,
+    active.teardown = true;
+    const state = { node: NODE, status: 'installed' };
+    const service = new L2tpSimpleService({ configWriteEnv: { ...process.env }, allowRemoteExecution: true,
         HyNode: { find: () => query([relay]), findById: () => query(relay) },
-        RelayL2tpState: { find: () => query([]), findOne: () => query({ node: NODE, status: 'installed' }) },
+        RelayL2tpState: { db: remote.connection, find: () => query([]), findOne: () => query(state),
+            findOneAndUpdate: async (_, update) => { Object.assign(state, update.$set); return state; } },
+        CascadeTopologyState: remote.CascadeTopologyState,
         L2tpUser: { find: () => query([]) }, CascadeRouteGroup: { find: () => query([]) },
         l2tpService: { install() {}, getOperation() {} }, stateManagementService: { configureRelay() {}, revealPsk() {} },
         userManagementService: { createUser() {}, deleteUser() {}, importUser() {} },
         stateRepository: { getTopologyRevision: async () => 196 }, lockService: f.lockService,
-        remoteAdmissionRepository: { acquire: async () => 'admitted', release: async () => { f.events.push('admission-released'); } },
-        nodeSSHFactory: () => { throw new Error('must not construct SSH on owner veto'); },
+        remoteAdmissionRepository: remote.repository,
+        nodeSSHFactory: () => ({ exec: async () => { await active.assertScope(); f.assertHeld();
+            f.events.push('teardown-ssh'); await f.afterTeardown?.(); return { code: 0, stdout: 'TEARDOWN_OK' }; }, disconnect() {} }),
     });
-    await assert.rejects(service.uninstallRelay(NODE), { code: 'CLASSIC_CONFIG_WRITE_OWNER_VETO' });
-    assert.deepEqual(f.events, ['lock', 'owner-read', 'release', 'admission-released']);
+    return { service, state };
+}
+test('receipt assembled actual simple uninstall binds real acquired standalone admission', async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f);
+    const { service, state } = uninstallService(f, remote);
+    assert.deepEqual(await service.uninstallRelay(NODE), { ok: true });
+    assert.equal(state.status, 'not_installed');
     assert.equal(f.rows.size, 0);
+    const [admission] = f.legacy.data.remoteadmissions;
+    assert.equal(admission.kind, 'standalone_preflight');
+    assert.equal(admission.phase, 'completed');
+    assert.equal(Object.hasOwn(admission, 'operationId'), false);
+    assert.equal(Object.hasOwn(admission, 'leaseOwner'), false);
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 0);
+    assert(f.events.indexOf('owner-read') < f.events.indexOf('teardown-ssh'));
+});
+
+for (const [name, mutate] of [
+    ['wrong-node', a => { a.nodeId = HEAD; }],
+    ['replacement-id', a => { a._id = 'replacement-admission'; }],
+    ['foreign-worker-link', a => { a.operationId = 'foreign'; }],
+    ['wrong-kind', a => { a.kind = 'install'; }],
+    ['wrong-generation', a => { a.ownerGeneration = 2; }],
+    ['non-running', a => { a.phase = 'recovery_required'; }],
+]) test('receipt actual uninstall refuses foreign standalone admission before SSH: ' + name, async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f);
+    const { service, state } = uninstallService(f, remote);
+    const acquire = f.lockService.acquire.bind(f.lockService);
+    f.lockService.acquire = async input => { const result = await acquire(input);
+        mutate(f.legacy.data.remoteadmissions[0]); return result; };
+    await assert.rejects(service.uninstallRelay(NODE));
+    assert(!f.events.includes('teardown-ssh'));
+    assert.equal(state.status, 'installed');
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 1);
+});
+for (const drift of ['admission-replacement', 'generation-replacement', 'expired-lease', 'admission-read-error'])
+test('receipt actual uninstall retains fences on post-SSH drift: ' + drift, async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f);
+    const { service, state } = uninstallService(f, remote);
+    f.afterTeardown = () => {
+        if (drift === 'admission-replacement') f.legacy.data.remoteadmissions[0]._id = 'replacement-admission';
+        if (drift === 'generation-replacement') f.rows.set(NODE, { ...f.rows.get(NODE), generation: 'replacement' });
+        if (drift === 'expired-lease') f.rows.get(NODE).leaseUntil = new Date(0);
+        if (drift === 'admission-read-error') remote.repository.RemoteAdmission.findOne = () => ({
+            setOptions() { return this; }, lean: async () => { throw new Error('SIMULATED read failure'); } });
+    };
+    await assert.rejects(service.uninstallRelay(NODE));
+    assert(f.events.includes('teardown-ssh'));
+    assert.equal(state.status, 'installed');
+    assert.equal(f.rows.size, 1, 'final held verification must fail before exact release');
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 1);
+    assert.equal(f.legacy.data.remoteadmissions[0].phase, 'running');
+});
+test('receipt genuine standalone held scope refuses outside, escaped and replaced generation', async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f);
+    const admissionId = await remote.repository.acquire({ nodeId: NODE });
+    const acquired = await f.lockService.acquire({ node: NODE, owner: 'worker', operationId: 'install-op', leaseMs: 30000 });
+    const { withHeldL2tpNodeConfigWrite } = require('../classicNodeConfigWrite');
+    const read = () => require('../testLegacyTopologyRelease').hasTestLegacyTopologyRelease({
+        db: f.legacy.db, nodeId: NODE, env: process.env });
+    await assert.rejects(read(), /SCOPE_CLOSED/);
+    let escaped;
+    const scope = { lock: acquired.lock, lockService: f.lockService, clock: f.lockService.clock,
+        standaloneAdmission: { id: admissionId, repository: remote.repository } };
+    await withHeldL2tpNodeConfigWrite(scope, async () => {
+        assert.equal(await read(), true);
+        escaped = new Promise(resolve => setImmediate(() => resolve(read())));
+    });
+    await assert.rejects(escaped, /SCOPE_CLOSED/);
+    f.rows.set(NODE, { ...acquired.lock, generation: 'foreign-generation' });
+    await assert.rejects(withHeldL2tpNodeConfigWrite(scope, read), /LOCK_UNCERTAIN/);
+    assert.equal(f.rows.size, 1);
+});
+
+for (const kind of ['install', 'sync_users']) for (const veto of ['native-owner', 'foreign-admission']) {
+    test(`receipt actual worker keeps ${veto} veto before first SSH: ${kind}`, async () => {
+        const f = await releasedFixture();
+        if (veto === 'native-owner') f.legacy.data.topologyconfigowners = [{}];
+        else {
+            const create = f.model.create;
+            f.model.create = async row => { const lock = await create(row);
+                f.legacy.data.remoteadmissions[0].operationId = 'foreign-operation'; return lock; };
+        }
+        const result = await assembledRuntime(f, kind).worker.runOnce();
+        assert.equal(result.status, 'failed');
+        assert(!f.events.includes('connect'));
+        assert(!f.events.includes('user-snapshot'));
+        assert(!f.events.some(e => e.startsWith('runner:') || e.startsWith('candidate-upload:')));
+    });
+}
+test('receipt genuine standalone scope rejects a repository from a foreign connection', async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f);
+    const admissionId = await remote.repository.acquire({ nodeId: NODE });
+    const acquired = await f.lockService.acquire({ node: NODE, owner: 'worker', operationId: 'install-op', leaseMs: 30000 });
+    remote.repository.RemoteAdmission.db = { foreign: true };
+    await assert.rejects(require('../classicNodeConfigWrite').withHeldL2tpNodeConfigWrite({
+        lock: acquired.lock, lockService: f.lockService, clock: f.lockService.clock,
+        standaloneAdmission: { id: admissionId, repository: remote.repository },
+    }, () => { throw new Error('must not dispatch'); }), /ADMISSION_UNCERTAIN/);
+    assert.equal(f.rows.size, 1);
+});
+
+for (const kind of ['install', 'sync_users']) test('receipt actual worker retains unknown held completion before settlement: ' + kind, async () => {
+    const f = await releasedFixture();
+    if (kind === 'install') {
+        const build = f.candidateService.buildCandidate.bind(f.candidateService);
+        f.candidateService.buildCandidate = async input => { const result = await build(input);
+            f.rows.get(NODE).leaseUntil = new Date(0); return result; };
+    } else f.resolveUserSnapshot = async () => { f.rows.get(NODE).leaseUntil = new Date(0);
+        return { credentialRevision: 7, users: [] }; };
+    const result = await assembledRuntime(f, kind).worker.runOnce();
+    assert.equal(result.errorCode, 'REMOTE_COMMAND_OUTCOME_UNCERTAIN');
+    assert.equal(result.stopped, true);
+    assert.equal(f.rows.size, 1);
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 1);
+    assert(!f.events.includes('release'));
+    assert(!f.events.includes('admission-done'));
+});
+
+test('receipt actual execution factory forwards root-owned guard to real simple uninstall', async () => {
+    const f = await releasedFixture(); const remote = standaloneRepository(f); active.teardown = true;
+    const { createL2tpExecutionRuntime } = require('../../modules/relay-l2tp/runtime/createL2tpExecutionRuntime');
+    const state = { node: NODE, status: 'installed', ...f.plan.desired };
+    class TeardownSSH {
+        async exec() { await active.assertScope(); f.events.push('factory-teardown-ssh');
+            return { code: 0, stdout: 'TEARDOWN_OK' }; }
+        disconnect() {}
+    }
+    const rootDependencies = f.root;
+    const host = createL2tpExecutionRuntime({ ...rootDependencies,
+        workerLifecycle: { enabled: true },
+        HyNode: { find: () => query([relay]), findById: () => query(relay) },
+        RelayL2tpState: { db: remote.connection, find: () => query([]), findOne: () => query(state),
+            findOneAndUpdate: async (_, update) => { Object.assign(state, update.$set); return state; } },
+        L2tpUser: { find: () => query([]), findOne: () => query(null),
+            findOneAndUpdate: async () => { throw new Error('unused user write'); },
+            create: async () => { throw new Error('unused user create'); } },
+        CascadeRouteGroup: { find: () => query([]) },
+        CascadeTopologyState: remote.CascadeTopologyState, RemoteAdmission: remote.RemoteAdmission,
+        operationModel: {}, lockModel: f.model, NodeSSH: TeardownSSH, NodeTransport: class {},
+        createCandidateService: () => f.candidateService,
+        createUserSnapshotResolver: () => async () => ({ credentialRevision: 7, users: [] }),
+        createUserSyncReconciler: () => ({ finalizeVerifiedSync() {} }),
+        stateManagementService: { configureRelay() {}, revealPsk() {} },
+        secretBox: { encrypt() {}, decrypt() {} }, secretKey: 'SIMULATED-key',
+        runtimeDependencies: { executionContext: f.executionContext, enableInstallAdmission: true,
+            stateRepository: { getTopologyRevision: async () => 196 } },
+        createRuntime: () => ({ service: { install() {}, getOperation() {} }, worker: {} }),
+        createWorkerLifecycle: () => ({ start() {}, stop() {} }),
+    });
+    assert.deepEqual(await host.runtime.simpleService.uninstallRelay(NODE), { ok: true });
+    assert(f.events.indexOf('guard-held') < f.events.indexOf('factory-teardown-ssh'));
+    assert.equal(f.rows.size, 0);
+    assert.equal(f.legacy.data.cascadetopologystates[0].remoteAdmissionCount, 0);
+    assert.equal(f.legacy.data.remoteadmissions[0].phase, 'completed');
 });
 
 process.on('exit', () => { Module._load = original; });
