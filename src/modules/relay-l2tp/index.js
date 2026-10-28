@@ -132,9 +132,22 @@ function createTopologyTransferDraftService(dependencies) {
         .createTopologyTransferDraftService(dependencies);
 }
 
-function createTopologyDeploymentService(dependencies) {
+function isClassicProductionDeploymentEnabled(env) {
+    return require('../../services/classicScopedCascadeDeploymentService')
+        .isClassicProductionDeploymentEnabled(env);
+}
+
+function createTopologyDeploymentService(dependencies = {}) {
+    const env = Object.freeze({ ...(dependencies?.env ?? process.env) });
+    const selected = { ...dependencies, env };
+    if (isClassicProductionDeploymentEnabled(env)) {
+        return require('../../services/classicScopedCascadeDeploymentService')
+            .createClassicScopedCascadeDeploymentService(selected);
+    }
+    // Native flags win. Never catch native construction/authorization failures
+    // or use classic as a fallback for an incomplete native configuration.
     return require('./runtime/createTopologyOperationRuntime')
-        .createTopologyOperationRuntime(dependencies);
+        .createTopologyOperationRuntime(selected);
 }
 
 module.exports = {
@@ -146,5 +159,6 @@ module.exports = {
     registerRoutes,
     createTopologyTransferDraftService,
     createTopologyDeploymentService,
+    isClassicProductionDeploymentEnabled,
     createTopologyIntentService: dependencies => require('./services/topologyIntentService').createTopologyIntentService(dependencies),
 };

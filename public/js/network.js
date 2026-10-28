@@ -25,6 +25,13 @@
     // Backend cause codes -> Russian UI text. Codes are enum-like and safe to
     // display; free-form backend messages are not trusted (see below).
     const TOPOLOGY_CAUSE_TEXT_RU = Object.freeze({
+        CLASSIC_DEPLOY_UNSUPPORTED: 'Classic поддерживает только отдельный Deploy активной reverse-связи',
+        CLASSIC_DEPLOY_BUSY: 'Топология занята или не инициализирована — требуется проверка',
+        CLASSIC_DEPLOY_SCOPE_CHANGED: 'Состав применённых связей изменился — обновите топологию',
+        CLASSIC_DEPLOY_IN_USE: 'Связь используется L2TP или группой маршрутов — classic запрещён',
+        CLASSIC_DEPLOY_OWNER_VETO: 'Конфигурация узла принадлежит другому исполнителю',
+        CLASSIC_DEPLOY_UNCERTAIN: 'Завершение classic не подтверждено; блокировка сохранена для восстановления',
+        CLASSIC_DEPLOY_FENCE_LOST: 'Владение блокировкой classic не подтверждено — требуется проверка',
         INVALID_REQUEST: 'Некорректный запрос',
         INVALID_TOPOLOGY_REVISION: 'Некорректная ревизия топологии',
         STALE_TOPOLOGY_REVISION: 'Топология изменилась — обновите данные и повторите',
@@ -116,10 +123,18 @@
         return CLIENT_READINESS_UNVERIFIED;
     }
 
+    function isCompletedClassicDeploymentResult(result, revision) {
+        return !!result && result.status === 'succeeded' && result.executionMode === 'classic'
+            && Number.isSafeInteger(revision) && revision >= 0 && result.topologyRevision === revision
+            && Object.keys(result).sort().join(',') === 'executionMode,status,topologyRevision';
+    }
+
     function deployResultMessage(result, labels = {}) {
-        const outcome = result.status === 'succeeded'
-            ? (labels.deployAlreadyDeployed || 'Topology already deployed')
-            : (labels.deployQueued || 'Deployment queued');
+        const outcome = isCompletedClassicDeploymentResult(result, result.topologyRevision)
+            ? (labels.classicLinkApplied || 'Связь применена (classic)')
+            : result.status === 'succeeded'
+                ? (labels.deployAlreadyDeployed || 'Topology already deployed')
+                : (labels.deployQueued || 'Deployment queued');
         return outcome + ' — ' + (labels.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED);
     }
 
@@ -131,6 +146,7 @@
             TOPOLOGY_CAUSE_TEXT_RU,
             clientReadinessMessage,
             deployResultMessage,
+            isCompletedClassicDeploymentResult,
             describeTopologyError,
             fingerprintForLinkEdit,
             resolveRealityFingerprint,
@@ -1253,6 +1269,11 @@
             startIntentPolling(job);
             return;
         }
+        const completed = snapshot?.autoDeployResult;
+        if (isCompletedClassicDeploymentResult(completed, snapshot?.topologyRevision)) {
+            showToast(deployResultMessage(completed));
+            return;
+        }
         const operation = snapshot?.autoDeployOperation;
         if (operation?.status === 'queued' && operation.operationId) {
             startOperationPolling(operation);
@@ -1263,9 +1284,14 @@
         // particular, never fall back to an unscoped full-topology deploy.
         const error = snapshot?.autoDeployError
             || { code: snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus };
-        showToast((i18n.savedAutoDeployBlocked || 'Изменения сохранены, но автодеплой не запущен') + ': '
-            + describeTopologyError({ error }, 'Автодеплой не поставлен в очередь')
-            + '. Для применения используйте отдельный Deploy этой связи.', 'error');
+        const classicRefusal = typeof error.code === 'string' && error.code.startsWith('CLASSIC_DEPLOY_');
+        const savedMessage = classicRefusal
+            ? (i18n.savedClassicDeployUnconfirmed || 'Изменения сохранены; применение не подтверждено')
+            : (i18n.savedAutoDeployBlocked || 'Изменения сохранены, но автодеплой не запущен');
+        showToast(savedMessage + ': '
+            + describeTopologyError({ error }, 'Автодеплой не подтверждён')
+            + (classicRefusal ? '. Проверьте состояние и блокировки перед повторной попыткой.'
+                : '. Для применения используйте отдельный Deploy этой связи.'), 'error');
     }
 
     async function onAddLinkSubmit(e) {

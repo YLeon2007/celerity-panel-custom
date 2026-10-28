@@ -419,6 +419,32 @@ test('PUT queue errors remain blocked with safe codes and preserve the edited sn
     assert.doesNotMatch(JSON.stringify(response.body), /secret-value|CREDENTIAL_SECRET/);
 });
 
+test('PUT exact completed classic result has its own truthful contract without operation/job IDs', async () => {
+    const { router } = createAutoDeployHarness({ editedLink: editedLink(),
+        coordinator: { async queue() { return { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 }; } } });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.autoDeployResult, { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 });
+    assert.equal(response.body.autoDeployOperation, undefined);
+    assert.equal(response.body.autoDeployJob, undefined);
+    assert.equal(response.body.autoDeployStatus, undefined);
+    assert.equal(response.body.deployedRevision, 5);
+});
+
+test('PUT classic refusals preserve safe codes and never pretend that completion was queued', async () => {
+    for (const code of ['CLASSIC_DEPLOY_BUSY', 'CLASSIC_DEPLOY_UNSUPPORTED', 'CLASSIC_DEPLOY_SCOPE_CHANGED',
+        'CLASSIC_DEPLOY_IN_USE', 'CLASSIC_DEPLOY_OWNER_VETO', 'CLASSIC_DEPLOY_UNCERTAIN', 'CLASSIC_DEPLOY_FENCE_LOST']) {
+        const { router } = createAutoDeployHarness({ editedLink: editedLink(),
+            coordinator: { async queue() { throw Object.assign(new Error('password=secret'), { code }); } } });
+        const response = await putEdit(router, editBody({ autoDeploy: true }));
+        assert.equal(response.body.autoDeployStatus, 'blocked');
+        assert.equal(response.body.autoDeployError.code, code);
+        assert.equal(response.body.autoDeployResult, undefined);
+        assert.equal(response.body.autoDeployOperation, undefined);
+        assert.doesNotMatch(JSON.stringify(response.body), /password|secret/);
+    }
+});
+
 test('PUT malformed queue result fails closed rather than claiming a queued operation', async () => {
     const { router } = createAutoDeployHarness({
         editedLink: editedLink(),

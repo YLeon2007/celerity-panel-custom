@@ -20,6 +20,7 @@ const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
+const { isCompletedClassicDeploymentResult } = require('../services/classicScopedCascadeDeploymentService');
 const { requireScope } = require('../middleware/auth');
 
 const LINK_POPULATE_SELECT = 'name ip flag status';
@@ -137,6 +138,13 @@ const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
     'TOPOLOGY_DEPLOY_BUSY',
     'TOPOLOGY_OPERATION_QUEUE_FAILED',
     'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+    'CLASSIC_DEPLOY_UNSUPPORTED',
+    'CLASSIC_DEPLOY_BUSY',
+    'CLASSIC_DEPLOY_SCOPE_CHANGED',
+    'CLASSIC_DEPLOY_IN_USE',
+    'CLASSIC_DEPLOY_OWNER_VETO',
+    'CLASSIC_DEPLOY_UNCERTAIN',
+    'CLASSIC_DEPLOY_FENCE_LOST',
 ]);
 
 function autoDeployBlockedError(error) {
@@ -145,9 +153,11 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: code === 'TOPOLOGY_DEPLOY_BUSY'
-            ? 'Another topology deployment owns the slot; retry after it finishes'
-            : 'The auto-deploy operation could not be queued',
+        message: code.startsWith('CLASSIC_DEPLOY_')
+            ? 'Classic deployment was not confirmed; inspect retained ownership before retrying'
+            : code === 'TOPOLOGY_DEPLOY_BUSY'
+                ? 'Another topology deployment owns the slot; retry after it finishes'
+                : 'The auto-deploy operation could not be queued',
         ...(code === 'TOPOLOGY_DEPLOY_BUSY' ? { retryable: true } : {}),
     };
 }
@@ -433,7 +443,11 @@ function createCascadeLinksRouter({
                     linkIds: [linkId, ...baselineLinkIds],
                 },
             });
-            if (!result || typeof result.operationId !== 'string'
+            if (isCompletedClassicDeploymentResult(result, revision)) {
+                // Synchronous checked completion, not a queued native operation.
+                return { autoDeployResult: { status: 'succeeded', executionMode: 'classic', topologyRevision: revision } };
+            }
+            if (!result || result.executionMode === 'classic' || typeof result.operationId !== 'string'
                 || result.operationId.length === 0
                 || result.topologyRevision !== revision
                 || !['queued', 'preparing', 'committing', 'succeeded'].includes(result.status)) {

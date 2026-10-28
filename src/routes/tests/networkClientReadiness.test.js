@@ -16,6 +16,42 @@ test('deployment outcomes never claim client readiness from queue or apply succe
     assert.match(source, /i18n\.operationApplied[\s\S]*?готовность клиента не подтверждена/);
 });
 
+test('classic synchronous UI completion says link applied, keeps readiness unverified, and never polls invented IDs', () => {
+    const result = { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 };
+    assert.match(network.deployResultMessage(result), /Связь применена/i);
+    assert.doesNotMatch(network.deployResultMessage(result), /topology already|цепь готова/i);
+    assert.match(network.deployResultMessage(result), /готовность клиента не подтверждена/i);
+    const handler = source.match(/    function handleLinkAutoDeploy\(snapshot, optedIn\) \{[\s\S]*?(?=\n    async function onAddLinkSubmit)/)?.[0];
+    const toasts = [];
+    const polls = [];
+    const context = { i18n: {}, deployResultMessage: network.deployResultMessage,
+        isCompletedClassicDeploymentResult: network.isCompletedClassicDeploymentResult,
+        showToast: (message, type) => toasts.push({ message, type }),
+        startOperationPolling: op => polls.push(op), startIntentPolling: op => polls.push(op),
+        describeTopologyError: () => 'blocked' };
+    const handle = vm.runInNewContext(handler + '\nhandleLinkAutoDeploy', context);
+    handle({ topologyRevision: 7, autoDeployResult: result }, true);
+    assert.equal(toasts.length, 1); assert.notEqual(toasts[0].type, 'error');
+    assert.match(toasts[0].message, /Связь применена/i);
+    assert.match(toasts[0].message, /готовность клиента не подтверждена/i);
+    assert.deepEqual(polls, []);
+    for (const bad of [{ ...result, status: 'queued' }, { ...result, topologyRevision: 6 },
+        { ...result, operationId: 'fake' }, { ...result, executionMode: 'native' }]) {
+        handle({ topologyRevision: 7, autoDeployResult: bad }, true);
+        assert.equal(toasts.at(-1).type, 'error');
+    }
+    for (const code of ['CLASSIC_DEPLOY_UNCERTAIN', 'CLASSIC_DEPLOY_FENCE_LOST']) {
+        handle({ autoDeployError: { code } }, true);
+        assert.match(toasts.at(-1).message, /применение не подтверждено/i);
+        assert.doesNotMatch(toasts.at(-1).message, /не запущен/i);
+    }
+    const before = toasts.length;
+    handle({ topologyRevision: 7, autoDeployResult: result }, false);
+    assert.equal(toasts.length, before);
+    handle({ autoDeployOperation: { status: 'queued', operationId: 'real-native' } }, true);
+    assert.equal(polls.length, 1);
+});
+
 test('edge readiness fails closed without current explicit client proof', () => {
     const label = network.clientReadinessMessage;
     assert.match(label(null, 7, 7), /не подтверждена/i);

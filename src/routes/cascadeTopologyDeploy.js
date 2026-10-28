@@ -20,6 +20,7 @@ const {
 } = require('./panel/csrf');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
+const { isCompletedClassicDeploymentResult } = require('../services/classicScopedCascadeDeploymentService');
 const { selectLinkApplyBaselineLinkIds } = require('./cascadeLinks');
 
 const DEFAULT_MODELS = Object.freeze({
@@ -53,6 +54,13 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['TOPOLOGY_DEPLOYMENT_FAILED', 500],
     ['TOPOLOGY_OPERATION_QUEUE_FAILED', 500],
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
+    ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
+    ['CLASSIC_DEPLOY_BUSY', 409],
+    ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409],
+    ['CLASSIC_DEPLOY_IN_USE', 409],
+    ['CLASSIC_DEPLOY_OWNER_VETO', 409],
+    ['CLASSIC_DEPLOY_UNCERTAIN', 503],
+    ['CLASSIC_DEPLOY_FENCE_LOST', 503],
 ]);
 const PUBLIC_ERROR_FIELDS = Object.freeze([
     'operationId',
@@ -174,6 +182,7 @@ function publicResult(result = {}) {
     for (const field of ['operationId', 'topologyRevision', 'deployedRevision', 'status']) {
         if (result[field] !== undefined) body[field] = result[field];
     }
+    if (isCompletedClassicDeploymentResult(result, result.topologyRevision)) body.executionMode = 'classic';
     if (Array.isArray(result.nodeEvidence)) {
         body.nodeEvidence = result.nodeEvidence.map(evidence => {
             const publicEvidence = {};
@@ -191,6 +200,9 @@ function publicResult(result = {}) {
 }
 
 function publicError(error) {
+    if (typeof error.code === 'string' && error.code.startsWith('CLASSIC_DEPLOY_')) {
+        return { error: { code: error.code, message: 'Classic deployment is blocked; reload the topology or recover retained ownership' } };
+    }
     const body = {
         error: {
             code: error.code,
@@ -382,6 +394,8 @@ function createCascadeTopologyDeployRouter({
                         },
                     });
                     if (!result || result.topologyRevision !== input.expectedTopologyRevision
+                        || (result.executionMode === 'classic'
+                            && !isCompletedClassicDeploymentResult(result, input.expectedTopologyRevision))
                         || !['queued', 'succeeded'].includes(result.status)) {
                         throw new TopologyDeployRequestError(
                             'TOPOLOGY_OPERATION_QUEUE_FAILED',

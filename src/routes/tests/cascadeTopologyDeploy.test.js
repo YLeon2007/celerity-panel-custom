@@ -333,6 +333,53 @@ test('per-link deploy queues only the selected link and applied component, never
     assert.equal(response.body.status, 'queued');
 });
 
+test('manual classic completion exposes mode without inventing an operation id', async () => {
+    const linkId = '507f1f77bcf86cd799439011';
+    const router = createCascadeTopologyDeployRouter({
+        topologyDeploymentService: { async deploy() { throw new Error('global forbidden'); },
+            async queue() { return { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 }; } },
+        models: { CascadeLink: { find() { return { select() { return this; }, async lean() {
+            return [{ _id: linkId, portalNode: '507f1f77bcf86cd799439031',
+                bridgeNode: '507f1f77bcf86cd799439032', active: true, status: 'pending' }];
+        } }; } } }, ...guardHarness([]),
+    });
+    const response = await request(router, { body: { expectedTopologyRevision: 7, linkId },
+        headers: { 'x-test-auth': 'api-write' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { status: 'succeeded', executionMode: 'classic', topologyRevision: 7, kind: 'link.apply' });
+});
+
+test('manual malformed classic results cannot masquerade as native queued IDs or completed work', async () => {
+    const linkId = '507f1f77bcf86cd799439011';
+    for (const result of [{ status: 'queued', executionMode: 'classic', topologyRevision: 7, operationId: 'fake' },
+        { status: 'succeeded', executionMode: 'classic', topologyRevision: 7, operationId: 'fake' }]) {
+        const router = createCascadeTopologyDeployRouter({ topologyDeploymentService: { async deploy() {}, async queue() { return result; } },
+            models: { CascadeLink: { find() { return { select() { return this; }, async lean() {
+                return [{ _id: linkId, portalNode: '507f1f77bcf86cd799439031',
+                    bridgeNode: '507f1f77bcf86cd799439032', active: true, status: 'pending' }];
+            } }; } } }, ...guardHarness([]), routeLogger: { error() {} } });
+        const response = await request(router, { body: { expectedTopologyRevision: 7, linkId }, headers: { 'x-test-auth': 'api-write' } });
+        assert.equal(response.status, 500);
+        assert.equal(response.body.error.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+        assert.equal(response.body.operationId, undefined);
+    }
+});
+
+test('classic errors use fixed 409/503 responses, never backend text or diagnostics', async () => {
+    for (const [code, status] of [['CLASSIC_DEPLOY_BUSY', 409], ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
+        ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409], ['CLASSIC_DEPLOY_IN_USE', 409],
+        ['CLASSIC_DEPLOY_OWNER_VETO', 409], ['CLASSIC_DEPLOY_UNCERTAIN', 503], ['CLASSIC_DEPLOY_FENCE_LOST', 503]]) {
+        const logged = [];
+        const router = createCascadeTopologyDeployRouter({ topologyDeploymentService: {
+            async deploy() { throw Object.assign(new Error('password=secret'), { code, errors: ['private'] }); },
+        }, ...guardHarness([]), routeLogger: { error: message => logged.push(message) } });
+        const response = await request(router, { headers: { 'x-test-auth': 'api-write' } });
+        assert.equal(response.status, status, code);
+        assert.equal(response.body.error.code, code);
+        assert.doesNotMatch(JSON.stringify(response.body) + logged.join(' '), /password|secret|private/);
+    }
+});
+
 test('manual domain Sync queues only the chosen confirmed component, not another domain or pending link', async () => {
     const selectedId = '507f1f77bcf86cd799439011';
     const companionId = '507f1f77bcf86cd799439012';
