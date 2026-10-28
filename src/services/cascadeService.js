@@ -321,8 +321,18 @@ class CascadeService {
             // Derive migration ingress ONLY from exact old target routes, including
             // preserved path SOCKS ingress. Never route arbitrary service inbounds.
             if (oldOutbound.length || oldHop.length) {
+                const priorSecurity = oldOutbound[0]?.streamSettings?.security;
+                if (!['none', 'reality', 'tls'].includes(priorSecurity)
+                    || oldHop[0]?.streamSettings?.security !== priorSecurity) {
+                    throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
+                }
+                // The saved reverse settings describe the desired next config,
+                // not the old transport. Infer only its finite security enum;
+                // still compare both full fragments against persisted keys,
+                // UUID/port/endpoints and every other canonical transport field.
+                const priorTarget = { ...target, tunnelSecurity: priorSecurity };
                 const expected = { inbounds: [], outbounds: [], routing: { rules: [] } };
-                configGenerator.applyForwardChain(expected, [target], configuredTags);
+                configGenerator.applyForwardChain(expected, [priorTarget], configuredTags);
                 const routes = main.routing.rules.filter(row => row.outboundTag === forwardTag);
                 const tags = routes.flatMap(row => row.inboundTag || []);
                 if (oldOutbound.length !== 1 || oldHop.length !== 1
@@ -336,7 +346,7 @@ class CascadeService {
                 main.outbounds = main.outbounds.filter(row => row.tag !== forwardTag);
                 main.routing.rules = main.routing.rules.filter(row => row.outboundTag !== forwardTag);
                 const hop = { inbounds: [], routing: { rules: [] } };
-                configGenerator.applyForwardHopInbound(hop, [target]);
+                configGenerator.applyForwardHopInbound(hop, [priorTarget]);
                 const hopRules = targetMain.routing.rules.filter(row => row.inboundTag?.includes(hopTag));
                 if (!scopedContains(hop.inbounds, oldHop[0]) || scopedCanonical(hopRules) !== scopedCanonical(hop.routing.rules)) {
                     throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
@@ -401,9 +411,17 @@ class CascadeService {
                 if (bridgeBaseline.length === 1) candidates.push(configGenerator.generateBridgeConfig(link, link.portalNode));
                 if (!candidates.some(text => {
                     const expected = JSON.parse(text);
+                    // Attribute the existing link's tunnel and bridge routes,
+                    // not newer generator-wide defaults (e.g. IPv6 blackhole).
+                    // Existing global rules remain byte-for-byte preserved.
+                    const bridgeTags = expected.reverse.bridges.map(row => row.tag);
+                    const tunnelTags = expected.outbounds.filter(row => !['freedom', 'blackhole'].includes(row.protocol))
+                        .map(row => row.tag);
+                    const linkRules = expected.routing.rules.filter(row => tunnelTags.includes(row.outboundTag)
+                        || row.inboundTag?.some(tag => bridgeTags.includes(tag)));
                     return expected.reverse.bridges.every(row => scopedContains(combined.reverse?.bridges, row))
                         && expected.outbounds.every(row => scopedContains(combined.outbounds, row))
-                        && expected.routing.rules.every(row => scopedContains(combined.routing.rules, row));
+                        && linkRules.every(row => scopedContains(combined.routing.rules, row));
                 })) throw scopedFailure('CLASSIC_SCOPED_SHARED_BRIDGE_BASELINE_MISMATCH');
             }
             const hasCollision = config => [...(config.inbounds || []), ...config.outbounds,

@@ -167,6 +167,57 @@ test('actual forward migration retires only exact owned fragments across three s
     for (const row of oldCombined.routing.rules) assert.ok(combined.routing.rules.some(item => JSON.stringify(item) === JSON.stringify(row)));
 });
 
+test('migration validates prior plaintext ownership when saved reverse requests REALITY', async t => {
+    const f = fixture(t); physicalForward(f);
+    f.target.tunnelSecurity = 'reality';
+    f.target.realityPrivateKey = 'fixture-private-key'; f.target.realityPublicKey = 'fixture-public-key';
+    f.target.realityShortIds = ['0123456789abcdef'];
+    assert.equal((await f.run()).success, true);
+    const portal = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`));
+    assert.equal(portal.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`).streamSettings.security, 'reality');
+});
+
+for (const legacySingle of [false, true]) {
+    test(`existing ${legacySingle ? 'single' : 'combined'} bridge without a newer global IPv6 default is preserved`, async t => {
+        const f = fixture(t); physicalForward(f, { legacySingle });
+        const key = `${BRIDGE}:${TRANSIT}`, before = JSON.parse(f.files.get(key));
+        before.routing.rules = before.routing.rules.filter(row => !row.ip?.includes('::/0'));
+        f.files.set(key, JSON.stringify(before));
+        assert.equal((await f.run()).success, true);
+        const after = JSON.parse(f.files.get(key));
+        for (const row of before.routing.rules) assert.ok(after.routing.rules.some(x => JSON.stringify(x) === JSON.stringify(row)));
+        assert.equal(after.routing.rules.some(row => row.ip?.includes('::/0')), false);
+    });
+}
+
+for (const missing of ['domain', 'bridge']) {
+    test(`shared bridge missing its own ${missing} rule is not grandfathered`, async t => {
+        const f = fixture(t); physicalForward(f);
+        const key = `${BRIDGE}:${TRANSIT}`, config = JSON.parse(f.files.get(key));
+        config.routing.rules = config.routing.rules.filter(row => missing === 'domain'
+            ? row.outboundTag !== `tunnel-${BASE.slice(-8)}`
+            : !row.inboundTag?.includes(`bridge-${BASE.slice(-8)}`));
+        f.files.set(key, JSON.stringify(config));
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_SHARED_BRIDGE_BASELINE_MISMATCH' });
+        assert.equal(f.writes.length, 0);
+    });
+}
+
+for (const kind of ['unknown-security', 'inconsistent-security', 'plaintext-wrong-uuid']) {
+    test(`prior transport inference refuses ${kind} before writes`, async t => {
+        const f = fixture(t); physicalForward(f); f.target.tunnelSecurity = 'reality';
+        const key = `${kind === 'inconsistent-security' ? BRIDGE : SOURCE}:${MAIN}`;
+        const config = JSON.parse(f.files.get(key));
+        const row = kind === 'inconsistent-security' ? config.inbounds.find(x => x.tag === `fwd-hop-${TARGET.slice(-8)}`)
+            : config.outbounds.find(x => x.tag === `fwd-${TARGET.slice(-8)}`);
+        if (kind === 'plaintext-wrong-uuid') row.settings.vnext[0].users[0].id = 'wrong-owned-credential';
+        else row.streamSettings.security = kind === 'unknown-security' ? 'unreviewed' : 'tls';
+        f.files.set(key, JSON.stringify(config));
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_OLD_FORWARD_MISMATCH' });
+        assert.equal(f.writes.length, 0);
+    });
+}
+
 test('existing DNS source endpoint is preserved verbatim through SSH and generated reverse config', async t => {
     const f = fixture(t); f.nodes[SOURCE].ip = 'test.infograd.online'; physicalForward(f);
     const result = await f.run();
