@@ -135,6 +135,13 @@ test('checked scoped completion returns synchronous classic result without IDs o
     assert.equal(h.calls.updates[1].options.writeConcern.w, 'majority');
 });
 
+test('internal create-and-apply path permits only the newly persisted pending target without allowlisting', async () => {
+    const h = harness({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: FOREIGN } });
+    const result = await h.service.queueCreatedLink(input());
+    assert.deepEqual(result, { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 });
+    assert.equal(h.calls.remote.length, 1);
+});
+
 test('forward confirmed baseline is refused before dispatch', async () => {
     const h = harness({ links: [{ _id: NEIGHBOR, portalNode: B, bridgeNode: C,
         active: true, status: 'online', mode: 'forward' }] });

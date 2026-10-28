@@ -241,6 +241,27 @@ test('POST without the autoDeploy opt-in never queues a scoped operation', async
     assert.equal(response.body.topologyRevision, 9);
 });
 
+test('POST classic autoDeploy persists then uses the fenced create-and-apply path', async () => {
+    const calls = [];
+    const { router } = createAutoDeployHarness({
+        coordinator: {
+            async queue() { throw new Error('public queue must not be selected'); },
+            async queueCreatedLink(input) {
+                calls.push(input);
+                return { status: 'succeeded', executionMode: 'classic', topologyRevision: input.expectedTopologyRevision };
+            },
+        },
+    });
+    const response = await request(router, { method: 'POST', body: createBody({ autoDeploy: true }) });
+    assert.equal(response.status, 201);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].scope.kind, 'link.apply');
+    assert.deepEqual(response.body.autoDeployResult,
+        { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 });
+    assert.equal(response.body.autoDeployOperation, undefined);
+    assert.equal(response.body.autoDeployStatus, undefined);
+});
+
 test('baseline selection treats a persisted staged link as physically applied, never pending', () => {
     const links = [
         {

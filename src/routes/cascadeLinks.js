@@ -20,7 +20,11 @@ const { maintainAutoL2tpPaths } = require('../modules/relay-l2tp/services/autoL2
 const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
-const { isCompletedClassicDeploymentResult } = require('../services/classicScopedCascadeDeploymentService');
+const {
+    isCompletedClassicDeploymentResult,
+    isClassicProductionDeploymentEnabled,
+    createClassicScopedCascadeDeploymentService,
+} = require('../services/classicScopedCascadeDeploymentService');
 const { requireScope } = require('../middleware/auth');
 
 const LINK_POPULATE_SELECT = 'name ip flag status';
@@ -380,6 +384,17 @@ function createCascadeLinksRouter({
             NodeOperationLock,
             NodeSSH,
         }),
+    classicTopologyCoordinator,
+    createClassicTopologyCoordinator = () => createClassicScopedCascadeDeploymentService({
+        env: process.env,
+        HyNode: Node,
+        CascadeLink: Link,
+        CascadeRouteGroup: RouteGroup,
+        CascadeTopologyState: TopologyState,
+        RelayL2tpState: RelayState,
+        TopologyOperation,
+        NodeOperationLock,
+    }),
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
@@ -411,7 +426,11 @@ function createCascadeLinksRouter({
     // construct (or start) the topology runtime.
     const getTopologyCoordinator = () => {
         if (!coordinator) {
-            coordinator = createTopologyCoordinator();
+            if (isClassicProductionDeploymentEnabled(process.env)) {
+                coordinator = classicTopologyCoordinator || createClassicTopologyCoordinator();
+            } else {
+                coordinator = createTopologyCoordinator();
+            }
         }
         return coordinator;
     };
@@ -420,7 +439,7 @@ function createCascadeLinksRouter({
     // have settled, pinning the post-maintenance revision. The result is
     // truthful: an operation id with its real queued status, or a blocked
     // reason — never a readiness claim.
-    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action }) => {
+    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action, linkCreated = false }) => {
         const linkId = String(link._id);
         try {
             const scopedCoordinator = await getTopologyCoordinator();
@@ -432,7 +451,10 @@ function createCascadeLinksRouter({
                 error.code = 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE';
                 throw error;
             }
-            const result = await scopedCoordinator.queue({
+            const queueMethod = linkCreated && typeof scopedCoordinator.queueCreatedLink === 'function'
+                ? scopedCoordinator.queueCreatedLink
+                : scopedCoordinator.queue;
+            const result = await queueMethod({
                 expectedTopologyRevision: revision,
                 scope: {
                     kind: 'link.apply',
@@ -703,6 +725,38 @@ function createCascadeLinksRouter({
                         ? geoRouting.geoip.filter(Boolean)
                         : [],
                 };
+            }
+            if (link.autoDeploy === true && isClassicProductionDeploymentEnabled(process.env)) {
+                // Classic has no durable native intent worker. Persist the draft,
+                // then run the same fenced, completion-checked scoped apply used by
+                // the manual Deploy action; never return a synthetic 202 job.
+                const revisions = await getWriteService().createLink({
+                    expectedTopologyRevision,
+                    link,
+                });
+                await invalidateCaches();
+                const maintenance = await maintainL2tpPaths();
+                const finalRevisions = Number.isSafeInteger(maintenance?.revision)
+                    ? { ...revisions, revision: maintenance.revision } : revisions;
+                const snapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
+                const created = snapshot.links.find(candidate => String(candidate._id) === String(link._id));
+                const autoDeploy = await queueAutoDeploy({
+                    link: created || link,
+                    action: 'link.create',
+                    portalNodeId: portalNodeId,
+                    bridgeNodeId: bridgeNodeId,
+                    revision: finalRevisions.revision,
+                    links: snapshot.links,
+                    linkCreated: true,
+                });
+                await invalidateCaches();
+                const finalSnapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
+                logger.info(`[Cascade Links API] Created and auto-deployed ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
+                return res.status(201).json({
+                    ...finalSnapshot,
+                    ...autoDeploy,
+                    createdLinkId: String(link._id),
+                });
             }
             if (link.autoDeploy === true) {
                 const { digest } = require('../modules/relay-l2tp/services/topologyIntentService');

@@ -150,7 +150,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         return { ...models, connection };
     }
 
-    async function queue(input) {
+    async function queue(input, { allowUnlistedPending = false } = {}) {
         if (!isClassicProductionDeploymentEnabled(env)) throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
         if (!input || typeof input !== 'object' || Array.isArray(input)
             || Object.keys(input).some(key => !['expectedTopologyRevision', 'scope'].includes(key))
@@ -166,7 +166,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         }
         // Copy before the first await; external callers cannot change the pin.
         const linkId = scope.linkId;
-        if (!classicLinkAllowlist(env).includes(linkId)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+        if (!allowUnlistedPending && !classicLinkAllowlist(env).includes(linkId)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
         const requestedIds = [...scope.linkIds].sort();
         const m = resolve();
         const stateModel = m.CascadeTopologyState;
@@ -228,6 +228,9 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             }
             const selected = links.find(link => entityId(link._id) === linkId);
             if (!selected || selected.active !== true || selected.mode !== 'reverse') throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            if (allowUnlistedPending && !['pending', 'error'].includes(selected.status)) {
+                throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            }
             const baselineLinkIds = baselineIds(links, selected);
             if (links.some(link => baselineLinkIds.includes(entityId(link._id))
                 && (link.mode ?? 'reverse') !== 'reverse')) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
@@ -269,7 +272,8 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN');
         }
     }
-    return Object.freeze({ queue,
+    return Object.freeze({
+        queue,
         // This service positively enforces absent L2TP/unused retained groups
         // under its fence; it must never prepare ingress or mutate route groups.
         get requiresL2tpIngressPreparation() { return false; },
@@ -278,7 +282,12 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             if (!selected) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
             return baselineIds(links, selected);
         },
-        async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); } });
+        // Internal create-and-apply path: the caller must have just persisted
+        // the pending link in the same request. Public Deploy remains fenced by
+        // CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS.
+        queueCreatedLink: input => queue(input, { allowUnlistedPending: true }),
+        async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); },
+    });
 }
 
 function isCompletedClassicDeploymentResult(result, revision) {
