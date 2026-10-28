@@ -20,11 +20,88 @@ const MESSAGES = Object.freeze({
 function failure(code) { return Object.assign(new Error(MESSAGES[code]), { code }); }
 const validId = value => typeof value === 'string' && ID.test(value);
 const entityId = value => String(value?._id ?? value);
+const MAIN_PROFILE = '/usr/local/etc/xray/config.json';
+const BRIDGE_PROFILE = '/usr/local/etc/xray-bridge/config.json';
+const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+const sameList = (actual, expected) => Array.isArray(actual)
+    && actual.length === expected.length && actual.every((value, i) => value === expected[i]);
+function classicLinkAllowlist(env) {
+    const value = env.CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS;
+    if (typeof value !== 'string' || value.length > 1599) return null;
+    const ids = value.split(',');
+    return ids.length <= 64 && ids.every(id => /^[0-9a-f]{24}$/.test(id))
+        && new Set(ids).size === ids.length ? ids : null;
+}
+
+// This is a private completion protocol, not a native operation/queued receipt.
+// Account for every main/transit profile on the two endpoints exactly once.
+function checkedCompletion(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints }) {
+    const receipt = result?.receipt;
+    if (result?.success !== true || result?.remoteQuiescent !== true
+        || Object.keys(result).sort().join(',') !== 'receipt,remoteQuiescent,success'
+        || !receipt || receipt.kind !== 'classic-scoped-reverse' || receipt.linkId !== linkId
+        || receipt.topologyRevision !== expectedTopologyRevision || receipt.tunnelEstablished !== true
+        || !sameList(receipt.nodeIds, [...endpoints].sort())
+        || !sameList(receipt.preservedLinkIds, baselineLinkIds)
+        || !Array.isArray(receipt.profiles) || !Array.isArray(receipt.preservedProfiles)) return false;
+    const [source, target] = endpoints;
+    const key = (node, path) => `${node}:${path}`;
+    const requiredChanges = [key(source, MAIN_PROFILE), key(target, BRIDGE_PROFILE)];
+    const optionalChange = key(target, MAIN_PROFILE);
+    const changed = new Set();
+    for (const profile of receipt.profiles) {
+        if (!profile || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
+            || !digest(profile.beforeSha256) || !digest(profile.sha256)) return false;
+        const id = key(profile.nodeId, profile.path);
+        if ((!requiredChanges.includes(id) && id !== optionalChange) || changed.has(id)) return false;
+        changed.add(id);
+    }
+    if (!requiredChanges.every(id => changed.has(id))) return false;
+    const expectedPreserved = [key(source, BRIDGE_PROFILE), ...(!changed.has(optionalChange) ? [optionalChange] : [])];
+    const preserved = new Set();
+    for (const profile of receipt.preservedProfiles) {
+        if (!profile || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
+            || (profile.sha256 !== null && !digest(profile.sha256))) return false;
+        const id = key(profile.nodeId, profile.path);
+        if (!expectedPreserved.includes(id) || preserved.has(id)) return false;
+        preserved.add(id);
+    }
+    return preserved.size === expectedPreserved.length;
+}
+
+function inactiveRelay(state) {
+    // Include the observed legacy desiredState spelling without adopting any
+    // missing/unknown status as evidence of a completed uninstall.
+    return state?.status === 'not_installed' && ['absent', 'not_installed'].includes(state.desiredState)
+        && state.installedRouteGroup == null;
+}
+
+function routeGroupUseVeto(groups, relays, touching) {
+    if (!Array.isArray(groups) || !Array.isArray(relays)) return true;
+    for (const group of groups) {
+        if (!group || !validId(entityId(group._id)) || !Array.isArray(group.paths)) return true;
+        let touches = false;
+        for (const path of group.paths) {
+            if (!path || !Array.isArray(path.linkIds) || !path.linkIds.every(id => validId(entityId(id)))
+                || (path.enabled !== undefined && typeof path.enabled !== 'boolean')) return true;
+            if (path.enabled !== false && path.linkIds.some(id => touching.has(entityId(id)))) touches = true;
+        }
+        if (!touches) continue;
+        const id = entityId(group._id);
+        const references = relays.filter(state => entityId(state?.routeGroup) === id
+            || entityId(state?.installedRouteGroup) === id);
+        // Retained paths are configuration, not installed authority, only when
+        // every reference is positively attributable to a completed uninstall.
+        if (!references.length || !references.every(inactiveRelay)) return true;
+    }
+    return false;
+}
 
 function isClassicProductionDeploymentEnabled(env) {
     const auth = resolveL2tpExecutionAuthorization(env);
     return auth.enableProductionExecution === true && env.PANEL_DOMAIN === 'lm1.infograd.online'
         && env.CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
+        && classicLinkAllowlist(env) !== null
         && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'false'
         && env.TOPOLOGY_TEST_EXECUTION_ENABLED === 'false';
 }
@@ -88,6 +165,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         }
         // Copy before the first await; external callers cannot change the pin.
         const linkId = scope.linkId;
+        if (!classicLinkAllowlist(env).includes(linkId)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
         const requestedIds = [...scope.linkIds].sort();
         const m = resolve();
         const stateModel = m.CascadeTopologyState;
@@ -165,20 +243,19 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 if (await owns(matches[0], env)) throw failure('CLASSIC_DEPLOY_OWNER_VETO');
             }
             const relays = await m.RelayL2tpState.find({}).setOptions(READ).lean();
-            if (relays.some(state => endpoints.includes(entityId(state.node))
-                && (['installed', 'installing'].includes(state.status)
-                    || ['installed', 'installing'].includes(state.desiredState)))) throw failure('CLASSIC_DEPLOY_IN_USE');
+            if (!Array.isArray(relays) || relays.some(state => endpoints.includes(entityId(state?.node))
+                && !inactiveRelay(state))) throw failure('CLASSIC_DEPLOY_IN_USE');
             const touching = new Set(links.filter(link => endpoints.includes(entityId(link.portalNode))
                 || endpoints.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
             const groups = await m.CascadeRouteGroup.find({}).setOptions(READ).lean();
-            if (groups.some(group => group.paths.some(path => path.enabled !== false
-                && path.linkIds.some(id => touching.has(entityId(id)))))) throw failure('CLASSIC_DEPLOY_IN_USE');
+            if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
             await verifyFence();
             const core = dependencies.cascadeService ?? require('./cascadeService');
             if (typeof core.deployScopedClassicLink !== 'function') throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
             const result = await core.deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds });
-            if (result?.success !== true || result?.remoteQuiescent !== true
-                || Object.keys(result).sort().join(',') !== 'remoteQuiescent,success') throw failure('CLASSIC_DEPLOY_UNCERTAIN');
+            if (!checkedCompletion(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints })) {
+                throw failure('CLASSIC_DEPLOY_UNCERTAIN');
+            }
             await verifyFence();
             const released = await stateModel.findOneAndUpdate(fence,
                 { $unset: { replacementReservation: '' } },

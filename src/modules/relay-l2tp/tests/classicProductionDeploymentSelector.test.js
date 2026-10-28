@@ -11,6 +11,7 @@ const env = () => ({ PANEL_DOMAIN: 'lm1.infograd.online',
     L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
     L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
     CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: '6ae13ae24bc4b4e3e44e65c6',
     TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false' });
 
 test('classic PROD selection requires exact canonical identity and every explicit flag', () => {

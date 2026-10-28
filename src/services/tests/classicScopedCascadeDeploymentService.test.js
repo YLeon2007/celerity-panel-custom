@@ -9,9 +9,24 @@ const C = '507f1f77bcf86cd799439033';
 const NEIGHBOR = '507f1f77bcf86cd799439042';
 const PENDING = '507f1f77bcf86cd799439043';
 const FOREIGN = '507f1f77bcf86cd799439044';
+const GROUP = '6abf570edf3782a8235f1575';
+const MAIN = '/usr/local/etc/xray/config.json';
+const TRANSIT = '/usr/local/etc/xray-bridge/config.json';
+function completed(coreInput = { linkId: LINK, expectedTopologyRevision: 7, baselineLinkIds: [] }) {
+    return { success: true, remoteQuiescent: true, receipt: {
+        kind: 'classic-scoped-reverse', linkId: coreInput.linkId,
+        topologyRevision: coreInput.expectedTopologyRevision, nodeIds: [A, B],
+        preservedLinkIds: coreInput.baselineLinkIds, tunnelEstablished: true,
+        profiles: [{ nodeId: A, path: MAIN, beforeSha256: 'a'.repeat(64), sha256: 'b'.repeat(64) },
+            { nodeId: B, path: TRANSIT, beforeSha256: 'c'.repeat(64), sha256: 'd'.repeat(64) }],
+        preservedProfiles: [{ nodeId: A, path: TRANSIT, sha256: 'e'.repeat(64) },
+            { nodeId: B, path: MAIN, sha256: null }],
+    } };
+}
 const env = () => ({ PANEL_DOMAIN: 'lm1.infograd.online', L2TP_EXECUTION_ENABLED: 'true',
     L2TP_MIGRATIONS_ENABLED: 'true', L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
     CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: LINK,
     TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false' });
 function matches(row, filter) {
     return Object.entries(filter).every(([key, value]) => {
@@ -63,7 +78,7 @@ function harness(overrides = {}) {
             return state;
         }),
     };
-    const dependencies = { ...models, env: env(),
+    const dependencies = { ...models, env: { ...env(), ...overrides.env },
         topologyManagesNodeConfig: async node => {
             assert.ok(state.replacementReservation, 'ownership checked after global reservation');
             calls.owner.push(String(node._id));
@@ -75,8 +90,8 @@ function harness(overrides = {}) {
             assert.equal(state.revision, 7);
             assert.equal(state.deployedRevision, 5);
             calls.remote.push(input);
-            return overrides.work ? overrides.work({ state, rows, calls })
-                : { success: true, remoteQuiescent: true };
+            return overrides.work ? overrides.work({ state, rows, calls, result: completed(input) })
+                : completed(input);
         } },
     };
     return { service: createClassicScopedCascadeDeploymentService(dependencies), calls, rows,
@@ -193,7 +208,7 @@ test('only exact checked completion releases; unknown results and raw errors rem
 test('foreign replacement token or epoch cannot be released after successful remote callback', async () => {
     for (const mutate of [state => { state.replacementReservation.ownerToken = 'foreign'; },
         state => { state.replacementReservation.epoch++; }, state => { state.replacementEpoch++; }]) {
-        const h = harness({ work: ({ state }) => { mutate(state); return { success: true, remoteQuiescent: true }; } });
+        const h = harness({ work: ({ state, result }) => { mutate(state); return result; } });
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
         assert.ok(h.state().replacementReservation); assert.equal(h.calls.updates.length, 1);
     }
@@ -206,7 +221,7 @@ test('nonexpiring reservation is held across pending work and excludes concurren
     let finish; let entered;
     const started = new Promise(resolve => { entered = resolve; });
     const wait = new Promise(resolve => { finish = resolve; });
-    const h = harness({ work: async () => { entered(); await wait; return { success: true, remoteQuiescent: true }; } });
+    const h = harness({ work: async ({ result }) => { entered(); await wait; return result; } });
     const pending = h.service.queue(input());
     await started;
     assert.deepEqual(Object.keys(h.state().replacementReservation).sort(), ['epoch', 'ownerToken']);
@@ -281,4 +296,75 @@ test('malformed request and scope identifiers refuse before any acquisition', as
     }
 });
 
-module.exports = { harness, input, LINK, A, B, C, NEIGHBOR, PENDING, FOREIGN };
+test('typed receipt permits target main cleanup only instead of its preserved profile', async () => {
+    const h = harness({ work: ({ result }) => {
+        result.receipt.preservedProfiles.pop();
+        result.receipt.profiles.push({ nodeId: B, path: MAIN, beforeSha256: 'e'.repeat(64), sha256: 'f'.repeat(64) });
+        return result;
+    } });
+    assert.deepEqual(await h.service.queue(input()), { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 });
+});
+
+test('missing, mismatched or malformed typed receipts retain the exact fence', async () => {
+    const mutations = [r => { delete r.receipt; }, r => { r.operationId = 'fake'; },
+        r => { r.receipt.kind = 'other'; }, r => { r.receipt.linkId = FOREIGN; },
+        r => { r.receipt.topologyRevision = 8; }, r => { r.receipt.nodeIds = [A, C]; },
+        r => { r.receipt.nodeIds.reverse(); }, r => { r.receipt.preservedLinkIds = [NEIGHBOR]; },
+        r => { r.receipt.tunnelEstablished = false; }, r => { r.receipt.profiles.pop(); },
+        r => { r.receipt.profiles[0].sha256 = ['b'.repeat(64)]; },
+        r => { r.receipt.profiles[0].beforeSha256 = null; },
+        r => { r.receipt.profiles[0].path = TRANSIT; },
+        r => { r.receipt.profiles.push({ ...r.receipt.profiles[0] }); },
+        r => { r.receipt.preservedProfiles.pop(); },
+        r => { r.receipt.preservedProfiles[0].sha256 = 'secret'; },
+        r => { r.receipt.preservedProfiles[0].nodeId = C; }];
+    for (const mutate of mutations) {
+        const h = harness({ work: ({ result }) => { mutate(result); return result; } });
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+        assert.ok(h.state().replacementReservation); assert.equal(h.calls.updates.length, 1);
+    }
+});
+
+test('retained uninstalled L2TP group is not installed path authority and stays untouched', async () => {
+    for (const desiredState of ['not_installed', 'absent']) {
+        const h = harness({ relays: [{ node: A, desiredState, status: 'not_installed', routeGroup: GROUP }],
+            groups: [{ _id: GROUP, name: 'l2tp-prod-pilot', mode: 'forward', strategy: 'priority-failover',
+                paths: [{ pathKey: 'pilot-main', linkIds: [LINK], priority: 1, enabled: true }] }] });
+        const before = structuredClone(h.rows);
+        await h.service.queue(input());
+        assert.equal(h.calls.remote.length, 1); assert.deepEqual(h.rows, before);
+    }
+});
+
+test('active, unknown and installed group references veto even from a non-endpoint owner', async () => {
+    for (const relay of [{ node: C, routeGroup: GROUP, status: 'installed' },
+        { node: C, routeGroup: GROUP, status: 'installing' },
+        { node: C, routeGroup: GROUP, status: 'error', desiredState: 'installed' },
+        { node: C, routeGroup: GROUP, status: 'removing', desiredState: 'absent' },
+        { node: C, routeGroup: GROUP, status: 'unknown', desiredState: 'absent' },
+        { node: C, installedRouteGroup: GROUP, routeGroup: FOREIGN, status: 'installed' }]) {
+        const h = harness({ relays: [relay], groups: [{ _id: GROUP, paths: [{ linkIds: [LINK], enabled: true }] }] });
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_IN_USE' });
+        assert.equal(h.calls.remote.length, 0); assert.ok(h.state().replacementReservation);
+    }
+});
+
+test('missing, malformed and unknown retained group ownership remain conservative', async () => {
+    for (const group of [{ _id: GROUP }, { _id: GROUP, paths: [null] },
+        { _id: GROUP, paths: [{ linkIds: LINK }] }, { _id: GROUP, paths: [{ linkIds: [LINK] }] }]) {
+        const h = harness({ groups: [group] });
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_IN_USE' });
+        assert.equal(h.calls.remote.length, 0);
+    }
+});
+
+test('only an exact allowlisted target can acquire the global reservation', async () => {
+    for (const value of [FOREIGN, undefined, '', `${LINK},`, LINK.toUpperCase(), ` ${LINK}`,
+        `${LINK},${LINK}`, Array(65).fill(LINK).join(',')]) {
+        const h = harness({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: value } });
+        await assert.rejects(h.service.queue(input()));
+        assert.equal(h.calls.updates.length, 0); assert.equal(h.calls.remote.length, 0);
+    }
+});
+
+module.exports = { harness, input, completed, LINK, A, B, C, NEIGHBOR, PENDING, FOREIGN };
