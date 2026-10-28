@@ -926,12 +926,12 @@ class CascadeService {
             return;
         }
 
-        if (opts.requireCompletion && ((!portalNode.ssh?.password && !portalNode.ssh?.privateKey)
-            || portalNode.xray?.agentToken)) {
-            // Agent restart has no joinable completion protocol (and HTTP
-            // mutation refusal must not be bypassed through an SSH fallback).
-            throw undeployUncertain('Legacy undeploy requires SSH without an agent restart path');
+        if (opts.requireCompletion && !portalNode.ssh?.password && !portalNode.ssh?.privateKey) {
+            throw undeployUncertain('Legacy undeploy requires SSH credentials');
         }
+        // Select checked SSH before dispatch: agent restart is not joinable.
+        // This is not a fallback after an agent mutation or refusal.
+        const hasAgent = !opts.requireCompletion && !!portalNode.xray?.agentToken;
         const createSSH = completionCheckedSSH;
         const syncService = require('./syncService');
         const users = await syncService._getUsersForNode(portalNode);
@@ -1020,7 +1020,6 @@ class CascadeService {
         }
 
         if (!portalNode.ssh?.password && !portalNode.ssh?.privateKey) return false;
-        const hasAgent = !!(portalNode.xray?.agentToken);
         if (hasAgent) {
             try {
                 const restarted = await syncService._agentRequest(portalNode, 'POST', '/restart');

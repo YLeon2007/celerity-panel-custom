@@ -24,15 +24,23 @@ function query(value) {
     return { session() { return this; }, lean: async () => structuredClone(value), then(resolve) { return Promise.resolve(value).then(resolve); },
         populate() { return this; } };
 }
-function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, direct = false, sftp = null } = {}) {
+function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, direct = false, sftp = null, agent = false } = {}) {
+    const mongoose = require('mongoose');
+    const db = mongoose.connection.db;
+    mongoose.connection.db = { collection(name) {
+        assert.equal(name, 'topologyconfigowners');
+        return { find: () => ({ toArray: async () => [] }) };
+    } };
+    t.after(() => { mongoose.connection.db = db; });
     const state = { _id: 'singleton', revision: 7, deployedRevision: 5, replacementEpoch: 0,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0 };
     const nodes = {
-        portal: { _id: 'portal', name: 'portal', type: 'xray', active: true, ssh: { password: 'local-mock' } },
-        bridge: { _id: 'bridge', name: 'bridge', type: mode === 'forward' ? 'xray' : 'hysteria', active: true,
+        portal: { _id: '507f1f77bcf86cd799439011', name: 'portal', type: 'xray', active: true, ssh: { password: 'local-mock' } },
+        bridge: { _id: '507f1f77bcf86cd799439012', name: 'bridge', type: mode === 'forward' ? 'xray' : 'hysteria', active: true,
             ssh: { password: 'local-mock' } },
     };
     const link = { _id: 'removed', name: 'removed', portalNode: 'portal', bridgeNode: 'bridge', mode };
+    if (agent) for (const node of Object.values(nodes)) node.xray = { agentToken: 'local-only' };
     const survivor = { _id: 'survivor', portalNode: nodes.portal, bridgeNode: 'bridge', mode: 'reverse' };
     const calls = { commands: [], uploads: [], releases: 0, liveWriter: false, agent: 0, generatedLinks: [] };
     t.mock.method(State.db, 'transaction', async work => work({ localOnly: true }));
@@ -54,7 +62,7 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
     t.mock.method(Node, 'findById', async id => nodes[id]);
     t.mock.method(Link, 'updateOne', async () => ({ acknowledged: true, matchedCount: 1 }));
     t.mock.method(Link, 'find', filter => {
-        if (filter.bridgeNode === 'bridge' && filter.mode?.$ne === 'forward') {
+        if (filter.bridgeNode === nodes.bridge?._id && filter.mode?.$ne === 'forward') {
             return query(remaining ? (filter._id ? [survivor] : [link, survivor]) : []);
         }
         return query([]);
@@ -69,10 +77,10 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
     t.mock.method(global, 'setTimeout', (fn, ms, ...args) => originalTimeout(fn, ms === 30000 ? 100 : ms, ...args));
     function client(node) {
         return { end() {}, exec(command, callback) {
-            calls.commands.push([node._id, command]);
+            calls.commands.push([node.name, command]);
             const stream = new EventEmitter(); stream.stderr = new EventEmitter();
             callback(null, stream);
-            const failure = fault(node, command);
+            const failure = fault({ ...node, _id: node.name }, command);
             if (failure === 'timeout') { calls.liveWriter = true; return; }
             setImmediate(() => {
                 const marker = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
@@ -82,7 +90,7 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
                 if (failure) calls.liveWriter = true;
                 stream.emit('close', failure === 'nonzero' ? 1 : failure === 'missing-exit' ? undefined : 0);
             });
-        }, sftp(callback) { callback(null, sftp(node, calls)); } };
+        }, sftp(callback) { callback(null, sftp({ ...node, _id: node.name }, calls)); } };
     }
     t.mock.method(pool, 'getConnection', async node => client(node));
     if (!sftp) t.mock.method(pool, 'writeFile', async (node, remotePath) => { calls.uploads.push([node._id, remotePath]); });
@@ -123,8 +131,8 @@ for (const failure of ['nonzero', 'missing-exit', 'missing-receipt']) {
 
 for (const [name, options, targetNode, targetCommand] of [
     ['portal upload mkdir', {}, 'portal', 'mkdir -p'],
-    ['portal restart', {}, 'portal', 'systemctl restart xray'],
-    ['forward bridge restart', { mode: 'forward' }, 'bridge', 'systemctl restart xray'],
+    ['portal restart', { agent: true }, 'portal', 'systemctl restart xray'],
+    ['forward bridge restart', { mode: 'forward', agent: true }, 'bridge', 'systemctl restart xray'],
     ['remaining reverse bridge restart', { remaining: true }, 'bridge', 'systemctl daemon-reload'],
 ]) {
     for (const failure of ['timeout', 'nonzero', 'missing-exit', 'missing-receipt']) {
@@ -138,24 +146,20 @@ for (const [name, options, targetNode, targetCommand] of [
     }
 }
 
-for (const reason of ['missing portal', 'missing bridge', 'no portal credentials', 'no bridge credentials', 'agent acknowledgement', 'topology skip']) {
+for (const reason of ['missing portal', 'missing bridge', 'no portal credentials', 'no bridge credentials', 'agent without SSH', 'topology skip']) {
     test(`legacy ${reason} cannot authorize fence release`, async t => {
         const f = fixture(t);
         if (reason === 'missing portal') delete f.nodes.portal;
         if (reason === 'missing bridge') delete f.nodes.bridge;
         if (reason === 'no portal credentials') delete f.nodes.portal.ssh;
         if (reason === 'no bridge credentials') delete f.nodes.bridge.ssh;
-        if (reason === 'agent acknowledgement') f.nodes.portal.xray = { agentToken: 'local-only' };
+        if (reason === 'agent without SSH') {
+            f.nodes.portal.xray = { agentToken: 'local-only' };
+            delete f.nodes.portal.ssh;
+        }
         if (reason === 'topology skip') {
-            const domain = process.env.PANEL_DOMAIN;
-            process.env.PANEL_DOMAIN = 'test.infograd.online';
-            t.after(() => { if (domain === undefined) delete process.env.PANEL_DOMAIN; else process.env.PANEL_DOMAIN = domain; });
-            t.mock.method(Link, 'exists', async () => ({ _id: 'applied-test-link' }));
-            for (const flag of ['L2TP_EXECUTION_ENABLED', 'L2TP_MIGRATIONS_ENABLED', 'TOPOLOGY_TEST_EXECUTION_ENABLED']) {
-                const old = process.env[flag]; process.env[flag] = 'true';
-                t.after(() => { if (old === undefined) delete process.env[flag]; else process.env[flag] = old; });
-            }
-            f.nodes.portal.cascadeRole = 'portal';
+            t.mock.method(Operation, 'exists', filter => query(
+                filter.$or?.some(row => row['nodes.node']) ? { _id: 'active-topology-operation' } : null));
         }
         await assert.rejects(f.run(), { code: 'LEGACY_CASCADE_UNDEPLOY_UNCERTAIN' });
         assert.equal(f.calls.agent, 0, 'do not issue an unjoinable agent restart');
@@ -183,7 +187,7 @@ test('a callback swallowing a real timeout cannot turn later success into releas
     await assertRetained(f);
 });
 
-for (const options of [{}, { mode: 'forward' }, { remaining: true }, { direct: true }]) {
+for (const options of [{}, { mode: 'forward' }, { remaining: true }, { direct: true }, { agent: true }, { mode: 'forward', agent: true }]) {
     test(`checked foreground success releases exact fence ${JSON.stringify(options)}`, async t => {
         const f = fixture(t, options);
         const result = await legacy.withLegacyCascadeUndeploy(async () => {
@@ -194,6 +198,12 @@ for (const options of [{}, { mode: 'forward' }, { remaining: true }, { direct: t
         assert.deepEqual(result, { name: 'MCP callback document' });
         assert.equal(f.state.replacementReservation, undefined);
         assert.equal(f.calls.releases, 1);
+        assert.equal(f.calls.agent, 0, 'checked undeploy selects SSH before any agent dispatch');
+        if (options.agent) {
+            for (const nodeId of options.mode === 'forward' ? ['portal', 'bridge'] : ['portal']) {
+                assert.ok(f.calls.commands.some(([id, command]) => id === nodeId && command.includes('systemctl restart xray')));
+            }
+        }
         if (options.remaining) assert.deepEqual(f.calls.generatedLinks, ['survivor'], 'removed link must not reappear during a successful bridge rebuild');
         assert.ok(f.calls.uploads.length > 0);
         assert.ok(f.calls.commands.every(([, command]) => /C3_LEGACY_DONE_[a-f0-9]+/.test(command)));
@@ -201,6 +211,15 @@ for (const options of [{}, { mode: 'forward' }, { remaining: true }, { direct: t
         assert.equal(new Set(markers).size, markers.length, 'completion receipts cannot be replayed across commands');
     });
 }
+
+test('ordinary portal deployment keeps the successful agent restart path', async t => {
+    const f = fixture(t, { agent: true });
+    t.mock.method(sync, '_agentRequest', async () => { f.calls.agent++; return { status: 200, data: { ok: true } }; });
+    assert.equal(await cascade._deployPortalConfig(f.nodes.portal, { requireCompletion: false }), true);
+    assert.equal(f.calls.agent, 1);
+    assert.equal(f.calls.uploads.length, 1);
+    assert.equal(f.calls.commands.some(([, command]) => command.includes('systemctl restart')), false);
+});
 
 for (const failure of ['missing-exit', 'missing-receipt']) {
     test(`direct NodeSSH close with ${failure} retains ownership`, async t => {

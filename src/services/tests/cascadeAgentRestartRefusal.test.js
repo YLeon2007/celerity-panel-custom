@@ -18,6 +18,13 @@ const sshPool = require('../sshPoolService');
 test.after(() => sshPool.closeAll());
 
 function stubPortalDeployment(t, agentError) {
+    const mongoose = require('mongoose');
+    const db = mongoose.connection.db;
+    mongoose.connection.db = { collection(name) {
+        assert.equal(name, 'topologyconfigowners');
+        return { find: () => ({ toArray: async () => [] }) };
+    } };
+    t.after(() => { mongoose.connection.db = db; });
     const calls = { uploads: [], execs: [], agent: [], statuses: [], connections: 0 };
     t.mock.method(TopologyOperation, 'exists', async () => null);
     t.mock.method(syncService, '_getUsersForNode', async () => []);
@@ -32,7 +39,11 @@ function stubPortalDeployment(t, agentError) {
     });
     t.mock.method(NodeSSH.prototype, 'connect', async () => { calls.connections++; });
     t.mock.method(NodeSSH.prototype, 'uploadContent', async (...args) => { calls.uploads.push(args); });
-    t.mock.method(NodeSSH.prototype, 'exec', async command => { calls.execs.push(command); });
+    t.mock.method(NodeSSH.prototype, 'exec', async command => {
+        calls.execs.push(command);
+        const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
+        return { code: 0, stdout: receipt ? `\n${receipt[0]}\n` : '', stderr: '' };
+    });
     t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
     t.mock.method(syncService, '_agentRequest', async (_node, method, path) => {
         calls.agent.push([method, path]);
@@ -79,13 +90,14 @@ test('HTTP 423 refusal also propagates without an SSH restart', async t => {
     assert.deepEqual(calls.execs, []);
 });
 
-test('agent transport failure retains legacy SSH restart fallback', async t => {
-    const calls = stubPortalDeployment(t, new Error('ECONNRESET'));
-    await cascadeService._deployPortalConfig(portal());
+test('agent transport failure propagates without SSH restart fallback', async t => {
+    const failure = new Error('ECONNRESET');
+    const calls = stubPortalDeployment(t, failure);
+    await assert.rejects(cascadeService._deployPortalConfig(portal()), error => error === failure);
     assert.deepEqual(calls.agent, [['POST', '/restart']]);
     assert.equal(calls.uploads.length, 1);
-    assert.equal(calls.connections, 2);
-    assert.deepEqual(calls.execs, ['systemctl restart xray']);
+    assert.equal(calls.connections, 1);
+    assert.deepEqual(calls.execs, []);
 });
 
 test('no-agent portal retains direct SSH restart', async t => {
@@ -96,5 +108,7 @@ test('no-agent portal retains direct SSH restart', async t => {
     assert.deepEqual(calls.agent, []);
     assert.equal(calls.uploads.length, 1);
     assert.equal(calls.connections, 2);
-    assert.deepEqual(calls.execs, ['systemctl restart xray']);
+    assert.equal(calls.execs.length, 1);
+    assert.match(calls.execs[0], /systemctl restart xray/);
+    assert.match(calls.execs[0], /C3_LEGACY_DONE_[a-f0-9]+/);
 });
