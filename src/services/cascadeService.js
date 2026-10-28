@@ -104,7 +104,7 @@ function scopedScopePin(scope) {
             portalNode: { _id: scopedId(link.portalNode), ip: link.portalNode?.ip },
             bridgeNode: { _id: scopedId(link.bridgeNode), ip: link.bridgeNode?.ip } };
         for (const key of ['lastHealthCheck', 'latencyMs', 'lastError', 'updatedAt', 'createdAt']) delete pin[key];
-        if (confirmed) delete pin.status; // APPLIED/legacy-offline membership is checked separately.
+        if (confirmed) delete pin.status; // Confirmed membership is checked separately.
         return pin;
     };
     return scopedCanonical({ target: linkPin(scope.target, false),
@@ -121,7 +121,7 @@ class CascadeService {
      * Completion-checked classic no-upstream Relay -> terminal Bridge only.
      * Caller MUST hold the nonexpiring topology reservation at this exact
      * revision and retain it on every throw. baselineLinkIds is the complete
-     * active confirmed baseline (APPLIED_LINK_STATUSES plus legacy offline).
+     * active APPLIED connected-component baseline; touching offline edges refuse.
      * This entry never acquires topology adoption or native operation identity.
      */
     async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
@@ -188,13 +188,30 @@ class CascadeService {
                 { _id: linkId }, { status: { $in: [...APPLIED_LINK_STATUSES, 'offline'] } },
             ] }).populate('portalNode bridgeNode').setOptions({ maxTimeMS: 5000 }).lean();
             const target = rows.find(row => scopedId(row) === linkId);
-            const confirmed = rows.filter(row => scopedId(row) !== linkId);
+            // Match the public connected-component baseline, never all global links.
+            const visited = new Set(ids), selected = new Set();
+            let grew = true;
+            while (grew) {
+                grew = false;
+                for (const row of rows) {
+                    if (scopedId(row) === linkId || row.active !== true || !APPLIED_LINK_STATUSES.includes(row.status)) continue;
+                    const endpoints = [scopedId(row.portalNode), scopedId(row.bridgeNode)];
+                    if (!endpoints.some(id => visited.has(id))) continue;
+                    selected.add(scopedId(row));
+                    for (const id of endpoints) if (!visited.has(id)) { visited.add(id); grew = true; }
+                }
+            }
+            if (rows.some(row => scopedId(row) !== linkId && row.status === 'offline'
+                && [scopedId(row.portalNode), scopedId(row.bridgeNode)].some(id => visited.has(id)))) {
+                throw scopedFailure('CLASSIC_SCOPED_OFFLINE_DEPENDENCY_UNSUPPORTED');
+            }
+            const confirmed = rows.filter(row => selected.has(scopedId(row)));
             if (!target || target.active !== true || (target.mode || 'reverse') !== 'reverse'
                 || !['pending', 'error', ...APPLIED_LINK_STATUSES].includes(target.status)
                 || !Number.isSafeInteger(target.tunnelPort) || target.tunnelPort < 1 || target.tunnelPort > 65535
                 || typeof target.tunnelUuid !== 'string' || !target.tunnelUuid) throw scopedFailure('CLASSIC_SCOPED_TARGET_INVALID');
             if (confirmed.some(row => row.active !== true || typeof row.status !== 'string'
-                || ![...APPLIED_LINK_STATUSES, 'offline'].includes(row.status))) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
+                || !APPLIED_LINK_STATUSES.includes(row.status))) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
             const actual = confirmed.map(scopedId).sort();
             if (scopedCanonical(actual) !== scopedCanonical(baseline)) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
             const endpoints = [scopedId(target.portalNode), scopedId(target.bridgeNode)].sort();
@@ -250,13 +267,17 @@ class CascadeService {
             const bytes = await readConfig(node, file);
             const service = file === SCOPED_MAIN ? 'xray' : 'xray-bridge';
             const observed = bytes === 'C3_CONFIG_ABSENT' ? null
-                : await exec(node, `systemctl show ${service} --property=ActiveState --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload --property=ExecStart && systemctl cat ${service}`);
+                : await exec(node, `systemctl show ${service} --property=ActiveState --property=MainPID --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload --property=ExecStart && systemctl cat ${service}`);
             // ExecStart's runtime PID/timestamps change on restart. Pin its
             // loaded argv independently of unit-file text, retaining the stable
             // unit/drop-in bytes and all other observed service properties.
             const loaded = observed?.match(/^ExecStart=\{ path=([^;]+) ; argv\[\]=([^;]+) ;[^\n]*$/m);
-            const unit = loaded ? observed.replace(loaded[0], `LoadedExecStart=${loaded[1].trim()}|${loaded[2].trim()}`) : observed;
-            return { bytes, unit, loaded: loaded ? [loaded[1].trim(), loaded[2].trim()] : null };
+            const stable = observed?.replace(/^MainPID=\d+\n/m, '');
+            const unit = loaded ? stable.replace(loaded[0], `LoadedExecStart=${loaded[1].trim()}|${loaded[2].trim()}`) : stable;
+            // Preserve runtime identity on untouched profiles, but permit expected
+            // PID/timestamp changes only on explicitly restarted plan entries.
+            return { bytes, unit, runtime: [observed?.match(/^MainPID=\d+$/m)?.[0] || null, loaded?.[0] || null],
+                loaded: loaded ? [loaded[1].trim(), loaded[2].trim()] : null };
         };
         try {
             // Select checked SSH for both nodes before any configuration dispatch.
@@ -280,6 +301,78 @@ class CascadeService {
             }
             const main = scopedConfig(mainBefore.bytes), combined = scopedConfig(bridgeBefore.bytes);
             const target = { ...scope.target, portalNode: source, bridgeNode: bridge };
+            const targetSuffix = linkId.slice(-8), forwardTag = `fwd-${targetSuffix}`, hopTag = `fwd-hop-${targetSuffix}`;
+            const targetMainItem = preserved.find(item => scopedId(item.node) === scopedId(bridge));
+            const targetMain = targetMainItem.profile.bytes === 'C3_CONFIG_ABSENT' ? null : scopedConfig(targetMainItem.profile.bytes);
+            const configuredTags = [source.xray?.inboundTag || 'vless-in',
+                ...(source.xray?.extraInbounds || []).map(row => row.inboundTag).filter(Boolean)];
+            let clientTags = [...configuredTags];
+            const oldOutbound = main.outbounds.filter(row => row.tag === forwardTag);
+            const oldHop = targetMain?.inbounds?.filter(row => row.tag === hopTag) || [];
+            // Derive migration ingress ONLY from exact old target routes, including
+            // preserved path SOCKS ingress. Never route arbitrary service inbounds.
+            if (oldOutbound.length || oldHop.length) {
+                const expected = { inbounds: [], outbounds: [], routing: { rules: [] } };
+                configGenerator.applyForwardChain(expected, [target], configuredTags);
+                const routes = main.routing.rules.filter(row => row.outboundTag === forwardTag);
+                const tags = routes.flatMap(row => row.inboundTag || []);
+                if (oldOutbound.length !== 1 || oldHop.length !== 1
+                    || !scopedContains(expected.outbounds, oldOutbound[0]) || !routes.length
+                    || routes.some(row => !Array.isArray(row.inboundTag) || !row.inboundTag.length
+                        || scopedCanonical(row) !== scopedCanonical({ type: 'field', inboundTag: row.inboundTag, outboundTag: forwardTag }))
+                    || new Set(tags).size !== tags.length || configuredTags.some(tag => !tags.includes(tag))) {
+                    throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
+                }
+                clientTags = tags;
+                main.outbounds = main.outbounds.filter(row => row.tag !== forwardTag);
+                main.routing.rules = main.routing.rules.filter(row => row.outboundTag !== forwardTag);
+                const hop = { inbounds: [], routing: { rules: [] } };
+                configGenerator.applyForwardHopInbound(hop, [target]);
+                const hopRules = targetMain.routing.rules.filter(row => row.inboundTag?.includes(hopTag));
+                if (!scopedContains(hop.inbounds, oldHop[0]) || scopedCanonical(hopRules) !== scopedCanonical(hop.routing.rules)) {
+                    throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
+                }
+                targetMain.inbounds = targetMain.inbounds.filter(row => row.tag !== hopTag);
+                targetMain.routing.rules = targetMain.routing.rules.filter(row => !row.inboundTag?.includes(hopTag));
+                // No hidden references to the retired transport may survive.
+                if ([main, targetMain].some(config => JSON.stringify(config).includes(forwardTag)
+                    || JSON.stringify(config).includes(hopTag))) throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
+            } else {
+                const existingClient = main.routing.rules.filter(row => row.outboundTag === `portal-${targetSuffix}` && !row.domain);
+                if (existingClient.length) {
+                    clientTags = existingClient.flatMap(row => row.inboundTag || []);
+                    if (new Set(clientTags).size !== clientTags.length || configuredTags.some(tag => !clientTags.includes(tag))) {
+                        throw scopedFailure('CLASSIC_SCOPED_MAIN_INGRESS_MISMATCH');
+                    }
+                }
+            }
+            if (clientTags.some(tag => typeof tag !== 'string' || main.inbounds?.filter(row => row.tag === tag).length !== 1)) {
+                throw scopedFailure('CLASSIC_SCOPED_MAIN_INGRESS_MISMATCH');
+            }
+            const portalDelta = { inbounds: [], outbounds: [], routing: { rules: [] } };
+            configGenerator.applyReversePortal(portalDelta, [target], clientTags);
+            const bridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([target]));
+            // On replay remove only a COMPLETE exact generated target fragment.
+            // A partial/duplicate/foreign collision must never be treated as ours.
+            const stripOwnedReverse = (config, delta) => {
+                const sections = [ ['inbounds', config, delta], ['outbounds', config, delta],
+                    ['portals', config.reverse || {}, delta.reverse || {}],
+                    ['bridges', config.reverse || {}, delta.reverse || {}], ['rules', config.routing, delta.routing] ];
+                const owned = row => JSON.stringify(row).includes(targetSuffix);
+                const present = sections.some(([key, from]) => (from[key] || []).some(owned));
+                if (!present) return false;
+                for (const [key, from, expected] of sections) {
+                    const actual = (from[key] || []).filter(owned), wanted = (expected[key] || []).filter(owned);
+                    if (actual.length !== wanted.length || wanted.some(row => actual.filter(item => scopedCanonical(item) === scopedCanonical(row)).length !== 1)) {
+                        throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+                    }
+                }
+                for (const [key, from] of sections) if (from[key]) from[key] = from[key].filter(row => !owned(row));
+                return true;
+            };
+            const portalApplied = stripOwnedReverse(main, portalDelta);
+            const bridgeApplied = stripOwnedReverse(combined, bridgeDelta);
+            if (portalApplied !== bridgeApplied || (oldOutbound.length && portalApplied)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
             const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
             const representedDomains = bridgeBaseline.map(row =>
                 `${scopedId(row).slice(-8)}.${row.tunnelDomain || 'reverse.tunnel.internal'}`).sort();
@@ -304,13 +397,6 @@ class CascadeService {
                         && expected.routing.rules.every(row => scopedContains(combined.routing.rules, row));
                 })) throw scopedFailure('CLASSIC_SCOPED_SHARED_BRIDGE_BASELINE_MISMATCH');
             }
-            const clientTags = [source.xray?.inboundTag || 'vless-in',
-                ...(source.xray?.extraInbounds || []).map(row => row.inboundTag).filter(Boolean)];
-            if (clientTags.some(tag => !main.inbounds?.some(row => row.tag === tag))) throw scopedFailure('CLASSIC_SCOPED_MAIN_INGRESS_MISMATCH');
-            const portalDelta = { inbounds: [], outbounds: [], routing: { rules: [] } };
-            configGenerator.applyReversePortal(portalDelta, [target], clientTags);
-            const bridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([target]));
-            const targetSuffix = linkId.slice(-8);
             const hasCollision = config => [...(config.inbounds || []), ...config.outbounds,
                 ...(config.reverse?.bridges || []), ...(config.reverse?.portals || [])].some(row =>
                 row.tag?.includes(targetSuffix) || row.port === target.tunnelPort);
@@ -349,9 +435,24 @@ class CascadeService {
             }
             insertRules(combined, bridgeDelta.routing.rules.filter(row => row.domain || row.inboundTag));
             const plans = [
-                { node: source, file: SCOPED_MAIN, service: 'xray', before: mainBefore, bytes: JSON.stringify(main, null, 2) },
-                { node: bridge, file: SCOPED_BRIDGE, service: 'xray-bridge', before: bridgeBefore, bytes: JSON.stringify(combined, null, 2) },
+                { node: source, file: SCOPED_MAIN, service: 'xray', before: mainBefore, config: main },
+                { node: bridge, file: SCOPED_BRIDGE, service: 'xray-bridge', before: bridgeBefore, config: combined },
             ];
+            if (targetMain) {
+                if (hasCollision(targetMain)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+                if (!targetMainItem.profile.unit?.includes('ActiveState=active\n')
+                    || !targetMainItem.profile.unit.includes('NeedDaemonReload=no\n')
+                    || scopedCanonical(targetMainItem.profile.loaded) !== scopedCanonical(['/usr/local/bin/xray', `/usr/local/bin/xray run -config ${SCOPED_MAIN}`])) {
+                    throw scopedFailure('CLASSIC_SCOPED_SERVICE_LAYOUT_UNSUPPORTED');
+                }
+                plans.push({ node: bridge, file: SCOPED_MAIN, service: 'xray', before: targetMainItem.profile, config: targetMain });
+                preserved.splice(preserved.indexOf(targetMainItem), 1);
+            }
+            for (const plan of plans) {
+                plan.bytes = scopedCanonical(plan.config) === scopedCanonical(scopedConfig(plan.before.bytes))
+                    ? plan.before.bytes : JSON.stringify(plan.config, null, 2);
+            }
+            const changedPlans = plans.filter(plan => plan.bytes !== plan.before.bytes);
             if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
             await checkNodePins();
             // Check every baseline again before the first mutation, including the
@@ -359,19 +460,20 @@ class CascadeService {
             for (const item of [...plans.map(plan => ({ ...plan, profile: plan.before })), ...preserved]) {
                 if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
             }
-            // Stage and validate BOTH payloads before restarting either service.
-            for (const plan of plans) {
+            // Stage and validate ALL changed payloads before restarting any service.
+            for (const plan of changedPlans) {
                 plan.stage = `${plan.file}.${randomBytes(12).toString('hex')}.stage`;
                 await exec(plan.node, `umask 077\ncat > ${plan.stage}`, plan.bytes);
                 await exec(plan.node, `/usr/local/bin/xray run -test -config ${plan.stage}`);
                 if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
             }
             const port = target.tunnelPort;
-            await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
-            for (const plan of plans) {
+            if (changedPlans.length) await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
+            for (const plan of changedPlans) {
                 await exec(plan.node, `chown --reference=${plan.file} ${plan.stage} && chmod --reference=${plan.file} ${plan.stage} && mv -- ${plan.stage} ${plan.file} && systemctl restart ${plan.service} && systemctl is-active --quiet ${plan.service}`);
                 const after = await readProfile(plan.node, plan.file);
-                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
+                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit
+                    || (plan.bytes === plan.before.bytes && scopedCanonical(after.runtime) !== scopedCanonical(plan.before.runtime))) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
             }
             for (const item of preserved) {
                 if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');
@@ -392,7 +494,8 @@ class CascadeService {
             // One final whole-scope barrier, not merely the last restarted node.
             for (const plan of plans) {
                 const after = await readProfile(plan.node, plan.file);
-                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
+                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit
+                    || (plan.bytes === plan.before.bytes && scopedCanonical(after.runtime) !== scopedCanonical(plan.before.runtime))) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
             }
             for (const item of preserved) {
                 if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');

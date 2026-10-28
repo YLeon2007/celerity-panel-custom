@@ -104,7 +104,7 @@ function fixture(t, options = {}) {
                 files.set(`${id}:${stage}`, String(execOptions.stdin)); writes.push([id, stage]);
             } else if (command.includes('mv --')) {
                 const stage = command.match(/\/usr\/local\/etc\/xray(?:-bridge)?\/[^'\s]+\.stage/)[0];
-                const configPath = id === SOURCE ? MAIN : TRANSIT;
+                const configPath = stage.replace(/\.[a-f0-9]+\.stage$/, '');
                 files.set(`${id}:${configPath}`, files.get(`${id}:${stage}`)); files.delete(`${id}:${stage}`);
             } else if (command.includes('ss -tnH')) stdout = '0 0 192.0.2.1:10096 192.0.2.2:49900\n';
             return { code: 0, stdout: `${stdout}\n${marker[0]}\n`, stderr: '' };
@@ -122,6 +122,125 @@ function fixture(t, options = {}) {
     return { cascade, held, locks, events, commands, writes, original, files, nodes, target, baseline, links, state, main,
         run: args => cascade.deployScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args }) };
 }
+
+function physicalForward(f) {
+    delete f.nodes[SOURCE].xray.extraInbounds;
+    const main = structuredClone(f.main);
+    main.inbounds = [main.inbounds[0], { tag: 'cascade-pilot-main', listen: '127.0.0.1', port: 18019,
+        protocol: 'socks', settings: { auth: 'noauth', udp: true, ip: '127.0.0.1' } },
+        { tag: 'unrelated-service', port: 18020, protocol: 'socks' }];
+    const forward = { inbounds: [], outbounds: [], routing: { rules: [] } };
+    generator.applyForwardChain(forward, [f.target], ['vless-in']);
+    main.outbounds.push(...forward.outbounds, { tag: 'cascade-pilot-main', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: 18019 }] } });
+    main.routing.rules.unshift(...['vless-in', 'cascade-pilot-main'].map(tag => ({ type: 'field', inboundTag: [tag], outboundTag: `fwd-${TARGET.slice(-8)}` })));
+    const targetMain = structuredClone(f.main);
+    generator.applyForwardHopInbound(targetMain, [f.target]);
+    f.files.set(`${SOURCE}:${MAIN}`, JSON.stringify(main));
+    f.files.set(`${BRIDGE}:${MAIN}`, JSON.stringify(targetMain));
+    f.files.set(`${SOURCE}:${TRANSIT}`, JSON.stringify({ reverse: { bridges: [{ tag: 'old-test', domain: 'test.invalid' }] },
+        inbounds: [{ tag: 'old-test', port: 12345 }], outbounds: [{ tag: 'old-test', protocol: 'freedom' }], routing: { rules: [] } }));
+    return { main, targetMain, orphan: f.files.get(`${SOURCE}:${TRANSIT}`) };
+}
+
+test('actual forward migration retires only exact owned fragments across three staged profiles', async t => {
+    const f = fixture(t), before = physicalForward(f);
+    f.links.push({ ...f.baseline, _id: '1'.repeat(24), portalNode: { _id: '2'.repeat(24) }, bridgeNode: { _id: '3'.repeat(24) } });
+    const result = await f.run();
+    assert.equal(result.success, true);
+    assert.equal(result.receipt.profiles.length, 3);
+    const main = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`));
+    assert.deepEqual(main.inbounds.slice(0, 3), before.main.inbounds);
+    assert.deepEqual(main.outbounds, before.main.outbounds.filter(row => row.tag !== `fwd-${TARGET.slice(-8)}`));
+    const clientRule = main.routing.rules.find(row => row.outboundTag === `portal-${TARGET.slice(-8)}` && !row.domain);
+    assert.deepEqual(clientRule.inboundTag, ['vless-in', 'cascade-pilot-main']);
+    assert.equal(clientRule.inboundTag.includes('unrelated-service'), false);
+    const retired = structuredClone(before.targetMain);
+    retired.inbounds = retired.inbounds.filter(row => row.tag !== `fwd-hop-${TARGET.slice(-8)}`);
+    retired.routing.rules = retired.routing.rules.filter(row => !row.inboundTag?.includes(`fwd-hop-${TARGET.slice(-8)}`));
+    assert.deepEqual(JSON.parse(f.files.get(`${BRIDGE}:${MAIN}`)), retired);
+    assert.equal(f.files.get(`${SOURCE}:${TRANSIT}`), before.orphan);
+    const firstRestart = f.commands.findIndex(row => row.command.includes('mv --'));
+    assert.equal(f.commands.slice(0, firstRestart).filter(row => row.command.includes('run -test')).length, 3);
+    const oldCombined = JSON.parse(f.original.get(`${BRIDGE}:${TRANSIT}`));
+    const combined = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+    for (const row of oldCombined.routing.rules) assert.ok(combined.routing.rules.some(item => JSON.stringify(item) === JSON.stringify(row)));
+});
+
+test('matching reverse replay including pending same-link PUT performs no remote mutations', async t => {
+    const f = fixture(t); physicalForward(f);
+    await f.run();
+    const bytes = new Map(f.files);
+    for (const status of ['deployed', 'pending']) {
+        f.target.status = status;
+        const start = f.commands.length;
+        const result = await f.run();
+        assert.equal(result.receipt.profiles.length, 3);
+        assert.equal(result.receipt.tunnelEstablished, true);
+        assert.deepEqual(f.files, bytes);
+        assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+        assert.ok(f.commands.slice(start).some(row => row.command.includes('ss -tnH')));
+    }
+});
+
+for (const kind of ['outbound', 'hop', 'route']) {
+    test(`corrupted old forward ${kind} refuses before writes`, async t => {
+        const f = fixture(t); physicalForward(f);
+        const key = `${kind === 'hop' ? BRIDGE : SOURCE}:${MAIN}`;
+        const config = JSON.parse(f.files.get(key));
+        if (kind === 'outbound') config.outbounds.find(row => row.tag === `fwd-${TARGET.slice(-8)}`).settings.vnext[0].users[0].id = 'wrong';
+        if (kind === 'hop') config.inbounds.find(row => row.tag === `fwd-hop-${TARGET.slice(-8)}`).settings.clients[0].id = 'wrong';
+        if (kind === 'route') config.routing.rules[0].domain = ['foreign'];
+        f.files.set(key, JSON.stringify(config));
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_OLD_FORWARD_MISMATCH' });
+        assert.equal(f.writes.length, 0);
+        assert.equal(f.commands.some(row => /mv --|ufw allow/.test(row.command)), false);
+    });
+}
+
+test('touching offline dependency refuses before SSH and is not treated as missing', async t => {
+    const f = fixture(t); f.baseline.status = 'offline';
+    await assert.rejects(f.run({ baselineLinkIds: [] }), { code: 'CLASSIC_SCOPED_OFFLINE_DEPENDENCY_UNSUPPORTED' });
+    assert.equal(f.commands.length, 0);
+});
+
+for (const kind of ['duplicate', 'credential', 'unknown-port']) {
+    test(`reverse replay refuses ${kind} collision before any remote mutation`, async t => {
+        const f = fixture(t); physicalForward(f); await f.run();
+        const config = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`));
+        const connector = config.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`);
+        if (kind === 'duplicate') config.inbounds.push(structuredClone(connector));
+        if (kind === 'credential') connector.settings.clients[0].id = 'foreign';
+        if (kind === 'unknown-port') config.inbounds.push({ tag: 'foreign', port: 10096, protocol: 'socks' });
+        f.files.set(`${SOURCE}:${MAIN}`, JSON.stringify(config));
+        const start = f.commands.length;
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' });
+        assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow/.test(row.command)), false);
+    });
+}
+
+test('third profile validation failure cannot restart either earlier profile', async t => {
+    const f = fixture(t, { fault({ id, command }) {
+        if (id === BRIDGE && command.includes('run -test -config /usr/local/etc/xray/config.json.')) {
+            return { code: 1, stdout: '', stderr: 'invalid third payload' };
+        }
+    } });
+    physicalForward(f);
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN' });
+    assert.equal(f.writes.length, 3);
+    assert.equal(f.commands.some(row => row.command.includes('mv --')), false);
+    assert.equal(f.locks.size, 2);
+});
+
+test('orphan source PID drift is refused without adopting or restarting that profile', async t => {
+    let reads = 0;
+    const f = fixture(t, { fault({ id, command }) {
+        if (id !== SOURCE || !command.includes('systemctl show xray-bridge')) return;
+        const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+        return { code: 0, stderr: '', stdout: `ActiveState=active\nNeedDaemonReload=no\nExecStart={ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${TRANSIT} ; pid=${++reads === 1 ? 100 : 101} ; }\n\n${marker}\n` };
+    } });
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT' });
+    assert.equal(f.writes.length, 0);
+});
 
 test('scoped entry refuses malformed input without remote effects', async t => {
     const f = fixture(t);
@@ -167,7 +286,7 @@ test('scoped no-upstream reverse adds main portal and shared bridge without touc
     assert.equal(f.commands.some(row => /install-release|daemon-reload|enable xray/.test(row.command)), false);
 });
 
-for (const status of ['staged', 'deployed', 'online', 'offline']) {
+for (const status of ['staged', 'deployed', 'online']) {
     test(`preserves explicitly confirmed ${status} baseline`, async t => {
         const f = fixture(t); f.baseline.status = status;
         assert.equal((await f.run()).remoteQuiescent, true);
@@ -179,11 +298,11 @@ test('ordinary confirmed-link health and node monitor updates do not change admi
     f = fixture(t, { fault() {
         if (changed) return;
         changed = true;
-        f.baseline.status = 'offline'; f.baseline.lastHealthCheck = new Date(); f.baseline.latencyMs = 123;
+        f.baseline.status = 'deployed'; f.baseline.lastHealthCheck = new Date(); f.baseline.latencyMs = 123;
         f.nodes[SOURCE].onlineUsers = 9; f.nodes[BRIDGE].status = 'online';
     } });
     assert.equal((await f.run()).remoteQuiescent, true);
-    assert.equal(f.baseline.status, 'offline');
+    assert.equal(f.baseline.status, 'deployed');
 });
 
 test('preserves legacy single-bridge tags while adding the new combined tunnel', async t => {
@@ -382,7 +501,7 @@ test('post-bridge source service drift is caught by final whole-scope readback',
     assert.equal(f.target.status, 'pending');
 });
 
-test('actual shell envelope stages stdin, validates both payloads, atomically replaces and reads back in a scratch root', async t => {
+test('actual shell migrates three forward profiles then replays without restarting in a scratch root', async t => {
     // Real /bin/sh, timeout, stdin, cat, stat, chmod/chown and mv. Xray,
     // systemd and ss are explicit local stand-ins, not physical flow proof.
     const { spawnSync } = require('node:child_process');
@@ -400,21 +519,24 @@ test('actual shell envelope stages stdin, validates both payloads, atomically re
         const result = spawnSync('/bin/sh', ['-c', local], { input: options.stdin, encoding: 'utf8', timeout: 15000 });
         return { code: result.status, stdout: result.stdout || '', stderr: result.stderr || '' };
     } });
-    for (const [key, bytes] of f.original) {
+    const forward = physicalForward(f);
+    for (const [key, bytes] of f.files) {
         const [id, file] = key.split(':');
         const dest = `${root}/${id}${file.replace('/usr/local', '')}`;
         fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, bytes, { mode: 0o600 });
     }
-    // The absent target-main directory is intentional; it is never created.
     const result = await f.run();
     assert.equal(result.remoteQuiescent, true);
-    assert.equal(fs.readFileSync(`${root}/${SOURCE}/etc/xray-bridge/config.json`, 'utf8'), f.original.get(`${SOURCE}:${TRANSIT}`));
+    assert.equal(fs.readFileSync(`${root}/${SOURCE}/etc/xray-bridge/config.json`, 'utf8'), forward.orphan);
     const main = JSON.parse(fs.readFileSync(`${root}/${SOURCE}/etc/xray/config.json`, 'utf8'));
-    assert.deepEqual(main.inbounds.slice(0, 2), f.main.inbounds);
+    assert.deepEqual(main.inbounds.slice(0, 3), forward.main.inbounds);
     assert.equal(main.inbounds.at(-1).port, 10096);
     const bridge = JSON.parse(fs.readFileSync(`${root}/${BRIDGE}/etc/xray-bridge/config.json`, 'utf8'));
     assert.equal(bridge.reverse.bridges.length, 2);
-    assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\n');
+    assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\nxray\n');
+    f.target.status = 'pending';
+    assert.equal((await f.run()).receipt.profiles.length, 3);
+    assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\nxray\n');
     assert.equal(f.locks.size, 0);
 });
 
