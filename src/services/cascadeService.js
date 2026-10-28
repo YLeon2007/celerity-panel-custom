@@ -6,7 +6,7 @@
  */
 
 const net = require('net');
-const { randomBytes } = require('node:crypto');
+const { randomBytes, createHash } = require('node:crypto');
 const CascadeLink = require('../models/cascadeLinkModel');
 const HyNode = require('../models/hyNodeModel');
 const Settings = require('../models/settingsModel');
@@ -15,7 +15,8 @@ const { applyClassicL2tpPathIngress, finishClassicConfigRouting } = require('./c
 const { mergePreservedL2tpSections } = require('../modules/relay-l2tp/domain/l2tpXrayConfigMerge');
 const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('./topologyConfigOwnership');
 const NodeSSH = require('./nodeSSH');
-const { withClassicNodeConfigWrite, assertClassicNodeConfigWriteHeld } = require('./classicNodeConfigWrite');
+const { withClassicNodeConfigWrite, assertClassicNodeConfigWriteHeld,
+    assertHeldL2tpNodeConfigWrite } = require('./classicNodeConfigWrite');
 const cache = require('./cacheService');
 const logger = require('../utils/logger');
 const webhook = require('./webhookService');
@@ -73,7 +74,352 @@ ${command}
     return ssh;
 }
 
+const SCOPED_MAIN = '/usr/local/etc/xray/config.json';
+const SCOPED_BRIDGE = '/usr/local/etc/xray-bridge/config.json';
+const scopedFailure = code => Object.assign(new Error(code), { code });
+const scopedHash = text => createHash('sha256').update(text).digest('hex');
+const scopedId = value => String(value?._id || value);
+const shellQuote = text => `'${text.replace(/'/g, `'\\''`)}'`;
+// Compare JSON values without changing array/routing order or disclosing bytes.
+function scopedCanonical(value) {
+    if (Array.isArray(value)) return `[${value.map(scopedCanonical).join(',')}]`;
+    if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key =>
+        `${JSON.stringify(key)}:${scopedCanonical(value[key])}`).join(',')}}`;
+    return JSON.stringify(value);
+}
+function scopedConfig(text) {
+    try {
+        const value = JSON.parse(text);
+        if (!value || typeof value !== 'object' || !Array.isArray(value.outbounds)
+            || !Array.isArray(value.routing?.rules) || (value.inbounds && !Array.isArray(value.inbounds))) throw new Error();
+        return value;
+    } catch { throw scopedFailure('CLASSIC_SCOPED_CONFIG_INVALID'); }
+}
+function scopedContains(rows, expected) {
+    return rows?.some(row => scopedCanonical(row) === scopedCanonical(expected));
+}
+function scopedScopePin(scope) {
+    const linkPin = (link, confirmed) => {
+        const pin = { ...link, _id: scopedId(link),
+            portalNode: { _id: scopedId(link.portalNode), ip: link.portalNode?.ip },
+            bridgeNode: { _id: scopedId(link.bridgeNode), ip: link.bridgeNode?.ip } };
+        for (const key of ['lastHealthCheck', 'latencyMs', 'lastError', 'updatedAt', 'createdAt']) delete pin[key];
+        if (confirmed) delete pin.status; // APPLIED/legacy-offline membership is checked separately.
+        return pin;
+    };
+    return scopedCanonical({ target: linkPin(scope.target, false),
+        confirmed: scope.confirmed.map(link => linkPin(link, true)).sort((a, b) => a._id.localeCompare(b._id)) });
+}
+function scopedNodePin(node) {
+    return scopedCanonical({ _id: scopedId(node), ip: node?.ip, active: node?.active,
+        type: node?.type, cascadeRole: node?.cascadeRole, ssh: node?.ssh,
+        clientTags: [node?.xray?.inboundTag, ...(node?.xray?.extraInbounds || []).map(row => row.inboundTag)] });
+}
+
 class CascadeService {
+    /**
+     * Completion-checked classic no-upstream Relay -> terminal Bridge only.
+     * Caller MUST hold the nonexpiring topology reservation at this exact
+     * revision and retain it on every throw. baselineLinkIds is the complete
+     * active confirmed baseline (APPLIED_LINK_STATUSES plus legacy offline).
+     * This entry never acquires topology adoption or native operation identity.
+     */
+    async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
+        const id = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
+        if (!id(linkId) || !Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0
+            || !Array.isArray(baselineLinkIds) || !baselineLinkIds.every(id)
+            || new Set(baselineLinkIds).size !== baselineLinkIds.length || baselineLinkIds.includes(linkId)) {
+            throw Object.assign(new Error('CLASSIC_SCOPED_INPUT_INVALID'), { code: 'CLASSIC_SCOPED_INPUT_INVALID' });
+        }
+        // Capture policy before the first await. This path never calls deployLink,
+        // full-config generators, path-ingress composition, an installer or agent.
+        const env = Object.freeze({ ...process.env });
+        const baseline = Object.freeze([...baselineLinkIds].sort());
+        try {
+            const initial = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
+            if (!initial || initial.active !== true || (initial.mode || 'reverse') !== 'reverse') {
+                throw scopedFailure('CLASSIC_SCOPED_REVERSE_LINK_REQUIRED');
+            }
+            const ids = [scopedId(initial.portalNode), scopedId(initial.bridgeNode)].sort();
+            if (!ids.every(id) || ids[0] === ids[1]) throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_INVALID');
+            let result;
+            await withClassicNodeConfigWrite({ nodeId: ids[0], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
+                await withClassicNodeConfigWrite({ nodeId: ids[1], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
+                    result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids });
+                    return true;
+                });
+                return true;
+            });
+            return result;
+        } catch (error) {
+            // Never forward transport, generated config, credential or journal text.
+            const code = typeof error?.code === 'string'
+                && /^(CLASSIC_SCOPED_[A-Z_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code)
+                ? error.code : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN';
+            throw scopedFailure(code);
+        }
+    }
+
+    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids }) {
+        const started = performance.now();
+        const checkHeld = async () => {
+            if (performance.now() - started >= 100000) throw scopedFailure('CLASSIC_SCOPED_DEADLINE');
+            // Unlike assertClassic..., this refuses an authorization-disabled no-op.
+            for (const nodeId of ids) await assertHeldL2tpNodeConfigWrite(nodeId);
+        };
+        const bounded = async (work, ms = 15000) => {
+            let timer;
+            try {
+                return await Promise.race([work(), new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(scopedFailure('CLASSIC_SCOPED_COMPLETION_UNCERTAIN')), ms);
+                })]);
+            } finally { clearTimeout(timer); }
+        };
+        const State = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
+        const revision = async () => {
+            await checkHeld();
+            const state = await State.findById('singleton').setOptions({ maxTimeMS: 5000,
+                readPreference: 'primary', readConcern: { level: 'majority' } }).lean();
+            if (state?.revision !== expectedTopologyRevision) throw scopedFailure('CLASSIC_SCOPED_REVISION_CONFLICT');
+        };
+        const readScope = async () => {
+            await revision();
+            const rows = await CascadeLink.find({ active: true, $or: [
+                { _id: linkId }, { status: { $in: [...APPLIED_LINK_STATUSES, 'offline'] } },
+            ] }).populate('portalNode bridgeNode').setOptions({ maxTimeMS: 5000 }).lean();
+            const target = rows.find(row => scopedId(row) === linkId);
+            const confirmed = rows.filter(row => scopedId(row) !== linkId);
+            if (!target || target.active !== true || (target.mode || 'reverse') !== 'reverse'
+                || !['pending', 'error', ...APPLIED_LINK_STATUSES].includes(target.status)
+                || !Number.isSafeInteger(target.tunnelPort) || target.tunnelPort < 1 || target.tunnelPort > 65535
+                || typeof target.tunnelUuid !== 'string' || !target.tunnelUuid) throw scopedFailure('CLASSIC_SCOPED_TARGET_INVALID');
+            if (confirmed.some(row => row.active !== true || typeof row.status !== 'string'
+                || ![...APPLIED_LINK_STATUSES, 'offline'].includes(row.status))) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
+            const actual = confirmed.map(scopedId).sort();
+            if (scopedCanonical(actual) !== scopedCanonical(baseline)) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
+            const endpoints = [scopedId(target.portalNode), scopedId(target.bridgeNode)].sort();
+            if (scopedCanonical(endpoints) !== scopedCanonical(ids)) throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_DRIFT');
+            // Only current no-upstream Relay -> terminal Bridge is supported.
+            // Do not silently omit or regenerate a reverse transit profile.
+            const sourceId = scopedId(target.portalNode), bridgeId = scopedId(target.bridgeNode);
+            const touches = row => [sourceId, bridgeId].some(node =>
+                scopedId(row.portalNode) === node || scopedId(row.bridgeNode) === node);
+            if (confirmed.some(row => touches(row) && row.mode === 'forward')) throw scopedFailure('CLASSIC_SCOPED_FORWARD_DEPENDENCY_UNSUPPORTED');
+            if (confirmed.some(row => scopedId(row.bridgeNode) === sourceId)) throw scopedFailure('CLASSIC_SCOPED_REVERSE_UPSTREAM_UNSUPPORTED');
+            if (confirmed.some(row => scopedId(row.portalNode) === sourceId)) throw scopedFailure('CLASSIC_SCOPED_SHARED_SOURCE_UNSUPPORTED');
+            if (confirmed.some(row => scopedId(row.portalNode) === bridgeId)) throw scopedFailure('CLASSIC_SCOPED_TRANSIT_BRIDGE_UNSUPPORTED');
+            const l2tp = require('../modules/relay-l2tp/models/relayL2tpStateModel');
+            if (await l2tp.exists({ $or: [{ desiredState: 'installed' }, { status: { $ne: 'not_installed' } }] })
+                .setOptions({ maxTimeMS: 5000 })) throw scopedFailure('CLASSIC_SCOPED_L2TP_UNSUPPORTED');
+            return { target, confirmed };
+        };
+        const scope = await readScope();
+        const scopePin = scopedScopePin(scope);
+        const source = await HyNode.findById(scopedId(scope.target.portalNode)).setOptions({ maxTimeMS: 5000 }).lean();
+        const bridge = await HyNode.findById(scopedId(scope.target.bridgeNode)).setOptions({ maxTimeMS: 5000 }).lean();
+        if (source?.type !== 'xray' || source?.cascadeRole !== 'relay' || source.active !== true
+            || !bridge || bridge.active !== true || !net.isIP(source.ip || '') || !net.isIP(bridge.ip || '')
+            || [source, bridge].some(node => !node.ssh?.password && !node.ssh?.privateKey)) {
+            throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED');
+        }
+        const nodePins = [source, bridge].map(scopedNodePin);
+        const checkNodePins = async () => {
+            await checkHeld();
+            for (const [index, node] of [source, bridge].entries()) {
+                const fresh = await HyNode.findById(scopedId(node)).setOptions({ maxTimeMS: 5000 }).lean();
+                if (scopedNodePin(fresh) !== nodePins[index]) throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_DRIFT');
+            }
+        };
+        const transports = new Map();
+        const exec = async (node, command, stdin) => {
+            await checkHeld();
+            const marker = `C3_SCOPED_DONE_${randomBytes(24).toString('hex')}`;
+            // A local timeout is NOT cancellation/quiescence. Its throw retains
+            // both uncertain generations; no retry, rollback or later release.
+            const remote = `timeout --signal=TERM --kill-after=2s 10s sh -c ${shellQuote(`set -eu\n${command}`)} && printf '\\n${marker}\\n'`;
+            const result = await bounded(() => transports.get(scopedId(node)).exec(remote,
+                { timeout: 13000, ...(stdin !== undefined && { stdin }) }));
+            const suffix = `\n${marker}\n`;
+            if (result?.code !== 0 || typeof result.stdout !== 'string' || typeof result.stderr !== 'string'
+                || !result.stdout.endsWith(suffix) || result.stdout.length > 1100000) throw scopedFailure('CLASSIC_SCOPED_COMPLETION_UNCERTAIN');
+            await checkHeld();
+            return result.stdout.slice(0, -suffix.length);
+        };
+        const readConfig = (node, file) => exec(node, `# C3_READ_CONFIG\nif test -e ${file}; then\n test -f ${file} && test ! -L ${file} && test "$(stat -c %s ${file})" -le 1048576 && cat ${file}\nelse\n printf C3_CONFIG_ABSENT\nfi`);
+        const readProfile = async (node, file) => {
+            const bytes = await readConfig(node, file);
+            const service = file === SCOPED_MAIN ? 'xray' : 'xray-bridge';
+            const observed = bytes === 'C3_CONFIG_ABSENT' ? null
+                : await exec(node, `systemctl show ${service} --property=ActiveState --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload --property=ExecStart && systemctl cat ${service}`);
+            // ExecStart's runtime PID/timestamps change on restart. Pin its
+            // loaded argv independently of unit-file text, retaining the stable
+            // unit/drop-in bytes and all other observed service properties.
+            const loaded = observed?.match(/^ExecStart=\{ path=([^;]+) ; argv\[\]=([^;]+) ;[^\n]*$/m);
+            const unit = loaded ? observed.replace(loaded[0], `LoadedExecStart=${loaded[1].trim()}|${loaded[2].trim()}`) : observed;
+            return { bytes, unit, loaded: loaded ? [loaded[1].trim(), loaded[2].trim()] : null };
+        };
+        try {
+            // Select checked SSH for both nodes before any configuration dispatch.
+            for (const node of [source, bridge]) {
+                await checkHeld();
+                const ssh = new NodeSSH(node); transports.set(scopedId(node), ssh);
+                await bounded(() => ssh.connect(), 10000);
+                await checkHeld();
+            }
+            const mainBefore = await readProfile(source, SCOPED_MAIN);
+            const bridgeBefore = await readProfile(bridge, SCOPED_BRIDGE);
+            const preserved = [
+                { node: source, file: SCOPED_BRIDGE, profile: await readProfile(source, SCOPED_BRIDGE) },
+                { node: bridge, file: SCOPED_MAIN, profile: await readProfile(bridge, SCOPED_MAIN) },
+            ];
+            for (const [profile, file] of [[mainBefore, SCOPED_MAIN], [bridgeBefore, SCOPED_BRIDGE]]) {
+                if (!profile.unit?.includes('ActiveState=active\n') || !profile.unit.includes('NeedDaemonReload=no\n')
+                    || scopedCanonical(profile.loaded) !== scopedCanonical(['/usr/local/bin/xray', `/usr/local/bin/xray run -config ${file}`])) {
+                    throw scopedFailure('CLASSIC_SCOPED_SERVICE_LAYOUT_UNSUPPORTED');
+                }
+            }
+            const main = scopedConfig(mainBefore.bytes), combined = scopedConfig(bridgeBefore.bytes);
+            const target = { ...scope.target, portalNode: source, bridgeNode: bridge };
+            const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
+            const representedDomains = bridgeBaseline.map(row =>
+                `${scopedId(row).slice(-8)}.${row.tunnelDomain || 'reverse.tunnel.internal'}`).sort();
+            if (scopedCanonical((combined.reverse?.bridges || []).map(row => row.domain).sort()) !== scopedCanonical(representedDomains)
+                || combined.reverse?.portals?.length) throw scopedFailure('CLASSIC_SCOPED_UNREPRESENTED_BRIDGE_CONFIG');
+            const forwardFragment = config => [...(config.inbounds || []), ...config.outbounds]
+                .some(row => /^(fwd-|cascade-in-|conn-down-|bridge-conn-)/.test(row.tag || ''));
+            if (main.reverse?.portals?.length || main.reverse?.bridges?.length || forwardFragment(main)) {
+                throw scopedFailure('CLASSIC_SCOPED_UNREPRESENTED_MAIN_CONFIG');
+            }
+            if (forwardFragment(combined)) throw scopedFailure('CLASSIC_SCOPED_UNREPRESENTED_BRIDGE_CONFIG');
+            // Confirm every established shared-bridge tunnel before adding a new
+            // one. Preserve actual existing rows/extra sections, including old
+            // single-tunnel tag conventions, instead of rebuilding from DB alone.
+            for (const link of bridgeBaseline) {
+                const candidates = [configGenerator.generateCombinedBridgeConfig([link])];
+                if (bridgeBaseline.length === 1) candidates.push(configGenerator.generateBridgeConfig(link, link.portalNode));
+                if (!candidates.some(text => {
+                    const expected = JSON.parse(text);
+                    return expected.reverse.bridges.every(row => scopedContains(combined.reverse?.bridges, row))
+                        && expected.outbounds.every(row => scopedContains(combined.outbounds, row))
+                        && expected.routing.rules.every(row => scopedContains(combined.routing.rules, row));
+                })) throw scopedFailure('CLASSIC_SCOPED_SHARED_BRIDGE_BASELINE_MISMATCH');
+            }
+            const clientTags = [source.xray?.inboundTag || 'vless-in',
+                ...(source.xray?.extraInbounds || []).map(row => row.inboundTag).filter(Boolean)];
+            if (clientTags.some(tag => !main.inbounds?.some(row => row.tag === tag))) throw scopedFailure('CLASSIC_SCOPED_MAIN_INGRESS_MISMATCH');
+            const portalDelta = { inbounds: [], outbounds: [], routing: { rules: [] } };
+            configGenerator.applyReversePortal(portalDelta, [target], clientTags);
+            const bridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([target]));
+            const targetSuffix = linkId.slice(-8);
+            const hasCollision = config => [...(config.inbounds || []), ...config.outbounds,
+                ...(config.reverse?.bridges || []), ...(config.reverse?.portals || [])].some(row =>
+                row.tag?.includes(targetSuffix) || row.port === target.tunnelPort);
+            if (hasCollision(main) || hasCollision(combined)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+            for (const item of preserved) {
+                if (item.profile.bytes === 'C3_CONFIG_ABSENT') continue;
+                let config;
+                try { config = JSON.parse(item.profile.bytes); }
+                catch { throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_INVALID'); }
+                // Orphan source transit is preserved, not adopted. It must not
+                // already occupy the new main-owned listener on the same host.
+                if (scopedId(item.node) === scopedId(source)
+                    && config.inbounds?.some(row => Number(row.port) === target.tunnelPort)) {
+                    throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+                }
+            }
+            if (main.routing.rules.some(row => (!row.inboundTag || row.inboundTag.some(tag => clientTags.includes(tag)))
+                && !['domain', 'ip', 'port', 'network', 'protocol', 'source', 'sourcePort', 'user'].some(key => row[key]))) {
+                throw scopedFailure('CLASSIC_SCOPED_MAIN_ROUTING_SHADOW_UNSUPPORTED');
+            }
+            main.reverse = main.reverse || {};
+            main.reverse.portals = [...(main.reverse.portals || []), ...portalDelta.reverse.portals];
+            main.inbounds.push(...portalDelta.inbounds);
+            const insertRules = (config, rules) => {
+                const index = config.routing.rules.findIndex(row => !row.inboundTag && row.ip?.includes('geoip:private'));
+                config.routing.rules.splice(index < 0 ? config.routing.rules.length : index, 0, ...rules);
+            };
+            insertRules(main, portalDelta.routing.rules);
+            if (portalDelta.routing.domainStrategy) main.routing.domainStrategy = portalDelta.routing.domainStrategy;
+            combined.reverse = combined.reverse || {};
+            combined.reverse.bridges = [...(combined.reverse.bridges || []), ...bridgeDelta.reverse.bridges];
+            for (const outbound of bridgeDelta.outbounds) {
+                const old = combined.outbounds.find(row => row.tag === outbound.tag);
+                if (old && scopedCanonical(old) !== scopedCanonical(outbound)) throw scopedFailure('CLASSIC_SCOPED_BRIDGE_OUTBOUND_CONFLICT');
+                if (!old) combined.outbounds.push(outbound);
+            }
+            insertRules(combined, bridgeDelta.routing.rules.filter(row => row.domain || row.inboundTag));
+            const plans = [
+                { node: source, file: SCOPED_MAIN, service: 'xray', before: mainBefore, bytes: JSON.stringify(main, null, 2) },
+                { node: bridge, file: SCOPED_BRIDGE, service: 'xray-bridge', before: bridgeBefore, bytes: JSON.stringify(combined, null, 2) },
+            ];
+            if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
+            await checkNodePins();
+            // Check every baseline again before the first mutation, including the
+            // orphan source transit profile. Neither of its bytes/unit is adopted.
+            for (const item of [...plans.map(plan => ({ ...plan, profile: plan.before })), ...preserved]) {
+                if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
+            }
+            // Stage and validate BOTH payloads before restarting either service.
+            for (const plan of plans) {
+                plan.stage = `${plan.file}.${randomBytes(12).toString('hex')}.stage`;
+                await exec(plan.node, `umask 077\ncat > ${plan.stage}`, plan.bytes);
+                await exec(plan.node, `/usr/local/bin/xray run -test -config ${plan.stage}`);
+                if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
+            }
+            const port = target.tunnelPort;
+            await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
+            for (const plan of plans) {
+                await exec(plan.node, `chown --reference=${plan.file} ${plan.stage} && chmod --reference=${plan.file} ${plan.stage} && mv -- ${plan.stage} ${plan.file} && systemctl restart ${plan.service} && systemctl is-active --quiet ${plan.service}`);
+                const after = await readProfile(plan.node, plan.file);
+                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
+            }
+            for (const item of preserved) {
+                if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');
+            }
+            let established = false;
+            for (let attempt = 0; attempt < 8; attempt++) {
+                const sockets = await exec(source, `ss -tnH state established '( sport = :${port} and dst ${bridge.ip} )'`);
+                const targetPeer = sockets.trim().split('\n').some(line => {
+                    const fields = line.trim().split(/\s+/);
+                    if (fields.length !== 4 || !/^\d+$/.test(fields[0]) || !/^\d+$/.test(fields[1])) return false;
+                    const peer = fields[3].slice(0, fields[3].lastIndexOf(':')).replace(/^\[|\]$/g, '');
+                    return fields[2].endsWith(`:${port}`) && (peer === bridge.ip || peer === `::ffff:${bridge.ip}`);
+                });
+                if (targetPeer) { established = true; break; }
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            if (!established) throw scopedFailure('CLASSIC_SCOPED_TUNNEL_UNCONFIRMED');
+            // One final whole-scope barrier, not merely the last restarted node.
+            for (const plan of plans) {
+                const after = await readProfile(plan.node, plan.file);
+                if (after.bytes !== plan.bytes || after.unit !== plan.before.unit) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
+            }
+            for (const item of preserved) {
+                if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');
+            }
+            if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
+            await checkNodePins();
+            const updated = await CascadeLink.updateOne({ _id: linkId, active: true }, {
+                $set: { status: 'deployed', lastError: '', lastHealthCheck: new Date() },
+            }, { maxTimeMS: 5000 });
+            if (updated?.acknowledged !== true || updated.matchedCount !== 1) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
+            const saved = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
+            if (saved?.status !== 'deployed' || saved.active !== true || scopedId(saved.portalNode) !== scopedId(source)
+                || scopedId(saved.bridgeNode) !== scopedId(bridge)) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
+            await revision();
+            return { success: true, remoteQuiescent: true, receipt: {
+                kind: 'classic-scoped-reverse', linkId, topologyRevision: expectedTopologyRevision,
+                nodeIds: ids, preservedLinkIds: baseline, tunnelEstablished: true,
+                profiles: plans.map(plan => ({ nodeId: scopedId(plan.node), path: plan.file,
+                    beforeSha256: scopedHash(plan.before.bytes), sha256: scopedHash(plan.bytes) })),
+                preservedProfiles: preserved.map(item => ({ nodeId: scopedId(item.node), path: item.file,
+                    sha256: item.profile.bytes === 'C3_CONFIG_ABSENT' ? null : scopedHash(item.profile.bytes) })),
+            } };
+        } finally {
+            for (const ssh of transports.values()) ssh.disconnect();
+        }
+    }
+
     /**
      * Deploy a single cascade link: upload configs to both Portal and Bridge,
      * restart services, and verify tunnel establishment.

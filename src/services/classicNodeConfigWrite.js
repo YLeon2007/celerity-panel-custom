@@ -9,9 +9,10 @@ const failure = code => Object.assign(new Error(code), { code });
 // This is only a shared exclusion fence, never topology adoption/handback
 // authority. The callback must return true ONLY after checked completion of all
 // dispatched effects. A false/unknown result or throw keeps the uncertain row.
-async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, callback) {
+async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env, leaseMs = 30000 }, callback) {
     const selectedEnv = Object.freeze({ ...env });
-    if (!nodeId || typeof kind !== 'string' || !kind) throw failure('CLASSIC_CONFIG_WRITE_INVALID');
+    if (!nodeId || typeof kind !== 'string' || !kind
+        || !Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 120000) throw failure('CLASSIC_CONFIG_WRITE_INVALID');
     const key = String(nodeId);
     const parent = heldWrites.getStore();
     const nested = parent?.get(key);
@@ -43,7 +44,7 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env }, c
         clock: { now: () => new Date() } });
     const owner = 'classic-config-writer';
     const operationId = `classic:${kind}:${randomUUID()}`;
-    const acquired = await service.acquire({ node: nodeId, owner, operationId, leaseMs: 30000 });
+    const acquired = await service.acquire({ node: nodeId, owner, operationId, leaseMs });
     if (!acquired?.ok) throw failure('NODE_OPERATION_LOCK_CONFLICT');
     const lock = acquired.lock;
     if (!lock || String(lock.node) !== key || lock.owner !== owner || lock.operationId !== operationId
