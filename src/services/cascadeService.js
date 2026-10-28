@@ -371,6 +371,29 @@ class CascadeService {
             const portalDelta = { inbounds: [], outbounds: [], routing: { rules: [] } };
             configGenerator.applyReversePortal(portalDelta, [target], clientTags);
             const bridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([target]));
+            let priorPortalDelta = portalDelta, priorBridgeDelta = bridgeDelta;
+            const oldListeners = main.inbounds.filter(row => row.tag === `bridge-conn-${targetSuffix}`);
+            if (target.tunnelSecurity === 'reality' && oldListeners.length) {
+                const stream = oldListeners[0].streamSettings, reality = stream?.realitySettings;
+                const dest = typeof reality?.dest === 'string'
+                    ? reality.dest.match(/^(?:\[([0-9a-fA-F:]+)\]|([^:\[\]]+)):([1-9]\d{0,4})$/) : null;
+                if (oldListeners.length !== 1 || stream?.security !== 'reality' || !dest
+                    || Number(dest[3]) > 65535 || (dest[1] ? net.isIP(dest[1]) !== 6 : !scopedSourceHost(dest[2]))
+                    || !Array.isArray(reality.serverNames) || !reality.serverNames.length
+                    || reality.serverNames.some(name => !scopedSourceHost(name) || net.isIP(name))
+                    || new Set(reality.serverNames).size !== reality.serverNames.length) {
+                    throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+                }
+                // Only decoy fields may come from the old listener, and only for
+                // ownership validation. Regenerate BOTH complete prior fragments
+                // from persisted credentials/transport: the bridge's old client
+                // SNI must match the listener's first serverName exactly. Never
+                // use these prior deltas when composing the desired configs.
+                const priorTarget = { ...target, realityDest: reality.dest, realitySni: reality.serverNames };
+                priorPortalDelta = { inbounds: [], outbounds: [], routing: { rules: [] } };
+                configGenerator.applyReversePortal(priorPortalDelta, [priorTarget], clientTags);
+                priorBridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([priorTarget]));
+            }
             // On replay remove only a COMPLETE exact generated target fragment.
             // A partial/duplicate/foreign collision must never be treated as ours.
             const stripOwnedReverse = (config, delta) => {
@@ -389,8 +412,8 @@ class CascadeService {
                 for (const [key, from] of sections) if (from[key]) from[key] = from[key].filter(row => !owned(row));
                 return true;
             };
-            const portalApplied = stripOwnedReverse(main, portalDelta);
-            const bridgeApplied = stripOwnedReverse(combined, bridgeDelta);
+            const portalApplied = stripOwnedReverse(main, priorPortalDelta);
+            const bridgeApplied = stripOwnedReverse(combined, priorBridgeDelta);
             if (portalApplied !== bridgeApplied || (oldOutbound.length && portalApplied)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
             const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
             const representedDomains = bridgeBaseline.map(row =>

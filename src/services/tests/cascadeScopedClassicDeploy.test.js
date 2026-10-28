@@ -276,6 +276,175 @@ test('matching reverse replay including pending same-link PUT performs no remote
     }
 });
 
+async function appliedReality(t) {
+    const f = fixture(t); physicalForward(f);
+    Object.assign(f.target, { tunnelSecurity: 'reality', realityPrivateKey: 'fixture-private-key',
+        realityPublicKey: 'fixture-public-key', realityShortIds: ['0123456789abcdef'],
+        realityDest: 'old-decoy.example:443', realitySni: ['old-decoy.example', 'old-alt.example'] });
+    const key = `${BRIDGE}:${TRANSIT}`, combined = JSON.parse(f.files.get(key));
+    combined.policy = { levels: { 0: { handshake: 4 } } };
+    combined.routing.rules = combined.routing.rules.filter(row => !row.ip?.includes('::/0'));
+    f.files.set(key, JSON.stringify(combined));
+    assert.equal((await f.run()).success, true);
+    return f;
+}
+
+function requestDecoyUpdate(f) {
+    Object.assign(f.target, { status: 'pending', realityDest: 'new-decoy.example:8443',
+        realitySni: ['new-decoy.example', 'new-alt.example'] });
+}
+
+test('current reverse REALITY decoy-only update stages two profiles and subsequent replay is no-write', async t => {
+    const f = await appliedReality(t), before = new Map(f.files);
+    // Unchanged REALITY replay remains no-write, including the old multi-SNI set.
+    let start = f.commands.length;
+    await f.run();
+    assert.deepEqual(f.files, before);
+    assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+    requestDecoyUpdate(f);
+    start = f.commands.length;
+    const result = await f.run(), updateCommands = f.commands.slice(start);
+    assert.equal(result.success, true);
+    assert.equal(f.locks.size, 0);
+    assert.equal(result.receipt.profiles.length, 3);
+    assert.deepEqual(updateCommands.filter(row => row.options.stdin !== undefined).map(row =>
+        [row.id, row.command.includes('/xray-bridge/') ? TRANSIT : MAIN]), [[SOURCE, MAIN], [BRIDGE, TRANSIT]]);
+    const firstRestart = updateCommands.findIndex(row => row.command.includes('mv --'));
+    assert.equal(updateCommands.slice(0, firstRestart).filter(row => row.command.includes('run -test')).length, 2);
+    assert.equal(updateCommands.filter(row => row.command.includes('mv --')).length, 2);
+    for (const key of [`${SOURCE}:${MAIN}`, `${BRIDGE}:${TRANSIT}`]) {
+        const expected = JSON.parse(before.get(key)), after = JSON.parse(f.files.get(key));
+        if (key === `${SOURCE}:${MAIN}`) {
+            const reality = expected.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`).streamSettings.realitySettings;
+            reality.dest = f.target.realityDest; reality.serverNames = f.target.realitySni;
+        } else {
+            expected.outbounds.find(row => row.tag === `tunnel-${TARGET.slice(-8)}`).streamSettings.realitySettings.serverName = f.target.realitySni[0];
+        }
+        assert.deepEqual(after, expected, 'only generated decoy fields may change; preserve shared/global rules and credentials');
+    }
+    for (const key of [`${SOURCE}:${TRANSIT}`, `${BRIDGE}:${MAIN}`]) assert.equal(f.files.get(key), before.get(key));
+    const updated = new Map(f.files);
+    f.target.status = 'pending'; start = f.commands.length;
+    assert.equal((await f.run()).success, true);
+    assert.deepEqual(f.files, updated);
+    assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+});
+
+for (const field of ['realityDest', 'realitySni']) {
+    test(`current reverse REALITY permits changing only ${field}`, async t => {
+        const f = await appliedReality(t), before = new Map(f.files);
+        if (field === 'realityDest') f.target.realityDest = 'new-decoy.example:8443';
+        else f.target.realitySni = ['new-decoy.example'];
+        const start = f.commands.length;
+        assert.equal((await f.run()).success, true);
+        const expected = JSON.parse(before.get(`${SOURCE}:${MAIN}`));
+        const reality = expected.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`).streamSettings.realitySettings;
+        if (field === 'realityDest') reality.dest = f.target.realityDest;
+        else reality.serverNames = f.target.realitySni;
+        assert.deepEqual(JSON.parse(f.files.get(`${SOURCE}:${MAIN}`)), expected);
+        if (field === 'realityDest') assert.equal(f.files.get(`${BRIDGE}:${TRANSIT}`), before.get(`${BRIDGE}:${TRANSIT}`));
+        assert.equal(f.commands.slice(start).filter(row => row.command.includes('mv --')).length, field === 'realityDest' ? 1 : 2);
+        const updated = new Map(f.files), replayStart = f.commands.length;
+        await f.run();
+        assert.deepEqual(f.files, updated);
+        assert.equal(f.commands.slice(replayStart).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+    });
+}
+
+const reverseDecoyCorruptions = [
+    ['old private key', (f, server) => { server.streamSettings.realitySettings.privateKey = 'foreign-private'; }],
+    ['old public key', (f, server, client) => { client.streamSettings.realitySettings.publicKey = 'foreign-public'; }],
+    ['old server UUID', (f, server) => { server.settings.clients[0].id = 'foreign-uuid'; }],
+    ['old client UUID', (f, server, client) => { client.settings.vnext[0].users[0].id = 'foreign-uuid'; }],
+    ['consistent foreign UUID pair', (f, server, client) => {
+        server.settings.clients[0].id = client.settings.vnext[0].users[0].id = 'foreign-uuid';
+    }],
+    ['old server shortIds', (f, server) => { server.streamSettings.realitySettings.shortIds = ['fedcba9876543210']; }],
+    ['old client shortId', (f, server, client) => { client.streamSettings.realitySettings.shortId = 'fedcba9876543210'; }],
+    ['consistent foreign shortId pair', (f, server, client) => {
+        server.streamSettings.realitySettings.shortIds = ['fedcba9876543210'];
+        client.streamSettings.realitySettings.shortId = 'fedcba9876543210';
+    }],
+    ['persisted private key rotation', f => { f.target.realityPrivateKey = 'different-private'; }],
+    ['persisted public key rotation', f => { f.target.realityPublicKey = 'different-public'; }],
+    ['persisted UUID rotation', f => { f.target.tunnelUuid = 'baa54cac-323a-4a0a-8cb2-e8f605980fe0'; }],
+    ['persisted shortId rotation', f => { f.target.realityShortIds = ['fedcba9876543210']; }],
+    ['old client SNI mismatch', (f, server, client) => { client.streamSettings.realitySettings.serverName = 'unmatched.example'; }],
+    ['old client SNI uses non-first serverName', (f, server, client) => {
+        client.streamSettings.realitySettings.serverName = server.streamSettings.realitySettings.serverNames[1];
+    }],
+    ['old fingerprint', (f, server, client) => { client.streamSettings.realitySettings.fingerprint = 'firefox'; }],
+    ['persisted fingerprint', f => { f.target.realityFingerprint = 'firefox'; }],
+    ['old client endpoint', (f, server, client) => { client.settings.vnext[0].address = 'foreign.example'; }],
+    ['old client port', (f, server, client) => { client.settings.vnext[0].port++; }],
+    ['old listener port', (f, server) => { server.port++; }],
+    ['persisted endpoint', f => { f.nodes[SOURCE].ip = 'changed.example'; }],
+    ['persisted port', f => { f.target.tunnelPort++; }],
+    ['persisted tunnel domain', f => { f.target.tunnelDomain = 'different.internal'; }],
+    ['persisted transport', f => { f.target.tunnelTransport = 'ws'; }],
+    ['persisted security', f => { f.target.tunnelSecurity = 'none'; }],
+    ['old server security', (f, server) => { server.streamSettings.security = 'none'; }],
+    ['old client security', (f, server, client) => { client.streamSettings.security = 'none'; }],
+    ['old paired transport', (f, server, client) => { server.streamSettings.network = client.streamSettings.network = 'ws'; }],
+    ['old server socket settings', (f, server) => { server.streamSettings.sockopt.tcpNoDelay = false; }],
+    ['partial source listener', (f, server, client, portal) => { portal.inbounds = portal.inbounds.filter(row => row !== server); }],
+    ['partial bridge client', (f, server, client, portal, combined) => { combined.outbounds = combined.outbounds.filter(row => row !== client); }],
+    ['absent bridge endpoint', (f, server, client, portal, combined) => {
+        const foreign = row => !JSON.stringify(row).includes(TARGET.slice(-8));
+        combined.outbounds = combined.outbounds.filter(foreign);
+        combined.reverse.bridges = combined.reverse.bridges.filter(foreign);
+        combined.routing.rules = combined.routing.rules.filter(foreign);
+    }],
+    ['duplicate source listener', (f, server, client, portal) => { portal.inbounds.push(structuredClone(server)); }],
+    ['duplicate bridge client', (f, server, client, portal, combined) => { combined.outbounds.push(structuredClone(client)); }],
+    ['foreign source rule', (f, server, client, portal) => {
+        portal.routing.rules.find(row => row.outboundTag === `portal-${TARGET.slice(-8)}`).domain = ['foreign.example'];
+    }],
+    ['duplicate bridge rule', (f, server, client, portal, combined) => {
+        combined.routing.rules.push(structuredClone(combined.routing.rules.find(row => row.outboundTag === client.tag)));
+    }],
+    ['partial bridge rule', (f, server, client, portal, combined) => {
+        combined.routing.rules = combined.routing.rules.filter(row => row.outboundTag !== client.tag);
+    }],
+];
+for (const [name, corrupt] of reverseDecoyCorruptions) {
+    test(`reverse REALITY decoy update refuses ${name} before writes`, async t => {
+        const f = await appliedReality(t); requestDecoyUpdate(f);
+        const portal = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`)), combined = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+        const server = portal.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`);
+        const client = combined.outbounds.find(row => row.tag === `tunnel-${TARGET.slice(-8)}`);
+        corrupt(f, server, client, portal, combined);
+        f.files.set(`${SOURCE}:${MAIN}`, JSON.stringify(portal)); f.files.set(`${BRIDGE}:${TRANSIT}`, JSON.stringify(combined));
+        const before = new Map(f.files), start = f.commands.length, writes = f.writes.length;
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' });
+        assert.equal(f.writes.length, writes);
+        assert.deepEqual(f.files, before);
+        assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+        assert.equal(f.locks.size, 2);
+    });
+}
+
+for (const [field, values] of [
+    ['dest', [null, '', 'old-decoy.example', 'https://old-decoy.example:443', 'old-decoy.example:0',
+        'old-decoy.example:65536', 'bad..example:443', 'old-decoy.example:443/path', 'old-decoy.example:443\n',
+        ['old-decoy.example:443'], '999.2.3.4:443']],
+    ['serverNames', [null, [], 'old-decoy.example', [''], [null], [123], ['bad..example'], ['*.example'],
+        ['old-decoy.example\n'], ['old-decoy.example', 'old-decoy.example']]],
+]) {
+    for (const value of values) {
+        test(`reverse REALITY decoy update refuses malformed old ${field} ${JSON.stringify(value)}`, async t => {
+            const f = await appliedReality(t); requestDecoyUpdate(f);
+            const key = `${SOURCE}:${MAIN}`, config = JSON.parse(f.files.get(key));
+            config.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`).streamSettings.realitySettings[field] = value;
+            f.files.set(key, JSON.stringify(config));
+            const before = new Map(f.files), start = f.commands.length;
+            await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' });
+            assert.deepEqual(f.files, before);
+            assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+        });
+    }
+}
+
 for (const kind of ['outbound', 'hop', 'route']) {
     test(`corrupted old forward ${kind} refuses before writes`, async t => {
         const f = fixture(t); physicalForward(f);
