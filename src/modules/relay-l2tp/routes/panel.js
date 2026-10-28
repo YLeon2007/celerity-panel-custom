@@ -112,6 +112,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['L2TP_USER_REVISION_CONFLICT', 409],
     ['L2TP_NOT_CONFIGURED', 409],
     ['NODE_OPERATION_LOCK_CONFLICT', 409],
+    ['REMOTE_ADMISSION_BLOCKED', 409],
+    ['REMOTE_INSTALL_ALREADY_ACTIVE', 409],
     ['CONFIG_DRIFT', 409],
     ['CONFIG_DRIFT_CONFLICT', 409],
     ['UNPROCESSABLE_ENTITY', 422],
@@ -133,6 +135,14 @@ const ERROR_STATUS_BY_CODE = new Map([
 ]);
 
 const SAFE_ERROR_MESSAGE_BY_CODE = new Map([
+    [
+        'REMOTE_INSTALL_ALREADY_ACTIVE',
+        'A remote install is already active for this relay',
+    ],
+    [
+        'REMOTE_ADMISSION_BLOCKED',
+        'Remote operations are blocked by an active reservation',
+    ],
     [
         'L2TP_USER_STALE_REVISION',
         'The L2TP user changed before this request was applied',

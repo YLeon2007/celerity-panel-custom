@@ -558,6 +558,97 @@ test('structured service error codes map to the documented HTTP statuses', async
     }
 });
 
+test('simple uninstall admission conflicts return fixed safe 409 responses', async () => {
+    const calls = [];
+    const router = createRouter({
+        simpleService: {
+            async uninstallRelay(nodeId) {
+                calls.push(nodeId);
+                throw Object.assign(new Error('password=canary-secret SSH private output'), {
+                    code: 'REMOTE_ADMISSION_BLOCKED',
+                    details: { password: 'canary-secret' },
+                    rawCommand: 'private-command',
+                });
+            },
+        },
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const response = await request(router, {
+        method: 'POST',
+        path: '/l2tp/simple/relays/relay-1/uninstall',
+        body: {},
+    });
+
+    assert.deepEqual(calls, ['relay-1']);
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, {
+        error: {
+            code: 'REMOTE_ADMISSION_BLOCKED',
+            message: 'Remote operations are blocked by an active reservation',
+        },
+    });
+    assert.doesNotMatch(JSON.stringify(response.body), /canary-secret|SSH|private/i);
+});
+
+test('simple install active admission returns a fixed safe 409 response', async () => {
+    const router = createRouter({
+        simpleService: {
+            async installRelay(nodeId) {
+                assert.equal(nodeId, 'relay-1');
+                throw Object.assign(new Error('password=canary-secret SSH private output'), {
+                    code: 'REMOTE_INSTALL_ALREADY_ACTIVE',
+                });
+            },
+        },
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const response = await request(router, {
+        method: 'POST',
+        path: '/l2tp/simple/relays/relay-1/install',
+        body: {},
+    });
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, {
+        error: {
+            code: 'REMOTE_INSTALL_ALREADY_ACTIVE',
+            message: 'A remote install is already active for this relay',
+        },
+    });
+});
+
+test('simple uninstall unknown errors remain opaque 500 responses', async () => {
+    const router = createRouter({
+        simpleService: {
+            async uninstallRelay() {
+                throw Object.assign(new Error('password=canary-secret SSH private output'), {
+                    code: 'UNKNOWN_REMOTE_FAILURE',
+                });
+            },
+        },
+        requireAuth: passThrough,
+        csrf: passThrough,
+        rateLimiter: passThrough,
+    });
+
+    const response = await request(router, {
+        method: 'POST',
+        path: '/l2tp/simple/relays/relay-1/uninstall',
+        body: {},
+    });
+
+    assert.equal(response.status, 500);
+    assert.deepEqual(response.body, {
+        error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
+    });
+});
+
 test('unexpected service errors return an opaque 500 response', async () => {
     const router = createRouter({
         l2tpService: {
