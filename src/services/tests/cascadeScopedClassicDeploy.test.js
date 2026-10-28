@@ -179,8 +179,10 @@ test('migration validates prior plaintext ownership when saved reverse requests 
 
 for (const legacySingle of [false, true]) {
     test(`existing ${legacySingle ? 'single' : 'combined'} bridge without a newer global IPv6 default is preserved`, async t => {
-        const f = fixture(t); physicalForward(f, { legacySingle });
-        const key = `${BRIDGE}:${TRANSIT}`, before = JSON.parse(f.files.get(key));
+        const f = fixture(t); physicalForward(f);
+        const key = `${BRIDGE}:${TRANSIT}`, before = JSON.parse(legacySingle
+            ? generator.generateBridgeConfig(f.baseline, f.baseline.portalNode) : f.files.get(key));
+        assert.equal(before.reverse.bridges[0].tag, legacySingle ? 'bridge' : `bridge-${BASE.slice(-8)}`);
         before.routing.rules = before.routing.rules.filter(row => !row.ip?.includes('::/0'));
         f.files.set(key, JSON.stringify(before));
         assert.equal((await f.run()).success, true);
@@ -189,6 +191,19 @@ for (const legacySingle of [false, true]) {
         assert.equal(after.routing.rules.some(row => row.ip?.includes('::/0')), false);
     });
 }
+
+test('JSON staging with a non-JSON extension explicitly selects the Xray JSON loader', async t => {
+    const f = fixture(t, { fault({ command }) {
+        if (command.includes('run -test') && !command.includes('run -test -format json -config ')) {
+            return { code: 23, stdout: 'Failed to get format of staged config', stderr: '' };
+        }
+    } });
+    physicalForward(f);
+    assert.equal((await f.run()).success, true);
+    const validators = f.commands.filter(row => row.command.includes('run -test'));
+    assert.equal(validators.length, 3);
+    assert.ok(validators.every(row => row.command.includes('run -test -format json -config ') && row.command.includes('.stage')));
+});
 
 for (const missing of ['domain', 'bridge']) {
     test(`shared bridge missing its own ${missing} rule is not grandfathered`, async t => {
@@ -300,7 +315,7 @@ for (const kind of ['duplicate', 'credential', 'unknown-port']) {
 
 test('third profile validation failure cannot restart either earlier profile', async t => {
     const f = fixture(t, { fault({ id, command }) {
-        if (id === BRIDGE && command.includes('run -test -config /usr/local/etc/xray/config.json.')) {
+        if (id === BRIDGE && command.includes('run -test -format json -config /usr/local/etc/xray/config.json.')) {
             return { code: 1, stdout: '', stderr: 'invalid third payload' };
         }
     } });
@@ -646,7 +661,7 @@ test('actual shell migrates three forward profiles then replays without restarti
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const bin = path.join(root, 'bin'); fs.mkdirSync(bin);
     const script = (name, body) => { const file = path.join(bin, name); fs.writeFileSync(file, body, { mode: 0o700 }); return file; };
-    const xray = script('xray', `#!/usr/bin/env node\nconst fs=require('node:fs'); const args=process.argv.slice(2); if(args.slice(0,3).join(' ')!=='run -test -config')process.exit(23); JSON.parse(fs.readFileSync(args[3],'utf8'));\n`);
+    const xray = script('xray', `#!/usr/bin/env node\nconst fs=require('node:fs'); const args=process.argv.slice(2); if(args.slice(0,5).join(' ')!=='run -test -format json -config')process.exit(23); JSON.parse(fs.readFileSync(args[5],'utf8'));\n`);
     const systemctl = script('systemctl', `#!/bin/sh\nset -eu\ncase "$1" in\nshow) if test "$2" = xray; then file=${MAIN}; else file=${TRANSIT}; fi; printf 'ActiveState=active\\nNeedDaemonReload=no\\nExecStart={ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config %s ; }\\n' "$file";;\ncat) printf '# stable local unit\\n';;\nrestart) printf '%s\\n' "$2" >> '${root}/restarts';;\nis-active) test "$2" = --quiet;;\n*) exit 24;;\nesac\n`);
     const ss = script('ss', `#!/bin/sh\nprintf '0 0 192.0.2.1:10096 192.0.2.2:49900\\n'\n`);
     const f = fixture(t, { fault({ id, command, options }) {

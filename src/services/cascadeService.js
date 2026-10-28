@@ -491,7 +491,7 @@ class CascadeService {
             for (const plan of changedPlans) {
                 plan.stage = `${plan.file}.${randomBytes(12).toString('hex')}.stage`;
                 await exec(plan.node, `umask 077\ncat > ${plan.stage}`, plan.bytes);
-                await exec(plan.node, `/usr/local/bin/xray run -test -config ${plan.stage}`);
+                await exec(plan.node, `/usr/local/bin/xray run -test -format json -config ${plan.stage}`);
                 if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
             }
             const port = target.tunnelPort;
