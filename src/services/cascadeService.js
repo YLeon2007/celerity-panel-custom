@@ -100,16 +100,18 @@ function scopedContains(rows, expected) {
     return rows?.some(row => scopedCanonical(row) === scopedCanonical(expected));
 }
 function scopedScopePin(scope) {
-    const linkPin = (link, confirmed) => {
+    const linkPin = link => {
         const pin = { ...link, _id: scopedId(link),
             portalNode: { _id: scopedId(link.portalNode), ip: link.portalNode?.ip },
             bridgeNode: { _id: scopedId(link.bridgeNode), ip: link.bridgeNode?.ip } };
         for (const key of ['lastHealthCheck', 'latencyMs', 'lastError', 'updatedAt', 'createdAt']) delete pin[key];
-        if (confirmed) delete pin.status; // Confirmed membership is checked separately.
+        // readScope validates status membership on every observation. Health is
+        // independently mutable for the target too, not configuration identity.
+        delete pin.status;
         return pin;
     };
-    return scopedCanonical({ target: linkPin(scope.target, false),
-        confirmed: scope.confirmed.map(link => linkPin(link, true)).sort((a, b) => a._id.localeCompare(b._id)) });
+    return scopedCanonical({ target: linkPin(scope.target),
+        confirmed: scope.confirmed.map(link => linkPin(link)).sort((a, b) => a._id.localeCompare(b._id)) });
 }
 function scopedNodePin(node) {
     return scopedCanonical({ _id: scopedId(node), ip: node?.ip, active: node?.active,
@@ -504,7 +506,7 @@ class CascadeService {
             }, { maxTimeMS: 5000 });
             if (updated?.acknowledged !== true || updated.matchedCount !== 1) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
             const saved = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
-            if (saved?.status !== 'deployed' || saved.active !== true || scopedId(saved.portalNode) !== scopedId(source)
+            if (!['deployed', 'online', 'offline'].includes(saved?.status) || saved.active !== true || scopedId(saved.portalNode) !== scopedId(source)
                 || scopedId(saved.bridgeNode) !== scopedId(bridge)) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
             await revision();
             return { success: true, remoteQuiescent: true, receipt: {

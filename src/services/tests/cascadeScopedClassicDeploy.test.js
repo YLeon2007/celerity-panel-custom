@@ -78,7 +78,8 @@ function fixture(t, options = {}) {
                 && (!filter.$or || filter.$or.some(term => term._id === row._id || term.status?.$in.includes(row.status)))));
         },
         async updateOne(filter, update) { const row = links.find(row => row._id === String(filter._id));
-            assert.ok(row); Object.assign(row, update.$set); return { acknowledged: true, matchedCount: 1 }; },
+            assert.ok(row); Object.assign(row, update.$set); options.afterStatusUpdate?.(row);
+            return { acknowledged: true, matchedCount: 1 }; },
     };
     class SSH {
         constructor(node) { this.node = node; }
@@ -305,6 +306,63 @@ test('ordinary confirmed-link health and node monitor updates do not change admi
     assert.equal((await f.run()).remoteQuiescent, true);
     assert.equal(f.baseline.status, 'deployed');
 });
+
+for (const replay of [false, true]) {
+    for (const phase of ['before-first-mutation', 'after-tunnel-confirmation']) {
+        for (const health of ['online', 'offline']) {
+            test(`target ${health} health update ${phase} permits ${replay ? 'replay' : 'migration'}`, async t => {
+                let enabled = false, changed = false, f;
+                f = fixture(t, { fault({ command }) {
+                    if (!enabled || changed || !command.includes(phase === 'before-first-mutation' ? 'C3_READ_CONFIG' : 'ss -tnH')) return;
+                    changed = true;
+                    f.target.status = health; f.target.lastHealthCheck = new Date(); f.target.lastError = 'monitor-only';
+                } });
+                physicalForward(f);
+                if (replay) await f.run();
+                const start = f.commands.length;
+                enabled = true;
+                const result = await f.run();
+                assert.equal(changed, true);
+                assert.equal(result.success, true);
+                assert.equal(f.locks.size, 0);
+                assert.equal(f.target.status, 'deployed');
+                if (replay) assert.equal(f.commands.slice(start).some(row => /cat >|mv --|ufw allow|run -test/.test(row.command)), false);
+            });
+        }
+    }
+}
+
+for (const health of ['online', 'offline']) {
+    test(`target ${health} health update after acknowledged publication permits completion`, async t => {
+        const f = fixture(t, { afterStatusUpdate(row) { row.status = health; } });
+        assert.equal((await f.run()).success, true);
+        assert.equal(f.target.status, health);
+        assert.equal(f.locks.size, 0);
+    });
+}
+
+test('unconfirmed pending status after publication is not accepted as a health update', async t => {
+    const f = fixture(t, { afterStatusUpdate(row) { row.status = 'pending'; } });
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_STATUS_UNCONFIRMED' });
+    assert.equal(f.locks.size, 2);
+});
+
+for (const change of ['tunnelPort', 'revision']) {
+    test(`target health transition does not hide real ${change} drift after restart`, async t => {
+        let changed = false, f;
+        f = fixture(t, { fault({ command }) {
+            if (changed || !command.includes('ss -tnH')) return;
+            changed = true; f.target.status = 'online';
+            if (change === 'tunnelPort') f.target.tunnelPort++;
+            else f.state.revision++;
+        } });
+        physicalForward(f);
+        await assert.rejects(f.run());
+        assert.equal(changed, true);
+        assert.equal(f.locks.size, 2);
+        assert.equal(f.events.some(row => row[0] === 'release'), false);
+    });
+}
 
 test('preserves legacy single-bridge tags while adding the new combined tunnel', async t => {
     const f = fixture(t);
