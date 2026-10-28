@@ -28,6 +28,16 @@ const LINK_DISABLED_DEPLOYED = '507f1f77bcf86cd799439044';
 const LINK_FOREIGN_DEPLOYED = '507f1f77bcf86cd799439045';
 const LINK_STAGED_FIRST_HOP = '507f1f77bcf86cd799439046';
 const LINK_EDITED = '507f1f77bcf86cd799439047';
+const CLASSIC_ENV = Object.freeze({
+    PANEL_DOMAIN: 'lm1.infograd.online',
+    L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
+    L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: LINK_DEPLOYED_PORTAL_TO_RELAY,
+    TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false',
+    TOPOLOGY_TEST_EXECUTION_ENABLED: 'false',
+});
 
 function queryResult(result) {
     return {
@@ -132,6 +142,7 @@ function createAutoDeployHarness({
     prepareL2tpIngressFn,
     editedLink,
     updateError,
+    deploymentEnv = {},
 } = {}) {
     const calls = { queue: [] };
     let storedLinks = links.map(link => ({ ...link }));
@@ -183,6 +194,7 @@ function createAutoDeployHarness({
         })),
         invalidateSubscriptions: async () => {},
         invalidateTopology: async () => {},
+        deploymentEnv,
         topologyCoordinator: resolvedCoordinator,
     });
     return { calls, router };
@@ -245,12 +257,15 @@ test('POST classic autoDeploy persists then uses the fenced create-and-apply pat
     const calls = [];
     const { router } = createAutoDeployHarness({
         coordinator: {
+            beginCreatedLinkCapability() { return { token: 'test-capability' }; },
+            confirmCreatedLinkCapability(capability) { return capability; },
             async queue() { throw new Error('public queue must not be selected'); },
             async queueCreatedLink(input) {
                 calls.push(input);
                 return { status: 'succeeded', executionMode: 'classic', topologyRevision: input.expectedTopologyRevision };
             },
         },
+        deploymentEnv: CLASSIC_ENV,
     });
     const response = await request(router, { method: 'POST', body: createBody({ autoDeploy: true }) });
     assert.equal(response.status, 201);
@@ -260,6 +275,17 @@ test('POST classic autoDeploy persists then uses the fenced create-and-apply pat
         { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 });
     assert.equal(response.body.autoDeployOperation, undefined);
     assert.equal(response.body.autoDeployStatus, undefined);
+});
+
+test('POST classic autoDeploy refuses forward mode before persisting a draft', async () => {
+    const { calls, router } = createAutoDeployHarness({ deploymentEnv: CLASSIC_ENV });
+    const response = await request(router, {
+        method: 'POST',
+        body: createBody({ mode: 'forward', autoDeploy: true }),
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, 'CLASSIC_DEPLOY_UNSUPPORTED');
+    assert.equal(calls.createLink, undefined);
 });
 
 test('baseline selection treats a persisted staged link as physically applied, never pending', () => {

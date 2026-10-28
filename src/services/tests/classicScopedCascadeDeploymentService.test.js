@@ -137,9 +137,26 @@ test('checked scoped completion returns synchronous classic result without IDs o
 
 test('internal create-and-apply path permits only the newly persisted pending target without allowlisting', async () => {
     const h = harness({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: FOREIGN } });
-    const result = await h.service.queueCreatedLink(input());
+    const capability = h.service.beginCreatedLinkCapability({ linkId: LINK });
+    h.service.confirmCreatedLinkCapability(capability, { linkId: LINK, expectedTopologyRevision: 7 });
+    const result = await h.service.queueCreatedLink(input(), capability);
     assert.deepEqual(result, { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 });
     assert.equal(h.calls.remote.length, 1);
+});
+
+test('creation capability is one-use and requires confirmation plus exact pending status', async () => {
+    const h = harness({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: FOREIGN } });
+    const capability = h.service.beginCreatedLinkCapability({ linkId: LINK });
+    await assert.rejects(h.service.queueCreatedLink(input(), capability), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
+    h.service.confirmCreatedLinkCapability(capability, { linkId: LINK, expectedTopologyRevision: 7 });
+    await h.service.queueCreatedLink(input(), capability);
+    await assert.rejects(h.service.queueCreatedLink(input(), capability), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
+
+    const errored = harness({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: FOREIGN } });
+    errored.rows.CascadeLink[0].status = 'error';
+    const errorCapability = errored.service.beginCreatedLinkCapability({ linkId: LINK });
+    errored.service.confirmCreatedLinkCapability(errorCapability, { linkId: LINK, expectedTopologyRevision: 7 });
+    await assert.rejects(errored.service.queueCreatedLink(input(), errorCapability), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
 });
 
 test('forward confirmed baseline is refused before dispatch', async () => {

@@ -369,10 +369,11 @@ function createCascadeLinksRouter({
         }
         return { revision: input.expectedTopologyRevision };
     },
+    deploymentEnv = process.env,
     topologyCoordinator,
     createTopologyCoordinator = () => require('../modules/relay-l2tp')
         .createTopologyDeploymentService({
-            env: process.env,
+            env: deploymentEnv,
             HyNode: Node,
             CascadeLink: Link,
             CascadeRouteGroup: RouteGroup,
@@ -386,7 +387,7 @@ function createCascadeLinksRouter({
         }),
     classicTopologyCoordinator,
     createClassicTopologyCoordinator = () => createClassicScopedCascadeDeploymentService({
-        env: process.env,
+        env: deploymentEnv,
         HyNode: Node,
         CascadeLink: Link,
         CascadeRouteGroup: RouteGroup,
@@ -426,7 +427,7 @@ function createCascadeLinksRouter({
     // construct (or start) the topology runtime.
     const getTopologyCoordinator = () => {
         if (!coordinator) {
-            if (isClassicProductionDeploymentEnabled(process.env)) {
+            if (isClassicProductionDeploymentEnabled(deploymentEnv)) {
                 coordinator = classicTopologyCoordinator || createClassicTopologyCoordinator();
             } else {
                 coordinator = createTopologyCoordinator();
@@ -439,7 +440,7 @@ function createCascadeLinksRouter({
     // have settled, pinning the post-maintenance revision. The result is
     // truthful: an operation id with its real queued status, or a blocked
     // reason — never a readiness claim.
-    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action, linkCreated = false }) => {
+    const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action, linkCreated = false, creationCapability }) => {
         const linkId = String(link._id);
         try {
             const scopedCoordinator = await getTopologyCoordinator();
@@ -454,14 +455,23 @@ function createCascadeLinksRouter({
             const queueMethod = linkCreated && typeof scopedCoordinator.queueCreatedLink === 'function'
                 ? scopedCoordinator.queueCreatedLink
                 : scopedCoordinator.queue;
-            const result = await queueMethod({
-                expectedTopologyRevision: revision,
-                scope: {
-                    kind: 'link.apply',
-                    linkId,
-                    linkIds: [linkId, ...baselineLinkIds],
-                },
-            });
+            const result = linkCreated
+                ? await queueMethod({
+                    expectedTopologyRevision: revision,
+                    scope: {
+                        kind: 'link.apply',
+                        linkId,
+                        linkIds: [linkId, ...baselineLinkIds],
+                    },
+                }, creationCapability)
+                : await queueMethod({
+                    expectedTopologyRevision: revision,
+                    scope: {
+                        kind: 'link.apply',
+                        linkId,
+                        linkIds: [linkId, ...baselineLinkIds],
+                    },
+                });
             if (isCompletedClassicDeploymentResult(result, revision)) {
                 // Synchronous checked completion, not a queued native operation.
                 return { autoDeployResult: { status: 'succeeded', executionMode: 'classic', topologyRevision: revision } };
@@ -726,7 +736,25 @@ function createCascadeLinksRouter({
                         : [],
                 };
             }
-            if (link.autoDeploy === true && isClassicProductionDeploymentEnabled(process.env)) {
+            if (link.autoDeploy === true && isClassicProductionDeploymentEnabled(deploymentEnv)) {
+                if (linkMode !== 'reverse') {
+                    throw new RequestValidationError(
+                        'Classic auto-deploy supports reverse links only',
+                        undefined,
+                        'CLASSIC_DEPLOY_UNSUPPORTED',
+                    );
+                }
+                const classicCoordinator = getTopologyCoordinator();
+                if (typeof classicCoordinator?.beginCreatedLinkCapability !== 'function'
+                    || typeof classicCoordinator?.confirmCreatedLinkCapability !== 'function'
+                    || typeof classicCoordinator?.queueCreatedLink !== 'function') {
+                    throw Object.assign(new Error('Classic deployment capabilities are unavailable'), {
+                        code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+                    });
+                }
+                const creationCapability = classicCoordinator.beginCreatedLinkCapability({
+                    linkId: String(link._id),
+                });
                 // Classic has no durable native intent worker. Persist the draft,
                 // then run the same fenced, completion-checked scoped apply used by
                 // the manual Deploy action; never return a synthetic 202 job.
@@ -738,6 +766,10 @@ function createCascadeLinksRouter({
                 const maintenance = await maintainL2tpPaths();
                 const finalRevisions = Number.isSafeInteger(maintenance?.revision)
                     ? { ...revisions, revision: maintenance.revision } : revisions;
+                classicCoordinator.confirmCreatedLinkCapability(creationCapability, {
+                    linkId: String(link._id),
+                    expectedTopologyRevision: finalRevisions.revision,
+                });
                 const snapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
                 const created = snapshot.links.find(candidate => String(candidate._id) === String(link._id));
                 const autoDeploy = await queueAutoDeploy({
@@ -748,6 +780,7 @@ function createCascadeLinksRouter({
                     revision: finalRevisions.revision,
                     links: snapshot.links,
                     linkCreated: true,
+                    creationCapability,
                 });
                 await invalidateCaches();
                 const finalSnapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });

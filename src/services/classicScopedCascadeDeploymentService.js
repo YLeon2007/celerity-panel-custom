@@ -130,6 +130,40 @@ function baselineIds(links, selected) {
 
 function createClassicScopedCascadeDeploymentService(dependencies = {}) {
     const env = Object.freeze({ ...(dependencies.env ?? process.env) });
+    const creationCapabilities = new Map();
+    const CAPABILITY_TTL_MS = 5 * 60 * 1000;
+    const purgeCreationCapabilities = () => {
+        const now = Date.now();
+        for (const [token, record] of creationCapabilities) {
+            if (record.expiresAt <= now) creationCapabilities.delete(token);
+        }
+    };
+    const capabilityToken = capability => typeof capability?.token === 'string'
+        && /^[0-9a-f-]{36}$/.test(capability.token) ? capability.token : null;
+    function beginCreatedLinkCapability({ linkId } = {}) {
+        purgeCreationCapabilities();
+        if (!validId(linkId)) throw failure('INVALID_REQUEST');
+        const token = randomUUID();
+        creationCapabilities.set(token, {
+            linkId,
+            expectedTopologyRevision: null,
+            confirmed: false,
+            expiresAt: Date.now() + CAPABILITY_TTL_MS,
+        });
+        return Object.freeze({ token });
+    }
+    function confirmCreatedLinkCapability(capability, { linkId, expectedTopologyRevision } = {}) {
+        purgeCreationCapabilities();
+        const token = capabilityToken(capability);
+        const record = token && creationCapabilities.get(token);
+        if (!record || record.confirmed || record.linkId !== linkId
+            || !Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) {
+            throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+        }
+        record.expectedTopologyRevision = expectedTopologyRevision;
+        record.confirmed = true;
+        return capability;
+    }
     // Resolve lazily: selecting the mode must not construct native workers, SSH,
     // optional models or index/collection DDL during dormant router import.
     function resolve() {
@@ -150,7 +184,8 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         return { ...models, connection };
     }
 
-    async function queue(input, { allowUnlistedPending = false } = {}) {
+    async function runQueue(input, { creationCapability = null } = {}) {
+        const allowUnlistedPending = creationCapability !== null;
         if (!isClassicProductionDeploymentEnabled(env)) throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
         if (!input || typeof input !== 'object' || Array.isArray(input)
             || Object.keys(input).some(key => !['expectedTopologyRevision', 'scope'].includes(key))
@@ -228,7 +263,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             }
             const selected = links.find(link => entityId(link._id) === linkId);
             if (!selected || selected.active !== true || selected.mode !== 'reverse') throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-            if (allowUnlistedPending && !['pending', 'error'].includes(selected.status)) {
+            if (allowUnlistedPending && selected.status !== 'pending') {
                 throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             }
             const baselineLinkIds = baselineIds(links, selected);
@@ -272,8 +307,25 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN');
         }
     }
+    const queue = input => runQueue(input);
+    const queueCreatedLink = async (input, capability) => {
+        purgeCreationCapabilities();
+        const token = capabilityToken(capability);
+        const record = token && creationCapabilities.get(token);
+        const linkId = input?.scope?.linkId;
+        if (!record || !record.confirmed || record.linkId !== linkId
+            || input?.expectedTopologyRevision !== record.expectedTopologyRevision) {
+            throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+        }
+        // Consume before any await: a retry or concurrent caller cannot dispatch
+        // the same newly-created link twice with one creation receipt.
+        creationCapabilities.delete(token);
+        return runQueue(input, { creationCapability: record });
+    };
     return Object.freeze({
         queue,
+        beginCreatedLinkCapability,
+        confirmCreatedLinkCapability,
         // This service positively enforces absent L2TP/unused retained groups
         // under its fence; it must never prepare ingress or mutate route groups.
         get requiresL2tpIngressPreparation() { return false; },
@@ -285,7 +337,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         // Internal create-and-apply path: the caller must have just persisted
         // the pending link in the same request. Public Deploy remains fenced by
         // CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS.
-        queueCreatedLink: input => queue(input, { allowUnlistedPending: true }),
+        queueCreatedLink,
         async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); },
     });
 }
