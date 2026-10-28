@@ -167,6 +167,33 @@ test('actual forward migration retires only exact owned fragments across three s
     for (const row of oldCombined.routing.rules) assert.ok(combined.routing.rules.some(item => JSON.stringify(item) === JSON.stringify(row)));
 });
 
+test('existing DNS source endpoint is preserved verbatim through SSH and generated reverse config', async t => {
+    const f = fixture(t); f.nodes[SOURCE].ip = 'test.infograd.online'; physicalForward(f);
+    const result = await f.run();
+    assert.equal(result.success, true);
+    assert.equal(f.nodes[SOURCE].ip, 'test.infograd.online');
+    const bridge = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+    const tunnel = bridge.outbounds.find(row => row.tag === `tunnel-${TARGET.slice(-8)}`);
+    assert.equal(tunnel.settings.vnext[0].address, 'test.infograd.online');
+    assert.equal(f.commands.filter(row => row.command.includes('ss -tnH')).every(row => row.command.includes('dst 192.0.2.2')), true);
+    assert.equal(f.locks.size, 0);
+});
+
+for (const host of ['bad.example;false', 'bad.example\nfalse', '-bad.example', 'bad-.example', 'a'.repeat(64) + '.example', '999.2.3.4', 'bad..example']) {
+    test(`invalid source host ${JSON.stringify(host)} refuses before SSH`, async t => {
+        const f = fixture(t); f.nodes[SOURCE].ip = host;
+        await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
+        assert.equal(f.events.some(row => row[0] === 'connect'), false);
+        assert.equal(f.writes.length, 0);
+    });
+}
+
+test('DNS bridge endpoint is not interpolated into the literal-IP socket proof', async t => {
+    const f = fixture(t); f.nodes[BRIDGE].ip = 'bridge.example';
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
+    assert.equal(f.events.some(row => row[0] === 'connect'), false);
+});
+
 test('matching reverse replay including pending same-link PUT performs no remote mutations', async t => {
     const f = fixture(t); physicalForward(f);
     await f.run();

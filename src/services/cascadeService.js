@@ -113,6 +113,16 @@ function scopedScopePin(scope) {
     return scopedCanonical({ target: linkPin(scope.target),
         confirmed: scope.confirmed.map(link => linkPin(link)).sort((a, b) => a._id.localeCompare(b._id)) });
 }
+function scopedSourceHost(value) {
+    if (typeof value !== 'string') return false;
+    if (net.isIP(value)) return true;
+    // Existing panel nodes support DNS SSH endpoints. Preserve the stored
+    // source name in SSH/JSON; only the bridge enters the shell socket filter.
+    const labels = value.split('.');
+    return value.length <= 253 && labels.length > 1
+        && /[A-Za-z]/.test(labels.at(-1))
+        && labels.every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
+}
 function scopedNodePin(node) {
     return scopedCanonical({ _id: scopedId(node), ip: node?.ip, active: node?.active,
         type: node?.type, cascadeRole: node?.cascadeRole, ssh: node?.ssh,
@@ -124,7 +134,7 @@ class CascadeService {
      * Completion-checked classic no-upstream Relay -> terminal Bridge only.
      * Caller MUST hold the nonexpiring topology reservation at this exact
      * revision and retain it on every throw. baselineLinkIds is the complete
-     * active APPLIED connected-component baseline; touching offline edges refuse.
+     * active APPLIED/offline connected-component preservation baseline.
      * This entry never acquires topology adoption or native operation identity.
      */
     async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
@@ -234,7 +244,7 @@ class CascadeService {
         const source = await HyNode.findById(scopedId(scope.target.portalNode)).setOptions({ maxTimeMS: 5000 }).lean();
         const bridge = await HyNode.findById(scopedId(scope.target.bridgeNode)).setOptions({ maxTimeMS: 5000 }).lean();
         if (source?.type !== 'xray' || source?.cascadeRole !== 'relay' || source.active !== true
-            || !bridge || bridge.active !== true || !net.isIP(source.ip || '') || !net.isIP(bridge.ip || '')
+            || !bridge || bridge.active !== true || !scopedSourceHost(source.ip) || !net.isIP(bridge.ip || '')
             || [source, bridge].some(node => !node.ssh?.password && !node.ssh?.privateKey)) {
             throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED');
         }
