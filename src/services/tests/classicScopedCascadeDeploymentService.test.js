@@ -100,6 +100,18 @@ function harness(overrides = {}) {
 const input = (linkIds = [LINK]) => ({ expectedTopologyRevision: 7,
     scope: { kind: 'link.apply', linkId: LINK, linkIds } });
 
+test('classic ingress capability is explicit and construction/access resolves no dependencies', () => {
+    const service = createClassicScopedCascadeDeploymentService(new Proxy({ env: {} }, {
+        get(target, key) {
+            assert.equal(key, 'env', 'constructor and capability must not resolve models or services');
+            return target[key];
+        },
+    }));
+    assert.equal(service.requiresL2tpIngressPreparation, false);
+    assert.equal(Object.isFrozen(service), true);
+    assert.equal(typeof Object.getOwnPropertyDescriptor(service, 'requiresL2tpIngressPreparation').get, 'function');
+});
+
 test('classic baseline selector preserves connected offline links without activating unrelated pending links', async () => {
     const h = harness({ links: [{ _id: NEIGHBOR, portalNode: C, bridgeNode: B,
         active: true, status: 'offline', mode: 'reverse' },
@@ -190,6 +202,7 @@ test('fresh installed/installing/desired L2TP state and enabled route paths bloc
     ];
     for (const overrides of cases) {
         const h = harness(overrides);
+        assert.equal(h.service.requiresL2tpIngressPreparation, false);
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_IN_USE' });
         assert.equal(h.calls.remote.length, 0); assert.ok(h.state().replacementReservation);
     }

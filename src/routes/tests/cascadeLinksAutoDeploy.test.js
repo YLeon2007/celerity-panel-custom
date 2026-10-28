@@ -315,6 +315,75 @@ test('PUT prepares L2TP ingress before freezing the explicit autoDeploy operatio
     assert.deepEqual(order, ['prepare', 'queue']);
 });
 
+test('PUT trusted classic capability skips native ingress for online and changed pending links', async () => {
+    for (const [status, changes, maintenanceRevision, revision] of [
+        ['online', {}, null, 8],
+        ['pending', { tunnelPort: 10088 }, 9, 9],
+    ]) {
+        let preparations = 0;
+        const queued = [];
+        const classic = require('../../services/classicScopedCascadeDeploymentService')
+            .createClassicScopedCascadeDeploymentService({ env: {} });
+        const { calls, router } = createAutoDeployHarness({
+            editedLink: editedLink({ status }), maintenanceRevision,
+            prepareL2tpIngressFn: async () => {
+                preparations++;
+                throw Object.assign(new Error('native pending-only ingress must not mutate groups'),
+                    { code: 'SIMPLE_TOPOLOGY_CONFLICT' });
+            },
+            coordinator: {
+                requiresL2tpIngressPreparation: false,
+                selectBaselineLinkIds: classic.selectBaselineLinkIds,
+                async queue(input) {
+                    queued.push(input);
+                    return { status: 'succeeded', executionMode: 'classic', topologyRevision: revision };
+                },
+            },
+        });
+        const response = await putEdit(router, { expectedTopologyRevision: 8, autoDeploy: true, ...changes });
+        assert.equal(response.status, 200);
+        assert.equal(preparations, 0);
+        assert.deepEqual(calls.updateLink.changes, { autoDeploy: true, ...changes });
+        assert.deepEqual(queued, [{ expectedTopologyRevision: revision, scope: {
+            kind: 'link.apply', linkId: LINK_EDITED,
+            linkIds: [LINK_EDITED, LINK_DEPLOYED_PORTAL_TO_RELAY, LINK_ONLINE_RELAY_TO_RELAY],
+        } }]);
+        assert.equal(response.body.topologyRevision, revision);
+        assert.deepEqual(response.body.autoDeployResult,
+            { status: 'succeeded', executionMode: 'classic', topologyRevision: revision });
+        assert.equal(response.body.autoDeployOperation, undefined);
+        assert.equal(response.body.autoDeployStatus, undefined);
+        assert.equal(response.body.deployedRevision, 5);
+    }
+});
+
+test('PUT only literal trusted false skips ingress; native preparation refusal never queues', async () => {
+    for (const capability of [undefined, true, null, 0, 'false']) {
+        let preparations = 0;
+        let queues = 0;
+        const { router } = createAutoDeployHarness({ editedLink: editedLink({ status: 'online' }),
+            coordinator: { requiresL2tpIngressPreparation: capability,
+                async queue() { queues++; } },
+            prepareL2tpIngressFn: async ({ expectedTopologyRevision, link }) => {
+                preparations++;
+                assert.equal(expectedTopologyRevision, 9);
+                assert.equal(link.status, 'online');
+                throw Object.assign(new Error('pending required password=secret'),
+                    { code: 'SIMPLE_TOPOLOGY_CONFLICT' });
+            },
+        });
+        const response = await putEdit(router, { expectedTopologyRevision: 8, autoDeploy: true,
+            requiresL2tpIngressPreparation: false });
+        assert.equal(response.status, 200);
+        assert.equal(preparations, 1);
+        assert.equal(queues, 0);
+        assert.equal(response.body.autoDeployStatus, 'blocked');
+        assert.equal(response.body.autoDeployError.code, 'TOPOLOGY_OPERATION_QUEUE_FAILED');
+        assert.equal(response.body.autoDeployResult, undefined);
+        assert.doesNotMatch(JSON.stringify(response.body), /password|secret/);
+    }
+});
+
 test('PUT explicit autoDeploy true queues only the edited enabled link and confirmed baseline after maintenance', async () => {
     const { calls, router } = createAutoDeployHarness({ editedLink: editedLink() });
     const response = await putEdit(router, editBody({ autoDeploy: true }));

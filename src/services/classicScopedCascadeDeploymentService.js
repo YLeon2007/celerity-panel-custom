@@ -270,6 +270,9 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         }
     }
     return Object.freeze({ queue,
+        // This service positively enforces absent L2TP/unused retained groups
+        // under its fence; it must never prepare ingress or mutate route groups.
+        get requiresL2tpIngressPreparation() { return false; },
         selectBaselineLinkIds({ links, linkId }) {
             const selected = links.find(link => entityId(link._id) === entityId(linkId));
             if (!selected) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');

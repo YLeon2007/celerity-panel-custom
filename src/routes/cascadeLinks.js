@@ -914,35 +914,40 @@ function createCascadeLinksRouter({
                     let preparationError = maintenanceError;
                     if (!preparationError) {
                         try {
-                        const baselineLinkIds = selectLinkApplyBaselineLinkIds({
-                            links: snapshot.links,
-                            linkId: link._id,
-                            portalNodeId: link.portalNode,
-                            bridgeNodeId: link.bridgeNode,
-                        });
-                        const prepared = await prepareL2tpIngressFn({
-                            link,
-                            linkId: String(link._id),
-                            linkIds: [String(link._id), ...baselineLinkIds],
-                            expectedTopologyRevision: finalRevisions.revision,
-                        });
-                        if (!Number.isSafeInteger(prepared?.revision)
-                            || prepared.revision < finalRevisions.revision) {
-                            const error = new Error('L2TP ingress preparation returned no exact revision');
-                            error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
-                            throw error;
+                            const scopedCoordinator = await getTopologyCoordinator();
+                            // Only a trusted server-selected service can omit the
+                            // native hook. Its queue retains all admission checks.
+                            if (scopedCoordinator?.requiresL2tpIngressPreparation !== false) {
+                                const baselineLinkIds = selectLinkApplyBaselineLinkIds({
+                                    links: snapshot.links,
+                                    linkId: link._id,
+                                    portalNodeId: link.portalNode,
+                                    bridgeNodeId: link.bridgeNode,
+                                });
+                                const prepared = await prepareL2tpIngressFn({
+                                    link,
+                                    linkId: String(link._id),
+                                    linkIds: [String(link._id), ...baselineLinkIds],
+                                    expectedTopologyRevision: finalRevisions.revision,
+                                });
+                                if (!Number.isSafeInteger(prepared?.revision)
+                                    || prepared.revision < finalRevisions.revision) {
+                                    const error = new Error('L2TP ingress preparation returned no exact revision');
+                                    error.code = 'TOPOLOGY_OPERATION_QUEUE_FAILED';
+                                    throw error;
+                                }
+                                if (prepared.revision !== finalRevisions.revision) {
+                                    finalRevisions = { ...finalRevisions, revision: prepared.revision };
+                                    snapshot = { ...snapshot, topologyRevision: prepared.revision };
+                                    body = { ...body, topologyRevision: prepared.revision };
+                                }
+                            }
+                        } catch (error) {
+                            preparationError = error;
+                            logTopologyTestFailure({ action: 'link.update', phase: 'ingress.prepare',
+                                revision: finalRevisions.revision, linkId: req.params.id, error });
+                            logger.warn(`[Cascade Links API] L2TP ingress preparation blocked: ${error.code || 'UNKNOWN'}`);
                         }
-                        if (prepared.revision !== finalRevisions.revision) {
-                            finalRevisions = { ...finalRevisions, revision: prepared.revision };
-                            snapshot = { ...snapshot, topologyRevision: prepared.revision };
-                            body = { ...body, topologyRevision: prepared.revision };
-                        }
-                    } catch (error) {
-                        preparationError = error;
-                        logTopologyTestFailure({ action: 'link.update', phase: 'ingress.prepare',
-                            revision: finalRevisions.revision, linkId: req.params.id, error });
-                        logger.warn(`[Cascade Links API] L2TP ingress preparation blocked: ${error.code || 'UNKNOWN'}`);
-                    }
                     }
                     if (preparationError) {
                         Object.assign(body, {
