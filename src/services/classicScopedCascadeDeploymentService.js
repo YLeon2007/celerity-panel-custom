@@ -3,7 +3,8 @@
 const { randomUUID } = require('node:crypto');
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const ID = /^[0-9a-f]{24}$/i;
-const APPLIED = new Set(['deployed', 'online', 'staged']);
+// Health-offline is not evidence that an established physical tunnel is absent.
+const APPLIED = new Set(['deployed', 'online', 'staged', 'offline']);
 const READ = Object.freeze({ readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 });
 const MESSAGES = Object.freeze({
     CLASSIC_DEPLOY_UNSUPPORTED: 'Classic deployment supports only an existing active reverse link.apply',
@@ -268,7 +269,13 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN');
         }
     }
-    return Object.freeze({ queue, async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); } });
+    return Object.freeze({ queue,
+        selectBaselineLinkIds({ links, linkId }) {
+            const selected = links.find(link => entityId(link._id) === entityId(linkId));
+            if (!selected) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+            return baselineIds(links, selected);
+        },
+        async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); } });
 }
 
 function isCompletedClassicDeploymentResult(result, revision) {

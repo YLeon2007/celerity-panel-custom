@@ -379,7 +379,9 @@ function createCascadeTopologyDeployRouter({
                             'The chosen domain link is not confirmed applied',
                         );
                     }
-                    const baseline = selectLinkApplyBaselineLinkIds({
+                    const selectBaseline = typeof deploymentService.selectBaselineLinkIds === 'function'
+                        ? deploymentService.selectBaselineLinkIds : selectLinkApplyBaselineLinkIds;
+                    const baseline = selectBaseline({
                         links,
                         linkId,
                         portalNodeId: selected.portalNode,

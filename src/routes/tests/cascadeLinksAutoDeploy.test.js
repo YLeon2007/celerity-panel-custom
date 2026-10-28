@@ -419,6 +419,21 @@ test('PUT queue errors remain blocked with safe codes and preserve the edited sn
     assert.doesNotMatch(JSON.stringify(response.body), /secret-value|CREDENTIAL_SECRET/);
 });
 
+test('PUT classic auto-deploy uses the preservation selector for offline neighbors', async () => {
+    const neighbor = { _id: LINK_ONLINE_RELAY_TO_RELAY, portalNode: nodeRef(PORTAL_A),
+        bridgeNode: nodeRef(BRIDGE_A), active: true, status: 'offline' };
+    const classic = require('../../services/classicScopedCascadeDeploymentService')
+        .createClassicScopedCascadeDeploymentService({ env: {} });
+    let queued;
+    const { router } = createAutoDeployHarness({ links: [neighbor], editedLink: editedLink(),
+        coordinator: { selectBaselineLinkIds: classic.selectBaselineLinkIds,
+            async queue(input) { queued = input; return { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 }; } } });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.deepEqual(queued.scope.linkIds, [LINK_EDITED, LINK_ONLINE_RELAY_TO_RELAY]);
+    assert.equal(response.body.autoDeployResult.status, 'succeeded');
+});
+
 test('PUT exact completed classic result has its own truthful contract without operation/job IDs', async () => {
     const { router } = createAutoDeployHarness({ editedLink: editedLink(),
         coordinator: { async queue() { return { status: 'succeeded', executionMode: 'classic', topologyRevision: 9 }; } } });

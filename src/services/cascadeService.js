@@ -76,6 +76,7 @@ ${command}
 
 const SCOPED_MAIN = '/usr/local/etc/xray/config.json';
 const SCOPED_BRIDGE = '/usr/local/etc/xray-bridge/config.json';
+const SCOPED_PRESERVED_STATUSES = Object.freeze([...APPLIED_LINK_STATUSES, 'offline']);
 const scopedFailure = code => Object.assign(new Error(code), { code });
 const scopedHash = text => createHash('sha256').update(text).digest('hex');
 const scopedId = value => String(value?._id || value);
@@ -194,24 +195,20 @@ class CascadeService {
             while (grew) {
                 grew = false;
                 for (const row of rows) {
-                    if (scopedId(row) === linkId || row.active !== true || !APPLIED_LINK_STATUSES.includes(row.status)) continue;
+                    if (scopedId(row) === linkId || row.active !== true || !SCOPED_PRESERVED_STATUSES.includes(row.status)) continue;
                     const endpoints = [scopedId(row.portalNode), scopedId(row.bridgeNode)];
                     if (!endpoints.some(id => visited.has(id))) continue;
                     selected.add(scopedId(row));
                     for (const id of endpoints) if (!visited.has(id)) { visited.add(id); grew = true; }
                 }
             }
-            if (rows.some(row => scopedId(row) !== linkId && row.status === 'offline'
-                && [scopedId(row.portalNode), scopedId(row.bridgeNode)].some(id => visited.has(id)))) {
-                throw scopedFailure('CLASSIC_SCOPED_OFFLINE_DEPENDENCY_UNSUPPORTED');
-            }
             const confirmed = rows.filter(row => selected.has(scopedId(row)));
             if (!target || target.active !== true || (target.mode || 'reverse') !== 'reverse'
-                || !['pending', 'error', ...APPLIED_LINK_STATUSES].includes(target.status)
+                || !['pending', 'error', ...SCOPED_PRESERVED_STATUSES].includes(target.status)
                 || !Number.isSafeInteger(target.tunnelPort) || target.tunnelPort < 1 || target.tunnelPort > 65535
                 || typeof target.tunnelUuid !== 'string' || !target.tunnelUuid) throw scopedFailure('CLASSIC_SCOPED_TARGET_INVALID');
             if (confirmed.some(row => row.active !== true || typeof row.status !== 'string'
-                || !APPLIED_LINK_STATUSES.includes(row.status))) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
+                || !SCOPED_PRESERVED_STATUSES.includes(row.status))) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
             const actual = confirmed.map(scopedId).sort();
             if (scopedCanonical(actual) !== scopedCanonical(baseline)) throw scopedFailure('CLASSIC_SCOPED_BASELINE_CONFLICT');
             const endpoints = [scopedId(target.portalNode), scopedId(target.bridgeNode)].sort();

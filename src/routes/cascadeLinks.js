@@ -422,14 +422,11 @@ function createCascadeLinksRouter({
     // reason — never a readiness claim.
     const queueAutoDeploy = async ({ link, portalNodeId, bridgeNodeId, revision, links, action }) => {
         const linkId = String(link._id);
-        const baselineLinkIds = selectLinkApplyBaselineLinkIds({
-            links,
-            linkId,
-            portalNodeId,
-            bridgeNodeId,
-        });
         try {
             const scopedCoordinator = await getTopologyCoordinator();
+            const selectBaseline = typeof scopedCoordinator?.selectBaselineLinkIds === 'function'
+                ? scopedCoordinator.selectBaselineLinkIds : selectLinkApplyBaselineLinkIds;
+            const baselineLinkIds = selectBaseline({ links, linkId, portalNodeId, bridgeNodeId });
             if (typeof scopedCoordinator?.queue !== 'function') {
                 const error = new Error('Topology deployment capabilities are unavailable');
                 error.code = 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE';

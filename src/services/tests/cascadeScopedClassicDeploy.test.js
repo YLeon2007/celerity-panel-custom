@@ -197,10 +197,11 @@ for (const kind of ['outbound', 'hop', 'route']) {
     });
 }
 
-test('touching offline dependency refuses before SSH and is not treated as missing', async t => {
+test('touching offline dependency remains in the classic preservation baseline', async t => {
     const f = fixture(t); f.baseline.status = 'offline';
-    await assert.rejects(f.run({ baselineLinkIds: [] }), { code: 'CLASSIC_SCOPED_OFFLINE_DEPENDENCY_UNSUPPORTED' });
-    assert.equal(f.commands.length, 0);
+    const result = await f.run();
+    assert.equal(result.success, true);
+    assert.deepEqual(result.receipt.preservedLinkIds, [BASE]);
 });
 
 for (const kind of ['duplicate', 'credential', 'unknown-port']) {

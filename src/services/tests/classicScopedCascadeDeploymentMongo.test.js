@@ -175,3 +175,13 @@ test('real Mongo non-allowlisted target is rejected before reservation acquisiti
     await assert.rejects(service().queue(request)); assert.equal(calls, 0);
     assert.equal((await state()).replacementEpoch, 0); assert.equal((await state()).replacementReservation, undefined);
 });
+
+test('real Mongo classic selector and queue retain an offline established neighbor', local, async () => {
+    await reset(); await CascadeLink.updateOne({ _id: oldId }, { $set: { status: 'offline' } });
+    const s = service(); const links = await CascadeLink.find().lean();
+    const ids = s.selectBaselineLinkIds({ links, linkId });
+    assert.deepEqual(ids, [oldId]);
+    assert.equal((await s.queue({ expectedTopologyRevision: 4,
+        scope: { kind: 'link.apply', linkId, linkIds: [linkId, ...ids] } })).status, 'succeeded');
+    assert.equal((await CascadeLink.findById(oldId).lean()).status, 'offline');
+});

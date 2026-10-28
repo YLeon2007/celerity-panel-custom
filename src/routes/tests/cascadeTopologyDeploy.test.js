@@ -333,6 +333,26 @@ test('per-link deploy queues only the selected link and applied component, never
     assert.equal(response.body.status, 'queued');
 });
 
+test('manual classic route carries an offline preservation neighbor through its server-selected baseline', async () => {
+    const linkId = '507f1f77bcf86cd799439011', neighbor = '507f1f77bcf86cd799439012';
+    const portal = '507f1f77bcf86cd799439031', bridge = '507f1f77bcf86cd799439032';
+    const classic = require('../../services/classicScopedCascadeDeploymentService')
+        .createClassicScopedCascadeDeploymentService({ env: {} });
+    let queued;
+    const router = createCascadeTopologyDeployRouter({
+        topologyDeploymentService: { async deploy() { throw Error('global forbidden'); },
+            selectBaselineLinkIds: classic.selectBaselineLinkIds,
+            async queue(input) { queued = input; return { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 }; } },
+        models: { CascadeLink: { find() { return { select() { return this; }, async lean() {
+            return [{ _id: linkId, portalNode: portal, bridgeNode: bridge, active: true, status: 'pending' },
+                { _id: neighbor, portalNode: '507f1f77bcf86cd799439033', bridgeNode: bridge, active: true, status: 'offline' }];
+        } }; } } }, ...guardHarness([]),
+    });
+    const response = await request(router, { body: { expectedTopologyRevision: 7, linkId }, headers: { 'x-test-auth': 'api-write' } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(queued.scope.linkIds, [linkId, neighbor]);
+});
+
 test('manual classic completion exposes mode without inventing an operation id', async () => {
     const linkId = '507f1f77bcf86cd799439011';
     const router = createCascadeTopologyDeployRouter({

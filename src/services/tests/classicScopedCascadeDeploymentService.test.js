@@ -100,6 +100,16 @@ function harness(overrides = {}) {
 const input = (linkIds = [LINK]) => ({ expectedTopologyRevision: 7,
     scope: { kind: 'link.apply', linkId: LINK, linkIds } });
 
+test('classic baseline selector preserves connected offline links without activating unrelated pending links', async () => {
+    const h = harness({ links: [{ _id: NEIGHBOR, portalNode: C, bridgeNode: B,
+        active: true, status: 'offline', mode: 'reverse' },
+    { _id: PENDING, portalNode: A, bridgeNode: C, active: true, status: 'pending', mode: 'reverse' }] });
+    const baseline = h.service.selectBaselineLinkIds({ links: h.rows.CascadeLink, linkId: LINK });
+    assert.deepEqual(baseline, [NEIGHBOR]);
+    await h.service.queue(input([LINK, ...baseline]));
+    assert.deepEqual(h.calls.remote[0].baselineLinkIds, [NEIGHBOR]);
+});
+
 test('checked scoped completion returns synchronous classic result without IDs or revision publication', async () => {
     const h = harness();
     const result = await h.service.queue(input());
