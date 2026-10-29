@@ -257,14 +257,11 @@ class CascadeService {
         const scopePin = scopedScopePin(scope);
         const source = await HyNode.findById(scopedId(scope.target.portalNode)).setOptions({ maxTimeMS: 5000 }).lean();
         const bridge = await HyNode.findById(scopedId(scope.target.bridgeNode)).setOptions({ maxTimeMS: 5000 }).lean();
-        // Legacy standalone portals may be checked-removed, but this does not
-        // widen apply admission. The same upstream/shared-source, whole-profile
-        // ownership and pending-absence checks still run before any mutation.
-        const sourceRoleSupported = source?.cascadeRole === 'relay'
-            || (remove && source?.cascadeRole === 'portal');
-        if (source?.type !== 'xray' || !sourceRoleSupported || source.active !== true
-            || !bridge || bridge.active !== true || !scopedSourceHost(source.ip) || !net.isIP(bridge.ip || '')
-            || [source, bridge].some(node => !node.ssh?.password && !node.ssh?.privateKey)) {
+        // Root portals and no-upstream relays share the same scoped inverse.
+        // Recheck the exact preclaim capability under both held generations;
+        // graph, ownership and whole-profile guards below remain mandatory.
+        const { scopedClassicEndpointsSupported } = require('./classicScopedEndpointSupport');
+        if (!scopedClassicEndpointsSupported(source, bridge)) {
             throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED');
         }
         const nodePins = [source, bridge].map(scopedNodePin);

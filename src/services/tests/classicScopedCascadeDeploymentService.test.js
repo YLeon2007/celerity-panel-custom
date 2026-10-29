@@ -53,7 +53,7 @@ function harness(overrides = {}) {
         CascadeLink: [{ _id: LINK, portalNode: A, bridgeNode: B, mode: 'reverse', active: true,
             status: 'pending', tunnelPort: 10086, tunnelUuid: 'local-target-uuid' }, ...(overrides.links || [])],
         HyNode: [{ _id: A, cascadeRole: 'relay', active: true, type: 'xray', ip: '192.0.2.1', ssh: { password: 'fixture' } },
-            { _id: B, cascadeRole: 'bridge', active: true, type: 'xray', ip: '192.0.2.2' },
+            { _id: B, cascadeRole: 'bridge', active: true, type: 'xray', ip: '192.0.2.2', ssh: { password: 'fixture' } },
             { _id: C, cascadeRole: 'relay', active: true, type: 'xray' }],
         RelayL2tpState: overrides.relays || [], CascadeRouteGroup: overrides.groups || [],
         TopologyOperation: overrides.operations || [], TopologyCreateIntent: overrides.intents || [],
@@ -123,7 +123,7 @@ function harness(overrides = {}) {
         disconnect() { calls.preview.push('disconnect'); }
     }
     const dependencies = { ...models, env: { ...env(), ...overrides.env }, NodeSSH: PreviewSSH,
-        logger: { warn(event) { calls.diagnostic = event; } },
+        logger: { warn(event) { assert.equal(typeof event, 'string', 'production logger stringifies objects without metadata'); calls.diagnostic = JSON.parse(event); } },
         topologyManagesNodeConfig: async node => {
             assert.ok(calls.transactionActive || state.replacementReservation, 'ownership checked in claim transaction or held fence');
             calls.owner.push(String(node._id));
@@ -150,6 +150,34 @@ function harness(overrides = {}) {
 }
 const input = (linkIds = [LINK]) => ({ expectedTopologyRevision: 7,
     scope: { kind: 'link.apply', linkId: LINK, linkIds } });
+
+test('unsupported endpoint capability refuses before preview or topology claim', async () => {
+    for (const change of [nodes => { nodes[0].cascadeRole = 'bridge'; },
+        nodes => { nodes[0].active = false; }, nodes => { nodes[0].type = 'hysteria'; },
+        nodes => { nodes[0].ip = 'bad;host'; }, nodes => { nodes[1].ip = 'bridge.invalid'; },
+        nodes => { delete nodes[1].ssh; }]) {
+        const h = harness(); change(h.rows.HyNode);
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
+        assert.equal(h.calls.remote.length, 0); assert.equal(h.calls.updates.length, 0);
+        assert.equal(h.calls.preview.length, 0); assert.equal(h.state().replacementEpoch, 2);
+        assert.equal(h.state().replacementReservation, undefined);
+    }
+});
+
+test('portal auto-create and save-only manual retry use the same endpoint contract', async () => {
+    for (const auto of [false, true]) {
+        const h = harness(); h.rows.HyNode[0].cascadeRole = 'portal';
+        let r;
+        if (auto) {
+            const c = h.service.beginCreatedLinkCapability({ linkId: LINK });
+            h.service.confirmCreatedLinkCapability(c, { linkId: LINK, expectedTopologyRevision: 7 });
+            r = await h.service.queueCreatedLink(input(), c);
+        } else r = await h.service.queue(input());
+        assert.equal(r.status, 'succeeded'); assert.equal(h.calls.remote.length, 1);
+        assert.equal(h.state().replacementReservation, undefined);
+        assert.equal(h.rows.HyNode[0].cascadeRole, 'portal');
+    }
+});
 
 test('classic ingress capability is explicit and construction/access resolves no dependencies', () => {
     const service = createClassicScopedCascadeDeploymentService(new Proxy({ env: {} }, {

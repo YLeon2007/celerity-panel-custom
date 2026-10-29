@@ -151,13 +151,30 @@ test('checked removal accepts an exact applied standalone portal and preserves i
     assert.equal(f.locks.size, 0);
 });
 
-test('portal removal support does not authorize portal apply or a foreign source role', async t => {
+for (const security of ['none', 'reality']) test(`standalone portal full apply replay remove recreate lifecycle (${security})`, async t => {
     const f = fixture(t);
     f.nodes[SOURCE].cascadeRole = 'portal';
-    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
-    assert.equal(f.commands.length, 0);
-    assert.equal(f.writes.length, 0);
-    assert.equal(f.locks.size, 2);
+    f.files.delete(`${SOURCE}:${TRANSIT}`);
+    Object.assign(f.target, { tunnelSecurity: security, realityPrivateKey: 'fixture-private-key',
+        realityPublicKey: 'fixture-public-key', realityShortIds: ['0123456789abcdef'] });
+    const before = new Map(f.files);
+    assert.equal((await f.run()).success, true);
+    const applied = new Map(f.files), writes = f.writes.length;
+    assert.equal((await f.run()).success, true);
+    assert.deepEqual(f.files, applied);
+    assert.equal(f.writes.length, writes);
+    assert.equal((await remove(f)).receipt.targetAbsent, true);
+    assert.deepEqual(JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`)), JSON.parse(before.get(`${BRIDGE}:${TRANSIT}`)));
+    assert.deepEqual(JSON.parse(f.files.get(`${SOURCE}:${MAIN}`)), JSON.parse(before.get(`${SOURCE}:${MAIN}`)));
+    const nextId = '6ae3a179bdc007543cb21e48';
+    f.target._id = nextId; f.target.status = 'pending';
+    assert.equal((await f.run({ linkId: nextId })).success, true);
+    assert.equal((await remove(f, { linkId: nextId })).receipt.targetAbsent, true);
+    assert.equal(f.nodes[SOURCE].cascadeRole, 'portal');
+    assert.equal(f.locks.size, 0);
+});
+
+test('standalone portal support does not authorize a foreign source role', async t => {
     const g = fixture(t);
     g.nodes[SOURCE].cascadeRole = 'bridge';
     await assert.rejects(remove(g), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });

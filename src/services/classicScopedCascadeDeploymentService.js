@@ -324,6 +324,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
             const source = nodes.find(node => entityId(node._id) === endpoints[0]);
             const destination = nodes.find(node => entityId(node._id) === endpoints[1]);
+            // Capability refusal is DB-only: do it before preview, reservation
+            // and node locks, and recheck it in the held core before dispatch.
+            const { scopedClassicEndpointsSupported } = require('./classicScopedEndpointSupport');
+            if (!scopedClassicEndpointsSupported(source, destination)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             return { baselineLinkIds, endpoints, portPreview: { node: source, port: selected.tunnelPort,
                 target: { ...selected, portalNode: source, bridgeNode: destination } } };
         }
@@ -332,9 +336,9 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 && (Object.hasOwn(MESSAGES, error.code)
                     || /^(CLASSIC_SCOPED_[A-Z_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code))
                 ? error.code : 'UNKNOWN';
-            try { (dependencies.logger ?? require('../utils/logger')).warn({
+            try { (dependencies.logger ?? require('../utils/logger')).warn(JSON.stringify({
                 event: 'classic-scoped-refusal', internalCode, phase, operationId, linkId,
-            }); } catch { /* diagnostics cannot change ownership semantics */ }
+            })); } catch { /* diagnostics cannot change ownership semantics */ }
         };
         async function checkedAdmission(session) {
             const state = await stateModel.findById('singleton').session(session).lean();
