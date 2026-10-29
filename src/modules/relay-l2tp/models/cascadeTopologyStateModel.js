@@ -2,6 +2,23 @@
 
 const mongoose = require('mongoose');
 
+const lifecycleIdentity = {
+    operationId: { type: String, required: true,
+        match: /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/ },
+    action: { type: String, required: true, enum: ['link.apply', 'link.delete'] },
+    linkId: { type: String, required: true, match: /^[a-f0-9]{24}$/i },
+    epoch: { type: Number, required: true, min: 1 },
+    nodeIds: { type: [String], required: true, default: undefined,
+        validate: v => Array.isArray(v) && v.length === 2 && v[0] !== v[1]
+            && v.every(id => /^[a-f0-9]{24}$/i.test(id)) },
+    baselineLinkIds: { type: [String], required: true, default: undefined,
+        validate: v => Array.isArray(v) && new Set(v).size === v.length
+            && v.every(id => /^[a-f0-9]{24}$/i.test(id)) },
+    topologyRevision: { type: Number, required: true, min: 0 },
+    deployedRevision: { type: Number, required: true, min: 0 },
+};
+const lifecycleOptions = { _id: false, versionKey: false, strict: 'throw' };
+
 const cascadeTopologyStateSchema = new mongoose.Schema({
     _id: {
         type: String,
@@ -34,6 +51,15 @@ const cascadeTopologyStateSchema = new mongoose.Schema({
     // Explicitly audited initialization only. Missing legacy state is not zero.
     // Queue admission increments this on the same transaction as the operation.
     topologyAdmissionCount: { type: Number, min: 0 },
+    // Non-expiring dispatch identity remains with the reservation on every
+    // unknown remote/commit outcome. It is diagnostic evidence, not retry authority.
+    classicLifecycleAttempt: { type: new mongoose.Schema({ ...lifecycleIdentity,
+        phase: { type: String, required: true, enum: ['dispatching'] },
+    }, lifecycleOptions), default: undefined },
+    classicLifecycleLastSettlement: { type: new mongoose.Schema({ ...lifecycleIdentity,
+        phase: { type: String, required: true, enum: ['succeeded'] },
+        revision: { type: Number, required: true, min: 0 },
+    }, lifecycleOptions), default: undefined },
     remoteDrain: {
         type: new mongoose.Schema({
             ownerToken: { type: String, required: true },

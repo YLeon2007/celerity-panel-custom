@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { hasClassicLifecycleGrant } = require('./classicLifecycleAuthorization');
 const { resolveL2tpExecutionAuthorization } = require('../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
 const ID = /^[0-9a-f]{24}$/i;
 // Health-offline is not evidence that an established physical tunnel is absent.
@@ -17,6 +18,7 @@ const MESSAGES = Object.freeze({
     TOPOLOGY_DEPLOYMENT_UNAVAILABLE: 'Classic deployment capabilities are unavailable',
     STALE_TOPOLOGY_REVISION: 'Topology revision changed; reload before applying',
     INVALID_REQUEST: 'Invalid scoped classic deployment request',
+    INVALID_TOPOLOGY_DRAFT: 'Classic deletion would leave an invalid topology draft',
 });
 function failure(code) { return Object.assign(new Error(MESSAGES[code]), { code }); }
 const validId = value => typeof value === 'string' && ID.test(value);
@@ -25,7 +27,7 @@ const MAIN_PROFILE = '/usr/local/etc/xray/config.json';
 const BRIDGE_PROFILE = '/usr/local/etc/xray-bridge/config.json';
 const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const sameList = (actual, expected) => Array.isArray(actual)
-    && actual.length === expected.length && actual.every((value, i) => value === expected[i]);
+    && actual.length === expected.length && expected.every((value, i) => Object.hasOwn(actual, i) && actual[i] === value);
 function classicLinkAllowlist(env) {
     const value = env.CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS;
     if (typeof value !== 'string' || value.length > 1599) return null;
@@ -70,6 +72,41 @@ function checkedCompletion(result, { linkId, expectedTopologyRevision, baselineL
     return preserved.size === expectedPreserved.length;
 }
 
+// Removal accounts for all four endpoint profiles, including unchanged/absent
+// files. A status string or a generic SSH success is never an absence proof.
+function checkedRemoval(result, context) {
+    const r = result?.receipt;
+    if (result?.success !== true || result?.remoteQuiescent !== true
+        || Object.keys(result).sort().join(',') !== 'receipt,remoteQuiescent,success'
+        || !r || Object.keys(r).sort().join(',') !== 'kind,linkId,nodeIds,preservedLinkIds,preservedProfiles,profiles,targetAbsent,topologyRevision'
+        || r.kind !== 'classic-scoped-reverse-removal' || r.linkId !== context.linkId
+        || r.topologyRevision !== context.expectedTopologyRevision || r.targetAbsent !== true
+        || !sameList(r.nodeIds, [...context.endpoints].sort())
+        || !sameList(r.preservedLinkIds, context.baselineLinkIds)
+        || !Array.isArray(r.profiles) || !Array.isArray(r.preservedProfiles)) return false;
+    const [source, target] = context.endpoints;
+    const key = p => `${p.nodeId}:${p.path}`;
+    const required = [`${source}:${MAIN_PROFILE}`, `${target}:${BRIDGE_PROFILE}`];
+    const optional = `${target}:${MAIN_PROFILE}`;
+    const changed = new Set();
+    const validProfile = p => p && Object.keys(p).sort().join(',') === 'beforeSha256,changed,nodeId,path,sha256'
+        && typeof p.nodeId === 'string' && typeof p.path === 'string'
+        && (p.beforeSha256 === null || digest(p.beforeSha256)) && (p.sha256 === null || digest(p.sha256))
+        && typeof p.changed === 'boolean' && p.changed === (p.beforeSha256 !== p.sha256);
+    for (const p of r.profiles) {
+        if (!validProfile(p) || (!required.includes(key(p)) && key(p) !== optional) || changed.has(key(p))) return false;
+        changed.add(key(p));
+    }
+    if (!required.every(k => changed.has(k))) return false;
+    const expectedPreserved = [`${source}:${BRIDGE_PROFILE}`, ...(!changed.has(optional) ? [optional] : [])];
+    const preserved = new Set();
+    for (const p of r.preservedProfiles) {
+        if (!validProfile(p) || p.changed !== false || !expectedPreserved.includes(key(p)) || preserved.has(key(p))) return false;
+        preserved.add(key(p));
+    }
+    return preserved.size === expectedPreserved.length;
+}
+
 function inactiveRelay(state) {
     // Include the observed legacy desiredState spelling without adopting any
     // missing/unknown status as evidence of a completed uninstall.
@@ -100,9 +137,12 @@ function routeGroupUseVeto(groups, relays, touching) {
 
 function isClassicProductionDeploymentEnabled(env) {
     const auth = resolveL2tpExecutionAuthorization(env);
+    const lifecycle = env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED === 'true';
+    const validLifecycle = lifecycle && typeof env.CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY === 'string'
+        && /^[a-f0-9]{64}$/.test(env.CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY);
     return auth.enableProductionExecution === true && env.PANEL_DOMAIN === 'lm1.infograd.online'
         && env.CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
-        && classicLinkAllowlist(env) !== null
+        && (lifecycle ? validLifecycle : classicLinkAllowlist(env) !== null)
         && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'false'
         && env.TOPOLOGY_TEST_EXECUTION_ENABLED === 'false';
 }
@@ -184,7 +224,8 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         return { ...models, connection };
     }
 
-    async function runQueue(input, { creationCapability = null } = {}) {
+    async function runQueue(input, { creationCapability = null, action = 'link.apply' } = {}) {
+        const isDelete = action === 'link.delete';
         const allowUnlistedPending = creationCapability !== null;
         if (!isClassicProductionDeploymentEnabled(env)) throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
         if (!input || typeof input !== 'object' || Array.isArray(input)
@@ -201,11 +242,82 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         }
         // Copy before the first await; external callers cannot change the pin.
         const linkId = scope.linkId;
-        if (!allowUnlistedPending && !classicLinkAllowlist(env).includes(linkId)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-        const requestedIds = [...scope.linkIds].sort();
+        const allowlisted = (classicLinkAllowlist(env) ?? []).includes(linkId);
+        if (!allowUnlistedPending && !allowlisted && env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED !== 'true') {
+            throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+        }
+        const requestedIds = isDelete ? null : [...scope.linkIds].sort();
         const m = resolve();
         const stateModel = m.CascadeTopologyState;
-        const ownerToken = `classic-deploy:${randomUUID()}`;
+        const operationId = randomUUID();
+        const ownerToken = `classic-deploy:${operationId}`;
+        let repository;
+        if (isDelete) {
+            const { TopologyDraftRepository } = require('../modules/relay-l2tp/repositories/topologyDraftRepository');
+            repository = new TopologyDraftRepository(m);
+        }
+        async function prepareDeletion(session) {
+            const snapshot = await repository.readDraft(session);
+            if (snapshot.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
+            const { buildCandidate } = require('../modules/relay-l2tp/domain/topologyDraft');
+            const { validateTopology } = require('../modules/relay-l2tp/domain/topologyValidator');
+            const { compileTopology } = require('../modules/relay-l2tp/domain/topologyCompiler');
+            const prepared = buildCandidate(snapshot, { kind: 'link.delete', id: linkId });
+            if (!validateTopology(prepared.candidate)?.valid
+                || !compileTopology({ ...prepared.candidate, healthByPathKey: {} })?.valid) {
+                throw failure('INVALID_TOPOLOGY_DRAFT');
+            }
+            return prepared.mutation;
+        }
+        async function assertNoCompetingWork(session) {
+            const read = query => session ? query.session(session) : query.setOptions(READ);
+            if (await read(m.TopologyOperation.exists({ $or: [
+                { status: { $nin: ['succeeded', 'failed', 'rolled_back'] } }, { heldTopologyAdmission: true },
+            ] }))
+                || await read(m.TopologyCreateIntent.exists({ status: { $nin: ['succeeded', 'failed'] } }))
+                || await read(m.TopologyIntentQueueState.exists({ outstanding: { $ne: 0 } }))
+                || await read(m.NodeOperationLock.exists({}))) throw failure('CLASSIC_DEPLOY_BUSY');
+        }
+        async function admission(session) {
+            const read = query => session ? query.session(session) : query.setOptions(READ);
+            const links = await read(m.CascadeLink.find({}).select('+classicLifecycleGrant')).lean();
+            if (!Array.isArray(links) || new Set(links.map(link => entityId(link._id))).size !== links.length) {
+                throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+            }
+            const selected = links.find(link => entityId(link._id) === linkId);
+            if (!selected || selected.active !== true || selected.mode !== 'reverse') throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            if (!allowlisted && !(allowUnlistedPending && env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED !== 'true')
+                && !hasClassicLifecycleGrant(selected, env)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            if (!['pending', 'error', ...APPLIED].includes(selected.status)
+                || (allowUnlistedPending && selected.status !== 'pending')) {
+                throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            }
+            const baselineLinkIds = baselineIds(links, selected);
+            if (links.some(link => baselineLinkIds.includes(entityId(link._id))
+                && (link.mode ?? 'reverse') !== 'reverse')) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            if (requestedIds && !sameList([...baselineLinkIds, linkId].sort(), requestedIds)) {
+                throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+            }
+            const endpoints = [entityId(selected.portalNode), entityId(selected.bridgeNode)];
+            if (!endpoints.every(validId) || endpoints[0] === endpoints[1]) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+            const nodes = await read(m.HyNode.find({})).lean();
+            for (const id of endpoints) {
+                const matches = nodes.filter(node => entityId(node._id) === id);
+                if (matches.length !== 1) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+                const owns = dependencies.topologyManagesNodeConfig ?? require('./topologyConfigOwnership').topologyManagesNodeConfig;
+                try {
+                    if (await owns(matches[0], env)) throw failure('CLASSIC_DEPLOY_OWNER_VETO');
+                } catch { throw failure('CLASSIC_DEPLOY_OWNER_VETO'); }
+            }
+            const relays = await read(m.RelayL2tpState.find({})).lean();
+            if (!Array.isArray(relays) || relays.some(state => endpoints.includes(entityId(state?.node))
+                && !inactiveRelay(state))) throw failure('CLASSIC_DEPLOY_IN_USE');
+            const touching = new Set(links.filter(link => endpoints.includes(entityId(link.portalNode))
+                || endpoints.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
+            const groups = await read(m.CascadeRouteGroup.find({})).lean();
+            if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
+            return { baselineLinkIds, endpoints };
+        }
         let claimed;
         try {
             claimed = await m.connection.transaction(async session => {
@@ -215,27 +327,31 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                     || !Number.isSafeInteger(state.replacementEpoch) || state.replacementEpoch < 0
                     || state.replacementEpoch >= Number.MAX_SAFE_INTEGER
                     || state.topologyAdmissionCount !== 0 || state.remoteAdmissionCount !== 0
-                    || state.replacementReservation !== undefined || state.remoteDrain !== undefined) {
+                    || state.replacementReservation !== undefined || state.remoteDrain !== undefined
+                    || state.classicLifecycleAttempt !== undefined || (isDelete && state.revision >= Number.MAX_SAFE_INTEGER)) {
                     throw failure('CLASSIC_DEPLOY_BUSY');
                 }
                 if (state.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
-                if (await m.TopologyOperation.exists({ $or: [
-                    { status: { $nin: ['succeeded', 'failed', 'rolled_back'] } }, { heldTopologyAdmission: true },
-                ] }).session(session)
-                    || await m.TopologyCreateIntent.exists({ status: { $nin: ['succeeded', 'failed'] } }).session(session)
-                    || await m.TopologyIntentQueueState.exists({ outstanding: { $ne: 0 } }).session(session)
-                    || await m.NodeOperationLock.exists({}).session(session)) throw failure('CLASSIC_DEPLOY_BUSY');
+                await assertNoCompetingWork(session);
+                const admitted = await admission(session);
+                if (isDelete) await prepareDeletion(session);
                 const epoch = state.replacementEpoch + 1;
+                const attempt = { operationId, action, linkId, epoch, nodeIds: admitted.endpoints,
+                    topologyRevision: expectedTopologyRevision, deployedRevision: state.deployedRevision,
+                    baselineLinkIds: admitted.baselineLinkIds, phase: 'dispatching' };
                 const row = await stateModel.findOneAndUpdate({
                     _id: 'singleton', revision: expectedTopologyRevision, deployedRevision: state.deployedRevision,
                     replacementEpoch: state.replacementEpoch, topologyAdmissionCount: 0, remoteAdmissionCount: 0,
                     replacementReservation: { $exists: false }, remoteDrain: { $exists: false },
-                }, { $set: { replacementReservation: { ownerToken, epoch } }, $inc: { replacementEpoch: 1 } },
+                    classicLifecycleAttempt: { $exists: false },
+                }, { $set: { replacementReservation: { ownerToken, epoch }, classicLifecycleAttempt: attempt },
+                    $inc: { replacementEpoch: 1 } },
                 { session, new: true, upsert: false, runValidators: true }).lean();
                 if (!row || row.revision !== expectedTopologyRevision || row.replacementEpoch !== epoch
                     || row.replacementReservation?.ownerToken !== ownerToken
-                    || row.replacementReservation?.epoch !== epoch) throw failure('CLASSIC_DEPLOY_BUSY');
-                return Object.freeze({ epoch, deployedRevision: state.deployedRevision });
+                    || row.replacementReservation?.epoch !== epoch
+                    || row.classicLifecycleAttempt?.operationId !== operationId) throw failure('CLASSIC_DEPLOY_BUSY');
+                return Object.freeze({ epoch, deployedRevision: state.deployedRevision, ...admitted });
             }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
         } catch (error) {
             // Unknown commit never dispatches and never attempts speculative release.
@@ -244,64 +360,99 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         const fence = Object.freeze({ _id: 'singleton', revision: expectedTopologyRevision,
             deployedRevision: claimed.deployedRevision, replacementEpoch: claimed.epoch,
             topologyAdmissionCount: 0, remoteAdmissionCount: 0, remoteDrain: { $exists: false },
-            'replacementReservation.ownerToken': ownerToken, 'replacementReservation.epoch': claimed.epoch });
-        async function verifyFence() {
-            const row = await stateModel.findOne(fence).setOptions(READ).lean();
+            'replacementReservation.ownerToken': ownerToken, 'replacementReservation.epoch': claimed.epoch,
+            'classicLifecycleAttempt.operationId': operationId, 'classicLifecycleAttempt.action': action,
+            'classicLifecycleAttempt.linkId': linkId, 'classicLifecycleAttempt.epoch': claimed.epoch,
+            'classicLifecycleAttempt.topologyRevision': expectedTopologyRevision,
+            'classicLifecycleAttempt.deployedRevision': claimed.deployedRevision,
+            'classicLifecycleAttempt.nodeIds': claimed.endpoints,
+            'classicLifecycleAttempt.baselineLinkIds': claimed.baselineLinkIds,
+            'classicLifecycleAttempt.phase': 'dispatching' });
+        async function verifyFence(session) {
+            const query = stateModel.findOne(fence);
+            const row = await (session ? query.session(session) : query.setOptions(READ)).lean();
             if (!row || row._id !== 'singleton' || row.revision !== expectedTopologyRevision
                 || row.deployedRevision !== claimed.deployedRevision || row.replacementEpoch !== claimed.epoch
                 || row.topologyAdmissionCount !== 0 || row.remoteAdmissionCount !== 0
                 || row.remoteDrain !== undefined || row.replacementReservation?.ownerToken !== ownerToken
-                || row.replacementReservation?.epoch !== claimed.epoch) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                || row.replacementReservation?.epoch !== claimed.epoch
+                || row.classicLifecycleAttempt?.operationId !== operationId
+                || row.classicLifecycleAttempt?.action !== action || row.classicLifecycleAttempt?.linkId !== linkId
+                || row.classicLifecycleAttempt?.epoch !== claimed.epoch
+                || row.classicLifecycleAttempt?.topologyRevision !== expectedTopologyRevision
+                || row.classicLifecycleAttempt?.deployedRevision !== claimed.deployedRevision
+                || row.classicLifecycleAttempt?.phase !== 'dispatching'
+                || !sameList(row.classicLifecycleAttempt?.nodeIds, claimed.endpoints)
+                || !sameList(row.classicLifecycleAttempt?.baselineLinkIds, claimed.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
         }
         // Everything below is AFTER acquisition. Every refusal keeps ownership;
         // no error/timeout/partial completion can authorize a successor writer.
         try {
             await verifyFence();
-            const links = await m.CascadeLink.find({}).setOptions(READ).lean();
-            if (!Array.isArray(links) || new Set(links.map(link => entityId(link._id))).size !== links.length) {
+            await assertNoCompetingWork();
+            const { baselineLinkIds, endpoints } = await admission();
+            if (!sameList(endpoints, claimed.endpoints) || !sameList(baselineLinkIds, claimed.baselineLinkIds)) {
                 throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
             }
-            const selected = links.find(link => entityId(link._id) === linkId);
-            if (!selected || selected.active !== true || selected.mode !== 'reverse') throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-            if (allowUnlistedPending && selected.status !== 'pending') {
-                throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-            }
-            const baselineLinkIds = baselineIds(links, selected);
-            if (links.some(link => baselineLinkIds.includes(entityId(link._id))
-                && (link.mode ?? 'reverse') !== 'reverse')) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-            if (JSON.stringify([...baselineLinkIds, linkId].sort()) !== JSON.stringify(requestedIds)) {
-                throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
-            }
-            const endpoints = [entityId(selected.portalNode), entityId(selected.bridgeNode)];
-            if (!endpoints.every(validId) || endpoints[0] === endpoints[1]) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
-            const nodes = await m.HyNode.find({}).setOptions(READ).lean();
-            for (const id of endpoints) {
-                const matches = nodes.filter(node => entityId(node._id) === id);
-                if (matches.length !== 1) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
-                const owns = dependencies.topologyManagesNodeConfig ?? require('./topologyConfigOwnership').topologyManagesNodeConfig;
-                if (await owns(matches[0], env)) throw failure('CLASSIC_DEPLOY_OWNER_VETO');
-            }
-            const relays = await m.RelayL2tpState.find({}).setOptions(READ).lean();
-            if (!Array.isArray(relays) || relays.some(state => endpoints.includes(entityId(state?.node))
-                && !inactiveRelay(state))) throw failure('CLASSIC_DEPLOY_IN_USE');
-            const touching = new Set(links.filter(link => endpoints.includes(entityId(link.portalNode))
-                || endpoints.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
-            const groups = await m.CascadeRouteGroup.find({}).setOptions(READ).lean();
-            if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
+            if (isDelete) await prepareDeletion();
             await verifyFence();
             const core = dependencies.cascadeService ?? require('./cascadeService');
-            if (typeof core.deployScopedClassicLink !== 'function') throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
-            const result = await core.deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds });
-            if (!checkedCompletion(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints })) {
+            const method = isDelete ? 'removeScopedClassicLink' : 'deployScopedClassicLink';
+            if (typeof core[method] !== 'function') throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
+            const result = await core[method]({ linkId, expectedTopologyRevision, baselineLinkIds });
+            if (!(isDelete ? checkedRemoval : checkedCompletion)(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints })) {
                 throw failure('CLASSIC_DEPLOY_UNCERTAIN');
             }
             await verifyFence();
-            const released = await stateModel.findOneAndUpdate(fence,
-                { $unset: { replacementReservation: '' } },
-                { new: true, upsert: false, writeConcern: { w: 'majority' }, maxTimeMS: 5000 }).lean();
-            if (!released || released.replacementReservation !== undefined
-                || released.revision !== expectedTopologyRevision || released.replacementEpoch !== claimed.epoch
-                || released.deployedRevision !== claimed.deployedRevision) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+            const revision = expectedTopologyRevision + (isDelete ? 1 : 0);
+            const settlement = { operationId, action, linkId, epoch: claimed.epoch, nodeIds: endpoints,
+                topologyRevision: expectedTopologyRevision, deployedRevision: claimed.deployedRevision,
+                baselineLinkIds, revision, phase: 'succeeded' };
+            const exactSettlement = actual => actual && Object.entries(settlement).every(([key, expected]) =>
+                Array.isArray(expected) ? sameList(actual[key], expected) : actual[key] === expected);
+            const update = { $set: { classicLifecycleLastSettlement: settlement },
+                $unset: { replacementReservation: '', classicLifecycleAttempt: '' },
+                ...(isDelete ? { $inc: { revision: 1 } } : {}) };
+            let released;
+            if (isDelete) {
+                released = await m.connection.transaction(async session => {
+                    await verifyFence(session);
+                    await assertNoCompetingWork(session);
+                    const fresh = await admission(session);
+                    if (!sameList(fresh.endpoints, endpoints) || !sameList(fresh.baselineLinkIds, baselineLinkIds)) {
+                        throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+                    }
+                    const mutation = await prepareDeletion(session);
+                    await repository.persistMutation(mutation, session);
+                    const row = await stateModel.findOneAndUpdate(fence, update,
+                        { session, new: true, upsert: false, runValidators: true }).lean();
+                    if (!row || row.revision !== revision || row.replacementReservation !== undefined
+                        || row.classicLifecycleAttempt !== undefined
+                        || !exactSettlement(row.classicLifecycleLastSettlement)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                    return row;
+                }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+            } else {
+                released = await stateModel.findOneAndUpdate(fence, update,
+                    { new: true, upsert: false, runValidators: true, writeConcern: { w: 'majority' }, maxTimeMS: 5000 }).lean();
+            }
+            if (!released || released.replacementReservation !== undefined || released.classicLifecycleAttempt !== undefined
+                || released.revision !== revision || released.replacementEpoch !== claimed.epoch
+                || released.deployedRevision !== claimed.deployedRevision
+                || !exactSettlement(released.classicLifecycleLastSettlement)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+            // A write acknowledgement alone is not completion. Read back this
+            // operation's exact settlement; unknown settlement never re-dispatches.
+            const confirmed = await stateModel.findOne({ _id: 'singleton', revision,
+                deployedRevision: claimed.deployedRevision, replacementEpoch: claimed.epoch,
+                replacementReservation: { $exists: false }, classicLifecycleAttempt: { $exists: false },
+                'classicLifecycleLastSettlement.operationId': operationId }).setOptions(READ).lean();
+            if (!confirmed || confirmed.revision !== revision || confirmed.replacementEpoch !== claimed.epoch
+                || confirmed.deployedRevision !== claimed.deployedRevision || confirmed.replacementReservation !== undefined
+                || confirmed.classicLifecycleAttempt !== undefined
+                || !exactSettlement(confirmed.classicLifecycleLastSettlement)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+            if (isDelete) {
+                if (await m.CascadeLink.exists({ _id: linkId }).setOptions(READ)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                return { revision, deployedRevision: claimed.deployedRevision };
+            }
             return { status: 'succeeded', executionMode: 'classic', topologyRevision: expectedTopologyRevision };
         } catch (error) {
             throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN');
@@ -324,10 +475,17 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
     };
     return Object.freeze({
         queue,
+        async deleteLink(input) {
+            if (!input || typeof input !== 'object' || Array.isArray(input)
+                || Object.keys(input).some(key => !['expectedTopologyRevision', 'linkId'].includes(key))
+                || !validId(input.linkId)) throw failure('INVALID_REQUEST');
+            return runQueue({ expectedTopologyRevision: input.expectedTopologyRevision,
+                scope: { kind: 'link.apply', linkId: input.linkId, linkIds: [input.linkId] } }, { action: 'link.delete' });
+        },
         beginCreatedLinkCapability,
         confirmCreatedLinkCapability,
-        // This service positively enforces absent L2TP/unused retained groups
-        // under its fence; it must never prepare ingress or mutate route groups.
+        // This service never prepares L2TP ingress. Only checked DELETE applies
+        // the draft builder's retained-group cleanup, in its settlement transaction.
         get requiresL2tpIngressPreparation() { return false; },
         selectBaselineLinkIds({ links, linkId }) {
             const selected = links.find(link => entityId(link._id) === entityId(linkId));
@@ -335,8 +493,8 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             return baselineIds(links, selected);
         },
         // Internal create-and-apply path: the caller must have just persisted
-        // the pending link in the same request. Public Deploy remains fenced by
-        // CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS.
+        // the pending link in the same request. Public Deploy requires an exact
+        // production ID or a verified server-issued durable lifecycle grant.
         queueCreatedLink,
         async deploy() { throw failure('CLASSIC_DEPLOY_UNSUPPORTED'); },
     });
