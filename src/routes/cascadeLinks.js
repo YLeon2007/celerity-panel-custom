@@ -53,6 +53,7 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CLASSIC_DEPLOY_IN_USE', 409],
     ['CLASSIC_DEPLOY_OWNER_VETO', 409],
     ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
+    ['CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED', 409],
     ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNCERTAIN', 503],
     ['CLASSIC_DEPLOY_FENCE_LOST', 503],
@@ -158,6 +159,7 @@ const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
     'CLASSIC_DEPLOY_IN_USE',
     'CLASSIC_DEPLOY_OWNER_VETO',
     'CLASSIC_DEPLOY_PORT_CONFLICT',
+    'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED',
     'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE',
     'CLASSIC_DEPLOY_UNCERTAIN',
     'CLASSIC_DEPLOY_FENCE_LOST',
@@ -169,7 +171,9 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
+        message: code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED'
+            ? 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.'
+            : code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
             ? 'The tunnel port is already in use on the source node; edit the port and retry'
             : code === 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'
                 ? 'Port inspection was unavailable; no deployment was started'

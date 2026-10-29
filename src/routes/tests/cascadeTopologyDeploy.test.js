@@ -389,6 +389,7 @@ test('classic errors use fixed 409/503 responses, never backend text or diagnost
     for (const [code, status] of [['CLASSIC_DEPLOY_BUSY', 409], ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
         ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409], ['CLASSIC_DEPLOY_IN_USE', 409],
         ['CLASSIC_DEPLOY_OWNER_VETO', 409], ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
+        ['CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED', 409],
         ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503], ['CLASSIC_DEPLOY_UNCERTAIN', 503], ['CLASSIC_DEPLOY_FENCE_LOST', 503]]) {
         const logged = [];
         const router = createCascadeTopologyDeployRouter({ topologyDeploymentService: {
@@ -397,6 +398,10 @@ test('classic errors use fixed 409/503 responses, never backend text or diagnost
         const response = await request(router, { headers: { 'x-test-auth': 'api-write' } });
         assert.equal(response.status, status, code);
         assert.equal(response.body.error.code, code);
+        if (code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
+            assert.match(response.body.error.message, /configuration.*verified/i);
+            assert.doesNotMatch(response.body.error.message, /retained ownership/i);
+        }
         assert.doesNotMatch(JSON.stringify(response.body) + logged.join(' '), /password|secret|private/);
     }
 });

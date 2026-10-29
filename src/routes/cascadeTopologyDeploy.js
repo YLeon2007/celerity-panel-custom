@@ -60,6 +60,7 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CLASSIC_DEPLOY_IN_USE', 409],
     ['CLASSIC_DEPLOY_OWNER_VETO', 409],
     ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
+    ['CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED', 409],
     ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNCERTAIN', 503],
     ['CLASSIC_DEPLOY_FENCE_LOST', 503],
@@ -202,6 +203,9 @@ function publicResult(result = {}) {
 }
 
 function publicError(error) {
+    if (error.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
+        return { error: { code: error.code, message: 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.' } };
+    }
     if (error.code === 'CLASSIC_DEPLOY_PORT_CONFLICT') {
         return { error: { code: error.code, message: 'The tunnel port is already in use on the source node; edit the port and retry' } };
     }

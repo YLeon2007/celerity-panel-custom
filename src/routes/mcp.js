@@ -140,8 +140,10 @@ async function dispatch(rpc, apiKey, emitProg) {
                 }),
             };
         } catch (err) {
-            if (['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'].includes(err?.code)) {
-                const message = err.code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
+            if (['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED'].includes(err?.code)) {
+                const message = err.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED'
+                    ? 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.'
+                    : err.code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
                     ? 'The tunnel port is already in use on the source node; edit the port and retry'
                     : 'Port inspection was unavailable; no deployment was started';
                 logger.warn(`[MCP] Tool refusal: ${err.code}`);

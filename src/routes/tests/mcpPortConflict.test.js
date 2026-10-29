@@ -5,7 +5,7 @@ const express = require('express');
 const Module = require('node:module');
 const fs = require('node:fs');
 const path = require('node:path');
-for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE']) {
+for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED']) {
     test(`MCP preserves safe port refusal ${code} without backend text`, async () => {
         const filename = path.resolve(__dirname, '../mcp.js');
         const mod = new Module(filename, module); mod.filename = filename; mod.paths = module.paths;
@@ -27,6 +27,9 @@ for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_U
             const payload = JSON.parse(text.split('\n').find(line => line.startsWith('data: ')).slice(6));
             assert.equal(payload.result.isError, true);
             assert.equal(JSON.parse(payload.result.content[0].text).code, code);
+            if (code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
+                assert.match(JSON.parse(payload.result.content[0].text).message, /configuration.*verified/i);
+            }
         } finally { await new Promise(resolve => server.close(resolve)); }
     });
 }
