@@ -223,12 +223,27 @@ test('checked removal of last target validates idle bridge and permits explicit 
     assert.equal(f.locks.size, 0);
 });
 
-test('checked removal cannot turn an absent target into deletion authority', async t => {
-    const f = fixture(t);
-    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_REMOVAL_PROOF_MISSING' });
+test('checked absence permits discarding a pending draft without config mutation or service restart', async t => {
+    const f = fixture(t), before = new Map(f.files);
+    const result = await remove(f);
+    assert.equal(result.success, true);
+    assert.equal(result.remoteQuiescent, true);
+    assert.equal(result.receipt.targetAbsent, true);
+    assert.ok(result.receipt.profiles.every(profile => profile.changed === false && profile.beforeSha256 === profile.sha256));
+    assert.deepEqual(f.files, before);
     assert.equal(f.writes.length, 0);
-    assert.equal(f.locks.size, 2);
+    assert.equal(f.commands.some(row => row.command.includes('systemctl restart')), false);
+    assert.equal(f.locks.size, 0);
 });
+
+for (const status of ['deployed', 'online', 'offline', 'error']) {
+    test(`absent ${status} target requires an independent recovery rather than draft discard`, async t => {
+        const f = fixture(t); f.target.status = status;
+        await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_REMOVAL_PROOF_MISSING' });
+        assert.equal(f.writes.length, 0);
+        assert.equal(f.locks.size, 2);
+    });
+}
 
 test('checked removal replay without independent prior receipt refuses without new mutation', async t => {
     const f = fixture(t);

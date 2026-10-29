@@ -430,7 +430,12 @@ class CascadeService {
             const portalApplied = stripOwnedReverse(main, priorPortalDelta);
             const bridgeApplied = stripOwnedReverse(combined, priorBridgeDelta);
             if (portalApplied !== bridgeApplied || (oldOutbound.length && portalApplied)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
-            if (remove && !portalApplied) throw scopedFailure('CLASSIC_SCOPED_REMOVAL_PROOF_MISSING');
+            // The caller already proved durable per-link authorization under
+            // its topology fence. A never-applied pending draft may be discarded
+            // only after the same whole-profile baseline/absence/readback proof;
+            // status alone is never physical absence. Applied/error rows need
+            // an independent recovery receipt if their fragments disappeared.
+            if (remove && !portalApplied && target.status !== 'pending') throw scopedFailure('CLASSIC_SCOPED_REMOVAL_PROOF_MISSING');
             const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
             const representedDomains = bridgeBaseline.map(row =>
                 `${scopedId(row).slice(-8)}.${row.tunnelDomain || 'reverse.tunnel.internal'}`).sort();
@@ -488,7 +493,7 @@ class CascadeService {
                 // sections, global defaults, user inbounds and sibling routes.
                 // The last bridge stays active but idle on its validated config;
                 // never stop a potentially shared service or touch target MAIN.
-                for (const config of [main, combined]) {
+                for (const config of portalApplied ? [main, combined] : []) {
                     for (const key of ['portals', 'bridges']) {
                         if (config.reverse?.[key]?.length === 0) delete config.reverse[key];
                     }
