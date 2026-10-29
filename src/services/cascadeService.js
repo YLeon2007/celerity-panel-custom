@@ -131,7 +131,7 @@ function scopedNodePin(node) {
 
 class CascadeService {
     /**
-     * Completion-checked classic no-upstream Relay -> terminal Bridge only.
+     * Completion-checked classic root Portal/no-upstream Relay -> terminal Bridge.
      * Caller MUST hold the nonexpiring topology reservation at this exact
      * revision and retain it on every throw. baselineLinkIds is the complete
      * active APPLIED/offline connected-component preservation baseline.
@@ -611,7 +611,10 @@ class CascadeService {
                 if (targetPeer) { established = true; break; }
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
-            if (!remove && !established) throw scopedFailure('CLASSIC_SCOPED_TUNNEL_UNCONFIRMED');
+            // A missing data-plane connection is not an unknown config-write
+            // outcome. Still run ALL final barriers before issuing the separate
+            // verified-unconnected receipt; every read/transport/drift failure
+            // below continues to throw and retain writer ownership.
             // One final whole-scope barrier, not merely the last restarted node.
             for (const plan of plans) {
                 const after = await readProfile(plan.node, plan.file);
@@ -637,7 +640,8 @@ class CascadeService {
                 } };
             }
             const updated = await CascadeLink.updateOne({ _id: linkId, active: true }, {
-                $set: { status: 'deployed', lastError: '', lastHealthCheck: new Date() },
+                $set: { status: established ? 'deployed' : 'offline',
+                    lastError: established ? '' : 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED', lastHealthCheck: new Date() },
             }, { maxTimeMS: 5000 });
             if (updated?.acknowledged !== true || updated.matchedCount !== 1) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
             const saved = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
@@ -645,8 +649,10 @@ class CascadeService {
                 || scopedId(saved.bridgeNode) !== scopedId(bridge)) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
             await revision();
             return { success: true, remoteQuiescent: true, receipt: {
-                kind: 'classic-scoped-reverse', linkId, topologyRevision: expectedTopologyRevision,
-                nodeIds: ids, preservedLinkIds: baseline, tunnelEstablished: true,
+                kind: established ? 'classic-scoped-reverse' : 'classic-scoped-reverse-unconnected',
+                linkId, topologyRevision: expectedTopologyRevision,
+                nodeIds: ids, preservedLinkIds: baseline, tunnelEstablished: established,
+                ...(!established ? { configurationVerified: true } : {}),
                 profiles: plans.map(plan => ({ nodeId: scopedId(plan.node), path: plan.file,
                     beforeSha256: scopedHash(plan.before.bytes), sha256: scopedHash(plan.bytes) })),
                 preservedProfiles: preserved.map(item => ({ nodeId: scopedId(item.node), path: item.file,

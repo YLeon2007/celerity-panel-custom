@@ -31,6 +31,7 @@
         CLASSIC_DEPLOY_IN_USE: 'Связь используется L2TP или группой маршрутов — classic запрещён',
         CLASSIC_DEPLOY_OWNER_VETO: 'Конфигурация узла принадлежит другому исполнителю',
         CLASSIC_DEPLOY_UNCERTAIN: 'Завершение classic не подтверждено; блокировка сохранена для восстановления',
+        CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED: 'Конфигурация применена и проверена, но соединение туннеля не установлено. Проверьте доступность узлов друг для друга. Повторный деплой и удаление доступны.',
         CLASSIC_DEPLOY_FENCE_LOST: 'Владение блокировкой classic не подтверждено — требуется проверка',
         CLASSIC_DEPLOY_PORT_CONFLICT: 'Порт туннеля уже занят на слушающем узле. Выберите другой порт и повторите деплой.',
         TUNNEL_PORT_IN_USE: 'Порт туннеля уже занят на слушающем узле. Выберите другой порт и повторите деплой.',
@@ -66,6 +67,10 @@
 
     function topologyCauseText(code) {
         if (typeof code !== 'string' || !code) return null;
+        if (code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
+            return (typeof window !== 'undefined' && window._networkI18n?.classicTunnelUnconfirmed)
+                || TOPOLOGY_CAUSE_TEXT_RU[code];
+        }
         if (['CLASSIC_DEPLOY_PORT_CONFLICT', 'TUNNEL_PORT_IN_USE'].includes(code)) {
             return (typeof window !== 'undefined' && window._networkI18n?.portCheckDeployConflict)
                 || TOPOLOGY_CAUSE_TEXT_RU[code];
@@ -1284,6 +1289,10 @@
         // particular, never fall back to an unscoped full-topology deploy.
         const error = snapshot?.autoDeployError
             || { code: snapshot?.autoDeployCauseCode || snapshot?.autoDeployStatus };
+        if (error.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
+            showToast(topologyCauseText(error.code), 'error');
+            return;
+        }
         const classicRefusal = typeof error.code === 'string' && error.code.startsWith('CLASSIC_DEPLOY_');
         const savedMessage = classicRefusal
             ? (i18n.savedClassicDeployUnconfirmed || 'Изменения сохранены; применение не подтверждено')

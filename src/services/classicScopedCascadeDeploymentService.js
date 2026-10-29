@@ -16,6 +16,7 @@ const MESSAGES = Object.freeze({
     CLASSIC_DEPLOY_PORT_CONFLICT: 'The requested tunnel port is already in use on the source node; edit the port and retry',
     CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE: 'Source port inspection could not be completed; no deployment was started',
     CLASSIC_DEPLOY_UNCERTAIN: 'Classic deployment completion is unproved; ownership retained for recovery',
+    CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED: 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes; retry and checked deletion remain available.',
     CLASSIC_DEPLOY_FENCE_LOST: 'Classic deployment ownership could not be confirmed or released',
     TOPOLOGY_DEPLOYMENT_UNAVAILABLE: 'Classic deployment capabilities are unavailable',
     STALE_TOPOLOGY_REVISION: 'Topology revision changed; reload before applying',
@@ -49,6 +50,26 @@ function checkedCompletion(result, { linkId, expectedTopologyRevision, baselineL
         || !sameList(receipt.nodeIds, [...endpoints].sort())
         || !sameList(receipt.preservedLinkIds, baselineLinkIds)
         || !Array.isArray(receipt.profiles) || !Array.isArray(receipt.preservedProfiles)) return false;
+    return checkedApplyProfiles(receipt, endpoints);
+}
+
+// Known configuration completion, NOT a connected-tunnel success. Only this
+// distinct full four-profile proof may settle ownership before a public warning.
+function checkedUnconnectedCompletion(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints }) {
+    const receipt = result?.receipt;
+    if (result?.success !== true || result?.remoteQuiescent !== true
+        || Object.keys(result).sort().join(',') !== 'receipt,remoteQuiescent,success'
+        || !receipt || Object.keys(receipt).sort().join(',') !== 'configurationVerified,kind,linkId,nodeIds,preservedLinkIds,preservedProfiles,profiles,topologyRevision,tunnelEstablished'
+        || receipt.kind !== 'classic-scoped-reverse-unconnected' || receipt.configurationVerified !== true
+        || receipt.tunnelEstablished !== false || receipt.linkId !== linkId
+        || receipt.topologyRevision !== expectedTopologyRevision
+        || !sameList(receipt.nodeIds, [...endpoints].sort())
+        || !sameList(receipt.preservedLinkIds, baselineLinkIds)
+        || !Array.isArray(receipt.profiles) || !Array.isArray(receipt.preservedProfiles)) return false;
+    return checkedApplyProfiles(receipt, endpoints);
+}
+
+function checkedApplyProfiles(receipt, endpoints) {
     const [source, target] = endpoints;
     const key = (node, path) => `${node}:${path}`;
     const requiredChanges = [key(source, MAIN_PROFILE), key(target, BRIDGE_PROFILE)];
@@ -428,8 +449,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 || !sameList(row.classicLifecycleAttempt?.nodeIds, claimed.endpoints)
                 || !sameList(row.classicLifecycleAttempt?.baselineLinkIds, claimed.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
         }
-        // Everything below is AFTER acquisition. Every refusal keeps ownership;
-        // no error/timeout/partial completion can authorize a successor writer.
+        // Everything below is AFTER acquisition. Errors/timeouts/partial proofs
+        // keep ownership. A full verified-unconnected receipt is separately
+        // settled before warning; it does not claim a connected tunnel.
+        let unconnectedSettled = false;
         try {
             await verifyFence();
             await assertNoCompetingWork();
@@ -443,7 +466,9 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             const method = isDelete ? 'removeScopedClassicLink' : 'deployScopedClassicLink';
             if (typeof core[method] !== 'function') throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
             const result = await core[method]({ linkId, expectedTopologyRevision, baselineLinkIds });
-            if (!(isDelete ? checkedRemoval : checkedCompletion)(result, { linkId, expectedTopologyRevision, baselineLinkIds, endpoints })) {
+            const context = { linkId, expectedTopologyRevision, baselineLinkIds, endpoints };
+            const unconnected = !isDelete && checkedUnconnectedCompletion(result, context);
+            if (!unconnected && !(isDelete ? checkedRemoval : checkedCompletion)(result, context)) {
                 throw failure('CLASSIC_DEPLOY_UNCERTAIN');
             }
             await verifyFence();
@@ -496,11 +521,16 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 if (await m.CascadeLink.exists({ _id: linkId }).setOptions(READ)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
                 return { revision, deployedRevision: claimed.deployedRevision };
             }
+            if (unconnected) {
+                unconnectedSettled = true;
+                throw failure('CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED');
+            }
             return { status: 'succeeded', executionMode: 'classic', topologyRevision: expectedTopologyRevision };
         } catch (error) {
             diagnose(error, 'held-dispatch-or-settlement');
             // A code from a held callback cannot certify a pre-dispatch refusal.
-            const safeCode = !['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'].includes(error?.code)
+            const safeCode = !(error?.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED' && !unconnectedSettled)
+                && !['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'].includes(error?.code)
                 && Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN';
             throw failure(safeCode);
         }

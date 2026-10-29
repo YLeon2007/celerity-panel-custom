@@ -275,7 +275,7 @@ test('both actual form templates expose accessible localized port status beside 
     }
     for (const locale of ['ru', 'en']) {
         const labels = require('../src/locales/' + locale + '.json').network;
-        for (const key of ['portCheckChecking', 'portCheckOccupied', 'portCheckUnknown', 'portCheckAvailable', 'portCheckDeployConflict']) {
+        for (const key of ['portCheckChecking', 'portCheckOccupied', 'portCheckUnknown', 'portCheckAvailable', 'portCheckDeployConflict', 'classicTunnelUnconfirmed']) {
             assert.equal(typeof labels[key], 'string', locale + ':' + key);
             assert(view.includes("JSON.stringify(t('network." + key + "'))"), 'EJS must pass ' + key + ' to network.js');
         }
@@ -296,6 +296,23 @@ test('manual Deploy and saved auto-deploy conflict use readable RU/EN port diagn
         await save(saved);
         assert(saved.toasts.some(([message, type]) => type === 'error' && expected.test(message)));
         assert(!saved.toasts.some(([message]) => message.includes('do-not-display')));
+    }
+});
+
+test('verified-unconnected manual and auto warning is localized and never claims retained locks', async () => {
+    for (const locale of ['ru', 'en']) {
+        const expected = locale === 'ru' ? /конфигурация.*проверена/i : /configuration.*verified/i;
+        const error = { code: 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED', message: 'secret=do-not-display' };
+        const h = browserHarness({ livePorts: true, locale,
+            deployResponse: { status: 409, body: { error } } });
+        await h.window._cascadeDeploy(LINK_ID);
+        assert(h.toasts.some(([message, type]) => type === 'error' && expected.test(message)));
+        const saved = browserHarness({ livePorts: true, locale, autoDeployError: error });
+        await saved.ui.openAddLinkModal(); await save(saved);
+        assert(saved.toasts.some(([message, type]) => type === 'error' && expected.test(message)));
+        for (const [message] of [...h.toasts, ...saved.toasts]) {
+            assert.doesNotMatch(message, /do-not-display|Проверьте состояние и блокировки|блокировка сохранена|ownership retained/i);
+        }
     }
 });
 

@@ -151,6 +151,35 @@ test('checked removal accepts an exact applied standalone portal and preserves i
     assert.equal(f.locks.size, 0);
 });
 
+test('verified unconnected portal settles offline and remains physically removable', async t => {
+    const f = fixture(t, { fault({ command }) {
+        if (!command.includes('ss -tnH')) return;
+        const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+        return { code: 0, stderr: '', stdout: `\n${marker}\n` };
+    } });
+    f.nodes[SOURCE].cascadeRole = 'portal';
+    const result = await f.run();
+    assert.equal(result.success, true); assert.equal(result.remoteQuiescent, true);
+    assert.equal(result.receipt.kind, 'classic-scoped-reverse-unconnected');
+    assert.equal(result.receipt.configurationVerified, true); assert.equal(result.receipt.tunnelEstablished, false);
+    assert.equal(f.target.status, 'offline'); assert.equal(f.target.lastError, 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED');
+    assert.equal(f.locks.size, 0);
+    assert.equal((await remove(f)).receipt.targetAbsent, true); assert.equal(f.locks.size, 0);
+});
+
+test('unconnected does not bypass the final preserved-profile barrier', async t => {
+    let socketsSeen = false;
+    const f = fixture(t, { fault({ command }) {
+        if (!command.includes('ss -tnH')) return;
+        socketsSeen = true;
+        const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+        f.files.set(`${SOURCE}:${TRANSIT}`, JSON.stringify({ changed: true }));
+        return { code: 0, stderr: '', stdout: `\n${marker}\n` };
+    } });
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT' });
+    assert.equal(socketsSeen, true); assert.equal(f.locks.size, 2); assert.equal(f.target.status, 'pending');
+});
+
 for (const security of ['none', 'reality']) test(`standalone portal full apply replay remove recreate lifecycle (${security})`, async t => {
     const f = fixture(t);
     f.nodes[SOURCE].cascadeRole = 'portal';
@@ -1125,9 +1154,12 @@ test('an unrelated established peer is not target tunnel proof', async t => {
         const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
         return { code: 0, stderr: '', stdout: `0 0 192.0.2.1:10096 198.51.100.55:40000\n\n${marker}\n` };
     } });
-    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED' });
-    assert.equal(f.locks.size, 2);
-    assert.equal(f.target.status, 'pending');
+    const result = await f.run();
+    assert.equal(result.receipt.kind, 'classic-scoped-reverse-unconnected');
+    assert.equal(result.receipt.tunnelEstablished, false);
+    assert.equal(result.receipt.configurationVerified, true);
+    assert.equal(f.locks.size, 0);
+    assert.equal(f.target.status, 'offline');
 });
 
 test('a timed-out foreground writer stays fenced even after late completion', async t => {

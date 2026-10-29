@@ -151,6 +151,49 @@ function harness(overrides = {}) {
 const input = (linkIds = [LINK]) => ({ expectedTopologyRevision: 7,
     scope: { kind: 'link.apply', linkId: LINK, linkIds } });
 
+test('verified unconnected settlement warns without poisoning a manual retry or delete', async () => {
+    const h = harness({ work({ result }) {
+        result.receipt.kind = 'classic-scoped-reverse-unconnected';
+        result.receipt.configurationVerified = true; result.receipt.tunnelEstablished = false;
+        return result;
+    } });
+    h.rows.HyNode[0].cascadeRole = 'portal';
+    for (let i = 0; i < 2; i++) {
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED' });
+        assert.equal(h.state().replacementReservation, undefined); assert.equal(h.state().classicLifecycleAttempt, undefined);
+        assert.equal(h.state().classicLifecycleLastSettlement.phase, 'succeeded');
+    }
+    assert.equal(h.calls.remote.length, 2);
+    await h.service.deleteLink(deletion());
+    assert.equal(h.rows.CascadeLink.length, 0); assert.equal(h.state().revision, 8);
+});
+
+test('verified unconnected receipt cannot hide a failed settlement', async () => {
+    const h = harness({ releaseFailure: true, work({ result }) {
+        result.receipt.kind = 'classic-scoped-reverse-unconnected';
+        result.receipt.configurationVerified = true; result.receipt.tunnelEstablished = false;
+        return result;
+    } });
+    await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
+    assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);
+});
+
+test('unconnected flags and partial or failed proof cannot authorize release', async () => {
+    for (const change of [r => { r.receipt.configurationVerified = false; },
+        r => { delete r.receipt.configurationVerified; }, r => { r.remoteQuiescent = false; },
+        r => { r.receipt.profiles.pop(); }, r => { r.receipt.preservedProfiles.pop(); },
+        r => { r.receipt.topologyRevision++; }, r => { r.receipt.tunnelEstablished = true; },
+        r => { r.receipt.extra = 'not a completion protocol'; }]) {
+        const h = harness({ work({ result }) {
+            result.receipt.kind = 'classic-scoped-reverse-unconnected';
+            result.receipt.configurationVerified = true; result.receipt.tunnelEstablished = false; change(result);
+            return result;
+        } });
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+        assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);
+    }
+});
+
 test('unsupported endpoint capability refuses before preview or topology claim', async () => {
     for (const change of [nodes => { nodes[0].cascadeRole = 'bridge'; },
         nodes => { nodes[0].active = false; }, nodes => { nodes[0].type = 'hysteria'; },
@@ -712,7 +755,7 @@ test('failed read-only inspection never claims writer effects or ownership', asy
 });
 
 test('post-claim port codes and adapter not-dispatched flags cannot authorize safe refusal or release', async () => {
-    for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE']) {
+    for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED']) {
         const h = harness({ work: () => { throw Object.assign(Error('password=secret'), { code, notDispatched: true }); } });
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
         assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);

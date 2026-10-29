@@ -1491,6 +1491,7 @@
     "portCheckUnknown": "Could not check port {port} on listening node {node}. Availability is unknown; deployment will check again.",
     "portCheckAvailable": "Port {port} is available on listening node {node} at the time of this check. Deployment will check again.",
     "portCheckDeployConflict": "The tunnel port is already in use on the listening node. Choose another port and retry deployment.",
+    "classicTunnelUnconfirmed": "Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.",
     "routeEntry": "Entry",
     "routeExit": "Exit",
     "routeEncryption": "Tunnel encryption",
