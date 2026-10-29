@@ -257,7 +257,12 @@ class CascadeService {
         const scopePin = scopedScopePin(scope);
         const source = await HyNode.findById(scopedId(scope.target.portalNode)).setOptions({ maxTimeMS: 5000 }).lean();
         const bridge = await HyNode.findById(scopedId(scope.target.bridgeNode)).setOptions({ maxTimeMS: 5000 }).lean();
-        if (source?.type !== 'xray' || source?.cascadeRole !== 'relay' || source.active !== true
+        // Legacy standalone portals may be checked-removed, but this does not
+        // widen apply admission. The same upstream/shared-source, whole-profile
+        // ownership and pending-absence checks still run before any mutation.
+        const sourceRoleSupported = source?.cascadeRole === 'relay'
+            || (remove && source?.cascadeRole === 'portal');
+        if (source?.type !== 'xray' || !sourceRoleSupported || source.active !== true
             || !bridge || bridge.active !== true || !scopedSourceHost(source.ip) || !net.isIP(bridge.ip || '')
             || [source, bridge].some(node => !node.ssh?.password && !node.ssh?.privateKey)) {
             throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED');

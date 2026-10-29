@@ -124,6 +124,48 @@ function fixture(t, options = {}) {
         run: args => cascade.deployScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args }) };
 }
 
+test('checked absent pending removal accepts a standalone portal without changing any profile', async t => {
+    const f = fixture(t);
+    f.nodes[SOURCE].cascadeRole = 'portal';
+    f.files.delete(`${SOURCE}:${TRANSIT}`);
+    const before = new Map(f.files);
+    const result = await remove(f);
+    assert.equal(result.success, true);
+    assert.equal(result.receipt.targetAbsent, true);
+    assert.deepEqual(f.files, before);
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.commands.some(row => /mv --|systemctl restart/.test(row.command)), false);
+    assert.equal(f.locks.size, 0);
+});
+
+test('checked removal accepts an exact applied standalone portal and preserves its shared bridge sibling', async t => {
+    const f = fixture(t);
+    await f.run();
+    f.nodes[SOURCE].cascadeRole = 'portal';
+    const sourceTransit = f.files.get(`${SOURCE}:${TRANSIT}`);
+    const result = await remove(f);
+    assert.equal(result.success, true);
+    assert.equal(result.receipt.targetAbsent, true);
+    assert.equal(f.files.get(`${SOURCE}:${TRANSIT}`), sourceTransit);
+    assert.deepEqual(JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`)), JSON.parse(f.original.get(`${BRIDGE}:${TRANSIT}`)));
+    assert.equal(f.locks.size, 0);
+});
+
+test('portal removal support does not authorize portal apply or a foreign source role', async t => {
+    const f = fixture(t);
+    f.nodes[SOURCE].cascadeRole = 'portal';
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
+    assert.equal(f.commands.length, 0);
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.locks.size, 2);
+    const g = fixture(t);
+    g.nodes[SOURCE].cascadeRole = 'bridge';
+    await assert.rejects(remove(g), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
+    assert.equal(g.commands.length, 0);
+    assert.equal(g.writes.length, 0);
+    assert.equal(g.locks.size, 2);
+});
+
 test('runtime-only collision under both node fences refuses before staging and retains uncertain generations', async t => {
     const f = fixture(t, { fault({ command }) {
         if (!command.includes('ss -H -ltnp')) return;
