@@ -26,6 +26,7 @@ const {
     createClassicScopedCascadeDeploymentService,
 } = require('../services/classicScopedCascadeDeploymentService');
 const { requireScope } = require('../middleware/auth');
+const { issueClassicLifecycleGrant } = require('../services/classicLifecycleAuthorization');
 
 const LINK_POPULATE_SELECT = 'name ip flag status';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
@@ -46,6 +47,13 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_TOPOLOGY_DRAFT', 422],
     ['TOPOLOGY_DEPLOY_BUSY', 409],
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
+    ['CLASSIC_DEPLOY_UNSUPPORTED', 422],
+    ['CLASSIC_DEPLOY_BUSY', 409],
+    ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409],
+    ['CLASSIC_DEPLOY_IN_USE', 409],
+    ['CLASSIC_DEPLOY_OWNER_VETO', 409],
+    ['CLASSIC_DEPLOY_UNCERTAIN', 409],
+    ['CLASSIC_DEPLOY_FENCE_LOST', 409],
     ['TOPOLOGY_INTENT_BACKLOG_FULL', 429],
     ['TOPOLOGY_INTENT_KEY_CONFLICT', 409],
     ['TOPOLOGY_INTENT_NOT_FOUND', 404],
@@ -422,9 +430,8 @@ function createCascadeLinksRouter({
         return writeService;
     };
     let coordinator = topologyCoordinator;
-    // The scoped operation coordinator is resolved lazily and only on an
-    // explicit autoDeploy opt-in: merely requiring this router must never
-    // construct (or start) the topology runtime.
+    // Resolve lazily only for explicit deploy or checked classic deletion;
+    // importing this router must never construct or start the runtime.
     const getTopologyCoordinator = () => {
         if (!coordinator) {
             if (isClassicProductionDeploymentEnabled(deploymentEnv)) {
@@ -736,6 +743,12 @@ function createCascadeLinksRouter({
                         : [],
                 };
             }
+            // Server-owned authorization is inserted atomically with this new
+            // draft, for save-only and auto creates alike. Never adopt old rows.
+            if (linkMode === 'reverse' && isClassicProductionDeploymentEnabled(deploymentEnv)) {
+                const grant = issueClassicLifecycleGrant(link, deploymentEnv);
+                if (grant !== undefined) link.classicLifecycleGrant = grant;
+            }
             if (link.autoDeploy === true && isClassicProductionDeploymentEnabled(deploymentEnv)) {
                 if (linkMode !== 'reverse') {
                     throw new RequestValidationError(
@@ -784,7 +797,12 @@ function createCascadeLinksRouter({
                 });
                 await invalidateCaches();
                 const finalSnapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
-                logger.info(`[Cascade Links API] Created and auto-deployed ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
+                const creationOutcome = autoDeploy.autoDeployResult?.status === 'succeeded'
+                    ? 'Created and auto-deployed'
+                    : autoDeploy.autoDeployStatus === 'blocked'
+                        ? 'Created; auto-deploy blocked for'
+                        : 'Created; auto-deploy queued for';
+                logger.info(`[Cascade Links API] ${creationOutcome} ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
                 return res.status(201).json({
                     ...finalSnapshot,
                     ...autoDeploy,
@@ -1070,7 +1088,17 @@ function createCascadeLinksRouter({
                 );
             }
             const expectedTopologyRevision = normalizeExpectedTopologyRevision(req.body);
-            const revisions = await getWriteService().deleteLink({
+            // A draft-only delete can strand live classic configuration. The
+            // lifecycle coordinator owns checked removal and atomic settlement,
+            // even when issuing new durable grants is disabled.
+            const deletionService = isClassicProductionDeploymentEnabled(deploymentEnv)
+                ? getTopologyCoordinator() : getWriteService();
+            if (typeof deletionService?.deleteLink !== 'function') {
+                throw Object.assign(new Error('Checked cascade deletion is unavailable'), {
+                    code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+                });
+            }
+            const revisions = await deletionService.deleteLink({
                 expectedTopologyRevision,
                 linkId: req.params.id,
             });

@@ -11,6 +11,11 @@ const CascadeTopologyState = require('../../modules/relay-l2tp/models/cascadeTop
 const cascadeService = require('../../services/cascadeService');
 const cache = require('../../services/cacheService');
 const logger = require('../../utils/logger');
+const {
+    isClassicProductionDeploymentEnabled,
+    createClassicScopedCascadeDeploymentService,
+} = require('../../services/classicScopedCascadeDeploymentService');
+const { issueClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
 
 async function invalidateCascadeCache() {
     await cache.invalidateAllSubscriptions();
@@ -89,6 +94,21 @@ function getDraftWriteService() {
     return draftWriteService;
 }
 
+let classicTopologyCoordinator;
+function getClassicTopologyCoordinator() {
+    if (!classicTopologyCoordinator) {
+        classicTopologyCoordinator = createClassicScopedCascadeDeploymentService({
+            env: process.env,
+            HyNode, CascadeLink, CascadeTopologyState,
+            CascadeRouteGroup: require('../../modules/relay-l2tp/models/cascadeRouteGroupModel'),
+            RelayL2tpState: require('../../modules/relay-l2tp/models/relayL2tpStateModel'),
+            TopologyOperation: require('../../modules/relay-l2tp/models/topologyOperationModel'),
+            NodeOperationLock: require('../../modules/relay-l2tp/models/nodeOperationLockModel'),
+        });
+    }
+    return classicTopologyCoordinator;
+}
+
 async function manageCascade(args, emit) {
     const parsed = manageCascadeSchema.parse(args);
     const { action, id, data = {}, expectedTopologyRevision } = parsed;
@@ -155,6 +175,10 @@ async function manageCascade(args, emit) {
                 muxEnabled: false,
                 muxConcurrency: 8,
             };
+            if (linkMode === 'reverse' && isClassicProductionDeploymentEnabled(process.env)) {
+                const grant = issueClassicLifecycleGrant(link, process.env);
+                if (grant !== undefined) link.classicLifecycleGrant = grant;
+            }
             const revisions = await getDraftWriteService().createLink({ expectedTopologyRevision, link });
 
             await invalidateCascadeCache();
@@ -188,7 +212,14 @@ async function manageCascade(args, emit) {
             if (!id) throw new Error('id is required for delete');
             const link = await CascadeLink.findById(id);
             if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-            const revisions = await getDraftWriteService().deleteLink({ expectedTopologyRevision, linkId: id });
+            const deletionService = isClassicProductionDeploymentEnabled(process.env)
+                ? getClassicTopologyCoordinator() : getDraftWriteService();
+            if (typeof deletionService?.deleteLink !== 'function') {
+                throw Object.assign(new Error('Checked cascade deletion is unavailable'), {
+                    code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+                });
+            }
+            const revisions = await deletionService.deleteLink({ expectedTopologyRevision, linkId: id });
             await invalidateCascadeCache();
             logger.info(`[MCP] Deleted cascade link ${link.name}`);
             return { success: true, message: `Link '${link.name}' deleted`,
@@ -204,6 +235,13 @@ async function manageCascade(args, emit) {
         }
 
         case 'undeploy': {
+            if (isClassicProductionDeploymentEnabled(process.env)) {
+                return {
+                    success: false,
+                    code: 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED',
+                    error: 'Use delete with expectedTopologyRevision for checked classic removal, or the HTTP revision-safe deploy path',
+                };
+            }
             if (!id) throw new Error('id is required for undeploy');
             if (!await CascadeLink.findById(id)) return { error: `Cascade link '${id}' not found`, code: 404 };
             const link = await require('../../modules/relay-l2tp/services/legacyCascadeUndeploy')

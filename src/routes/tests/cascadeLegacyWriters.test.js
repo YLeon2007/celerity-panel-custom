@@ -112,6 +112,90 @@ async function httpUndeploy(body = {}) {
     } finally { await new Promise(resolve => server.close(resolve)); }
 }
 
+const SYNTHETIC_CLASSIC_ENV = Object.freeze({
+    PANEL_DOMAIN: 'lm1.infograd.online', L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
+    L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: linkId,
+    TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false',
+    CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED: 'true',
+    CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY: 'a'.repeat(64), // Fixture only, never a deployed key.
+});
+async function withSyntheticClassicEnv(work) {
+    const saved = Object.fromEntries(Object.keys(SYNTHETIC_CLASSIC_ENV).map(key => [key, process.env[key]]));
+    Object.assign(process.env, SYNTHETIC_CLASSIC_ENV);
+    try { return await work(); } finally {
+        for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key]; else process.env[key] = value;
+        }
+    }
+}
+async function createGrantedDraft(ingress) {
+    const data = { name: 'granted synthetic', portalNodeId: ids[0], bridgeNodeId: ids[1],
+        mode: 'reverse', tunnelPort: 10087, autoDeploy: false, classicLifecycleGrant: 'b'.repeat(64) };
+    if (ingress === 'MCP') return withSyntheticClassicEnv(() => manageCascade({
+        action: 'create', expectedTopologyRevision: 7, data,
+    }, () => {}));
+    const { createCascadeLinksRouter } = require('../cascadeLinks');
+    const app = express();
+    app.use(express.json());
+    app.use((req, res, next) => { req.session = { authenticated: true }; next(); });
+    app.use(createCascadeLinksRouter({ deploymentEnv: SYNTHETIC_CLASSIC_ENV,
+        maintainAutoL2tpPathsFn: async () => {}, invalidateSubscriptions: async () => {},
+        invalidateTopology: async () => {},
+    }));
+    const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+    try {
+        const response = await fetch(`http://127.0.0.1:${server.address().port}/`, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ expectedTopologyRevision: 7, ...data }),
+        });
+        return { status: response.status, body: await response.json() };
+    } finally { await new Promise(resolve => server.close(resolve)); }
+}
+for (const ingress of ['HTTP', 'MCP']) {
+    test(`${ingress} lifecycle grant survives the real draft transaction and is hidden on default reads`, local, async () => {
+        await reset();
+        const result = await createGrantedDraft(ingress);
+        if (ingress === 'HTTP') assert.equal(result.status, 201, JSON.stringify(result.body));
+        else assert.equal(result.success, true);
+        const stored = await CascadeLink.findOne({ name: 'granted synthetic' }).select('+classicLifecycleGrant').lean();
+        const { hasClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
+        assert.equal(hasClassicLifecycleGrant(stored, SYNTHETIC_CLASSIC_ENV), true);
+        assert.notEqual(stored.classicLifecycleGrant, 'b'.repeat(64));
+        assert.equal((await CascadeLink.findById(stored._id).lean()).classicLifecycleGrant, undefined);
+        assert.equal((await CascadeLink.findById(linkId).select('+classicLifecycleGrant').lean()).classicLifecycleGrant, undefined);
+        // New model context recovers durable authority without a route capability.
+        const reloaded = mongoose.connection.useDb('legacy_writers_scratch', { useCache: false })
+            .model('CascadeLink', CascadeLink.schema.clone());
+        assert.equal(hasClassicLifecycleGrant(await reloaded.findById(stored._id).select('+classicLifecycleGrant').lean(),
+            SYNTHETIC_CLASSIC_ENV), true);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 8);
+        assert.equal(remoteCalls, 0);
+    });
+    test(`${ingress} real transaction abort removes the inserted lifecycle grant with its draft`, local, async t => {
+        await reset();
+        let insertedGrantObserved = false;
+        t.mock.method(models.CascadeTopologyState, 'findOneAndUpdate', (filter, update, options) => ({
+            select() { return this; },
+            async lean() {
+                const inserted = await CascadeLink.findOne({ name: 'granted synthetic' })
+                    .select('+classicLifecycleGrant').session(options.session).lean();
+                insertedGrantObserved = require('../../services/classicLifecycleAuthorization')
+                    .hasClassicLifecycleGrant(inserted, SYNTHETIC_CLASSIC_ENV);
+                throw Object.assign(new Error('synthetic post-insert CAS failure'), { code: 'STALE_TOPOLOGY_REVISION' });
+            },
+        }));
+        if (ingress === 'HTTP') assert.equal((await createGrantedDraft(ingress)).status, 409);
+        else await assert.rejects(createGrantedDraft(ingress), { code: 'STALE_TOPOLOGY_REVISION' });
+        assert.equal(insertedGrantObserved, true, 'the refusal must follow an actual transaction-local insert');
+        assert.equal(await CascadeLink.countDocuments({ name: 'granted synthetic' }), 0);
+        assert.equal(await CascadeLink.countDocuments({ classicLifecycleGrant: { $exists: true } }), 0);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 7);
+        assert.equal(remoteCalls, 0);
+    });
+}
+
 test('MCP topology exposes the exact revision needed for a draft CAS', local, async () => {
     await reset();
     const topology = await getTopology();

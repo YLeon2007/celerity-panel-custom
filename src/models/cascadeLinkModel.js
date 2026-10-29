@@ -66,6 +66,12 @@ const cascadeLinkSchema = new mongoose.Schema({
     active: { type: Boolean, default: true },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
+    // Server-issued only at trusted create; legacy documents remain ungranted.
+    classicLifecycleGrant: {
+        type: String,
+        select: false,
+        validate: value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value),
+    },
     status: {
         type: String,
         enum: ['pending', 'staged', 'deployed', 'online', 'offline', 'error'],
