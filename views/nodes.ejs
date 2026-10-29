@@ -472,9 +472,9 @@ function nodeMetaFor(node) {
                 <div class="form-row">
                     <div class="form-group">
                         <label><%= t('network.tunnelPort') %></label>
-                        <input type="number" name="tunnelPort" class="form-input" value="10086" min="1" max="65535">
+                        <input type="number" name="tunnelPort" class="form-input" value="10086" min="1" max="65535" aria-describedby="tunnelPortHint portConflictHint">
                         <div class="form-hint" id="tunnelPortHint" style="margin-top:3px"><%= t('network.tunnelPortReverseHint') %></div>
-                        <div class="form-warning" id="portConflictHint" style="display:none;margin-top:5px"></div>
+                        <div class="form-warning" id="portConflictHint" role="status" aria-live="polite" style="display:none;margin-top:5px"></div>
                     </div>
                     <div class="form-group">
                         <label><%= t('network.tunnelProtocol') %></label>
@@ -653,7 +653,8 @@ function nodeMetaFor(node) {
                 <div class="form-row">
                     <div class="form-group">
                         <label><%= t('network.tunnelPort') %></label>
-                        <input type="number" id="quickTunnelPort" class="form-input" value="10086" min="1" max="65535">
+                        <input type="number" id="quickTunnelPort" class="form-input" value="10086" min="1" max="65535" aria-describedby="quickPortConflictHint">
+                        <div class="form-warning" id="quickPortConflictHint" role="status" aria-live="polite" style="display:none;margin-top:5px"></div>
                     </div>
                     <div class="form-group">
                         <label><%= t('network.tunnelProtocol') %></label>
@@ -1218,6 +1219,11 @@ window._networkI18n = {
     tunnelPortForwardHint: <%- JSON.stringify(t('network.tunnelPortForwardHint')) %>,
     realityTunnelHint: <%- JSON.stringify(t('network.realityTunnelHint')) %>,
     portConflictClientHint: <%- JSON.stringify(t('network.portConflictClientHint')) %>,
+    portCheckChecking: <%- JSON.stringify(t('network.portCheckChecking')) %>,
+    portCheckOccupied: <%- JSON.stringify(t('network.portCheckOccupied')) %>,
+    portCheckUnknown: <%- JSON.stringify(t('network.portCheckUnknown')) %>,
+    portCheckAvailable: <%- JSON.stringify(t('network.portCheckAvailable')) %>,
+    portCheckDeployConflict: <%- JSON.stringify(t('network.portCheckDeployConflict')) %>,
     routeEntry: <%- JSON.stringify(t('network.routeEntry')) %>,
     routeExit: <%- JSON.stringify(t('network.routeExit')) %>,
     routeEncryption: <%- JSON.stringify(t('network.routeEncryption')) %>,

@@ -32,6 +32,8 @@
         CLASSIC_DEPLOY_OWNER_VETO: 'Конфигурация узла принадлежит другому исполнителю',
         CLASSIC_DEPLOY_UNCERTAIN: 'Завершение classic не подтверждено; блокировка сохранена для восстановления',
         CLASSIC_DEPLOY_FENCE_LOST: 'Владение блокировкой classic не подтверждено — требуется проверка',
+        CLASSIC_DEPLOY_PORT_CONFLICT: 'Порт туннеля уже занят на слушающем узле. Выберите другой порт и повторите деплой.',
+        TUNNEL_PORT_IN_USE: 'Порт туннеля уже занят на слушающем узле. Выберите другой порт и повторите деплой.',
         INVALID_REQUEST: 'Некорректный запрос',
         INVALID_TOPOLOGY_REVISION: 'Некорректная ревизия топологии',
         STALE_TOPOLOGY_REVISION: 'Топология изменилась — обновите данные и повторите',
@@ -64,6 +66,10 @@
 
     function topologyCauseText(code) {
         if (typeof code !== 'string' || !code) return null;
+        if (['CLASSIC_DEPLOY_PORT_CONFLICT', 'TUNNEL_PORT_IN_USE'].includes(code)) {
+            return (typeof window !== 'undefined' && window._networkI18n?.portCheckDeployConflict)
+                || TOPOLOGY_CAUSE_TEXT_RU[code];
+        }
         return TOPOLOGY_CAUSE_TEXT_RU[code] || null;
     }
 
@@ -311,15 +317,7 @@
             updateLinkFormWarnings();
         });
 
-        // Portal/Bridge selects -> refresh port conflict hint
-        ['selectPortal', 'selectBridge'].forEach(function (id) {
-            var el = document.getElementById(id);
-            if (el) el.addEventListener('change', updateLinkFormWarnings);
-        });
-
-        // Tunnel port input -> refresh port conflict hint
-        var tpInput = document.querySelector('#addLinkForm [name="tunnelPort"]');
-        if (tpInput) tpInput.addEventListener('input', updateLinkFormWarnings);
+        initPortWarnings();
 
         // Geo routing toggle
         var geoCheck = document.getElementById('geoRoutingEnabled');
@@ -1072,6 +1070,7 @@
     }
 
     async function openAddLinkModal() {
+        resetPortWarning('main');
         const modal       = document.getElementById('addLinkModal');
         const portalSelect = document.getElementById('selectPortal');
         const bridgeSelect = document.getElementById('selectBridge');
@@ -1192,6 +1191,7 @@
     }
 
     function closeModal() {
+        resetPortWarning('main');
         document.getElementById('addLinkModal').classList.remove('active');
         document.getElementById('addLinkForm').reset();
         linkModalMode = 'create';
@@ -1296,6 +1296,7 @@
 
     async function onAddLinkSubmit(e) {
         e.preventDefault();
+        if (portSubmissionBlocked('main')) return;
         const form = e.target;
         const btn  = form.querySelector('[type="submit"]');
         const linkId = form.linkId?.value || '';
@@ -1673,7 +1674,8 @@
                 // Show/hide tunnel domain field (reverse only)
                 var domGroup = document.getElementById('tunnelDomainGroup');
                 if (domGroup) domGroup.style.display = mode === 'forward' ? 'none' : '';
-                updateLinkFormWarnings();
+                if (inputId === 'quickLinkMode') schedulePortWarning('quick');
+                else updateLinkFormWarnings();
             });
         });
     }
@@ -1705,40 +1707,159 @@
                 : (i18n.tunnelPortReverseHint || 'In Reverse mode this port is listened on the Portal node.');
         }
 
-        // Port conflict check using cached links
-        var portConflict = document.getElementById('portConflictHint');
-        if (!portConflict) return;
-        portConflict.style.display = 'none';
-        portConflict.textContent = '';
+        schedulePortWarning('main');
+    }
 
-        var portalId = (form.portalNodeId || {}).value || '';
-        var bridgeId = (form.bridgeNodeId || {}).value || '';
-        var tunnelPort = parseInt((form.tunnelPort || {}).value, 10) || 10086;
-        var linkId = (document.getElementById('linkIdInput') || {}).value || '';
-        var checkNodeId = isForward ? bridgeId : portalId;
-        var checkField = isForward ? 'bridgeNode' : 'portalNode';
+    const portWarnings = {
+        main: { generation: 0, key: null, status: null, timer: null, deadline: null, controller: null },
+        quick: { generation: 0, key: null, status: null, timer: null, deadline: null, controller: null },
+    };
 
-        if (!checkNodeId || !_allLinks.length) return;
+    function portWarningContext(kind) {
+        const quick = kind === 'quick';
+        const form = document.getElementById('addLinkForm');
+        const value = id => document.getElementById(id)?.value || '';
+        const mode = quick ? value('quickLinkMode') : (form?.mode?.value || 'reverse');
+        const portal = quick ? value('quickPortalId') : (form?.portalNodeId?.value || '');
+        const bridge = quick ? value('quickBridgeId') : (form?.bridgeNodeId?.value || '');
+        const rawPort = quick ? value('quickTunnelPort') : (form?.tunnelPort?.value || '');
+        const linkId = quick ? '' : value('linkIdInput');
+        const nodeId = mode === 'forward' ? bridge : portal;
+        const port = /^\d+$/.test(rawPort) ? Number(rawPort) : NaN;
+        const modal = document.getElementById(quick ? 'quickLinkModal' : 'addLinkModal');
+        const valid = modal?.classList.contains('active') && /^[a-f0-9]{24}$/i.test(nodeId)
+            && (!linkId || /^[a-f0-9]{24}$/i.test(linkId))
+            && Number.isInteger(port) && port >= 1 && port <= 65535;
+        return { nodeId, port, linkId, key: valid ? JSON.stringify([nodeId, port, linkId, mode, portal, bridge]) : null };
+    }
 
-        var conflict = _allLinks.find(function (l) {
-            if (!l || !l.active) return false;
-            if (linkId && String(l._id) === linkId) return false;
-            var nodeRef = l[checkField];
-            var nid = nodeRef && typeof nodeRef === 'object' ? (nodeRef._id || '') : (nodeRef || '');
-            return String(nid) === checkNodeId && Number(l.tunnelPort) === tunnelPort;
+    function cachedPortConflict(context) {
+        return context.key && _allLinks.find(link => {
+            if (!link?.active || String(link._id) === context.linkId) return false;
+            // Each existing link has its own listening side, even in mixed modes.
+            const ref = link[link.mode === 'forward' ? 'bridgeNode' : 'portalNode'];
+            const nodeId = ref && typeof ref === 'object' ? ref._id : ref;
+            return String(nodeId || '') === context.nodeId && Number(link.tunnelPort) === context.port;
         });
+    }
 
-        if (conflict) {
-            portConflict.style.display = '';
-            portConflict.textContent =
-                (i18n.portConflictClientHint || 'This tunnel port is already used by another active link on the listening side.') +
-                ' (' + (conflict.name || 'link') + ')';
+    function portWarningText(key, fallback, context) {
+        return (i18n[key] || fallback).replace(/\{port\}/g, String(context.port))
+            .replace(/\{node\}/g, context.nodeId);
+    }
+
+    function renderPortWarning(kind, context) {
+        const hint = document.getElementById(kind === 'quick' ? 'quickPortConflictHint' : 'portConflictHint');
+        if (!hint) return;
+        const state = portWarnings[kind];
+        const conflict = cachedPortConflict(context);
+        const status = conflict ? 'occupied' : state.status;
+        hint.style.display = context.key ? '' : 'none';
+        hint.textContent = !context.key ? '' : status === 'occupied'
+            ? portWarningText('portCheckOccupied', 'Port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context)
+                + (conflict ? ' (' + (conflict.name || 'link') + ')' : '')
+            : status === 'available'
+                ? portWarningText('portCheckAvailable', 'Port {port} is available on listening node {node}. It will be checked again when saving or deploying.', context)
+                : status === 'unknown'
+                    ? portWarningText('portCheckUnknown', 'Could not check port {port} on listening node {node}. Availability is unknown; saving or deploying will check again.', context)
+                    : portWarningText('portCheckChecking', 'Checking port {port} on listening node {node}…', context);
+    }
+
+    function resetPortWarning(kind) {
+        const state = portWarnings[kind];
+        state.generation += 1;
+        clearTimeout(state.timer);
+        clearTimeout(state.deadline);
+        state.controller?.abort();
+        state.timer = state.deadline = state.controller = state.key = state.status = null;
+    }
+
+    function schedulePortWarning(kind) {
+        const context = portWarningContext(kind);
+        const state = portWarnings[kind];
+        if (context.key === state.key) { renderPortWarning(kind, context); return; }
+        resetPortWarning(kind);
+        state.key = context.key;
+        renderPortWarning(kind, context);
+        if (!context.key) return;
+        const generation = state.generation;
+        state.timer = setTimeout(async function () {
+            state.timer = null;
+            const controller = new AbortController();
+            state.controller = controller;
+            const current = () => state.generation === generation
+                && portWarningContext(kind).key === context.key;
+            const deadline = state.deadline = setTimeout(() => {
+                if (!current()) return;
+                state.generation += 1; // Ignore late JSON even if abort is not honored.
+                state.status = 'unknown';
+                state.controller = state.deadline = null;
+                controller.abort();
+                renderPortWarning(kind, context);
+            }, 10000);
+            try {
+                const query = new URLSearchParams({ nodeId: context.nodeId, port: String(context.port) });
+                if (context.linkId) query.set('linkId', context.linkId);
+                const response = await fetch('/api/cascade/links/port-check?' + query.toString(), {
+                    signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
+                });
+                if (response.status !== 200) throw new Error('Port check unavailable');
+                const result = await response.json();
+                if (result?.port !== context.port || typeof result.available !== 'boolean'
+                    || result.code !== (result.available ? null : 'TUNNEL_PORT_IN_USE')) {
+                    throw new Error('Invalid port check response');
+                }
+                if (current()) state.status = result.available ? 'available' : 'occupied';
+            } catch (_) {
+                if (current()) state.status = 'unknown';
+            } finally {
+                clearTimeout(deadline);
+                if (current()) {
+                    state.controller = state.deadline = null;
+                    renderPortWarning(kind, context);
+                }
+            }
+        }, 300);
+    }
+
+    function portSubmissionBlocked(kind) {
+        schedulePortWarning(kind);
+        const context = portWarningContext(kind);
+        const deploying = kind === 'quick' ? document.getElementById('quickAutoDeploy')?.checked
+            : document.getElementById('addLinkForm')?.autoDeploy?.checked;
+        if (deploying && context.key && (cachedPortConflict(context) || portWarnings[kind].status === 'occupied')) {
+            showToast(portWarningText('portCheckOccupied',
+                'Port {port} is already in use on listening node {node}. Choose another port before deploying. Saving without deployment is still possible.', context), 'error');
+            return true;
         }
+        // Unknown/checking is advisory, not a new save-only restriction. The
+        // server must recheck the actual listener before any deployment write.
+        return false;
+    }
+
+    function initPortWarnings() {
+        ['selectPortal', 'selectBridge'].forEach(id => {
+            document.getElementById(id)?.addEventListener('change', updateLinkFormWarnings);
+        });
+        const port = document.querySelector('#addLinkForm [name="tunnelPort"]');
+        ['input', 'change'].forEach(event => port?.addEventListener(event, updateLinkFormWarnings));
+        ['quickTunnelPort', 'quickPortalId', 'quickBridgeId'].forEach(id => {
+            ['input', 'change'].forEach(event => document.getElementById(id)?.addEventListener(event,
+                () => schedulePortWarning('quick')));
+        });
+        // Also covers quick-form opening by graph/UI integrations and closing
+        // before an outstanding response arrives. Never poll a hidden modal.
+        ['main', 'quick'].forEach(kind => {
+            const modal = document.getElementById(kind === 'quick' ? 'quickLinkModal' : 'addLinkModal');
+            if (modal) new MutationObserver(() => schedulePortWarning(kind))
+                .observe(modal, { attributes: true, attributeFilter: ['class'] });
+        });
     }
 
     // ==================== QUICK LINK MODAL ====================
 
     function closeQuickModal() {
+        resetPortWarning('quick');
         var modal = document.getElementById('quickLinkModal');
         if (modal) modal.classList.remove('active');
     }
@@ -1751,10 +1872,12 @@
         if (!pId || !bId) return;
         var tmpId = pId.value; pId.value = bId.value; bId.value = tmpId;
         var tmpName = pName.textContent; pName.textContent = bName.textContent; bName.textContent = tmpName;
+        schedulePortWarning('quick');
     }
 
     async function onQuickLinkSubmit(e) {
         e.preventDefault();
+        if (portSubmissionBlocked('quick')) return;
         var data = {
             name: document.getElementById('quickLinkName').value,
             mode: document.getElementById('quickLinkMode').value || 'reverse',
