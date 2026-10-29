@@ -52,6 +52,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409],
     ['CLASSIC_DEPLOY_IN_USE', 409],
     ['CLASSIC_DEPLOY_OWNER_VETO', 409],
+    ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
+    ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNCERTAIN', 503],
     ['CLASSIC_DEPLOY_FENCE_LOST', 503],
     ['TOPOLOGY_INTENT_BACKLOG_FULL', 429],
@@ -155,6 +157,8 @@ const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
     'CLASSIC_DEPLOY_SCOPE_CHANGED',
     'CLASSIC_DEPLOY_IN_USE',
     'CLASSIC_DEPLOY_OWNER_VETO',
+    'CLASSIC_DEPLOY_PORT_CONFLICT',
+    'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE',
     'CLASSIC_DEPLOY_UNCERTAIN',
     'CLASSIC_DEPLOY_FENCE_LOST',
 ]);
@@ -165,7 +169,11 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: code.startsWith('CLASSIC_DEPLOY_')
+        message: code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
+            ? 'The tunnel port is already in use on the source node; edit the port and retry'
+            : code === 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'
+                ? 'Port inspection was unavailable; no deployment was started'
+                : code.startsWith('CLASSIC_DEPLOY_')
             ? 'Classic deployment was not confirmed; inspect retained ownership before retrying'
             : code === 'TOPOLOGY_DEPLOY_BUSY'
                 ? 'Another topology deployment owns the slot; retry after it finishes'
@@ -404,6 +412,7 @@ function createCascadeLinksRouter({
         TopologyOperation,
         NodeOperationLock,
     }),
+    portCheckSSH = NodeSSH,
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
@@ -571,6 +580,38 @@ function createCascadeLinksRouter({
             if (!job) throw Object.assign(new Error('The auto-deploy job was not found'), { code: 'TOPOLOGY_INTENT_NOT_FOUND' });
             return res.json({ autoDeployJob: job });
         } catch (error) { return sendError(res, error, 'Get job'); }
+    });
+
+    router.get('/port-check', requireScope('nodes:read'), async (req, res) => {
+        res.set('Cache-Control', 'no-store');
+        const { nodeId, port: rawPort, linkId } = req.query;
+        const validId = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
+        if (Object.keys(req.query).some(key => !['nodeId', 'port', 'linkId'].includes(key))
+            || !validId(nodeId) || typeof rawPort !== 'string' || !/^[1-9]\d{0,4}$/.test(rawPort)
+            || Number(rawPort) > 65535 || (linkId !== undefined && !validId(linkId))) {
+            return res.status(400).json({ error: { code: 'INVALID_REQUEST', message: 'Invalid tunnel port check request' } });
+        }
+        const port = Number(rawPort);
+        try {
+            const read = { maxTimeMS: 5000, readPreference: 'primary', readConcern: { level: 'majority' } };
+            const node = await Node.findById(nodeId).setOptions(read).lean();
+            if (!node) return res.status(404).json({ error: { code: 'NODE_NOT_FOUND', message: 'Node was not found' } });
+            let target = null;
+            if (linkId !== undefined) {
+                const link = await Link.findById(linkId).populate('portalNode bridgeNode').setOptions(read).lean();
+                if (!link) return res.status(404).json({ error: { code: 'CASCADE_LINK_NOT_FOUND', message: 'Link was not found' } });
+                if (!['reverse', 'forward'].includes(link.mode ?? 'reverse')) throw Error('Unsupported listener mode');
+                const listener = (link.mode ?? 'reverse') === 'reverse' ? link.portalNode : link.bridgeNode;
+                if (link.active === true && scopedLinkEntityId(listener) === nodeId && link.tunnelPort === port) target = link;
+            }
+            const { preflightTunnelPort } = require('../services/classicScopedPortPreflight');
+            await preflightTunnelPort({ node, port, target }, { NodeSSH: portCheckSSH });
+            return res.json({ available: true, port, code: null });
+        } catch (error) {
+            if (error?.code === 'TUNNEL_PORT_IN_USE') return res.json({ available: false, port, code: 'TUNNEL_PORT_IN_USE' });
+            // Unknown is not free, and transport/config text is never public.
+            return res.status(503).json({ error: { code: 'TUNNEL_PORT_CHECK_UNAVAILABLE', message: 'Tunnel port inspection could not be completed' } });
+        }
     });
 
     router.get('/:id', requireScope('nodes:read'), async (req, res) => {

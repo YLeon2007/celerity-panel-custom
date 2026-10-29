@@ -124,6 +124,33 @@ function fixture(t, options = {}) {
         run: args => cascade.deployScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args }) };
 }
 
+test('runtime-only collision under both node fences refuses before staging and retains uncertain generations', async t => {
+    const f = fixture(t, { fault({ command }) {
+        if (!command.includes('ss -H -ltnp')) return;
+        const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+        return { code: 0, stdout: `LISTEN 0 128 0.0.0.0:10096 0.0.0.0:* users:(("foreign",pid=991,fd=3))\n\n${marker}\n`, stderr: '' };
+    } });
+    // A genuinely successful read-only preview is not a TOCTOU/write fence:
+    // a new runtime listener appearing afterward must still retain both locks.
+    const { preflightTunnelPort } = require('../classicScopedPortPreflight');
+    class PreviewSSH {
+        async connect() { assert.equal(f.locks.size, 0); }
+        disconnect() {}
+        async exec(command) {
+            assert.equal(f.locks.size, 0);
+            const marker = command.match(/C3_PORT_READ_[a-f0-9]+/)[0];
+            let text = '';
+            if (command.includes('C3_READ_CONFIG')) text = f.files.get(`${SOURCE}:${command.includes(TRANSIT) ? TRANSIT : MAIN}`);
+            return { code: 0, stdout: `${text}\n${marker}\n`, stderr: '' };
+        }
+    }
+    await preflightTunnelPort({ node: f.nodes[SOURCE], port: f.target.tunnelPort, target: f.target }, { NodeSSH: PreviewSSH });
+    assert.equal(f.events.some(([kind]) => kind === 'acquire'), false);
+    await assert.rejects(f.run(), { code: 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' });
+    assert.equal(f.writes.length, 0); assert.equal(f.locks.size, 2);
+    assert.deepEqual(f.files, f.original);
+});
+
 test('checked removal strips only exact target fragments and never publishes or deletes the draft', async t => {
     const f = fixture(t);
     await f.run();

@@ -46,14 +46,14 @@ function matches(row, filter) {
     });
 }
 function harness(overrides = {}) {
-    const calls = { remote: [], updates: [], owner: [], transactionActive: false };
+    const calls = { remote: [], preview: [], updates: [], owner: [], transactionActive: false };
     let state = { _id: 'singleton', revision: 7, deployedRevision: 5, replacementEpoch: 2,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0, ...overrides.state };
     const rows = {
         CascadeLink: [{ _id: LINK, portalNode: A, bridgeNode: B, mode: 'reverse', active: true,
-            status: 'pending' }, ...(overrides.links || [])],
-        HyNode: [{ _id: A, cascadeRole: 'relay', active: true, type: 'xray' },
-            { _id: B, cascadeRole: 'bridge', active: true, type: 'xray' },
+            status: 'pending', tunnelPort: 10086, tunnelUuid: 'local-target-uuid' }, ...(overrides.links || [])],
+        HyNode: [{ _id: A, cascadeRole: 'relay', active: true, type: 'xray', ip: '192.0.2.1', ssh: { password: 'fixture' } },
+            { _id: B, cascadeRole: 'bridge', active: true, type: 'xray', ip: '192.0.2.2' },
             { _id: C, cascadeRole: 'relay', active: true, type: 'xray' }],
         RelayL2tpState: overrides.relays || [], CascadeRouteGroup: overrides.groups || [],
         TopologyOperation: overrides.operations || [], TopologyCreateIntent: overrides.intents || [],
@@ -98,7 +98,32 @@ function harness(overrides = {}) {
             return state;
         }),
     };
-    const dependencies = { ...models, env: { ...env(), ...overrides.env },
+    class PreviewSSH {
+        constructor(node) { assert.equal(String(node._id), A); this.updatesBefore = calls.updates.length; }
+        async connect() {
+            assert.equal(calls.transactionActive, false, 'no SSH inside a retryable transaction');
+            assert.equal(state.replacementReservation, undefined, 'preview precedes topology claim');
+            assert.equal(rows.NodeOperationLock.length, 0);
+            calls.preview.push('connect');
+        }
+        async exec(command) {
+            assert.equal(calls.transactionActive, false);
+            assert.equal(calls.updates.length, this.updatesBefore, 'preview is read-only and before ownership writes');
+            assert.doesNotMatch(command, /\.stage|restart|ufw|firewall-cmd|\bmv\b/);
+            calls.preview.push(command);
+            if (overrides.previewError) throw Error('private password=redact');
+            const marker = command.match(/C3_PORT_READ_[a-f0-9]+/)[0];
+            let text = '';
+            if (command.includes('C3_READ_CONFIG')) text = command.includes(TRANSIT)
+                ? JSON.stringify(overrides.transit || { inbounds: [] }) : JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } });
+            if (command.includes('ss -')) text = overrides.sockets || '';
+            overrides.afterPreviewRead?.({ rows, state, command });
+            return { code: 0, stdout: `${text}\n${marker}\n`, stderr: '' };
+        }
+        disconnect() { calls.preview.push('disconnect'); }
+    }
+    const dependencies = { ...models, env: { ...env(), ...overrides.env }, NodeSSH: PreviewSSH,
+        logger: { warn(event) { calls.diagnostic = event; } },
         topologyManagesNodeConfig: async node => {
             assert.ok(calls.transactionActive || state.replacementReservation, 'ownership checked in claim transaction or held fence');
             calls.owner.push(String(node._id));
@@ -153,7 +178,7 @@ test('checked scoped completion returns synchronous classic result without IDs o
     const result = await h.service.queue(input());
     assert.deepEqual(result, { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 });
     assert.deepEqual(h.calls.remote, [{ linkId: LINK, expectedTopologyRevision: 7, baselineLinkIds: [] }]);
-    assert.deepEqual(h.calls.owner.sort(), [A, A, B, B]);
+    assert.deepEqual(h.calls.owner.sort(), [A, A, A, B, B, B]);
     assert.equal(h.state().revision, 7);
     assert.equal(h.state().deployedRevision, 5);
     assert.equal(h.state().replacementEpoch, 3);
@@ -228,6 +253,7 @@ test('stale revision and non-quiescent or uninitialized state refuse before rese
         const h = harness({ state });
         await assert.rejects(h.service.queue(input()), { code: state.revision ? 'STALE_TOPOLOGY_REVISION' : 'CLASSIC_DEPLOY_BUSY' });
         assert.equal(h.calls.remote.length, 0); assert.equal(h.calls.updates.length, 0);
+        assert.deepEqual(h.calls.preview, []);
     }
 });
 
@@ -239,6 +265,7 @@ test('active or orphaned operations, intent backlog, malformed queue counters an
         const h = harness(overrides);
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_BUSY' });
         assert.equal(h.calls.remote.length, 0); assert.equal(h.calls.updates.length, 0);
+        assert.deepEqual(h.calls.preview, []);
     }
 });
 
@@ -320,7 +347,11 @@ test('unknown reservation commit never dispatches or attempts speculative releas
     const h = harness();
     const connection = h.dependencies.CascadeTopologyState.db;
     const transaction = connection.transaction.bind(connection);
-    connection.transaction = async (...args) => { await transaction(...args); throw new Error('unknown commit password=secret'); };
+    connection.transaction = async (...args) => {
+        const result = await transaction(...args);
+        if (h.state().replacementReservation) throw new Error('unknown commit password=secret');
+        return result;
+    };
     await assert.rejects(h.service.queue(input()), { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
     assert.ok(h.state().replacementReservation); assert.equal(h.calls.remote.length, 0);
     assert.equal(h.calls.updates.length, 1);
@@ -333,7 +364,7 @@ test('graph drift after reservation and disabled/forward targets refuse under th
         const transaction = connection.transaction.bind(connection);
         connection.transaction = async (...args) => {
             const result = await transaction(...args);
-            Object.assign(h.rows.CascadeLink[0], change); return result;
+            if (h.state().replacementReservation) Object.assign(h.rows.CascadeLink[0], change); return result;
         };
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
         assert.ok(h.state().replacementReservation); assert.equal(h.calls.remote.length, 0);
@@ -603,7 +634,7 @@ test('fresh operation veto after claim refuses dispatch while retaining its admi
     const transaction = connection.transaction.bind(connection);
     connection.transaction = async (...args) => {
         const result = await transaction(...args);
-        h.rows.TopologyOperation.push({ status: 'committing' }); return result;
+        if (h.state().replacementReservation) h.rows.TopologyOperation.push({ status: 'committing' }); return result;
     };
     await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_BUSY' });
     assert.equal(h.calls.remote.length, 0); assert.ok(h.state().classicLifecycleAttempt);
@@ -626,6 +657,43 @@ test('sparse removal node IDs are not a typed completion receipt', async () => {
     const h = harness({ removeWork: ({ result }) => { result.receipt.nodeIds = [A, ,]; return result; } });
     await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
     assert.ok(h.state().replacementReservation); assert.equal(h.rows.CascadeLink.length, 1);
+});
+
+test('occupied preserved source port refuses before claim and leaves pending row editable', async () => {
+    const h = harness({ transit: { inbounds: [{ tag: 'conn-down-355c34b8', port: 10086 },
+        { tag: 'conn-down-355c3623', port: 10087 }] } });
+    const before = structuredClone(h.rows);
+    await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_PORT_CONFLICT' });
+    assert.deepEqual(h.rows, before);
+    assert.equal(h.calls.updates.length, 0); assert.equal(h.calls.remote.length, 0);
+    assert.equal(h.state().replacementEpoch, 2); assert.equal(h.state().classicLifecycleAttempt, undefined);
+    assert.ok(h.calls.preview.includes('connect')); assert.ok(h.calls.preview.includes('disconnect'));
+});
+
+test('runtime-only source listener refuses before claim', async () => {
+    const h = harness({ sockets: 'LISTEN 0 128 0.0.0.0:10086 0.0.0.0:* users:(("foreign",pid=991,fd=3))\n' });
+    await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_PORT_CONFLICT' });
+    assert.equal(h.calls.updates.length, 0); assert.equal(h.calls.remote.length, 0);
+});
+
+test('failed read-only inspection never claims writer effects or ownership', async () => {
+    const h = harness({ previewError: true });
+    await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE' });
+    assert.equal(h.calls.updates.length, 0); assert.equal(h.calls.remote.length, 0);
+    assert.equal(h.state().replacementEpoch, 2); assert.equal(h.rows.CascadeLink[0].status, 'pending');
+});
+
+test('post-claim port codes and adapter not-dispatched flags cannot authorize safe refusal or release', async () => {
+    for (const code of ['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE']) {
+        const h = harness({ work: () => { throw Object.assign(Error('password=secret'), { code, notDispatched: true }); } });
+        await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+        assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);
+        assert.equal(h.calls.updates.length, 1);
+        assert.deepEqual(Object.keys(h.calls.diagnostic).sort(), ['event', 'internalCode', 'linkId', 'operationId', 'phase']);
+        assert.equal(h.calls.diagnostic.internalCode, code); assert.equal(h.calls.diagnostic.linkId, LINK);
+        assert.equal(h.calls.diagnostic.phase, 'held-dispatch-or-settlement');
+        assert.doesNotMatch(JSON.stringify(h.calls.diagnostic), /password|secret|notDispatched/);
+    }
 });
 
 module.exports = { harness, input, completed, LINK, A, B, C, NEIGHBOR, PENDING, FOREIGN };

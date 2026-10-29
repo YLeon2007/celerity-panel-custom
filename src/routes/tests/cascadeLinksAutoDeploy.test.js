@@ -564,7 +564,8 @@ test('PUT exact completed classic result has its own truthful contract without o
 
 test('PUT classic refusals preserve safe codes and never pretend that completion was queued', async () => {
     for (const code of ['CLASSIC_DEPLOY_BUSY', 'CLASSIC_DEPLOY_UNSUPPORTED', 'CLASSIC_DEPLOY_SCOPE_CHANGED',
-        'CLASSIC_DEPLOY_IN_USE', 'CLASSIC_DEPLOY_OWNER_VETO', 'CLASSIC_DEPLOY_UNCERTAIN', 'CLASSIC_DEPLOY_FENCE_LOST']) {
+        'CLASSIC_DEPLOY_IN_USE', 'CLASSIC_DEPLOY_OWNER_VETO', 'CLASSIC_DEPLOY_PORT_CONFLICT',
+        'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 'CLASSIC_DEPLOY_UNCERTAIN', 'CLASSIC_DEPLOY_FENCE_LOST']) {
         const { router } = createAutoDeployHarness({ editedLink: editedLink(),
             coordinator: { async queue() { throw Object.assign(new Error('password=secret'), { code }); } } });
         const response = await putEdit(router, editBody({ autoDeploy: true }));

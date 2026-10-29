@@ -310,6 +310,15 @@ class CascadeService {
                 await bounded(() => ssh.connect(), 10000);
                 await checkHeld();
             }
+            if (!remove) {
+                // Preview is not a fence: repeat actual listener/config checks
+                // under BOTH held generations. Any refusal here retains them.
+                const { inspectTunnelPort } = require('./classicScopedPortPreflight');
+                try { await inspectTunnelPort({ node: source, port: scope.target.tunnelPort,
+                    target: { ...scope.target, portalNode: source, bridgeNode: bridge } }, command => exec(source, command)); }
+                catch (error) { throw scopedFailure(error?.code === 'TUNNEL_PORT_IN_USE'
+                    ? 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN'); }
+            }
             const mainBefore = await readProfile(source, SCOPED_MAIN);
             const bridgeBefore = await readProfile(bridge, SCOPED_BRIDGE);
             const preserved = [

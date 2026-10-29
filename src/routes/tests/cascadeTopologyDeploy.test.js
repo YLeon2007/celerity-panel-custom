@@ -388,7 +388,8 @@ test('manual malformed classic results cannot masquerade as native queued IDs or
 test('classic errors use fixed 409/503 responses, never backend text or diagnostics', async () => {
     for (const [code, status] of [['CLASSIC_DEPLOY_BUSY', 409], ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
         ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409], ['CLASSIC_DEPLOY_IN_USE', 409],
-        ['CLASSIC_DEPLOY_OWNER_VETO', 409], ['CLASSIC_DEPLOY_UNCERTAIN', 503], ['CLASSIC_DEPLOY_FENCE_LOST', 503]]) {
+        ['CLASSIC_DEPLOY_OWNER_VETO', 409], ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
+        ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503], ['CLASSIC_DEPLOY_UNCERTAIN', 503], ['CLASSIC_DEPLOY_FENCE_LOST', 503]]) {
         const logged = [];
         const router = createCascadeTopologyDeployRouter({ topologyDeploymentService: {
             async deploy() { throw Object.assign(new Error('password=secret'), { code, errors: ['private'] }); },

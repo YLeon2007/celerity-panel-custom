@@ -140,6 +140,14 @@ async function dispatch(rpc, apiKey, emitProg) {
                 }),
             };
         } catch (err) {
+            if (['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'].includes(err?.code)) {
+                const message = err.code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
+                    ? 'The tunnel port is already in use on the source node; edit the port and retry'
+                    : 'Port inspection was unavailable; no deployment was started';
+                logger.warn(`[MCP] Tool refusal: ${err.code}`);
+                return { sync: false, result: jsonRpcOk(id, { isError: true,
+                    content: [{ type: 'text', text: JSON.stringify({ code: err.code, message }) }] }) };
+            }
             logger.warn(`[MCP] Tool error ${toolName}: ${err.message}`);
             let msg = err.message;
             if (err.name === 'ZodError') {

@@ -13,6 +13,8 @@ const MESSAGES = Object.freeze({
     CLASSIC_DEPLOY_SCOPE_CHANGED: 'Classic deployment scope no longer matches the confirmed baseline',
     CLASSIC_DEPLOY_IN_USE: 'Classic deployment is blocked by L2TP or route-group use',
     CLASSIC_DEPLOY_OWNER_VETO: 'Classic deployment is blocked by configuration ownership',
+    CLASSIC_DEPLOY_PORT_CONFLICT: 'The requested tunnel port is already in use on the source node; edit the port and retry',
+    CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE: 'Source port inspection could not be completed; no deployment was started',
     CLASSIC_DEPLOY_UNCERTAIN: 'Classic deployment completion is unproved; ownership retained for recovery',
     CLASSIC_DEPLOY_FENCE_LOST: 'Classic deployment ownership could not be confirmed or released',
     TOPOLOGY_DEPLOYMENT_UNAVAILABLE: 'Classic deployment capabilities are unavailable',
@@ -320,25 +322,57 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 || endpoints.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
             const groups = await read(m.CascadeRouteGroup.find({})).lean();
             if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
-            return { baselineLinkIds, endpoints };
+            const source = nodes.find(node => entityId(node._id) === endpoints[0]);
+            const destination = nodes.find(node => entityId(node._id) === endpoints[1]);
+            return { baselineLinkIds, endpoints, portPreview: { node: source, port: selected.tunnelPort,
+                target: { ...selected, portalNode: source, bridgeNode: destination } } };
+        }
+        const diagnose = (error, phase) => {
+            const internalCode = typeof error?.code === 'string' && error.code.length <= 96
+                && (Object.hasOwn(MESSAGES, error.code)
+                    || /^(CLASSIC_SCOPED_[A-Z_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code))
+                ? error.code : 'UNKNOWN';
+            try { (dependencies.logger ?? require('../utils/logger')).warn({
+                event: 'classic-scoped-refusal', internalCode, phase, operationId, linkId,
+            }); } catch { /* diagnostics cannot change ownership semantics */ }
+        };
+        async function checkedAdmission(session) {
+            const state = await stateModel.findById('singleton').session(session).lean();
+            if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0
+                || !Number.isSafeInteger(state.deployedRevision) || state.deployedRevision < 0
+                || !Number.isSafeInteger(state.replacementEpoch) || state.replacementEpoch < 0
+                || state.replacementEpoch >= Number.MAX_SAFE_INTEGER
+                || state.topologyAdmissionCount !== 0 || state.remoteAdmissionCount !== 0
+                || state.replacementReservation !== undefined || state.remoteDrain !== undefined
+                || state.classicLifecycleAttempt !== undefined || (isDelete && state.revision >= Number.MAX_SAFE_INTEGER)) {
+                throw failure('CLASSIC_DEPLOY_BUSY');
+            }
+            if (state.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
+            await assertNoCompetingWork(session);
+            const admitted = await admission(session);
+            if (isDelete) await prepareDeletion(session);
+            return { state, admitted };
+        }
+        const transactionOptions = { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' };
+        if (!isDelete) {
+            // A retried DB-only authorization/ownership snapshot, then bounded
+            // read-only SSH OUTSIDE Mongo transactions and BEFORE any claim.
+            // This preview never licenses release; the held core still rechecks.
+            try {
+                const { admitted } = await m.connection.transaction(checkedAdmission, transactionOptions);
+                const { preflightTunnelPort } = require('./classicScopedPortPreflight');
+                try { await preflightTunnelPort(admitted.portPreview, { NodeSSH: dependencies.NodeSSH }); }
+                catch (error) { throw failure(error?.code === 'TUNNEL_PORT_IN_USE'
+                    ? 'CLASSIC_DEPLOY_PORT_CONFLICT' : 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'); }
+            } catch (error) {
+                diagnose(error, 'port-preflight');
+                throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
+            }
         }
         let claimed;
         try {
             claimed = await m.connection.transaction(async session => {
-                const state = await stateModel.findById('singleton').session(session).lean();
-                if (!state || !Number.isSafeInteger(state.revision) || state.revision < 0
-                    || !Number.isSafeInteger(state.deployedRevision) || state.deployedRevision < 0
-                    || !Number.isSafeInteger(state.replacementEpoch) || state.replacementEpoch < 0
-                    || state.replacementEpoch >= Number.MAX_SAFE_INTEGER
-                    || state.topologyAdmissionCount !== 0 || state.remoteAdmissionCount !== 0
-                    || state.replacementReservation !== undefined || state.remoteDrain !== undefined
-                    || state.classicLifecycleAttempt !== undefined || (isDelete && state.revision >= Number.MAX_SAFE_INTEGER)) {
-                    throw failure('CLASSIC_DEPLOY_BUSY');
-                }
-                if (state.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
-                await assertNoCompetingWork(session);
-                const admitted = await admission(session);
-                if (isDelete) await prepareDeletion(session);
+                const { state, admitted } = await checkedAdmission(session);
                 const epoch = state.replacementEpoch + 1;
                 const attempt = { operationId, action, linkId, epoch, nodeIds: admitted.endpoints,
                     topologyRevision: expectedTopologyRevision, deployedRevision: state.deployedRevision,
@@ -359,6 +393,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
         } catch (error) {
             // Unknown commit never dispatches and never attempts speculative release.
+            diagnose(error, 'claim');
             throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
         }
         const fence = Object.freeze({ _id: 'singleton', revision: expectedTopologyRevision,
@@ -459,7 +494,11 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             }
             return { status: 'succeeded', executionMode: 'classic', topologyRevision: expectedTopologyRevision };
         } catch (error) {
-            throw failure(Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN');
+            diagnose(error, 'held-dispatch-or-settlement');
+            // A code from a held callback cannot certify a pre-dispatch refusal.
+            const safeCode = !['CLASSIC_DEPLOY_PORT_CONFLICT', 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'].includes(error?.code)
+                && Object.hasOwn(MESSAGES, error?.code) ? error.code : 'CLASSIC_DEPLOY_UNCERTAIN';
+            throw failure(safeCode);
         }
     }
     const queue = input => runQueue(input);

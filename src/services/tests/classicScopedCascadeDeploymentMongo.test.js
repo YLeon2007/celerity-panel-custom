@@ -25,7 +25,28 @@ const env = Object.freeze({ PANEL_DOMAIN: 'lm1.infograd.online', L2TP_EXECUTION_
     L2TP_MIGRATIONS_ENABLED: 'true', L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
     TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false',
     CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true', CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: linkId });
-let models, child, directory, calls;
+let models, child, directory, calls, previewCalls, previewOptions;
+class PreviewSSH {
+    constructor(node) { assert.equal(String(node._id), source); }
+    async connect() {
+        assert.equal((await state()).replacementReservation, undefined);
+        assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+        previewCalls++;
+    }
+    disconnect() {}
+    async exec(command) {
+        assert.equal((await state()).replacementReservation, undefined);
+        assert.doesNotMatch(command, /\.stage|restart|ufw|firewall-cmd|\bmv\b/);
+        if (previewOptions.fail) throw Error("private transport error");
+        const marker = command.match(/C3_PORT_READ_[a-f0-9]+/)[0];
+        let text = "";
+        if (command.includes("C3_READ_CONFIG")) text = JSON.stringify({ inbounds: command.includes("xray-bridge")
+            && previewOptions.preserved ? [{ tag: "conn-down-355c34b8", port: 10086 }, { tag: "conn-down-355c3623", port: 10087 }] : [] });
+        if (command.includes("ss -")) text = previewOptions.sockets || "";
+        await previewOptions.afterRead?.(command);
+        return { code: 0, stdout: `${text}\n${marker}\n`, stderr: "" };
+    }
+}
 async function until(work) {
     let last;
     for (let i = 0; i < 250; i++) {
@@ -70,7 +91,7 @@ async function reset({ installed = false, group = false } = {}) {
         replacementEpoch: 0, topologyAdmissionCount: 0, remoteAdmissionCount: 0 });
     await HyNode.collection.insertMany([source, bridge, otherPortal].map((_id, i) => ({
         _id: new mongoose.Types.ObjectId(_id), name: `fixture-${i}`, type: 'xray', active: true,
-        cascadeRole: i === 1 ? 'bridge' : 'relay', ip: `192.0.2.${i + 1}`,
+        cascadeRole: i === 1 ? 'bridge' : 'relay', ip: `192.0.2.${i + 1}`, ssh: { password: 'fixture' },
     })));
     await CascadeLink.create([{ _id: linkId, name: 'selected', portalNode: source, bridgeNode: bridge,
         tunnelUuid: 'local-selected', tunnelPort: 10096, mode: 'reverse', active: true, status: 'pending' },
@@ -81,7 +102,7 @@ async function reset({ installed = false, group = false } = {}) {
     await models.RelayL2tpState.collection.insertOne({ node: new mongoose.Types.ObjectId(source),
         status: installed ? 'installed' : 'not_installed', desiredState: installed ? 'installed' : 'not_installed',
         ...(group && { routeGroup: new mongoose.Types.ObjectId(groupId) }) });
-    calls = 0;
+    calls = 0; previewCalls = 0; previewOptions = {};
 }
 const input = () => ({ expectedTopologyRevision: 4, scope: { kind: 'link.apply', linkId, linkIds: [linkId, oldId] } });
 const state = () => models.CascadeTopologyState.findById('singleton').lean();
@@ -94,9 +115,36 @@ function receipt() {
         preservedProfiles: [{ nodeId: source, path: '/usr/local/etc/xray-bridge/config.json', sha256: 'c'.repeat(64) }] } };
 }
 function service(work = async () => receipt()) {
-    return createClassicScopedCascadeDeploymentService({ ...models, env,
+    return createClassicScopedCascadeDeploymentService({ ...models, NodeSSH: PreviewSSH, env,
         cascadeService: { async deployScopedClassicLink(args) { calls++; return work(args); } } });
 }
+test('real Mongo occupied source port and failed preview preserve exact DB state with zero ownership writes', local, async () => {
+    for (const [options, code] of [[{ preserved: true }, 'CLASSIC_DEPLOY_PORT_CONFLICT'],
+        [{ sockets: 'LISTEN 0 128 *:10086 *:* users:(("foreign",pid=999,fd=3))\n' }, 'CLASSIC_DEPLOY_PORT_CONFLICT'],
+        [{ fail: true }, 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE']]) {
+        await reset();
+        await CascadeLink.updateOne({ _id: linkId }, { $set: { tunnelPort: 10086, tunnelSecurity: 'reality' } });
+        previewOptions = options;
+        const before = await state(), links = await CascadeLink.find().lean(), nodes = await HyNode.find().lean();
+        await assert.rejects(service().queue(input()), { code });
+        assert.deepEqual(await state(), before); assert.deepEqual(await CascadeLink.find().lean(), links);
+        assert.deepEqual(await HyNode.find().lean(), nodes);
+        assert.equal(await models.NodeOperationLock.countDocuments(), 0); assert.equal(calls, 0); assert.equal(previewCalls, 1);
+        assert.equal((await CascadeLink.findById(linkId).lean()).status, 'pending');
+    }
+});
+
+test('real Mongo post-preview competing admission is rechecked before claim', local, async () => {
+    await reset();
+    previewOptions.afterRead = async command => {
+        if (command.includes('ss -')) await models.CascadeTopologyState.updateOne({ _id: 'singleton' }, { $set: { remoteAdmissionCount: 1 } });
+    };
+    await assert.rejects(service().queue(input()), { code: 'CLASSIC_DEPLOY_BUSY' });
+    assert.equal(previewCalls, 1); assert.equal(calls, 0);
+    assert.equal((await state()).replacementEpoch, 0); assert.equal((await state()).replacementReservation, undefined);
+    assert.equal((await state()).remoteAdmissionCount, 1); assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+});
+
 test('real Mongo success holds reservation and both exact node generations, preserving topology revisions', local, async () => {
     await reset();
     const selected = service(async args => {
@@ -200,13 +248,13 @@ function removalReceipt() {
     return result;
 }
 function removalService(work = async () => removalReceipt(), options = {}) {
-    return createClassicScopedCascadeDeploymentService({ ...models, env, ...options,
+    return createClassicScopedCascadeDeploymentService({ ...models, NodeSSH: PreviewSSH, env, ...options,
         cascadeService: { async removeScopedClassicLink(args) { calls++; return work(args); } } });
 }
 
 test('real Mongo saved durable grant survives reconstruction and never admits an unsigned pending link', local, async () => {
     await reset();
-    const make = () => createClassicScopedCascadeDeploymentService({ ...models, env: lifecycleEnv,
+    const make = () => createClassicScopedCascadeDeploymentService({ ...models, NodeSSH: PreviewSSH, env: lifecycleEnv,
         cascadeService: { async deployScopedClassicLink() { calls++; return receipt(); } } });
     await assert.rejects(make().queue(input()), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
     assert.equal((await state()).replacementEpoch, 0); assert.equal(calls, 0);
@@ -327,7 +375,7 @@ test('real Mongo select:false grant is explicitly selected by the service', loca
         classicLifecycleGrant: issueClassicLifecycleGrant(link, lifecycleEnv),
     } });
     assert.equal((await ProjectedLink.findById(linkId).lean()).classicLifecycleGrant, undefined);
-    const s = createClassicScopedCascadeDeploymentService({ ...models, CascadeLink: ProjectedLink, env: lifecycleEnv,
+    const s = createClassicScopedCascadeDeploymentService({ ...models, NodeSSH: PreviewSSH, CascadeLink: ProjectedLink, env: lifecycleEnv,
         cascadeService: { async deployScopedClassicLink() { calls++; return receipt(); } } });
     assert.equal((await s.queue(input())).status, 'succeeded'); assert.equal(calls, 1);
 });
@@ -374,7 +422,7 @@ test('real Mongo durable saved grant supports manual replay, checked DELETE and 
     await CascadeLink.collection.updateOne({ _id: originalLink._id }, { $set: {
         classicLifecycleGrant: issueClassicLifecycleGrant(originalLink, lifecycleEnv),
     } });
-    const make = revision => createClassicScopedCascadeDeploymentService({ ...models, env: lifecycleEnv,
+    const make = revision => createClassicScopedCascadeDeploymentService({ ...models, NodeSSH: PreviewSSH, env: lifecycleEnv,
         cascadeService: {
             async deployScopedClassicLink() { calls++; const r = receipt(); r.receipt.topologyRevision = revision; return r; },
             async removeScopedClassicLink() { calls++; const r = removalReceipt(); r.receipt.topologyRevision = revision; return r; },
