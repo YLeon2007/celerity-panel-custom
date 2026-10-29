@@ -39,7 +39,9 @@ function ownsFragment(main, target, node) {
     if (mode === 'reverse') {
         const configured = [node.xray?.inboundTag || 'vless-in', ...(node.xray?.extraInbounds || []).map(row => row.inboundTag).filter(Boolean)];
         const routes = (main.routing?.rules || []).filter(row => row.outboundTag === `portal-${suffix}` && !row.domain);
-        const tags = routes.flatMap(row => row.inboundTag || []);
+        // Domain-only geo generation has no domain-free client route; the
+        // held writer then uses configured tags. Keep full fragment equality.
+        const tags = routes.length ? routes.flatMap(row => row.inboundTag || []) : configured;
         if (!tags.length || new Set(tags).size !== tags.length || configured.some(tag => !tags.includes(tag))
             || tags.some(tag => typeof tag !== 'string' || main.inbounds?.filter(row => row.tag === tag).length !== 1)) return false;
         // Match the held core's exact replay, including a prior REALITY decoy.

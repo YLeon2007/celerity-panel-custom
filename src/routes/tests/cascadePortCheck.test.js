@@ -11,6 +11,7 @@ const MAIN = '/usr/local/etc/xray/config.json', TRANSIT = '/usr/local/etc/xray-b
 function harness(options = {}) {
     const node = { _id: A, active: true, type: 'xray', ip: '192.0.2.1', ssh: { password: 'fixture' }, xray: { inboundTag: 'vless-in' } };
     const link = { _id: L, active: true, mode: options.mode || 'reverse', tunnelPort: 10086, tunnelUuid: 'fixture-uuid',
+        ...(options.geoRouting ? {geoRouting: options.geoRouting} : {}),
         portalNode: node, bridgeNode: { _id: B, ip: '192.0.2.2' } };
     if (link.mode === 'forward') [link.portalNode, link.bridgeNode] = [link.bridgeNode, node];
     const main = { inbounds: [{ tag: 'vless-in', port: 443 }], outbounds: [], routing: { rules: [] } };
@@ -73,6 +74,11 @@ for (const options of [{ preserved: true }, { runtime: true }, { own: true, forg
 for (const mode of ['reverse', 'forward']) test(`port-check exact ${mode} own listener with canonical service PID is replayable`, async () => {
     assert.deepEqual(await request(harness({ own: true, mode }), `nodeId=${A}&port=10086&linkId=${L}`),
         { status: 200, body: { available: true, port: 10086, code: null } });
+});
+for (const forged of [false, true]) test(`domain-only geo own listener preserves exact fragment comparison forged=${forged}`, async () => {
+    const h = harness({ own: true, forged, geoRouting: {enabled:true, domains:['google'], geoip:[]} });
+    assert.deepEqual(await request(h, `nodeId=${A}&port=10086&linkId=${L}`),
+        {status:200, body:{available:!forged, port:10086, code:forged ? 'TUNNEL_PORT_IN_USE' : null}});
 });
 test('port-check unknown inspection returns safe 503, not available', async () => {
     const r = await request(harness({ fail: true }));

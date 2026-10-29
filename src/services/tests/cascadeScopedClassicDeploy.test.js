@@ -1087,6 +1087,28 @@ for (const leaseMs of [0, -1, 999, 120001, 1.5, Infinity, NaN]) {
     });
 }
 
+test('domain-only geo exact listener replays without mutation or retained locks', async t => {
+    const f = fixture(t);
+    f.target.geoRouting = {enabled:true, domains:['google'], geoip:[]};
+    assert.equal((await f.run()).success, true);
+    const before = structuredClone([...f.files]);
+    assert.equal((await f.run()).success, true);
+    assert.deepEqual([...f.files], before);
+    assert.equal(f.locks.size, 0);
+});
+test('domain-only geo forged own listener stays refused under held generations', async t => {
+    const f = fixture(t);
+    f.target.geoRouting = {enabled:true, domains:['google'], geoip:[]};
+    await f.run();
+    const key = SOURCE + ':' + MAIN;
+    const config = JSON.parse(f.files.get(key));
+    config.inbounds.find(row => row.port === f.target.tunnelPort).settings.clients[0].id = 'foreign';
+    f.files.set(key, JSON.stringify(config));
+    const before = structuredClone([...f.files]);
+    await assert.rejects(f.run(), {code:'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT'});
+    assert.deepEqual([...f.files], before);
+    assert.equal(f.locks.size, 2);
+});
 test('post-bridge source service drift is caught by final whole-scope readback', async t => {
     let bridgeRestarted = false;
     const f = fixture(t, { fault({ id, command }) {
