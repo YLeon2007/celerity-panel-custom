@@ -124,6 +124,134 @@ function fixture(t, options = {}) {
         run: args => cascade.deployScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args }) };
 }
 
+test('checked removal strips only exact target fragments and never publishes or deletes the draft', async t => {
+    const f = fixture(t);
+    await f.run();
+    const before = new Map(f.files), status = f.target.status, start = f.commands.length;
+    const targetBefore = structuredClone(f.target);
+    const result = await f.cascade.removeScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE] });
+    assert.equal(result.success, true);
+    assert.equal(result.remoteQuiescent, true);
+    assert.equal(result.receipt.kind, 'classic-scoped-reverse-removal');
+    assert.equal(result.receipt.targetAbsent, true);
+    assert.equal(result.receipt.linkId, TARGET);
+    assert.equal(result.receipt.topologyRevision, 17);
+    assert.deepEqual(result.receipt.preservedLinkIds, [BASE]);
+    assert.equal(result.receipt.profiles.length, 2);
+    assert.equal(result.receipt.preservedProfiles.length, 2);
+    const { createHash } = require('node:crypto');
+    const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+    for (const row of [...result.receipt.profiles, ...result.receipt.preservedProfiles]) {
+        const key = `${row.nodeId}:${row.path}`;
+        assert.equal(row.sha256, f.files.has(key) ? hash(f.files.get(key)) : null);
+        assert.equal(row.beforeSha256, before.has(key) ? hash(before.get(key)) : null);
+        assert.equal(row.changed, before.get(key) !== f.files.get(key));
+    }
+    for (const key of [`${SOURCE}:${TRANSIT}`, `${BRIDGE}:${MAIN}`]) assert.equal(f.files.get(key), before.get(key));
+    const main = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`));
+    assert.deepEqual(main.inbounds, f.main.inbounds);
+    assert.deepEqual(main.outbounds, f.main.outbounds);
+    assert.deepEqual(main.routing.rules, f.main.routing.rules);
+    assert.equal(main.reverse, undefined, 'omit empty reverse rather than leaving an invalid empty structure');
+    const combined = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+    assert.deepEqual(combined, JSON.parse(f.original.get(`${BRIDGE}:${TRANSIT}`)));
+    for (const key of [`${SOURCE}:${MAIN}`, `${BRIDGE}:${TRANSIT}`]) assert.equal(f.files.get(key).includes(TARGET.slice(-8)), false);
+    const commands = f.commands.slice(start), firstCommit = commands.findIndex(row => row.command.includes('mv --'));
+    assert.equal(commands.slice(0, firstCommit).filter(row => row.command.includes('run -test')).length, 2);
+    assert.equal(commands.some(row => /ufw|firewall-cmd|ss -tnH|stop |disable |daemon-reload/.test(row.command)), false);
+    assert.equal(f.target.status, status);
+    assert.deepEqual(f.target, targetBefore);
+    assert.equal(f.links.includes(f.target), true);
+    assert.equal(f.locks.size, 0);
+});
+
+test('checked removal refuses config drift during staging before either live commit', async t => {
+    let removing = false, drifted = false;
+    const f = fixture(t, { fault({ command, files }) {
+        if (!removing || drifted || !command.includes('run -test')) return;
+        drifted = true;
+        const key = `${SOURCE}:${MAIN}`, config = JSON.parse(files.get(key));
+        config.log.loglevel = 'error'; files.set(key, JSON.stringify(config));
+    } });
+    await f.run(); removing = true;
+    const start = f.commands.length;
+    await assert.rejects(f.cascade.removeScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE] }),
+        { code: 'CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT' });
+    assert.equal(drifted, true);
+    assert.equal(f.commands.slice(start).some(row => row.command.includes('mv --')), false);
+    assert.equal(f.locks.size, 2);
+});
+
+test('checked removal refuses second-profile drift after first checked commit', async t => {
+    let removing = false, drifted = false;
+    const f = fixture(t, { fault({ id, command, files }) {
+        if (!removing || drifted || id !== SOURCE || !command.includes('mv --')) return;
+        drifted = true;
+        const key = `${BRIDGE}:${TRANSIT}`, config = JSON.parse(files.get(key));
+        config.log.loglevel = 'error'; files.set(key, JSON.stringify(config));
+    } });
+    await f.run(); removing = true;
+    const start = f.commands.length;
+    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT' });
+    assert.equal(f.commands.slice(start).filter(row => row.command.includes('mv --')).length, 1);
+    assert.equal(JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`)).log.loglevel, 'error');
+    assert.equal(f.locks.size, 2);
+});
+
+function remove(f, args = {}) {
+    return f.cascade.removeScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args });
+}
+
+test('checked removal of last target validates idle bridge and permits explicit recreate', async t => {
+    const f = fixture(t);
+    f.links.splice(f.links.indexOf(f.baseline), 1);
+    const idle = JSON.parse(generator.generateCombinedBridgeConfig([f.target]));
+    delete idle.reverse;
+    idle.outbounds = idle.outbounds.filter(row => !row.tag.includes(TARGET.slice(-8)));
+    idle.routing.rules = idle.routing.rules.filter(row => !JSON.stringify(row).includes(TARGET.slice(-8)));
+    idle.policy = { levels: { 0: { handshake: 4 } } };
+    f.files.set(`${BRIDGE}:${TRANSIT}`, JSON.stringify(idle));
+    await f.run({ baselineLinkIds: [] });
+    const result = await remove(f, { baselineLinkIds: [] });
+    assert.equal(result.receipt.targetAbsent, true);
+    assert.deepEqual(result.receipt.preservedLinkIds, []);
+    assert.deepEqual(JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`)), idle);
+    assert.equal(JSON.parse(f.files.get(`${SOURCE}:${MAIN}`)).reverse, undefined);
+    f.target.status = 'pending';
+    assert.equal((await f.run({ baselineLinkIds: [] })).success, true);
+    assert.equal(JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`)).reverse.bridges.length, 1);
+    assert.equal(f.locks.size, 0);
+});
+
+test('checked removal cannot turn an absent target into deletion authority', async t => {
+    const f = fixture(t);
+    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_REMOVAL_PROOF_MISSING' });
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.locks.size, 2);
+});
+
+test('checked removal replay without independent prior receipt refuses without new mutation', async t => {
+    const f = fixture(t);
+    await f.run(); await remove(f);
+    const writes = f.writes.length;
+    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_REMOVAL_PROOF_MISSING' });
+    assert.equal(f.writes.length, writes);
+    assert.equal(f.locks.size, 2);
+});
+
+for (const key of [`${SOURCE}:${TRANSIT}`, `${BRIDGE}:${MAIN}`]) {
+    test(`checked removal refuses hidden target reference in preserved ${key}`, async t => {
+        const f = fixture(t); await f.run();
+        const config = key.startsWith(BRIDGE) ? structuredClone(f.main) : { outbounds: [], routing: { rules: [] } };
+        config.metadata = `portal-${TARGET.slice(-8)}`;
+        f.files.set(key, JSON.stringify(config));
+        const writes = f.writes.length;
+        await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_REMOVAL_TARGET_REMAINS' });
+        assert.equal(f.writes.length, writes);
+        assert.equal(f.locks.size, 2);
+    });
+}
+
 function physicalForward(f) {
     delete f.nodes[SOURCE].xray.extraInbounds;
     const main = structuredClone(f.main);
@@ -407,6 +535,114 @@ const reverseDecoyCorruptions = [
         combined.routing.rules = combined.routing.rules.filter(row => row.outboundTag !== client.tag);
     }],
 ];
+for (const [name, corrupt] of reverseDecoyCorruptions) {
+    test(`checked removal refuses mismatched or partial ${name} without mutations`, async t => {
+        const f = await appliedReality(t);
+        const portal = JSON.parse(f.files.get(`${SOURCE}:${MAIN}`)), combined = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+        const server = portal.inbounds.find(row => row.tag === `bridge-conn-${TARGET.slice(-8)}`);
+        const client = combined.outbounds.find(row => row.tag === `tunnel-${TARGET.slice(-8)}`);
+        corrupt(f, server, client, portal, combined);
+        f.files.set(`${SOURCE}:${MAIN}`, JSON.stringify(portal)); f.files.set(`${BRIDGE}:${TRANSIT}`, JSON.stringify(combined));
+        const before = new Map(f.files), start = f.commands.length, writes = f.writes.length;
+        await assert.rejects(remove(f));
+        assert.equal(f.writes.length, writes);
+        assert.deepEqual(f.files, before);
+        assert.equal(f.commands.slice(start).some(row => /cat >|mv --|run -test/.test(row.command)), false);
+        assert.equal(f.locks.size, 2);
+    });
+}
+
+for (const step of ['C3_READ_CONFIG', 'cat >', 'run -test', 'mv --', 'systemctl show']) {
+    for (const failure of ['nonzero', 'missing-exit', 'missing-receipt', 'throw']) {
+        test(`checked removal ${step} ${failure} retains exact locks without retry`, async t => {
+            let removing = false, failed = false;
+            const f = fixture(t, { fault({ command }) {
+                if (!removing || failed || !command.includes(step)) return;
+                failed = true;
+                if (failure === 'throw') throw new Error('SECRET');
+                const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+                return { code: failure === 'nonzero' ? 1 : failure === 'missing-exit' ? undefined : 0,
+                    stdout: failure === 'missing-receipt' ? '' : `\n${marker}\n`, stderr: 'SECRET' };
+            } });
+            await f.run(); removing = true;
+            const status = f.target.status;
+            await assert.rejects(remove(f), error => error.code === 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN' && !error.message.includes('SECRET'));
+            assert.equal(failed, true);
+            assert.equal(f.locks.size, 2);
+            assert.equal(f.target.status, status);
+            assert.deepEqual(f.events.slice(-2).filter(row => row[0] === 'release'), []);
+        });
+    }
+}
+
+test('checked removal validates every stage before live mutation', async t => {
+    let removing = false;
+    const f = fixture(t, { fault({ id, command }) {
+        if (removing && id === BRIDGE && command.includes('run -test')) return { code: 1, stdout: '', stderr: 'SECRET' };
+    } });
+    await f.run(); removing = true;
+    const before = new Map(f.files), start = f.commands.length;
+    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN' });
+    assert.equal(f.commands.slice(start).filter(row => row.options.stdin !== undefined).length, 2);
+    assert.equal(f.commands.slice(start).some(row => row.command.includes('mv --')), false);
+    for (const [key, bytes] of before) assert.equal(f.files.get(key), bytes);
+    assert.equal(f.locks.size, 2);
+});
+
+test('checked removal retains exact generations after a timed-out writer completes late', async t => {
+    const realTimeout = global.setTimeout;
+    t.mock.method(global, 'setTimeout', (fn, ms, ...args) => realTimeout(fn, ms === 15000 ? 10 : ms, ...args));
+    let removing = false, complete;
+    const f = fixture(t, { fault({ command }) {
+        if (!removing || !command.includes('cat >')) return;
+        return new Promise(resolve => { complete = () => {
+            const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+            resolve({ code: 0, stdout: `\n${marker}\n`, stderr: '' });
+        }; });
+    } });
+    await f.run(); removing = true;
+    await assert.rejects(remove(f), { code: 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN' });
+    const generations = structuredClone([...f.locks]);
+    assert.equal(generations.length, 2);
+    complete(); await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual([...f.locks], generations);
+});
+
+for (const drift of ['generation', 'revision', 'preserved-bytes', 'source-service']) {
+    test(`checked removal retains ownership after ${drift} drift`, async t => {
+        let removing = false, changed = false;
+        const f = fixture(t, { fault({ id, command, locks, files }) {
+            if (!removing) return;
+            if (!changed && id === BRIDGE && command.includes('mv --')) {
+                changed = true;
+                if (drift === 'generation') locks.get(SOURCE).generation = 'foreign-winner';
+                if (drift === 'revision') f.state.revision++;
+                if (drift === 'preserved-bytes') files.set(`${SOURCE}:${TRANSIT}`, '{"foreign":"edit"}');
+            }
+            if (changed && drift === 'source-service' && id === SOURCE && command.includes('systemctl show xray ')) {
+                const marker = command.match(/C3_SCOPED_DONE_[a-f0-9]+/)[0];
+                return { code: 0, stderr: '', stdout: `ActiveState=failed\nNeedDaemonReload=no\nExecStart={ path=/usr/local/bin/xray ; argv[]=/usr/local/bin/xray run -config ${MAIN} ; }\n\n${marker}\n` };
+            }
+        } });
+        await f.run(); removing = true;
+        const events = f.events.length;
+        await assert.rejects(remove(f));
+        assert.equal(changed, true);
+        assert.equal(f.locks.size, 2);
+        assert.equal(f.events.slice(events).some(row => row[0] === 'release'), false);
+        if (drift === 'generation') assert.equal(f.locks.get(SOURCE).generation, 'foreign-winner');
+    });
+}
+
+test('checked removal requires the same authorization and node generations before transport', async t => {
+    const f = fixture(t); await f.run();
+    process.env.L2TP_PRODUCTION_EXECUTION_ENABLED = 'false';
+    const start = f.commands.length;
+    await assert.rejects(remove(f), { code: 'CLASSIC_CONFIG_WRITE_SCOPE_CLOSED' });
+    assert.equal(f.commands.length, start);
+    assert.equal(f.locks.size, 0);
+});
+
 for (const [name, corrupt] of reverseDecoyCorruptions) {
     test(`reverse REALITY decoy update refuses ${name} before writes`, async t => {
         const f = await appliedReality(t); requestDecoyUpdate(f);
@@ -858,6 +1094,20 @@ test('actual shell migrates three forward profiles then replays without restarti
     f.target.status = 'pending';
     assert.equal((await f.run()).receipt.profiles.length, 3);
     assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\nxray\n');
+    const targetMainBytes = fs.readFileSync(`${root}/${BRIDGE}/etc/xray/config.json`, 'utf8');
+    const removal = await remove(f);
+    assert.equal(removal.remoteQuiescent, true);
+    assert.equal(removal.receipt.targetAbsent, true);
+    assert.equal(fs.readFileSync(`${root}/${SOURCE}/etc/xray-bridge/config.json`, 'utf8'), forward.orphan);
+    assert.equal(fs.readFileSync(`${root}/${BRIDGE}/etc/xray/config.json`, 'utf8'), targetMainBytes);
+    const removedMain = JSON.parse(fs.readFileSync(`${root}/${SOURCE}/etc/xray/config.json`, 'utf8'));
+    assert.deepEqual(removedMain.inbounds, forward.main.inbounds);
+    assert.equal(removedMain.reverse, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(`${root}/${BRIDGE}/etc/xray-bridge/config.json`, 'utf8')).reverse.bridges.length, 1);
+    assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\nxray\nxray\nxray-bridge\n');
+    f.target.status = 'pending';
+    assert.equal((await f.run()).success, true);
+    assert.equal(fs.readFileSync(`${root}/restarts`, 'utf8'), 'xray\nxray-bridge\nxray\nxray\nxray-bridge\nxray\nxray-bridge\n');
     assert.equal(f.locks.size, 0);
 });
 

@@ -138,6 +138,20 @@ class CascadeService {
      * This entry never acquires topology adoption or native operation identity.
      */
     async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds });
+    }
+
+    /**
+     * Checked inverse for an exactly present scoped reverse link. The caller
+     * holds the topology reservation through this receipt and subsequent draft
+     * deletion, retaining it on every throw. No DB row/status is changed here.
+     * An absent/partial target is NOT an idempotent removal proof.
+     */
+    async removeScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove: true });
+    }
+
+    async #scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove = false }) {
         const id = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
         if (!id(linkId) || !Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0
             || !Array.isArray(baselineLinkIds) || !baselineLinkIds.every(id)
@@ -158,7 +172,7 @@ class CascadeService {
             let result;
             await withClassicNodeConfigWrite({ nodeId: ids[0], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
                 await withClassicNodeConfigWrite({ nodeId: ids[1], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
-                    result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids });
+                    result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove });
                     return true;
                 });
                 return true;
@@ -173,7 +187,7 @@ class CascadeService {
         }
     }
 
-    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids }) {
+    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove }) {
         const started = performance.now();
         const checkHeld = async () => {
             if (performance.now() - started >= 100000) throw scopedFailure('CLASSIC_SCOPED_DEADLINE');
@@ -318,6 +332,7 @@ class CascadeService {
             let clientTags = [...configuredTags];
             const oldOutbound = main.outbounds.filter(row => row.tag === forwardTag);
             const oldHop = targetMain?.inbounds?.filter(row => row.tag === hopTag) || [];
+            if (remove && (oldOutbound.length || oldHop.length)) throw scopedFailure('CLASSIC_SCOPED_OLD_FORWARD_MISMATCH');
             // Derive migration ingress ONLY from exact old target routes, including
             // preserved path SOCKS ingress. Never route arbitrary service inbounds.
             if (oldOutbound.length || oldHop.length) {
@@ -373,7 +388,7 @@ class CascadeService {
             const bridgeDelta = JSON.parse(configGenerator.generateCombinedBridgeConfig([target]));
             let priorPortalDelta = portalDelta, priorBridgeDelta = bridgeDelta;
             const oldListeners = main.inbounds.filter(row => row.tag === `bridge-conn-${targetSuffix}`);
-            if (target.tunnelSecurity === 'reality' && oldListeners.length) {
+            if (!remove && target.tunnelSecurity === 'reality' && oldListeners.length) {
                 const stream = oldListeners[0].streamSettings, reality = stream?.realitySettings;
                 const dest = typeof reality?.dest === 'string'
                     ? reality.dest.match(/^(?:\[([0-9a-fA-F:]+)\]|([^:\[\]]+)):([1-9]\d{0,4})$/) : null;
@@ -415,6 +430,7 @@ class CascadeService {
             const portalApplied = stripOwnedReverse(main, priorPortalDelta);
             const bridgeApplied = stripOwnedReverse(combined, priorBridgeDelta);
             if (portalApplied !== bridgeApplied || (oldOutbound.length && portalApplied)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
+            if (remove && !portalApplied) throw scopedFailure('CLASSIC_SCOPED_REMOVAL_PROOF_MISSING');
             const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
             const representedDomains = bridgeBaseline.map(row =>
                 `${scopedId(row).slice(-8)}.${row.tunnelDomain || 'reverse.tunnel.internal'}`).sort();
@@ -467,28 +483,45 @@ class CascadeService {
                 && !['domain', 'ip', 'port', 'network', 'protocol', 'source', 'sourcePort', 'user'].some(key => row[key]))) {
                 throw scopedFailure('CLASSIC_SCOPED_MAIN_ROUTING_SHADOW_UNSUPPORTED');
             }
-            main.reverse = main.reverse || {};
-            main.reverse.portals = [...(main.reverse.portals || []), ...portalDelta.reverse.portals];
-            main.inbounds.push(...portalDelta.inbounds);
-            const insertRules = (config, rules) => {
-                const index = config.routing.rules.findIndex(row => !row.inboundTag && row.ip?.includes('geoip:private'));
-                config.routing.rules.splice(index < 0 ? config.routing.rules.length : index, 0, ...rules);
-            };
-            insertRules(main, portalDelta.routing.rules);
-            if (portalDelta.routing.domainStrategy) main.routing.domainStrategy = portalDelta.routing.domainStrategy;
-            combined.reverse = combined.reverse || {};
-            combined.reverse.bridges = [...(combined.reverse.bridges || []), ...bridgeDelta.reverse.bridges];
-            for (const outbound of bridgeDelta.outbounds) {
-                const old = combined.outbounds.find(row => row.tag === outbound.tag);
-                if (old && scopedCanonical(old) !== scopedCanonical(outbound)) throw scopedFailure('CLASSIC_SCOPED_BRIDGE_OUTBOUND_CONFLICT');
-                if (!old) combined.outbounds.push(outbound);
+            if (remove) {
+                // Drop empty reverse sections; preserve all nonempty/unknown
+                // sections, global defaults, user inbounds and sibling routes.
+                // The last bridge stays active but idle on its validated config;
+                // never stop a potentially shared service or touch target MAIN.
+                for (const config of [main, combined]) {
+                    for (const key of ['portals', 'bridges']) {
+                        if (config.reverse?.[key]?.length === 0) delete config.reverse[key];
+                    }
+                    if (config.reverse && !Object.keys(config.reverse).length) delete config.reverse;
+                }
+                if ([main, combined, ...preserved.filter(item => item.profile.bytes !== 'C3_CONFIG_ABSENT')
+                    .map(item => JSON.parse(item.profile.bytes))].some(config => JSON.stringify(config).includes(targetSuffix))) {
+                    throw scopedFailure('CLASSIC_SCOPED_REMOVAL_TARGET_REMAINS');
+                }
+            } else {
+                main.reverse = main.reverse || {};
+                main.reverse.portals = [...(main.reverse.portals || []), ...portalDelta.reverse.portals];
+                main.inbounds.push(...portalDelta.inbounds);
+                const insertRules = (config, rules) => {
+                    const index = config.routing.rules.findIndex(row => !row.inboundTag && row.ip?.includes('geoip:private'));
+                    config.routing.rules.splice(index < 0 ? config.routing.rules.length : index, 0, ...rules);
+                };
+                insertRules(main, portalDelta.routing.rules);
+                if (portalDelta.routing.domainStrategy) main.routing.domainStrategy = portalDelta.routing.domainStrategy;
+                combined.reverse = combined.reverse || {};
+                combined.reverse.bridges = [...(combined.reverse.bridges || []), ...bridgeDelta.reverse.bridges];
+                for (const outbound of bridgeDelta.outbounds) {
+                    const old = combined.outbounds.find(row => row.tag === outbound.tag);
+                    if (old && scopedCanonical(old) !== scopedCanonical(outbound)) throw scopedFailure('CLASSIC_SCOPED_BRIDGE_OUTBOUND_CONFLICT');
+                    if (!old) combined.outbounds.push(outbound);
+                }
+                insertRules(combined, bridgeDelta.routing.rules.filter(row => row.domain || row.inboundTag));
             }
-            insertRules(combined, bridgeDelta.routing.rules.filter(row => row.domain || row.inboundTag));
             const plans = [
                 { node: source, file: SCOPED_MAIN, service: 'xray', before: mainBefore, config: main },
                 { node: bridge, file: SCOPED_BRIDGE, service: 'xray-bridge', before: bridgeBefore, config: combined },
             ];
-            if (targetMain) {
+            if (targetMain && !remove) {
                 if (hasCollision(targetMain)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
                 if (!targetMainItem.profile.unit?.includes('ActiveState=active\n')
                     || !targetMainItem.profile.unit.includes('NeedDaemonReload=no\n')
@@ -517,9 +550,28 @@ class CascadeService {
                 await exec(plan.node, `/usr/local/bin/xray run -test -format json -config ${plan.stage}`);
                 if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
             }
+            if (remove) {
+                // Staging/validation can await remote work: do not overwrite a
+                // concurrent edit observed after the initial physical snapshot.
+                if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
+                await checkNodePins();
+                for (const item of [...plans.map(plan => ({ ...plan, profile: plan.before })), ...preserved]) {
+                    if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) {
+                        throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
+                    }
+                }
+            }
             const port = target.tunnelPort;
-            if (changedPlans.length) await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
+            if (changedPlans.length && !remove) await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
             for (const plan of changedPlans) {
+                if (remove) {
+                    if (scopedCanonical(await readProfile(plan.node, plan.file)) !== scopedCanonical(plan.before)) {
+                        throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
+                    }
+                    if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
+                    if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
+                    await checkNodePins();
+                }
                 await exec(plan.node, `chown --reference=${plan.file} ${plan.stage} && chmod --reference=${plan.file} ${plan.stage} && mv -- ${plan.stage} ${plan.file} && systemctl restart ${plan.service} && systemctl is-active --quiet ${plan.service}`);
                 const after = await readProfile(plan.node, plan.file);
                 if (after.bytes !== plan.bytes || after.unit !== plan.before.unit
@@ -529,7 +581,7 @@ class CascadeService {
                 if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');
             }
             let established = false;
-            for (let attempt = 0; attempt < 8; attempt++) {
+            for (let attempt = 0; !remove && attempt < 8; attempt++) {
                 const sockets = await exec(source, `ss -tnH state established '( sport = :${port} and dst ${bridge.ip} )'`);
                 const targetPeer = sockets.trim().split('\n').some(line => {
                     const fields = line.trim().split(/\s+/);
@@ -540,7 +592,7 @@ class CascadeService {
                 if (targetPeer) { established = true; break; }
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
-            if (!established) throw scopedFailure('CLASSIC_SCOPED_TUNNEL_UNCONFIRMED');
+            if (!remove && !established) throw scopedFailure('CLASSIC_SCOPED_TUNNEL_UNCONFIRMED');
             // One final whole-scope barrier, not merely the last restarted node.
             for (const plan of plans) {
                 const after = await readProfile(plan.node, plan.file);
@@ -552,6 +604,19 @@ class CascadeService {
             }
             if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
             await checkNodePins();
+            if (remove) {
+                await revision();
+                return { success: true, remoteQuiescent: true, receipt: {
+                    kind: 'classic-scoped-reverse-removal', linkId, topologyRevision: expectedTopologyRevision,
+                    nodeIds: ids, preservedLinkIds: baseline, targetAbsent: true,
+                    profiles: plans.map(plan => ({ nodeId: scopedId(plan.node), path: plan.file,
+                        beforeSha256: scopedHash(plan.before.bytes), sha256: scopedHash(plan.bytes),
+                        changed: plan.bytes !== plan.before.bytes })),
+                    preservedProfiles: preserved.map(item => ({ nodeId: scopedId(item.node), path: item.file,
+                        beforeSha256: item.profile.bytes === 'C3_CONFIG_ABSENT' ? null : scopedHash(item.profile.bytes),
+                        sha256: item.profile.bytes === 'C3_CONFIG_ABSENT' ? null : scopedHash(item.profile.bytes), changed: false })),
+                } };
+            }
             const updated = await CascadeLink.updateOne({ _id: linkId, active: true }, {
                 $set: { status: 'deployed', lastError: '', lastHealthCheck: new Date() },
             }, { maxTimeMS: 5000 });
