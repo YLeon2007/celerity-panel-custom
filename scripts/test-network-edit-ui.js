@@ -256,6 +256,13 @@ test('quick form checks the forward listener after mode change and swap, and blo
     assert.equal(created.body.tunnelPort, 10086);
 });
 
+test('network loader cache key is bound to the exact shipped warning asset', () => {
+    const view = fs.readFileSync(path.join(__dirname, '..', 'views/nodes.ejs'), 'utf8');
+    const asset = fs.readFileSync(path.join(__dirname, '..', 'public/js/network.min.js'));
+    const digest = require('node:crypto').createHash('sha256').update(asset).digest('hex').slice(0, 16);
+    assert.ok(view.includes('/js/network.min.js?v=' + digest), 'Production assets cache for one day; new warning JS needs a content-bound URL');
+});
+
 test('both actual form templates expose accessible localized port status beside their inputs', () => {
     const view = fs.readFileSync(path.join(__dirname, '..', 'views/nodes.ejs'), 'utf8');
     const ejs = require('ejs');
