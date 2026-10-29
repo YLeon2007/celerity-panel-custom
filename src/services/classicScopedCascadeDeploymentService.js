@@ -135,16 +135,20 @@ function routeGroupUseVeto(groups, relays, touching) {
     return false;
 }
 
-function isClassicProductionDeploymentEnabled(env) {
+function isClassicProductionDeploymentConfigured(env) {
     const auth = resolveL2tpExecutionAuthorization(env);
+    return auth.enableProductionExecution === true && env.PANEL_DOMAIN === 'lm1.infograd.online'
+        && env.CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
+        && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'false'
+        && env.TOPOLOGY_TEST_EXECUTION_ENABLED === 'false';
+}
+
+function isClassicProductionDeploymentEnabled(env) {
     const lifecycle = env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED === 'true';
     const validLifecycle = lifecycle && typeof env.CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY === 'string'
         && /^[a-f0-9]{64}$/.test(env.CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY);
-    return auth.enableProductionExecution === true && env.PANEL_DOMAIN === 'lm1.infograd.online'
-        && env.CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'true'
-        && (lifecycle ? validLifecycle : classicLinkAllowlist(env) !== null)
-        && env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED === 'false'
-        && env.TOPOLOGY_TEST_EXECUTION_ENABLED === 'false';
+    return isClassicProductionDeploymentConfigured(env)
+        && (lifecycle ? validLifecycle : classicLinkAllowlist(env) !== null);
 }
 
 // Same endpoint-connected, confirmed-applied selection as the HTTP contract.
@@ -507,4 +511,4 @@ function isCompletedClassicDeploymentResult(result, revision) {
 }
 
 module.exports = { createClassicScopedCascadeDeploymentService, isClassicProductionDeploymentEnabled,
-    isCompletedClassicDeploymentResult };
+    isClassicProductionDeploymentConfigured, isCompletedClassicDeploymentResult };

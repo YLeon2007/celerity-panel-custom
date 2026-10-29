@@ -12,7 +12,7 @@ const cascadeService = require('../../services/cascadeService');
 const cache = require('../../services/cacheService');
 const logger = require('../../utils/logger');
 const {
-    isClassicProductionDeploymentEnabled,
+    isClassicProductionDeploymentConfigured,
     createClassicScopedCascadeDeploymentService,
 } = require('../../services/classicScopedCascadeDeploymentService');
 const { issueClassicLifecycleGrant } = require('../../services/classicLifecycleAuthorization');
@@ -175,7 +175,7 @@ async function manageCascade(args, emit) {
                 muxEnabled: false,
                 muxConcurrency: 8,
             };
-            if (linkMode === 'reverse' && isClassicProductionDeploymentEnabled(process.env)) {
+            if (linkMode === 'reverse' && isClassicProductionDeploymentConfigured(process.env)) {
                 const grant = issueClassicLifecycleGrant(link, process.env);
                 if (grant !== undefined) link.classicLifecycleGrant = grant;
             }
@@ -212,7 +212,7 @@ async function manageCascade(args, emit) {
             if (!id) throw new Error('id is required for delete');
             const link = await CascadeLink.findById(id);
             if (!link) return { error: `Cascade link '${id}' not found`, code: 404 };
-            const deletionService = isClassicProductionDeploymentEnabled(process.env)
+            const deletionService = isClassicProductionDeploymentConfigured(process.env)
                 ? getClassicTopologyCoordinator() : getDraftWriteService();
             if (typeof deletionService?.deleteLink !== 'function') {
                 throw Object.assign(new Error('Checked cascade deletion is unavailable'), {
@@ -235,7 +235,7 @@ async function manageCascade(args, emit) {
         }
 
         case 'undeploy': {
-            if (isClassicProductionDeploymentEnabled(process.env)) {
+            if (isClassicProductionDeploymentConfigured(process.env)) {
                 return {
                     success: false,
                     code: 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED',

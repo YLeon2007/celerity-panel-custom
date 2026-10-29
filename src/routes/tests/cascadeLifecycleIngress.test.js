@@ -145,7 +145,7 @@ test('HTTP classic DELETE preserves the row on checked removal failure or unavai
         const h = harness({ coordinator, env: { ...CLASSIC, CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED: 'false' } });
         h.rows.push({ _id: ID, name: 'synthetic', status: 'online' });
         const response = await request(h.router, 'DELETE', `/${ID}`, { expectedTopologyRevision: 7 });
-        assert.equal(response.status, coordinator.deleteLink ? 409 : 503);
+        assert.equal(response.status, 503);
         assert.equal(response.body.error.code, coordinator.deleteLink ? 'CLASSIC_DEPLOY_UNCERTAIN' : 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
         assert.equal(h.calls.draftDeletes.length, 0);
         assert.equal(h.rows.length, 1);
@@ -254,6 +254,25 @@ test('invalid lifecycle signing key refuses HTTP and MCP before draft insert', a
             { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
         assert.equal(mcp.calls.creates.length, 0);
     });
+});
+
+test('invalid lifecycle configuration never downgrades checked HTTP or MCP deletion to draft-only', async () => {
+    for (const delta of [{ CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY: 'invalid' },
+        { CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED: 'false', CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: 'invalid' }]) {
+        const env = { ...CLASSIC, ...delta }, h = harness({ env });
+        h.rows.push({ _id: ID, name: 'legacy', status: 'online' });
+        const response = await request(h.router, 'DELETE', `/${ID}`, { expectedTopologyRevision: 7 });
+        assert.equal(response.status, 503);
+        assert.equal(response.body.error.code, 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
+        assert.equal(h.rows.length, 1); assert.equal(h.calls.draftDeletes.length, 0);
+        await withEnv(env, async () => {
+            const mcp = mcpHarness(); mcp.rows.push({ _id: ID, name: 'legacy' });
+            await assert.rejects(mcp.manageCascade({ action: 'delete', id: ID, expectedTopologyRevision: 7 }),
+                { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
+            assert.equal(mcp.rows.length, 1); assert.equal(mcp.calls.draftDeletes.length, 0);
+            assert.equal((await mcp.manageCascade({ action: 'undeploy', id: ID })).code, 'REVISION_SAFE_TOPOLOGY_DEPLOY_REQUIRED');
+        });
+    }
 });
 
 test('failed draft insert cannot persist a grant or confirm/apply a create capability', async () => {
