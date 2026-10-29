@@ -445,6 +445,9 @@ class CascadeService {
             // status alone is never physical absence. Applied/error rows need
             // an independent recovery receipt if their fragments disappeared.
             if (remove && !portalApplied && target.status !== 'pending') throw scopedFailure('CLASSIC_SCOPED_REMOVAL_PROOF_MISSING');
+            // No listener is created when discarding an independently checked absent pending draft.
+            // Preserve unrelated numeric port owners; all target-fragment/reference guards remain.
+            const checkedPendingAbsence = remove && !portalApplied;
             const bridgeBaseline = scope.confirmed.filter(row => scopedId(row.bridgeNode) === scopedId(bridge));
             const representedDomains = bridgeBaseline.map(row =>
                 `${scopedId(row).slice(-8)}.${row.tunnelDomain || 'reverse.tunnel.internal'}`).sort();
@@ -479,7 +482,7 @@ class CascadeService {
             }
             const hasCollision = config => [...(config.inbounds || []), ...config.outbounds,
                 ...(config.reverse?.bridges || []), ...(config.reverse?.portals || [])].some(row =>
-                row.tag?.includes(targetSuffix) || row.port === target.tunnelPort);
+                row.tag?.includes(targetSuffix) || (!checkedPendingAbsence && row.port === target.tunnelPort));
             if (hasCollision(main) || hasCollision(combined)) throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
             for (const item of preserved) {
                 if (item.profile.bytes === 'C3_CONFIG_ABSENT') continue;
@@ -488,7 +491,7 @@ class CascadeService {
                 catch { throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_INVALID'); }
                 // Orphan source transit is preserved, not adopted. It must not
                 // already occupy the new main-owned listener on the same host.
-                if (scopedId(item.node) === scopedId(source)
+                if (!checkedPendingAbsence && scopedId(item.node) === scopedId(source)
                     && config.inbounds?.some(row => Number(row.port) === target.tunnelPort)) {
                     throw scopedFailure('CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT');
                 }

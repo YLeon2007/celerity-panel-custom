@@ -263,6 +263,37 @@ test('checked absence permits discarding a pending draft without config mutation
     assert.equal(f.locks.size, 0);
 });
 
+for (const conflict of ['source-transit', 'source-main', 'bridge-api']) {
+    test(`checked pending absence ignores unrelated occupied port only after ownership proof ${conflict}`, async t => {
+        const f = fixture(t);
+        if (conflict === 'source-transit') f.files.set(`${SOURCE}:${TRANSIT}`,
+            JSON.stringify({inbounds:[{tag:'preserved-listener',port:f.target.tunnelPort}],outbounds:[],routing:{rules:[]}}));
+        else if (conflict === 'source-main') f.target.tunnelPort = f.main.inbounds[0].port;
+        else {
+            const combined = JSON.parse(f.files.get(`${BRIDGE}:${TRANSIT}`));
+            combined.inbounds = [{tag:'api-local', port:f.target.tunnelPort, protocol:'dokodemo-door', settings:{address:'127.0.0.1'}}];
+            f.files.set(`${BRIDGE}:${TRANSIT}`, JSON.stringify(combined));
+        }
+        const before = new Map(f.files);
+        const result = await remove(f);
+        assert.equal(result.remoteQuiescent, true);
+        assert.equal(result.receipt.targetAbsent, true);
+        assert.deepEqual(f.files, before);
+        assert.equal(f.writes.length, 0);
+        assert.equal(f.commands.some(row => row.command.includes('systemctl restart')), false);
+        assert.equal(f.locks.size, 0);
+    });
+}
+test('occupied-port pending discard still refuses hidden target references', async t => {
+    const f = fixture(t);
+    f.files.set(`${SOURCE}:${TRANSIT}`, JSON.stringify({inbounds:[{tag:'preserved-listener',port:f.target.tunnelPort}],
+        outbounds:[],routing:{rules:[]},metadata:`portal-${TARGET.slice(-8)}`}));
+    const before = new Map(f.files);
+    await assert.rejects(remove(f), {code:'CLASSIC_SCOPED_REMOVAL_TARGET_REMAINS'});
+    assert.deepEqual(f.files, before);
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.locks.size, 2);
+});
 for (const status of ['deployed', 'online', 'offline', 'error']) {
     test(`absent ${status} target requires an independent recovery rather than draft discard`, async t => {
         const f = fixture(t); f.target.status = status;
