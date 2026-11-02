@@ -443,7 +443,12 @@
             });
         }
 
+        // Only the drawable projection is filtered. Inactive/deleted endpoints
+        // can survive in cached graphs; they must not break every other edge.
+        // The link inventory and deployment authorization remain unchanged.
+        const visibleNodeIds = new Set(data.nodes.map(n => n.data.id));
         for (const e of data.edges) {
+            if (!e?.data || !visibleNodeIds.has(e.data.source) || !visibleNodeIds.has(e.data.target)) continue;
             elements.push({
                 group: 'edges',
                 data: { ...e.data, edgeLabel: buildEdgeLabel(e.data) },

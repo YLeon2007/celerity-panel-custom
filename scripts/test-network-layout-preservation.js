@@ -12,6 +12,10 @@ const graph = {
     })); },
     elements() { return { remove() { items.clear(); } }; },
     add(elements) {
+        const ids = new Set(elements.filter(x => x.group === 'nodes').map(x => x.data.id));
+        for (const x of elements.filter(x => x.group === 'edges')) {
+            assert.ok(ids.has(x.data.source) && ids.has(x.data.target), 'Cytoscape requires both edge endpoints');
+        }
         for (const x of elements) items.set(x.data.id, { group: x.group, data: x.data,
             position: x.position ? { ...x.position } : { x: 0, y: 0 } });
     },
@@ -65,4 +69,27 @@ window.__renderGraph({ nodes: [n('a', { x: 11, y: 22 }), n('b', { x: 33, y: 44 }
 assert.deepEqual(point('internet'), { x: 930, y: 85 }, 'create preserves unsaved virtual position');
 window.__renderGraph({ nodes: [n('a', { x: 11, y: 22 }), n('b', { x: 33, y: 44 }), globe({ x: 870, y: 96 })], edges: [] });
 assert.deepEqual(point('internet'), { x: 930, y: 85 }, 'delete preserves virtual position');
-console.log('network layout preservation: OK');
+// Inactive/deleted endpoints may remain in a cached API graph. Draw only the
+// projection with both visible endpoints; keep offline links and input intact.
+items.clear();
+const snapshot = { nodes: [n('a'), n('b')], edges: [
+    { data: { id: 'visible-offline', source: 'a', target: 'b', status: 'offline', linkId: 'offline' } },
+    { data: { id: 'missing-source', source: 'disabled', target: 'b', linkId: 'hidden' } },
+    { data: { id: 'missing-target', source: 'a', target: 'deleted', linkId: 'deleted' } },
+    { data: { id: 'null-source', source: null, target: 'b' } },
+    { data: { id: 'string-null-target', source: 'a', target: 'null' } },
+] };
+const originalSnapshot = JSON.stringify(snapshot);
+window.__renderGraph(snapshot);
+assert.equal([...items.values()].filter(x => x.group === 'edges').length, 1);
+assert.equal(items.get('visible-offline').data.status, 'offline');
+assert.equal(JSON.stringify(snapshot), originalSnapshot, 'display filtering must not alter inventory snapshot');
+items.get('a').position = { x: 71, y: 121 };
+graph.pan({ x: 19, y: 30 }); graph.zoom(1.36);
+const beforeLayouts = layouts;
+window.__renderGraph(snapshot);
+assert.deepEqual(point('a'), { x: 71, y: 121 });
+assert.deepEqual(graph.pan(), { x: 19, y: 30 });
+assert.equal(graph.zoom(), 1.36);
+assert.equal(layouts, beforeLayouts, 'dangling-edge protection preserves layout');
+console.log('network layout preservation and dangling-edge projection: OK');
