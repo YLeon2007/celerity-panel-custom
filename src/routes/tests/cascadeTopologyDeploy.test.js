@@ -387,6 +387,7 @@ test('manual malformed classic results cannot masquerade as native queued IDs or
 
 test('classic errors use fixed 409/503 responses, never backend text or diagnostics', async () => {
     for (const [code, status] of [['CLASSIC_DEPLOY_BUSY', 409], ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
+        ['CLASSIC_DEPLOY_NODE_BUSY', 409], ['CLASSIC_DEPLOY_PREFLIGHT_FAILED', 409],
         ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409], ['CLASSIC_DEPLOY_IN_USE', 409],
         ['CLASSIC_DEPLOY_OWNER_VETO', 409], ['CLASSIC_DEPLOY_PORT_CONFLICT', 409],
         ['CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED', 409],
@@ -398,6 +399,14 @@ test('classic errors use fixed 409/503 responses, never backend text or diagnost
         const response = await request(router, { headers: { 'x-test-auth': 'api-write' } });
         assert.equal(response.status, status, code);
         assert.equal(response.body.error.code, code);
+        if (code === 'CLASSIC_DEPLOY_NODE_BUSY') {
+            assert.match(response.body.error.message, /node.*busy/i);
+            assert.doesNotMatch(response.body.error.message, /reload.*topology|recover.*ownership/i);
+        }
+        if (code === 'CLASSIC_DEPLOY_PREFLIGHT_FAILED') {
+            assert.match(response.body.error.message, /before remote changes.*retry remains available/i);
+            assert.doesNotMatch(response.body.error.message, /recover.*ownership/i);
+        }
         if (code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
             assert.match(response.body.error.message, /configuration.*verified/i);
             assert.doesNotMatch(response.body.error.message, /retained ownership/i);

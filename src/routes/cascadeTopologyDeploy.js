@@ -56,6 +56,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
     ['CLASSIC_DEPLOY_BUSY', 409],
+    ['CLASSIC_DEPLOY_NODE_BUSY', 409],
+    ['CLASSIC_DEPLOY_PREFLIGHT_FAILED', 409],
     ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409],
     ['CLASSIC_DEPLOY_IN_USE', 409],
     ['CLASSIC_DEPLOY_OWNER_VETO', 409],
@@ -203,6 +205,12 @@ function publicResult(result = {}) {
 }
 
 function publicError(error) {
+    if (error.code === 'CLASSIC_DEPLOY_NODE_BUSY') {
+        return { error: { code: error.code, message: 'A node used by this link is busy; retry after its operation finishes' } };
+    }
+    if (error.code === 'CLASSIC_DEPLOY_PREFLIGHT_FAILED') {
+        return { error: { code: error.code, message: 'The node preflight failed before remote changes; retry remains available' } };
+    }
     if (error.code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED') {
         return { error: { code: error.code, message: 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.' } };
     }

@@ -27,6 +27,8 @@
     const TOPOLOGY_CAUSE_TEXT_RU = Object.freeze({
         CLASSIC_DEPLOY_UNSUPPORTED: 'Classic поддерживает только отдельный Deploy активной reverse-связи',
         CLASSIC_DEPLOY_BUSY: 'Топология занята или не инициализирована — требуется проверка',
+        CLASSIC_DEPLOY_NODE_BUSY: 'Один из узлов связи занят другой операцией. Повторите после её завершения.',
+        CLASSIC_DEPLOY_PREFLIGHT_FAILED: 'Предварительная проверка узлов не пройдена. Изменений на узлах не было; повторный деплой доступен.',
         CLASSIC_DEPLOY_SCOPE_CHANGED: 'Состав применённых связей изменился — обновите топологию',
         CLASSIC_DEPLOY_IN_USE: 'Связь используется L2TP или группой маршрутов — classic запрещён',
         CLASSIC_DEPLOY_OWNER_VETO: 'Конфигурация узла принадлежит другому исполнителю',
