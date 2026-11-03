@@ -310,18 +310,40 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             const { TopologyDraftRepository } = require('../modules/relay-l2tp/repositories/topologyDraftRepository');
             repository = new TopologyDraftRepository(m);
         }
-        async function prepareDeletion(session, checkRevision = true) {
+        async function prepareDeletion(session, checkRevision = true, heldNodeIds = null) {
             const snapshot = await repository.readDraft(session);
             if (checkRevision && snapshot.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
             const { buildCandidate } = require('../modules/relay-l2tp/domain/topologyDraft');
             const { validateTopology } = require('../modules/relay-l2tp/domain/topologyValidator');
             const { compileTopology } = require('../modules/relay-l2tp/domain/topologyCompiler');
-            const prepared = buildCandidate(snapshot, { kind: 'link.delete', id: linkId });
+            const { mutationNodeIds, isStandaloneClassicMutation } = require('../modules/relay-l2tp/repositories/topologyDraftRepository');
+            const request = { kind: 'link.delete', id: linkId };
+            let standaloneClassicDraft = false;
+            let candidateSnapshot = snapshot;
+            if (heldNodeIds) {
+                // Classification needs complete relay inventory, not just installed groups.
+                const query = m.RelayL2tpState.find({});
+                snapshot.relayReferences = await (session ? query.session(session) : query.setOptions(READ)).lean();
+                standaloneClassicDraft = isStandaloneClassicMutation(snapshot, request);
+                if (standaloneClassicDraft) {
+                    // No groups reference this proven standalone component. Build
+                    // locally too: the global builder also prunes unrelated empty groups.
+                    candidateSnapshot = { ...snapshot,
+                        nodes: snapshot.nodes.filter(node => heldNodeIds.includes(entityId(node))),
+                        links: snapshot.links.filter(link => heldNodeIds.includes(entityId(link.portalNode))
+                            && heldNodeIds.includes(entityId(link.bridgeNode))),
+                        groups: [], activeRouteGroupIds: [], installedRouteGroupIds: [] };
+                }
+            }
+            const prepared = buildCandidate(candidateSnapshot, request);
+            if (heldNodeIds && mutationNodeIds(snapshot, prepared.mutation).some(id => !heldNodeIds.includes(id))) {
+                throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+            }
             if (!validateTopology(prepared.candidate)?.valid
                 || !compileTopology({ ...prepared.candidate, healthByPathKey: {} })?.valid) {
                 throw failure('INVALID_TOPOLOGY_DRAFT');
             }
-            return prepared.mutation;
+            return { mutation: prepared.mutation, standaloneClassicDraft };
         }
         async function assertNoCompetingWork(session) {
             const read = query => session ? query.session(session) : query.setOptions(READ);
@@ -332,7 +354,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 || await read(m.TopologyIntentQueueState.exists({ outstanding: { $ne: 0 } }))
                 || await read(m.NodeOperationLock.exists({}))) throw failure('CLASSIC_DEPLOY_BUSY');
         }
-        async function admission(session, independent = false) {
+        async function admission(session, independent = false, requireCreatedPending = allowUnlistedPending) {
             const read = query => session ? query.session(session) : query.setOptions(READ);
             const links = await read(m.CascadeLink.find({}).select('+classicLifecycleGrant')).lean();
             if (!Array.isArray(links) || new Set(links.map(link => entityId(link._id))).size !== links.length) {
@@ -343,7 +365,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             if (!allowlisted && !(allowUnlistedPending && env.CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED !== 'true')
                 && !hasClassicLifecycleGrant(selected, env)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             if (!['pending', 'error', ...APPLIED].includes(selected.status)
-                || (allowUnlistedPending && selected.status !== 'pending')) {
+                || (requireCreatedPending && selected.status !== 'pending')) {
                 throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
             }
             const baselineLinkIds = baselineIds(links, selected);
@@ -416,10 +438,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             return { state, admitted };
         }
         const transactionOptions = { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' };
-        // Only explicit standalone root Portal -> terminal Bridge operations use
-        // independent admission. Relay/forward/full-sync and create-and-apply
-        // retain their existing reservation protocol below.
-        if (!allowUnlistedPending) {
+        // Only standalone root Portal -> terminal Bridge operations use
+        // independent admission, including a consumed server creation capability.
+        // Relay/forward/full-sync retain their reservation protocol below.
+        {
             const candidates = await m.CascadeLink.find({ _id: linkId }).setOptions(READ).lean();
             const candidate = candidates[0];
             const candidateNodes = candidate ? await m.HyNode.find({ _id: { $in: [candidate.portalNode, candidate.bridgeNode] } }).setOptions(READ).lean() : [];
@@ -431,7 +453,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                     const state = await stateModel.findById('singleton').session(session).lean();
                     if (!state || state.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
                     const admitted = await admission(session, true);
-                    if (isDelete) await prepareDeletion(session);
+                    if (isDelete) await prepareDeletion(session, true, admitted.componentNodeIds);
                     return admitted;
                 }, transactionOptions);
                 let warning = false;
@@ -442,9 +464,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                         || !sameList(pinned.baselineLinkIds, initial.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
                     const verifyPins = async session => {
                         await held.verify();
-                        const fresh = await admission(session, true);
+                        const fresh = await admission(session, true, false);
                         if (fresh.pin !== pinned.pin || !sameList(fresh.componentNodeIds, pinned.componentNodeIds)
                             || !sameList(fresh.baselineLinkIds, pinned.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+                        if (isDelete) await prepareDeletion(session, false, pinned.componentNodeIds);
                         await held.verify();
                     };
                     if (!isDelete) {
@@ -474,14 +497,15 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                     if (isDelete) {
                         const removed = await m.connection.transaction(async session => {
                             await verifyPins(session);
-                            const mutation = await prepareDeletion(session, false);
+                            const { mutation, standaloneClassicDraft } = await prepareDeletion(session, false, pinned.componentNodeIds);
                             const state = await stateModel.findById('singleton').session(session).lean();
                             if (!Number.isSafeInteger(state?.revision) || state.revision >= Number.MAX_SAFE_INTEGER) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
                             await repository.persistMutation(mutation, session);
                             const updated = await stateModel.findOneAndUpdate({ _id: 'singleton', revision: state.revision },
                                 { $inc: { revision: 1 } }, { session, new: true, upsert: false, runValidators: true }).lean();
                             if (updated?.revision !== state.revision + 1) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
-                            return { revision: updated.revision, deployedRevision: updated.deployedRevision };
+                            return { revision: updated.revision, deployedRevision: updated.deployedRevision,
+                                ...(standaloneClassicDraft ? { standaloneClassicDraft: true } : {}) };
                         }, transactionOptions);
                         if (await m.CascadeLink.exists({ _id: linkId }).setOptions(READ)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
                         const state = await stateModel.findById('singleton').setOptions(READ).lean();
@@ -625,7 +649,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                     if (!sameList(fresh.endpoints, endpoints) || !sameList(fresh.baselineLinkIds, baselineLinkIds)) {
                         throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
                     }
-                    const mutation = await prepareDeletion(session);
+                    const { mutation } = await prepareDeletion(session);
                     await repository.persistMutation(mutation, session);
                     const row = await stateModel.findOneAndUpdate(fence, update,
                         { session, new: true, upsert: false, runValidators: true }).lean();

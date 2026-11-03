@@ -32,7 +32,8 @@ function fixture(options = {}) {
     };
     const query = read => ({ session() { return this; }, setOptions() { return this; }, select() { return this; },
         async lean() { return structuredClone(read()); }, then(a, b) { return Promise.resolve().then(read).then(a, b); } });
-    const db = { async transaction(work) { return work({ fixture: true }); } };
+    let transactions = 0;
+    const db = { async transaction(work) { options.beforeTransaction?.({ rows, state, count: ++transactions }); return work({ fixture: true }); } };
     const models = {};
     for (const [name, data] of Object.entries(rows)) models[name] = { db,
         find: filter => query(() => data.filter(row => match(row, filter))),
@@ -83,6 +84,7 @@ function fixture(options = {}) {
         if (options.effectError) throw Error('effect failed');
         if (options.forgedAfterEffect) throw createClassicPortalBridgePhase({ beforeRemoteMutation: input.beforeRemoteMutation })
             .failure(Object.assign(new Error('private transport text'), { code: 'CLASSIC_DEPLOY_PREFLIGHT_FAILED' }));
+        if (options.statusMovement) rows.CascadeLink[0].status = 'online';
         const result = receipt(input, remove); if (options.partial) result.receipt.preservedProfiles.pop();
         if (options.extraReceiptKey) result.receipt.profiles[0].status = 'failed';
         return result;
@@ -90,7 +92,7 @@ function fixture(options = {}) {
     const service = createClassicScopedCascadeDeploymentService({ ...models, lockService, NodeSSH: SSH,
         env: { PANEL_DOMAIN: 'lm1.infograd.online', L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', L2TP_PRODUCTION_EXECUTION_ENABLED: 'true',
             CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true', CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: L,
-            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false' },
+            TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false', ...options.env },
         topologyManagesNodeConfig: async node => node._id === options.ownerVeto,
         cascadeService: { deployScopedClassicLink: execute, removeScopedClassicLink: input => execute(input, true) } });
     const run = () => service.queue({ expectedTopologyRevision: 7, scope: { kind: 'link.apply', linkId: L, linkIds: options.baseline ? [L, N] : [L] } });
@@ -146,6 +148,82 @@ test('verified unconnected completion releases for retry, even if status persist
 test('checked removal deletes only selected link and increments current revision without global reservation', async () => {
     const f = fixture({ revisionMovement: true });
     const r = await f.service.deleteLink({ expectedTopologyRevision: 7, linkId: L });
-    assert.deepEqual(r, { revision: 9, deployedRevision: 5 }); assert.equal(f.rows.CascadeLink.length, 0); assert.equal(f.locks.size, 0);
+    assert.deepEqual(r, { revision: 9, deployedRevision: 5, standaloneClassicDraft: true }); assert.equal(f.rows.CascadeLink.length, 0); assert.equal(f.locks.size, 0);
     assert.equal(f.state.replacementReservation.ownerToken, 'unrelated');
+});
+
+// Local persistence/transport fixtures; not Mongo or deployed connectivity proof.
+function created(f) {
+    const cap = f.service.beginCreatedLinkCapability({ linkId: L });
+    f.service.confirmCreatedLinkCapability(cap, { linkId: L, expectedTopologyRevision: 7 });
+    return { cap, input: { expectedTopologyRevision: 7, scope: { kind: 'link.apply', linkId: L, linkIds: [L] } } };
+}
+test('creation-capability auto apply ignores unrelated busy state and permits core status completion', async () => {
+    const f = fixture({ statusMovement: true }); const foreign = { node: C, generation: 'foreign' }; f.locks.set(C, foreign);
+    const { cap, input } = created(f);
+    assert.deepEqual(await f.service.queueCreatedLink(input, cap), { status: 'succeeded', executionMode: 'classic', topologyRevision: 7 });
+    assert.equal(f.rows.CascadeLink[0].status, 'deployed'); assert.deepEqual([...f.locks], [[C, foreign]]);
+    assert.equal(f.state.replacementReservation.ownerToken, 'unrelated');
+    await assert.rejects(f.service.queueCreatedLink(input, cap), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
+    assert.equal(f.calls.filter(c => c === 'core').length, 1);
+});
+test('creation-capability selected lock conflict, forged token and initial nonpending rows have no effects', async () => {
+    for (const mode of ['lock', 'forged', 'nonpending']) {
+        const f = fixture(); const { cap, input } = created(f);
+        if (mode === 'lock') f.locks.set(B, { node: B, generation: 'winner' });
+        if (mode === 'nonpending') f.rows.CascadeLink[0].status = 'online';
+        await assert.rejects(f.service.queueCreatedLink(input, mode === 'forged' ? { token: '00000000-0000-0000-0000-000000000000' } : cap),
+            { code: mode === 'lock' ? 'CLASSIC_DEPLOY_NODE_BUSY' : 'CLASSIC_DEPLOY_UNSUPPORTED' });
+        assert.deepEqual(f.calls, []);
+    }
+});
+test('Relay creation capability retains strict global busy refusal', async () => {
+    const f = fixture(); f.rows.HyNode[0].cascadeRole = 'relay'; const { cap, input } = created(f);
+    await assert.rejects(f.service.queueCreatedLink(input, cap), { code: 'CLASSIC_DEPLOY_BUSY' }); assert.deepEqual(f.calls, []);
+});
+
+function retainedCleanup(rows) {
+    rows.CascadeRouteGroup.push({ _id: '507f1f77bcf86cd799439055', name: 'retained', mode: 'reverse', strategy: 'priority-failover',
+        paths: [{ pathKey: 'old', priority: 1, enabled: false, linkIds: [L, N] }] });
+}
+function outsideLink(f) {
+    const D = '507f1f77bcf86cd799439034';
+    f.rows.HyNode.push({ ...f.rows.HyNode[1], _id: D });
+    f.rows.CascadeLink.push({ ...f.rows.CascadeLink[0], _id: N, portalNode: C, bridgeNode: D, tunnelPort: 10087 });
+}
+test('checked DELETE refuses retained cleanup node union outside locks before physical removal', async () => {
+    const f = fixture(); outsideLink(f); retainedCleanup(f.rows);
+    await assert.rejects(f.service.deleteLink({ expectedTopologyRevision: 7, linkId: L }), { code: 'CLASSIC_DEPLOY_SCOPE_CHANGED' });
+    assert.deepEqual(f.calls, []); assert.equal(f.rows.CascadeLink.length, 2); assert.equal(f.rows.CascadeRouteGroup.length, 1);
+});
+test('checked DELETE rebuild refuses newly expanded retained cleanup before draft persistence', async () => {
+    const f = fixture({ beforeTransaction: ({ rows, count }) => { if (count === 2) retainedCleanup(rows); } }); outsideLink(f);
+    await assert.rejects(f.service.deleteLink({ expectedTopologyRevision: 7, linkId: L }), { code: 'CLASSIC_DEPLOY_SCOPE_CHANGED' });
+    assert.equal(f.calls.filter(c => c === 'core').length, 1);
+    assert.equal(f.rows.CascadeLink.length, 2); assert.equal(f.rows.CascadeRouteGroup.length, 1); assert.equal(f.state.revision, 7);
+});
+test('standalone checked DELETE validates only its contained candidate despite unrelated invalid graph', async () => {
+    const f = fixture(); outsideLink(f);
+    f.rows.CascadeRouteGroup.push({ _id: '507f1f77bcf86cd799439055', name: 'unrelated-invalid', mode: 'reverse', strategy: 'priority-failover',
+        paths: [{ pathKey: 'broken', priority: 1, enabled: true, linkIds: ['507f1f77bcf86cd799439099'] }] });
+    const before = structuredClone(f.rows.CascadeRouteGroup);
+    const r = await f.service.deleteLink({ expectedTopologyRevision: 7, linkId: L });
+    assert.deepEqual(r, { revision: 8, deployedRevision: 5, standaloneClassicDraft: true });
+    assert.equal(f.rows.CascadeLink.length, 1); assert.equal(f.rows.CascadeLink[0]._id, N);
+    assert.deepEqual(f.rows.CascadeRouteGroup, before);
+});
+
+test('independent auto creation retains lifecycle HMAC policy and legacy capability exception', async () => {
+    const lifecycleEnv = { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: N, CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED: 'true',
+        CLASSIC_TOPOLOGY_LIFECYCLE_SIGNING_KEY: 'ab'.repeat(32) };
+    for (const granted of [false, true]) {
+        const f = fixture({ env: lifecycleEnv, statusMovement: true });
+        if (granted) f.rows.CascadeLink[0].classicLifecycleGrant = require('../classicLifecycleAuthorization').issueClassicLifecycleGrant(f.rows.CascadeLink[0], lifecycleEnv);
+        const { cap, input } = created(f);
+        if (granted) { await f.service.queueCreatedLink(input, cap); await f.run(); assert.equal(f.calls.filter(c => c === 'core').length, 2); }
+        else { await assert.rejects(f.service.queueCreatedLink(input, cap), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' }); assert.deepEqual(f.calls, []); }
+    }
+    const legacy = fixture({ env: { CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS: N } }); const { cap, input } = created(legacy);
+    await legacy.service.queueCreatedLink(input, cap);
+    await assert.rejects(legacy.run(), { code: 'CLASSIC_DEPLOY_UNSUPPORTED' });
 });
