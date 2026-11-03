@@ -143,8 +143,10 @@ function createAutoDeployHarness({
     editedLink,
     updateError,
     deploymentEnv = {},
+    standaloneClassicDraft = false,
+    maintainAutoL2tpPathsFn,
 } = {}) {
-    const calls = { queue: [] };
+    const calls = { queue: [], maintenance: 0 };
     let storedLinks = links.map(link => ({ ...link }));
     if (editedLink) storedLinks.push({ ...editedLink });
     const Link = {
@@ -161,7 +163,7 @@ function createAutoDeployHarness({
             // The draft write persists the new link with the model default
             // status 'pending'; it is NOT part of the deployed baseline.
             storedLinks = [...storedLinks, { ...input.link, status: 'pending' }];
-            return { revision: 8, deployedRevision: 5 };
+            return { revision: 8, deployedRevision: 5, ...(standaloneClassicDraft ? { standaloneClassicDraft: true } : {}) };
         },
         async updateLink(input) {
             calls.updateLink = input;
@@ -173,7 +175,7 @@ function createAutoDeployHarness({
                 throw error;
             }
             Object.assign(link, input.changes);
-            return { revision: 8, deployedRevision: 5 };
+            return { revision: 8, deployedRevision: 5, ...(standaloneClassicDraft ? { standaloneClassicDraft: true } : {}) };
         },
     };
     const resolvedCoordinator = coordinator ?? {
@@ -186,9 +188,11 @@ function createAutoDeployHarness({
         Link,
         Node,
         topologyDraftWriteService,
-        maintainAutoL2tpPathsFn: async () => (
-            maintenanceRevision === null ? undefined : { updated: 1, revision: maintenanceRevision }
-        ),
+        maintainAutoL2tpPathsFn: async input => {
+            calls.maintenance += 1;
+            if (maintainAutoL2tpPathsFn) return maintainAutoL2tpPathsFn(input);
+            return maintenanceRevision === null ? undefined : { updated: 1, revision: maintenanceRevision };
+        },
         prepareL2tpIngressFn: prepareL2tpIngressFn ?? (async ({ expectedTopologyRevision }) => ({
             revision: expectedTopologyRevision,
         })),
@@ -563,7 +567,7 @@ test('PUT exact completed classic result has its own truthful contract without o
 });
 
 test('PUT classic refusals preserve safe codes and never pretend that completion was queued', async () => {
-    for (const code of ['CLASSIC_DEPLOY_BUSY', 'CLASSIC_DEPLOY_UNSUPPORTED', 'CLASSIC_DEPLOY_SCOPE_CHANGED',
+    for (const code of ['CLASSIC_DEPLOY_BUSY', 'CLASSIC_DEPLOY_NODE_BUSY', 'CLASSIC_DEPLOY_PREFLIGHT_FAILED', 'CLASSIC_DEPLOY_UNSUPPORTED', 'CLASSIC_DEPLOY_SCOPE_CHANGED',
         'CLASSIC_DEPLOY_IN_USE', 'CLASSIC_DEPLOY_OWNER_VETO', 'CLASSIC_DEPLOY_PORT_CONFLICT',
         'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED',
         'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 'CLASSIC_DEPLOY_UNCERTAIN', 'CLASSIC_DEPLOY_FENCE_LOST']) {
@@ -580,6 +584,73 @@ test('PUT classic refusals preserve safe codes and never pretend that completion
         assert.equal(response.body.autoDeployOperation, undefined);
         assert.doesNotMatch(JSON.stringify(response.body), /password|secret/);
     }
+});
+
+test('DELETE selected-node busy and trusted preflight refusals are safe 409 responses', async () => {
+    for (const code of ['CLASSIC_DEPLOY_NODE_BUSY', 'CLASSIC_DEPLOY_PREFLIGHT_FAILED']) {
+        const { router } = createAutoDeployHarness({ deploymentEnv: CLASSIC_ENV,
+            coordinator: { async deleteLink() {
+                throw Object.assign(Error('password=transport-secret'), { code, details: { secret: 'transport-secret' } });
+            } } });
+        const response = await request(router, { method: 'DELETE', path: `/${LINK_EDITED}`,
+            body: { expectedTopologyRevision: 8 } });
+        assert.equal(response.status, 409);
+        assert.equal(response.body.error.code, code);
+        assert.equal(response.body.error.details, undefined);
+        assert.doesNotMatch(JSON.stringify(response.body), /password|transport-secret/);
+    }
+});
+
+test('classic standalone save-only POST omits unrelated global maintenance', async () => {
+    const { router, calls } = createAutoDeployHarness({ deploymentEnv: CLASSIC_ENV,
+        standaloneClassicDraft: true, links: [],
+        maintainAutoL2tpPathsFn: async () => { throw Error('unrelated relay busy'); } });
+    const response = await request(router, { method: 'POST', body: createBody({
+        portalNodeId: PORTAL_A, autoDeploy: false }) });
+    assert.equal(response.status, 201);
+    assert.equal(calls.maintenance, 0);
+    assert.equal(response.body.topologyRevision, 8);
+    assert.equal(calls.queue.length, 0);
+});
+
+test('classic standalone auto POST applies exact draft revision without maintenance', async () => {
+    let begun = 0, confirmed = 0, queued = 0;
+    const { router, calls } = createAutoDeployHarness({ deploymentEnv: CLASSIC_ENV,
+        standaloneClassicDraft: true, links: [],
+        coordinator: {
+            beginCreatedLinkCapability() { begun++; return {}; },
+            confirmCreatedLinkCapability(cap, input) { confirmed++; assert.equal(input.expectedTopologyRevision, 8); },
+            async queueCreatedLink(input) { queued++; assert.equal(input.expectedTopologyRevision, 8);
+                return { status: 'succeeded', executionMode: 'classic', topologyRevision: 8 }; },
+            async queue() { throw Error('must use creation capability'); },
+        } });
+    const response = await request(router, { method: 'POST', body: createBody({ portalNodeId: PORTAL_A }) });
+    assert.equal(response.status, 201);
+    assert.equal(calls.maintenance, 0);
+    assert.equal(begun, 1); assert.equal(confirmed, 1); assert.equal(queued, 1);
+    assert.equal(response.body.autoDeployResult.status, 'succeeded');
+});
+
+test('classic standalone PUT skips global maintenance and ingress but still uses checked queue', async () => {
+    const { router, calls } = createAutoDeployHarness({ deploymentEnv: CLASSIC_ENV,
+        standaloneClassicDraft: true, links: [], editedLink: editedLink(),
+        prepareL2tpIngressFn: async () => { throw Error('unrelated ingress busy'); },
+    });
+    const response = await putEdit(router, editBody({ autoDeploy: true }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.maintenance, 0);
+    assert.equal(calls.queue.length, 1);
+    assert.equal(calls.queue[0].expectedTopologyRevision, 8);
+});
+
+test('request standalone flag cannot bypass strict chain maintenance', async () => {
+    const { router, calls } = createAutoDeployHarness({ editedLink: editedLink(),
+        maintainAutoL2tpPathsFn: async () => { throw Object.assign(Error('busy'), { code: 'TOPOLOGY_DEPLOY_BUSY' }); } });
+    const response = await putEdit(router, editBody({ autoDeploy: true, standaloneClassicDraft: true }));
+    assert.equal(response.status, 200);
+    assert.equal(calls.maintenance, 1);
+    assert.equal(calls.queue.length, 0);
+    assert.equal(response.body.autoDeployStatus, 'blocked');
 });
 
 test('PUT malformed queue result fails closed rather than claiming a queued operation', async () => {

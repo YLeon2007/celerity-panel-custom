@@ -1,5 +1,101 @@
 'use strict';
 
+const { randomUUID } = require('node:crypto');
+const { entityId } = require('../domain/topologyDraft');
+
+// Include old and new endpoints, and every path changed by dependency cleanup.
+// This is deliberately independent of active/status projection: inactive drafts
+// still share the same endpoint configuration writers.
+function mutationNodeIds(snapshot, mutation) {
+    if (Object.keys(mutation.changes || {}).some(key => /^(portalNode|bridgeNode|source|target|paths)\./.test(key))) {
+        throw new TopologyDraftRepositoryError('TOPOLOGY_DRAFT_LOCK_SCOPE_CHANGED',
+            'Dotted structural changes cannot establish a selected-node lock scope');
+    }
+    const links = snapshot.links || [];
+    const groups = snapshot.groups || [];
+    const ids = new Set();
+    const addLink = link => {
+        if (!link) throw new TopologyDraftRepositoryError('TOPOLOGY_DRAFT_LOCK_SCOPE_CHANGED', 'A draft dependency disappeared');
+        for (const endpoint of [link.portalNode ?? link.source, link.bridgeNode ?? link.target]) {
+            const id = entityId(endpoint);
+            if (!id) throw new TopologyDraftRepositoryError('TOPOLOGY_DRAFT_LOCK_SCOPE_CHANGED', 'A draft endpoint is missing');
+            ids.add(id);
+        }
+    };
+    const addGroup = group => {
+        for (const path of group?.paths || []) {
+            for (const id of path.linkIds || []) addLink(links.find(link => entityId(link) === entityId(id)));
+        }
+    };
+    if (mutation.kind === 'link.create') addLink(mutation.document);
+    else if (mutation.kind === 'link.update' || mutation.kind === 'link.delete') {
+        const old = links.find(link => entityId(link) === entityId(mutation.id));
+        addLink(old);
+        if (mutation.kind === 'link.update') addLink({ ...old, ...mutation.changes });
+        const affected = new Set([
+            ...(mutation.groupUpdates || []).map(update => entityId(update.id)),
+            ...(mutation.groupDeletes || []).map(entityId),
+        ]);
+        for (const group of groups) {
+            if (affected.has(entityId(group)) || (group.paths || []).some(path =>
+                (path.linkIds || []).some(id => entityId(id) === entityId(mutation.id)))) addGroup(group);
+        }
+        for (const update of mutation.groupUpdates || []) addGroup(update);
+    } else if (mutation.kind.startsWith('group.')) {
+        const old = groups.find(group => entityId(group) === entityId(mutation.id));
+        addGroup(old);
+        if (mutation.kind === 'group.create') addGroup(mutation.document);
+        if (mutation.kind === 'group.update') addGroup({ ...old, ...mutation.changes });
+    }
+    return [...ids].sort();
+}
+
+function isStandaloneClassicMutation(snapshot, mutation) {
+    if (!['link.create', 'link.update', 'link.delete'].includes(mutation.kind)
+        || mutation.groupUpdates?.length || mutation.groupDeletes?.length) return false;
+    const old = (snapshot.links || []).find(link => entityId(link) === entityId(mutation.id));
+    const variants = mutation.kind === 'link.create' ? [mutation.document]
+        : mutation.kind === 'link.delete' ? [old] : [old, { ...old, ...mutation.changes }];
+    const roles = new Map((snapshot.nodes || []).map(node => [entityId(node), node.cascadeRole]));
+    const nodes = new Set();
+    for (const link of variants) {
+        const source = entityId(link?.portalNode), target = entityId(link?.bridgeNode);
+        if (!source || !target || source === target || (link.mode ?? 'reverse') !== 'reverse'
+            || roles.get(source) !== 'portal' || roles.get(target) !== 'bridge'
+            || link.geoRouting?.enabled === true || mutation.changes?.['geoRouting.enabled'] === true) return false;
+        nodes.add(source); nodes.add(target);
+    }
+    // Inspect the whole connected draft component, including disabled siblings:
+    // a hidden continuation through a sibling bridge is not a standalone pair.
+    let expanded = true;
+    while (expanded) {
+        expanded = false;
+        for (const link of snapshot.links || []) {
+            const source = entityId(link.portalNode), target = entityId(link.bridgeNode);
+            if (!nodes.has(source) && !nodes.has(target)) continue;
+            for (const id of [source, target]) {
+                if (id && !nodes.has(id)) { nodes.add(id); expanded = true; }
+            }
+        }
+    }
+    const touching = (snapshot.links || []).filter(link =>
+        nodes.has(entityId(link.portalNode)) || nodes.has(entityId(link.bridgeNode)));
+    // A shared portal may have sibling terminal bridges, but no transit/forward
+    // links or incoming portal hop may participate in this narrow exception.
+    if (touching.some(link => (link.mode ?? 'reverse') !== 'reverse'
+        || roles.get(entityId(link.portalNode)) !== 'portal'
+        || roles.get(entityId(link.bridgeNode)) !== 'bridge'
+        || link.geoRouting?.enabled === true)) return false;
+    const touchingIds = new Set(touching.map(entityId));
+    for (const link of variants) touchingIds.add(entityId(link));
+    if ((snapshot.groups || []).some(group => (group.paths || []).some(path =>
+        (path.linkIds || []).some(id => touchingIds.has(entityId(id)))))) return false;
+    // Missing reference inventory is not proof of independence.
+    if (!Array.isArray(snapshot.relayReferences) || snapshot.relayReferences.some(row =>
+        nodes.has(entityId(row.node)))) return false;
+    return true;
+}
+
 const ACTIVE_NODE_ROLES = Object.freeze(['portal', 'relay', 'bridge']);
 const ACTIVE_RELAY_STATUSES = Object.freeze([
     'queued',
@@ -76,6 +172,8 @@ class TopologyDraftRepository {
         CascadeTopologyState,
         RelayL2tpState,
         transactionRunner,
+        withScopedNodeLocks,
+        allowStandaloneClassicDrafts = false,
     } = {}) {
         const models = {
             HyNode,
@@ -120,6 +218,11 @@ class TopologyDraftRepository {
             throw new TypeError('Topology draft repository requires a transaction runner');
         }
         Object.assign(this, models);
+        if (withScopedNodeLocks !== undefined && typeof withScopedNodeLocks !== 'function') {
+            throw new TypeError('Topology draft repository requires withScopedNodeLocks to be a function');
+        }
+        this.withScopedNodeLocks = withScopedNodeLocks;
+        this.allowStandaloneClassicDrafts = allowStandaloneClassicDrafts === true;
         this.transactionRunner = runTransaction;
     }
 
@@ -129,14 +232,18 @@ class TopologyDraftRepository {
         const nodeQuery = this.HyNode.find(NODE_FILTER).select(NODE_SELECT);
         const linkQuery = this.CascadeLink.find({}).select(LINK_SELECT);
         const groupQuery = this.CascadeRouteGroup.find({}).select(GROUP_SELECT);
-        const relayStateQuery = this.RelayL2tpState.find(ACTIVE_ROUTE_GROUP_FILTER)
-            .select(ROUTE_GROUP_REFERENCE_SELECT);
+        const relayStateQuery = this.RelayL2tpState.find(this.withScopedNodeLocks ? {} : ACTIVE_ROUTE_GROUP_FILTER)
+            .select(this.withScopedNodeLocks
+                ? `${ROUTE_GROUP_REFERENCE_SELECT} desiredState installedRouteGroup` : ROUTE_GROUP_REFERENCE_SELECT);
         const state = await withSession(topologyQuery, session).lean();
         const nodes = await withSession(nodeQuery, session).lean();
         const links = await withSession(linkQuery, session).lean();
         const groups = await withSession(groupQuery, session).lean();
-        const activeRelayStates = await withSession(relayStateQuery, session).lean();
+        const relayStates = await withSession(relayStateQuery, session).lean();
+        const activeRelayStates = this.withScopedNodeLocks ? (relayStates || []).filter(row =>
+            row.routeGroup != null && (row.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.includes(row.status))) : relayStates;
         return {
+            ...(this.withScopedNodeLocks ? { relayReferences: relayStates || [] } : {}),
             revision: state?.revision ?? 0,
             deployedRevision: state?.deployedRevision ?? 0,
             ...(state?.topologyAdmissionCount !== undefined ? { topologyAdmissionCount: state.topologyAdmissionCount } : {}),
@@ -255,21 +362,32 @@ class TopologyDraftRepository {
             throw new TypeError('Topology draft commit requires a prepare function');
         }
         try {
-            return await this.transactionRunner(async session => {
+            const commit = (held, heldIds) => this.transactionRunner(async session => {
                 const snapshot = await this.readDraft(session);
                 if (snapshot.revision !== expectedRevision) {
                     throw staleRevision(expectedRevision, snapshot.revision);
                 }
-                if (snapshot.replacementReservation) {
+                let prepared = heldIds ? await prepare(snapshot) : null;
+                const standalone = !!held && this.allowStandaloneClassicDrafts
+                    && isStandaloneClassicMutation(snapshot, prepared?.mutation);
+                if (heldIds) {
+                    const changedIds = mutationNodeIds(snapshot, prepared?.mutation);
+                    if (changedIds.some(id => !heldIds.has(id))) {
+                        throw new TopologyDraftRepositoryError('TOPOLOGY_DRAFT_LOCK_SCOPE_CHANGED',
+                            'The fresh draft mutation exceeds its selected-node locks');
+                    }
+                    if (held) await held.verify();
+                }
+                if (!standalone && snapshot.replacementReservation) {
                     throw new TopologyDraftRepositoryError(
                         'TOPOLOGY_REPLACEMENT_RESERVED',
                         'A topology replacement owns the draft mutation fence',
                     );
                 }
-                if (snapshot.topologyAdmissionCount > 0) {
+                if (!standalone && snapshot.topologyAdmissionCount > 0) {
                     throw new TopologyDraftRepositoryError('TOPOLOGY_DEPLOY_BUSY', 'An active operation owns the exact topology revision');
                 }
-                const prepared = await prepare(snapshot);
+                prepared ??= await prepare(snapshot);
                 await this.persistMutation(prepared?.mutation, session);
                 const update = { $inc: { revision: 1 } };
                 if (expectedRevision === 0) {
@@ -279,8 +397,13 @@ class TopologyDraftRepository {
                     {
                         _id: 'singleton',
                         revision: expectedRevision,
-                        topologyAdmissionCount: 0,
-                        replacementReservation: { $exists: false },
+                        // Independent classic drafts still serialize through the
+                        // real global revision CAS, but do not own or clear an
+                        // unrelated native operation's reservation/counters.
+                        ...(!standalone ? {
+                            topologyAdmissionCount: 0,
+                            replacementReservation: { $exists: false },
+                        } : {}),
                     },
                     update,
                     {
@@ -293,10 +416,28 @@ class TopologyDraftRepository {
                     .select(TOPOLOGY_STATE_SELECT)
                     .lean();
                 if (!state) throw staleRevision(expectedRevision, null);
+                if (held) await held.verify();
                 return {
                     revision: state.revision,
                     deployedRevision: state.deployedRevision ?? 0,
+                    ...(standalone ? { standaloneClassicDraft: true } : {}),
                 };
+            });
+            if (!this.withScopedNodeLocks) return await commit();
+            const snapshot = await this.readDraft();
+            if (snapshot.revision !== expectedRevision) throw staleRevision(expectedRevision, snapshot.revision);
+            const prepared = await prepare(snapshot);
+            const nodeIds = mutationNodeIds(snapshot, prepared?.mutation);
+            // Empty groups have no node writers to exclude. Still recheck the
+            // empty changed-set inside the transaction and retain strict CAS.
+            if (nodeIds.length === 0) return await commit(undefined, new Set());
+            return await this.withScopedNodeLocks({
+                nodeIds, operationId: `classic-draft:${randomUUID()}`,
+            }, async held => {
+                if (typeof held?.verify !== 'function') throw new TypeError('Draft node locks require held.verify');
+                await held.verify();
+                // No beforeRemoteMutation: this scope is pure transactional DB work.
+                return commit(held, new Set(nodeIds));
             });
         } catch (error) {
             if (expectedRevision === 0 && (error?.code === 11000 || error?.code === 11001)) {
@@ -308,6 +449,10 @@ class TopologyDraftRepository {
 }
 
 module.exports = {
+    // Checked deletion can derive its outer union with the same dependency
+    // rules before entering a reentrant draft/config lock scope.
+    mutationNodeIds,
+    isStandaloneClassicMutation,
     ACTIVE_NODE_ROLES,
     ACTIVE_RELAY_STATUSES,
     ACTIVE_ROUTE_GROUP_FILTER,

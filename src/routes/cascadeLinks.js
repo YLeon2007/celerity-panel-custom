@@ -49,6 +49,9 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
     ['CLASSIC_DEPLOY_BUSY', 409],
+    ['CLASSIC_DEPLOY_NODE_BUSY', 409],
+    ['CLASSIC_DEPLOY_PREFLIGHT_FAILED', 409],
+    ['TOPOLOGY_DRAFT_LOCK_SCOPE_CHANGED', 409],
     ['CLASSIC_DEPLOY_SCOPE_CHANGED', 409],
     ['CLASSIC_DEPLOY_IN_USE', 409],
     ['CLASSIC_DEPLOY_OWNER_VETO', 409],
@@ -155,6 +158,8 @@ const SAFE_AUTO_DEPLOY_BLOCKED_CODES = new Set([
     'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
     'CLASSIC_DEPLOY_UNSUPPORTED',
     'CLASSIC_DEPLOY_BUSY',
+    'CLASSIC_DEPLOY_NODE_BUSY',
+    'CLASSIC_DEPLOY_PREFLIGHT_FAILED',
     'CLASSIC_DEPLOY_SCOPE_CHANGED',
     'CLASSIC_DEPLOY_IN_USE',
     'CLASSIC_DEPLOY_OWNER_VETO',
@@ -171,7 +176,11 @@ function autoDeployBlockedError(error) {
         : 'TOPOLOGY_OPERATION_QUEUE_FAILED';
     return {
         code,
-        message: code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED'
+        message: code === 'CLASSIC_DEPLOY_NODE_BUSY'
+            ? 'A selected node is busy; retry after its operation finishes'
+            : code === 'CLASSIC_DEPLOY_PREFLIGHT_FAILED'
+                ? 'Deployment preflight rejected the request before any remote write'
+                : code === 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED'
             ? 'Configuration was applied and verified, but the tunnel has no confirmed connection. Check connectivity between nodes. Retry and checked deletion remain available.'
             : code === 'CLASSIC_DEPLOY_PORT_CONFLICT'
             ? 'The tunnel port is already in use on the source node; edit the port and retry'
@@ -345,6 +354,11 @@ function sendError(res, error, operation, context = {}) {
             error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
         });
     }
+    if (code.startsWith('CLASSIC_DEPLOY_')) {
+        // Known public codes are not permission to serialize transport text or
+        // arbitrary attached details (including checked-delete failures).
+        return res.status(status).json({ error: { code, message: autoDeployBlockedError(error).message } });
+    }
     const body = { error: { code, message: error.message } };
     if (Array.isArray(error?.errors)) body.error.details = error.errors;
     else if (error?.details !== undefined) body.error.details = error.details;
@@ -420,6 +434,7 @@ function createCascadeLinksRouter({
     invalidateSubscriptions = () => require('../services/cacheService').invalidateAllSubscriptions(),
     invalidateTopology = () => require('../services/cascadeService')._invalidateTopologyCache(),
 } = {}) {
+    deploymentEnv = Object.freeze({ ...deploymentEnv });
     const router = express.Router();
     const getIntentService = () => {
         const service = topologyIntentService === undefined
@@ -438,6 +453,7 @@ function createCascadeLinksRouter({
                 CascadeRouteGroup: RouteGroup,
                 CascadeTopologyState: TopologyState,
                 RelayL2tpState: RelayState,
+                deploymentEnv,
             });
         }
         return writeService;
@@ -526,6 +542,10 @@ function createCascadeLinksRouter({
             };
         }
     };
+    // Only the locked repository's fresh transactional classification may
+    // bypass unrelated global maintenance. Never trust a request-body flag.
+    const isIndependentClassicDraft = revisions =>
+        isClassicProductionDeploymentConfigured(deploymentEnv) && revisions?.standaloneClassicDraft === true;
     const invalidateCaches = async () => {
         const results = await Promise.allSettled([
             invalidateSubscriptions(),
@@ -821,7 +841,7 @@ function createCascadeLinksRouter({
                     link,
                 });
                 await invalidateCaches();
-                const maintenance = await maintainL2tpPaths();
+                const maintenance = isIndependentClassicDraft(revisions) ? null : await maintainL2tpPaths();
                 const finalRevisions = Number.isSafeInteger(maintenance?.revision)
                     ? { ...revisions, revision: maintenance.revision } : revisions;
                 classicCoordinator.confirmCreatedLinkCapability(creationCapability, {
@@ -872,7 +892,7 @@ function createCascadeLinksRouter({
                 link,
             });
             await invalidateCaches();
-            const maintenance = await maintainL2tpPaths();
+            const maintenance = isIndependentClassicDraft(revisions) ? null : await maintainL2tpPaths();
             const finalRevisions = Number.isSafeInteger(maintenance?.revision)
                 ? { ...revisions, revision: maintenance.revision } : revisions;
             const snapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
@@ -1037,7 +1057,9 @@ function createCascadeLinksRouter({
             let maintenance = null;
             let maintenanceError = null;
             try {
-                maintenance = await maintainL2tpPaths({ required: changes.autoDeploy === true });
+                if (!isIndependentClassicDraft(revisions)) {
+                    maintenance = await maintainL2tpPaths({ required: changes.autoDeploy === true });
+                }
             } catch (error) {
                 maintenanceError = error;
             }
@@ -1067,7 +1089,8 @@ function createCascadeLinksRouter({
                             const scopedCoordinator = await getTopologyCoordinator();
                             // Only a trusted server-selected service can omit the
                             // native hook. Its queue retains all admission checks.
-                            if (scopedCoordinator?.requiresL2tpIngressPreparation !== false) {
+                            if (!isIndependentClassicDraft(revisions)
+                                && scopedCoordinator?.requiresL2tpIngressPreparation !== false) {
                                 const baselineLinkIds = selectLinkApplyBaselineLinkIds({
                                     links: snapshot.links,
                                     linkId: link._id,
@@ -1148,7 +1171,7 @@ function createCascadeLinksRouter({
                 linkId: req.params.id,
             });
             await invalidateCaches();
-            const maintenance = await maintainL2tpPaths();
+            const maintenance = isIndependentClassicDraft(revisions) ? null : await maintainL2tpPaths();
             let finalRevisions = Number.isSafeInteger(maintenance?.revision)
                 ? { ...revisions, revision: maintenance.revision }
                 : revisions;

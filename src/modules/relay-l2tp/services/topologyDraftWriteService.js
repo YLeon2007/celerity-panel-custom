@@ -142,10 +142,24 @@ function createTopologyDraftWriteService({
     CascadeTopologyState,
     RelayL2tpState,
     transactionRunner,
+    withScopedNodeLocks,
+    deploymentEnv = process.env,
     Repository = TopologyDraftRepository,
     validator = validateTopology,
     compiler = compileTopology,
 } = {}) {
+    if (withScopedNodeLocks !== undefined && typeof withScopedNodeLocks !== 'function') {
+        throw new TypeError('Topology draft factory requires withScopedNodeLocks to be a function');
+    }
+    const env = Object.freeze({ ...deploymentEnv });
+    const { isClassicProductionDeploymentConfigured } = require('../../../services/classicScopedCascadeDeploymentService');
+    const classic = isClassicProductionDeploymentConfigured(env);
+    // Keep dormant/native imports unchanged. The shared unique-lock helper is
+    // resolved on use only; a missing integration must fail, never fall back.
+    const scopedLocks = withScopedNodeLocks ?? (classic ? ((options, work) => {
+        const { withScopedClassicNodeLocks } = require('../../../services/classicPortalBridgeAdmission');
+        return withScopedClassicNodeLocks(options, work);
+    }) : undefined);
     const repository = new Repository({
         HyNode,
         CascadeLink,
@@ -153,6 +167,10 @@ function createTopologyDraftWriteService({
         CascadeTopologyState,
         RelayL2tpState,
         transactionRunner,
+        ...(scopedLocks ? {
+            withScopedNodeLocks: scopedLocks,
+            allowStandaloneClassicDrafts: classic,
+        } : {}),
     });
     return new TopologyDraftWriteService({
         repository,
