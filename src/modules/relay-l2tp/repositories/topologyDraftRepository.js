@@ -362,6 +362,7 @@ class TopologyDraftRepository {
             throw new TypeError('Topology draft commit requires a prepare function');
         }
         try {
+            let databaseCommitted;
             const commit = (held, heldIds) => this.transactionRunner(async session => {
                 const snapshot = await this.readDraft(session);
                 if (snapshot.revision !== expectedRevision) {
@@ -388,6 +389,9 @@ class TopologyDraftRepository {
                     throw new TopologyDraftRepositoryError('TOPOLOGY_DEPLOY_BUSY', 'An active operation owns the exact topology revision');
                 }
                 prepared ??= await prepare(snapshot);
+                // Arm only after read/validation, immediately before the first
+                // persistent attempt. Reuse this entry across transaction retries.
+                if (held && !databaseCommitted) databaseCommitted = await held.beforeDatabaseMutation();
                 await this.persistMutation(prepared?.mutation, session);
                 const update = { $inc: { revision: 1 } };
                 if (expectedRevision === 0) {
@@ -422,6 +426,11 @@ class TopologyDraftRepository {
                     deployedRevision: state.deployedRevision ?? 0,
                     ...(standalone ? { standaloneClassicDraft: true } : {}),
                 };
+            }).then(async result => {
+                // Unknown/failed persistent attempts keep their own pending
+                // ledger entry, even when an outer reentrant caller swallows.
+                if (databaseCommitted) await databaseCommitted();
+                return result;
             });
             if (!this.withScopedNodeLocks) return await commit();
             const snapshot = await this.readDraft();
@@ -434,9 +443,10 @@ class TopologyDraftRepository {
             return await this.withScopedNodeLocks({
                 nodeIds, operationId: `classic-draft:${randomUUID()}`,
             }, async held => {
-                if (typeof held?.verify !== 'function') throw new TypeError('Draft node locks require held.verify');
+                if (typeof held?.verify !== 'function' || typeof held?.beforeDatabaseMutation !== 'function') {
+                    throw new TypeError('Draft node locks require held.verify and held.beforeDatabaseMutation');
+                }
                 await held.verify();
-                // No beforeRemoteMutation: this scope is pure transactional DB work.
                 return commit(held, new Set(nodeIds));
             });
         } catch (error) {

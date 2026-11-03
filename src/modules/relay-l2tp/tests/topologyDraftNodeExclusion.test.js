@@ -62,6 +62,10 @@ function fixture({ snapshot = {}, onAcquire } = {}) {
                 await onAcquire?.(state);
                 return await work({
                     async verify() { trace.push(['verify']); },
+                    async beforeDatabaseMutation() {
+                        trace.push(['beforeDatabaseMutation']);
+                        return async () => { trace.push(['databaseCommitted']); };
+                    },
                     async beforeRemoteMutation() { throw Error('pure draft must not authorize remote writes'); },
                 });
             } finally {
@@ -83,6 +87,10 @@ test('selected-node locks enclose fresh draft read, persistence and transaction 
     assert.deepEqual(trace.find(row => row[0] === 'acquire'), ['acquire', ['b', 'p']]);
     assert.deepEqual(trace.find(row => row[0] === 'begin'), ['begin', ['b', 'p']]);
     assert.deepEqual(trace.find(row => row[0] === 'commit'), ['commit', ['b', 'p']]);
+    assert.equal(trace.filter(row => row[0] === 'beforeDatabaseMutation').length, 1);
+    assert.equal(trace.filter(row => row[0] === 'databaseCommitted').length, 1);
+    assert.ok(trace.findIndex(row => row[0] === 'beforeDatabaseMutation') < trace.findIndex(row => row[0] === 'create'));
+    assert.ok(trace.findIndex(row => row[0] === 'databaseCommitted') > trace.findIndex(row => row[0] === 'commit'));
     assert.equal(trace.at(-1)[0], 'release');
     assert.equal(state.revision, 8);
     assert.equal(state.deployedRevision, 5);
@@ -149,13 +157,21 @@ test('a concurrent sibling create cannot enter while the first draft transaction
 test('failed held verification after writes aborts the entire local transaction', async () => {
     const { repository, service, state, trace } = fixture();
     let checks = 0;
-    repository.withScopedNodeLocks = async (options, work) => work({ async verify() {
-        if (++checks === 3) throw Object.assign(Error('lost'), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
-    } });
+    repository.withScopedNodeLocks = async (options, work) => work({
+        async beforeDatabaseMutation() {
+            trace.push(['beforeDatabaseMutation']);
+            return async () => { trace.push(['databaseCommitted']); };
+        },
+        async verify() {
+            if (++checks === 3) throw Object.assign(Error('lost'), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
+        },
+    });
     await assert.rejects(service.createLink({ expectedTopologyRevision: 7, link: pair() }), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
     assert.equal(state.revision, 7);
     assert.deepEqual(state.links, []);
     assert.equal(trace.some(row => row[0] === 'commit'), false);
+    assert.equal(trace.filter(row => row[0] === 'beforeDatabaseMutation').length, 1);
+    assert.equal(trace.filter(row => row[0] === 'databaseCommitted').length, 0);
 });
 
 test('empty groups keep strict revision CAS without requesting a fictitious empty node lock', async () => {

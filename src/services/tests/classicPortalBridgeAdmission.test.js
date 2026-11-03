@@ -67,6 +67,61 @@ test('existing held L2TP bridge consumes only the private no-write brand on nest
     }
 });
 
+test('database mutation rearms settled SSH and an unconfirmed nested write cannot be cleared by outer settlement', async () => {
+    const f = fixture();
+    await withScopedClassicNodeLocks({ nodeIds: [A, B], operationId: 'outer', lockService: f.lockService }, async held => {
+        await held.beforeRemoteMutation({ nodeId: A, phase: 'stage' });
+        await held.settleVerified();
+        await assert.rejects(withScopedClassicNodeLocks({ nodeIds: [A], operationId: 'inner' }, async nested => {
+            await nested.beforeDatabaseMutation();
+            throw createClassicPortalBridgePhase({ beforeRemoteMutation: nested.beforeRemoteMutation })
+                .failure(new Error('modeled unknown DB commit, no SSH'));
+        }), /modeled unknown DB commit/);
+        await assert.rejects(held.settleVerified(), { code: 'CLASSIC_CONFIG_WRITE_DATABASE_UNCERTAIN' });
+    });
+    assert.equal(f.rows.size, 2); assert.equal(f.released.length, 0);
+});
+
+test('known database commit releases, but escaped commit confirmation and database entry refuse after close', async () => {
+    const f = fixture(); let committed, heldScope;
+    await withScopedClassicNodeLocks({ nodeIds: [A, B], operationId: 'db', lockService: f.lockService }, async held => {
+        heldScope = held;
+        committed = await held.beforeDatabaseMutation();
+        await committed(); // Trusted caller invokes only after transaction success.
+    });
+    assert.equal(f.rows.size, 0);
+    await assert.rejects(committed(), { code: 'CLASSIC_CONFIG_WRITE_SCOPE_CLOSED' });
+    await assert.rejects(heldScope.beforeDatabaseMutation(), { code: 'CLASSIC_CONFIG_WRITE_SCOPE_CLOSED' });
+});
+
+test('known DB commit cannot settle unverified SSH effects', async () => {
+    const f = fixture();
+    await withScopedClassicNodeLocks({ nodeIds: [A, B], operationId: 'mixed', lockService: f.lockService }, async held => {
+        await held.beforeRemoteMutation({ nodeId: A, phase: 'unverified-stage' });
+        const committed = await held.beforeDatabaseMutation();
+        await committed();
+    });
+    assert.equal(f.rows.size, 2);
+});
+
+test('pending borrowed callback retains locks and refuses database entry after parent close', async () => {
+    const f = fixture(); let signal, resume, nested;
+    const entered = new Promise(resolve => { signal = resolve; });
+    const gate = new Promise(resolve => { resume = resolve; });
+    await withScopedClassicNodeLocks({ nodeIds: [A, B], operationId: 'outer', lockService: f.lockService }, async () => {
+        nested = withScopedClassicNodeLocks({ nodeIds: [A], operationId: 'borrower' }, async held => {
+            signal(); await gate;
+            await held.beforeDatabaseMutation();
+            assert.fail('closed borrower must not receive database authority');
+        }).then(() => null, error => error);
+        await entered;
+    });
+    assert.equal(f.rows.size, 2); assert.equal(f.released.length, 0);
+    resume();
+    assert.equal((await nested).code, 'CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+    assert.equal(f.rows.size, 2);
+});
+
 test('nested subset borrows exact locks and an escaped callback cannot dispatch after close', async () => {
     const f = fixture(); let escaped;
     await withScopedClassicNodeLocks({ nodeIds: [A, B], operationId: 'outer', lockService: f.lockService }, async held => {

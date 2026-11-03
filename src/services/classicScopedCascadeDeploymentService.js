@@ -491,25 +491,35 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                         throw failure('CLASSIC_DEPLOY_UNCERTAIN');
                     }
                     await verifyPins();
-                    // Full four-profile receipt establishes known remote completion.
-                    // A later status/draft DB failure must not poison a safe retry.
-                    await held.settleVerified();
+                    // Status-only failures cannot change desired config. DELETE
+                    // also needs a known DB commit and majority absence proof.
+                    if (!isDelete) await held.settleVerified();
                     if (isDelete) {
+                        let databaseCommitted;
                         const removed = await m.connection.transaction(async session => {
                             await verifyPins(session);
                             const { mutation, standaloneClassicDraft } = await prepareDeletion(session, false, pinned.componentNodeIds);
                             const state = await stateModel.findById('singleton').session(session).lean();
                             if (!Number.isSafeInteger(state?.revision) || state.revision >= Number.MAX_SAFE_INTEGER) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                            if (!databaseCommitted) databaseCommitted = await held.beforeDatabaseMutation();
                             await repository.persistMutation(mutation, session);
                             const updated = await stateModel.findOneAndUpdate({ _id: 'singleton', revision: state.revision },
                                 { $inc: { revision: 1 } }, { session, new: true, upsert: false, runValidators: true }).lean();
                             if (updated?.revision !== state.revision + 1) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
                             return { revision: updated.revision, deployedRevision: updated.deployedRevision,
                                 ...(standaloneClassicDraft ? { standaloneClassicDraft: true } : {}) };
-                        }, transactionOptions);
+                        }, transactionOptions).catch(async error => {
+                            // Validation/read-only refusal after a proved REMOVE
+                            // has no late DB config effect to fence. Never use
+                            // error labels or no-SSH provenance for this decision.
+                            if (!databaseCommitted) await held.settleVerified();
+                            throw error;
+                        });
                         if (await m.CascadeLink.exists({ _id: linkId }).setOptions(READ)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
                         const state = await stateModel.findById('singleton').setOptions(READ).lean();
                         if (!state || state.revision < removed.revision) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                        await databaseCommitted();
+                        await held.settleVerified();
                         return removed;
                     }
                     const status = warning ? 'offline' : 'deployed';

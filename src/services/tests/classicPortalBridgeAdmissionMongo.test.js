@@ -19,6 +19,164 @@ const { createClassicPortalBridgePhase } = require('../classicPortalBridgePhase'
 const { AsyncResource } = require('node:async_hooks');
 const { createTopologyDraftWriteService } = require('../../modules/relay-l2tp/services/topologyDraftWriteService');
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to a private disposable MongoDB binary' };
+const { TopologyDraftRepository } = require('../../modules/relay-l2tp/repositories/topologyDraftRepository');
+const { withScopedClassicNodeLocks } = require('../classicPortalBridgeAdmission');
+
+// REAL transaction writes and separately held real commit. Only the timing of
+// an UnknownTransactionCommitResult delivery is modeled, not a server failpoint.
+function delayedCommit() {
+    let session;
+    return {
+        async run(work) {
+            assert.equal(session, undefined, 'one owned transaction');
+            session = await f.mongoose.connection.startSession();
+            session.startTransaction({ readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' });
+            await work(session);
+            throw Object.assign(new Error('modeled transport unknown commit before held real commit'), {
+                errorLabels: ['UnknownTransactionCommitResult'],
+            });
+        },
+        async commit() { await session.commitTransaction(); },
+        async close() {
+            if (!session) return;
+            try { if (session.inTransaction()) await session.abortTransaction(); }
+            finally { await session.endSession(); }
+        },
+    };
+}
+function removalReceipt() {
+    const result = f.receipt();
+    result.receipt.kind = 'classic-scoped-reverse-removal';
+    delete result.receipt.tunnelEstablished;
+    result.receipt.targetAbsent = true;
+    for (const p of result.receipt.profiles) p.changed = true;
+    for (const p of result.receipt.preservedProfiles) { p.beforeSha256 = p.sha256; p.changed = false; }
+    return result;
+}
+
+test('native Mongo draft unknown commit retains exact fences before a late real config update commit', local, async () => {
+    await setup(); const delayed = delayedCommit(); let coreCalls = 0;
+    // Standalone draft classification requires no relay reference inventory.
+    await f.models.RelayL2tpState.deleteMany({ node: f.source });
+    const repository = new TopologyDraftRepository({ ...f.models, transactionRunner: delayed.run,
+        withScopedNodeLocks: withScopedClassicNodeLocks, allowStandaloneClassicDrafts: true });
+    try {
+        await assert.rejects(repository.commitDraft({ expectedRevision: 4,
+            prepare: async () => ({ mutation: { kind: 'link.update', id: f.linkId, changes: { tunnelPort: 11096 } } }),
+        }), /modeled transport unknown commit/);
+        const locks = await f.models.NodeOperationLock.find().sort({ node: 1 }).lean();
+        assert.equal(locks.length, 3, 'selected pair plus unrelated fence retained');
+        assert.equal((await f.CascadeLink.findById(f.linkId).lean()).tunnelPort, 10096);
+        await assert.rejects(service(async () => { coreCalls++; return f.receipt(); }).queue(f.input()), { code: 'CLASSIC_DEPLOY_NODE_BUSY' });
+        assert.equal(coreCalls, 0);
+        await delayed.commit();
+        assert.equal((await f.CascadeLink.findById(f.linkId).lean()).tunnelPort, 11096);
+        assert.equal((await f.state()).revision, 5);
+        assert.deepEqual(await f.models.NodeOperationLock.find().sort({ node: 1 }).lean(), locks);
+    } finally { await delayed.close(); }
+});
+
+test('native Mongo draft validation remains retryable and a known commit releases exact selected locks', local, async () => {
+    await setup(); await f.models.RelayL2tpState.deleteMany({ node: f.source });
+    const repository = new TopologyDraftRepository({ ...f.models,
+        withScopedNodeLocks: withScopedClassicNodeLocks, allowStandaloneClassicDrafts: true });
+    let reads = 0;
+    const mutation = { kind: 'link.update', id: f.linkId, changes: { tunnelPort: 11096 } };
+    await assert.rejects(repository.commitDraft({ expectedRevision: 4, prepare: async () => {
+        if (++reads === 2) {
+            assert.equal(await f.models.NodeOperationLock.countDocuments(), 3);
+            throw new Error('read-only fresh validation refusal');
+        }
+        return { mutation };
+    } }), /read-only fresh validation refusal/);
+    assert.equal((await f.CascadeLink.findById(f.linkId).lean()).tunnelPort, 10096);
+    assert.equal((await f.state()).revision, 4);
+    assert.equal(await f.models.NodeOperationLock.countDocuments(), 1);
+    assert.deepEqual(await repository.commitDraft({ expectedRevision: 4, prepare: async () => ({ mutation }) }),
+        { revision: 5, deployedRevision: 0, standaloneClassicDraft: true });
+    assert.equal((await f.CascadeLink.findById(f.linkId).lean()).tunnelPort, 11096);
+    assert.equal(await f.models.NodeOperationLock.countDocuments(), 1);
+});
+
+test('native Mongo swallowed nested draft unknown commit keeps parent generation poisoned', local, async () => {
+    await setup(); await f.models.RelayL2tpState.deleteMany({ node: f.source });
+    const delayed = delayedCommit();
+    const repository = new TopologyDraftRepository({ ...f.models, transactionRunner: delayed.run,
+        withScopedNodeLocks: withScopedClassicNodeLocks, allowStandaloneClassicDrafts: true });
+    try {
+        await withScopedClassicNodeLocks({ nodeIds: [f.source, f.bridge], operationId: 'fixture-parent-db' }, async held => {
+            await held.beforeRemoteMutation({ nodeId: f.source, phase: 'modeled-previous-write' });
+            await held.settleVerified();
+            await assert.rejects(repository.commitDraft({ expectedRevision: 4,
+                prepare: async () => ({ mutation: { kind: 'link.update', id: f.linkId, changes: { tunnelPort: 11096 } } }),
+            }), /modeled transport unknown commit/);
+            // A later known successful nested DB capability cannot clear it.
+            const anotherCommitted = await held.beforeDatabaseMutation();
+            await anotherCommitted();
+            await assert.rejects(held.settleVerified(), { code: 'CLASSIC_CONFIG_WRITE_DATABASE_UNCERTAIN' });
+        });
+        assert.equal(await f.models.NodeOperationLock.countDocuments(), 3);
+    } finally { await delayed.close(); }
+});
+
+test('native Mongo independent DELETE releases only after known commit and bounded primary-majority absence', local, async () => {
+    for (const failRead of [false, true]) {
+        await setup(); let absenceReads = 0;
+        const exists = f.CascadeLink.exists;
+        f.CascadeLink.exists = function(filter) {
+            const query = exists.call(this, filter), setOptions = query.setOptions;
+            query.setOptions = function(options) {
+                assert.deepEqual(options, { readPreference: 'primary', readConcern: { level: 'majority' }, maxTimeMS: 5000 });
+                absenceReads++;
+                if (failRead) throw new Error('modeled postcommit majority absence read failure');
+                return setOptions.call(this, options);
+            };
+            return query;
+        };
+        try {
+            const selected = createClassicScopedCascadeDeploymentService({ ...f.models, env: f.env, NodeSSH: Preview,
+                cascadeService: { async removeScopedClassicLink(args) {
+                    await args.beforeRemoteMutation({ nodeId: f.source, phase: 'modeled-physical-remove' });
+                    return removalReceipt();
+                } } });
+            const deletion = selected.deleteLink({ expectedTopologyRevision: 4, linkId: f.linkId });
+            if (failRead) await assert.rejects(deletion, { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+            else assert.deepEqual(await deletion, { revision: 5, deployedRevision: 0 });
+            assert.equal(absenceReads, 1);
+            assert.equal(await f.CascadeLink.collection.findOne({ _id: new f.mongoose.Types.ObjectId(f.linkId) }), null);
+            assert.equal((await f.state()).revision, 5);
+            assert.equal(await f.models.NodeOperationLock.countDocuments(), failRead ? 4 : 1);
+        } finally { f.CascadeLink.exists = exists; }
+    }
+});
+
+test('native Mongo checked DELETE unknown commit rearms settled removal before a late real delete commit', local, async () => {
+    await setup(); const delayed = delayedCommit(); let coreCalls = 0;
+    const connection = f.mongoose.connection, transaction = connection.transaction;
+    let transactions = 0;
+    connection.transaction = function(work, options) {
+        return ++transactions === 2 ? delayed.run(work) : transaction.call(this, work, options);
+    };
+    try {
+        const selected = createClassicScopedCascadeDeploymentService({ ...f.models, env: f.env, NodeSSH: Preview,
+            cascadeService: { async removeScopedClassicLink(args) {
+                coreCalls++;
+                await args.beforeRemoteMutation({ nodeId: f.source, phase: 'modeled-physical-remove' });
+                return removalReceipt();
+            } } });
+        await assert.rejects(selected.deleteLink({ expectedTopologyRevision: 4, linkId: f.linkId }), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+        const locks = await f.models.NodeOperationLock.find().sort({ node: 1 }).lean();
+        assert.equal(locks.length, 4, 'whole preservation component plus unrelated fence retained');
+        assert.ok(await f.CascadeLink.exists({ _id: f.linkId }));
+        await assert.rejects(service(async () => { coreCalls++; return f.receipt(); }).queue(f.input()), { code: 'CLASSIC_DEPLOY_NODE_BUSY' });
+        assert.equal(coreCalls, 1, 'second independent apply never calls the core');
+        await delayed.commit();
+        assert.equal(await f.CascadeLink.exists({ _id: f.linkId }), null);
+        assert.equal((await f.state()).revision, 5);
+        assert.deepEqual(await f.models.NodeOperationLock.find().sort({ node: 1 }).lean(), locks);
+    } finally { connection.transaction = transaction; await delayed.close(); }
+});
+
 const outside = '507f1f77bcf86cd799439040';
 class Preview {
     async connect() { assert.equal(await f.models.NodeOperationLock.countDocuments({ node: { $in: [f.source, f.bridge, f.otherPortal] } }), 3); }

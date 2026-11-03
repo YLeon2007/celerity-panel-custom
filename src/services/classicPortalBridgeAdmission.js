@@ -43,7 +43,7 @@ async function withScopedClassicNodeLocks({ nodeIds, operationId, leaseMs = 1200
     const service = lockService ?? defaultLockService();
     const owner = 'classic-portal-bridge';
     const locks = [];
-    const scope = { active: true, pending: 0, mutated: false, settled: false, uncertain: false, nodeIds: ids };
+    const scope = { active: true, pending: 0, mutated: false, settled: false, uncertain: false, databaseMutations: new Set(), nodeIds: ids };
     scope.verify = async () => {
         if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
         for (const lock of locks) {
@@ -62,7 +62,23 @@ async function withScopedClassicNodeLocks({ nodeIds, operationId, leaseMs = 1200
             // Mark BEFORE returning dispatch permission, including staging writes.
             scope.mutated = true; scope.settled = false;
         },
-        async settleVerified() { await scope.verify(); scope.settled = true; },
+        async beforeDatabaseMutation() {
+            await scope.verify();
+            // A no-SSH brand says nothing about a late persistent config write.
+            // Each transaction owns its confirmation; another nested success or
+            // a swallowed error cannot settle an unresolved predecessor.
+            const attempt = {};
+            scope.databaseMutations.add(attempt);
+            return async () => {
+                await scope.verify();
+                scope.databaseMutations.delete(attempt);
+            };
+        },
+        async settleVerified() {
+            await scope.verify();
+            if (scope.databaseMutations.size) throw failure('CLASSIC_CONFIG_WRITE_DATABASE_UNCERTAIN');
+            scope.settled = true;
+        },
         async runWithHeldConfigWrites(work) {
             await scope.verify(); scope.pending++;
             try {
@@ -93,7 +109,7 @@ async function withScopedClassicNodeLocks({ nodeIds, operationId, leaseMs = 1200
     // Close before the first awaited release. Captured ALS callbacks cannot
     // acquire/dispatch through a released or borrowed generation.
     scope.active = false;
-    if (!scope.uncertain && scope.pending === 0 && (!scope.mutated || scope.settled)) {
+    if (!scope.uncertain && scope.databaseMutations.size === 0 && scope.pending === 0 && (!scope.mutated || scope.settled)) {
         for (const lock of [...locks].reverse()) {
             try {
                 if ((await service.releaseVerified(lock))?.ok !== true) throw failure('CLASSIC_CONFIG_WRITE_RELEASE_UNCERTAIN');
@@ -103,7 +119,7 @@ async function withScopedClassicNodeLocks({ nodeIds, operationId, leaseMs = 1200
     if (thrown) {
         // The outer dispatch ledger overrides even a privately branded error
         // from a different nested phase after a possible effect.
-        if (scope.uncertain || (scope.mutated && !scope.settled) || scope.pending !== 0) thrown.remoteOutcomeUncertain = true;
+        if (scope.uncertain || scope.databaseMutations.size || (scope.mutated && !scope.settled) || scope.pending !== 0) thrown.remoteOutcomeUncertain = true;
         throw thrown;
     }
     return result;
