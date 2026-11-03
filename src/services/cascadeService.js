@@ -137,8 +137,8 @@ class CascadeService {
      * active APPLIED/offline connected-component preservation baseline.
      * This entry never acquires topology adoption or native operation identity.
      */
-    async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation } = {}) {
-        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation });
+    async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation, scopedExecutionContext } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation, scopedExecutionContext });
     }
 
     /**
@@ -147,11 +147,11 @@ class CascadeService {
      * deletion, retaining it on every throw. No DB row/status is changed here.
      * An absent/partial target is NOT an idempotent removal proof.
      */
-    async removeScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation } = {}) {
-        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove: true, beforeRemoteMutation });
+    async removeScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation, scopedExecutionContext } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove: true, beforeRemoteMutation, scopedExecutionContext });
     }
 
-    async #scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove = false, beforeRemoteMutation }) {
+    async #scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove = false, beforeRemoteMutation, scopedExecutionContext }) {
         // INTERNAL capability, never accepted by public request allowlists.
         const phase = require('./classicPortalBridgePhase').createClassicPortalBridgePhase({ beforeRemoteMutation });
         const id = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
@@ -165,6 +165,12 @@ class CascadeService {
         const env = Object.freeze({ ...process.env });
         const baseline = Object.freeze([...baselineLinkIds].sort());
         try {
+            if (scopedExecutionContext !== undefined) {
+                if (!require('./classicPortalBridgeAdmission').isScopedClassicExecutionContext(scopedExecutionContext)) {
+                    throw scopedFailure('CLASSIC_SCOPED_INPUT_INVALID');
+                }
+                await scopedExecutionContext.verify();
+            }
             const initial = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
             if (!initial || initial.active !== true || (initial.mode || 'reverse') !== 'reverse') {
                 throw scopedFailure('CLASSIC_SCOPED_REVERSE_LINK_REQUIRED');
@@ -175,7 +181,7 @@ class CascadeService {
             await withClassicNodeConfigWrite({ nodeId: ids[0], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
                 await withClassicNodeConfigWrite({ nodeId: ids[1], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
                     try {
-                        result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase });
+                        result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase, scopedExecutionContext });
                     } catch (error) {
                         // Brand before unwinding either held-node scope. The
                         // node-lock owner may consume this private provenance.
@@ -189,18 +195,19 @@ class CascadeService {
         } catch (error) {
             // Never forward transport, generated config, credential or journal text.
             const code = typeof error?.code === 'string'
-                && /^(CLASSIC_SCOPED_[A-Z_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code)
+                && /^(CLASSIC_SCOPED_[A-Z0-9_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code)
                 ? error.code : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN';
             throw phase.failure(scopedFailure(code));
         }
     }
 
-    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase }) {
+    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase, scopedExecutionContext }) {
         const started = performance.now();
         const checkHeld = async () => {
             if (performance.now() - started >= 100000) throw scopedFailure('CLASSIC_SCOPED_DEADLINE');
             // Unlike assertClassic..., this refuses an authorization-disabled no-op.
             for (const nodeId of ids) await assertHeldL2tpNodeConfigWrite(nodeId);
+            if (scopedExecutionContext) await scopedExecutionContext.verify();
         };
         const bounded = async (work, ms = 15000) => {
             let timer;
@@ -213,6 +220,7 @@ class CascadeService {
         const State = require('../modules/relay-l2tp/models/cascadeTopologyStateModel');
         const revision = async () => {
             await checkHeld();
+            if (scopedExecutionContext) return;
             const state = await State.findById('singleton').setOptions({ maxTimeMS: 5000,
                 readPreference: 'primary', readConcern: { level: 'majority' } }).lean();
             if (state?.revision !== expectedTopologyRevision) throw scopedFailure('CLASSIC_SCOPED_REVISION_CONFLICT');
@@ -257,7 +265,8 @@ class CascadeService {
             if (confirmed.some(row => scopedId(row.portalNode) === sourceId)) throw scopedFailure('CLASSIC_SCOPED_SHARED_SOURCE_UNSUPPORTED');
             if (confirmed.some(row => scopedId(row.portalNode) === bridgeId)) throw scopedFailure('CLASSIC_SCOPED_TRANSIT_BRIDGE_UNSUPPORTED');
             const l2tp = require('../modules/relay-l2tp/models/relayL2tpStateModel');
-            if (await l2tp.exists({ $or: [{ desiredState: 'installed' }, { status: { $ne: 'not_installed' } }] })
+            if (await l2tp.exists({ ...(scopedExecutionContext ? { node: { $in: scopedExecutionContext.nodeIds } } : {}),
+                $or: [{ desiredState: 'installed' }, { status: { $ne: 'not_installed' } }] })
                 .setOptions({ maxTimeMS: 5000 })) throw scopedFailure('CLASSIC_SCOPED_L2TP_UNSUPPORTED');
             return { target, confirmed };
         };
@@ -269,7 +278,8 @@ class CascadeService {
         // Recheck the exact preclaim capability under both held generations;
         // graph, ownership and whole-profile guards below remain mandatory.
         const { scopedClassicEndpointsSupported } = require('./classicScopedEndpointSupport');
-        if (!scopedClassicEndpointsSupported(source, bridge)) {
+        if (!scopedClassicEndpointsSupported(source, bridge)
+            || (scopedExecutionContext && (source?.cascadeRole !== 'portal' || bridge?.cascadeRole !== 'bridge'))) {
             throw scopedFailure('CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED');
         }
         const nodePins = [source, bridge].map(scopedNodePin);
@@ -696,14 +706,16 @@ class CascadeService {
                         sha256: item.profile.bytes === 'C3_CONFIG_ABSENT' ? null : scopedHash(item.profile.bytes), changed: false })),
                 } };
             }
-            const updated = await CascadeLink.updateOne({ _id: linkId, active: true }, {
-                $set: { status: established ? 'deployed' : 'offline',
-                    lastError: established ? '' : 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED', lastHealthCheck: new Date() },
-            }, { maxTimeMS: 5000 });
-            if (updated?.acknowledged !== true || updated.matchedCount !== 1) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
-            const saved = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
-            if (!['deployed', 'online', 'offline'].includes(saved?.status) || saved.active !== true || scopedId(saved.portalNode) !== scopedId(source)
-                || scopedId(saved.bridgeNode) !== scopedId(bridge)) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
+            if (!scopedExecutionContext) {
+                const updated = await CascadeLink.updateOne({ _id: linkId, active: true }, {
+                    $set: { status: established ? 'deployed' : 'offline',
+                        lastError: established ? '' : 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED', lastHealthCheck: new Date() },
+                }, { maxTimeMS: 5000 });
+                if (updated?.acknowledged !== true || updated.matchedCount !== 1) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
+                const saved = await CascadeLink.findById(linkId).setOptions({ maxTimeMS: 5000 }).lean();
+                if (!['deployed', 'online', 'offline'].includes(saved?.status) || saved.active !== true || scopedId(saved.portalNode) !== scopedId(source)
+                    || scopedId(saved.bridgeNode) !== scopedId(bridge)) throw scopedFailure('CLASSIC_SCOPED_STATUS_UNCONFIRMED');
+            }
             await revision();
             return { success: true, remoteQuiescent: true, receipt: {
                 kind: established ? 'classic-scoped-reverse' : 'classic-scoped-reverse-unconnected',

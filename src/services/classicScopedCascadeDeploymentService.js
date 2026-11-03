@@ -10,6 +10,8 @@ const READ = Object.freeze({ readPreference: 'primary', readConcern: { level: 'm
 const MESSAGES = Object.freeze({
     CLASSIC_DEPLOY_UNSUPPORTED: 'Classic deployment supports only an existing active reverse link.apply',
     CLASSIC_DEPLOY_BUSY: 'Classic deployment requires an initialized, quiescent topology',
+    CLASSIC_DEPLOY_NODE_BUSY: 'A node in this Portal-to-Bridge component is busy; retry when its operation completes',
+    CLASSIC_DEPLOY_PREFLIGHT_FAILED: 'Portal-to-Bridge preflight failed before any remote write; correct the prerequisite and retry',
     CLASSIC_DEPLOY_SCOPE_CHANGED: 'Classic deployment scope no longer matches the confirmed baseline',
     CLASSIC_DEPLOY_IN_USE: 'Classic deployment is blocked by L2TP or route-group use',
     CLASSIC_DEPLOY_OWNER_VETO: 'Classic deployment is blocked by configuration ownership',
@@ -31,6 +33,28 @@ const BRIDGE_PROFILE = '/usr/local/etc/xray-bridge/config.json';
 const digest = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const sameList = (actual, expected) => Array.isArray(actual)
     && actual.length === expected.length && expected.every((value, i) => Object.hasOwn(actual, i) && actual[i] === value);
+function immutablePin(value) {
+    const stable = item => {
+        if (item && typeof item.toJSON === 'function') return stable(item.toJSON());
+        if (Array.isArray(item)) return item.map(stable);
+        if (item && typeof item === 'object') return Object.fromEntries(Object.keys(item).sort().map(k => [k, stable(item[k])]));
+        return item;
+    };
+    return JSON.stringify(stable(value));
+}
+function independentPins(links, nodes, nodeIds) {
+    const pinnedLinks = links.filter(link => nodeIds.includes(entityId(link.portalNode)) || nodeIds.includes(entityId(link.bridgeNode)))
+        .map(link => {
+            const pin = { ...link, _id: entityId(link._id), portalNode: entityId(link.portalNode), bridgeNode: entityId(link.bridgeNode) };
+            for (const key of ['status', 'lastHealthCheck', 'latencyMs', 'lastError', 'updatedAt', 'createdAt']) delete pin[key];
+            return pin;
+        }).sort((a, b) => a._id.localeCompare(b._id));
+    const pinnedNodes = nodes.filter(node => nodeIds.includes(entityId(node._id))).map(node => ({
+        _id: entityId(node._id), ip: node.ip, active: node.active, type: node.type, cascadeRole: node.cascadeRole,
+        ssh: node.ssh, xray: node.xray,
+    })).sort((a, b) => a._id.localeCompare(b._id));
+    return immutablePin({ links: pinnedLinks, nodes: pinnedNodes });
+}
 function classicLinkAllowlist(env) {
     const value = env.CLASSIC_TOPOLOGY_PRODUCTION_LINK_IDS;
     if (typeof value !== 'string' || value.length > 1599) return null;
@@ -45,7 +69,8 @@ function checkedCompletion(result, { linkId, expectedTopologyRevision, baselineL
     const receipt = result?.receipt;
     if (result?.success !== true || result?.remoteQuiescent !== true
         || Object.keys(result).sort().join(',') !== 'receipt,remoteQuiescent,success'
-        || !receipt || receipt.kind !== 'classic-scoped-reverse' || receipt.linkId !== linkId
+        || !receipt || Object.keys(receipt).sort().join(',') !== 'kind,linkId,nodeIds,preservedLinkIds,preservedProfiles,profiles,topologyRevision,tunnelEstablished'
+        || receipt.kind !== 'classic-scoped-reverse' || receipt.linkId !== linkId
         || receipt.topologyRevision !== expectedTopologyRevision || receipt.tunnelEstablished !== true
         || !sameList(receipt.nodeIds, [...endpoints].sort())
         || !sameList(receipt.preservedLinkIds, baselineLinkIds)
@@ -76,7 +101,8 @@ function checkedApplyProfiles(receipt, endpoints) {
     const optionalChange = key(target, MAIN_PROFILE);
     const changed = new Set();
     for (const profile of receipt.profiles) {
-        if (!profile || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
+        if (!profile || Object.keys(profile).sort().join(',') !== 'beforeSha256,nodeId,path,sha256'
+            || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
             || !digest(profile.beforeSha256) || !digest(profile.sha256)) return false;
         const id = key(profile.nodeId, profile.path);
         if ((!requiredChanges.includes(id) && id !== optionalChange) || changed.has(id)) return false;
@@ -86,7 +112,8 @@ function checkedApplyProfiles(receipt, endpoints) {
     const expectedPreserved = [key(source, BRIDGE_PROFILE), ...(!changed.has(optionalChange) ? [optionalChange] : [])];
     const preserved = new Set();
     for (const profile of receipt.preservedProfiles) {
-        if (!profile || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
+        if (!profile || Object.keys(profile).sort().join(',') !== 'nodeId,path,sha256'
+            || typeof profile.nodeId !== 'string' || typeof profile.path !== 'string'
             || (profile.sha256 !== null && !digest(profile.sha256))) return false;
         const id = key(profile.nodeId, profile.path);
         if (!expectedPreserved.includes(id) || preserved.has(id)) return false;
@@ -283,9 +310,9 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             const { TopologyDraftRepository } = require('../modules/relay-l2tp/repositories/topologyDraftRepository');
             repository = new TopologyDraftRepository(m);
         }
-        async function prepareDeletion(session) {
+        async function prepareDeletion(session, checkRevision = true) {
             const snapshot = await repository.readDraft(session);
-            if (snapshot.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
+            if (checkRevision && snapshot.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
             const { buildCandidate } = require('../modules/relay-l2tp/domain/topologyDraft');
             const { validateTopology } = require('../modules/relay-l2tp/domain/topologyValidator');
             const { compileTopology } = require('../modules/relay-l2tp/domain/topologyCompiler');
@@ -305,7 +332,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 || await read(m.TopologyIntentQueueState.exists({ outstanding: { $ne: 0 } }))
                 || await read(m.NodeOperationLock.exists({}))) throw failure('CLASSIC_DEPLOY_BUSY');
         }
-        async function admission(session) {
+        async function admission(session, independent = false) {
             const read = query => session ? query.session(session) : query.setOptions(READ);
             const links = await read(m.CascadeLink.find({}).select('+classicLifecycleGrant')).lean();
             if (!Array.isArray(links) || new Set(links.map(link => entityId(link._id))).size !== links.length) {
@@ -328,7 +355,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             const endpoints = [entityId(selected.portalNode), entityId(selected.bridgeNode)];
             if (!endpoints.every(validId) || endpoints[0] === endpoints[1]) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
             const nodes = await read(m.HyNode.find({})).lean();
-            for (const id of endpoints) {
+            const componentNodeIds = independent ? [...new Set([...endpoints, ...links
+                .filter(link => baselineLinkIds.includes(entityId(link._id)))
+                .flatMap(link => [entityId(link.portalNode), entityId(link.bridgeNode)])])].sort() : endpoints;
+            for (const id of componentNodeIds) {
                 const matches = nodes.filter(node => entityId(node._id) === id);
                 if (matches.length !== 1) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
                 const owns = dependencies.topologyManagesNodeConfig ?? require('./topologyConfigOwnership').topologyManagesNodeConfig;
@@ -337,10 +367,10 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
                 } catch { throw failure('CLASSIC_DEPLOY_OWNER_VETO'); }
             }
             const relays = await read(m.RelayL2tpState.find({})).lean();
-            if (!Array.isArray(relays) || relays.some(state => endpoints.includes(entityId(state?.node))
+            if (!Array.isArray(relays) || relays.some(state => componentNodeIds.includes(entityId(state?.node))
                 && !inactiveRelay(state))) throw failure('CLASSIC_DEPLOY_IN_USE');
-            const touching = new Set(links.filter(link => endpoints.includes(entityId(link.portalNode))
-                || endpoints.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
+            const touching = new Set(links.filter(link => componentNodeIds.includes(entityId(link.portalNode))
+                || componentNodeIds.includes(entityId(link.bridgeNode))).map(link => entityId(link._id)));
             const groups = await read(m.CascadeRouteGroup.find({})).lean();
             if (routeGroupUseVeto(groups, relays, touching)) throw failure('CLASSIC_DEPLOY_IN_USE');
             const source = nodes.find(node => entityId(node._id) === endpoints[0]);
@@ -349,7 +379,14 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             // and node locks, and recheck it in the held core before dispatch.
             const { scopedClassicEndpointsSupported } = require('./classicScopedEndpointSupport');
             if (!scopedClassicEndpointsSupported(source, destination)) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
-            return { baselineLinkIds, endpoints, portPreview: { node: source, port: selected.tunnelPort,
+            const standalone = source.cascadeRole === 'portal' && destination.cascadeRole === 'bridge'
+                && !links.some(link => link !== selected && link.active !== false && APPLIED.has(link.status)
+                    && (entityId(link.bridgeNode) === endpoints[0] || entityId(link.portalNode) === endpoints[0]
+                        || entityId(link.portalNode) === endpoints[1]));
+            if (independent && !standalone) throw failure('CLASSIC_DEPLOY_UNSUPPORTED');
+            return { baselineLinkIds, endpoints, componentNodeIds, standalone,
+                pin: independent ? independentPins(links, nodes, componentNodeIds) : null,
+                portPreview: { node: source, port: selected.tunnelPort,
                 target: { ...selected, portalNode: source, bridgeNode: destination } } };
         }
         const diagnose = (error, phase) => {
@@ -379,6 +416,104 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
             return { state, admitted };
         }
         const transactionOptions = { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' };
+        // Only explicit standalone root Portal -> terminal Bridge operations use
+        // independent admission. Relay/forward/full-sync and create-and-apply
+        // retain their existing reservation protocol below.
+        if (!allowUnlistedPending) {
+            const candidates = await m.CascadeLink.find({ _id: linkId }).setOptions(READ).lean();
+            const candidate = candidates[0];
+            const candidateNodes = candidate ? await m.HyNode.find({ _id: { $in: [candidate.portalNode, candidate.bridgeNode] } }).setOptions(READ).lean() : [];
+            if (candidateNodes.find(node => entityId(node._id) === entityId(candidate?.portalNode))?.cascadeRole === 'portal'
+                && candidateNodes.find(node => entityId(node._id) === entityId(candidate?.bridgeNode))?.cascadeRole === 'bridge') {
+                try {
+                const { withScopedClassicNodeLocks, createScopedClassicExecutionContext } = require('./classicPortalBridgeAdmission');
+                const initial = await m.connection.transaction(async session => {
+                    const state = await stateModel.findById('singleton').session(session).lean();
+                    if (!state || state.revision !== expectedTopologyRevision) throw failure('STALE_TOPOLOGY_REVISION');
+                    const admitted = await admission(session, true);
+                    if (isDelete) await prepareDeletion(session);
+                    return admitted;
+                }, transactionOptions);
+                let warning = false;
+                const result = await withScopedClassicNodeLocks({ nodeIds: initial.componentNodeIds,
+                    operationId: `classic-deploy:${operationId}`, lockService: dependencies.lockService }, async held => {
+                    const pinned = await admission(undefined, true);
+                    if (!sameList(pinned.componentNodeIds, initial.componentNodeIds) || pinned.pin !== initial.pin
+                        || !sameList(pinned.baselineLinkIds, initial.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+                    const verifyPins = async session => {
+                        await held.verify();
+                        const fresh = await admission(session, true);
+                        if (fresh.pin !== pinned.pin || !sameList(fresh.componentNodeIds, pinned.componentNodeIds)
+                            || !sameList(fresh.baselineLinkIds, pinned.baselineLinkIds)) throw failure('CLASSIC_DEPLOY_SCOPE_CHANGED');
+                        await held.verify();
+                    };
+                    if (!isDelete) {
+                        const { preflightTunnelPort } = require('./classicScopedPortPreflight');
+                        try { await preflightTunnelPort(pinned.portPreview, { NodeSSH: dependencies.NodeSSH }); }
+                        catch (error) { throw failure(error?.code === 'TUNNEL_PORT_IN_USE'
+                            ? 'CLASSIC_DEPLOY_PORT_CONFLICT' : 'CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE'); }
+                    }
+                    await verifyPins();
+                    const scopedExecutionContext = createScopedClassicExecutionContext({ nodeIds: pinned.componentNodeIds, verify: verifyPins });
+                    const core = dependencies.cascadeService ?? require('./cascadeService');
+                    const method = isDelete ? 'removeScopedClassicLink' : 'deployScopedClassicLink';
+                    if (typeof core[method] !== 'function') throw failure('TOPOLOGY_DEPLOYMENT_UNAVAILABLE');
+                    const completion = await held.runWithHeldConfigWrites(() => core[method]({ linkId, expectedTopologyRevision,
+                        baselineLinkIds: pinned.baselineLinkIds, scopedExecutionContext, beforeRemoteMutation: held.beforeRemoteMutation }));
+                    const context = { linkId, expectedTopologyRevision, baselineLinkIds: pinned.baselineLinkIds, endpoints: pinned.endpoints };
+                    warning = !isDelete && checkedUnconnectedCompletion(completion, context);
+                    if (!warning && !(isDelete ? checkedRemoval : checkedCompletion)(completion, context)) {
+                        // A malformed receipt cannot authorize releasing possible effects.
+                        await held.beforeRemoteMutation({ nodeId: pinned.endpoints[0], phase: 'unproved-completion' });
+                        throw failure('CLASSIC_DEPLOY_UNCERTAIN');
+                    }
+                    await verifyPins();
+                    // Full four-profile receipt establishes known remote completion.
+                    // A later status/draft DB failure must not poison a safe retry.
+                    await held.settleVerified();
+                    if (isDelete) {
+                        const removed = await m.connection.transaction(async session => {
+                            await verifyPins(session);
+                            const mutation = await prepareDeletion(session, false);
+                            const state = await stateModel.findById('singleton').session(session).lean();
+                            if (!Number.isSafeInteger(state?.revision) || state.revision >= Number.MAX_SAFE_INTEGER) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                            await repository.persistMutation(mutation, session);
+                            const updated = await stateModel.findOneAndUpdate({ _id: 'singleton', revision: state.revision },
+                                { $inc: { revision: 1 } }, { session, new: true, upsert: false, runValidators: true }).lean();
+                            if (updated?.revision !== state.revision + 1) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                            return { revision: updated.revision, deployedRevision: updated.deployedRevision };
+                        }, transactionOptions);
+                        if (await m.CascadeLink.exists({ _id: linkId }).setOptions(READ)) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                        const state = await stateModel.findById('singleton').setOptions(READ).lean();
+                        if (!state || state.revision < removed.revision) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                        return removed;
+                    }
+                    const status = warning ? 'offline' : 'deployed';
+                    const updated = await m.CascadeLink.updateOne({ _id: linkId, active: true }, { $set: { status,
+                        lastError: warning ? 'CLASSIC_SCOPED_TUNNEL_UNCONFIRMED' : '', lastHealthCheck: new Date() } },
+                    { writeConcern: { w: 'majority' }, maxTimeMS: 5000 });
+                    if (updated?.matchedCount !== 1) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                    const saved = await m.CascadeLink.find({ _id: linkId }).setOptions(READ).lean();
+                    if (saved.length !== 1 || saved[0].status !== status) throw failure('CLASSIC_DEPLOY_FENCE_LOST');
+                    await verifyPins();
+                    return { status: 'succeeded', executionMode: 'classic', topologyRevision: expectedTopologyRevision };
+                });
+                if (warning) throw failure('CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED');
+                return result;
+                } catch (error) {
+                    diagnose(error, 'independent-portal-bridge');
+                    if (error?.remoteOutcomeUncertain === true) throw failure('CLASSIC_DEPLOY_UNCERTAIN');
+                    if (error?.code === 'NODE_OPERATION_LOCK_CONFLICT') throw failure('CLASSIC_DEPLOY_NODE_BUSY');
+                    if (require('./classicPortalBridgePhase').isClassicPortalBridgePreflightError(error)) {
+                        throw failure('CLASSIC_DEPLOY_PREFLIGHT_FAILED');
+                    }
+                    if (error?.code === 'CLASSIC_DEPLOY_PREFLIGHT_FAILED') throw failure('CLASSIC_DEPLOY_UNCERTAIN');
+                    if (Object.hasOwn(MESSAGES, error?.code)) throw failure(error.code);
+                    throw failure(/^CLASSIC_CONFIG_WRITE_/.test(error?.code ?? '')
+                        ? 'CLASSIC_DEPLOY_FENCE_LOST' : 'CLASSIC_DEPLOY_UNCERTAIN');
+                }
+            }
+        }
         if (!isDelete) {
             // A retried DB-only authorization/ownership snapshot, then bounded
             // read-only SSH OUTSIDE Mongo transactions and BEFORE any claim.

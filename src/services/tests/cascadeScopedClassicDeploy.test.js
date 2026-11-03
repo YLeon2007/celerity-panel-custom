@@ -115,7 +115,10 @@ function fixture(t, options = {}) {
         '../models/cascadeLinkModel': linkModel, '../models/hyNodeModel': { findById: id => query(nodes[String(id)]) },
         '../models/settingsModel': {}, './nodeSSH': SSH, './classicNodeConfigWrite': held,
         '../modules/relay-l2tp/models/cascadeTopologyStateModel': { findById: () => query(state) },
-        '../modules/relay-l2tp/models/relayL2tpStateModel': { exists: () => query(options.l2tp ? { _id: 'installed' } : null) },
+        '../modules/relay-l2tp/models/relayL2tpStateModel': { exists: filter => {
+            options.onL2tpFilter?.(filter);
+            return query(options.l2tp && (!filter.node?.$in || filter.node.$in.includes(options.l2tpNode ?? SOURCE)) ? { _id: 'installed' } : null);
+        } },
         './cacheService': {}, '../utils/logger': { info() {}, error() {}, warn() {} }, './webhookService': {},
         './topologyConfigOwnership': { APPLIED_LINK_STATUSES: ['staged', 'deployed', 'online'], topologyManagesNodeConfig: async () => false, usesTestTopologyConfig: () => false },
         '../modules/relay-l2tp/services/legacyCascadeUndeploy': { trackLegacyCascadeUndeploy: work => work() },
@@ -123,6 +126,56 @@ function fixture(t, options = {}) {
     return { cascade, held, locks, events, commands, writes, original, files, nodes, target, baseline, links, state, main,
         run: args => cascade.deployScopedClassicLink({ linkId: TARGET, expectedTopologyRevision: 17, baselineLinkIds: [BASE], ...args }) };
 }
+
+async function independentRun(f, work = held => f.run({ beforeRemoteMutation: held.beforeRemoteMutation, scopedExecutionContext: held.context })) {
+    const admission = require('../classicPortalBridgeAdmission');
+    const { NodeOperationLockService } = require('../../modules/relay-l2tp/services/nodeOperationLockService');
+    const service = new NodeOperationLockService({ clock: { now: () => new Date() }, repository: {
+        async acquireLease(row) {
+            if (f.locks.has(String(row.node))) return { acquired: false, currentLock: f.locks.get(String(row.node)) };
+            f.locks.set(String(row.node), { ...row }); return { acquired: true, lock: { ...row } };
+        },
+        async findByNode(node) { return f.locks.get(String(node)); },
+        async deleteVerifiedOwned(lock) {
+            const row = f.locks.get(String(lock.node));
+            if (!row || !['owner', 'operationId', 'generation'].every(k => row[k] === lock[k])) return false;
+            f.locks.delete(String(lock.node)); return true;
+        },
+    } });
+    return admission.withScopedClassicNodeLocks({ nodeIds: [SOURCE, BRIDGE], operationId: 'independent-core', lockService: service }, async held => {
+        const context = admission.createScopedClassicExecutionContext({ nodeIds: [SOURCE, BRIDGE].sort(), verify: async () => {} });
+        const result = await f.held.withHeldScopedClassicConfigWrites({ locks: [...f.locks.values()], lockService: service, verify: held.verify },
+            () => work({ ...held, context }));
+        await held.settleVerified(); return result;
+    });
+}
+
+test('trusted independent context tolerates unrelated revision movement and narrows L2TP to held nodes', async t => {
+    let f;
+    const filters = [];
+    f = fixture(t, { l2tp: true, l2tpNode: '507f1f77bcf86cd799439099', onL2tpFilter: filter => filters.push(filter),
+        fault() { f.state.revision++; } });
+    f.nodes[SOURCE].cascadeRole = 'portal';
+    const result = await independentRun(f);
+    assert.equal(result.receipt.kind, 'classic-scoped-reverse'); assert.equal(f.locks.size, 0);
+    assert.equal(f.target.status, 'pending', 'independent core leaves status to receipt-consuming wrapper');
+    assert.ok(filters.length > 0); for (const filter of filters) assert.deepEqual(filter.node.$in, [SOURCE, BRIDGE].sort());
+});
+
+test('trusted context cannot bypass relevant L2TP or relay source guards', async t => {
+    const l2tp = fixture(t, { l2tp: true }); l2tp.nodes[SOURCE].cascadeRole = 'portal';
+    await assert.rejects(independentRun(l2tp), { code: 'CLASSIC_SCOPED_L2TP_UNSUPPORTED' });
+    assert.equal(l2tp.commands.length, 0); assert.equal(l2tp.locks.size, 0);
+    const relay = fixture(t);
+    await assert.rejects(independentRun(relay), { code: 'CLASSIC_SCOPED_ENDPOINT_UNSUPPORTED' });
+    assert.equal(relay.commands.length, 0);
+});
+
+test('untrusted scoped context refuses before acquiring or dispatching', async t => {
+    const f = fixture(t); f.nodes[SOURCE].cascadeRole = 'portal';
+    await assert.rejects(f.run({ scopedExecutionContext: { nodeIds: [SOURCE, BRIDGE], verify: async () => {} } }), { code: 'CLASSIC_SCOPED_INPUT_INVALID' });
+    assert.equal(f.locks.size, 0); assert.equal(f.commands.length, 0);
+});
 
 test('checked absent pending removal accepts a standalone portal without changing any profile', async t => {
     const f = fixture(t);

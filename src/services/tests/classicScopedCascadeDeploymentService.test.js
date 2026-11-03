@@ -79,7 +79,7 @@ function harness(overrides = {}) {
         },
         async deleteOne(filter, options) {
             assert.ok(calls.transactionActive && options.session, 'draft deletion in held settlement transaction');
-            assert.ok(state.replacementReservation);
+            assert.ok(state.replacementReservation || rows.NodeOperationLock.length >= 2);
             const i = records.findIndex(row => matches(row, filter));
             if (i >= 0) records.splice(i, 1);
             return { deletedCount: i >= 0 ? 1 : 0 };
@@ -103,7 +103,7 @@ function harness(overrides = {}) {
         async connect() {
             assert.equal(calls.transactionActive, false, 'no SSH inside a retryable transaction');
             assert.equal(state.replacementReservation, undefined, 'preview precedes topology claim');
-            assert.equal(rows.NodeOperationLock.length, 0);
+            assert.ok([0, 2].includes(rows.NodeOperationLock.length));
             calls.preview.push('connect');
         }
         async exec(command) {
@@ -122,10 +122,23 @@ function harness(overrides = {}) {
         }
         disconnect() { calls.preview.push('disconnect'); }
     }
-    const dependencies = { ...models, env: { ...env(), ...overrides.env }, NodeSSH: PreviewSSH,
+    const { NodeOperationLockService } = require('../../modules/relay-l2tp/services/nodeOperationLockService');
+    const lockService = new NodeOperationLockService({ clock: { now: () => new Date() }, repository: {
+        async acquireLease(row) {
+            const currentLock = rows.NodeOperationLock.find(lock => String(lock.node) === String(row.node));
+            if (currentLock) return { acquired: false, currentLock };
+            rows.NodeOperationLock.push({ ...row }); return { acquired: true, lock: { ...row } };
+        },
+        async findByNode(node) { return rows.NodeOperationLock.find(lock => String(lock.node) === String(node)); },
+        async deleteVerifiedOwned(lock) {
+            const i = rows.NodeOperationLock.findIndex(row => ['node', 'owner', 'operationId', 'generation'].every(k => String(row[k]) === String(lock[k])));
+            if (i < 0) return false; rows.NodeOperationLock.splice(i, 1); return true;
+        },
+    } });
+    const dependencies = { ...models, lockService, env: { ...env(), ...overrides.env }, NodeSSH: PreviewSSH,
         logger: { warn(event) { assert.equal(typeof event, 'string', 'production logger stringifies objects without metadata'); calls.diagnostic = JSON.parse(event); } },
         topologyManagesNodeConfig: async node => {
-            assert.ok(calls.transactionActive || state.replacementReservation, 'ownership checked in claim transaction or held fence');
+            assert.ok(calls.transactionActive || state.replacementReservation || rows.NodeOperationLock.length >= 2, 'ownership checked in claim transaction or held fence');
             calls.owner.push(String(node._id));
             return !!overrides.ownerVeto;
         },
@@ -137,7 +150,8 @@ function harness(overrides = {}) {
             return overrides.removeWork ? overrides.removeWork({ state, rows, calls, result }) : result;
         }, async deployScopedClassicLink(input) {
             assert.equal(calls.transactionActive, false, 'remote work outside retryable transaction');
-            assert.match(state.replacementReservation.ownerToken, /^classic-deploy:/);
+            if (input.scopedExecutionContext) assert.ok(rows.NodeOperationLock.length >= 2);
+            else assert.match(state.replacementReservation.ownerToken, /^classic-deploy:/);
             assert.equal(state.revision, 7);
             assert.equal(state.deployedRevision, 5);
             calls.remote.push(input);
@@ -161,7 +175,8 @@ test('verified unconnected settlement warns without poisoning a manual retry or 
     for (let i = 0; i < 2; i++) {
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED' });
         assert.equal(h.state().replacementReservation, undefined); assert.equal(h.state().classicLifecycleAttempt, undefined);
-        assert.equal(h.state().classicLifecycleLastSettlement.phase, 'succeeded');
+        assert.equal(h.rows.CascadeLink[0].status, 'offline');
+        assert.equal(h.rows.NodeOperationLock.length, 0);
     }
     assert.equal(h.calls.remote.length, 2);
     await h.service.deleteLink(deletion());

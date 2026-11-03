@@ -27,7 +27,9 @@ async function withClassicNodeConfigWrite({ nodeId, kind, env = process.env, lea
             if (result !== true) scope.uncertain = true;
             return result;
         } catch (error) {
-            scope.uncertain = true;
+            // Only the private phase brand can prove a nested preflight did not
+            // dispatch. Public codes/flags and transport assertions are not proof.
+            if (!require('./classicPortalBridgePhase').isClassicPortalBridgePreflightError(error)) scope.uncertain = true;
             throw error;
         } finally {
             scope.pending--;
@@ -160,5 +162,41 @@ async function assertClassicNodeConfigWriteHeld(nodeId) {
     }
 }
 
-module.exports = { withClassicNodeConfigWrite, withHeldL2tpNodeConfigWrite,
+// Internal multi-node bridge: use the exact already-acquired service and
+// generations. It owns neither acquisition nor release; settlement is outer.
+async function withHeldScopedClassicConfigWrites({ locks, lockService, verify }, callback) {
+    if (!lockService?.repository || typeof verify !== 'function' || !Array.isArray(locks) || !locks.length) {
+        throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
+    }
+    const scopes = new Map(heldWrites.getStore() || []);
+    const owned = [];
+    for (const lock of locks) {
+        const key = String(lock.node);
+        if (scopes.has(key)) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CONFLICT');
+        const scope = { active: true, uncertain: false, pending: 0, verify: async () => {
+            if (!scope.active) throw failure('CLASSIC_CONFIG_WRITE_SCOPE_CLOSED');
+            await verify();
+            const row = await lockService.repository.findByNode(lock.node);
+            if (!scope.active || !row || String(row.node) !== key || row.owner !== lock.owner
+                || row.operationId !== lock.operationId || row.generation !== lock.generation
+                || row.remoteUncertain !== true || !(row.leaseUntil instanceof Date)
+                || row.leaseUntil <= lockService.clock.now()) throw failure('CLASSIC_CONFIG_WRITE_LOCK_UNCERTAIN');
+        } };
+        scopes.set(key, scope); owned.push(scope);
+    }
+    try {
+        return await heldWrites.run(scopes, async () => {
+            for (const scope of owned) await scope.verify();
+            const result = await callback();
+            for (const scope of owned) await scope.verify();
+            if (owned.some(scope => scope.uncertain || scope.pending !== 0)) throw failure('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
+            return result;
+        });
+    } catch (error) {
+        if (owned.some(scope => scope.uncertain || scope.pending !== 0)) error.remoteOutcomeUncertain = true;
+        throw error;
+    } finally { for (const scope of owned) scope.active = false; }
+}
+
+module.exports = { withClassicNodeConfigWrite, withHeldL2tpNodeConfigWrite, withHeldScopedClassicConfigWrites,
     assertHeldL2tpNodeConfigWrite, assertClassicNodeConfigWriteHeld };
