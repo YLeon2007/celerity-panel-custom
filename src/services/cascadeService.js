@@ -137,8 +137,8 @@ class CascadeService {
      * active APPLIED/offline connected-component preservation baseline.
      * This entry never acquires topology adoption or native operation identity.
      */
-    async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
-        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds });
+    async deployScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation });
     }
 
     /**
@@ -147,16 +147,18 @@ class CascadeService {
      * deletion, retaining it on every throw. No DB row/status is changed here.
      * An absent/partial target is NOT an idempotent removal proof.
      */
-    async removeScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds } = {}) {
-        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove: true });
+    async removeScopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, beforeRemoteMutation } = {}) {
+        return this.#scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove: true, beforeRemoteMutation });
     }
 
-    async #scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove = false }) {
+    async #scopedClassicLink({ linkId, expectedTopologyRevision, baselineLinkIds, remove = false, beforeRemoteMutation }) {
+        // INTERNAL capability, never accepted by public request allowlists.
+        const phase = require('./classicPortalBridgePhase').createClassicPortalBridgePhase({ beforeRemoteMutation });
         const id = value => typeof value === 'string' && /^[a-f0-9]{24}$/.test(value);
         if (!id(linkId) || !Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0
             || !Array.isArray(baselineLinkIds) || !baselineLinkIds.every(id)
             || new Set(baselineLinkIds).size !== baselineLinkIds.length || baselineLinkIds.includes(linkId)) {
-            throw Object.assign(new Error('CLASSIC_SCOPED_INPUT_INVALID'), { code: 'CLASSIC_SCOPED_INPUT_INVALID' });
+            throw phase.failure(scopedFailure('CLASSIC_SCOPED_INPUT_INVALID'));
         }
         // Capture policy before the first await. This path never calls deployLink,
         // full-config generators, path-ingress composition, an installer or agent.
@@ -172,7 +174,13 @@ class CascadeService {
             let result;
             await withClassicNodeConfigWrite({ nodeId: ids[0], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
                 await withClassicNodeConfigWrite({ nodeId: ids[1], kind: 'scoped-reverse', env, leaseMs: 120000 }, async () => {
-                    result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove });
+                    try {
+                        result = await this.#deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase });
+                    } catch (error) {
+                        // Brand before unwinding either held-node scope. The
+                        // node-lock owner may consume this private provenance.
+                        throw phase.failure(error);
+                    }
                     return true;
                 });
                 return true;
@@ -183,11 +191,11 @@ class CascadeService {
             const code = typeof error?.code === 'string'
                 && /^(CLASSIC_SCOPED_[A-Z_]+|CLASSIC_CONFIG_WRITE_[A-Z_]+|NODE_OPERATION_LOCK_CONFLICT)$/.test(error.code)
                 ? error.code : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN';
-            throw scopedFailure(code);
+            throw phase.failure(scopedFailure(code));
         }
     }
 
-    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove }) {
+    async #deployScopedClassicHeld({ linkId, expectedTopologyRevision, baseline, ids, remove, phase }) {
         const started = performance.now();
         const checkHeld = async () => {
             if (performance.now() - started >= 100000) throw scopedFailure('CLASSIC_SCOPED_DEADLINE');
@@ -273,12 +281,16 @@ class CascadeService {
             }
         };
         const transports = new Map();
-        const exec = async (node, command, stdin) => {
+        const exec = async (node, command, stdin, mutationPhase) => {
             await checkHeld();
             const marker = `C3_SCOPED_DONE_${randomBytes(24).toString('hex')}`;
             // A local timeout is NOT cancellation/quiescence. Its throw retains
             // both uncertain generations; no retry, rollback or later release.
             const remote = `timeout --signal=TERM --kill-after=2s 10s sh -c ${shellQuote(`set -eu\n${command}`)} && printf '\\n${marker}\\n'`;
+            if (mutationPhase) {
+                await phase.beforeDispatch(scopedId(node), mutationPhase);
+                await checkHeld();
+            }
             const result = await bounded(() => transports.get(scopedId(node)).exec(remote,
                 { timeout: 13000, ...(stdin !== undefined && { stdin }) }));
             const suffix = `\n${marker}\n`;
@@ -292,16 +304,17 @@ class CascadeService {
             const bytes = await readConfig(node, file);
             const service = file === SCOPED_MAIN ? 'xray' : 'xray-bridge';
             const observed = bytes === 'C3_CONFIG_ABSENT' ? null
-                : await exec(node, `systemctl show ${service} --property=ActiveState --property=MainPID --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload --property=ExecStart && systemctl cat ${service}`);
+                : await exec(node, `systemctl show ${service} --property=ActiveState --property=MainPID --property=ExecMainStartTimestampMonotonic --property=FragmentPath --property=DropInPaths --property=NeedDaemonReload --property=ExecStart && systemctl cat ${service}`);
             // ExecStart's runtime PID/timestamps change on restart. Pin its
             // loaded argv independently of unit-file text, retaining the stable
             // unit/drop-in bytes and all other observed service properties.
             const loaded = observed?.match(/^ExecStart=\{ path=([^;]+) ; argv\[\]=([^;]+) ;[^\n]*$/m);
-            const stable = observed?.replace(/^MainPID=\d+\n/m, '');
+            const stable = observed?.replace(/^MainPID=\d+\n/m, '').replace(/^ExecMainStartTimestampMonotonic=\d+\n/m, '');
             const unit = loaded ? stable.replace(loaded[0], `LoadedExecStart=${loaded[1].trim()}|${loaded[2].trim()}`) : stable;
             // Preserve runtime identity on untouched profiles, but permit expected
             // PID/timestamp changes only on explicitly restarted plan entries.
-            return { bytes, unit, runtime: [observed?.match(/^MainPID=\d+$/m)?.[0] || null, loaded?.[0] || null],
+            return { bytes, unit, runtime: [observed?.match(/^MainPID=\d+$/m)?.[0] || null, loaded?.[0] || null,
+                observed?.match(/^ExecMainStartTimestampMonotonic=\d+$/m)?.[0] || null],
                 loaded: loaded ? [loaded[1].trim(), loaded[2].trim()] : null };
         };
         try {
@@ -322,18 +335,26 @@ class CascadeService {
                     ? 'CLASSIC_SCOPED_LISTENER_OR_TAG_CONFLICT' : 'CLASSIC_SCOPED_COMPLETION_UNCERTAIN'); }
             }
             const mainBefore = await readProfile(source, SCOPED_MAIN);
-            const bridgeBefore = await readProfile(bridge, SCOPED_BRIDGE);
+            let bridgeBefore = await readProfile(bridge, SCOPED_BRIDGE);
             const preserved = [
                 { node: source, file: SCOPED_BRIDGE, profile: await readProfile(source, SCOPED_BRIDGE) },
                 { node: bridge, file: SCOPED_MAIN, profile: await readProfile(bridge, SCOPED_MAIN) },
             ];
-            for (const [profile, file] of [[mainBefore, SCOPED_MAIN], [bridgeBefore, SCOPED_BRIDGE]]) {
+            const bootstrap = !remove && source.cascadeRole === 'portal' && bridge.cascadeRole === 'bridge'
+                && bridgeBefore.bytes === 'C3_CONFIG_ABSENT';
+            const bootstrapper = require('./classicPortalBridgeBootstrap');
+            let bootstrapPin;
+            if (bootstrap) {
+                bootstrapPin = await exec(bridge, bootstrapper.preflightCommand());
+                if (!/^[a-f0-9]{64}$/.test(bootstrapPin)) throw scopedFailure('CLASSIC_SCOPED_BRIDGE_PREFLIGHT_INVALID');
+            }
+            for (const [profile, file] of [[mainBefore, SCOPED_MAIN], ...(!bootstrap ? [[bridgeBefore, SCOPED_BRIDGE]] : [])]) {
                 if (!profile.unit?.includes('ActiveState=active\n') || !profile.unit.includes('NeedDaemonReload=no\n')
                     || scopedCanonical(profile.loaded) !== scopedCanonical(['/usr/local/bin/xray', `/usr/local/bin/xray run -config ${file}`])) {
                     throw scopedFailure('CLASSIC_SCOPED_SERVICE_LAYOUT_UNSUPPORTED');
                 }
             }
-            const main = scopedConfig(mainBefore.bytes), combined = scopedConfig(bridgeBefore.bytes);
+            const main = scopedConfig(mainBefore.bytes), combined = scopedConfig(bootstrap ? bootstrapper.IDLE_BYTES : bridgeBefore.bytes);
             const target = { ...scope.target, portalNode: source, bridgeNode: bridge };
             const targetSuffix = linkId.slice(-8), forwardTag = `fwd-${targetSuffix}`, hopTag = `fwd-hop-${targetSuffix}`;
             const targetMainItem = preserved.find(item => scopedId(item.node) === scopedId(bridge));
@@ -534,6 +555,11 @@ class CascadeService {
                     if (old && scopedCanonical(old) !== scopedCanonical(outbound)) throw scopedFailure('CLASSIC_SCOPED_BRIDGE_OUTBOUND_CONFLICT');
                     if (!old) combined.outbounds.push(outbound);
                 }
+                // An empty newly constructed service has no historical global
+                // policy to preserve. Seed the ordinary generator's safety tail
+                // before the usual insertion point, so the first apply is already
+                // replay-stable. Never rewrite established sibling defaults.
+                if (bootstrap) combined.routing.rules.push(...bridgeDelta.routing.rules.filter(row => !row.domain && !row.inboundTag));
                 insertRules(combined, bridgeDelta.routing.rules.filter(row => row.domain || row.inboundTag));
             }
             const plans = [
@@ -551,7 +577,7 @@ class CascadeService {
                 preserved.splice(preserved.indexOf(targetMainItem), 1);
             }
             for (const plan of plans) {
-                plan.bytes = scopedCanonical(plan.config) === scopedCanonical(scopedConfig(plan.before.bytes))
+                plan.bytes = scopedCanonical(plan.config) === scopedCanonical(scopedConfig(bootstrap && plan.file === SCOPED_BRIDGE ? bootstrapper.IDLE_BYTES : plan.before.bytes))
                     ? plan.before.bytes : JSON.stringify(plan.config, null, 2);
             }
             const changedPlans = plans.filter(plan => plan.bytes !== plan.before.bytes);
@@ -562,11 +588,42 @@ class CascadeService {
             for (const item of [...plans.map(plan => ({ ...plan, profile: plan.before })), ...preserved]) {
                 if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
             }
+            if (bootstrap) {
+                if (await exec(bridge, bootstrapper.bootstrapCommand(bootstrapPin), undefined, 'bootstrap') !== 'C3_BRIDGE_READY') {
+                    throw scopedFailure('CLASSIC_SCOPED_BRIDGE_BOOTSTRAP_UNCONFIRMED');
+                }
+                const idle = await readProfile(bridge, SCOPED_BRIDGE);
+                if (idle.bytes !== bootstrapper.IDLE_BYTES || !idle.unit?.includes('ActiveState=active\n')
+                    || !idle.unit.includes('NeedDaemonReload=no\n')
+                    || scopedCanonical(idle.loaded) !== scopedCanonical(['/usr/local/bin/xray', `/usr/local/bin/xray run -config ${SCOPED_BRIDGE}`])) {
+                    throw scopedFailure('CLASSIC_SCOPED_BRIDGE_BOOTSTRAP_UNCONFIRMED');
+                }
+                bridgeBefore = idle;
+                plans.find(plan => plan.file === SCOPED_BRIDGE).before = idle;
+                // daemon-reload ran only on the bridge host. Permit its known
+                // nested ExecStart bookkeeping reset, never a MAIN process change.
+                const afterMain = await readProfile(bridge, SCOPED_MAIN);
+                if (!bootstrapper.sameProfileAcrossBootstrapReload(targetMainItem.profile, afterMain)) {
+                    throw scopedFailure('CLASSIC_SCOPED_PRESERVED_PROFILE_DRIFT');
+                }
+                targetMainItem.profile = afterMain;
+                const mainPlan = plans.find(plan => plan.node === bridge && plan.file === SCOPED_MAIN);
+                if (mainPlan) mainPlan.before = afterMain;
+                if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
+                await checkNodePins();
+                for (const item of [...plans.map(plan => ({ ...plan, profile: plan.before })), ...preserved]) {
+                    if (scopedCanonical(await readProfile(item.node, item.file)) !== scopedCanonical(item.profile)) {
+                        throw scopedFailure('CLASSIC_SCOPED_PHYSICAL_BASELINE_DRIFT');
+                    }
+                }
+            }
             // Stage and validate ALL changed payloads before restarting any service.
             for (const plan of changedPlans) {
                 plan.stage = `${plan.file}.${randomBytes(12).toString('hex')}.stage`;
-                await exec(plan.node, `umask 077\ncat > ${plan.stage}`, plan.bytes);
-                await exec(plan.node, `/usr/local/bin/xray run -test -format json -config ${plan.stage}`);
+                await exec(plan.node, `umask 077\ncat > ${plan.stage}`, plan.bytes, 'stage');
+                if (bootstrap && plan.file === SCOPED_BRIDGE) {
+                    await exec(plan.node, bootstrapper.stageTestCommand(plan.stage), undefined, 'stage-permissions');
+                } else await exec(plan.node, `/usr/local/bin/xray run -test -format json -config ${plan.stage}`);
                 if (await readConfig(plan.node, plan.stage) !== plan.bytes) throw scopedFailure('CLASSIC_SCOPED_STAGE_READBACK_MISMATCH');
             }
             if (remove) {
@@ -581,7 +638,7 @@ class CascadeService {
                 }
             }
             const port = target.tunnelPort;
-            if (changedPlans.length && !remove) await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`);
+            if (changedPlans.length && !remove) await exec(source, `if command -v ufw >/dev/null 2>&1; then\n ufw allow ${port}/tcp\nelif command -v firewall-cmd >/dev/null 2>&1; then\n firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload && firewall-cmd --query-port=${port}/tcp\nfi`, undefined, 'firewall');
             for (const plan of changedPlans) {
                 if (remove) {
                     if (scopedCanonical(await readProfile(plan.node, plan.file)) !== scopedCanonical(plan.before)) {
@@ -591,7 +648,7 @@ class CascadeService {
                     if (scopedScopePin(await readScope()) !== scopePin) throw scopedFailure('CLASSIC_SCOPED_SCOPE_DRIFT');
                     await checkNodePins();
                 }
-                await exec(plan.node, `chown --reference=${plan.file} ${plan.stage} && chmod --reference=${plan.file} ${plan.stage} && mv -- ${plan.stage} ${plan.file} && systemctl restart ${plan.service} && systemctl is-active --quiet ${plan.service}`);
+                await exec(plan.node, `chown --reference=${plan.file} ${plan.stage} && chmod --reference=${plan.file} ${plan.stage} && mv -- ${plan.stage} ${plan.file} && systemctl restart ${plan.service} && systemctl is-active --quiet ${plan.service}`, undefined, 'apply');
                 const after = await readProfile(plan.node, plan.file);
                 if (after.bytes !== plan.bytes || after.unit !== plan.before.unit
                     || (plan.bytes === plan.before.bytes && scopedCanonical(after.runtime) !== scopedCanonical(plan.before.runtime))) throw scopedFailure('CLASSIC_SCOPED_CONFIG_READBACK_MISMATCH');
