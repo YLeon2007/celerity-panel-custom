@@ -19,7 +19,7 @@ const { createClassicPortalBridgePhase } = require('../classicPortalBridgePhase'
 const { AsyncResource } = require('node:async_hooks');
 const { createTopologyDraftWriteService } = require('../../modules/relay-l2tp/services/topologyDraftWriteService');
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to a private disposable MongoDB binary' };
-const { TopologyDraftRepository } = require('../../modules/relay-l2tp/repositories/topologyDraftRepository');
+const { TopologyDraftRepository, isStandaloneClassicMutation, NODE_FILTER } = require('../../modules/relay-l2tp/repositories/topologyDraftRepository');
 const { withScopedClassicNodeLocks } = require('../classicPortalBridgeAdmission');
 
 // REAL transaction writes and separately held real commit. Only the timing of
@@ -200,6 +200,146 @@ function service(work) {
         cascadeService: { async deployScopedClassicLink(args) { return work(args); } } });
 }
 async function foreign() { return f.models.NodeOperationLock.findOne({ node: outside }).lean(); }
+
+test('native Mongo default draft factory admits Hysteria terminal Bridge create and update under unrelated busy state', local, async () => {
+    await setup();
+    await f.HyNode.updateOne({ _id: f.bridge }, { $set: { type: 'hysteria' } });
+    await f.models.RelayL2tpState.deleteMany({ node: f.source });
+    const before = await f.state(), lock = await foreign(), nodes = await f.HyNode.find().sort({ _id: 1 }).lean();
+    const drafts = createTopologyDraftWriteService({ ...f.models, deploymentEnv: f.env });
+    const newId = '507f1f77bcf86cd799439023';
+    assert.deepEqual(await drafts.createLink({ expectedTopologyRevision: 4, link: {
+        _id: newId, name: 'Hysteria terminal draft', portalNode: f.source, bridgeNode: f.bridge,
+        mode: 'reverse', active: true, status: 'pending', tunnelPort: 11096, tunnelUuid: 'fixture-hysteria',
+    } }), { revision: 5, deployedRevision: 0, standaloneClassicDraft: true });
+    assert.deepEqual(await drafts.updateLink({ expectedTopologyRevision: 5, linkId: newId,
+        changes: { name: 'edited Hysteria terminal draft' },
+    }), { revision: 6, deployedRevision: 0, standaloneClassicDraft: true });
+    assert.equal((await f.CascadeLink.findById(newId).lean()).name, 'edited Hysteria terminal draft');
+    const after = await f.state();
+    assert.ok(after.updatedAt >= before.updatedAt, 'ordinary revision write updates its timestamp');
+    assert.deepEqual(after, { ...before, revision: 6, updatedAt: after.updatedAt });
+    assert.deepEqual(await foreign(), lock);
+    assert.deepEqual(await f.HyNode.find().sort({ _id: 1 }).lean(), nodes);
+    assert.equal(await f.models.NodeOperationLock.countDocuments(), 1);
+});
+test('native Mongo classic endpoint inventory uses the same session and leaves native nodes xray-only', local, async () => {
+    await setup();
+    await f.HyNode.updateOne({ _id: f.bridge }, { $set: { type: 'hysteria' } });
+    const native = await new TopologyDraftRepository(f.models).readDraft();
+    assert.equal(Object.hasOwn(native, 'classicEndpointNodes'), false, 'native reads stay dormant');
+    assert.deepEqual(native.nodes.map(row => String(row._id)).sort(), [f.source, f.otherPortal, outside].sort());
+    assert.deepEqual(NODE_FILTER, { type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } });
+    const find = f.HyNode.find, reads = [];
+    f.HyNode.find = function(filter) {
+        const query = find.call(this, filter), lean = query.lean;
+        query.lean = function(...args) {
+            reads.push({ filter: this.getFilter(), session: this.getOptions().session, fields: this._fields });
+            return lean.apply(this, args);
+        };
+        return query;
+    };
+    try {
+        await f.mongoose.connection.transaction(async session => {
+            const snapshot = await new TopologyDraftRepository({ ...f.models, allowStandaloneClassicDrafts: true }).readDraft(session);
+            assert.deepEqual(snapshot.nodes, native.nodes);
+            assert.deepEqual(snapshot.classicEndpointNodes.map(row => String(row._id)).sort(), [f.source, f.bridge, f.otherPortal].sort());
+            assert.equal(reads.length, 2);
+            for (const read of reads) {
+                assert.ok(read.session === session, 'fresh role queries join the transaction');
+                assert.deepEqual(read.fields, { _id: 1, cascadeRole: 1 });
+            }
+            assert.deepEqual(reads[0].filter, NODE_FILTER);
+            assert.deepEqual(reads[1].filter, { active: true, $or: [
+                { type: 'xray', cascadeRole: { $in: ['portal', 'bridge'] } },
+                { type: 'hysteria', cascadeRole: 'bridge' },
+            ] });
+        });
+    } finally { f.HyNode.find = find; }
+});
+
+test('native Mongo unsupported endpoints and forward group relay chain dependencies remain strict', local, async () => {
+    for (const scenario of ['unsupported', 'case', 'whitespace', 'inactive', 'source-hysteria', 'nonterminal',
+        'forward', 'geo', 'group', 'relay-reference', 'chain']) {
+        await setup();
+        await f.HyNode.updateOne({ _id: f.bridge }, { $set: { type: 'hysteria' } });
+        await f.models.RelayL2tpState.deleteMany({ node: f.source });
+        const link = { _id: '507f1f77bcf86cd799439023', portalNode: f.source, bridgeNode: f.bridge, mode: 'reverse' };
+        if (['unsupported', 'case', 'whitespace'].includes(scenario)) {
+            await f.HyNode.collection.updateOne({ _id: new f.mongoose.Types.ObjectId(f.bridge) },
+                { $set: { type: { unsupported: 'unsupported', case: 'Hysteria', whitespace: 'hysteria ' }[scenario] } });
+        }
+        if (scenario === 'inactive') await f.HyNode.updateOne({ _id: f.bridge }, { $set: { active: false } });
+        if (scenario === 'source-hysteria') await f.HyNode.updateOne({ _id: f.source }, { $set: { type: 'hysteria' } });
+        if (scenario === 'nonterminal') await f.HyNode.updateOne({ _id: f.bridge }, { $set: { cascadeRole: 'relay' } });
+        if (scenario === 'forward') link.mode = 'forward';
+        if (scenario === 'geo') link.geoRouting = { enabled: true };
+        if (scenario === 'group') await f.models.CascadeRouteGroup.collection.insertOne({ paths: [{ linkIds: [new f.mongoose.Types.ObjectId(f.oldId)] }] });
+        if (scenario === 'relay-reference') await f.models.RelayL2tpState.collection.insertOne({ node: new f.mongoose.Types.ObjectId(f.bridge), status: 'not_installed' });
+        if (scenario === 'chain') await f.CascadeLink.collection.insertOne({ portalNode: new f.mongoose.Types.ObjectId(f.bridge), bridgeNode: new f.mongoose.Types.ObjectId(outside), mode: 'reverse', active: false });
+        // Test the counted-busy refusal separately from replacement ownership.
+        await f.models.CascadeTopologyState.collection.updateOne({ _id: 'singleton' }, { $unset: { replacementReservation: '' } });
+        const before = await f.state(), locks = await f.models.NodeOperationLock.find().lean();
+        const links = await f.CascadeLink.find().sort({ _id: 1 }).lean();
+        const repository = new TopologyDraftRepository({ ...f.models,
+            withScopedNodeLocks: withScopedClassicNodeLocks, allowStandaloneClassicDrafts: true });
+        const mutation = { kind: 'link.create', document: link };
+        assert.equal(isStandaloneClassicMutation(await repository.readDraft(), mutation), false, scenario);
+        await assert.rejects(repository.commitDraft({ expectedRevision: 4, prepare: async () => ({ mutation }) }),
+            { code: 'TOPOLOGY_DEPLOY_BUSY' }, scenario);
+        assert.deepEqual(await f.state(), before, scenario);
+        assert.deepEqual(await f.CascadeLink.find().sort({ _id: 1 }).lean(), links, scenario);
+        assert.deepEqual(await f.models.NodeOperationLock.find().lean(), locks, scenario);
+    }
+});
+
+test('native Mongo default factory rechecks Hysteria endpoint eligibility inside the locked transaction', local, async () => {
+    for (const change of [{ type: 'unsupported' }, { active: false }, { cascadeRole: 'relay' }]) {
+        await setup();
+        await f.HyNode.updateOne({ _id: f.bridge }, { $set: { type: 'hysteria' } });
+        await f.models.RelayL2tpState.deleteMany({ node: f.source });
+        const before = await f.state();
+        const drafts = createTopologyDraftWriteService({ ...f.models, deploymentEnv: f.env,
+            transactionRunner: async work => {
+                assert.equal(await f.models.NodeOperationLock.countDocuments(), 3, 'selected old/new pair is locked');
+                await f.HyNode.updateOne({ _id: f.bridge }, { $set: change });
+                return f.mongoose.connection.transaction(work);
+            },
+        });
+        await assert.rejects(drafts.updateLink({ expectedTopologyRevision: 4, linkId: f.linkId,
+            changes: { name: 'must not commit' } }), { code: 'TOPOLOGY_REPLACEMENT_RESERVED' });
+        assert.equal((await f.CascadeLink.findById(f.linkId).lean()).name, 'selected');
+        assert.deepEqual(await f.state(), before);
+        assert.equal(await f.models.NodeOperationLock.countDocuments(), 1);
+    }
+});
+
+test('native Mongo default checked DELETE returns trusted standalone metadata for Hysteria terminal Bridge', local, async () => {
+    await setup();
+    await f.HyNode.updateOne({ _id: f.bridge }, { $set: { type: 'hysteria' } });
+    await f.models.RelayL2tpState.deleteMany({ node: f.source });
+    const before = await f.state(), lock = await foreign();
+    const preserved = await f.CascadeLink.findById(f.oldId).lean();
+    const nodes = await f.HyNode.find().sort({ _id: 1 }).lean();
+    let removals = 0;
+    const selected = createClassicScopedCascadeDeploymentService({ ...f.models, env: f.env, NodeSSH: Preview,
+        cascadeService: { async removeScopedClassicLink(args) {
+            removals++;
+            await args.beforeRemoteMutation({ nodeId: f.source, phase: 'modeled-physical-remove' });
+            return removalReceipt();
+        } } });
+    assert.deepEqual(await selected.deleteLink({ expectedTopologyRevision: 4, linkId: f.linkId }),
+        { revision: 5, deployedRevision: 0, standaloneClassicDraft: true });
+    assert.equal(removals, 1);
+    assert.equal(await f.CascadeLink.exists({ _id: f.linkId }), null);
+    assert.deepEqual(await f.CascadeLink.findById(f.oldId).lean(), preserved);
+    const after = await f.state();
+    assert.deepEqual(after, { ...before, revision: 5, updatedAt: after.updatedAt });
+    assert.deepEqual(await foreign(), lock);
+    assert.deepEqual(await f.HyNode.find().sort({ _id: 1 }).lean(), nodes);
+    assert.equal(await f.models.NodeOperationLock.countDocuments(), 1);
+});
+
 test('native Mongo independent apply preserves unrelated busy state and locks across an unrelated revision change', local, async () => {
     await setup(); const before = await f.state(), lock = await foreign();
     const result = await service(async args => {

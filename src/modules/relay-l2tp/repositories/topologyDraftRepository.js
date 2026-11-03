@@ -56,7 +56,7 @@ function isStandaloneClassicMutation(snapshot, mutation) {
     const old = (snapshot.links || []).find(link => entityId(link) === entityId(mutation.id));
     const variants = mutation.kind === 'link.create' ? [mutation.document]
         : mutation.kind === 'link.delete' ? [old] : [old, { ...old, ...mutation.changes }];
-    const roles = new Map((snapshot.nodes || []).map(node => [entityId(node), node.cascadeRole]));
+    const roles = new Map((snapshot.classicEndpointNodes || []).map(node => [entityId(node), node.cascadeRole]));
     const nodes = new Set();
     for (const link of variants) {
         const source = entityId(link?.portalNode), target = entityId(link?.bridgeNode);
@@ -110,6 +110,15 @@ const NODE_FILTER = Object.freeze({
     type: 'xray',
     active: true,
     cascadeRole: Object.freeze({ $in: ACTIVE_NODE_ROLES }),
+});
+// Classic terminal bridges also support Hysteria. Keep this role inventory
+// separate: it must never widen snapshot.nodes/native compiler eligibility.
+const CLASSIC_ENDPOINT_FILTER = Object.freeze({
+    active: true,
+    $or: Object.freeze([
+        Object.freeze({ type: 'xray', cascadeRole: Object.freeze({ $in: Object.freeze(['portal', 'bridge']) }) }),
+        Object.freeze({ type: 'hysteria', cascadeRole: 'bridge' }),
+    ]),
 });
 const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
     routeGroup: Object.freeze({ $ne: null }),
@@ -237,12 +246,16 @@ class TopologyDraftRepository {
                 ? `${ROUTE_GROUP_REFERENCE_SELECT} desiredState installedRouteGroup` : ROUTE_GROUP_REFERENCE_SELECT);
         const state = await withSession(topologyQuery, session).lean();
         const nodes = await withSession(nodeQuery, session).lean();
+        const classicEndpointNodes = this.allowStandaloneClassicDrafts
+            ? await withSession(this.HyNode.find(CLASSIC_ENDPOINT_FILTER).select(NODE_SELECT), session).lean()
+            : undefined;
         const links = await withSession(linkQuery, session).lean();
         const groups = await withSession(groupQuery, session).lean();
         const relayStates = await withSession(relayStateQuery, session).lean();
         const activeRelayStates = this.withScopedNodeLocks ? (relayStates || []).filter(row =>
             row.routeGroup != null && (row.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.includes(row.status))) : relayStates;
         return {
+            ...(this.allowStandaloneClassicDrafts ? { classicEndpointNodes: classicEndpointNodes || [] } : {}),
             ...(this.withScopedNodeLocks ? { relayReferences: relayStates || [] } : {}),
             revision: state?.revision ?? 0,
             deployedRevision: state?.deployedRevision ?? 0,

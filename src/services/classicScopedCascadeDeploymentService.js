@@ -308,7 +308,7 @@ function createClassicScopedCascadeDeploymentService(dependencies = {}) {
         let repository;
         if (isDelete) {
             const { TopologyDraftRepository } = require('../modules/relay-l2tp/repositories/topologyDraftRepository');
-            repository = new TopologyDraftRepository(m);
+            repository = new TopologyDraftRepository({ ...m, allowStandaloneClassicDrafts: true });
         }
         async function prepareDeletion(session, checkRevision = true, heldNodeIds = null) {
             const snapshot = await repository.readDraft(session);
