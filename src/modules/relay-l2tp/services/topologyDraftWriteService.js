@@ -156,9 +156,15 @@ function createTopologyDraftWriteService({
     const classic = isClassicProductionDeploymentConfigured(env);
     // Keep dormant/native imports unchanged. The shared unique-lock helper is
     // resolved on use only; a missing integration must fail, never fall back.
-    const scopedLocks = withScopedNodeLocks ?? (classic ? ((options, work) => {
+    const scopedLocks = withScopedNodeLocks ?? (classic ? (async (options, work) => {
         const { withScopedClassicNodeLocks } = require('../../../services/classicPortalBridgeAdmission');
-        return withScopedClassicNodeLocks(options, work);
+        try { return await withScopedClassicNodeLocks(options, work); }
+        catch (error) {
+            if (error?.code === 'NODE_OPERATION_LOCK_CONFLICT') {
+                throw new TopologyDraftWriteError('CLASSIC_DEPLOY_NODE_BUSY', 'A selected node is busy; retry after its operation finishes');
+            }
+            throw error;
+        }
     }) : undefined);
     const repository = new Repository({
         HyNode,
