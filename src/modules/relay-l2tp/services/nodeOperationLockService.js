@@ -103,7 +103,7 @@ class NodeOperationLockService {
         }
 
         return {
-            ok: true,
+            ok: results.every(result => result?.ok === true),
             code: RESULT_CODES.BATCH_ACQUIRED,
             results,
         };

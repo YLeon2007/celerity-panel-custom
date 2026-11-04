@@ -55,7 +55,7 @@ async function verifyAttachChain(CascadeLink, scope, session) {
     const byId = new Map(edges.map(edge => [String(edge._id), edge]));
     if (byId.size !== scope.linkIds.length) rejectFinalization();
     const prefixIds = scope.linkIds.filter(id => !scope.newPathLinkIds.includes(id));
-    if (!prefixIds.length) rejectFinalization();
+    // A directly attached installed relay has no portal prefix.
     let node = scope.ownerNodeId;
     const suffixNodes = new Set([node]);
     for (const id of scope.newPathLinkIds) {
@@ -121,8 +121,8 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
                 || !['groupId', 'ownerNodeId'].every(key =>
                     typeof operation[key] === 'string' && operation[key].length > 0)
                 || !Array.isArray(operation.newPathLinkIds)
-                || operation.newPathLinkIds.length < 2
-                || operation.newPathLinkIds.length >= operation.linkIds.length
+                || operation.newPathLinkIds.length < 1
+                || operation.newPathLinkIds.length > operation.linkIds.length
                 || new Set(operation.newPathLinkIds).size !== operation.newPathLinkIds.length
                 || operation.newPathLinkIds.at(-1) !== operation.linkId
                 || !operation.newPathLinkIds.every(id => operation.linkIds.includes(id))
@@ -137,7 +137,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
                 || operation.oldLinkId === operation.linkId
                 || operation.linkIds.includes(operation.oldLinkId)
                 || !Array.isArray(operation.oldPathLinkIds)
-                || operation.oldPathLinkIds.length < 2
+                || operation.oldPathLinkIds.length < 1
                 || operation.oldPathLinkIds.at(-1) !== operation.oldLinkId
                 || new Set(operation.oldPathLinkIds).size !== operation.oldPathLinkIds.length
             : operation.kind === 'link.attach' ? false
@@ -166,7 +166,7 @@ async function loadOperationScope(TopologyOperation, operationId, session) {
 class TopologyOperationFinalizationRepository {
     constructor({ TopologyOperation, CascadeTopologyState, CascadeLink,
         CascadeRouteGroup, RelayL2tpState, transactionRunner, NodeOperationLock,
-        TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment, HyNode, L2tpUser, L2tpOperation } = {}) {
+        TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment, HyNode, L2tpUser, L2tpOperation, selectedTopologyRepository } = {}) {
         if (!TopologyOperation || typeof TopologyOperation.updateOne !== 'function'
             || typeof TopologyOperation.findById !== 'function') {
             throw new TypeError('Topology operation finalization requires TopologyOperation');
@@ -185,6 +185,7 @@ class TopologyOperationFinalizationRepository {
         this.CascadeRouteGroup = CascadeRouteGroup || null;
         this.RelayL2tpState = RelayL2tpState || null;
         this.transactionRunner = runTransaction;
+        this.selectedTopologyRepository = selectedTopologyRepository;
         Object.assign(this, { NodeOperationLock, TopologyConfigOwner, TopologyExecutionBinding, TopologyExecutionEnrollment,
             HyNode, L2tpUser, L2tpOperation });
     }
@@ -211,6 +212,29 @@ class TopologyOperationFinalizationRepository {
         return require('./topologyV2Settlement').probe(this, operationId);
     }
 
+    async rejectUndispatchedSelected(request) {
+        assertFinalizationRequest(request);
+        if (this.NodeOperationLock?.db !== this.TopologyOperation.db
+            || this.CascadeTopologyState.db !== this.TopologyOperation.db) return false;
+        try {
+            return await this.transactionRunner(async session => {
+                const operation = await this.TopologyOperation.findById(request.operationId).select('+admissionScope').session(session).lean();
+                if (operation?.status !== 'preparing' || operation.heldTopologyAdmission !== true
+                    || operation.admissionScope !== 'selected' || operation.leaseOwner !== request.owner
+                    || operation.leaseUntil?.getTime() !== request.leaseUntil.getTime() || operation.leaseUntil <= request.now
+                    || operation.v2Terminal !== undefined || operation.pppWait !== undefined
+                    || !operation.nodes?.length || operation.nodes.some(node => node.state !== 'pending' || node.backupId !== '')
+                    || await this.NodeOperationLock.findOne({ operationId: request.operationId }).session(session).lean()) rejectFinalization();
+                const changed = await this.TopologyOperation.updateOne({ _id: request.operationId, status: 'preparing',
+                    heldTopologyAdmission: true, leaseOwner: request.owner, leaseUntil: request.leaseUntil },
+                    { $set: { status: 'failed', heldTopologyAdmission: false, leaseUntil: null, finishedAt: request.now } }, { session, runValidators: true });
+                if (changed.matchedCount !== 1 || (await this.CascadeTopologyState.updateOne({ _id: 'singleton', topologyAdmissionCount: { $gte: 1 } },
+                    { $inc: { topologyAdmissionCount: -1 } }, { session, runValidators: true })).matchedCount !== 1) rejectFinalization();
+                return true;
+            });
+        } catch (error) { if (error === FINALIZATION_REJECTED) return false; throw error; }
+    }
+
     async finalizeRolledBack({ operationId, topologyRevision, priorDeployedRevision, now }) {
         if (typeof operationId !== 'string' || !operationId
             || !validRevision(topologyRevision) || !validRevision(priorDeployedRevision)
@@ -219,7 +243,7 @@ class TopologyOperationFinalizationRepository {
         }
         return this.transactionRunner(async session => {
             const durable = await this.TopologyOperation.findById(operationId)
-                .select('nodes.state nodes.backupId v2Terminal').session(session).lean();
+                .select('nodes.state nodes.backupId v2Terminal +admissionScope').session(session).lean();
             if (durable?.v2Terminal) rejectFinalization();
             // Terminal labels alone are not rollback proof. A failed or still
             // prepared/committed node must retain the topology admission.
@@ -239,8 +263,8 @@ class TopologyOperationFinalizationRepository {
             if (operation?.matchedCount !== 1) rejectFinalization();
             const topology = await this.CascadeTopologyState.updateOne({
                 _id: 'singleton',
-                deployedRevision: priorDeployedRevision,
-                topologyAdmissionCount: 1,
+                ...(durable.admissionScope === 'selected' ? { topologyAdmissionCount: { $gte: 1 } }
+                    : { deployedRevision: priorDeployedRevision, topologyAdmissionCount: 1 }),
             }, {
                 $inc: { topologyAdmissionCount: -1 },
             }, { runValidators: true, session, timestamps: false });
@@ -279,12 +303,29 @@ class TopologyOperationFinalizationRepository {
         try {
             return await run(async session => {
                 const admission = await this.TopologyOperation.findById(operationId)
-                    .select('heldTopologyAdmission pppWait nodes v2Terminal')
+                    .select('heldTopologyAdmission pppWait nodes v2Terminal executionContext topologyRevision priorDeployedRevision idempotencyKey linkId linkIds staged kind admissionFingerprint routeState +admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion')
                     .session(session)
                     .lean();
                 if (!admission || (admission.v2Terminal && !settlementSession)
                     || (settlementSession && (session !== settlementSession || !session.inTransaction()
                         || admission.v2Terminal?.state !== 'proven'))) rejectFinalization();
+                const selected = admission.admissionScope === 'selected';
+                if (selected && !settlementSession) {
+                    if (!this.selectedTopologyRepository || admission.executionContext?.target !== 'test') rejectFinalization();
+                    await this.selectedTopologyRepository.verifySelected(admission, session);
+                    // The TEST-only executor has completed all remote callbacks.
+                    // Real V2 follows its branded close/readback transaction.
+                    for (const pin of admission.selectedOwnerPins) {
+                        const lock = await this.NodeOperationLock.findOne({ node: pin.node, owner, operationId })
+                            .session(session).lean();
+                        const owned = await this.TopologyConfigOwner.findOne({ node: pin.node, profile: pin.profile }).session(session).lean();
+                        if (!lock?.generation || lock.leaseUntil <= now || !owned) rejectFinalization();
+                        const updated = await this.TopologyConfigOwner.updateOne(owned, { $set: {
+                            lastSettledOperation: operationId, lastSettledGeneration: lock.generation, lastSettledRevision: topologyRevision,
+                        } }, { session, runValidators: true });
+                        if (updated.matchedCount !== 1 || (await this.NodeOperationLock.deleteOne(lock, { session })).deletedCount !== 1) rejectFinalization();
+                    }
+                }
                 const wait = admission.pppWait;
                 if (wait || request.pppProof !== undefined) {
                     const proof = request.pppProof;
@@ -388,15 +429,15 @@ class TopologyOperationFinalizationRepository {
                 }
                 const topology = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton',
-                    revision: topologyRevision,
-                    deployedRevision: priorDeployedRevision,
-                    ...(releasesAdmission ? { topologyAdmissionCount: 1 } : {}),
+                    ...(selected ? { topologyAdmissionCount: { $gte: 1 }, replacementReservation: { $exists: false } }
+                        : { revision: topologyRevision, deployedRevision: priorDeployedRevision,
+                            ...(releasesAdmission ? { topologyAdmissionCount: 1 } : {}) }),
                     ...(scope?.kind === 'link.replace' || scope?.kind === 'link.attach'
                         ? { replacementReservation: { $exists: false } } : {}),
                 }, {
                     // A scoped commit only checks the fence; it cannot claim
                     // the rest of the draft revision has been deployed.
-                    $set: { deployedRevision: scope ? priorDeployedRevision : topologyRevision },
+                    ...(!selected ? { $set: { deployedRevision: scope ? priorDeployedRevision : topologyRevision } } : {}),
                     ...(releasesAdmission ? { $inc: { topologyAdmissionCount: -1 } } : {}),
                 }, {
                     runValidators: true,
@@ -477,7 +518,23 @@ class TopologyOperationFinalizationRepository {
                             'paths.0.enabled': { $ne: false },
                         }, { $set: { 'paths.0.linkIds': scope.newPathLinkIds } },
                         { runValidators: true, session });
-                        if (existing?.matchedCount !== 1) rejectFinalization();
+                        if (existing?.matchedCount !== 1) {
+                            // Shared groups retain every peer path and its
+                            // metadata. CAS the exact read array so a peer edit
+                            // conflicts instead of being overwritten.
+                            if (typeof this.CascadeRouteGroup.findById !== 'function') rejectFinalization();
+                            const current = await this.CascadeRouteGroup.findById(scope.groupId).session(session).lean();
+                            if (!Array.isArray(current?.paths)) rejectFinalization();
+                            const owned = current.paths.filter(path => path.pathKey === scope.pathKey);
+                            if (owned.length > 1 || owned.some(path => path.enabled === false
+                                || !Array.isArray(path.linkIds) || path.linkIds.length)) rejectFinalization();
+                            const paths = current.paths.map(path => path.pathKey === scope.pathKey
+                                ? { ...path, linkIds: scope.newPathLinkIds } : path);
+                            if (!owned.length) paths.push({ pathKey: scope.pathKey, linkIds: scope.newPathLinkIds, priority: 1, enabled: true });
+                            const shared = await this.CascadeRouteGroup.updateOne({ _id: scope.groupId, paths: current.paths },
+                                { $set: { paths } }, { runValidators: true, session });
+                            if (shared?.matchedCount !== 1) rejectFinalization();
+                        }
                     }
                     const suffix = await this.CascadeLink.updateMany({
                         _id: { $in: [scope.linkId] }, active: true,
@@ -496,7 +553,7 @@ class TopologyOperationFinalizationRepository {
                     && scope?.kind !== 'link.attach'
                     && this.CascadeLink && typeof this.CascadeLink.updateMany === 'function') {
                     const isStagedApply = scope?.kind === 'link.apply' && scope.staged === true;
-                    const linkIds = isStagedApply ? [scope.linkId] : scope?.linkIds;
+                    const linkIds = selected ? [scope.linkId] : isStagedApply ? [scope.linkId] : scope?.linkIds;
                     const linkFilter = scope
                         ? { _id: { $in: linkIds } }
                         : { active: true };

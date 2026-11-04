@@ -166,6 +166,9 @@ function durablePlan(operation, operationId) {
         operationId,
         topologyRevision: operation.topologyRevision,
         priorDeployedRevision: operation.priorDeployedRevision,
+        ...(operation.admissionScope === 'selected' ? { admissionScope: 'selected',
+            resourceNodeIds: [...operation.resourceNodeIds], kind: operation.kind,
+            linkId: operation.linkId, routeState: operation.routeState } : {}),
         ...(operation.kind === 'link.attach' ? {
             kind: 'link.attach',
             groupId: operation.groupId,
@@ -247,6 +250,7 @@ class TopologyOperationWorker {
         attachIngressGate,
         bindingProvisioner,
         bindingLifecycle,
+        selectedTopologyRepository,
         allowUnprovenTestExecution = false,
     } = {}) {
         const selectedContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -301,6 +305,7 @@ class TopologyOperationWorker {
         this.#bindingProvisioner = bindingProvisioner;
         this.#bindingLifecycle = bindingLifecycle;
         this.operationRepository = operationRepository;
+        this.selectedTopologyRepository = selectedTopologyRepository;
         this.executor = executor;
         this.#retainExecutionOwnership = executor.executionProtocolVersion === 2;
         this.finalizer = finalizer;
@@ -459,6 +464,17 @@ class TopologyOperationWorker {
             acquiredNodeIds.push({ node: nodeId, generation: acquired.lock.generation });
         }
         return null;
+    }
+
+    async releaseNoDispatchLocks(operationId, acquiredNodeIds) {
+        let released = true;
+        for (const { node, generation } of [...acquiredNodeIds].reverse()) {
+            try {
+                if ((await this.lockService.releaseVerified({ node, generation, owner: this.workerId, operationId }))?.ok !== true) released = false;
+            } catch { released = false; }
+        }
+        if (released) acquiredNodeIds.length = 0;
+        return released;
     }
 
     async releaseVerifiedLocks(operationId, acquiredNodeIds) {
@@ -1230,9 +1246,21 @@ class TopologyOperationWorker {
                 return { claimed: true, operationId, status: operation.status, stopped: true,
                     errorCode: 'REMOTE_COMMAND_OUTCOME_UNCERTAIN' };
             }
-            const lockErrorCode = await this.acquireLocks(operationId, nodes, acquiredNodeIds);
+            const lockNodes = operation.admissionScope === 'selected'
+                ? operation.resourceNodeIds.map(node => ({ node })) : nodes;
+            const lockErrorCode = await this.acquireLocks(operationId, lockNodes, acquiredNodeIds);
             if (lockErrorCode) {
                 traceWorkerFailure(plan, operationId, 'worker.lock', { code: lockErrorCode });
+                // Nothing has dispatched in this acquisition attempt, even for
+                // V2. Release only the exact successful generations, never the
+                // ambiguous acquire or the foreign winner.
+                if (operation.admissionScope === 'selected') {
+                    await heartbeat.stop();
+                    const released = await this.releaseNoDispatchLocks(operationId, acquiredNodeIds);
+                    if (released && lockErrorCode === 'NODE_OPERATION_LOCK_CONFLICT') {
+                        await this.operationRepository.waitForSelectedResources({ operationId, owner: this.workerId, now: this.clock.now() });
+                    }
+                }
                 return {
                     claimed: true,
                     operationId,
@@ -1240,6 +1268,20 @@ class TopologyOperationWorker {
                     stopped: true,
                     errorCode: lockErrorCode,
                 };
+            }
+
+            if (operation.admissionScope === 'selected') {
+                try {
+                    if (!this.selectedTopologyRepository) throw new Error('Selected snapshot verifier unavailable');
+                    await heartbeat.run(() => this.selectedTopologyRepository.verifySelected(operation));
+                } catch (error) {
+                    await heartbeat.stop();
+                    const released = await this.releaseNoDispatchLocks(operationId, acquiredNodeIds);
+                    const rejected = released && await this.finalizer.rejectUndispatchedSelected?.({ operationId, owner: this.workerId,
+                        leaseUntil: await this.renew(operationId), topologyRevision: operation.topologyRevision, priorDeployedRevision: operation.priorDeployedRevision });
+                    return { claimed: true, operationId, status: rejected ? 'failed' : 'preparing', stopped: true,
+                        errorCode: error.code || 'TOPOLOGY_SELECTED_PIN_CHANGED' };
+                }
             }
 
             // Expected ownership comes only from this claim and locks we just
@@ -1535,7 +1577,7 @@ class TopologyOperationWorker {
             // can drop topology admission. No mutation is safe after this point.
             await heartbeat.renew();
             await heartbeat.stop();
-            if (!await this.releaseVerifiedLocks(operationId, acquiredNodeIds)) {
+            if (operation.admissionScope !== 'selected' && !await this.releaseVerifiedLocks(operationId, acquiredNodeIds)) {
                 return { claimed: true, operationId, status: 'committing', stopped: true,
                     errorCode: 'NODE_LOCK_RELEASE_FAILED' };
             }

@@ -183,6 +183,7 @@ class TopologyDraftRepository {
         transactionRunner,
         withScopedNodeLocks,
         allowStandaloneClassicDrafts = false,
+        selectedTopologyRepository,
     } = {}) {
         const models = {
             HyNode,
@@ -231,6 +232,7 @@ class TopologyDraftRepository {
             throw new TypeError('Topology draft repository requires withScopedNodeLocks to be a function');
         }
         this.withScopedNodeLocks = withScopedNodeLocks;
+        this.selectedTopologyRepository = selectedTopologyRepository;
         this.allowStandaloneClassicDrafts = allowStandaloneClassicDrafts === true;
         this.transactionRunner = runTransaction;
     }
@@ -370,6 +372,43 @@ class TopologyDraftRepository {
         );
     }
 
+    createIntentDraftWriter({ selectedTopologyRepository } = {}) {
+        const repository = this;
+        return Object.freeze({ db: this.CascadeTopologyState.db,
+            async createLink({ expectedTopologyRevision, link, session }) {
+                if (!session?.inTransaction?.() || !selectedTopologyRepository
+                    || selectedTopologyRepository.db !== repository.CascadeTopologyState.db
+                    || (typeof repository.CascadeTopologyState.db?.getClient === 'function'
+                        && session.client !== repository.CascadeTopologyState.db.getClient())) {
+                    throw new TypeError('Intent draft requires the exact active admission session and connection');
+                }
+                const { TopologyDraftWriteService } = require('../services/topologyDraftWriteService');
+                // This is DB-only and JOINED. There is no scoped wrapper whose
+                // post-runner acknowledgement could release before outer commit.
+                const writer = new TopologyDraftWriteService({ repository: {
+                    async commitDraft({ expectedRevision, prepare }) {
+                        const snapshot = await repository.readDraft(session);
+                        if (snapshot.revision !== expectedRevision) throw staleRevision(expectedRevision, snapshot.revision);
+                        const prepared = await prepare(snapshot);
+                        // A new desired neighbor may wait behind selected work;
+                        // it does not alter that operation's frozen descriptors.
+                        // Legacy/remote/drain fences remain checked.
+                        const count = await selectedTopologyRepository.assertSelectedAvailable(
+                            mutationNodeIds(snapshot, prepared.mutation), session, undefined, { desiredOnly: true });
+                        await repository.persistMutation(prepared.mutation, session);
+                        const state = await repository.CascadeTopologyState.findOneAndUpdate({
+                            _id: 'singleton', revision: expectedRevision, topologyAdmissionCount: count.topologyAdmissionCount,
+                            remoteAdmissionCount: count.remoteAdmissionCount, replacementReservation: { $exists: false }, remoteDrain: { $exists: false },
+                        }, { $inc: { revision: 1 } }, { new: true, session, upsert: false, runValidators: true }).lean();
+                        if (!state) throw staleRevision(expectedRevision, null);
+                        return { revision: state.revision, deployedRevision: state.deployedRevision };
+                    },
+                } });
+                return writer.createLink({ expectedTopologyRevision, link });
+            },
+        });
+    }
+
     async commitDraft({ expectedRevision, prepare }) {
         if (typeof prepare !== 'function') {
             throw new TypeError('Topology draft commit requires a prepare function');
@@ -398,7 +437,10 @@ class TopologyDraftRepository {
                         'A topology replacement owns the draft mutation fence',
                     );
                 }
-                if (!standalone && snapshot.topologyAdmissionCount > 0) {
+                prepared ??= await prepare(snapshot);
+                const selectedCount = this.selectedTopologyRepository?.selectedEnabled && !this.withScopedNodeLocks
+                    ? await this.selectedTopologyRepository.assertSelectedAvailable(mutationNodeIds(snapshot, prepared.mutation), session) : null;
+                if (!standalone && selectedCount === null && snapshot.topologyAdmissionCount > 0) {
                     throw new TopologyDraftRepositoryError('TOPOLOGY_DEPLOY_BUSY', 'An active operation owns the exact topology revision');
                 }
                 prepared ??= await prepare(snapshot);
@@ -418,7 +460,8 @@ class TopologyDraftRepository {
                         // real global revision CAS, but do not own or clear an
                         // unrelated native operation's reservation/counters.
                         ...(!standalone ? {
-                            topologyAdmissionCount: 0,
+                            topologyAdmissionCount: selectedCount?.topologyAdmissionCount ?? 0,
+                            ...(selectedCount ? { remoteAdmissionCount: selectedCount.remoteAdmissionCount, remoteDrain: { $exists: false } } : {}),
                             replacementReservation: { $exists: false },
                         } : {}),
                     },

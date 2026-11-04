@@ -1,6 +1,24 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+const { isDeepStrictEqual: same } = require('node:util');
+const { validTerminalReceipt, UUID } = require('../models/topologyExecutionBindingContract');
+const { durableSelectedTopology, selectedAdmissionFingerprint } = require('./topologyOperationRepository');
+const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
+const { linkDesiredVersion } = require('../services/topologyIntentService');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
+const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion';
+const plain = value => JSON.parse(JSON.stringify(value));
+const ownerPin = row => plain(Object.fromEntries(['node', 'profile', 'executionContext', 'owner', 'generation',
+    'nodeIdentity', 'originalSnapshot', 'adoptionReceipt', 'handbackReceipt', 'lastSettledOperation',
+    'lastSettledGeneration', 'lastSettledRevision', 'lastSettledCloseId'].filter(key => row[key] !== undefined).map(key => [key, row[key]])));
+function selectedError(code = 'APPLIED_BASELINE_REQUIRED') {
+    return new TopologyDeploymentRepositoryError(code, 'The selected applied baseline could not be verified');
+}
+// An exact adopted readback of {} (optionally newline terminated) proves no
+// managed cascade graph, unlike an absent pointer or a desired status. This is
+// deliberately narrower than importing an arbitrary classic configuration.
+const EMPTY_CONFIG_HASHES = new Set(['{}', '{}\n'].map(bytes => createHash('sha256').update(bytes).digest('hex')));
 
 class TopologyDeploymentRepositoryError extends Error {
     constructor(code, message, details = {}) {
@@ -32,8 +50,30 @@ function withSession(query, session) {
     return session === undefined ? query : query.session(session);
 }
 
+function componentAt(snapshot, nodeId) {
+    const nodes = new Set(snapshot.nodes.some(node => node.id === nodeId) ? [nodeId] : []);
+    const links = new Set(), groups = new Set();
+    let expanded;
+    do {
+        expanded = false;
+        for (const link of snapshot.links) {
+            if (!nodes.has(link.source) && !nodes.has(link.target) && !links.has(link.id)) continue;
+            if (!links.has(link.id)) expanded = true;
+            links.add(link.id); nodes.add(link.source); nodes.add(link.target);
+        }
+        for (const group of snapshot.groups) {
+            const members = group.paths.flatMap(path => path.linkIds);
+            if (!members.some(id => links.has(id))) continue;
+            groups.add(group._id);
+            for (const id of members) { if (!links.has(id)) expanded = true; links.add(id); }
+        }
+    } while (expanded);
+    return { nodes: snapshot.nodes.filter(node => nodes.has(node.id)), links: snapshot.links.filter(link => links.has(link.id)),
+        groups: snapshot.groups.filter(group => groups.has(group._id)) };
+}
+
 class TopologyDeploymentRepository {
-    constructor({ snapshotReader, CascadeTopologyState, TopologyOperation, transactionRunner } = {}) {
+    constructor({ snapshotReader, CascadeTopologyState, TopologyOperation, TopologyConfigOwner, NodeOperationLock, RemoteAdmission, transactionRunner } = {}) {
         if (!snapshotReader || typeof snapshotReader.readDraft !== 'function') {
             throw new TypeError('Topology deployment repository requires snapshotReader.readDraft');
         }
@@ -50,17 +90,195 @@ class TopologyDeploymentRepository {
         this.CascadeTopologyState = CascadeTopologyState;
         this.transactionRunner = runTransaction;
         this.TopologyOperation = TopologyOperation;
+        this.TopologyConfigOwner = TopologyConfigOwner;
+        this.NodeOperationLock = NodeOperationLock;
+        this.RemoteAdmission = RemoteAdmission;
+        this.db = CascadeTopologyState.db;
+        this.selectedEnabled = Boolean(TopologyConfigOwner && NodeOperationLock);
         this.usesDefaultRunner = transactionRunner === undefined;
+    }
+
+    async readSelected({ snapshot, scope, executionContext, session, desiredVersion }) {
+        executionContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
+        if (!executionContext || !this.selectedEnabled || scope?.kind !== 'link.apply') throw selectedError();
+        const { NODE_METADATA_SELECT, LINK_METADATA_SELECT } = require('../services/topologyOperationPlanMaterializer');
+        const nodeRows = await withSession(this.snapshotReader.HyNode.find({ type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } })
+            .select(NODE_METADATA_SELECT), session).lean();
+        const linkRows = await withSession(this.snapshotReader.CascadeLink.find({ _id: scope.linkId, active: true })
+            .select(`${LINK_METADATA_SELECT} tunnelUuid active name priority`), session).lean();
+        const target = linkRows.find(row => String(row._id) === scope.linkId);
+        if (!target) throw selectedError('CASCADE_LINK_NOT_FOUND');
+        const version = linkDesiredVersion(target);
+        if (desiredVersion !== undefined && desiredVersion !== version) throw selectedError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+        const desiredTopology = durableSelectedTopology({
+            nodes: nodeRows.map(row => {
+                const { _id, cascadeRole, ...fields } = plain(row);
+                delete fields.__v; delete fields.createdAt; delete fields.updatedAt;
+                return { ...fields, id: String(_id), role: cascadeRole };
+            }),
+            links: linkRows.map(row => {
+                const { _id, portalNode, bridgeNode, status, ...fields } = plain(row);
+                delete fields.__v; delete fields.createdAt; delete fields.updatedAt;
+                return { ...fields, id: String(_id), source: String(portalNode), target: String(bridgeNode) };
+            }),
+            groups: [], // Only settled policies may be preserved by a link apply.
+        });
+        const catalog = await withSession(this.TopologyConfigOwner.find({}), session).lean();
+        const resources = new Set([String(target.portalNode), String(target.bridgeNode)]);
+        // Endpoint edits must also clean the OLD applied profiles. Discover the
+        // old selected link only through existing owner settlement pointers;
+        // the loop below verifies every discovered owner/component in full.
+        const pointers = [...new Set(catalog.map(row => row.lastSettledOperation).filter(Boolean))];
+        if (pointers.length) {
+            const prior = await withSession(this.TopologyOperation.find({ _id: { $in: pointers },
+                'effectiveTopology.links.id': scope.linkId }).select(SELECTED_FIELDS), session).lean();
+            for (const source of prior) {
+                const old = source.effectiveTopology.links.find(link => link.id === scope.linkId);
+                resources.add(old.source); resources.add(old.target);
+            }
+        }
+        const baseline = { nodes: [], links: [], groups: [] };
+        const visited = new Set();
+        const owners = new Map();
+        const add = topology => {
+            for (const kind of ['nodes', 'links', 'groups']) for (const value of topology[kind]) {
+                const key = kind === 'groups' ? '_id' : 'id';
+                const existing = baseline[kind].find(row => row[key] === value[key]);
+                if (existing && !same(existing, value)) throw selectedError();
+                if (!existing) baseline[kind].push(value);
+            }
+            topology.nodes.forEach(node => resources.add(node.id));
+        };
+        while ([...resources].some(node => !visited.has(node))) {
+            const node = [...resources].find(id => !visited.has(id));
+            visited.add(node);
+            const metadata = desiredTopology.nodes.find(row => row.id === node);
+            if (!metadata) throw selectedError('TOPOLOGY_SELECTED_NODE_CHANGED');
+            const profile = metadata.role === 'portal' ? 'xray-main' : 'xray-bridge';
+            const matches = catalog.filter(row => String(row.node) === node && row.profile === profile);
+            const owner = matches[0];
+            if (matches.length !== 1 || owner.owner !== 'topology'
+                || !matchesTopologyExecutionContext(owner.executionContext, executionContext)
+                || !/^[a-f0-9]{32}$/.test(owner.nodeIdentity?.machineId)
+                || !/^[a-f0-9]{64}$/.test(owner.nodeIdentity?.sshHostKeySha256)
+                || !UUID.test(owner.generation) || !owner.originalSnapshot || owner.adoptionReceipt?.toGeneration !== owner.generation
+                || !UUID.test(owner.adoptionReceipt?.proofId) || !UUID.test(owner.adoptionReceipt?.maintenanceId)
+                || !Number.isFinite(new Date(owner.adoptionReceipt?.verifiedAt).getTime())
+                || owner.handbackReceipt !== undefined) throw selectedError('TOPOLOGY_CONFIG_OWNER_REQUIRED');
+            // A physical alias cannot receive a separate admission slot. Until
+            // multi-ID profile composition is supported, refuse that alias rather
+            // than locking just one mutable node name and racing another writer.
+            if (catalog.some(other => String(other.node) !== node
+                && (other.nodeIdentity?.machineId === owner.nodeIdentity.machineId
+                    || other.nodeIdentity?.sshHostKeySha256 === owner.nodeIdentity.sshHostKeySha256))) {
+                throw selectedError('TOPOLOGY_PHYSICAL_NODE_ALIAS');
+            }
+            owners.set(node, owner);
+            if (owner.lastSettledOperation === undefined) {
+                if (!EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)
+                    || owner.lastSettledGeneration !== undefined || owner.lastSettledRevision !== undefined
+                    || owner.lastSettledCloseId !== undefined) throw selectedError();
+                // The adopted original {} proves an empty managed graph, not a
+                // fictitious terminal operation. Retain the real owner pin below.
+                continue;
+            }
+            const operation = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation)
+                .select(SELECTED_FIELDS), session).lean();
+            if (!operation || operation.status !== 'succeeded' || operation.heldTopologyAdmission !== false
+                || operation.admissionScope !== 'selected'
+                || !matchesTopologyExecutionContext(operation.executionContext, executionContext)
+                || owner.lastSettledRevision !== operation.topologyRevision
+                || operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)
+                || !operation.selectedOwnerPins?.some(pin => pin.node === node && pin.profile === profile
+                    && pin.generation === owner.generation && same(pin.nodeIdentity, plain(owner.nodeIdentity))
+                    && same(pin.originalSnapshot, plain(owner.originalSnapshot))
+                    && same(pin.adoptionReceipt, plain(owner.adoptionReceipt)))) throw selectedError();
+            const entry = operation.nodes?.find(item => String(item.node) === node && item.targetProfile === profile);
+            if (!entry || entry.state !== 'committed' || !owner.lastSettledGeneration) throw selectedError();
+            if (operation.v2Terminal) {
+                const binding = operation.v2Terminal.bindings?.find(item => item.nodeId === node);
+                const proof = operation.v2Terminal.proofs?.find(item => item.commandId === owner.lastSettledCloseId);
+                if (operation.v2Terminal.state !== 'proven' || !binding
+                    || binding.generation !== owner.lastSettledGeneration
+                    || binding.commandIds?.close !== owner.lastSettledCloseId
+                    || !validTerminalReceipt(proof, binding) || proof.terminalOutcome !== 'verified') throw selectedError();
+            } else if (executionContext.target !== 'test') throw selectedError();
+            add(componentAt(durableSelectedTopology(operation.effectiveTopology), node));
+        }
+        for (const kind of ['nodes', 'links', 'groups']) baseline[kind].sort((a, b) =>
+            String(a.id ?? a._id).localeCompare(String(b.id ?? b._id), 'en'));
+        // Every node in a published component must still point to the same
+        // snapshot. A stale partial pointer is not a source of old descriptors.
+        for (const node of baseline.nodes) {
+            const owner = owners.get(node.id);
+            const source = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation).select(SELECTED_FIELDS), session).lean();
+            const component = componentAt(durableSelectedTopology(source.effectiveTopology), node.id);
+            if (component.nodes.some(member => owners.get(member.id)?.lastSettledOperation !== owner.lastSettledOperation)) throw selectedError();
+        }
+        const selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
+            verifiedBaselineTopology: baseline, desiredTopology, scope,
+        });
+        if ((snapshot?.installedRouteOwners || []).some(owner => selected.resourceNodeIds.includes(String(owner.nodeId))
+            && !selected.effectiveTopology.groups.some(group => group._id === String(owner.groupId)))) {
+            // An installed empty group needs the separate ingress/readback and
+            // owned-path publication handoff, not merely a successful Xray write.
+            throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+        }
+        return { ...selected, desiredVersion: version,
+            selectedOwnerPins: [...owners.values()].filter(owner => selected.resourceNodeIds.includes(String(owner.node))).sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin) };
+    }
+
+    async isSelectedCurrent(operation) {
+        if (!Array.isArray(operation.selectedOwnerPins) || !operation.selectedOwnerPins.length) return false;
+        for (const pin of operation.selectedOwnerPins) {
+            const owner = await this.TopologyConfigOwner.findOne({ node: pin.node, profile: pin.profile }).lean();
+            if (!owner || owner.lastSettledOperation !== String(operation._id) || owner.owner !== 'topology'
+                || owner.generation !== pin.generation || !same(plain(owner.nodeIdentity), pin.nodeIdentity)) return false;
+        }
+        const link = await this.snapshotReader.CascadeLink.findById(operation.linkId).lean();
+        return Boolean(link && linkDesiredVersion(link) === operation.desiredVersion);
+    }
+
+    async verifySelected(operation, session) {
+        if (operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)) throw selectedError('TOPOLOGY_SELECTED_FINGERPRINT_CHANGED');
+        const fresh = await this.readSelected({ snapshot: await this.snapshotReader.readDraft(session),
+            scope: { kind: 'link.apply', linkId: operation.linkId }, executionContext: operation.executionContext,
+            desiredVersion: operation.desiredVersion, session });
+        for (const key of ['baselineTopology', 'effectiveTopology', 'resourceNodeIds', 'selectedOwnerPins', 'desiredVersion']) {
+            if (!same(fresh[key], operation[key])) throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED');
+        }
+        return fresh;
+    }
+
+    async assertSelectedAvailable(resourceNodeIds, session, exceptOperationId, { desiredOnly = false } = {}) {
+        const state = await withSession(this.CascadeTopologyState.findById('singleton'), session).lean();
+        const held = await withSession(this.TopologyOperation.find({ heldTopologyAdmission: true }).select(SELECTED_FIELDS), session).lean();
+        if (!Number.isSafeInteger(state?.topologyAdmissionCount) || state.topologyAdmissionCount !== held.length
+            || !Number.isSafeInteger(state.remoteAdmissionCount) || state.remoteAdmissionCount < 0
+            || state.remoteDrain || state.replacementReservation
+            || held.some(row => row.admissionScope !== 'selected' || !Array.isArray(row.resourceNodeIds) || !row.resourceNodeIds.length)) throw selectedError('TOPOLOGY_ADMISSION_UNAVAILABLE');
+        if (!desiredOnly && held.some(row => String(row._id) !== exceptOperationId
+            && row.resourceNodeIds?.some(node => resourceNodeIds.includes(node)))) throw selectedError('TOPOLOGY_ADMISSION_UNAVAILABLE');
+        if (state.remoteAdmissionCount > 0) {
+            if (!this.RemoteAdmission || this.RemoteAdmission.db !== this.db) throw selectedError('TOPOLOGY_ADMISSION_UNAVAILABLE');
+            const remote = await withSession(this.RemoteAdmission.find({ phase: { $in: ['running', 'queued', 'recovery_required'] } }), session).lean();
+            if (remote.length !== state.remoteAdmissionCount || remote.some(row => typeof row.nodeId !== 'string' || !row.nodeId || resourceNodeIds.includes(row.nodeId))) throw selectedError('TOPOLOGY_ADMISSION_UNAVAILABLE');
+        }
+        if (this.NodeOperationLock && await withSession(this.NodeOperationLock.exists({ node: { $in: resourceNodeIds },
+            ...(desiredOnly ? { operationId: { $nin: held.map(row => String(row._id)) } }
+                : exceptOperationId ? { operationId: { $ne: exceptOperationId } } : {}) }), session)) throw selectedError('NODE_OPERATION_LOCK_CONFLICT');
+        return { topologyAdmissionCount: state.topologyAdmissionCount, remoteAdmissionCount: state.remoteAdmissionCount };
     }
 
     // Admission is separate from the legacy pin API: a caller cannot accidentally
     // acknowledge a pin without committing its frozen operation in the same tx.
-    async admitTopology({ expectedRevision, prepare, admit }) {
+    async admitTopology({ expectedRevision, prepare, admit, session: joinedSession }) {
         if (typeof prepare !== 'function' || typeof admit !== 'function') {
             throw new TypeError('Topology admission requires prepare and admit callbacks');
         }
         const connection = this.CascadeTopologyState.db;
         const participatingModels = [this.TopologyOperation,
+            ...(this.selectedEnabled ? [this.TopologyConfigOwner, this.NodeOperationLock] : []),
             this.snapshotReader.HyNode, this.snapshotReader.CascadeLink,
             this.snapshotReader.CascadeRouteGroup, this.snapshotReader.RelayL2tpState];
         if (this.usesDefaultRunner && (!connection
@@ -70,9 +288,11 @@ class TopologyDeploymentRepository {
         if (connection && participatingModels.some(model => model?.db !== connection)) {
             throw new TypeError('Topology admission requires models on one transactional connection');
         }
-        return this.transactionRunner(async session => {
+        const run = joinedSession ? work => work(joinedSession) : this.transactionRunner;
+        return run(async session => {
             if (!session || typeof session.inTransaction !== 'function'
-                || session.inTransaction() !== true) {
+                || session.inTransaction() !== true
+                || (typeof connection?.getClient === 'function' && session.client !== connection.getClient())) {
                 throw new TypeError('Topology admission requires an active Mongo transaction');
             }
             const snapshot = await this.snapshotReader.readDraft(session);
@@ -86,6 +306,8 @@ class TopologyDeploymentRepository {
                 );
             }
             const prepared = await prepare(snapshot, session);
+            const selectedCount = prepared.admissionScope === 'selected'
+                ? await this.assertSelectedAvailable(prepared.resourceNodeIds, session) : { topologyAdmissionCount: 0, remoteAdmissionCount: 0 };
             // Never upsert or infer that either missing legacy counter is zero.
             // This shared singleton write conflicts with remote admission, drain
             // and replacement acquisition; only explicitly quiescent state admits.
@@ -95,8 +317,8 @@ class TopologyDeploymentRepository {
                     revision: expectedRevision,
                     replacementReservation: { $exists: false },
                     remoteDrain: { $exists: false },
-                    remoteAdmissionCount: 0,
-                    topologyAdmissionCount: 0,
+                    remoteAdmissionCount: selectedCount.remoteAdmissionCount,
+                    topologyAdmissionCount: selectedCount.topologyAdmissionCount,
                 },
                 { $inc: { topologyAdmissionCount: 1 } },
                 { new: true, runValidators: true, session, timestamps: false, upsert: false },

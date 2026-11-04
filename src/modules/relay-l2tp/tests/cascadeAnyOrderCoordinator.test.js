@@ -210,7 +210,7 @@ test('effective selector reports missing portal/exit honestly and never fabricat
     }
 });
 
-test('selected admission remains dormant in both worker claims and client-proof scheduling', async () => {
+test('selected worker claims are enabled while unintegrated selected client-proof scheduling stays disabled', async () => {
     const claims = [];
     const repository = new TopologyOperationRepository({ model: {
         create() {}, updateOne() {},
@@ -220,7 +220,8 @@ test('selected admission remains dormant in both worker claims and client-proof 
         now: new Date('2026-01-01T00:00:00Z'), executionContext: context });
     await repository.claimNextClientProof({ owner: 'local-proof', now: new Date('2026-01-01T00:00:00Z'), executionContext: context });
     assert.equal(claims.length, 3);
-    for (const filter of claims) assert.deepEqual(filter.admissionScope, { $exists: false });
+    for (const filter of claims.slice(0, 2)) assert.deepEqual(filter.admissionScope, { $in: [null, 'selected'] });
+    assert.deepEqual(claims[2].admissionScope, { $exists: false });
 });
 
 test('selected snapshot writes reject partial identities, missing endpoints and narrowed resource unions before insert', async () => {

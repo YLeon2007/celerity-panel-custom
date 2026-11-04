@@ -211,11 +211,16 @@ function createTopologyOperationRuntime(dependencies = {}) {
             snapshotReader,
             CascadeTopologyState,
             TopologyOperation,
+            TopologyConfigOwner: dependencies.TopologyConfigOwner, NodeOperationLock: dependencies.NodeOperationLock,
+            RemoteAdmission: dependencies.RemoteAdmission,
             ...optional(transactionRunner, 'transactionRunner'),
         });
+        snapshotReader.selectedTopologyRepository = topologyRepository;
         const planMaterializer = new PlanMaterializer({ HyNode, CascadeLink });
-        const operationRepository = new OperationRepository({ model: TopologyOperation });
+        const operationRepository = new OperationRepository({ model: TopologyOperation, topologyStateModel: CascadeTopologyState,
+            selectedTopologyRepository: topologyRepository });
         const finalizationRepository = new FinalizationRepository({
+            selectedTopologyRepository: topologyRepository,
             TopologyOperation,
             CascadeTopologyState,
             CascadeLink,
@@ -300,6 +305,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             }),
         });
         const operationWorker = new OperationWorker({
+            selectedTopologyRepository: topologyRepository,
             executionContext,
             operationRepository,
             executor,
@@ -328,6 +334,9 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(idFactory, 'idFactory'),
             ...optional(onWorkerError, 'onWorkerError'),
         });
+        coordinator.intentOperationAdmission = Object.freeze({ db: CascadeTopologyState.db, queue: input => coordinator.queueIntent(input) });
+        coordinator.resolveIntentResources = input => coordinator.resolveIntentResourcesForQueue(input);
+        coordinator.intentDraftWriter = snapshotReader.createIntentDraftWriter?.({ selectedTopologyRepository: topologyRepository });
         // Internal explicit command only; no HTTP/MCP or automatic startup call.
         coordinator.enrollTestOwners = () => require('../../../../scripts/test-topology-owner').enrollTestOwners({
             env: ownerEnrollmentEnv, lifecycle: bindingLifecycle, store: bindingStore,

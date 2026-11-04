@@ -59,7 +59,7 @@ function operationFilter(request) {
 }
 async function checked(repository, request, session, bindings) {
     models(repository);
-    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).session(session).setOptions(OPTIONS).lean();
+    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select('+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion').session(session).setOptions(OPTIONS).lean();
     const context = operation?.executionContext;
     if (!operation || !matchesTopologyOperationClaimBinding(operation, topologyExecutionContext(context?.target, context?.hostIdentity))
         || operation.status !== 'committing' || operation.heldTopologyAdmission !== true
@@ -70,7 +70,11 @@ async function checked(repository, request, session, bindings) {
         || !Array.isArray(bindings) || bindings.length !== operation.nodes?.length || !bindings.length
         || new Set(bindings.map(binding => binding.nodeId)).size !== bindings.length) refused();
     const topology = await repository.CascadeTopologyState.findById('singleton').session(session).setOptions(OPTIONS).lean();
-    if (topology?.revision !== request.topologyRevision || topology.deployedRevision !== request.priorDeployedRevision
+    if (operation.admissionScope === 'selected') {
+        if (!repository.selectedTopologyRepository || topology?.topologyAdmissionCount < 1
+            || topology.replacementReservation !== undefined) refused();
+        await repository.selectedTopologyRepository.verifySelected(operation, session);
+    } else if (topology?.revision !== request.topologyRevision || topology.deployedRevision !== request.priorDeployedRevision
         || topology.topologyAdmissionCount !== 1 || topology.replacementReservation !== undefined) refused();
     const rows = [];
     let deadline = operation.leaseUntil.getTime();
@@ -214,13 +218,14 @@ async function settle(repository, request, publish) {
         if (!session.inTransaction() || !DEADLINES.has(session) || typeof publish !== 'function') refused();
         const finalized = await publish(session);
         if (!finalized) refused();
-        return { ...finalized, terminal };
+        return { ...finalized, terminal, selected: operation.admissionScope === 'selected' };
     }, async result => {
         const operation = await majority(repository.TopologyOperation, { _id: request.operationId });
         const topology = await majority(repository.CascadeTopologyState, { _id: 'singleton' });
         if (operation?.status !== 'succeeded' || operation.heldTopologyAdmission !== false
-            || !same(operation.v2Terminal, result.terminal) || topology?.topologyAdmissionCount !== 0
-            || topology.deployedRevision !== result.deployedRevision) refused();
+            || !same(operation.v2Terminal, result.terminal)
+            || !Number.isSafeInteger(topology?.topologyAdmissionCount) || topology.topologyAdmissionCount < 0
+            || (!result.selected && (topology?.topologyAdmissionCount !== 0 || topology.deployedRevision !== result.deployedRevision))) refused();
         for (const binding of result.terminal.bindings) {
             if (await majority(repository.NodeOperationLock, { node: binding.nodeId, generation: binding.generation })) refused();
             const owner = await majority(repository.TopologyConfigOwner, { node: binding.nodeId, profile: binding.targetProfile });

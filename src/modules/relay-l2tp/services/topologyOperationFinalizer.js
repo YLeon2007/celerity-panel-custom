@@ -81,6 +81,11 @@ class TopologyOperationFinalizer {
         this.clock = clock;
     }
 
+    async rejectUndispatchedSelected(input) {
+        assertFinalizationInput(input);
+        return this.repository.rejectUndispatchedSelected({ ...input, now: this.clock.now() });
+    }
+
     async finalizeRolledBack(input) {
         const expectedKeys = ['operationId', 'priorDeployedRevision', 'topologyRevision'];
         if (!hasExactKeys(input, expectedKeys.sort())

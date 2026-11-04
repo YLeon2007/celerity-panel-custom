@@ -57,6 +57,8 @@ const CLAIM_PROJECTION = Object.freeze({
     leaseUntil: 1,
     heldTopologyAdmission: 1,
     pppWait: 1,
+    admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
+    desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1,
     'nodes.node': 1,
     'nodes.nodeRef': 1,
     'nodes.role': 1,
@@ -200,8 +202,20 @@ function durableSelectedOperationScope({ admissionScope, resourceNodeIds, baseli
         baselineTopology: baseline, effectiveTopology: effective };
 }
 
+function selectedAdmissionFingerprint(operation) {
+    const canonical = value => Array.isArray(value) ? value.map(canonical)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+    const metadata = operation.nodes.map(node => ({ ...node, node: operationId(node.node), ...TARGET_BY_ROLE[node.role] })).map(durableNodeMetadata);
+    const fields = ['executionContext', 'idempotencyKey', 'topologyRevision', 'priorDeployedRevision', 'kind',
+        'linkId', 'linkIds', 'staged', 'admissionScope', 'resourceNodeIds', 'baselineTopology', 'effectiveTopology',
+        'selectedOwnerPins', 'desiredVersion', 'routeState'];
+    const value = { operationId: String(operation.operationId ?? operation._id), nodes: metadata,
+        ...Object.fromEntries(fields.filter(key => operation[key] !== undefined).map(key => [key, operation[key]])) };
+    return require('node:crypto').createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+}
+
 class TopologyOperationRepository {
-    constructor({ model, topologyStateModel } = {}) {
+    constructor({ model, topologyStateModel, selectedTopologyRepository } = {}) {
         if (!model || typeof model.create !== 'function'
             || typeof model.findOneAndUpdate !== 'function'
             || typeof model.updateOne !== 'function') {
@@ -209,6 +223,7 @@ class TopologyOperationRepository {
         }
         this.model = model;
         this.topologyStateModel = topologyStateModel;
+        this.selectedTopologyRepository = selectedTopologyRepository;
     }
 
     async createFrozen({
@@ -236,6 +251,7 @@ class TopologyOperationRepository {
         resourceNodeIds,
         baselineTopology,
         effectiveTopology,
+        desiredVersion, selectedOwnerPins, routeState,
         session,
     }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -260,7 +276,7 @@ class TopologyOperationRepository {
                     typeof ({ oldLinkId, groupId, pathKey, ownerNodeId })[key] === 'string'
                     && ({ oldLinkId, groupId, pathKey, ownerNodeId })[key].length > 0)
                     || oldLinkId === linkId || linkIds.includes(oldLinkId)
-                    || !Array.isArray(oldPathLinkIds) || oldPathLinkIds.length < 2
+                    || !Array.isArray(oldPathLinkIds) || oldPathLinkIds.length < 1
                     || oldPathLinkIds.at(-1) !== oldLinkId
                     || new Set(oldPathLinkIds).size !== oldPathLinkIds.length
                 : kind === 'link.attach'
@@ -270,8 +286,8 @@ class TopologyOperationRepository {
                         || typeof ownerNodeId !== 'string' || ownerNodeId.length === 0
                         || !Number.isSafeInteger(ownerTopologyRevision) || ownerTopologyRevision < 0
                         || !Number.isSafeInteger(ownerCredentialRevision) || ownerCredentialRevision < 0
-                        || !Array.isArray(newPathLinkIds) || newPathLinkIds.length < 2
-                        || newPathLinkIds.length >= linkIds.length
+                        || !Array.isArray(newPathLinkIds) || newPathLinkIds.length < 1
+                        || newPathLinkIds.length > linkIds.length
                         || newPathLinkIds.at(-1) !== linkId
                         || new Set(newPathLinkIds).size !== newPathLinkIds.length
                         || !newPathLinkIds.every(id => linkIds.includes(id))
@@ -299,6 +315,7 @@ class TopologyOperationRepository {
             topologyRevision,
             priorDeployedRevision,
             ...selected,
+            ...(admissionScope === 'selected' ? { desiredVersion, selectedOwnerPins, routeState } : {}),
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
                 ...(kind === 'link.apply' ? { staged } : {}),
                 ...(kind === 'link.replace' ? { oldLinkId, groupId, pathKey,
@@ -346,7 +363,7 @@ class TopologyOperationRepository {
 
     async findPublicById(operationId) {
         const operation = await this.model.findById(operationId)
-            .select('status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason')
+            .select('status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion')
             .lean();
         if (!operation) return null;
         const verified = operation.status === 'succeeded'
@@ -368,6 +385,9 @@ class TopologyOperationRepository {
     }
 
     async isLiveRevision(operation) {
+        if (operation.admissionScope === 'selected') {
+            try { return await this.selectedTopologyRepository?.isSelectedCurrent(operation) === true; } catch { return false; }
+        }
         if (!Number.isSafeInteger(operation?.topologyRevision) || !this.topologyStateModel?.findById) return false;
         try {
             const live = await this.topologyStateModel.findById('singleton')
@@ -488,7 +508,7 @@ class TopologyOperationRepository {
         const claimed = await this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
-            admissionScope: { $exists: false },
+            admissionScope: { $in: [null, 'selected'] },
             v2Terminal: { $exists: false },
             $or: [
                 { status: 'queued' },
@@ -520,7 +540,7 @@ class TopologyOperationRepository {
         return this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
-            admissionScope: { $exists: false },
+            admissionScope: { $in: [null, 'selected'] },
             v2Terminal: { $exists: false },
             status: { $in: [...ACTIVE_STATUSES] },
             leaseUntil: { $lte: now },
@@ -531,6 +551,13 @@ class TopologyOperationRepository {
             },
             $inc: { attempts: 1 },
         }, options);
+    }
+
+    async waitForSelectedResources({ operationId: id, owner, now }) {
+        const result = await this.model.updateOne({ _id: id, admissionScope: 'selected', status: 'preparing',
+            leaseOwner: owner, leaseUntil: { $gt: now } }, { $set: { status: 'queued', leaseOwner: '', leaseUntil: null },
+            $inc: { attempts: -1 } }, { runValidators: true });
+        return result.matchedCount === 1;
     }
 
     async beginPppWait({ operationId: id, owner, now, relayNode, credentialRevision, locks }) {
@@ -662,4 +689,5 @@ module.exports = {
     TopologyOperationRepository,
     durableSelectedTopology,
     durableSelectedOperationScope,
+    selectedAdmissionFingerprint,
 };

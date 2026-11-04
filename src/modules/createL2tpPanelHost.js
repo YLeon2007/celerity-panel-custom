@@ -200,6 +200,7 @@ function createL2tpPanelHost({
             CascadeTopologyState: models.CascadeTopologyState,
             RelayL2tpState: models.RelayL2tpState,
             TopologyOperation: models.TopologyOperation,
+            RemoteAdmission: models.RemoteAdmission,
             L2tpUser: models.L2tpUser,
             L2tpOperation: models.L2tpOperation,
             NodeOperationLock: models.NodeOperationLock,
@@ -251,6 +252,11 @@ function createL2tpPanelHost({
                 HyNode: injectedHyNode,
                 CascadeLink: injectedCascadeLink,
                 clock,
+                intentOperationAdmission: topologyDeploymentService.intentOperationAdmission,
+                intentDraftWriter: topologyDeploymentService.intentDraftWriter,
+                resolveIntentResources: topologyDeploymentService.resolveIntentResources,
+                ...(typeof injectedCascadeLink.createDeleteIntentWriter === 'function'
+                    ? { deleteIntentWriter: injectedCascadeLink.createDeleteIntentWriter({ CascadeLink: injectedCascadeLink }) } : {}),
                 prepareIngress: input => executionRuntime.runtime.simpleService.prepareConfiguredRelayIngress(input),
             });
         }

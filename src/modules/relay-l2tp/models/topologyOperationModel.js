@@ -159,12 +159,15 @@ const topologyOperationSchema = new mongoose.Schema({
     // Remains held through failure/rollback until a proven-safe transactional release.
     heldTopologyAdmission: { type: Boolean },
     admissionFingerprint: { type: String, match: DIGEST_PATTERN },
-    // Dormant selected protocol: no read-time defaults or legacy adoption.
+    // Selected protocol fields have no read-time defaults or legacy adoption.
     // These contain private configuration descriptors, not public status data.
     admissionScope: { type: String, enum: ['selected'], immutable: true, select: false },
     resourceNodeIds: { type: [String], default: undefined, immutable: true, select: false },
     baselineTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     effectiveTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
+    desiredVersion: { type: String, match: DIGEST_PATTERN, immutable: true, select: false },
+    selectedOwnerPins: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
+    routeState: { type: String, immutable: true, enum: ['complete', 'no_portal_input', 'no_bridge_exit', 'policy_ambiguous'] },
     // Committing but unpublished; topology admission stays held during PPP sync.
     pppWait: { type: pppWaitSchema, default: undefined },
     status: {
@@ -227,8 +230,8 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
                 || this.pathKey !== 'main'
                 || typeof this.ownerNodeId !== 'string' || !this.ownerNodeId
                 || !Array.isArray(this.newPathLinkIds)
-                || this.newPathLinkIds.length < 2
-                || this.newPathLinkIds.length >= ids.length
+                || this.newPathLinkIds.length < 1
+                || this.newPathLinkIds.length > ids.length
                 || new Set(this.newPathLinkIds).size !== this.newPathLinkIds.length
                 || this.newPathLinkIds.at(-1) !== this.linkId
                 || !this.newPathLinkIds.every(id => ids.includes(id))
@@ -244,7 +247,7 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
                 || ids.includes(this.oldLinkId) || typeof this.groupId !== 'string'
                 || typeof this.pathKey !== 'string' || !this.pathKey
                 || typeof this.ownerNodeId !== 'string' || !this.ownerNodeId
-                || !Array.isArray(this.oldPathLinkIds) || this.oldPathLinkIds.length < 2
+                || !Array.isArray(this.oldPathLinkIds) || this.oldPathLinkIds.length < 1
                 || this.oldPathLinkIds.at(-1) !== this.oldLinkId
                 || new Set(this.oldPathLinkIds).size !== this.oldPathLinkIds.length
             : this.kind === 'link.attach' ? false

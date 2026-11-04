@@ -358,7 +358,7 @@ class RemoteAdmissionRepository {
                 const gate = await this.CascadeTopologyState.updateOne({
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
-                    topologyAdmissionCount: 0,
+                    topologyAdmissionCount: await this.selectedTopologyCountForNode(String(candidate.node), session),
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) return null;
@@ -387,6 +387,31 @@ class RemoteAdmissionRepository {
             if (error && typeof error === 'object') error.admissionId = admissionId;
             throw error;
         }
+    }
+
+    async selectedTopologyCountForNode(nodeId, session) {
+        // Reuse the registered same-connection operation/owner stores. Do not
+        // create a second coordination model or infer missing counters as zero.
+        const connection = this.CascadeTopologyState.db;
+        const Operation = connection?.models?.TopologyOperation;
+        const Owner = connection?.models?.TopologyConfigOwner;
+        if (!Operation || !Owner || Operation.db !== connection || Owner.db !== connection) return 0;
+        const state = await this.CascadeTopologyState.findOne({ _id: 'singleton' }).session(session).lean();
+        const count = state?.topologyAdmissionCount;
+        if (!Number.isSafeInteger(count) || count < 1) return 0;
+        const held = await Operation.find({ heldTopologyAdmission: true })
+            .select('+admissionScope +resourceNodeIds +selectedOwnerPins').session(session).lean();
+        if (held.length !== count || held.some(row => row.admissionScope !== 'selected'
+            || !Array.isArray(row.resourceNodeIds) || !row.resourceNodeIds.length
+            || row.resourceNodeIds.includes(String(nodeId)))) return 0;
+        const owners = await Owner.find({ node: nodeId }).session(session).lean();
+        const identity = owners[0]?.nodeIdentity;
+        if (!identity?.machineId || !identity?.sshHostKeySha256 || owners.some(owner =>
+            owner.nodeIdentity?.machineId !== identity.machineId || owner.nodeIdentity?.sshHostKeySha256 !== identity.sshHostKeySha256)) return 0;
+        if (held.some(row => !Array.isArray(row.selectedOwnerPins) || row.selectedOwnerPins.some(pin =>
+            pin.nodeIdentity?.machineId === identity.machineId
+            || pin.nodeIdentity?.sshHostKeySha256 === identity.sshHostKeySha256))) return 0;
+        return count;
     }
 
     async acquireInstall({ nodeId } = {}) {
@@ -418,7 +443,7 @@ class RemoteAdmissionRepository {
                     replacementReservation: { $exists: false },
                     // An active topology operation owns deployment, even before
                     // its worker has inserted the exact relay node lock.
-                    topologyAdmissionCount: 0,
+                    topologyAdmissionCount: await this.selectedTopologyCountForNode(String(nodeId), session),
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_BLOCKED');
@@ -455,7 +480,7 @@ class RemoteAdmissionRepository {
                     _id: 'singleton', remoteDrain: { $exists: false },
                     replacementReservation: { $exists: false },
                     // Share install/sync exclusion; never adopt a missing legacy counter.
-                    topologyAdmissionCount: 0,
+                    topologyAdmissionCount: await this.selectedTopologyCountForNode(String(nodeId), session),
                     remoteAdmissionCount: { $gte: 0 },
                 }, { $inc: { remoteAdmissionCount: 1 } }, { session });
                 if (gate.matchedCount !== 1) throw admissionError('REMOTE_ADMISSION_BLOCKED');

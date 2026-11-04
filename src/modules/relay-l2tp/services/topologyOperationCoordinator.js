@@ -11,10 +11,11 @@ const { validateTopology } = require('../domain/topologyValidator');
 const { computeTopologyDomains } = require('../domain/topologyDomains');
 const { deriveReplacementTopology, deriveAttachTopology } = require('../domain/topologyReplacement');
 const { validNodeRef } = require('./topologyNodeRef');
-const { durableSelectedTopology } = require('../repositories/topologyOperationRepository');
+const { durableSelectedTopology, selectedAdmissionFingerprint } = require('../repositories/topologyOperationRepository');
 const {
     TEST_TOPOLOGY_EXECUTION_CONTEXT,
     matchesTopologyOperationExecutionContext,
+    matchesTopologyExecutionContext,
     topologyExecutionContext,
 } = require('../domain/topologyExecutionContext');
 
@@ -212,10 +213,10 @@ function projectTopology(snapshot) {
     };
 }
 
-// Dormant selected-applied seam. Its caller must have verified every baseline
+// Selected-applied seam. Its caller must have verified every baseline
 // descriptor against the exact settled owner pointers in the same admission
 // snapshot. An absent/legacy baseline is not permission to hydrate desired.
-// Do not wire this into queue() until admission, worker and settlement agree.
+// Admission, claim, worker revalidation and settlement all consume these pins.
 function selectEffectiveTopology({ verifiedBaselineTopology, desiredTopology, scope } = {}) {
     if (verifiedBaselineTopology === undefined) {
         throw new TopologyOperationCoordinatorError('APPLIED_BASELINE_REQUIRED',
@@ -675,11 +676,36 @@ class TopologyOperationCoordinator {
         }
     }
 
+    // Transaction-aware v2 intent seam. No worker starts until its caller's
+    // outer intent+operation transaction commits; recovery performs handoff.
+    get db() { return this.topologyRepository.db; }
+
+    async resolveIntentResourcesForQueue({ kind, link, desiredVersion, session }) {
+        if (!['link.create', 'link.apply'].includes(kind)) {
+            throw new TopologyOperationCoordinatorError('TOPOLOGY_DELETE_PLAN_UNAVAILABLE', 'Selected delete settlement and row cleanup are not integrated');
+        }
+        const selected = await this.topologyRepository.readSelected({
+            snapshot: await this.topologyRepository.snapshotReader.readDraft(session),
+            scope: { kind: 'link.apply', linkId: String(link._id) }, desiredVersion, session, executionContext: this.#executionContext,
+        });
+        return selected.resourceNodeIds;
+    }
+
+    async queueIntent({ session, executionContext, intentId, mutation, expectedTopologyRevision, resourceNodeIds }) {
+        if (!session?.inTransaction?.() || !matchesTopologyExecutionContext(executionContext, this.#executionContext)
+            || mutation?.kind !== 'link.apply') {
+            throw new TopologyOperationCoordinatorError('TOPOLOGY_INTENT_ADMISSION_UNAVAILABLE', 'Selected apply transaction required');
+        }
+        return this.queueOnce({ expectedTopologyRevision, scope: { kind: 'link.apply', linkId: mutation.linkId, linkIds: [mutation.linkId] },
+            desiredVersion: mutation.desiredVersion, resourceNodeIds, session,
+            idempotencyKey: `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:link.apply:${mutation.linkId}` });
+    }
+
     deploy(input) {
         return this.queue(input);
     }
 
-    async queueOnce({ expectedTopologyRevision, scope, idempotencyKey }) {
+    async queueOnce({ expectedTopologyRevision, scope, idempotencyKey, session: joinedSession, desiredVersion, resourceNodeIds }) {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
         const runIdempotencyKey = `${idempotencyKey}:host-${this.#executionContext.hostIdentity}:${randomUUID()}`;
@@ -692,12 +718,14 @@ class TopologyOperationCoordinator {
         }
         let pinned;
         let scopedIdentity;
+        let selectedIdentity = {};
         let admissionFingerprint;
         let admittedPriorDeployedRevision;
         let effectiveRunIdempotencyKey = runIdempotencyKey;
         try {
             pinned = await this.topologyRepository.admitTopology({
                 expectedRevision: expectedTopologyRevision,
+                ...(joinedSession ? { session: joinedSession } : {}),
                 prepare: async (snapshot, session) => {
                     // Legacy full-sync finalization marks every active link
                     // deployed. Never let it silently claim an unrelated
@@ -716,6 +744,9 @@ class TopologyOperationCoordinator {
                             );
                         }
                     }
+                    const selected = scope?.kind === 'link.apply' && this.topologyRepository.selectedEnabled
+                        ? await this.topologyRepository.readSelected({ snapshot, scope,
+                            executionContext: this.#executionContext, session, desiredVersion }) : null;
                     const projected = projectTopology(snapshot);
                     // Scoped reconcile: plan only the caller-declared
                     // component (deployed links + the requested link). This
@@ -726,9 +757,11 @@ class TopologyOperationCoordinator {
                             groupId: scope.groupId, pathKey: scope.pathKey,
                             oldLinkId: scope.oldLinkId, newLinkId: scope.linkId,
                         }) : null;
-                    const scopedTopology = scope && !replacement
+                    const scopedTopology = selected ? selected.effectiveTopology : scope && !replacement
                         ? applyScopeToTopology(projected, scope, operationId, snapshot.links) : null;
-                    const attach = scopedTopology
+                    // Installed cutover remains in the explicit attach protocol; a
+                    // selected apply must not impersonate an installed owner path.
+                    const attach = !selected && scopedTopology
                         ? deriveScopedAttach(snapshot, scope, scopedTopology, operationId) : null;
                     if (attach) {
                         const attachIdentity = createHash('sha256').update(JSON.stringify({
@@ -756,6 +789,9 @@ class TopologyOperationCoordinator {
                             { operationId, causeCode: 'SCOPE_DOMAIN_AMBIGUOUS' },
                         );
                     }
+                    if (selected && resourceNodeIds && JSON.stringify(resourceNodeIds) !== JSON.stringify(selected.resourceNodeIds)) {
+                        throw new TopologyOperationCoordinatorError('TOPOLOGY_INTENT_RESOURCE_SCOPE_CHANGED', 'Selected resources changed');
+                    }
                     const validation = this.validator(topology);
                     if (validation?.valid !== true) {
                         throw new TopologyOperationCoordinatorError(
@@ -775,6 +811,7 @@ class TopologyOperationCoordinator {
                     const frozenPlan = await this.planMaterializer.materialize({
                         ...this.#executionContext,
                         operationKind: attach ? 'link.attach' : scope?.kind,
+                        ...(selected ? { baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology } : {}),
                         session,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,
@@ -782,7 +819,12 @@ class TopologyOperationCoordinator {
                             compiled,
                         }),
                     });
+                    if (selected && (frozenPlan.nodes.length !== selected.resourceNodeIds.length
+                        || selected.resourceNodeIds.some(id => !frozenPlan.nodes.some(node => String(node.node) === id)))) {
+                        throw new TopologyOperationCoordinatorError('TOPOLOGY_SELECTED_CLEANUP_PLAN_REQUIRED', 'The materializer must cover the full before/after node union');
+                    }
                     return { topology, frozenPlan,
+                        ...(selected ? { ...selected, admissionScope: 'selected' } : {}),
                         ...(attach ? { attach: {
                             groupId: attach.groupId, pathKey: attach.pathKey,
                             ownerNodeId: attach.ownerNodeId,
@@ -799,12 +841,24 @@ class TopologyOperationCoordinator {
                         operationId,
                         topologyRevision: admitted.revision,
                         priorDeployedRevision: admitted.deployedRevision,
-                        topology: admitted.topology,
+                        // Binding checks include removed profiles, not just the
+                        // effective linked nodes. This union is never compiled.
+                        topology: admitted.admissionScope === 'selected' ? {
+                            nodes: admitted.resourceNodeIds.map(id => admitted.effectiveTopology.nodes.find(node => node.id === id)
+                                || admitted.baselineTopology.nodes.find(node => node.id === id)),
+                            links: [...admitted.baselineTopology.links, ...admitted.effectiveTopology.links],
+                        } : admitted.topology,
                         plan: admitted.frozenPlan,
                     });
+                    selectedIdentity = admitted.admissionScope === 'selected' ? { admissionScope: 'selected',
+                        baselineTopology: admitted.baselineTopology, effectiveTopology: admitted.effectiveTopology,
+                        resourceNodeIds: admitted.resourceNodeIds, desiredVersion: admitted.desiredVersion,
+                        selectedOwnerPins: admitted.selectedOwnerPins, routeState: admitted.routeState } : {};
                     scopedIdentity = scope
                         ? { kind: admitted.attach ? 'link.attach' : scope.kind,
-                            linkId: scope.linkId, linkIds: [...scope.linkIds],
+                            linkId: scope.linkId, linkIds: admitted.admissionScope === 'selected'
+                                ? admitted.effectiveTopology.links.map(link => link.id).sort() : [...scope.linkIds],
+
                             ...(scope.kind === 'link.apply' && !admitted.attach
                                 ? { staged: admitted.frozenPlan.staged === true } : {}),
                             ...(scope.kind === 'link.replace' ? {
@@ -823,8 +877,13 @@ class TopologyOperationCoordinator {
                         nodes: plan.nodes,
                         executionContext: this.#executionContext,
                         idempotencyKey: effectiveRunIdempotencyKey,
-                        ...scopedIdentity,
+                        ...scopedIdentity, ...selectedIdentity,
                     })).digest('hex');
+                    if (selectedIdentity.admissionScope === 'selected') admissionFingerprint = selectedAdmissionFingerprint({
+                        operationId, executionContext: this.#executionContext, idempotencyKey: effectiveRunIdempotencyKey,
+                        topologyRevision: admitted.revision, priorDeployedRevision: admitted.deployedRevision, nodes: plan.nodes,
+                        ...scopedIdentity, ...selectedIdentity,
+                    });
                     await this.operationRepository.createFrozen({
                         executionContext: this.#executionContext,
                         operationId,
@@ -832,7 +891,7 @@ class TopologyOperationCoordinator {
                         topologyRevision: admitted.revision,
                         priorDeployedRevision: admitted.deployedRevision,
                         nodes: plan.nodes,
-                        ...scopedIdentity,
+                        ...scopedIdentity, ...selectedIdentity,
                         heldTopologyAdmission: true,
                         admissionFingerprint,
                         session,
@@ -865,7 +924,7 @@ class TopologyOperationCoordinator {
             }
             throw safeQueueError(error, operationId, expectedTopologyRevision);
         }
-        if (this.operationWorker) {
+        if (this.operationWorker && !joinedSession) {
             Promise.resolve(this.operationWorker.run(operationId)).catch(() => {
                 this.onWorkerError({ operationId });
             });

@@ -111,13 +111,12 @@ test('link.attach rejects invalid ordered suffix and unrelated component links b
     const invalid = [
         { newPathLinkIds: undefined },
         { newPathLinkIds: [] },
-        { newPathLinkIds: [ATTACH_IDS.bridge] },
         { newPathLinkIds: [ATTACH_IDS.bridge, ATTACH_IDS.relay] },
         { newPathLinkIds: [ATTACH_IDS.relay, ATTACH_IDS.relay, ATTACH_IDS.bridge] },
         { newPathLinkIds: [ATTACH_IDS.old, ATTACH_IDS.bridge] },
         { linkIds: [ATTACH_IDS.portal, ATTACH_IDS.bridge] },
-        // The suffix cannot stand in for the full scoped component (P1R1 is separate).
-        { linkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge] },
+        // A source-less suffix MAY be the full scoped set. Duplicate identities may not.
+        { linkIds: [ATTACH_IDS.relay, ATTACH_IDS.bridge, ATTACH_IDS.bridge] },
     ];
     for (const fields of invalid) {
         await assert.rejects(repository.createFrozen({ ...TEST_BINDING,
@@ -334,7 +333,7 @@ test('public operation read fails closed on legacy missing or malformed readines
             status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified',
         });
     }
-    assert.equal(projection, 'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason');
+    assert.equal(projection, 'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion');
     stored = { status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified' };
     assert.deepEqual(await repository.findPublicById('operation-1'), {
         ...stored, clientReadiness: 'unverified',
@@ -384,7 +383,7 @@ test('findPublicById returns only the public status projection', async () => {
     };
     const repository = new TopologyOperationRepository({ model });
     const result = await repository.findPublicById('operation-dup');
-    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason' });
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion' });
     assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified' });
 });
 
@@ -802,7 +801,7 @@ test('claim reads only durable candidates and never resets later active phases',
         query: {
             _id: 'operation-1',
             ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
-            admissionScope: { $exists: false },
+            admissionScope: { $in: [null, 'selected'] },
             v2Terminal: { $exists: false },
             $or: [
                 { status: 'queued' },
@@ -856,6 +855,8 @@ test('claim reads only durable candidates and never resets later active phases',
                 leaseUntil: 1,
                 heldTopologyAdmission: 1,
                 pppWait: 1,
+                admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
+                desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1,
                 'nodes.node': 1,
                 'nodes.nodeRef': 1,
                 'nodes.role': 1,
@@ -900,7 +901,7 @@ test('claim reacquires expired committing and rolling-back phases without resett
         query: {
             _id: 'operation-1',
             ...topologyOperationClaimBindingFilter(TEST_BINDING.executionContext),
-            admissionScope: { $exists: false },
+            admissionScope: { $in: [null, 'selected'] },
             v2Terminal: { $exists: false },
             status: { $in: ['preparing', 'committing', 'rolling_back'] },
             leaseUntil: { $lte: NOW },
@@ -938,6 +939,8 @@ test('claim reacquires expired committing and rolling-back phases without resett
                 leaseUntil: 1,
                 heldTopologyAdmission: 1,
                 pppWait: 1,
+                admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
+                desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1,
                 'nodes.node': 1,
                 'nodes.nodeRef': 1,
                 'nodes.role': 1,
