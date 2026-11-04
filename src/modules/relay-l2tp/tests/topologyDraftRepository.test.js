@@ -40,6 +40,10 @@ function createModels(trace, session) {
         },
         CascadeLink: {
             db: connection,
+            findById(id) {
+                trace.push({ label: 'links.findById', id });
+                return queryResult({ _id: id }, trace, 'linkTarget');
+            },
             find(filter) {
                 trace.push({ label: 'links.find', filter });
                 return queryResult([], trace, 'links');
@@ -222,6 +226,13 @@ test('persists link and route-group updates and deletes with validators in one s
     }, session);
     await repository.persistMutation({ kind: 'group.delete', id: 'group-2' }, session);
 
+    assert.deepEqual(trace.filter(entry => entry.label === 'links.findById'), [
+        { label: 'links.findById', id: 'link-1' },
+        { label: 'links.findById', id: 'link-2' },
+    ]);
+    assert.deepEqual(trace.filter(entry => entry.label === 'linkTarget.session'), [
+        { label: 'linkTarget.session', session }, { label: 'linkTarget.session', session },
+    ]);
     assert.deepEqual(trace.filter(entry => entry.label.endsWith('updateOne')), [
         {
             label: 'links.updateOne',

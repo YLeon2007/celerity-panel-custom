@@ -330,6 +330,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             planMaterializer,
             operationRepository,
             operationWorker,
+            intentDraftWriter: snapshotReader.createIntentDraftWriter?.({ selectedTopologyRepository: topologyRepository }),
             ...optional(validator, 'validator'),
             ...optional(compiler, 'compiler'),
             ...optional(idFactory, 'idFactory'),
@@ -337,7 +338,6 @@ function createTopologyOperationRuntime(dependencies = {}) {
         });
         coordinator.intentOperationAdmission = Object.freeze({ db: CascadeTopologyState.db, queue: input => coordinator.queueIntent(input) });
         coordinator.resolveIntentResources = input => coordinator.resolveIntentResourcesForQueue(input);
-        coordinator.intentDraftWriter = snapshotReader.createIntentDraftWriter?.({ selectedTopologyRepository: topologyRepository });
         coordinator.attachIngressGate = attachIngressGate;
         coordinator.installedPppReadinessGate = createTopologyPppReadinessGate({ ...pppGateDependencies, readOnly: true });
         Object.assign(coordinator, require('../services/topologySelectedPublicState').createTopologySelectedPublicState({

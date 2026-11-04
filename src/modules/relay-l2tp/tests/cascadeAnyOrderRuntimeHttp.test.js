@@ -201,6 +201,9 @@ test('default host publishes the SAME real selected service and DB-only joined r
         assert.ok(host.selectedTopologyIntentService === host.topologyIntentService);
         const dependencies = host.selectedTopologyIntentService.dependencies;
         assert.ok(dependencies.intentDraftWriter.db === f.models.CascadeLink.db);
+        assert.strictEqual(dependencies.intentDraftWriter, f.deployments[0].intentDraftWriter);
+        assert.equal(typeof dependencies.intentDraftWriter.createLink, 'function');
+        assert.equal(typeof dependencies.intentDraftWriter.updateLink, 'function');
         assert.ok(dependencies.intentOperationAdmission.db === f.models.CascadeLink.db);
         assert.equal(typeof dependencies.resolveIntentResources, 'function');
         assert.equal(typeof dependencies.deleteIntentWriter.markDeleting, 'function');
@@ -210,6 +213,42 @@ test('default host publishes the SAME real selected service and DB-only joined r
         assert.equal(typeof host.readLinkApplicationState, 'function');
         assert.deepEqual(f.calls, []);
     } finally { await host.stop(); }
+});
+
+test('default-host PUT Auto forwards joined update capability and local REALITY preparation through restart and settlement', async () => {
+    const f = fixture(); let host = f.host(); provider.installActiveHost(host);
+    try {
+        const saved = await request(app(f), 'POST', '/links', createBody(7, {
+            portalNodeId: id(1), bridgeNodeId: id(3), autoDeploy: false }));
+        assert.equal(saved.status, 201, JSON.stringify(saved.body));
+        const linkId = saved.body.createdLinkId;
+        const body = { expectedTopologyRevision: 8, autoDeploy: true, tunnelSecurity: 'reality',
+            tunnelPort: 23457, realityPrivateKey: '', realityPublicKey: '', realityShortIds: [] };
+        const accepted = await request(app(f), 'PUT', `/links/${linkId}`, body, 'runtime-put');
+        assert.equal(accepted.status, 202, JSON.stringify(accepted.body));
+        assert.equal(f.data.CascadeTopologyState[0].revision, 9);
+        assert.equal(f.data.TopologyCreateIntent.length, 1);
+        assert.equal(f.data.TopologyOperation.length, 0);
+        assert.deepEqual(f.calls, []);
+        const frozen = copy(f.data.CascadeLink[0]);
+        assert.match(frozen.realityPrivateKey, /^[A-Za-z0-9_-]{43}$/);
+        assert.doesNotMatch(JSON.stringify(accepted.body), new RegExp(frozen.realityPrivateKey));
+        await host.stop(); provider.clearActiveHost(host);
+        host = f.host(); provider.installActiveHost(host);
+        const replay = await request(app(f), 'PUT', `/links/${linkId}`, {
+            ...body, expectedTopologyRevision: 0 }, 'runtime-put');
+        assert.deepEqual(replay.body.job, accepted.body.job);
+        assert.deepEqual(f.data.CascadeLink[0], frozen);
+        host.start();
+        await waitFor(() => f.data.TopologyOperation.some(op => ['succeeded', 'failed'].includes(op.status)) || f.errors.length);
+        assert.deepEqual(f.errors, []);
+        assert.equal(f.data.TopologyOperation[0].status, 'succeeded');
+        await f.timer.tick();
+        const job = await request(app(f), 'GET', `/links/auto-deploy-jobs/${accepted.body.job.jobId}`);
+        assert.equal(job.body.job.status, 'succeeded', JSON.stringify(job.body));
+        assert.equal(f.data.TopologyIntentQueueState[0].outstanding, 0);
+        assert.equal(f.data.NodeOperationLock.length, 0);
+    } finally { provider.clearActiveHost(host); await host.stop(); }
 });
 
 test('loopback HTTP Auto create resumes durable v2 job after host restart through real worker/finalizer', async () => {

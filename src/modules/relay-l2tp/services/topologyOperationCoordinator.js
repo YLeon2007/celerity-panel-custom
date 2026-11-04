@@ -602,6 +602,7 @@ class TopologyOperationCoordinator {
         planMaterializer,
         operationRepository,
         operationWorker,
+        intentDraftWriter,
         validator = validateTopology,
         compiler = compileTopology,
         idFactory = idFromIdempotencyKey,
@@ -633,6 +634,8 @@ class TopologyOperationCoordinator {
         this.planMaterializer = planMaterializer;
         this.operationRepository = operationRepository;
         this.operationWorker = operationWorker;
+        // Forward the complete same-session capability, including atomic edits.
+        this.intentDraftWriter = intentDraftWriter;
         this.validator = validator;
         this.compiler = compiler;
         this.idFactory = idFactory;

@@ -44,11 +44,12 @@ function apply(row, update) {
     for (const key of Object.keys(update.$unset || {})) delete row[key];
 }
 function fixture() {
-    const db = {};
+    const client = {}, db = { getClient: () => client };
     let data = {
         CascadeTopologyState: [{ _id: 'singleton', revision: 7, deployedRevision: 5, topologyAdmissionCount: 0, remoteAdmissionCount: 0 }],
         HyNode: ids.map((_id, i) => ({ _id, active: true, type: 'xray', cascadeRole: i % 2 ? 'bridge' : 'portal' })),
         CascadeLink: [], CascadeRouteGroup: [], RelayL2tpState: [], TopologyCreateIntent: [], TopologyIntentQueueState: [], TopologyOperation: [],
+        NodeOperationLock: [], RemoteAdmission: [], TopologyConfigOwner: [],
     };
     const trace = [];
     function model(name) {
@@ -112,13 +113,19 @@ function fixture() {
     const dependencies = Object.fromEntries(Object.keys(data).map(name => [name, model(name)]));
     Object.assign(dependencies, { executionContext: context,
         async transactionRunner(work) {
-            const session = { data: copy(data) };
+            const session = { data: copy(data), client, inTransaction: () => true };
             const result = await work(session);
             data = session.data;
             return result;
         },
         async resolveIntentResources({ link }) { return [String(link.portalNode), String(link.bridgeNode)].sort(); },
     });
+    const { TopologyDraftRepository } = require('../repositories/topologyDraftRepository');
+    const { TopologyDeploymentRepository } = require('../repositories/topologyDeploymentRepository');
+    const draft = new TopologyDraftRepository(dependencies);
+    const selected = new TopologyDeploymentRepository({ ...dependencies, snapshotReader: draft });
+    dependencies.intentDraftWriter = draft.createIntentDraftWriter({ selectedTopologyRepository: selected });
+    dependencies.prepareLink = require('../../../routes/cascadeLinks').prepareIntentLink;
     const link = (pair = 0) => ({ name: `link-${pair}`, portalNode: ids[pair * 2], bridgeNode: ids[pair * 2 + 1], tunnelPort: 10086 });
     return { dependencies, link, trace, get data() { return data; } };
 }
