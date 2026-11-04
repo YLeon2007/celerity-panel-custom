@@ -842,7 +842,8 @@ class TopologyOperationCoordinator {
                     const frozenPlan = await this.planMaterializer.materialize({
                         ...this.#executionContext,
                         operationKind: attach ? 'link.attach' : scope?.kind,
-                        ...(selected ? { baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology } : {}),
+                        ...(selected ? { baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology,
+                            installedPath: selected.installedPath } : {}),
                         session,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,

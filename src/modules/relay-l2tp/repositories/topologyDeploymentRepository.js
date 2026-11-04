@@ -149,6 +149,7 @@ class TopologyDeploymentRepository {
         const baseline = { nodes: [], links: [], groups: [] };
         const visited = new Set();
         const owners = new Map();
+        const settledProfiles = new Map();
         const add = topology => {
             for (const kind of ['nodes', 'links', 'groups']) for (const value of topology[kind]) {
                 const key = kind === 'groups' ? '_id' : 'id';
@@ -209,17 +210,42 @@ class TopologyDeploymentRepository {
                     && pin.generation === owner.generation && same(pin.nodeIdentity, plain(owner.nodeIdentity))
                     && same(pin.originalSnapshot, plain(owner.originalSnapshot))
                     && same(pin.adoptionReceipt, plain(owner.adoptionReceipt)))) throw selectedError();
-            const entry = operation.nodes?.find(item => String(item.node) === node && item.targetProfile === profile);
-            if (!entry || entry.state !== 'committed' || !owner.lastSettledGeneration) throw selectedError();
+            const entries = operation.nodes?.filter(item => String(item.node) === node && item.targetProfile === profile);
+            const entry = entries?.[0];
+            if (entries?.length !== 1 || entry.state !== 'committed' || entry.role !== metadata.role
+                || !UUID.test(owner.lastSettledGeneration)) throw selectedError();
+            let currentProfile;
+            try {
+                currentProfile = require('../services/topologyXrayCandidate')
+                    .projectCanonicalXrayCandidate(entry.candidate, entry.candidateHash).content;
+            } catch { throw selectedError(); }
             if (operation.v2Terminal) {
-                const binding = operation.v2Terminal.bindings?.find(item => item.nodeId === node);
-                const proof = operation.v2Terminal.proofs?.find(item => item.commandId === owner.lastSettledCloseId);
-                if (operation.v2Terminal.state !== 'proven' || !binding
+                const bindings = operation.v2Terminal.bindings?.filter(item => item.nodeId === node);
+                const binding = bindings?.[0];
+                const proofs = operation.v2Terminal.proofs?.filter(item => item.commandId === owner.lastSettledCloseId);
+                const proof = proofs?.[0];
+                if (operation.v2Terminal.state !== 'proven' || bindings?.length !== 1 || proofs?.length !== 1
+                    || binding.operationId !== String(operation._id) || binding.targetProfile !== profile
+                    || binding.candidateHash !== `sha256:${entry.candidateHash}` || binding.backupId !== entry.backupId
+                    || binding.executionContext !== executionContext.hostIdentity || binding.owner !== operation.leaseOwner
+                    || binding.attempt !== operation.attempts || binding.topologyRevision !== operation.topologyRevision
+                    || binding.priorDeployedRevision !== operation.priorDeployedRevision
                     || binding.generation !== owner.lastSettledGeneration
                     || binding.commandIds?.close !== owner.lastSettledCloseId
                     || !validTerminalReceipt(proof, binding) || proof.terminalOutcome !== 'verified') throw selectedError();
             } else if (executionContext.target !== 'test') throw selectedError();
-            add(componentAt(durableSelectedTopology(operation.effectiveTopology), node));
+            const settled = durableSelectedTopology(operation.effectiveTopology);
+            const component = componentAt(settled, node);
+            // A cleaned detached endpoint is absent from effectiveTopology but
+            // its verified candidate remains the current physical profile. Keep
+            // its pinned prior metadata, not a new desired-profile guess.
+            if (!component.nodes.length) {
+                const prior = durableSelectedTopology(operation.baselineTopology).nodes.find(item => item.id === node);
+                if (!prior) throw selectedError();
+                component.nodes.push(prior);
+            }
+            add(component);
+            settledProfiles.set(node, currentProfile);
         }
         for (const kind of ['nodes', 'links', 'groups']) baseline[kind].sort((a, b) =>
             String(a.id ?? a._id).localeCompare(String(b.id ?? b._id), 'en'));
@@ -239,6 +265,10 @@ class TopologyDeploymentRepository {
             const component = componentAt(durableSelectedTopology(source.effectiveTopology), node.id);
             if (component.nodes.some(member => owners.get(member.id)?.lastSettledOperation !== owner.lastSettledOperation)) throw selectedError();
         }
+        // Apply current bytes only after each component member's independent
+        // owner/settlement/terminal checks above. Imported originals remain
+        // immutable historical handback evidence, never current readback.
+        for (const node of baseline.nodes) if (settledProfiles.has(node.id)) node.profileConfig = settledProfiles.get(node.id);
         let selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
             verifiedBaselineTopology: baseline, desiredTopology, scope,
         });
