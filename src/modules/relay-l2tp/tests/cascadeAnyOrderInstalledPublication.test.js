@@ -38,10 +38,11 @@ function installedFixture({ absent = false, mode = 'reverse' } = {}) {
     const ingress = new TopologyAttachIngressGate({ nodeExecutionResolver: { async resolve() { return {
         async connect() {}, disconnect() {}, async exec(command, execOptions) {
             options.gateCalls.push('ingress');
+            const pathKey = state.activePathKey;
             const main = { inbounds: [{ tag: `relay-l2tp-${id(60)}`, listen: '0.0.0.0', port: 12345, protocol: 'dokodemo-door',
                 settings: { network: 'tcp,udp', followRedirect: true }, streamSettings: { sockopt: { tproxy: 'tproxy' } } }],
-                outbounds: [{ tag: 'cascade-mine', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: cascadePathIngressPort(id(60), 'mine') }] } }],
-                routing: { rules: [{ type: 'field', inboundTag: [`relay-l2tp-${id(60)}`], outboundTag: 'cascade-mine' }] } };
+                outbounds: [{ tag: `cascade-${pathKey}`, protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: cascadePathIngressPort(id(60), pathKey) }] } }],
+                routing: { rules: [{ type: 'field', inboundTag: [`relay-l2tp-${id(60)}`], outboundTag: `cascade-${pathKey}` }] } };
             if (options.changeMain) options.changeMain(main);
             const setup = `import builtins,io,subprocess\nbuiltins.open=lambda *a,**k:io.StringIO(${JSON.stringify(JSON.stringify(main))})\nsubprocess.run=lambda *a,**k:type('Result',(),{'returncode':0,'stdout':'active\\n','stderr':''})()\n`;
             const result = spawnSync('python3', ['-'], { input: setup + execOptions.stdin, encoding: 'utf8' });
@@ -203,19 +204,35 @@ for (const mode of ['forward', 'reverse']) test(`actual V2 worker installed ${mo
 
 test('installed delete blocks only owned default path, keeping a nonempty geo peer and independent group', async () => {
     const f = installedFixture();
-    // Establish the real settled G3 graph before modeling an already installed
-    // group. Adding geo to an installed ingress is a separate gate handoff.
-    f.RelayL2tpState.rows.splice(0); await apply(f, id(10));
-    const main = f.CascadeLink.rows.find(row => row._id === id(10));
-    f.CascadeLink.rows.push({ ...main, _id: id(13), bridgeNode: id(4), tunnelPort: 23500, status: 'pending',
-        geoRouting: { enabled: true, geoip: ['ru'], domains: ['category-ru'] } });
+    // Establish the peer with the actual installed ingress preparation and
+    // worker publication, not a group retrofit onto ordinary settled bytes.
+    const peer = f.group.paths.find(path => path.pathKey === 'peer');
+    peer.enabled = true;
+    f.state.activePathKey = 'peer'; // modeled pre-existing MAIN/owner selection
+    f.CascadeLink.rows.push({ ...f.CascadeLink.rows[0], _id: id(13), bridgeNode: id(4), tunnelPort: 23500, status: 'pending' });
     f.CascadeTopologyState.rows[0].revision++;
     await apply(f, id(13));
-    f.group.paths.find(path => path.pathKey === 'mine').linkIds = [id(10)];
-    f.state.appliedTopologyRevision = f.CascadeTopologyState.rows[0].revision;
-    f.RelayL2tpState.rows.push(f.state);
-    const peer = f.group.paths.find(path => path.pathKey === 'peer'); peer.linkIds = [id(13)]; peer.enabled = true;
-    const protectedPeer = structuredClone(peer), protectedLink = structuredClone(f.CascadeLink.rows.find(row => row._id === id(13)));
+    assert.deepEqual(peer.linkIds, []); // publication replaces paths, not this old object
+    assert.deepEqual(f.group.paths.find(path => path.pathKey === 'peer').linkIds, [id(13)]);
+    assert.equal(f.options.prepares.at(-1).pathKey, 'peer');
+    assert.ok(f.options.gateCalls.includes('ingress') && f.options.gateCalls.includes('users'));
+    // Select the default owner in the modeled MAIN/state boundary. Both policy
+    // edits below still run real materialization, preparation and settlement.
+    f.state.activePathKey = 'mine';
+    f.CascadeLink.rows.find(row => row._id === id(13)).geoRouting = { enabled: true, geoip: ['ru'], domains: ['category-ru'] };
+    f.CascadeTopologyState.rows[0].revision++;
+    await apply(f, id(13));
+    await apply(f, id(10));
+    const settled = f.TopologyOperation.rows.at(-1);
+    const installed = JSON.parse(Buffer.from(settled.nodes.find(node => node.node === id(1)).candidate.bytes));
+    for (const pathKey of ['mine', 'peer']) {
+        assert.equal(installed.inbounds.filter(inbound => inbound.tag === `cascade-${pathKey}`
+            && inbound.port === cascadePathIngressPort(id(60), pathKey)).length, 1);
+        assert.ok(installed.routing.rules.some(rule => rule.inboundTag?.includes(`cascade-${pathKey}`)));
+    }
+    const protectedPeer = structuredClone(f.group.paths.find(path => path.pathKey === 'peer'));
+    const protectedLink = structuredClone(f.CascadeLink.rows.find(row => row._id === id(13)));
+    const protectedUsers = structuredClone(f.users), protectedState = structuredClone(f.state);
     const other = structuredClone(f.CascadeRouteGroup.rows[1]);
     const queued = await remove(f, id(10)); const result = await f.worker.run(queued.operationId);
     assert.equal(result.status, 'succeeded', JSON.stringify(result));
@@ -223,7 +240,44 @@ test('installed delete blocks only owned default path, keeping a nonempty geo pe
     assert.deepEqual(f.group.paths.find(path => path.pathKey === 'peer'), protectedPeer);
     assert.deepEqual(f.CascadeLink.rows.find(row => row._id === id(13)), protectedLink);
     assert.deepEqual(f.CascadeRouteGroup.rows[1], other);
+    assert.deepEqual(f.users, protectedUsers);
+    for (const key of ['pskEncrypted', 'secretRevision', 'clientCidr', 'localAddress', 'poolStart', 'poolEnd', 'dnsServers', 'routeGroup', 'activePathKey']) {
+        assert.deepEqual(f.state[key], protectedState[key]);
+    }
+    const deleted = f.TopologyOperation.rows.find(row => row._id === queued.operationId);
+    const after = JSON.parse(Buffer.from(deleted.nodes.find(node => node.node === id(1)).candidate.bytes));
+    assert.deepEqual(after.inbounds.filter(inbound => inbound.tag === 'cascade-peer'), installed.inbounds.filter(inbound => inbound.tag === 'cascade-peer'));
+    assert.deepEqual(after.routing.rules.filter(rule => rule.inboundTag?.includes('cascade-peer')),
+        installed.routing.rules.filter(rule => rule.inboundTag?.includes('cascade-peer')));
+    assert.deepEqual(after.routing.rules.filter(rule => rule.inboundTag?.includes('cascade-mine')),
+        [{ type: 'field', inboundTag: ['cascade-mine'], outboundTag: 'block' }]);
+    assert.equal(f.CascadeLink.rows.some(row => row._id === id(10)), false);
+    assert.equal(f.NodeOperationLock.rows.length, 0);
     assert.equal(f.options.prepares.at(-1).pppInternetProof, 'not_applicable');
+});
+test('installed group metadata without installed profile bytes is refused before queue or dispatch', async () => {
+    const f = installedFixture();
+    f.RelayL2tpState.rows.splice(0);
+    await apply(f, id(10));
+    f.CascadeLink.rows.push({ ...f.CascadeLink.rows[0], _id: id(13), bridgeNode: id(4), tunnelPort: 23500, status: 'pending',
+        geoRouting: { enabled: true, geoip: ['ru'], domains: ['category-ru'] } });
+    f.CascadeTopologyState.rows[0].revision++;
+    await apply(f, id(13));
+    // Exact invalid historical setup, retained as a negative: metadata cannot
+    // create the missing cascade-mine/peer listeners in ordinary settled bytes.
+    f.group.paths.find(path => path.pathKey === 'mine').linkIds = [id(10)];
+    Object.assign(f.group.paths.find(path => path.pathKey === 'peer'), { linkIds: [id(13)], enabled: true });
+    f.state.appliedTopologyRevision = f.CascadeTopologyState.rows[0].revision;
+    f.RelayL2tpState.rows.push(f.state);
+    const config = JSON.parse(Buffer.from(f.TopologyOperation.rows.at(-1).nodes.find(node => node.node === id(1)).candidate.bytes));
+    assert.equal(config.inbounds.some(inbound => ['cascade-mine', 'cascade-peer'].includes(inbound.tag)), false);
+    const before = structuredClone({ operations: f.TopologyOperation.rows, groups: f.CascadeRouteGroup.rows,
+        state: f.state, users: f.users, calls: f.calls });
+    await assert.rejects(remove(f, id(10)), { code: 'INVALID_TOPOLOGY_DEPLOYMENT', causeCode: 'TOPOLOGY_PROFILE_BASELINE_MISMATCH' });
+    assert.deepEqual({ operations: f.TopologyOperation.rows, groups: f.CascadeRouteGroup.rows,
+        state: f.state, users: f.users, calls: f.calls }, before);
+    assert.equal(f.NodeOperationLock.rows.length, 0);
+    assert.equal(f.CascadeTopologyState.rows[0].topologyAdmissionCount, 0);
 });
 test('missing installed dependency is rejected before dispatch and releases only its no-dispatch ownership', async () => {
     const f = installedFixture(); f.worker.installedIngressPreparer = undefined;
