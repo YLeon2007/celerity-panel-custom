@@ -10,8 +10,14 @@ const CascadeLink = require('../../models/cascadeLinkModel');
 const { clientReadinessMessage } = require('../../../public/js/network');
 
 const {
-    createCascadeLinksRouter,
+    createCascadeLinksRouter: createRouter,
 } = require('../cascadeLinks');
+// Legacy CRUD compatibility fixtures; native v2 uses real services in cascadeAnyOrderHttp.
+const LEGACY_ENV = Object.freeze({ PANEL_DOMAIN: 'lm1.infograd.online',
+    L2TP_PRODUCTION_EXECUTION_ENABLED: 'true', L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true', CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false' });
+const createCascadeLinksRouter = options => createRouter({ deploymentEnv: LEGACY_ENV, ...options });
 const sshPool = require('../../services/sshPoolService');
 
 // The route import starts the SSH pool's recurring cleanup timer.
@@ -137,11 +143,13 @@ test('GET returns the versioned link snapshot used by network clients', async ()
     const response = await request(router);
 
     assert.equal(response.status, 200);
-    assert.deepEqual(response.body, {
-        topologyRevision: 21,
-        deployedRevision: 18,
-        links,
-    });
+    assert.equal(response.body.topologyRevision, 21);
+    assert.equal(response.body.deployedRevision, 18);
+    assert.deepEqual(response.body.links.map(({ applicationState, routeState, tunnelState, desiredVersion, ...link }) => link), links);
+    assert.equal(response.body.links[0].applicationState, 'not_applied');
+    assert.equal(response.body.links[0].routeState, 'unknown');
+    assert.equal(response.body.links[0].tunnelState, 'unknown');
+    assert.match(response.body.links[0].desiredVersion, /^[a-f0-9]{64}$/);
     assert.deepEqual(calls.filter, {});
     assert.equal(calls.topologyId, 'singleton');
 });
@@ -266,7 +274,12 @@ test('GET by id preserves the populated cascade link contract', async () => {
     const response = await request(router, { path: `/${LINK_A}` });
 
     assert.equal(response.status, 200);
-    assert.deepEqual(response.body, link);
+    const { applicationState, routeState, tunnelState, desiredVersion, ...legacy } = response.body;
+    assert.deepEqual(legacy, link);
+    assert.equal(applicationState, 'not_applied');
+    assert.equal(routeState, 'unknown');
+    assert.equal(tunnelState, 'unknown');
+    assert.match(desiredVersion, /^[a-f0-9]{64}$/);
     assert.equal(calls.id, LINK_A);
 });
 
@@ -657,7 +670,8 @@ test('link CRUD maps in-use and reserved replacement errors to HTTP conflicts', 
                     throw error;
                 },
             };
-            const router = createCascadeLinksRouter({ topologyDraftWriteService });
+            const router = createCascadeLinksRouter({ topologyDraftWriteService,
+                topologyCoordinator: { deleteLink: topologyDraftWriteService.deleteLink } });
             const response = await request(router, {
                 method, path: `/${LINK_A}`,
                 body: { expectedTopologyRevision: 7, name: 'new link name' },
@@ -668,7 +682,7 @@ test('link CRUD maps in-use and reserved replacement errors to HTTP conflicts', 
     }
 });
 
-test('DELETE removes a link through the versioned draft boundary without undeployment', async () => {
+test('legacy DELETE delegates to the checked coordinator, never directly to the draft writer', async () => {
     const calls = { deployment: 0, subscriptionInvalidation: 0, topologyInvalidation: 0 };
     let links = [{
         _id: LINK_A,
@@ -694,7 +708,8 @@ test('DELETE removes a link through the versioned draft boundary without undeplo
     };
     const router = createCascadeLinksRouter({ maintainAutoL2tpPathsFn: async () => {},
         Link,
-        topologyDraftWriteService,
+        topologyCoordinator: { deleteLink: topologyDraftWriteService.deleteLink },
+        topologyDraftWriteService: { deleteLink() { assert.fail('draft-only deletion is forbidden'); } },
         async invalidateSubscriptions() { calls.subscriptionInvalidation += 1; },
         async invalidateTopology() { calls.topologyInvalidation += 1; },
         deploymentService: {

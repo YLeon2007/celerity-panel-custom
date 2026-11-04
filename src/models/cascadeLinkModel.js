@@ -7,6 +7,12 @@
 
 const mongoose = require('mongoose');
 
+const lifecycleSchema = new mongoose.Schema({
+    state: { type: String, enum: ['deleting'], required: true },
+    deleteJobId: { type: mongoose.Schema.Types.ObjectId, required: true },
+    desiredVersion: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+}, { _id: false, versionKey: false, strict: 'throw' });
+
 const cascadeLinkSchema = new mongoose.Schema({
     name: { type: String, required: true },
 
@@ -66,6 +72,9 @@ const cascadeLinkSchema = new mongoose.Schema({
     active: { type: Boolean, default: true },
     // Metadata only. Startup must never infer a fresh deploy from this flag.
     autoDeploy: { type: Boolean, default: false },
+    // The old descriptor remains intact until operation-owned cleanup/readback
+    // settles. Never overload tunnel health or infer deletion from pending.
+    lifecycle: { type: lifecycleSchema, default: undefined },
     // Server-issued only at trusted create; legacy documents remain ungranted.
     classicLifecycleGrant: {
         type: String,
@@ -86,4 +95,23 @@ cascadeLinkSchema.index({ portalNode: 1 });
 cascadeLinkSchema.index({ bridgeNode: 1 });
 cascadeLinkSchema.index({ active: 1, status: 1 });
 
-module.exports = mongoose.model('CascadeLink', cascadeLinkSchema);
+const CascadeLink = mongoose.model('CascadeLink', cascadeLinkSchema);
+
+// Same-session writer injected into TopologyIntentService.deleteIntentWriter.
+// This marker is not a cleanup receipt and grants no authority to delete a row.
+function createDeleteIntentWriter({ CascadeLink: Link = CascadeLink } = {}) {
+    return Object.freeze({ db: Link.db,
+        async markDeleting({ session, linkId, desiredVersion, jobId }) {
+            if (!session) throw new TypeError('Delete marker requires the admission transaction session');
+            const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
+            const current = await Link.findById(linkId).session(session).lean();
+            if (!current || current.lifecycle || linkDesiredVersion(current) !== desiredVersion) return { matchedCount: 0 };
+            return Link.updateOne({ _id: linkId, lifecycle: { $exists: false } }, {
+                $set: { lifecycle: { state: 'deleting', deleteJobId: jobId, desiredVersion } },
+            }, { session, runValidators: true });
+        },
+    });
+}
+
+module.exports = CascadeLink;
+module.exports.createDeleteIntentWriter = createDeleteIntentWriter;

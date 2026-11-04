@@ -20,8 +20,10 @@ const {
 } = require('./panel/csrf');
 const logger = require('../utils/logger');
 const { logTopologyTestFailure } = require('./topologyTestDiagnostics');
-const { isCompletedClassicDeploymentResult } = require('../services/classicScopedCascadeDeploymentService');
-const { selectLinkApplyBaselineLinkIds } = require('./cascadeLinks');
+const { isCompletedClassicDeploymentResult, isClassicProductionDeploymentConfigured } = require('../services/classicScopedCascadeDeploymentService');
+const { selectLinkApplyBaselineLinkIds, acceptedIntentResponse, readPersistedIntent } = require('./cascadeLinks');
+const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
+const { l2tpActiveHostProvider } = require('../modules/l2tpActiveHostProvider');
 
 const DEFAULT_MODELS = Object.freeze({
     HyNode,
@@ -66,6 +68,20 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNCERTAIN', 503],
     ['CLASSIC_DEPLOY_FENCE_LOST', 503],
+    ['CASCADE_LINK_DELETING', 409],
+    ['INVALID_IDEMPOTENCY_KEY', 400],
+    ['INVALID_TOPOLOGY_INTENT', 400],
+    ['TOPOLOGY_INTENT_KEY_CONFLICT', 409],
+    ['TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT', 409],
+    ['TOPOLOGY_INTENT_BACKLOG_FULL', 503],
+    ['TOPOLOGY_INTENT_STATE_MISSING', 503],
+    ['TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_RESOURCES_INVALID', 503],
+    ['TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_DRAFT_CONNECTION_MISMATCH', 503],
+    ['TOPOLOGY_INTENT_DRAFT_BINDING_INVALID', 503],
+    ['TOPOLOGY_INTENT_DELETE_BINDING_INVALID', 503],
+    ['TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH', 409],
 ]);
 const PUBLIC_ERROR_FIELDS = Object.freeze([
     'operationId',
@@ -97,18 +113,22 @@ function normalizeDeployRequest(body) {
         );
     }
     const keys = Object.keys(body);
-    if (keys.some(key => !['expectedTopologyRevision', 'linkId', 'domainLinkId'].includes(key))
+    if (keys.some(key => !['expectedTopologyRevision', 'linkId', 'domainLinkId', 'desiredVersion'].includes(key))
         || (Object.hasOwn(body, 'linkId') && Object.hasOwn(body, 'domainLinkId'))) {
         throw new TopologyDeployRequestError(
             'INVALID_REQUEST',
             'Only expectedTopologyRevision and one optional linkId or domainLinkId are accepted',
         );
     }
-    if (Object.hasOwn(body, 'linkId') && !/^[0-9a-fA-F]{24}$/.test(body.linkId)) {
+    if (Object.hasOwn(body, 'linkId') && (typeof body.linkId !== 'string' || !/^[0-9a-f]{24}$/.test(body.linkId))) {
         throw new TopologyDeployRequestError('INVALID_LINK_ID', 'Link id must be a 24-character hex string');
     }
-    if (Object.hasOwn(body, 'domainLinkId') && !/^[0-9a-fA-F]{24}$/.test(body.domainLinkId)) {
+    if (Object.hasOwn(body, 'domainLinkId') && (typeof body.domainLinkId !== 'string' || !/^[0-9a-f]{24}$/.test(body.domainLinkId))) {
         throw new TopologyDeployRequestError('INVALID_LINK_ID', 'Domain link id must be a 24-character hex string');
+    }
+    if (Object.hasOwn(body, 'desiredVersion') && (!body.linkId
+        || typeof body.desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(body.desiredVersion))) {
+        throw new TopologyDeployRequestError('INVALID_REQUEST', 'Invalid desired link version');
     }
     const expectedTopologyRevision = body.expectedTopologyRevision;
     if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) {
@@ -121,6 +141,7 @@ function normalizeDeployRequest(body) {
         expectedTopologyRevision,
         ...(Object.hasOwn(body, 'linkId') ? { linkId: body.linkId } : {}),
         ...(Object.hasOwn(body, 'domainLinkId') ? { domainLinkId: body.domainLinkId } : {}),
+        ...(Object.hasOwn(body, 'desiredVersion') ? { desiredVersion: body.desiredVersion } : {}),
     };
 }
 
@@ -147,8 +168,8 @@ function normalizeReplacementRequest(body) {
     }
     return body;
 }
-// Status lifecycle mirrors TopologyOperation. No kind/causeCode/reason or any
-// freeform field ever leaves this boundary.
+// Status lifecycle mirrors TopologyOperation. Only bounded public identity and
+// phase/reason enums leave this boundary, never candidate/config diagnostics.
 const OPERATION_STATUS_VALUES = new Set([
     'queued',
     'preparing',
@@ -178,6 +199,22 @@ function publicOperationStatus(operation = {}) {
     if (operation.clientReadiness === 'unverified'
         && ['active_unverified', 'degraded'].includes(operation.clientProofState)) {
         body.clientProofState = operation.clientProofState;
+    }
+    if (['link.apply', 'link.delete', 'domain.reconcile', 'link.replace', 'link.attach'].includes(operation.kind)) body.kind = operation.kind;
+    if (typeof operation.linkId === 'string' && /^[a-f0-9]{24}$/.test(operation.linkId)) body.linkId = operation.linkId;
+    const phase = { queued: 'waiting', preparing: 'preparing', committing: 'applying',
+        rolling_back: 'rolling_back', succeeded: 'completed', failed: 'failed', rolled_back: 'rolled_back' }[operation.status];
+    if (phase) body.phase = phase;
+    if (['TOPOLOGY_INTENT_RESOURCE_BUSY', 'TOPOLOGY_DEPLOY_BUSY', 'TOPOLOGY_RECONCILE_REQUIRED'].includes(operation.waitingReason)) body.waitingReason = operation.waitingReason;
+    if (typeof operation.failedNodeId === 'string' && /^[a-f0-9]{24}$/.test(operation.failedNodeId)) body.nodeId = operation.failedNodeId;
+    if (operation.status === 'queued') body.nextAction = 'poll_operation';
+    else if (['failed', 'rolling_back'].includes(operation.status)) body.nextAction = 'inspect_operation';
+    if (operation.pppWaiting === true) {
+        body.phase = 'waiting'; body.waitingReason = 'PPP_SYNC_PENDING'; body.nextAction = 'poll_operation';
+    }
+    if (operation.heldTopologyAdmission === true && ['failed', 'rolled_back', 'succeeded'].includes(operation.status)) {
+        body.phase = 'reconcile_required'; body.waitingReason = 'TOPOLOGY_RECONCILE_REQUIRED'; body.nextAction = 'inspect_operation';
+        body.clientReadiness = 'unverified';
     }
     return body;
 }
@@ -239,6 +276,19 @@ function publicError(error) {
 function sendError(res, error, routeLogger = logger, context = {}) {
     if (context.action) logTopologyTestFailure({ ...context, error });
     const status = ERROR_STATUS_BY_CODE.get(error?.code);
+    if (context.nativeIntent) {
+        const code = status ? error.code : 'INTERNAL_ERROR';
+        if (!status || status >= 500) routeLogger.error(`[Cascade Topology Deploy API] ${code}`);
+        return res.status(status || 500).json({ error: { code,
+            message: code === 'TOPOLOGY_INTENT_BACKLOG_FULL' ? 'The deployment queue is full; retry later'
+                : code === 'TOPOLOGY_INTENT_KEY_CONFLICT' ? 'The request key belongs to different content'
+                    : code === 'TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT' ? 'The requested link version changed; reload the topology'
+                        : status && status < 500 ? 'The deployment request was refused' : 'Durable deployment acceptance is unavailable',
+            phase: 'intent.accept',
+            ...(typeof context.linkId === 'string' && /^[a-f0-9]{24}$/.test(context.linkId) ? { linkId: context.linkId } : {}),
+            nextAction: code === 'TOPOLOGY_INTENT_BACKLOG_FULL' ? 'retry_later' : 'refresh_topology',
+        } });
+    }
     if (status) {
         if (status >= 500) {
             // Backend errors can contain short credentials. Neither logs nor
@@ -294,6 +344,9 @@ const defaultOperationStatusRateLimiter = rateLimit({
 
 function createCascadeTopologyDeployRouter({
     topologyDeploymentService,
+    topologyIntentService,
+    readPublicOperation,
+    deploymentEnv = process.env,
     createService = relayL2tpModule.createTopologyDeploymentService,
     models = DEFAULT_MODELS,
     requireAuth = requireAuthMiddleware,
@@ -306,7 +359,8 @@ function createCascadeTopologyDeployRouter({
     if (typeof createService !== 'function') {
         throw new TypeError('Cascade topology deploy router requires a deployment service factory');
     }
-    const deploymentService = topologyDeploymentService ?? createService(models);
+    deploymentEnv = Object.freeze({ ...deploymentEnv });
+    const deploymentService = topologyDeploymentService ?? createService({ ...models, env: deploymentEnv });
     if (typeof deploymentService?.deploy !== 'function') {
         throw new TypeError('Cascade topology deploy router requires a deployment service');
     }
@@ -341,10 +395,19 @@ function createCascadeTopologyDeployRouter({
                         'Operation id must be a 24-character hex string',
                     );
                 }
-                const operation = await new TopologyOperationRepository({
+                const reader = readPublicOperation ?? l2tpActiveHostProvider.getActiveHost()?.readPublicOperation;
+                let operation = reader ? await reader(operationId) : await new TopologyOperationRepository({
                     model: models.TopologyOperation,
                     topologyStateModel: models.CascadeTopologyState,
                 }).findPublicById(operationId);
+                if (operation && !reader) {
+                    const metadata = await models.TopologyOperation.findById(operationId)
+                        .select('admissionScope kind linkId waitingReason failedNodeId heldTopologyAdmission pppWait.relayNode').lean();
+                    operation = { ...operation, kind: metadata?.kind, linkId: metadata?.linkId == null ? undefined : String(metadata.linkId),
+                        waitingReason: metadata?.waitingReason, failedNodeId: metadata?.failedNodeId == null ? undefined : String(metadata.failedNodeId),
+                        heldTopologyAdmission: metadata?.heldTopologyAdmission, pppWaiting: !!metadata?.pppWait,
+                        ...(metadata?.admissionScope === 'selected' ? { clientReadiness: 'unverified' } : {}) };
+                }
                 if (!operation) {
                     throw new TopologyDeployRequestError(
                         'OPERATION_NOT_FOUND',
@@ -368,6 +431,28 @@ function createCascadeTopologyDeployRouter({
         async (req, res) => {
             try {
                 const input = normalizeDeployRequest(req.body);
+                if (input.linkId && !isClassicProductionDeploymentConfigured(deploymentEnv)
+                    && deploymentService.requiresL2tpIngressPreparation !== false) {
+                    const service = topologyIntentService === undefined
+                        ? l2tpActiveHostProvider.getActiveHost()?.selectedTopologyIntentService : topologyIntentService;
+                    if (typeof service?.accept !== 'function') {
+                        throw new TopologyDeployRequestError('TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 'Durable selected mutation runtime is unavailable');
+                    }
+                    const requestKey = req.get('Idempotency-Key');
+                    if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw new TopologyDeployRequestError('INVALID_IDEMPOTENCY_KEY', 'A valid Idempotency-Key is required');
+                    const selected = await models.CascadeLink.findById(input.linkId).lean();
+                    const existing = !selected || selected.lifecycle || selected.active === false
+                        ? await readPersistedIntent(service, models.CascadeLink, requestKey) : null;
+                    if (existing && (existing.version !== 2 || existing.kind !== 'link.apply' || String(existing.linkId) !== input.linkId)) throw new TopologyDeployRequestError('TOPOLOGY_INTENT_KEY_CONFLICT', 'The request key belongs to different content');
+                    if (!selected && !existing) throw new TopologyDeployRequestError('CASCADE_LINK_NOT_FOUND', 'Cascade link not found');
+                    if (selected?.lifecycle?.state === 'deleting' && !existing) throw new TopologyDeployRequestError('CASCADE_LINK_DELETING', 'Cascade link is being deleted');
+                    if (selected?.active === false && !existing) throw new TopologyDeployRequestError('CASCADE_LINK_DISABLED', 'Cascade link is disabled');
+                    const job = await service.accept({ version: 2, kind: 'link.apply',
+                        expectedTopologyRevision: input.expectedTopologyRevision,
+                        requestKey, linkId: input.linkId,
+                        desiredVersion: input.desiredVersion ?? (selected ? linkDesiredVersion(selected) : existing.desiredVersion) });
+                    return res.status(202).json(acceptedIntentResponse(job));
+                }
                 let result;
                 if (input.linkId || input.domainLinkId) {
                     if (typeof deploymentService.queue !== 'function') {
@@ -433,6 +518,7 @@ function createCascadeTopologyDeployRouter({
             } catch (error) {
                 return sendError(res, error, routeLogger, {
                     action: 'topology.sync', phase: 'deploy.queue',
+                    nativeIntent: !!req.body?.linkId && !isClassicProductionDeploymentConfigured(deploymentEnv),
                     revision: req.body?.expectedTopologyRevision,
                     linkId: req.body?.linkId || req.body?.domainLinkId });
             }

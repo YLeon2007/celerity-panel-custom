@@ -142,7 +142,10 @@ function createAutoDeployHarness({
     prepareL2tpIngressFn,
     editedLink,
     updateError,
-    deploymentEnv = {},
+    // These pre-v2 tests characterize the retained legacy route orchestration
+    // with injected queue doubles, NOT selected/native acceptance. The latter
+    // is exercised with real intent/draft services in cascadeAnyOrderHttp.
+    deploymentEnv = CLASSIC_ENV,
     standaloneClassicDraft = false,
     maintainAutoL2tpPathsFn,
 } = {}) {

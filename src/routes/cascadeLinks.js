@@ -27,6 +27,7 @@ const {
 } = require('../services/classicScopedCascadeDeploymentService');
 const { requireScope } = require('../middleware/auth');
 const { issueClassicLifecycleGrant } = require('../services/classicLifecycleAuthorization');
+const { linkDesiredVersion } = require('../modules/relay-l2tp/services/topologyIntentService');
 
 const LINK_POPULATE_SELECT = 'name ip flag status';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
@@ -43,6 +44,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['STALE_TOPOLOGY_REVISION', 409],
     ['CASCADE_LINK_CONFLICT', 409],
     ['CASCADE_LINK_IN_USE', 409],
+    ['CASCADE_LINK_DELETING', 409],
+    ['CASCADE_LINK_DISABLED', 409],
     ['TOPOLOGY_REPLACEMENT_RESERVED', 409],
     ['INVALID_TOPOLOGY_DRAFT', 422],
     ['TOPOLOGY_DEPLOY_BUSY', 409],
@@ -60,12 +63,23 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['CLASSIC_DEPLOY_PORT_CHECK_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNCERTAIN', 503],
     ['CLASSIC_DEPLOY_FENCE_LOST', 503],
-    ['TOPOLOGY_INTENT_BACKLOG_FULL', 429],
+    ['TOPOLOGY_INTENT_BACKLOG_FULL', 503],
     ['TOPOLOGY_INTENT_KEY_CONFLICT', 409],
     ['TOPOLOGY_INTENT_NOT_FOUND', 404],
     ['TOPOLOGY_INTENT_STATE_MISSING', 503],
     ['INVALID_IDEMPOTENCY_KEY', 400],
     ['TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE', 413],
+    ['INVALID_TOPOLOGY_INTENT', 400],
+    ['INVALID_TOPOLOGY_INTENT_VERSION', 400],
+    ['TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT', 409],
+    ['TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_RESOURCES_INVALID', 503],
+    ['TOPOLOGY_INTENT_DRAFT_BINDING_INVALID', 503],
+    ['TOPOLOGY_INTENT_DELETE_BINDING_INVALID', 503],
+    ['TOPOLOGY_INTENT_DELETE_WRITER_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_DRAFT_CONNECTION_MISMATCH', 503],
+    ['TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH', 409],
 ]);
 
 class RequestValidationError extends Error {
@@ -211,7 +225,7 @@ function generateRealityKeyPair() {
     return { privateKey: privateJwk.d, publicKey: publicJwk.x };
 }
 
-function resolveRealitySettings(input = {}, targetNode = null) {
+function resolveRealitySettings(input = {}, targetNode = null, { generate = true } = {}) {
     // When the link form leaves realityDest/realitySni empty, inherit them
     // from the TARGET node's card (xray.realityDest/realitySni); the global
     // google defaults apply only when the target node has none configured.
@@ -222,17 +236,17 @@ function resolveRealitySettings(input = {}, targetNode = null) {
         : [];
     let privateKey = String(input.realityPrivateKey || '').trim();
     let publicKey = String(input.realityPublicKey || '').trim();
-    if (!privateKey || !publicKey) {
+    if (generate && (!privateKey || !publicKey)) {
         const generated = generateRealityKeyPair();
         privateKey = generated.privateKey;
         publicKey = generated.publicKey;
     }
-    if (!REALITY_KEY_RE.test(privateKey)) {
+    if ((generate || privateKey) && !REALITY_KEY_RE.test(privateKey)) {
         throw new RequestValidationError(
             'Invalid REALITY privateKey format (expected base64 x25519 key)',
         );
     }
-    if (!REALITY_KEY_RE.test(publicKey)) {
+    if ((generate || publicKey) && !REALITY_KEY_RE.test(publicKey)) {
         throw new RequestValidationError(
             'Invalid REALITY publicKey format (expected base64 x25519 key)',
         );
@@ -247,15 +261,55 @@ function resolveRealitySettings(input = {}, targetNode = null) {
     }
     const realitySni = normalizeStringArray(input.realitySni).filter(Boolean);
     return {
-        realityDest: String(input.realityDest || '').trim() || nodeDest || 'www.google.com:443',
-        realitySni: realitySni.length > 0 ? realitySni : (nodeSni.length > 0 ? nodeSni : ['www.google.com']),
+        realityDest: String(input.realityDest || '').trim() || nodeDest || (generate ? 'www.google.com:443' : ''),
+        realitySni: realitySni.length > 0 ? realitySni : (nodeSni.length > 0 ? nodeSni : generate ? ['www.google.com'] : []),
         realityPrivateKey: privateKey,
         realityPublicKey: publicKey,
         realityShortIds: inputShortIds.some(Boolean)
             ? inputShortIds
-            : [crypto.randomBytes(8).toString('hex')],
+            : generate ? [crypto.randomBytes(8).toString('hex')] : [],
         realityFingerprint: String(input.realityFingerprint || 'random').trim() || 'random',
     };
+}
+
+// Inject into the real intent service as prepareLink. Admission invokes this
+// only after persisted-key replay; HTTP does not generate credentials first.
+function prepareIntentLink(link, targetNode = null) {
+    return { ...link, tunnelUuid: link.tunnelUuid || crypto.randomUUID(),
+        ...(link.tunnelSecurity === 'reality' ? resolveRealitySettings(link, targetNode) : {}) };
+}
+
+function acceptedIntentResponse(job, { autoDeploy = false } = {}) {
+    if (job?.version !== 2 || !['link.create', 'link.apply', 'link.delete'].includes(job.kind)
+        || typeof job.jobId !== 'string' || !/^[a-f0-9]{24}$/.test(job.jobId)
+        || typeof job.linkId !== 'string' || !/^[a-f0-9]{24}$/.test(job.linkId)
+        || (job.operationId !== undefined && (typeof job.operationId !== 'string' || !/^[a-f0-9]{24}$/.test(job.operationId)))
+        || job.desiredSaved !== true) {
+        throw Object.assign(new Error('Durable mutation acceptance was not confirmed'), {
+            code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
+        });
+    }
+    return { linkId: job.linkId, desiredSaved: true, job,
+        ...(job.createdLinkId ? { createdLinkId: job.createdLinkId } : {}),
+        ...(job.operationId ? { operationId: job.operationId } : {}),
+        ...(autoDeploy ? { autoDeployJob: job } : {}),
+        acceptedTopologyRevision: job.acceptanceRevision };
+}
+
+function requireIntentKey(req) {
+    const key = req.get('Idempotency-Key');
+    if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(key)) {
+        throw new RequestValidationError('A valid Idempotency-Key is required', undefined, 'INVALID_IDEMPOTENCY_KEY');
+    }
+    return key;
+}
+
+async function readPersistedIntent(service, Link, requestKey) {
+    if (!service.TopologyCreateIntent || service.TopologyCreateIntent.db !== Link.db) {
+        throw Object.assign(new Error('Durable intent lookup is unavailable'), { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
+    }
+    return service.TopologyCreateIntent.findOne({ requestKey })
+        .read('primary').readConcern('majority').maxTimeMS(5000).lean();
 }
 
 async function listLinks(Link, filter = {}) {
@@ -266,8 +320,24 @@ async function listLinks(Link, filter = {}) {
         .lean();
 }
 
+function projectLinkLifecycle(link) {
+    const { applicationState, routeState, tunnelState, clientReadiness, pppReadiness, xrayReadiness, ...publicLink } = link;
+    const deleting = link.lifecycle?.state === 'deleting';
+    // Lifecycle status is not a fresh client/route proof. In particular, never
+    // reconstruct a complete applied path from mutable desired neighbours.
+    return { ...publicLink,
+        desiredVersion: linkDesiredVersion({ ...link,
+            portalNode: scopedLinkEntityId(link.portalNode), bridgeNode: scopedLinkEntityId(link.bridgeNode) }),
+        applicationState: deleting ? 'deleting'
+            : CONFIRMED_DEPLOYED_LINK_STATUSES.has(link.status) ? 'applied'
+                : ['offline', 'error'].includes(link.status) ? 'reconcile_required' : 'not_applied',
+        routeState: 'unknown',
+        tunnelState: link.status === 'online' ? 'connected' : link.status === 'offline' ? 'disconnected' : 'unknown',
+    };
+}
+
 async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
-    revisions, filter = {}, includeClientReadiness = false }) {
+    revisions, filter = {}, includeClientReadiness = false, readLinkApplicationState }) {
     const linksPromise = listLinks(Link, filter);
     let topologyRevision;
     let deployedRevision;
@@ -281,19 +351,19 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
         topologyRevision = state?.revision ?? 0;
         deployedRevision = state?.deployedRevision ?? 0;
     }
-    let links = (await linksPromise) || [];
-    if (includeClientReadiness) {
+    let links = ((await linksPromise) || []).map(projectLinkLifecycle);
+    if (includeClientReadiness && typeof readLinkApplicationState !== 'function') {
         // Never trust a link-local/legacy ready flag. Only a durable, successful
         // client probe scoped to this exact live revision pair can paint green.
         links = links.map(({ clientReadiness, ...link }) => link);
-        const onlineIds = links.filter(link => link.active === true && link.status === 'online')
+        const onlineIds = links.filter(link => link.active === true && link.status === 'online' && !link.lifecycle)
             .map(link => String(link._id));
         if (onlineIds.length > 0 && ClientProofOperation?.find) {
             try {
                 const operations = await ClientProofOperation.find({
                     topologyRevision,
                     linkIds: { $in: onlineIds },
-                }).select('status clientReadiness kind topologyRevision priorDeployedRevision clientProofRevision linkIds')
+                }).select('status clientReadiness kind admissionScope topologyRevision priorDeployedRevision clientProofRevision linkIds')
                     .sort({ createdAt: -1, _id: -1 }).lean();
                 const verifiedIds = new Set();
                 const seenIds = new Set();
@@ -304,7 +374,10 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
                             && !seenIds.has(linkId))
                         : [];
                     for (const linkId of relevant) seenIds.add(linkId);
-                    if (operation.status !== 'succeeded' || operation.clientReadiness !== 'verified'
+                    // Selected freshness needs its settled profile/descriptor pins.
+                    // A global revision pair can neither validate nor invalidate it.
+                    if (operation.admissionScope === 'selected'
+                        || operation.status !== 'succeeded' || operation.clientReadiness !== 'verified'
                         || operation.topologyRevision !== topologyRevision
                         || operation.clientProofRevision !== topologyRevision) continue;
                     // Scoped success deliberately leaves deployedRevision at its
@@ -328,6 +401,39 @@ async function readLinkSnapshot({ Link, TopologyState, ClientProofOperation,
             }
         }
     }
+    if (typeof readLinkApplicationState === 'function') {
+        try {
+            // Trusted repository seam must validate selected settled-owner/profile
+            // pins. Neither request data nor a panel-wide revision can provide it.
+            const states = await readLinkApplicationState({ links: links.map(link => ({
+                linkId: String(link._id), desiredVersion: link.desiredVersion,
+            })) });
+            const byId = new Map();
+            const duplicates = new Set();
+            for (const state of Array.isArray(states) ? states : []) {
+                if (byId.has(state?.linkId)) duplicates.add(state.linkId);
+                byId.set(state?.linkId, state);
+            }
+            links = links.map(link => {
+                const state = byId.get(String(link._id));
+                if (!state || duplicates.has(String(link._id)) || state.desiredVersion !== link.desiredVersion
+                    || typeof state.operationId !== 'string' || !/^[a-f0-9]{24}$/.test(state.operationId)
+                    || !['not_applied', 'applying', 'applied', 'deleting', 'reconcile_required'].includes(state.applicationState)
+                    || !['complete', 'no_portal_input', 'no_bridge_exit', 'policy_ambiguous'].includes(state.routeState)
+                    || !['unknown', 'connected', 'disconnected'].includes(state.tunnelState)) return link;
+                const projected = { ...link, applicationState: link.lifecycle?.state === 'deleting' ? 'deleting' : state.applicationState,
+                    routeState: state.routeState, tunnelState: state.tunnelState, appliedOperationId: state.operationId,
+                    pppReadiness: state.pppReadiness === 'verified' ? 'verified' : 'unverified',
+                    xrayReadiness: state.xrayReadiness === 'verified' && state.applicationState === 'applied'
+                        && state.routeState === 'complete' && state.tunnelState === 'connected' ? 'verified' : 'unverified' };
+                delete projected.clientReadiness;
+                if (projected.xrayReadiness === 'verified' && projected.applicationState === 'applied') {
+                    projected.clientReadiness = { status: 'ready', clientProbe: 'passed', operationId: state.operationId };
+                }
+                return projected;
+            });
+        } catch (_) { logger.warn('[Cascade Links API] Selected application state unavailable'); }
+    }
     return { topologyRevision, deployedRevision, links };
 }
 
@@ -349,10 +455,21 @@ function sendError(res, error, operation, context = {}) {
         status = ERROR_STATUS_BY_CODE.get(code);
     }
     if (!status) {
-        logger.error(`[Cascade Links API] ${operation} error: ${error.message}`);
+        logger.error(`[Cascade Links API] ${operation}: INTERNAL_ERROR`);
         return res.status(500).json({
             error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
         });
+    }
+    if (code.startsWith('TOPOLOGY_INTENT_') || code === 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' || code === 'INVALID_IDEMPOTENCY_KEY') {
+        return res.status(status).json({ ...(context.desiredSaved ? { desiredSaved: true } : {}), error: { code,
+            message: code === 'INVALID_IDEMPOTENCY_KEY' ? 'A valid Idempotency-Key is required'
+                : code === 'TOPOLOGY_INTENT_BACKLOG_FULL' ? 'The deployment queue is full; retry later'
+                : code === 'TOPOLOGY_INTENT_KEY_CONFLICT' ? 'The request key belongs to different content'
+                    : code === 'TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT' ? 'The requested link version changed; reload the topology'
+                        : 'Durable deployment acceptance is unavailable',
+            phase: 'intent.accept', ...(context.linkId ? { linkId: context.linkId } : {}),
+            nextAction: error.code === 'TOPOLOGY_INTENT_BACKLOG_FULL' && !context.desiredSaved ? 'retry_later' : 'refresh_topology',
+        } });
     }
     if (code.startsWith('CLASSIC_DEPLOY_')) {
         // Known public codes are not permission to serialize transport text or
@@ -384,6 +501,7 @@ function createCascadeLinksRouter({
     TopologyState = CascadeTopologyState,
     RelayState = RelayL2tpState,
     ClientProofOperation = TopologyOperation,
+    readLinkApplicationState,
     topologyDraftWriteService,
     topologyIntentService,
     createDraftWriteService = createTopologyDraftWriteService,
@@ -436,10 +554,12 @@ function createCascadeLinksRouter({
 } = {}) {
     deploymentEnv = Object.freeze({ ...deploymentEnv });
     const router = express.Router();
-    const getIntentService = () => {
+    const getIntentService = (method = 'accept') => {
         const service = topologyIntentService === undefined
-            ? l2tpActiveHostProvider.getActiveHost()?.topologyIntentService : topologyIntentService;
-        if (typeof service?.accept !== 'function' && typeof service?.get !== 'function') {
+            ? (method === 'accept' ? l2tpActiveHostProvider.getActiveHost()?.selectedTopologyIntentService
+                : l2tpActiveHostProvider.getActiveHost()?.selectedTopologyIntentService
+                    ?? l2tpActiveHostProvider.getActiveHost()?.topologyIntentService) : topologyIntentService;
+        if (typeof service?.[method] !== 'function') {
             throw Object.assign(new Error('The supervised auto-deploy intent runtime is unavailable'), { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
         }
         return service;
@@ -591,6 +711,7 @@ function createCascadeLinksRouter({
             }
             return res.json(await readLinkSnapshot({
                 Link, TopologyState, ClientProofOperation, filter, includeClientReadiness: true,
+                readLinkApplicationState: readLinkApplicationState ?? l2tpActiveHostProvider.getActiveHost()?.readLinkApplicationState,
             }));
         } catch (error) {
             return sendError(res, error, 'List');
@@ -600,9 +721,9 @@ function createCascadeLinksRouter({
     router.get('/auto-deploy-jobs/:jobId', requireScope('nodes:read'), async (req, res) => {
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.jobId)) throw new RequestValidationError('Invalid job ID');
-            const job = await getIntentService().get(req.params.jobId);
+            const job = await getIntentService('get').get(req.params.jobId);
             if (!job) throw Object.assign(new Error('The auto-deploy job was not found'), { code: 'TOPOLOGY_INTENT_NOT_FOUND' });
-            return res.json({ autoDeployJob: job });
+            return res.json({ job, autoDeployJob: job });
         } catch (error) { return sendError(res, error, 'Get job'); }
     });
 
@@ -657,7 +778,15 @@ function createCascadeLinksRouter({
                 error.linkId = req.params.id;
                 throw error;
             }
-            return res.json(link);
+            const reader = readLinkApplicationState ?? l2tpActiveHostProvider.getActiveHost()?.readLinkApplicationState;
+            if (typeof reader === 'function') {
+                const snapshot = await readLinkSnapshot({ Link, TopologyState,
+                    filter: { _id: req.params.id }, readLinkApplicationState: reader });
+                const current = snapshot.links.find(candidate => String(candidate._id) === req.params.id);
+                if (!current) throw Object.assign(new Error('The cascade link was not found'), { code: 'CASCADE_LINK_NOT_FOUND' });
+                return res.json(current);
+            }
+            return res.json(projectLinkLifecycle(link));
         } catch (error) {
             return sendError(res, error, 'Get');
         }
@@ -730,18 +859,23 @@ function createCascadeLinksRouter({
                     'REALITY security is not compatible with WebSocket transport. Use TCP, gRPC, or SplitHTTP.',
                 );
             }
-            const [portalNode, bridgeNode] = await Promise.all([
+            const durableAutoDeploy = normalizeAutoDeploy(autoDeploy)
+                && !isClassicProductionDeploymentConfigured(deploymentEnv);
+            if (durableAutoDeploy) { getIntentService(); requireIntentKey(req); }
+            // v2 replay must precede mutable node defaults/existence checks too.
+            // The joined draft service validates endpoint inventory transactionally.
+            const [portalNode, bridgeNode] = durableAutoDeploy ? [] : await Promise.all([
                 Node.findById(portalNodeId),
                 Node.findById(bridgeNodeId),
             ]);
-            if (!portalNode) {
+            if (!durableAutoDeploy && !portalNode) {
                 throw new RequestValidationError(
                     'Portal node not found',
                     undefined,
                     'PORTAL_NODE_NOT_FOUND',
                 );
             }
-            if (!bridgeNode) {
+            if (!durableAutoDeploy && !bridgeNode) {
                 throw new RequestValidationError(
                     'Bridge node not found',
                     undefined,
@@ -762,12 +896,12 @@ function createCascadeLinksRouter({
                 );
             }
             const link = {
-                _id: new mongoose.Types.ObjectId(),
+                ...(!durableAutoDeploy ? { _id: new mongoose.Types.ObjectId() } : {}),
                 name,
                 mode: linkMode,
                 portalNode: portalNodeId,
                 bridgeNode: bridgeNodeId,
-                tunnelUuid: tunnelUuid || crypto.randomUUID(),
+                ...(tunnelUuid ? { tunnelUuid } : !durableAutoDeploy ? { tunnelUuid: crypto.randomUUID() } : {}),
                 tunnelPort: port,
                 tunnelDomain: tunnelDomain || 'reverse.tunnel.internal',
                 tunnelProtocol: protocol,
@@ -795,7 +929,7 @@ function createCascadeLinksRouter({
                     realityPublicKey,
                     realityShortIds,
                     realityFingerprint,
-                }, bridgeNode));
+                }, bridgeNode, { generate: !durableAutoDeploy }));
             }
             if (geoRouting && typeof geoRouting === 'object') {
                 link.geoRouting = {
@@ -871,21 +1005,20 @@ function createCascadeLinksRouter({
                 return res.status(201).json({
                     ...finalSnapshot,
                     ...autoDeploy,
-                    createdLinkId: String(link._id),
+                    createdLinkId: String(link._id), desiredSaved: true,
                 });
             }
             if (link.autoDeploy === true) {
-                const { digest } = require('../modules/relay-l2tp/services/topologyIntentService');
-                const { expectedTopologyRevision: ignoredRevision, ...requestPayload } = req.body;
+                if (security === 'reality' && typeof getIntentService().dependencies?.prepareLink !== 'function') {
+                    throw Object.assign(new Error('Durable REALITY credential preparation is unavailable'), { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' });
+                }
                 const job = await getIntentService().accept({
-                    expectedTopologyRevision, link,
+                    version: 2, kind: 'link.create', expectedTopologyRevision, link,
                     requestKey: req.get('Idempotency-Key'),
-                    payloadHash: digest(requestPayload),
                 });
-                return res.status(202).json({
-                    autoDeployJob: job,
-                    acceptedTopologyRevision: job.acceptanceRevision,
-                });
+                const body = acceptedIntentResponse(job, { autoDeploy: true });
+                await invalidateCaches();
+                return res.status(202).json(body);
             }
             const revisions = await getWriteService().createLink({
                 expectedTopologyRevision,
@@ -897,7 +1030,7 @@ function createCascadeLinksRouter({
                 ? { ...revisions, revision: maintenance.revision } : revisions;
             const snapshot = await readLinkSnapshot({ Link, TopologyState, revisions: finalRevisions });
             logger.info(`[Cascade Links API] Created ${linkMode} link ${name}: ${portalNode.name} -> ${bridgeNode.name}`);
-            return res.status(201).json({ ...snapshot, createdLinkId: String(link._id) });
+            return res.status(201).json({ ...snapshot, createdLinkId: String(link._id), desiredSaved: true });
         } catch (error) {
             return sendError(res, error, 'Create', {
                 revision: req.body?.expectedTopologyRevision });
@@ -905,6 +1038,7 @@ function createCascadeLinksRouter({
     });
 
     router.put('/:id', requireScope('nodes:write'), async (req, res) => {
+        let desiredSaved = false;
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
                 throw new RequestValidationError(
@@ -931,6 +1065,9 @@ function createCascadeLinksRouter({
             if (changes.autoDeploy !== undefined) {
                 changes.autoDeploy = normalizeAutoDeploy(changes.autoDeploy);
             }
+            const durableAutoDeploy = changes.autoDeploy === true
+                && !isClassicProductionDeploymentConfigured(deploymentEnv);
+            if (durableAutoDeploy) { getIntentService(); requireIntentKey(req); }
             if (changes.tunnelProtocol !== undefined
                 && !TUNNEL_PROTOCOLS.has(changes.tunnelProtocol)) {
                 throw new RequestValidationError('tunnelProtocol must be "vless" or "vmess"');
@@ -947,7 +1084,7 @@ function createCascadeLinksRouter({
                 || req.body?.realitySni !== undefined
                 || req.body?.realityShortIds !== undefined;
             let currentLink = null;
-            if (needsCurrentLink) {
+            if (needsCurrentLink || durableAutoDeploy || !isClassicProductionDeploymentConfigured(deploymentEnv)) {
                 currentLink = await Link.findById(req.params.id);
                 if (!currentLink) {
                     const error = new Error('The cascade link was not found');
@@ -955,8 +1092,18 @@ function createCascadeLinksRouter({
                     error.linkId = req.params.id;
                     throw error;
                 }
+                if (currentLink.lifecycle?.state === 'deleting') {
+                    throw Object.assign(new Error('The cascade link is being deleted'), { code: 'CASCADE_LINK_DELETING' });
+                }
             }
 
+            // Resolve a persisted PUT key before any local REALITY generation.
+            const existingIntent = durableAutoDeploy
+                ? await readPersistedIntent(getIntentService(), Link, requireIntentKey(req)) : null;
+            if (existingIntent && (existingIntent.version !== 2 || existingIntent.kind !== 'link.apply'
+                || String(existingIntent.linkId) !== req.params.id)) {
+                throw Object.assign(new Error('The request key belongs to a different mutation'), { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
+            }
             if (changes.tunnelPort !== undefined) {
                 const port = parseInt(changes.tunnelPort, 10);
                 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -1026,19 +1173,19 @@ function createCascadeLinksRouter({
                     realitySni: changes.realitySni !== undefined
                         ? changes.realitySni
                         : currentLink?.realitySni,
-                    realityPrivateKey: changes.realityPrivateKey !== undefined
+                    realityPrivateKey: changes.realityPrivateKey !== undefined && (!durableAutoDeploy || changes.realityPrivateKey)
                         ? changes.realityPrivateKey
                         : currentLink?.realityPrivateKey,
-                    realityPublicKey: changes.realityPublicKey !== undefined
+                    realityPublicKey: changes.realityPublicKey !== undefined && (!durableAutoDeploy || changes.realityPublicKey)
                         ? changes.realityPublicKey
                         : currentLink?.realityPublicKey,
-                    realityShortIds: changes.realityShortIds !== undefined
+                    realityShortIds: changes.realityShortIds !== undefined && (!durableAutoDeploy || changes.realityShortIds.some(Boolean))
                         ? changes.realityShortIds
                         : currentLink?.realityShortIds,
                     realityFingerprint: changes.realityFingerprint !== undefined
                         ? changes.realityFingerprint
                         : currentLink?.realityFingerprint,
-                }, targetNode));
+                }, targetNode, { generate: !existingIntent }));
                 // Only a new link or a changed fingerprint adopts the Random
                 // default. Preserve a legacy value even if an edit resubmits it.
                 if (req.body?.realityFingerprint === undefined) {
@@ -1048,6 +1195,53 @@ function createCascadeLinksRouter({
                 }
             }
 
+            if (durableAutoDeploy) {
+                const raw = typeof currentLink.toObject === 'function' ? currentLink.toObject() : currentLink;
+                const candidate = JSON.parse(JSON.stringify(raw));
+                for (const [key, value] of Object.entries(changes)) {
+                    const parts = key.split('.');
+                    if (parts.length === 1) candidate[key] = value;
+                    else { candidate[parts[0]] = { ...candidate[parts[0]], [parts[1]]: value }; }
+                }
+                const normalized = new Link(candidate).toObject();
+                if (normalized.active === false) throw Object.assign(new Error('The cascade link is disabled'), { code: 'CASCADE_LINK_DISABLED' });
+                const service = getIntentService();
+                // Use the real service's injected persistence model. A replay
+                // conflict must be detected BEFORE changing the desired row.
+                const existing = existingIntent;
+                if (existing) {
+                    if (existing.version !== 2 || existing.kind !== 'link.apply'
+                        || String(existing.linkId) !== req.params.id
+                        || existing.desiredVersion !== linkDesiredVersion(normalized)) {
+                        throw Object.assign(new Error('The request key belongs to a different mutation'), { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
+                    }
+                    const job = await service.accept({ version: 2, kind: 'link.apply',
+                        expectedTopologyRevision, requestKey: requireIntentKey(req), linkId: req.params.id,
+                        desiredVersion: existing.desiredVersion });
+                    return res.status(202).json(acceptedIntentResponse(job, { autoDeploy: true }));
+                }
+                // An identical retry must reach persisted-key replay before the
+                // draft revision CAS, not save the same edit a second time.
+                let intentRevision = expectedTopologyRevision;
+                if (linkDesiredVersion(raw) !== linkDesiredVersion(normalized)
+                    || raw.autoDeploy !== normalized.autoDeploy) {
+                    const revisions = await getWriteService().updateLink({ expectedTopologyRevision,
+                        linkId: req.params.id, changes });
+                    intentRevision = revisions.revision;
+                }
+                const saved = await Link.findById(req.params.id).lean();
+                if (!saved || linkDesiredVersion(saved) !== linkDesiredVersion(normalized)) {
+                    throw Object.assign(new Error('The requested desired version changed'), { code: 'TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT' });
+                }
+                desiredSaved = true;
+                const job = await getIntentService().accept({ version: 2, kind: 'link.apply',
+                    expectedTopologyRevision: intentRevision,
+                    requestKey: requireIntentKey(req), linkId: req.params.id,
+                    desiredVersion: linkDesiredVersion(saved) });
+                const body = acceptedIntentResponse(job, { autoDeploy: true });
+                await invalidateCaches();
+                return res.status(202).json(body);
+            }
             const revisions = await getWriteService().updateLink({
                 expectedTopologyRevision,
                 linkId: req.params.id,
@@ -1077,7 +1271,7 @@ function createCascadeLinksRouter({
                 TopologyState,
                 revisions: finalRevisions,
             });
-            let body = { ...snapshot };
+            let body = { ...snapshot, desiredSaved: true };
             // Only this PUT's explicit opt-in may queue; persisted metadata on
             // another edit is never an instruction to activate the link.
             if (changes.autoDeploy === true) {
@@ -1142,7 +1336,7 @@ function createCascadeLinksRouter({
             return res.json(body);
         } catch (error) {
             return sendError(res, error, 'Update', {
-                revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
+                revision: req.body?.expectedTopologyRevision, linkId: req.params.id, desiredSaved });
         }
     });
 
@@ -1159,8 +1353,29 @@ function createCascadeLinksRouter({
             // A draft-only delete can strand live classic configuration. The
             // lifecycle coordinator owns checked removal and atomic settlement,
             // even when issuing new durable grants is disabled.
-            const deletionService = isClassicProductionDeploymentConfigured(deploymentEnv)
-                ? getTopologyCoordinator() : getWriteService();
+            if (!isClassicProductionDeploymentConfigured(deploymentEnv)) {
+                const service = getIntentService();
+                const link = await Link.findById(req.params.id).lean();
+                const existing = !link ? await readPersistedIntent(service, Link, requireIntentKey(req)) : null;
+                if (existing && (existing.version !== 2 || existing.kind !== 'link.delete' || String(existing.linkId) !== req.params.id)) {
+                    throw Object.assign(new Error('The request key belongs to a different mutation'), { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
+                }
+                const desiredVersion = req.body?.desiredVersion ?? (link ? linkDesiredVersion(link) : existing?.desiredVersion);
+                if (!link && !desiredVersion) throw Object.assign(new Error('The cascade link was not found'), { code: 'CASCADE_LINK_NOT_FOUND' });
+                if (typeof desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(desiredVersion)) throw new RequestValidationError('Invalid desired link version');
+                // Pending/offline/error is NOT evidence of never-dispatched work.
+                // Without an authoritative history proof, always use durable cleanup.
+                const job = await service.accept({ version: 2, kind: 'link.delete',
+                    expectedTopologyRevision, requestKey: req.get('Idempotency-Key'),
+                    linkId: req.params.id, desiredVersion });
+                const body = acceptedIntentResponse(job);
+                await invalidateCaches();
+                return res.status(202).json({ ...body,
+                    ...(['succeeded', 'failed'].includes(job.status) ? {} : {
+                        applicationState: job.status === 'blocked' ? 'reconcile_required' : 'deleting',
+                    }) });
+            }
+            const deletionService = getTopologyCoordinator();
             if (typeof deletionService?.deleteLink !== 'function') {
                 throw Object.assign(new Error('Checked cascade deletion is unavailable'), {
                     code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE',
@@ -1203,4 +1418,7 @@ module.exports.normalizeExpectedTopologyRevision = normalizeExpectedTopologyRevi
 module.exports.normalizeStringArray = normalizeStringArray;
 module.exports.readLinkSnapshot = readLinkSnapshot;
 module.exports.resolveRealitySettings = resolveRealitySettings;
+module.exports.prepareIntentLink = prepareIntentLink;
+module.exports.acceptedIntentResponse = acceptedIntentResponse;
+module.exports.readPersistedIntent = readPersistedIntent;
 module.exports.selectLinkApplyBaselineLinkIds = selectLinkApplyBaselineLinkIds;

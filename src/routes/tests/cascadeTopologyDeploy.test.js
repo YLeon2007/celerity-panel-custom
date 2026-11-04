@@ -15,8 +15,15 @@ const sshPool = require('../../services/sshPoolService');
 test.after(() => sshPool.closeAll());
 
 const {
-    createCascadeTopologyDeployRouter,
+    createCascadeTopologyDeployRouter: createRouter,
 } = require('../cascadeTopologyDeploy');
+// Historical direct-queue fixtures characterize legacy route orchestration only;
+// actual native v2 HTTP acceptance is in cascadeAnyOrderHttp (real services).
+const LEGACY_ENV = Object.freeze({ PANEL_DOMAIN: 'lm1.infograd.online',
+    L2TP_PRODUCTION_EXECUTION_ENABLED: 'true', L2TP_EXECUTION_ENABLED: 'true',
+    L2TP_MIGRATIONS_ENABLED: 'true', CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true',
+    TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'false', TOPOLOGY_TEST_EXECUTION_ENABLED: 'false' });
+const createCascadeTopologyDeployRouter = options => createRouter({ deploymentEnv: LEGACY_ENV, ...options });
 const { buildSpec } = require('../../docs/openapi');
 const { TopologyOperationCoordinator } = require('../../modules/relay-l2tp/services/topologyOperationCoordinator');
 
@@ -830,7 +837,8 @@ test('deployment API uses the module factory and returns a safe unavailable resp
         headers: { 'x-test-auth': 'api-write' },
     });
 
-    assert.strictEqual(factoryDependencies, models);
+    assert.deepEqual(factoryDependencies, { ...models, env: LEGACY_ENV });
+    assert.ok(Object.isFrozen(factoryDependencies.env));
     assert.equal(response.status, 503);
     assert.deepEqual(response.body, {
         error: {
@@ -1038,7 +1046,7 @@ test('operation status endpoint enforces authentication, nodes:read scope, and s
     // Read-only polling must never trip CSRF or the deploy rate limiter.
     assert.ok(!calls.includes('csrf'));
     assert.ok(!calls.includes('rate'));
-    assert.deepEqual(findCalls, ['507f1f77bcf86cd799439021', '507f1f77bcf86cd799439021']);
+    assert.deepEqual(findCalls, Array(4).fill('507f1f77bcf86cd799439021'));
 });
 
 test('operation status endpoint rejects malformed operation ids before touching the model', async () => {
@@ -1102,12 +1110,13 @@ test('operation status endpoint returns only the strict public projection', asyn
     assert.equal(response.status, 200);
     assert.deepEqual(projections, [
         'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason',
+        'admissionScope kind linkId waitingReason failedNodeId heldTopologyAdmission pppWait.relayNode',
     ]);
     assert.deepEqual(response.body, {
         operationId: '507f1f77bcf86cd799439021',
         status: 'committing',
         topologyRevision: 7,
-        clientReadiness: 'unverified',
+        clientReadiness: 'unverified', kind: 'link.apply', phase: 'applying',
     });
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.doesNotMatch(
@@ -1135,11 +1144,12 @@ test('operation status exposes verified client proof only for a live scoped revi
     const response = await requestOperationStatus(router, { headers: { 'x-test-auth': 'api-read' } });
     assert.equal(response.status, 200);
     assert.deepEqual(response.body, {
-        operationId: id, status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified',
+        operationId: id, status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified', kind: 'link.apply', phase: 'completed',
     });
     assert.deepEqual(stateCalls, ['singleton', 'revision deployedRevision']);
     assert.deepEqual(projections, [
         'status topologyRevision priorDeployedRevision kind clientReadiness clientProofRevision clientProofState clientProofReason',
+        'admissionScope kind linkId waitingReason failedNodeId heldTopologyAdmission pppWait.relayNode',
     ]);
     assert.doesNotMatch(JSON.stringify(response.body), /secret|candidate|nodes|clientProofReason/);
 });
@@ -1165,7 +1175,7 @@ test('operation status does not claim verified proof for stale, absent, or incon
         const response = await requestOperationStatus(router, { headers });
         assert.equal(response.status, 200);
         assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
-            topologyRevision: 7, clientReadiness: 'unverified' });
+            topologyRevision: 7, clientReadiness: 'unverified', kind: 'link.apply', phase: 'completed' });
     }
 });
 
@@ -1187,7 +1197,7 @@ test('operation status exposes only allowlisted unverified proof state, not arbi
         const response = await requestOperationStatus(router, { headers });
         assert.equal(response.status, 200);
         assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
-            topologyRevision: 7, clientReadiness: 'unverified',
+            topologyRevision: 7, clientReadiness: 'unverified', phase: 'completed',
             ...(expected ? { clientProofState: expected } : {}) });
         assert.doesNotMatch(JSON.stringify(response.body), /secret|candidate|nodes|clientProofReason/);
     }
@@ -1207,7 +1217,7 @@ test('operation status requires deployed revision for global proof', async () =>
         const response = await requestOperationStatus(router, { headers });
         assert.equal(response.status, 200);
         assert.deepEqual(response.body, { operationId: id, status: 'succeeded',
-            topologyRevision: 7, clientReadiness: readiness });
+            topologyRevision: 7, clientReadiness: readiness, phase: 'completed' });
     }
 });
 

@@ -24,7 +24,7 @@ async function request(router, body, method = 'POST', route = '/') {
         return { status: response.status, body: result };
     } finally { await new Promise(resolve => server.close(resolve)); }
 }
-test('autoDeploy accepts a persisted job without claiming a created link or advancing the draft', async () => {
+test('autoDeploy forwards normalized v2 create and projects confirmed link/job identity', async () => {
     let mutations = 0; let accepted;
     const router = createCascadeLinksRouter({
         Node: { findById: async id => ({ _id: id, name: id }) },
@@ -33,7 +33,9 @@ test('autoDeploy accepts a persisted job without claiming a created link or adva
         TopologyState: { findById: () => ({ select() { return this; }, lean: async () => ({ revision: 7 }) }) },
         topologyIntentService: { async accept(input) {
             accepted = input;
-            return { jobId: '507f1f77bcf86cd799439040', status: 'waiting', acceptanceRevision: 7 };
+            return { jobId: '507f1f77bcf86cd799439040', status: 'waiting', acceptanceRevision: 7,
+                version: 2, kind: 'link.create', linkId: '507f1f77bcf86cd799439041',
+                createdLinkId: '507f1f77bcf86cd799439041', desiredSaved: true };
         } },
         maintainAutoL2tpPathsFn: async () => undefined,
         prepareL2tpIngressFn: async () => ({ revision: 8 }),
@@ -46,7 +48,11 @@ test('autoDeploy accepts a persisted job without claiming a created link or adva
     });
     assert.equal(result.status, 202, JSON.stringify(result.body));
     assert.equal(mutations, 0);
-    assert.equal(result.body.createdLinkId, undefined);
+    assert.equal(result.body.createdLinkId, '507f1f77bcf86cd799439041');
+    assert.equal(result.body.desiredSaved, true);
+    assert.equal(accepted.version, 2); assert.equal(accepted.kind, 'link.create');
+    assert.equal(accepted.link._id, undefined); assert.equal(accepted.link.tunnelUuid, undefined);
+    assert.deepEqual(result.body.job, result.body.autoDeployJob);
     assert.equal(result.body.autoDeployOperation, undefined);
     assert.equal(result.body.autoDeployJob.jobId, '507f1f77bcf86cd799439040');
     assert.equal(accepted.requestKey, 'rapid-1');
@@ -75,5 +81,5 @@ test('accepted job status is queryable without pretending its proposed link exis
     const router = createCascadeLinksRouter({ topologyIntentService: { get: async id => { assert.equal(id, jobId); return job; } } });
     const result = await request(router, undefined, 'GET', `/auto-deploy-jobs/${jobId}`);
     assert.equal(result.status, 200, JSON.stringify(result.body));
-    assert.deepEqual(result.body, { autoDeployJob: job });
+    assert.deepEqual(result.body, { job, autoDeployJob: job });
 });
