@@ -176,6 +176,12 @@ function durablePlan(operation, operationId) {
             groupId: operation.groupId,
             pathKey: operation.pathKey,
             ownerNodeId: operation.ownerNodeId,
+            // The legacy coordinator/repository also persist these attach pins.
+            // Do not discard them and turn an owned ingress proof into a legacy
+            // unowned probe. No selected snapshot is inferred for an old row.
+            ...(operation.ownerTopologyRevision !== undefined ? { ownerTopologyRevision: operation.ownerTopologyRevision } : {}),
+            ...(operation.ownerCredentialRevision !== undefined ? { ownerCredentialRevision: operation.ownerCredentialRevision } : {}),
+            ...(operation.newPathLinkIds !== undefined ? { newPathLinkIds: [...operation.newPathLinkIds] } : {}),
         } : {}),
         // Only the durable scoped link.apply identity can authorize a PPP skip.
         ...(operation.kind === 'link.apply' && operation.staged === true ? { staged: true } : {}),
