@@ -136,6 +136,9 @@ function desiredFingerprint(shouldShip, settings, tokenHash, node) {
  * unrelated settings saves never restart Xray on the fleet.
  */
 async function reconcileNode(node, settings) {
+    const writerEnv = Object.freeze({ ...process.env });
+    const { APPLIED_LINK_STATUSES, usesTestTopologyConfig, topologyManagesNodeConfig } = require('../topologyConfigOwnership');
+    const allowedStatuses = usesTestTopologyConfig(node, writerEnv) ? APPLIED_LINK_STATUSES : undefined;
     const HyNode = require('../../models/hyNodeModel');
     const shouldShip = nodeShouldShip(node, settings);
 
@@ -202,29 +205,65 @@ async function reconcileNode(node, settings) {
         // main client-facing Xray config here.
         const fresh = await HyNode.findById(node._id).select('+ssh.password +ssh.privateKey');
         if (fresh.cascadeRole === 'bridge') {
+            // Logging is not authority to replace a managed profile. Leave the
+            // applied fingerprint untouched so the setting remains unapplied.
+            if (await topologyManagesNodeConfig(fresh, writerEnv)) {
+                throw new Error('CLASSIC_CONFIG_WRITE_OWNER_VETO');
+            }
             const CascadeLink = require('../../models/cascadeLinkModel');
             const NodeSSH = require('../nodeSSH');
             const nodeSetup = require('../nodeSetup');
             const configGenerator = require('../configGenerator');
-            const links = await CascadeLink.find({
+            const { withClassicNodeConfigWrite, assertClassicNodeConfigWriteHeld } = require('../classicNodeConfigWrite');
+            const { resolveL2tpExecutionAuthorization } = require('../../modules/relay-l2tp/domain/l2tpExecutionAuthorization');
+            const fenced = resolveL2tpExecutionAuthorization(writerEnv).enableInstallAdmission;
+            // Use only the existing paired TEST selection policy. Missing legacy
+            // PROD status/receipts are not evidence that a working peer is absent.
+            const readLinks = () => CascadeLink.find({
                 bridgeNode: fresh._id,
                 active: true,
                 mode: { $ne: 'forward' },
+                ...(allowedStatuses ? { status: { $in: allowedStatuses } } : {}),
             }).populate('portalNode');
-            if (links.length === 0) throw new Error('No active reverse links for bridge access logging');
-            const bridgeConfig = configGenerator.generateCombinedBridgeConfig(links, {
-                accessLog: shouldShip ? accessLogPathForNode(fresh) : undefined,
+            if (!(await readLinks()).length) throw new Error('No active reverse links for bridge access logging');
+            const completed = await withClassicNodeConfigWrite({ nodeId: fresh._id, kind: 'access-logs-bridge', env: writerEnv }, async () => {
+                const links = await readLinks();
+                if (links.length === 0) throw new Error('No active reverse links for bridge access logging');
+                const bridgeConfig = configGenerator.generateCombinedBridgeConfig(links, {
+                    accessLog: shouldShip ? accessLogPathForNode(fresh) : undefined,
+                });
+                const ssh = new NodeSSH(fresh);
+                let completionFailed = false;
+                // Check nested agent-config effects too. A swallowed transport
+                // failure must not become the helper's exact-success receipt.
+                if (fenced) {
+                    for (const method of ['exec', 'uploadContent']) {
+                        const dispatch = ssh[method].bind(ssh);
+                        ssh[method] = async (...args) => {
+                            try {
+                                await assertClassicNodeConfigWriteHeld(fresh._id);
+                                const result = await dispatch(...args);
+                                if (method === 'exec' ? result?.code !== 0 : result !== undefined) {
+                                    throw new Error('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
+                                }
+                                return result;
+                            } catch (error) { completionFailed = true; throw error; }
+                        };
+                    }
+                }
+                try {
+                    await assertClassicNodeConfigWriteHeld(fresh._id);
+                    await ssh.connect();
+                    await ssh.exec('mkdir -p /var/log/xray-bridge && chown nobody:nogroup /var/log/xray-bridge');
+                    await ssh.uploadContent(bridgeConfig, '/usr/local/etc/xray-bridge/config.json');
+                    await ssh.exec('chown root:root /usr/local/etc/xray-bridge/config.json && chmod 644 /usr/local/etc/xray-bridge/config.json && systemctl restart xray-bridge');
+                    await nodeSetup.reloadCcAgent(fresh, ssh);
+                } finally {
+                    ssh.disconnect();
+                }
+                return !completionFailed;
             });
-            const ssh = new NodeSSH(fresh);
-            await ssh.connect();
-            try {
-                await ssh.exec('mkdir -p /var/log/xray-bridge && chown nobody:nogroup /var/log/xray-bridge');
-                await ssh.uploadContent(bridgeConfig, '/usr/local/etc/xray-bridge/config.json');
-                await ssh.exec('chown root:root /usr/local/etc/xray-bridge/config.json && chmod 644 /usr/local/etc/xray-bridge/config.json && systemctl restart xray-bridge');
-                await nodeSetup.reloadCcAgent(fresh, ssh);
-            } finally {
-                ssh.disconnect();
-            }
+            if (completed !== true) throw new Error('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
         } else {
             const syncService = require('../syncService');
             await syncService.updateXrayNodeConfig(fresh);
@@ -285,10 +324,10 @@ async function reconcileAll() {
 
         const anyError = results.some(r => r.status === 'error');
         let globalState;
-        if (!wantEnabled) {
-            globalState = 'disabled';
-        } else if (anyError) {
+        if (anyError) {
             globalState = 'error';
+        } else if (!wantEnabled) {
+            globalState = 'disabled';
         } else {
             globalState = 'active';
         }
