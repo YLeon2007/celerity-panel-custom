@@ -16,6 +16,38 @@ function desiredLinkPayload(link) {
 }
 // Content-addressed desired version: ordinary updateOne does not increment __v.
 function linkDesiredVersion(link) { return digest(desiredLinkPayload(link)); }
+// A PUT fingerprint describes the requested patch, not today's desired row or
+// generated secrets. Cast only explicitly supplied fields; defaults must not
+// turn a partial edit into an overwrite or change a restart replay fingerprint.
+function normalizedLinkChanges(Link, changes) {
+    if (!changes || typeof changes !== 'object' || Array.isArray(changes)) throw intentError('INVALID_TOPOLOGY_INTENT');
+    const allowed = new Set([...DESIRED_LINK_FIELDS, 'autoDeploy',
+        'geoRouting.enabled', 'geoRouting.domains', 'geoRouting.geoip']);
+    if (Object.keys(changes).some(key => !allowed.has(key) || changes[key] === undefined)
+        || (changes.geoRouting !== undefined && Object.keys(changes).some(key => key.startsWith('geoRouting.')))) {
+        throw intentError('INVALID_TOPOLOGY_INTENT');
+    }
+    const document = new Link({ _id: '000000000000000000000000', ...changes });
+    const error = document.validateSync(Object.keys(changes).filter(key =>
+        key !== 'tunnelUuid' || typeof changes[key] !== 'string' || changes[key].trim()));
+    if (error) throw error;
+    return JSON.parse(JSON.stringify(Object.fromEntries(Object.keys(changes).map(key => [key, document.get(key)]))));
+}
+function applyLinkChanges(link, changes) {
+    const candidate = JSON.parse(JSON.stringify(link));
+    // The preparation callback owns its candidate, never the frozen request
+    // arrays/objects retained in the intent payload and fingerprint.
+    for (const [key, value] of Object.entries(JSON.parse(JSON.stringify(changes)))) {
+        // Empty credential controls mean preserve, not generate a new tuple.
+        if (['tunnelUuid', 'realityPrivateKey', 'realityPublicKey'].includes(key)
+            && typeof value === 'string' && !value.trim()) continue;
+        if (key === 'realityShortIds' && !value.some(Boolean)) continue;
+        const parts = key.split('.');
+        if (parts.length === 1) candidate[key] = value;
+        else candidate[parts[0]] = { ...candidate[parts[0]], [parts[1]]: value };
+    }
+    return candidate;
+}
 function resourceIds(ids) {
     if (!Array.isArray(ids) || !ids.length || ids.length > 128
         || ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id))) {
@@ -80,26 +112,33 @@ class TopologyIntentService {
         if (input.kind !== undefined && input.kind !== 'link.create') return Promise.reject(intentError('INVALID_TOPOLOGY_INTENT'));
         return this.acceptLegacy(input);
     }
-    // v2 create accepts normalized user fields BEFORE credential generation.
-    // apply/delete require linkDesiredVersion(rawPersistedLink), a content pin.
+    // v2 create and explicit apply+changes accept normalized user fields BEFORE
+    // credential generation. Ordinary apply/delete retain their content-pin API.
     // prepareLink is an optional LOCAL credential generator, never a remote preflight.
-    async acceptVersioned({ kind, expectedTopologyRevision, requestKey, link, linkId, desiredVersion, payloadHash } = {}) {
+    async acceptVersioned({ kind, expectedTopologyRevision, requestKey, link, linkId, desiredVersion, changes, payloadHash } = {}) {
         if (!INTENT_KINDS.has(kind) || payloadHash !== undefined) throw intentError('INVALID_TOPOLOGY_INTENT');
         if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) throw intentError('INVALID_TOPOLOGY_REVISION');
         if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw intentError('INVALID_IDEMPOTENCY_KEY');
-        let normalized;
+        let normalized, normalizedChanges;
+        const editing = kind === 'link.apply' && changes !== undefined;
+        if (changes !== undefined && !editing) throw intentError('INVALID_TOPOLOGY_INTENT');
         if (kind === 'link.create') {
             if (!link || typeof link !== 'object' || Array.isArray(link) || linkId !== undefined || desiredVersion !== undefined) throw intentError('INVALID_TOPOLOGY_INTENT');
             // Fixed placeholder prevents even ObjectId generation before persisted-key lookup.
             normalized = desiredLinkPayload(new this.CascadeLink({ ...link,
                 _id: link._id ?? '000000000000000000000000', active: true }).toObject());
             if (link._id !== undefined) normalized._id = String(link._id);
-        } else if (link !== undefined || typeof linkId !== 'string' || !/^[a-f0-9]{24}$/.test(linkId)
-            || typeof desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(desiredVersion)) {
-            throw intentError('INVALID_TOPOLOGY_INTENT');
+        } else {
+            if (link !== undefined || typeof linkId !== 'string' || !/^[a-f0-9]{24}$/.test(linkId)
+                || (editing ? desiredVersion !== undefined
+                    : typeof desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(desiredVersion))) {
+                throw intentError('INVALID_TOPOLOGY_INTENT');
+            }
+            if (editing) normalizedChanges = normalizedLinkChanges(this.CascadeLink, changes);
         }
-        const fingerprint = digest({ version: 2, kind, ...(normalized ? { link: normalized } : { linkId, desiredVersion }) });
-        if (Buffer.byteLength(JSON.stringify(normalized || {})) > 32768) throw intentError('TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE');
+        const fingerprint = digest({ version: 2, kind, ...(normalized ? { link: normalized }
+            : editing ? { linkId, changes: normalizedChanges } : { linkId, desiredVersion }) });
+        if (Buffer.byteLength(JSON.stringify(normalized || normalizedChanges || {})) > 32768) throw intentError('TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE');
         const findExisting = async (session, confirmDurable = false) => {
             const query = this.TopologyCreateIntent.findOne({ requestKey }).session(session);
             if (confirmDurable) query.readConcern('majority').read('primary').maxTimeMS(5000);
@@ -112,15 +151,21 @@ class TopologyIntentService {
             return await this.transactionRunner(async session => {
                 const existing = await findExisting(session);
                 if (existing) return publicIntent(existing);
-                if (kind === 'link.create') {
+                if (kind === 'link.create' || editing) {
                     if (['HyNode', 'CascadeRouteGroup', 'RelayL2tpState'].some(name => this.dependencies[name]?.db !== this.CascadeLink.db)) {
                         throw intentError('TOPOLOGY_INTENT_DRAFT_CONNECTION_MISMATCH');
                     }
+                }
+                if (kind === 'link.create') {
                     // Scoped commitDraft acknowledges its own runner before returning;
                     // that wrapper cannot own an outer transaction's commit lifetime.
                     const writer = this.dependencies.intentDraftWriter;
                     if ((writer !== undefined && (writer?.db !== this.CascadeLink.db || typeof writer?.createLink !== 'function'))
                         || (this.dependencies.withScopedNodeLocks && !writer)) throw intentError('TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE');
+                }
+                if (editing && (this.dependencies.intentDraftWriter?.db !== this.CascadeLink.db
+                    || typeof this.dependencies.intentDraftWriter?.updateLink !== 'function')) {
+                    throw intentError('TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE');
                 }
                 if (typeof this.dependencies.resolveIntentResources !== 'function') throw intentError('TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE');
                 const state = await this.CascadeTopologyState.findOneAndUpdate(
@@ -167,7 +212,34 @@ class TopologyIntentService {
                 } else {
                     target = await this.CascadeLink.findById(linkId).session(session).lean();
                     if (!target) throw intentError('CASCADE_LINK_NOT_FOUND');
-                    if (linkDesiredVersion(target) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+                    if (editing) {
+                        if (target.lifecycle?.state === 'deleting') throw intentError('CASCADE_LINK_DELETING');
+                        let candidate = applyLinkChanges(target, normalizedChanges);
+                        if (candidate.tunnelSecurity === 'reality' && candidate.tunnelTransport === 'ws') throw intentError('INVALID_TOPOLOGY_INTENT');
+                        if (candidate.tunnelSecurity === 'reality' && typeof this.dependencies.prepareLink !== 'function') {
+                            throw intentError('TOPOLOGY_INTENT_PREPARATION_UNAVAILABLE');
+                        }
+                        // Only a new acceptance may generate credentials. Both the
+                        // lookup and the final tombstone check use this transaction.
+                        if (this.dependencies.prepareLink) candidate = await this.dependencies.prepareLink(candidate);
+                        const document = new this.CascadeLink(candidate);
+                        await document.validate();
+                        candidate = JSON.parse(JSON.stringify(document.toObject()));
+                        if (!candidate.active) throw intentError('CASCADE_LINK_DISABLED');
+                        if (!Number.isInteger(candidate.tunnelPort) || candidate.tunnelPort < 1 || candidate.tunnelPort > 65535) throw intentError('INVALID_TOPOLOGY_INTENT');
+                        const listener = value => String(value[(value.mode || 'reverse') === 'forward' ? 'bridgeNode' : 'portalNode']);
+                        const siblings = await this.CascadeLink.find({ active: true, tunnelPort: candidate.tunnelPort,
+                            _id: { $ne: linkId } }).session(session).lean();
+                        if (siblings.some(row => listener(row) === listener(candidate))) throw intentError('CASCADE_LINK_CONFLICT');
+                        const saved = await this.dependencies.intentDraftWriter.updateLink({
+                            expectedTopologyRevision, linkId, changes: { ...desiredLinkPayload(candidate), autoDeploy: true }, session,
+                        });
+                        const persisted = await this.CascadeLink.findById(linkId).session(session).lean();
+                        if (saved?.revision !== expectedTopologyRevision + 1 || !persisted
+                            || linkDesiredVersion(persisted) !== linkDesiredVersion(candidate)) throw intentError('TOPOLOGY_INTENT_DRAFT_BINDING_INVALID');
+                        target = persisted;
+                        desiredVersion = linkDesiredVersion(target);
+                    } else if (linkDesiredVersion(target) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
                 }
                 const resourceNodeIds = resourceIds(await this.dependencies.resolveIntentResources({ kind, link: target, desiredVersion, session }));
                 if (kind === 'link.delete') {
@@ -183,7 +255,7 @@ class TopologyIntentService {
                 const [row] = await this.TopologyCreateIntent.create([{
                     _id: jobId, executionContext: this.#executionContext, requestKey, version: 2, kind,
                     linkId, desiredVersion, resourceNodeIds, payloadHash: fingerprint,
-                    payload: { kind, linkId, desiredVersion }, ordinal: counted.ordinal,
+                    payload: { kind, linkId, desiredVersion, ...(editing ? { changes: normalizedChanges } : {}) }, ordinal: counted.ordinal,
                     ...(kind === 'link.create' ? { createdLinkId: linkId } : {}),
                     acceptanceRevision: expectedTopologyRevision, status: 'waiting', attempts: 0, generation: 0,
                 }], { session });

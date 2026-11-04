@@ -49,6 +49,8 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['TOPOLOGY_REPLACEMENT_RESERVED', 409],
     ['INVALID_TOPOLOGY_DRAFT', 422],
     ['TOPOLOGY_DEPLOY_BUSY', 409],
+    ['TOPOLOGY_ADMISSION_UNAVAILABLE', 409],
+    ['NODE_OPERATION_LOCK_CONFLICT', 409],
     ['TOPOLOGY_DEPLOYMENT_UNAVAILABLE', 503],
     ['CLASSIC_DEPLOY_UNSUPPORTED', 409],
     ['CLASSIC_DEPLOY_BUSY', 409],
@@ -73,6 +75,7 @@ const ERROR_STATUS_BY_CODE = new Map([
     ['INVALID_TOPOLOGY_INTENT_VERSION', 400],
     ['TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT', 409],
     ['TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE', 503],
+    ['TOPOLOGY_INTENT_PREPARATION_UNAVAILABLE', 503],
     ['TOPOLOGY_INTENT_RESOURCES_INVALID', 503],
     ['TOPOLOGY_INTENT_DRAFT_BINDING_INVALID', 503],
     ['TOPOLOGY_INTENT_DELETE_BINDING_INVALID', 503],
@@ -1038,7 +1041,6 @@ function createCascadeLinksRouter({
     });
 
     router.put('/:id', requireScope('nodes:write'), async (req, res) => {
-        let desiredSaved = false;
         try {
             if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
                 throw new RequestValidationError(
@@ -1073,6 +1075,34 @@ function createCascadeLinksRouter({
                 throw new RequestValidationError('tunnelProtocol must be "vless" or "vmess"');
             }
 
+            if (durableAutoDeploy) {
+                if (changes.tunnelPort !== undefined) {
+                    const port = parseInt(changes.tunnelPort, 10);
+                    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                        throw new RequestValidationError('tunnelPort must be between 1 and 65535');
+                    }
+                    changes.tunnelPort = port;
+                }
+                if (req.body?.geoRouting !== undefined) {
+                    const geoRouting = req.body.geoRouting;
+                    if (!geoRouting || typeof geoRouting !== 'object' || Array.isArray(geoRouting)) {
+                        throw new RequestValidationError('geoRouting must be an object');
+                    }
+                    changes['geoRouting.enabled'] = !!geoRouting.enabled;
+                    if (Array.isArray(geoRouting.domains)) changes['geoRouting.domains'] = geoRouting.domains.map(String);
+                    if (Array.isArray(geoRouting.geoip)) changes['geoRouting.geoip'] = geoRouting.geoip.map(String);
+                }
+                if (req.body?.realitySni !== undefined) changes.realitySni = normalizeStringArray(req.body.realitySni).filter(Boolean);
+                if (req.body?.realityShortIds !== undefined) changes.realityShortIds = normalizeStringArray(req.body.realityShortIds);
+                // Freeze requested content in the real intent service before any
+                // row-dependent defaults/credentials. Its joined writer owns the
+                // desired revision, tombstone check and job in ONE transaction.
+                const job = await getIntentService().accept({ version: 2, kind: 'link.apply',
+                    expectedTopologyRevision, requestKey: requireIntentKey(req), linkId: req.params.id, changes });
+                await invalidateCaches();
+                return res.status(202).json(acceptedIntentResponse(job, { autoDeploy: true }));
+            }
+
             const needsCurrentLink = changes.tunnelPort !== undefined
                 || changes.mode !== undefined
                 || changes.tunnelSecurity !== undefined
@@ -1084,7 +1114,7 @@ function createCascadeLinksRouter({
                 || req.body?.realitySni !== undefined
                 || req.body?.realityShortIds !== undefined;
             let currentLink = null;
-            if (needsCurrentLink || durableAutoDeploy || !isClassicProductionDeploymentConfigured(deploymentEnv)) {
+            if (needsCurrentLink || !isClassicProductionDeploymentConfigured(deploymentEnv)) {
                 currentLink = await Link.findById(req.params.id);
                 if (!currentLink) {
                     const error = new Error('The cascade link was not found');
@@ -1097,13 +1127,6 @@ function createCascadeLinksRouter({
                 }
             }
 
-            // Resolve a persisted PUT key before any local REALITY generation.
-            const existingIntent = durableAutoDeploy
-                ? await readPersistedIntent(getIntentService(), Link, requireIntentKey(req)) : null;
-            if (existingIntent && (existingIntent.version !== 2 || existingIntent.kind !== 'link.apply'
-                || String(existingIntent.linkId) !== req.params.id)) {
-                throw Object.assign(new Error('The request key belongs to a different mutation'), { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
-            }
             if (changes.tunnelPort !== undefined) {
                 const port = parseInt(changes.tunnelPort, 10);
                 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -1173,19 +1196,19 @@ function createCascadeLinksRouter({
                     realitySni: changes.realitySni !== undefined
                         ? changes.realitySni
                         : currentLink?.realitySni,
-                    realityPrivateKey: changes.realityPrivateKey !== undefined && (!durableAutoDeploy || changes.realityPrivateKey)
+                    realityPrivateKey: changes.realityPrivateKey !== undefined
                         ? changes.realityPrivateKey
                         : currentLink?.realityPrivateKey,
-                    realityPublicKey: changes.realityPublicKey !== undefined && (!durableAutoDeploy || changes.realityPublicKey)
+                    realityPublicKey: changes.realityPublicKey !== undefined
                         ? changes.realityPublicKey
                         : currentLink?.realityPublicKey,
-                    realityShortIds: changes.realityShortIds !== undefined && (!durableAutoDeploy || changes.realityShortIds.some(Boolean))
+                    realityShortIds: changes.realityShortIds !== undefined
                         ? changes.realityShortIds
                         : currentLink?.realityShortIds,
                     realityFingerprint: changes.realityFingerprint !== undefined
                         ? changes.realityFingerprint
                         : currentLink?.realityFingerprint,
-                }, targetNode, { generate: !existingIntent }));
+                }, targetNode));
                 // Only a new link or a changed fingerprint adopts the Random
                 // default. Preserve a legacy value even if an edit resubmits it.
                 if (req.body?.realityFingerprint === undefined) {
@@ -1195,53 +1218,6 @@ function createCascadeLinksRouter({
                 }
             }
 
-            if (durableAutoDeploy) {
-                const raw = typeof currentLink.toObject === 'function' ? currentLink.toObject() : currentLink;
-                const candidate = JSON.parse(JSON.stringify(raw));
-                for (const [key, value] of Object.entries(changes)) {
-                    const parts = key.split('.');
-                    if (parts.length === 1) candidate[key] = value;
-                    else { candidate[parts[0]] = { ...candidate[parts[0]], [parts[1]]: value }; }
-                }
-                const normalized = new Link(candidate).toObject();
-                if (normalized.active === false) throw Object.assign(new Error('The cascade link is disabled'), { code: 'CASCADE_LINK_DISABLED' });
-                const service = getIntentService();
-                // Use the real service's injected persistence model. A replay
-                // conflict must be detected BEFORE changing the desired row.
-                const existing = existingIntent;
-                if (existing) {
-                    if (existing.version !== 2 || existing.kind !== 'link.apply'
-                        || String(existing.linkId) !== req.params.id
-                        || existing.desiredVersion !== linkDesiredVersion(normalized)) {
-                        throw Object.assign(new Error('The request key belongs to a different mutation'), { code: 'TOPOLOGY_INTENT_KEY_CONFLICT' });
-                    }
-                    const job = await service.accept({ version: 2, kind: 'link.apply',
-                        expectedTopologyRevision, requestKey: requireIntentKey(req), linkId: req.params.id,
-                        desiredVersion: existing.desiredVersion });
-                    return res.status(202).json(acceptedIntentResponse(job, { autoDeploy: true }));
-                }
-                // An identical retry must reach persisted-key replay before the
-                // draft revision CAS, not save the same edit a second time.
-                let intentRevision = expectedTopologyRevision;
-                if (linkDesiredVersion(raw) !== linkDesiredVersion(normalized)
-                    || raw.autoDeploy !== normalized.autoDeploy) {
-                    const revisions = await getWriteService().updateLink({ expectedTopologyRevision,
-                        linkId: req.params.id, changes });
-                    intentRevision = revisions.revision;
-                }
-                const saved = await Link.findById(req.params.id).lean();
-                if (!saved || linkDesiredVersion(saved) !== linkDesiredVersion(normalized)) {
-                    throw Object.assign(new Error('The requested desired version changed'), { code: 'TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT' });
-                }
-                desiredSaved = true;
-                const job = await getIntentService().accept({ version: 2, kind: 'link.apply',
-                    expectedTopologyRevision: intentRevision,
-                    requestKey: requireIntentKey(req), linkId: req.params.id,
-                    desiredVersion: linkDesiredVersion(saved) });
-                const body = acceptedIntentResponse(job, { autoDeploy: true });
-                await invalidateCaches();
-                return res.status(202).json(body);
-            }
             const revisions = await getWriteService().updateLink({
                 expectedTopologyRevision,
                 linkId: req.params.id,
@@ -1336,7 +1312,7 @@ function createCascadeLinksRouter({
             return res.json(body);
         } catch (error) {
             return sendError(res, error, 'Update', {
-                revision: req.body?.expectedTopologyRevision, linkId: req.params.id, desiredSaved });
+                revision: req.body?.expectedTopologyRevision, linkId: req.params.id });
         }
     });
 

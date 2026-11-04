@@ -47,14 +47,41 @@ literal validated `Idempotency-Key` (1–128 ASCII alphanumeric/underscore/dot/
 colon/hyphen). Create UUID/REALITY generation happens inside real acceptance,
 not in HTTP before replay.
 
-Explicit PUT Auto uses the existing draft-update then v2 apply-accept signature;
-these are **two transactions**, not a claimed atomic update-and-intent operation.
-The route checks persisted key/content before editing, pins the resulting saved
-revision/content, and reports `desiredSaved:true` if acceptance fails after a
-successful save (with refresh required). Empty native REALITY edit controls
-preserve an already generated credential tuple across retries. Save-only create
-and PUT issue no intent. Concurrent same-key edit atomicity beyond the existing
-service contract is not proved by this local fixture.
+Explicit PUT Auto now calls the same v2 acceptance protocol once:
+`accept({version:2,kind:'link.apply',linkId,changes,expectedTopologyRevision,requestKey})`.
+`changes` is the normalized requested patch, not a desired-content pin calculated
+from today's row. Acceptance fingerprints that patch before credentials or row
+lookup, replays a matching persisted key first, then joins the actual draft
+update, desired revision CAS, resource resolution, queue counter and intent
+insert in **one transaction**. The persisted job still has kind `link.apply` and
+an actual `linkDesiredVersion()` configuration pin; its private payload also
+retains the normalized requested changes. No schema/version/consumer change is
+needed. A reused key with different requested content refuses before mutation.
+Replay also works after later save-only edits or deletion of the desired row.
+
+The existing real `intentDraftWriter` object must now expose both:
+
+```js
+createLink({expectedTopologyRevision,link,session})
+updateLink({expectedTopologyRevision,linkId,changes,session})
+```
+
+`TopologyDraftRepository.createIntentDraftWriter({selectedTopologyRepository})`
+implements both through the same DB-only joined commit and exact active-session
+check. Runtime already publishes that complete object; **do not wrap/forward only
+`createLink`**. Missing/foreign/create-only writers fail closed with
+`TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE` before mutation. No scoped
+`work => work(session)` substitution, second transaction, legacy fallback, worker
+start or remote preflight is added. REALITY edits require the already documented
+local `prepareLink` dependency; absent preparation refuses with
+`TOPOLOGY_INTENT_PREPARATION_UNAVAILABLE`. Blank UUID/REALITY key/short-ID controls
+preserve the existing tuple. The deleting-row check is repeated by the real
+draft repository inside the same outer transaction.
+
+Save-only create and PUT still issue no intent, even when stored `autoDeploy`
+metadata is true. Classic-production PUT retains its previous synchronous flow.
+Queue overflow or any precommit draft/resource/intent refusal leaves neither
+edit nor accepted job; the response no longer claims a separately saved edit.
 
 ## Delete/finalizer handoff
 
@@ -116,8 +143,9 @@ only this slice's HTTP modules, never coordinator/core doubles or assertions.
 No remote systems, DB, SSH, MCP, production environment, dependency installation,
 asset build, deployment or service operation was used.
 
-Final local execution (Node v22.23.1, shared installed dependencies via scoped
-`NODE_PATH`, explicit dummy import configuration, serial Node test runner):
+Historical HTTP-slice baseline execution (before the atomic-edit extension;
+Node v22.23.1, shared installed dependencies via scoped `NODE_PATH`, explicit
+dummy import configuration, serial Node test runner):
 
 - Six focused suites (`cascadeLinks`, `cascadeLinksAutoDeploy`,
   `cascadeLinksIntentAcceptance`, `cascadeTopologyDeploy`, `cascadeAnyOrderHttp`,
@@ -129,3 +157,52 @@ Final local execution (Node v22.23.1, shared installed dependencies via scoped
   completed native worker/apply/delete acceptance claim.
 - Logs: `/home/leon/.hermes/cache/scratch/anyorder-http-green-final.log` and
   `/home/leon/.hermes/cache/scratch/anyorder-http-historical-red-final.log`.
+
+### Atomic-edit extension verification and remaining fixture handoff
+
+`cascadeAnyOrderEditIntent.test.js` uses the actual Express PUT handler, real
+link and intent schemas, `TopologyIntentService`, `TopologyDraftWriteService`,
+`TopologyDraftRepository.createIntentDraftWriter` and
+`TopologyDeploymentRepository.assertSelectedAvailable`. Only persistence and
+transaction outcomes are modeled. The first regression failed because queue
+rejection left the edited row and advanced revision behind; the joined path
+passes it. Coverage includes exact-session writes, requested-content replay
+across reconstructed services and later desired drift/removal, blank credential
+preservation, no-fallback gates, late deleting markers, save-only exclusion,
+precommit refusals, mixed-mode listener collision, and uncertain commit/readback.
+This does **not** prove actual Mongo rollback, concurrent unique-key admission,
+worker execution or remote configuration.
+
+Normal serial Node runs (no force-exit):
+
+- New edit-intent suite plus `cascadeAnyOrderIntent`,
+  `cascadeAnyOrderSelectedApply`, `cascadeLinks`, `cascadeLinksAutoDeploy`, and
+  `cascadeLinksIntentAcceptance`: **99 tests / 99 pass / 0 fail / 0 cancelled /
+  0 skipped; exit 0**. Log:
+  `/home/leon/.hermes/cache/scratch/anyorder-edit-intent-green-complete.log`.
+- Historical `cascadeAnyOrderHttp` fixture without its newly required joined
+  writer: **12/15 pass**, three PUT cases safely refuse 503. It still constructs
+  only the old unscoped draft service and supplies neither an active session
+  marker nor local edit credential preparation. Do not loosen the product gate.
+  The integration-owner fixture fix is: add `inTransaction:()=>true` to its local
+  session; supply `prepareLink:prepareIntentLink`; construct the real draft and
+  deployment repositories over its existing model dependencies and set
+  `dependencies.intentDraftWriter = draftRepository.createIntentDraftWriter({
+  selectedTopologyRepository: deploymentRepository })`.
+  This exact proposed fixture-only adapter, with assertions and product source
+  unchanged, passes **15/15** through scratch loader
+  `/home/leon/.hermes/cache/scratch/anyorder-edit-http-fixture-adapter.cjs`;
+  log `anyorder-edit-http-proposed-fixture.log` in the same directory. It is not
+  an integrated test-fixture change or default-host activation claim.
+- `topologyDraftRepository.test.js`: **14/15 pass**; its old direct persistence
+  double lacks `CascadeLink.findById`, required by the existing deleting-row
+  check. Exact repository bytes from baseline
+  `6576ac59b153442eb38d54527e4e5bb89253b920` reproduce the same targeted failure
+  (log `anyorder-edit-repository-baseline-red.log`). No tombstone protection was
+  removed to accommodate that fixture.
+
+No coordinator, worker, consumer, runtime/host, model, queue or endpoint was
+added/rewritten for this extension. The runtime owner must retain the full
+joined writer and existing local `prepareLink` injection; a runtime that omits
+the REALITY preparation capability stays closed. Actual Mongo validation and
+assembled-host/worker acceptance remain with their separately owned slices.
