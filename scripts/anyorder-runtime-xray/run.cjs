@@ -194,6 +194,9 @@ async function main() {
         const own = JSON.parse(await ok(id, 'curl --silent --show-error --max-time 2 http://127.0.0.1:18080/?nonce=canary'));
         assert.equal(own.role, id);
     }
+    const tlsProbe = await ok('p', `python3 -c ${shell("import socket,ssl,json; c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; c.set_alpn_protocols(['h2']); s=c.wrap_socket(socket.create_connection(('127.0.0.1',18443),timeout=3),server_hostname='reality.anyorder.test'); print(json.dumps({'version':s.version(),'alpn':s.selected_alpn_protocol()})); s.close()")}`);
+    assert.deepEqual(JSON.parse(tlsProbe), { version: 'TLSv1.3', alpn: 'h2' });
+    fs.writeFileSync(path.join(work, 'tls-destination-readback.json'), tlsProbe);
     // Seed is fixture-only; every subsequent install uses the unchanged native executor/runner.
     const initial = await materialize({ nodes: [], links: [], groups: [] }, state);
     for (const n of initial.nodes) {
@@ -267,9 +270,15 @@ async function main() {
         authorityAdapter: 'synthetic-frozen-local-only', actual: ['materializer', 'compiler', 'composer', 'executor', 'transport', 'NodeSSH', 'runner', 'systemd', 'Xray', 'private-HTTP'],
         notProved: ['public POST/manual jobs', 'Mongo/worker settlement', 'physical enrollment/maintenance authority', 'PPP', 'public POST-created ID allocation', 'browser/assets', 'all permutations', 'country Internet exit', 'background writer compatibility', 'migration/rollback'] }, null, 2));
 }
-main().catch(error => {
+main().catch(async error => {
     const failure = { status: 'failed', label: activeLabel, error: causal(error), sequence };
     fs.writeFileSync(path.join(work, 'failure.json'), JSON.stringify(failure, null, 2));
+    for (const [id] of connections) {
+        try {
+            const diagnostics = await exec(id, 'systemctl status xray xray-bridge anyorder-client anyorder-tls --no-pager; journalctl -u xray -u xray-bridge -u anyorder-client -u anyorder-tls --no-pager -n 100; ss -ntp');
+            fs.writeFileSync(path.join(work, `diagnostic-${id}.private.log`), diagnostics.stdout + diagnostics.stderr);
+        } catch {}
+    }
     console.error(JSON.stringify(failure)); process.exitCode = 1;
 }).finally(() => {
     for (const ssh of connections.values()) ssh.disconnect();
