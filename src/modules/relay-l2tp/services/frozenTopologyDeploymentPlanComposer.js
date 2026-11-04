@@ -1895,7 +1895,10 @@ function composeDescriptorTransition(before, after) {
             .filter(inbound => inbound.tag?.startsWith('cascade-')
                 && !config.inbounds.some(current => current.tag === inbound.tag));
         config.inbounds.push(...structuredClone(missingIngress));
-        config.routing.rules.push(...missingIngress.map(inbound => ({
+        // Explicit no-exit PPP must win even for reverse-handshake domains.
+        // Keep this block scoped to the retired ingress; transit and other
+        // owners still follow the existing handshake/geo/default rule order.
+        config.routing.rules.unshift(...missingIngress.map(inbound => ({
             type: 'field', inboundTag: [inbound.tag], outboundTag: 'block',
         })));
         configGenerator.ensurePrivateIpBlock(config);

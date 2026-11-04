@@ -54,6 +54,38 @@ function assertPolicy(plan) {
     assert.equal(config.routing.domainStrategy, 'IPOnDemand');
     assert.equal(ownedIngressRouteState(plan), 'egress_configured');
 }
+function assertNoExitPolicy(plan, previousPlan) {
+    const config = configOf(plan), rules = ingressRules(config);
+    assert.deepEqual(rules, [{ inboundTag: ['cascade-mine'], outboundTag: 'block', type: 'field' }]);
+    assert.equal(config.routing.rules.indexOf(rules[0]), 0, 'explicit PPP no-exit blocks before every global/reverse selector');
+    const geoTarget = ingressRules(configOf(previousPlan))[0].outboundTag;
+    const transitTags = [
+        ...(config.reverse?.bridges || []).map(bridge => bridge.tag),
+        ...config.inbounds.filter(inbound => inbound.tag.startsWith('fwd-hop-')).map(inbound => inbound.tag),
+    ];
+    assert.ok(transitTags.length > 0, 'the surviving portal input still carries ordinary transit');
+    for (const tag of transitTags) {
+        const transit = config.routing.rules.filter(rule => rule.inboundTag?.includes(tag));
+        assert.equal(transit.length, 3, 'transit retains conditional geo/domain, geoip and blocked default');
+        assert.deepEqual(transit[0].domain, ['geosite:category-ru']);
+        assert.deepEqual(transit[1].ip, ['geoip:ru']);
+        assert.equal(transit[0].outboundTag, geoTarget); assert.equal(transit[1].outboundTag, geoTarget);
+        assert.deepEqual(transit[2], { inboundTag: [tag], outboundTag: 'block', type: 'field' });
+    }
+    for (const bridge of config.reverse?.bridges || []) {
+        const fullDomain = `full:${bridge.domain}`;
+        const handshake = config.routing.rules.find(rule => rule.domain?.includes(fullDomain) && !rule.inboundTag);
+        assert.ok(handshake && handshake.outboundTag.startsWith('tunnel-'), 'reverse control route survives');
+        assert.ok(config.routing.rules.indexOf(handshake) < config.routing.rules.findIndex(rule => rule.domain?.includes('geosite:category-ru')),
+            'ordinary transit handshake still precedes geo selection');
+        // Exact full-domain control traffic, not a general Xray policy emulator.
+        const controlRoute = inbound => config.routing.rules.find(rule => (!rule.inboundTag || rule.inboundTag.includes(inbound))
+            && (!rule.domain || rule.domain.includes(fullDomain)) && !rule.ip);
+        assert.equal(controlRoute('cascade-mine'), rules[0], 'even the handshake domain cannot escape the blocked PPP ingress');
+        assert.equal(controlRoute(bridge.tag), handshake, 'the scoped PPP block cannot swallow allowed reverse control traffic');
+    }
+    return config;
+}
 function protectedData(f) {
     const { appliedTopologyRevision, replacementFence, ...state } = f.state;
     const { paths, ...group } = f.group;
@@ -72,7 +104,7 @@ function assertSettled(f, queued, events) {
 for (const modes of [ ['forward', 'forward', 'forward'], ['reverse', 'reverse', 'reverse'],
     ['reverse', 'forward', 'reverse'], ['forward', 'reverse', 'forward'] ]) {
     for (const order of [ ['geo', 'input'], ['input', 'geo'] ]) {
-        test(`G3 installed actual V2 default->${order.join('->')} ${modes.join('/')} geo delete/recreate; default ${modes[2] === 'reverse' ? 'ordering-blocker characterization' : 'delete/recreate acceptance'}`, async () => {
+        test(`G3 installed actual V2 default->${order.join('->')} ${modes.join('/')} geo and default delete/recreate acceptance`, async t => {
             const f = geoFixture(modes), events = enableV2(f), protectedBefore = protectedData(f);
             assertSettled(f, await apply(f, id(10)), events);
             assert.equal(f.options.plans.at(-1).staged, true, 'R->B has no portal but PPP still has an exit');
@@ -90,36 +122,26 @@ for (const modes of [ ['forward', 'forward', 'forward'], ['reverse', 'reverse', 
             const identities = f.CascadeLink.rows.filter(row => [id(10), id(12), id(13)].includes(row._id))
                 .map(row => [row._id, row.tunnelUuid]);
             // Deleting default blocks only its stable owned PPP ingress, while
-            // geo remains configured for transit. Deleting geo later retains
-            // the default; neither action changes installed PPP credentials.
+            // geo remains configured for transit. Deleting geo retains the
+            // default; neither action changes installed PPP credentials.
             for (const [linkId, offset] of [[id(13), 100], [id(10), 0]]) {
+                const previousPlan = f.options.plans.at(-1);
                 const beforeLink = structuredClone(f.CascadeLink.rows.find(row => row._id === linkId));
                 const retained = f.CascadeLink.rows.filter(row => [id(10), id(12), id(13)].includes(row._id) && row._id !== linkId)
                     .map(row => [row._id, row.tunnelUuid]);
-                const groupBeforeDelete = structuredClone(f.group);
                 const queued = await remove(f, linkId, linkId === id(10) ? id(90) : id(91)), result = await f.worker.run(queued.operationId);
-                if (linkId === id(10) && modes[2] === 'reverse') {
-                    // Explicit cross-owner characterization, NOT deletion
-                    // acceptance: composer appends empty PPP block after its
-                    // global reverse-handshake route. Keep the refusal until
-                    // the composer owner fixes ordering, never weaken the gate.
-                    assert.equal(result.status, 'committing');
-                    assert.equal(result.errorCode, 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED');
-                    assert.equal(ownedIngressRouteState(f.options.plans.at(-1)), null);
-                    assert.deepEqual(f.group, groupBeforeDelete);
-                    assert.ok(f.NodeOperationLock.rows.length);
-                    assert.equal(f.TopologyOperation.rows.at(-1).heldTopologyAdmission, true);
-                    assert.deepEqual(protectedData(f), protectedBefore);
-                    return;
-                }
                 assert.equal(result.status, 'succeeded', JSON.stringify(result)); assertSettled(f, queued, events);
                 assert.equal(f.CascadeLink.rows.some(row => row._id === linkId), false);
                 const receipt = f.options.prepares.at(-1), plan = f.options.plans.at(-1);
                 if (linkId === id(10)) {
                     assert.deepEqual(f.group.paths.find(path => path.pathKey === 'mine').linkIds, []);
                     assert.equal(receipt.routeState, 'no_bridge_exit'); assert.equal(receipt.pppInternetProof, 'not_applicable');
-                    const rules = ingressRules(configOf(plan));
-                    assert.equal(rules.length, 1); assert.equal(rules[0].outboundTag, 'block');
+                    const config = assertNoExitPolicy(plan, previousPlan);
+                    assert.equal(ownedIngressRouteState(plan), 'no_bridge_exit');
+                    const owner = plan.nodes.find(node => node.node === plan.ownerNodeId);
+                    t.diagnostic(JSON.stringify({ kind: 'G3-default-delete', modes, order, candidateHash: owner.candidate.sha256,
+                        routing: config.routing, routeState: receipt.routeState, pppInternetProof: receipt.pppInternetProof,
+                        status: result.status, terminal: f.TopologyOperation.rows.at(-1).v2Terminal.state }));
                     assert.ok(plan.effectiveTopology.links.some(link => link.id === id(13)), 'geo is retained, not default fallback');
                 } else {
                     assert.deepEqual(f.group.paths.find(path => path.pathKey === 'mine').linkIds, [id(10)]);
@@ -163,6 +185,34 @@ for (const modes of [['forward', 'forward', 'forward'], ['reverse', 'reverse', '
         assert.equal(f.options.prepares.at(-1).pppInternetProof, 'unverified');
     });
 }
+
+test('G3 no-exit block leaves a separately owned same-profile peer ingress and geo policy unchanged', async () => {
+    const f = geoFixture(); await apply(f, id(10));
+    await apply(f, add(f, 'geo', ['reverse', 'reverse', 'reverse']));
+    await apply(f, add(f, 'input', ['reverse', 'reverse', 'reverse']));
+    const previousPlan = f.options.plans.at(-1), before = structuredClone(previousPlan.effectiveTopology);
+    // Explicitly modeled verified role-profile readbacks, including an already
+    // installed peer ingress not owned by this operation's default path.
+    for (const node of before.nodes) node.profileConfig = JSON.parse(Buffer.from(previousPlan.nodes.find(row => row.node === node.id).candidate.bytes));
+    const profile = before.nodes.find(node => node.id === previousPlan.ownerNodeId).profileConfig;
+    const peerIngress = { ...structuredClone(profile.inbounds.find(inbound => inbound.tag === 'cascade-mine')),
+        tag: 'cascade-peer', port: require('../domain/cascadePathIngress').cascadePathIngressPort(id(60), 'peer') };
+    const peerRules = ingressRules(profile).map(rule => ({ ...structuredClone(rule), inboundTag: ['cascade-peer'],
+        outboundTag: ingressRules(profile)[0].outboundTag }));
+    profile.inbounds.push(peerIngress); profile.routing.rules.push(...peerRules);
+    const peer = before.groups[0].paths.find(path => path.pathKey === 'peer');
+    Object.assign(peer, { enabled: true, linkIds: [id(13)] });
+    const after = structuredClone(before);
+    after.links = after.links.filter(link => link.id !== id(10));
+    after.groups[0].paths.find(path => path.pathKey === 'mine').linkIds = [];
+    const saved = structuredClone({ before, after });
+    const composed = composeFrozenTopologyDeploymentPlan({ snapshot: after, baselineTopology: before,
+        compiledTopology: compileTopology(after) });
+    const config = assertNoExitPolicy({ ...composed, ownerNodeId: previousPlan.ownerNodeId }, previousPlan);
+    assert.deepEqual(config.inbounds.filter(inbound => inbound.tag === 'cascade-peer'), [peerIngress]);
+    assert.deepEqual(config.routing.rules.filter(rule => rule.inboundTag?.includes('cascade-peer')), peerRules);
+    assert.deepEqual({ before, after }, saved, 'composition does not rewrite installed peer descriptors/readbacks');
+});
 
 function relayFragment(mode) {
     const snapshot = { nodes: [{ id: 'r1', role: 'relay' }, { id: 'r2', role: 'relay' }],
