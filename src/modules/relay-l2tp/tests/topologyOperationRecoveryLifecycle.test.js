@@ -523,9 +523,9 @@ test('panel host lazily registers opted-in topology recovery and stops it before
 
     assert.deepEqual(calls, [
         'models.register',
-        'execution.create',
         'topology.create',
         'recovery.create',
+        'execution.create', // L2TP simple service receives the real topology gates.
     ]);
     assert.deepEqual(deploymentDependencies.env, { ...ENABLED_ENV, PANEL_DOMAIN: 'test.infograd.online' });
     assert.strictEqual(deploymentDependencies.TopologyOperation, TopologyOperation);

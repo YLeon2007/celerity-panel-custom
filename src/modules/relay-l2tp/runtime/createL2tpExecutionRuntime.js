@@ -249,6 +249,8 @@ function createL2tpExecutionRuntime({
     runtimeDependencies,
     createRuntime = createL2tpRuntime,
     createWorkerLifecycle = createL2tpWorkerLifecycle,
+    topologyIngressGate,
+    topologyPppReadinessGate,
 } = {}) {
     const authorization = Object.freeze({
         executionContext: selectExecutionContext(runtimeDependencies?.executionContext),
@@ -432,6 +434,8 @@ function createL2tpExecutionRuntime({
             && runtimeDependencies?.enableInstallAdmission === true,
         secretBox,
         secretKey,
+        topologyIngressGate,
+        topologyPppReadinessGate,
     });
     Object.defineProperty(runtime, 'simpleService', {
         value: simpleService,

@@ -44,6 +44,7 @@ function createL2tpPanelHost({
     NodeSSH,
     // Server-owned external controller capability; never sourced from env or requests.
     topologyExecutionAuthority,
+    createTopologyOperationExecutor,
     NodeTransport,
     workerLifecycle,
     topologyRecoveryScanLimit,
@@ -124,6 +125,7 @@ function createL2tpPanelHost({
     let topologyDeploymentService;
     let topologyIntentService;
     let topologyRecoveryLifecycle;
+    let executionRuntime;
 
     // The L2TP install worker may advance the topology revision (route-group
     // paths are rebuilt for the relay). Deploy automatically right after a
@@ -138,7 +140,7 @@ function createL2tpPanelHost({
         await service.deploy({ expectedTopologyRevision: revision });
     };
 
-    const executionRuntime = createExecutionRuntime({
+    const createExecution = () => createExecutionRuntime({
         workerLifecycle,
         HyNode: injectedHyNode,
         RelayL2tpState: models.RelayL2tpState,
@@ -166,6 +168,8 @@ function createL2tpPanelHost({
         clock,
         createRuntime,
         createWorkerLifecycle: createLifecycle,
+        topologyIngressGate: topologyDeploymentService?.attachIngressGate,
+        topologyPppReadinessGate: topologyDeploymentService?.installedPppReadinessGate,
         runtimeDependencies: {
             operationModel: models.L2tpOperation,
             operationRepository: adapters.operationRepository,
@@ -209,6 +213,14 @@ function createL2tpPanelHost({
             TopologyConfigOwner: models.TopologyConfigOwner,
             ...(topologyExecutionAuthority !== undefined
                 ? { topologyExecutionAuthority } : {}),
+            ...(createTopologyOperationExecutor === undefined ? {} : { createTopologyOperationExecutor }),
+            installedIngressPreparer: ({ operationPlan }) => {
+                const service = executionRuntime?.runtime?.simpleService;
+                if (typeof service?.prepareConfiguredRelayIngress !== 'function') {
+                    throw Object.assign(new Error('Installed ingress preparation unavailable'), { code: 'INGRESS_UNVERIFIED' });
+                }
+                return service.prepareConfiguredRelayIngress({ operationPlan });
+            },
             NodeSSH,
             clock,
             workerId: `${workerId}-topology`,
@@ -257,7 +269,12 @@ function createL2tpPanelHost({
                 resolveIntentResources: topologyDeploymentService.resolveIntentResources,
                 ...(typeof injectedCascadeLink.createDeleteIntentWriter === 'function'
                     ? { deleteIntentWriter: injectedCascadeLink.createDeleteIntentWriter({ CascadeLink: injectedCascadeLink }) } : {}),
-                prepareIngress: input => executionRuntime.runtime.simpleService.prepareConfiguredRelayIngress(input),
+                prepareLink: async link => {
+                    // Invoked by the real service only AFTER persisted-key replay.
+                    // Defaults come from trusted node metadata, never HTTP fields.
+                    const targetNode = await injectedHyNode.findById(link.bridgeNode).lean();
+                    return require('../routes/cascadeLinks').prepareIntentLink(link, targetNode);
+                },
             });
         }
         const recoveryFactory = createTopologyRecoveryLifecycle
@@ -280,10 +297,15 @@ function createL2tpPanelHost({
         });
     }
 
+    executionRuntime = createExecution();
+
     return {
         moduleEntry: injectedModuleEntry,
         topologyRuntime,
         topologyIntentService,
+        selectedTopologyIntentService: topologyIntentService,
+        readLinkApplicationState: topologyDeploymentService?.readLinkApplicationState,
+        readPublicOperation: topologyDeploymentService?.readPublicOperation,
         enrollTestOwners() {
             if (typeof topologyDeploymentService?.enrollTestOwners !== 'function') {
                 throw new Error('TEST_DURABLE_ORIGINALS_CAPTURE_REQUIRED');

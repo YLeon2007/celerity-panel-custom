@@ -319,6 +319,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
             ...optional(pppDriftSync, 'pppDriftSync'),
             ...optional(pppResumeReadinessGate, 'pppResumeReadinessGate'),
             attachIngressGate,
+            ...optional(dependencies.installedIngressPreparer, 'installedIngressPreparer'),
             allowUnprovenTestExecution: testHostAllowed,
             ...optional(bindingStore, 'bindingProvisioner'),
             ...optional(bindingLifecycle, 'bindingLifecycle'),
@@ -337,6 +338,11 @@ function createTopologyOperationRuntime(dependencies = {}) {
         coordinator.intentOperationAdmission = Object.freeze({ db: CascadeTopologyState.db, queue: input => coordinator.queueIntent(input) });
         coordinator.resolveIntentResources = input => coordinator.resolveIntentResourcesForQueue(input);
         coordinator.intentDraftWriter = snapshotReader.createIntentDraftWriter?.({ selectedTopologyRepository: topologyRepository });
+        coordinator.attachIngressGate = attachIngressGate;
+        coordinator.installedPppReadinessGate = createTopologyPppReadinessGate({ ...pppGateDependencies, readOnly: true });
+        Object.assign(coordinator, require('../services/topologySelectedPublicState').createTopologySelectedPublicState({
+            topologyRepository, operationRepository, executionContext,
+        }));
         // Internal explicit command only; no HTTP/MCP or automatic startup call.
         coordinator.enrollTestOwners = () => require('../../../../scripts/test-topology-owner').enrollTestOwners({
             env: ownerEnrollmentEnv, lifecycle: bindingLifecycle, store: bindingStore,
