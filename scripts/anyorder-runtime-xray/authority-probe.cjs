@@ -28,13 +28,18 @@ const config = { version: 1, executionContext: TEST, nodes: old.map(([nodeId, ip
     owner: '', planHash: 'a'.repeat(64), session: { pid: 201, start: '320' } },
     backend: { instanceId: 'd'.repeat(64), pid: 333, processStartTime: '42' } } };
 config.host.guard.owner = config.host.owner;
-let channels = 0, observations = 0, writes = 0;
+let channels = 0, observations = 0, captureSpawns = 0;
 const options = { openChannel: async () => { channels++; throw Error('NO_CHANNEL_MAY_OPEN'); },
     readObservations: async () => { observations++; throw Error('NO_OBSERVATIONS_MAY_BE_READ'); } };
 const env = { PANEL_DOMAIN: TEST.hostIdentity, L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true' };
 async function main() {
     const control = createTestPhysicalController({ config, ...options });
     assert.equal(control.runnerTransport, 'preinstalled-attested-v1'); control.close();
+    for (const ownerEnrollment of [false, true]) {
+        const rootControl = createRootTestPhysicalAuthority({ env, read: () => Buffer.from(JSON.stringify(config)), ownerEnrollment,
+            captureSpawn: () => { captureSpawns++; throw Error('NO_CAPTURE_MAY_SPAWN'); }, ...options });
+        assert.equal(rootControl.runnerTransport, 'preinstalled-attested-v1'); rootControl.close();
+    }
     const cases = [];
     const variants = [
         ['four-fresh-private-nodes', c => { c.nodes = c.nodes.slice(0, 4); c.nodes.forEach((p, i) => { p.nodeId = randomBytes(12).toString('hex'); p.endpoint = { ip: `10.203.118.${i + 11}`, port: 22, username: 'root' }; }); }],
@@ -45,15 +50,19 @@ async function main() {
         const fresh = structuredClone(config); mutate(fresh);
         assert.throws(() => createTestPhysicalController({ config: fresh, ...options }), { code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' });
         assert.throws(() => createRootTestPhysicalAuthority({ env, read: () => Buffer.from(JSON.stringify(fresh)), ...options }), { code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' });
-        cases.push({ name, result: 'refused-before-channel', code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' });
+        assert.throws(() => createRootTestPhysicalAuthority({ env, read: () => Buffer.from(JSON.stringify(fresh)), ownerEnrollment: true,
+            captureSpawn: () => { captureSpawns++; throw Error('NO_CAPTURE_MAY_SPAWN'); }, ...options }), { code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' });
+        cases.push({ name, constructors: ['physical', 'root-runtime', 'root-owner-capture'],
+            result: 'refused-before-channel', code: 'TEST_PHYSICAL_AUTHORITY_UNKNOWN_RETAINED' });
     }
     // Stop the native path here: no replacement/positive controller, owner row,
     // enrollment, binding, operation, Mongo or invented terminal proof.
-    assert.equal(channels, 0); assert.equal(observations, 0); assert.equal(writes, 0);
+    assert.equal(channels, 0); assert.equal(observations, 0); assert.equal(captureSpawns, 0);
     const files = ['src/modules/relay-l2tp/runtime/testPhysicalController.js', 'scripts/test-topology-owner.js',
         'src/modules/relay-l2tp/runtime/createTopologyOperationRuntime.js', 'src/modules/relay-l2tp/repositories/topologyExecutionBindingStore.js'];
-    const result = { status: 'precise-blocker-proved', control: 'fixed-historical-config-construction-only-accepted', cases,
-        enrollment: 'not-invoked-controller-construction-refused', channels, observations, writes,
+    const result = { status: 'precise-blocker-proved', control: 'fixed-historical-config-construction-only-accepted-in-all-three-constructors', cases,
+        constructorRefusals: cases.reduce((n, row) => n + row.constructors.length, 0),
+        enrollment: 'not-invoked-controller-construction-refused', channels, observations, captureSpawns, persistence: 'not-invoked-no-store-created',
         source: Object.fromEntries(files.map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')])),
         missingCapability: 'Existing TEST physical/capture controller accepts only its fixed five historical IDs/endpoints; no public constructor accepting fresh approved rootless pins. A replacement controller or relaxed config would exceed scope.',
         nativeRuntimeJoin: 'not-run-blocked-before-enrollment', realMongo: false, syntheticPhysical: true };
