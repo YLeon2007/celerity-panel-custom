@@ -6,10 +6,12 @@ const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const mongoose = require('mongoose');
 const moduleEntry = require('..');
 const { TopologyOperationFinalizationRepository } = require('../repositories/topologyOperationFinalizationRepository');
 const ids = Array.from({ length: 5 }, (_, i) => `507f1f77bcf86cd79943903${i + 1}`);
+const databaseName = `c3_anyorder_${randomUUID().replaceAll('-', '')}`;
 let models, processHandle, directory;
 const TEST_CONTEXT = Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' });
 function createIntentService(dependencies = models) {
@@ -25,16 +27,18 @@ async function until(work) {
 }
 test.before(async () => {
     if (!process.env.C3_MONGOD) return;
-    directory = await fs.mkdtemp(path.join(process.env.TMPDIR || os.tmpdir(), 'c3-intent-db-'));
+    assert.ok(process.env.TMPDIR, 'explicit local scratch root required');
+    assert.ok((await fs.realpath(process.env.TMPDIR)).startsWith('/home/leon/.hermes/cache/scratch/'));
+    directory = await fs.mkdtemp(path.join(process.env.TMPDIR, 'c3-intent-db-'));
     const port = await new Promise(resolve => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const p = server.address().port; server.close(() => resolve(p)); }); });
-    processHandle = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--replSet', 'intentScratch', '--setParameter', 'enableTestCommands=1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
-    const uri = `mongodb://127.0.0.1:${port}/intent_scratch?directConnection=true`;
-    const client = new mongoose.mongo.MongoClient(uri, { serverSelectionTimeoutMS: 100 });
+    processHandle = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--replSet', 'intentScratch', '--wiredTigerCacheSizeGB', '0.25', '--oplogSize', '32', '--setParameter', 'enableTestCommands=1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+    const uri = `mongodb://127.0.0.1:${port}/${databaseName}`;
+    const client = new mongoose.mongo.MongoClient(`${uri}?directConnection=true`, { serverSelectionTimeoutMS: 100 });
     await until(() => client.connect());
     await client.db('admin').command({ replSetInitiate: { _id: 'intentScratch', members: [{ _id: 0, host: `127.0.0.1:${port}` }] } });
     await until(async () => { assert.equal((await client.db('admin').command({ hello: 1 })).isWritablePrimary, true); });
     await client.close();
-    await mongoose.connect(uri, { monitorCommands: true });
+    await mongoose.connect(`${uri}?replicaSet=intentScratch`, { monitorCommands: true });
     models = { ...moduleEntry.registerModels(), HyNode: require('../../../models/hyNodeModel'), CascadeLink: require('../../../models/cascadeLinkModel') };
     await Promise.all(Object.values(models).map(model => model.init()));
 });
@@ -42,15 +46,31 @@ test.after(async () => {
     // Assembled-host/HTTP imports initialize this singleton even with local executors.
     // Close its idle-cleanup timer without importing it into otherwise isolated tests.
     require.cache[require.resolve('../../../services/sshPoolService')]?.exports.closeAll();
+    let databaseAbsent = false;
+    if (mongoose.connection.readyState === 1) {
+        assert.equal(mongoose.connection.name, databaseName);
+        await mongoose.connection.dropDatabase();
+        databaseAbsent = !(await mongoose.connection.getClient().db('admin').admin().listDatabases()).databases.some(row => row.name === databaseName);
+        assert.equal(databaseAbsent, true);
+    }
     await mongoose.disconnect();
     if (processHandle && processHandle.exitCode === null) {
         const exited = new Promise(resolve => processHandle.once('exit', resolve));
         processHandle.kill('SIGTERM'); await exited;
     }
-    if (directory) await fs.rm(directory, { recursive: true, force: true });
+    if (directory && process.env.C3_ANYORDER_MONGO_EVIDENCE) {
+        await fs.mkdir(process.env.C3_ANYORDER_MONGO_EVIDENCE, { recursive: true });
+        await fs.copyFile(path.join(directory, 'mongo.log'), path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'legacy-queue-mongod.log'));
+    }
+    if (directory) {
+        await fs.rm(directory, { recursive: true, force: true });
+        assert.equal(require('node:fs').existsSync(directory), false);
+    }
+    if (process.env.C3_ANYORDER_MONGO_EVIDENCE) await fs.writeFile(path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'legacy-queue-cleanup.json'),
+        JSON.stringify({ databaseName, databaseAbsent, pid: processHandle?.pid, processExited: processHandle?.exitCode !== null, directory, directoryAbsent: !require('node:fs').existsSync(directory) }, null, 2));
 });
 async function reset() {
-    assert.equal(mongoose.connection.name, 'intent_scratch');
+    assert.equal(mongoose.connection.name, databaseName);
     // Registered immutable binding/enrollment models must retain their public
     // mutation guards. Reset only the isolated fixture via its raw collections.
     for (const model of Object.values(models)) await model.collection.deleteMany({});

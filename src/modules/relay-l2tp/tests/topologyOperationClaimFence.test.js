@@ -43,10 +43,22 @@ test('atomic Mongo claim fences TEST/PROD pairs, bounded host keys and exact rev
             server.close(() => resolve(selected));
         });
     });
+    const databaseName = `c3_anyorder_${require('node:crypto').randomUUID().replaceAll('-', '')}`;
     const child = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port),
-        '--bind_ip', '127.0.0.1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+        '--bind_ip', '127.0.0.1', '--replSet', 'claimScratch', '--wiredTigerCacheSizeGB', '0.25', '--oplogSize', '32',
+        '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
+    let databaseAbsent = false;
     try {
-        await mongoose.connect(`mongodb://127.0.0.1:${port}/claim_fence`, { serverSelectionTimeoutMS: 10000 });
+        const client = new mongoose.mongo.MongoClient(`mongodb://127.0.0.1:${port}/admin?directConnection=true`, { serverSelectionTimeoutMS: 200 });
+        try {
+            let connected = false;
+            for (let i = 0; i < 100; i++) { try { await client.connect(); connected = true; break; } catch (_) { await new Promise(resolve => setTimeout(resolve, 50)); } }
+            assert.ok(connected, 'owned Mongo must start');
+            await client.db('admin').command({ replSetInitiate: { _id: 'claimScratch', members: [{ _id: 0, host: `127.0.0.1:${port}` }] } });
+            for (let i = 0; i < 100 && !(await client.db('admin').command({ hello: 1 })).isWritablePrimary; i++) await new Promise(resolve => setTimeout(resolve, 50));
+            assert.equal((await client.db('admin').command({ hello: 1 })).isWritablePrimary, true);
+        } finally { await client.close(); }
+        await mongoose.connect(`mongodb://127.0.0.1:${port}/${databaseName}?replicaSet=claimScratch`, { serverSelectionTimeoutMS: 10000 });
         const repository = new TopologyOperationRepository({ model: Operation });
         for (const context of [TEST, PROD]) {
             const foreign = context === TEST ? PROD : TEST;
@@ -106,12 +118,25 @@ test('atomic Mongo claim fences TEST/PROD pairs, bounded host keys and exact rev
             }
         }
     } finally {
+        if (mongoose.connection.readyState === 1) {
+            assert.equal(mongoose.connection.name, databaseName);
+            await mongoose.connection.dropDatabase();
+            databaseAbsent = !(await mongoose.connection.getClient().db('admin').admin().listDatabases()).databases.some(row => row.name === databaseName);
+            assert.equal(databaseAbsent, true);
+        }
         await mongoose.disconnect();
         if (child.exitCode === null) {
             const exited = new Promise(resolve => child.once('exit', resolve));
             child.kill('SIGTERM');
             await exited;
         }
+        if (process.env.C3_ANYORDER_MONGO_EVIDENCE) {
+            await fs.mkdir(process.env.C3_ANYORDER_MONGO_EVIDENCE, { recursive: true });
+            await fs.copyFile(path.join(directory, 'mongo.log'), path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'claim-mongod.log'));
+        }
         await fs.rm(directory, { recursive: true, force: true });
+        assert.equal(require('node:fs').existsSync(directory), false);
+        if (process.env.C3_ANYORDER_MONGO_EVIDENCE) await fs.writeFile(path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'claim-cleanup.json'),
+            JSON.stringify({ databaseName, databaseAbsent, pid: child.pid, processExited: child.exitCode !== null, directory, directoryAbsent: true, port }, null, 2));
     }
 });
