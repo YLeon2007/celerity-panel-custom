@@ -2,6 +2,7 @@
 
 const mongoose = require('mongoose');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { durableSelectedOperationScope } = require('../repositories/topologyOperationRepository');
 
 const OPERATION_STATUSES = [
     'queued',
@@ -158,6 +159,12 @@ const topologyOperationSchema = new mongoose.Schema({
     // Remains held through failure/rollback until a proven-safe transactional release.
     heldTopologyAdmission: { type: Boolean },
     admissionFingerprint: { type: String, match: DIGEST_PATTERN },
+    // Dormant selected protocol: no read-time defaults or legacy adoption.
+    // These contain private configuration descriptors, not public status data.
+    admissionScope: { type: String, enum: ['selected'], immutable: true, select: false },
+    resourceNodeIds: { type: [String], default: undefined, immutable: true, select: false },
+    baselineTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
+    effectiveTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     // Committing but unpublished; topology admission stays held during PPP sync.
     pppWait: { type: pppWaitSchema, default: undefined },
     status: {
@@ -189,6 +196,10 @@ const topologyOperationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
+    durableSelectedOperationScope({ admissionScope: this.admissionScope,
+        resourceNodeIds: this.resourceNodeIds, baselineTopology: this.baselineTopology,
+        effectiveTopology: this.effectiveTopology, kind: this.kind,
+        linkId: this.linkId, linkIds: this.linkIds, nodes: this.nodes });
     if (this.clientReadiness === 'verified' && this.status !== 'succeeded') {
         throw new Error('Client readiness requires successful execution');
     }

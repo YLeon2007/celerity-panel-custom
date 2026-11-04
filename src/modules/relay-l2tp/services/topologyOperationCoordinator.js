@@ -10,6 +10,8 @@ const {
 const { validateTopology } = require('../domain/topologyValidator');
 const { computeTopologyDomains } = require('../domain/topologyDomains');
 const { deriveReplacementTopology, deriveAttachTopology } = require('../domain/topologyReplacement');
+const { validNodeRef } = require('./topologyNodeRef');
+const { durableSelectedTopology } = require('../repositories/topologyOperationRepository');
 const {
     TEST_TOPOLOGY_EXECUTION_CONTEXT,
     matchesTopologyOperationExecutionContext,
@@ -70,10 +72,9 @@ function idFromIdempotencyKey(idempotencyKey) {
 }
 
 const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
-// Baseline members of a scoped operation must be physically applied already:
-// deployed/online are fully confirmed, staged means a link.apply finished
-// applying the link to its endpoints but the component is not client-ready
-// yet. Anything else (pending, error, offline) is never a valid baseline.
+// Legacy global-admission scope filter only. These statuses do not establish
+// selected applied-descriptor authority; that requires a verified settled
+// snapshot, never a reread of a status-labelled desired record.
 const CONFIRMED_BASELINE_LINK_STATUSES = new Set(['deployed', 'online', 'staged']);
 
 function normalizeOperationScope(scope) {
@@ -211,6 +212,89 @@ function projectTopology(snapshot) {
     };
 }
 
+// Dormant selected-applied seam. Its caller must have verified every baseline
+// descriptor against the exact settled owner pointers in the same admission
+// snapshot. An absent/legacy baseline is not permission to hydrate desired.
+// Do not wire this into queue() until admission, worker and settlement agree.
+function selectEffectiveTopology({ verifiedBaselineTopology, desiredTopology, scope } = {}) {
+    if (verifiedBaselineTopology === undefined) {
+        throw new TopologyOperationCoordinatorError('APPLIED_BASELINE_REQUIRED',
+            'A verified applied snapshot is required for selected topology');
+    }
+    if (scope?.kind !== 'link.apply' || typeof scope.linkId !== 'string') {
+        throw new TopologyOperationCoordinatorError('INVALID_REQUEST',
+            'Selected topology currently requires one explicit link.apply mutation');
+    }
+    const applied = durableSelectedTopology(verifiedBaselineTopology);
+    const desired = durableSelectedTopology(desiredTopology);
+    const requested = desired.links.find(link => link.id === scope.linkId);
+    if (!requested) {
+        throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+            'The requested desired link is missing', { causeCode: 'SCOPE_LINK_MISSING', linkId: scope.linkId });
+    }
+    const old = applied.links.find(link => link.id === requested.id);
+    const resources = new Set([requested.source, requested.target,
+        ...(old ? [old.source, old.target] : [])]);
+    const included = new Set();
+    const groups = new Set();
+    let expanded;
+    do {
+        expanded = false;
+        for (const link of applied.links) {
+            if (!resources.has(link.source) && !resources.has(link.target) && !included.has(link.id)) continue;
+            if (!included.has(link.id)) expanded = true;
+            included.add(link.id);
+            resources.add(link.source);
+            resources.add(link.target);
+        }
+        for (const group of applied.groups) {
+            const linkIds = group.paths.flatMap(path => path.linkIds);
+            if (!linkIds.some(id => included.has(id) || id === requested.id)) continue;
+            groups.add(group._id);
+            for (const id of linkIds) {
+                if (!included.has(id)) expanded = true;
+                included.add(id);
+            }
+        }
+    } while (expanded);
+    const baselineTopology = {
+        nodes: applied.nodes.filter(node => resources.has(node.id)),
+        links: applied.links.filter(link => included.has(link.id)),
+        groups: applied.groups.filter(group => groups.has(group._id)),
+    };
+    const links = [...baselineTopology.links.filter(link => link.id !== requested.id), requested]
+        .sort((left, right) => left.id.localeCompare(right.id, 'en'));
+    const linkedNodes = new Set(links.flatMap(link => [link.source, link.target]));
+    const appliedNodes = new Map(applied.nodes.map(node => [node.id, node]));
+    const desiredNodes = new Map(desired.nodes.map(node => [node.id, node]));
+    const nodes = [...linkedNodes].sort((left, right) => left.localeCompare(right, 'en'))
+        .map(id => appliedNodes.get(id) || desiredNodes.get(id));
+    const effectiveTopology = { nodes, links, groups: baselineTopology.groups };
+    const defaults = new Map();
+    let ambiguous = false;
+    for (const link of links.filter(link => link.geoRouting?.enabled !== true)) {
+        if (defaults.has(link.source)) ambiguous = true;
+        defaults.set(link.source, link.target);
+    }
+    const roles = new Map(nodes.map(node => [node.id, node.role]));
+    const portals = nodes.filter(node => node.role === 'portal');
+    const complete = portals.some(portal => {
+        const seen = new Set();
+        let id = portal.id;
+        while (id && !seen.has(id)) {
+            if (roles.get(id) === 'bridge') return true;
+            seen.add(id);
+            id = defaults.get(id);
+        }
+        return false;
+    });
+    return deepFreeze({ baselineTopology, effectiveTopology,
+        resourceNodeIds: [...resources].sort((left, right) => left.localeCompare(right, 'en')),
+        affectedGroupIds: [...groups].sort((left, right) => left.localeCompare(right, 'en')),
+        routeState: ambiguous ? 'policy_ambiguous' : portals.length === 0 ? 'no_portal_input'
+            : complete ? 'complete' : 'no_bridge_exit' });
+}
+
 // Scoped reconcile: the effective graph is exactly the requested link plus the
 // links the caller proved deployed. Anything else — in particular preexisting
 // pending links — must stay out of the plan, even on shared relays.
@@ -338,7 +422,40 @@ function deriveScopedAttach(snapshot, scope, scopedTopology, operationId) {
         newPathLinkIds: [...newPathLinkIds] };
 }
 
-function nodeIdsByRef(topology) {
+function nodeIdsByRef(topology, plan) {
+    // New materializers preserve the composer's exact physical-node identity.
+    // Do not derive a second ordering for suffixes, geo leaves or fan-in. The
+    // legacy walker below is only for older plans with no binding metadata.
+    if (plan?.nodes?.some(node => Object.hasOwn(node, 'node'))) {
+        const rolesById = new Map(topology.nodes.map(node => [node.id, node.role]));
+        const refs = new Map();
+        const ids = new Set();
+        for (const node of plan.nodes) {
+            const id = entityId(node.node);
+            if (!id || rolesById.get(id) !== node.role || !validNodeRef(node.role, node.nodeRef)
+                || refs.has(node.nodeRef) || ids.has(id)) {
+                throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+                    'Invalid materialized node identity');
+            }
+            refs.set(node.nodeRef, id);
+            ids.add(id);
+        }
+        for (const role of ['portal', 'relay']) {
+            const members = plan.nodes.filter(node => node.role === role);
+            const expected = members.map((_, index) => role === 'portal' && members.length === 1
+                ? 'portal' : `${role}-${index + 1}`);
+            if (expected.some(ref => !refs.has(ref))) {
+                throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+                    'Invalid materialized node reference set');
+            }
+        }
+        const linked = new Set(topology.links.flatMap(link => [link.source, link.target]));
+        if (linked.size !== ids.size || [...linked].some(id => !ids.has(id))) {
+            throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
+                'Incomplete materialized node identity');
+        }
+        return refs;
+    }
     const nodes = new Map(topology.nodes.map(node => [node.id, node]));
     const outgoing = new Map();
     const incoming = new Set();
@@ -409,7 +526,7 @@ function nodeIdsByRef(topology) {
 }
 
 function operationPlan({ operationId, topologyRevision, priorDeployedRevision, topology, plan }) {
-    const idsByRef = nodeIdsByRef(topology);
+    const idsByRef = nodeIdsByRef(topology, plan);
     const seenRefs = new Set();
     const seenIds = new Set();
     const rolesById = new Map(topology.nodes.map(node => [node.id, node.role]));
@@ -771,5 +888,6 @@ module.exports = {
     deepFreeze,
     idFromIdempotencyKey,
     nodeIdsByRef,
+    selectEffectiveTopology,
     projectTopologyOperationStatus,
 };

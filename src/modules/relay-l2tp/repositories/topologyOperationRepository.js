@@ -133,6 +133,73 @@ function durableNodeMetadata(node) {
     };
 }
 
+// Private descriptors, not IDs rehydrated from mutable desired records. Keep
+// this validator shared with the schema so strict Mongoose writes cannot drop
+// a partial selected snapshot and silently fall back to legacy semantics.
+function durableSelectedTopology(topology) {
+    const invalid = () => new TypeError('Invalid selected applied topology snapshot');
+    function clone(value) {
+        if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (Array.isArray(value)) return value.map(clone);
+        if (!value || Object.getPrototypeOf(value) !== Object.prototype) throw invalid();
+        return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, clone(child)]));
+    }
+    const result = clone(topology);
+    if (!hasExactKeys(result, ['groups', 'links', 'nodes'])
+        || !['nodes', 'links', 'groups'].every(key => Array.isArray(result[key]))) throw invalid();
+    const validId = value => typeof value === 'string' && /^[a-f0-9]{24}$/i.test(value);
+    const nodeIds = new Set();
+    for (const node of result.nodes) {
+        if (!validId(node?.id) || nodeIds.has(node.id) || !TARGET_BY_ROLE[node.role]
+            || node.type !== 'xray' || node.active !== true) throw invalid();
+        nodeIds.add(node.id);
+    }
+    const linkIds = new Set();
+    for (const link of result.links) {
+        if (!validId(link?.id) || linkIds.has(link.id)
+            || !nodeIds.has(link.source) || !nodeIds.has(link.target)
+            || !['forward', 'reverse'].includes(link.mode)
+            || !Number.isSafeInteger(link.tunnelPort) || link.tunnelPort < 1
+            || link.tunnelPort > 65535) throw invalid();
+        linkIds.add(link.id);
+    }
+    const groupIds = new Set();
+    for (const group of result.groups) {
+        if (!validId(group?._id) || groupIds.has(group._id) || !Array.isArray(group.paths)
+            || group.paths.some(path => !Array.isArray(path?.linkIds)
+                || path.linkIds.some(id => !linkIds.has(id)))) throw invalid();
+        groupIds.add(group._id);
+    }
+    return result;
+}
+
+function durableSelectedOperationScope({ admissionScope, resourceNodeIds, baselineTopology,
+    effectiveTopology, kind, linkId, linkIds, nodes = [] }) {
+    if ([admissionScope, resourceNodeIds, baselineTopology, effectiveTopology]
+        .every(value => value === undefined)) return {};
+    if (admissionScope !== 'selected' || !SCOPED_OPERATION_KINDS.has(kind)
+        || !Array.isArray(resourceNodeIds) || resourceNodeIds.length === 0
+        || resourceNodeIds.some(id => typeof id !== 'string' || !/^[a-f0-9]{24}$/i.test(id))
+        || new Set(resourceNodeIds).size !== resourceNodeIds.length) {
+        throw new TypeError('Incomplete selected topology operation snapshots');
+    }
+    const baseline = durableSelectedTopology(baselineTopology);
+    const effective = durableSelectedTopology(effectiveTopology);
+    const effectiveIds = new Set(effective.links.map(link => link.id));
+    if (!Array.isArray(linkIds) || linkIds.length !== effectiveIds.size
+        || linkIds.some(id => !effectiveIds.has(id)) || !effectiveIds.has(linkId)) {
+        throw new TypeError('Selected topology snapshot must match its scoped links');
+    }
+    const union = new Set([...baseline.nodes, ...effective.nodes].map(node => node.id));
+    if (union.size !== resourceNodeIds.length || resourceNodeIds.some(id => !union.has(id))
+        || nodes.some(node => !union.has(operationId(node.node)))) {
+        throw new TypeError('Selected topology resource nodes must match the before/after union');
+    }
+    return { admissionScope, resourceNodeIds: [...resourceNodeIds],
+        baselineTopology: baseline, effectiveTopology: effective };
+}
+
 class TopologyOperationRepository {
     constructor({ model, topologyStateModel } = {}) {
         if (!model || typeof model.create !== 'function'
@@ -165,6 +232,10 @@ class TopologyOperationRepository {
         ownerCredentialRevision,
         heldTopologyAdmission,
         admissionFingerprint,
+        admissionScope,
+        resourceNodeIds,
+        baselineTopology,
+        effectiveTopology,
         session,
     }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -211,6 +282,8 @@ class TopologyOperationRepository {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
+        const selected = durableSelectedOperationScope({ admissionScope, resourceNodeIds,
+            baselineTopology, effectiveTopology, kind, linkId, linkIds, nodes: metadata });
         if (heldTopologyAdmission === true || admissionFingerprint !== undefined) {
             if (session === undefined || heldTopologyAdmission !== true
                 || !/^[a-f0-9]{64}$/.test(admissionFingerprint)) {
@@ -225,6 +298,7 @@ class TopologyOperationRepository {
             executionContext: { ...context }, idempotencyKey,
             topologyRevision,
             priorDeployedRevision,
+            ...selected,
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
                 ...(kind === 'link.apply' ? { staged } : {}),
                 ...(kind === 'link.replace' ? { oldLinkId, groupId, pathKey,
@@ -319,6 +393,9 @@ class TopologyOperationRepository {
         const leaseUntil = new Date(now.getTime() + leaseMs);
         return this.model.findOneAndUpdate({
             ...topologyOperationClaimBindingFilter(context),
+            // Selected persistence is preparatory only. The worker/finalizer
+            // still implement the legacy global protocol in this slice.
+            admissionScope: { $exists: false },
             status: 'succeeded',
             clientReadiness: 'unverified',
             $nor: [{ kind: 'link.apply', staged: true }],
@@ -353,6 +430,7 @@ class TopologyOperationRepository {
             throw new TypeError('Client proof completion requires an exact execution context');
         }
         const eligible = () => matchesTopologyOperationClaimBinding(operation, context)
+            && operation.admissionScope === undefined
             && operation.status === 'succeeded' && operation.clientReadiness === 'unverified'
             && !(operation.kind === 'link.apply' && operation.staged === true)
             && Number.isSafeInteger(operation.clientProofAttempts)
@@ -374,6 +452,7 @@ class TopologyOperationRepository {
         const exhausted = operation.clientProofAttempts >= maxAttempts;
         const result = await this.model.updateOne({
             _id: operation._id, status: 'succeeded', clientReadiness: 'unverified',
+            admissionScope: { $exists: false },
             $and: [topologyOperationClaimBindingFilter(context)],
             idempotencyKey: operation.idempotencyKey,
             $nor: [{ kind: 'link.apply', staged: true }],
@@ -409,6 +488,7 @@ class TopologyOperationRepository {
         const claimed = await this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
+            admissionScope: { $exists: false },
             v2Terminal: { $exists: false },
             $or: [
                 { status: 'queued' },
@@ -440,6 +520,7 @@ class TopologyOperationRepository {
         return this.model.findOneAndUpdate({
             _id: id,
             ...topologyOperationClaimBindingFilter(context),
+            admissionScope: { $exists: false },
             v2Terminal: { $exists: false },
             status: { $in: [...ACTIVE_STATUSES] },
             leaseUntil: { $lte: now },
@@ -579,4 +660,6 @@ module.exports = {
     NODE_STATES,
     TERMINAL_STATUSES,
     TopologyOperationRepository,
+    durableSelectedTopology,
+    durableSelectedOperationScope,
 };
