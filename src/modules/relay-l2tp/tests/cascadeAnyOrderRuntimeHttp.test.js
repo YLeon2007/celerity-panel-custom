@@ -408,18 +408,89 @@ test('selected public failures distinguish retained admission from already relea
     } finally { provider.clearActiveHost(host); await host.stop(); }
 });
 
-test('selected DELETE remains an honest refusal until separately owned cleanup path is integrated', async () => {
+for (const port of [23451, 23459]) test(`loopback DELETE drains its real job through worker cleanup and settlement, then recreates at ${port}`, async () => {
     const { f, host, operation } = await appliedFixture();
     try {
         const original = copy(f.data.CascadeLink[0]);
-        const jobs = f.data.TopologyCreateIntent.length;
-        const result = await request(app(f), 'DELETE', `/links/${operation.linkId}`, { expectedTopologyRevision: 8 }, 'not-a-delete-stub');
-        assert.notEqual(result.status, 202);
-        assert.deepEqual(f.data.CascadeLink[0], original);
-        assert.equal(f.data.TopologyCreateIntent.length, jobs);
-        await assert.rejects(host.selectedTopologyIntentService.dependencies.resolveIntentResources({
-            kind: 'link.delete', link: original, desiredVersion: operation.desiredVersion,
-        }), { code: 'TOPOLOGY_DELETE_PLAN_UNAVAILABLE' });
+        const before = f.data.TopologyOperation.length;
+        const result = await request(app(f), 'DELETE', `/links/${operation.linkId}`, {
+            expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+        }, 'delete-through-worker');
+        assert.equal(result.status, 202, JSON.stringify(result.body));
+        assert.equal(result.body.job.kind, 'link.delete');
+        const jobId = result.body.job.jobId;
+        const tombstone = f.data.CascadeLink.find(link => link._id === operation.linkId);
+        assert.equal(String(tombstone.lifecycle.deleteJobId), jobId);
+        assert.equal(f.data.TopologyOperation.length, before, 'HTTP does not bind an operation or remove the row');
+        const replay = await request(app(f), 'DELETE', `/links/${operation.linkId}`, {
+            expectedTopologyRevision: 0,
+        }, 'delete-through-worker');
+        assert.equal(replay.status, 202, JSON.stringify(replay.body));
+        assert.equal(replay.body.job.jobId, jobId);
+        let readbacks = 0;
+        f.deployments[0].operationWorker.executor.verify = async () => {
+            assert.ok(f.data.CascadeLink.some(link => link._id === operation.linkId), 'retain tombstone through cleanup readback');
+            readbacks++; return { ok: true };
+        };
+        await settleTick(f);
+        const cleanup = f.data.TopologyOperation[before];
+        assert.equal(cleanup?.kind, 'link.delete', JSON.stringify(f.data.TopologyCreateIntent));
+        assert.equal(cleanup.status, 'succeeded', JSON.stringify(cleanup));
+        assert.equal(cleanup.deleteJobId, jobId);
+        assert.ok(readbacks > 0);
+        assert.ok(cleanup.nodes.some(node => node.checks.some(check => check.expectedState === 'absent')),
+            'actual combined composer supplies removed-listener checks');
+        assert.equal(f.data.CascadeLink.some(link => link._id === operation.linkId), false);
+        assert.equal(cleanup.heldTopologyAdmission, false);
+        assert.equal(f.data.NodeOperationLock.length, 0);
+        assert.equal(f.data.CascadeTopologyState[0].topologyAdmissionCount, 0);
+        await settleTick(f);
+        const job = await request(app(f), 'GET', `/links/auto-deploy-jobs/${jobId}`);
+        assert.equal(job.body.job.status, 'succeeded', JSON.stringify(job.body));
+        assert.equal(job.body.job.operationId, cleanup._id);
+        assert.equal(f.data.TopologyIntentQueueState[0].outstanding, 0);
+        assert.deepEqual((await request(app(f), 'GET', '/links')).body.links, []);
+        f.deployments[0].operationWorker.executor.verify = async () => ({ ok: true });
+        const recreated = await request(app(f), 'POST', '/links', createBody(f.data.CascadeTopologyState[0].revision, {
+            portalNodeId: original.portalNode, bridgeNodeId: original.bridgeNode, tunnelPort: port,
+        }), `recreate-${port}`);
+        assert.equal(recreated.status, 202, JSON.stringify(recreated.body));
+        assert.notEqual(recreated.body.linkId, operation.linkId);
+        await settleTick(f); await settleTick(f);
+        const applied = f.data.TopologyOperation.at(-1);
+        assert.equal(applied.kind, 'link.apply'); assert.equal(applied.status, 'succeeded');
+        assert.equal(applied.linkId, recreated.body.linkId);
+        assert.deepEqual(applied.effectiveTopology.links.map(link => link.id), [recreated.body.linkId]);
+        assert.equal(f.data.CascadeLink[0].tunnelPort, port);
+        assert.equal(f.data.NodeOperationLock.length, 0);
+        assert.equal(f.data.TopologyIntentQueueState[0].outstanding, 0);
+    } finally { provider.clearActiveHost(host); await host.stop(); }
+});
+
+test('loopback DELETE with unknown cleanup retains tombstone and exact ownership instead of reporting removal', async () => {
+    const { f, host, operation } = await appliedFixture();
+    try {
+        const result = await request(app(f), 'DELETE', `/links/${operation.linkId}`, {
+            expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+        }, 'unknown-delete');
+        assert.equal(result.status, 202, JSON.stringify(result.body));
+        f.setPause(async () => { throw new Error('modeled cleanup outcome unknown'); });
+        await settleTick(f); await settleTick(f);
+        const cleanup = f.data.TopologyOperation.at(-1);
+        assert.equal(cleanup.kind, 'link.delete');
+        assert.equal(cleanup.heldTopologyAdmission, true);
+        assert.equal(f.data.CascadeLink[0].lifecycle.state, 'deleting');
+        assert.equal(String(f.data.CascadeLink[0].lifecycle.deleteJobId), result.body.job.jobId);
+        assert.ok(f.data.NodeOperationLock.every(lock => lock.operationId === cleanup._id));
+        assert.ok(f.data.NodeOperationLock.length > 0);
+        assert.equal(f.data.TopologyIntentQueueState[0].outstanding, 1);
+        const job = await request(app(f), 'GET', `/links/auto-deploy-jobs/${result.body.job.jobId}`);
+        assert.notEqual(job.body.job.status, 'succeeded');
+        const manual = await request(app(f), 'POST', '/topology/deploy', {
+            expectedTopologyRevision: f.data.CascadeTopologyState[0].revision, linkId: operation.linkId,
+        }, 'cannot-bypass-delete');
+        assert.equal(manual.status, 409, JSON.stringify(manual.body));
+        assert.equal(f.data.TopologyOperation.length, 2);
     } finally { provider.clearActiveHost(host); await host.stop(); }
 });
 
