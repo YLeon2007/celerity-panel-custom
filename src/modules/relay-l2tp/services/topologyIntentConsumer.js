@@ -149,7 +149,8 @@ class TopologyIntentConsumer {
             this.assertContext(intent);
             this.assertBinding(intent);
             if (!['admitted', 'blocked'].includes(intent.status) || !intent.operationId) return false;
-            const operation = await this.TopologyOperation.findById(intent.operationId).session(session).lean();
+            const operation = await this.TopologyOperation.findById(intent.operationId)
+                .select('+admissionScope +resourceNodeIds +desiredVersion').session(session).lean();
             if (operation) {
                 this.assertOperationContext(operation);
                 if (intent.version === 2) this.assertSelectedOperation(intent, operation);
@@ -216,7 +217,8 @@ class TopologyIntentConsumer {
                     linkId: String(intent.linkId), desiredVersion: intent.desiredVersion },
                 expectedTopologyRevision: current.revision, resourceNodeIds: freshResources,
             });
-            const operation = await this.TopologyOperation.findById(queued?.operationId).session(session).lean();
+            const operation = await this.TopologyOperation.findById(queued?.operationId)
+                .select('+admissionScope +resourceNodeIds +desiredVersion').session(session).lean();
             if (!operation) throw intentError('TOPOLOGY_INTENT_BINDING_INVALID');
             this.assertSelectedOperation(intent, operation);
             if (operation.heldTopologyAdmission !== true || operation.topologyRevision !== current.revision
