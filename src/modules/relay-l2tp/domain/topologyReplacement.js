@@ -34,6 +34,41 @@ function pathIds(path) {
     return path.linkIds.map(entityId);
 }
 
+// A shared group's other paths are preservation dependencies, not competing
+// owners of the requested path. Seed their confirmed components without ever
+// treating an unrelated pending link as applied inventory.
+function preservePeerPathNodes(group, selectedPath, linksById, nodesById, connected) {
+    for (const path of group.paths) {
+        if (path === selectedPath) continue;
+        for (const id of pathIds(path)) {
+            const link = linksById.get(id);
+            if (!link || link.active === false || !CONFIRMED.has(link.status)) {
+                fail('UNCONFIRMED_BASELINE', 'Every preserved peer path member must already be applied');
+            }
+            for (const nodeId of [entityId(link.portalNode ?? link.source), entityId(link.bridgeNode ?? link.target)]) {
+                if (!nodeId || !nodesById.has(nodeId)) fail('INCOMPLETE_PATH', 'A preserved peer path has a missing node');
+                connected.add(nodeId);
+            }
+        }
+    }
+}
+
+function connectedLinks(eligible, connected) {
+    const endpoints = link => [entityId(link.portalNode ?? link.source), entityId(link.bridgeNode ?? link.target)];
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const link of eligible) {
+            const ids = endpoints(link);
+            if (!ids.some(id => connected.has(id))) continue;
+            for (const id of ids) {
+                if (!connected.has(id)) { connected.add(id); changed = true; }
+            }
+        }
+    }
+    return eligible.filter(link => endpoints(link).every(id => connected.has(id)));
+}
+
 /**
  * Derive the effective graph of one installed, enabled L2TP path with its
  * downstream link replaced. The persisted snapshot remains untouched.
@@ -78,7 +113,7 @@ function deriveReplacementTopology(snapshot, request) {
     const path = paths[0];
     if (path.enabled === false) fail('INACTIVE_PATH', 'The installed path is disabled');
     const originalIds = pathIds(path);
-    if (originalIds.length < 2 || originalIds.at(-1) !== request.oldLinkId
+    if (originalIds.length === 0 || originalIds.at(-1) !== request.oldLinkId
         || new Set(originalIds).size !== originalIds.length) {
         fail('INCOMPLETE_PATH', 'The old link must terminate a complete, unique path');
     }
@@ -104,6 +139,29 @@ function deriveReplacementTopology(snapshot, request) {
     }
     const source = link => entityId(link.portalNode ?? link.source);
     const target = link => entityId(link.bridgeNode ?? link.target);
+    const groupOwners = (snapshot.installedRouteOwners || []).filter(owner =>
+        entityId(owner.groupId) === request.groupId);
+    // Legacy full-chain snapshots did not project activePathKey. Preserve
+    // their existing single-owner behavior, but new relay-root/one-hop shapes
+    // require explicit installed owner/path identity, never the request alone.
+    const legacyOwner = groupOwners.length === 1 && groupOwners[0].pathKey === undefined;
+    if (!legacyOwner && (groupOwners.some(owner => typeof owner.pathKey !== 'string' || !owner.pathKey)
+        || new Set(groupOwners.map(owner => owner.pathKey)).size !== groupOwners.length
+        || new Set(groupOwners.map(owner => entityId(owner.nodeId))).size !== groupOwners.length)) {
+        fail('GROUP_NOT_INSTALLED', 'Installed owner/path identities must be distinct');
+    }
+    const owners = legacyOwner ? groupOwners
+        : groupOwners.filter(owner => owner.pathKey === request.pathKey);
+    const ownerNodeId = owners.length === 1 ? entityId(owners[0].nodeId) : null;
+    if (!ownerNodeId || !originalIds.some(id => {
+        const link = linksById.get(id);
+        return link && source(link) === ownerNodeId;
+    }) || (nodesById.get(ownerNodeId)?.cascadeRole ?? nodesById.get(ownerNodeId)?.role) !== 'relay') {
+        fail('GROUP_NOT_INSTALLED', 'Replacement requires one installed L2TP owner on the requested path');
+    }
+    if (legacyOwner && originalIds.length < 2) {
+        fail('INCOMPLETE_PATH', 'A one-hop replacement requires the installed owner path key');
+    }
     if (source(old) !== source(replacement) || target(old) !== target(replacement)) {
         fail('REPLACEMENT_ENDPOINT_MISMATCH', 'Replacement must retain the old relay and bridge endpoints');
     }
@@ -128,9 +186,7 @@ function deriveReplacementTopology(snapshot, request) {
                 fail('INCOMPLETE_PATH', 'The installed route path must start at a portal or L2TP relay');
             }
             if (role === 'relay') {
-                const owners = (snapshot.installedRouteOwners || []).filter(owner =>
-                    entityId(owner.groupId) === request.groupId && entityId(owner.nodeId) === from);
-                if (owners.length !== 1) {
+                if (ownerNodeId !== from) {
                     fail('GROUP_NOT_INSTALLED', 'The installed L2TP route must start at its owner relay');
                 }
             }
@@ -141,35 +197,22 @@ function deriveReplacementTopology(snapshot, request) {
         || (nodesById.get(cursor).cascadeRole ?? nodesById.get(cursor).role) !== 'bridge') {
         fail('INCOMPLETE_PATH', 'The old downstream hop must go from relay to bridge');
     }
-    const owners = (snapshot.installedRouteOwners || []).filter(owner =>
-        entityId(owner.groupId) === request.groupId);
-    const ownerNodeId = owners.length === 1 ? entityId(owners[0].nodeId) : null;
-    if (!ownerNodeId || !originalIds.some(id => source(linksById.get(id)) === ownerNodeId)
-        || (nodesById.get(ownerNodeId)?.cascadeRole ?? nodesById.get(ownerNodeId)?.role) !== 'relay') {
-        fail('GROUP_NOT_INSTALLED', 'Replacement requires one installed L2TP owner on the route path');
-    }
-    // Confirmed links in the same connected component are retained; unrelated
-    // domains and pending staged drafts cannot be pulled into this candidate.
+
+    // Retain confirmed component members and the shared group's peer paths;
+    // unrelated domains and pending drafts cannot enter this candidate.
     const confirmed = snapshot.links.filter(link => link.active !== false
         && CONFIRMED.has(link.status) && entityId(link) !== request.oldLinkId);
     const eligible = [...confirmed, replacement];
     const connected = new Set([source(old), target(old)]);
-    let changed = true;
-    while (changed) {
-        changed = false;
-        for (const link of eligible) {
-            if (!connected.has(source(link)) && !connected.has(target(link))) continue;
-            for (const id of [source(link), target(link)]) {
-                if (!connected.has(id)) { connected.add(id); changed = true; }
-            }
-        }
-    }
-    if (![...connected].some(id => {
+    connectedLinks(eligible, connected);
+    if (legacyOwner && ![...connected].some(id => {
         const node = nodesById.get(id);
         return (node?.cascadeRole ?? node?.role) === 'portal';
     })) {
-        fail('INCOMPLETE_PATH', 'The installed relay-root path requires a confirmed upstream portal');
+        fail('INCOMPLETE_PATH', 'A source-less replacement requires the installed owner path key');
     }
+    preservePeerPathNodes(group, path, linksById, nodesById, connected);
+    const included = connectedLinks(eligible, connected);
     for (const link of snapshot.links) {
         if (link.active === false || link.status !== 'pending' || entityId(link) === request.newLinkId) continue;
         // Unrelated upstream drafts (for example a second portal entering the
@@ -180,7 +223,6 @@ function deriveReplacementTopology(snapshot, request) {
             fail('CONFLICTING_PENDING_LINK', 'Another pending link competes for the downstream hop');
         }
     }
-    const included = eligible.filter(link => connected.has(source(link)) && connected.has(target(link)));
     if (included.some(link => entityId(link) !== request.newLinkId
         && source(link) === source(old) && link.geoRouting?.enabled !== true)) {
         fail('AMBIGUOUS_DEFAULT_CHAIN', 'The relay has another confirmed default outgoing link');
@@ -249,7 +291,7 @@ function deriveAttachTopology(snapshot, request) {
         fail('INVALID_ATTACH_REQUEST', 'Attach requires a complete snapshot and group, path and link identities');
     }
     const nodes = unique(snapshot.nodes, 'AMBIGUOUS_NODE');
-    unique(snapshot.links, 'AMBIGUOUS_LINK');
+    const links = unique(snapshot.links, 'AMBIGUOUS_LINK');
     const groups = unique(snapshot.groups, 'AMBIGUOUS_GROUP');
     const activeIds = snapshot.activeRouteGroupIds.map(entityId);
     const installedIds = snapshot.installedRouteGroupIds.map(entityId);
@@ -268,10 +310,12 @@ function deriveAttachTopology(snapshot, request) {
     if (owners.some(owner => typeof owner.pathKey !== 'string' || !owner.pathKey)) {
         fail('MISSING_OWNER_PATH_KEY', 'Installed owner projection must include its active path key');
     }
-    if (owners.length !== 1 || new Set(owners.map(owner => owner.pathKey)).size !== owners.length) {
-        fail('AMBIGUOUS_PATH', 'Attach needs exactly one owner for the installed group');
+    if (new Set(owners.map(owner => owner.pathKey)).size !== owners.length
+        || new Set(owners.map(owner => entityId(owner.nodeId))).size !== owners.length) {
+        fail('AMBIGUOUS_PATH', 'Installed owner/path identities must be distinct');
     }
-    const owner = owners[0];
+    const owner = owners.find(owner => owner.pathKey === request.pathKey);
+    if (!owner) fail('GROUP_NOT_INSTALLED', 'No installed relay owns the requested path');
     const ownerId = entityId(owner.nodeId);
     if (owner.pathKey !== request.pathKey || !ownerId ||
         (nodes.get(ownerId)?.cascadeRole ?? nodes.get(ownerId)?.role) !== 'relay') {
@@ -305,8 +349,13 @@ function deriveAttachTopology(snapshot, request) {
             if (role !== 'relay') {
                 fail('INCOMPLETE_PATH', 'The attach chain has an invalid intermediate role');
             }
-            const candidates = direction === 'up' ? incoming(current) : outgoing(current);
+            const candidates = direction === 'up'
+                ? incoming(current).filter(link => APPLIED.has(link.status)) : outgoing(current);
             if (candidates.length > 1) fail('AMBIGUOUS_CHAIN', 'Attach chain has competing default links');
+            // PPP is an input at the pinned installed owner. Its confirmed
+            // upstream may be empty (or a source-less relay prefix); only the
+            // downstream walk must reach a bridge before preparing a cutover.
+            if (candidates.length === 0 && direction === 'up') return result.reverse();
             if (candidates.length === 0) fail('INCOMPLETE_PATH', 'Attach chain does not reach its endpoint');
             const link = candidates[0];
             const next = direction === 'up' ? source(link) : target(link);
@@ -359,11 +408,25 @@ function deriveAttachTopology(snapshot, request) {
         : [...group.paths, { pathKey: request.pathKey, linkIds: suffix.map(entityId),
             priority: 1, enabled: true }] }])[0];
     const included = new Set(chain.flatMap(link => [source(link), target(link)]));
+    preservePeerPathNodes(group, existing, links, nodes, included);
+    const selectedIds = new Set(chain.map(entityId));
+    const preservedLinks = connectedLinks([...chain, ...snapshot.links.filter(link =>
+        !selectedIds.has(entityId(link)) && link.active !== false && CONFIRMED.has(link.status))], included);
+    const includedIds = new Set(preservedLinks.map(entityId));
+    const projectedGroups = projectGroups(snapshot.groups).filter(candidate => {
+        if (candidate._id === request.groupId) return true;
+        const ids = candidate.paths.flatMap(path => path.linkIds);
+        const inside = ids.some(id => includedIds.has(id));
+        if (inside && ids.some(id => !includedIds.has(id))) {
+            fail('FOREIGN_PATH_OUTSIDE_COMPONENT', 'A foreign group crosses the candidate boundary');
+        }
+        return inside;
+    }).map(candidate => candidate._id === request.groupId ? projectedGroup : candidate);
     const topology = {
         nodes: projectNodes(snapshot.nodes).filter(node => included.has(node.id))
             .sort((a, b) => a.id.localeCompare(b.id, 'en')),
-        links: projectLinks(chain).sort((a, b) => a.id.localeCompare(b.id, 'en')),
-        groups: [projectedGroup],
+        links: projectLinks(preservedLinks).sort((a, b) => a.id.localeCompare(b.id, 'en')),
+        groups: projectedGroups.sort((a, b) => a._id.localeCompare(b._id, 'en')),
     };
     const compiled = compileTopology(topology);
     if (!compiled.valid || !compiled.relays.some(relay => relay.nodeId === ownerId

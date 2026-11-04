@@ -9,14 +9,11 @@ const { maintainAutoL2tpPaths } = require('../services/autoL2tpPathMaintenance')
 const { buildL2tpXrayFragment } = require('../services/l2tpXrayFragmentProvider');
 
 // Local model/domain evidence only: no Mongo, SSH, runtime bootstrap or real
-// PPP credentials. The acceptance cases deliberately stay RED where today's
-// private-candidate protocol cannot represent the spec. Do NOT make them green
-// by letting best-effort maintenance publish installed paths: the worker must
+// PPP credentials. Private candidates are not installed-path publication:
+// do NOT let best-effort maintenance publish installed paths. The worker must
 // prepare/read back ingress and atomically finalize the installed owner first.
 //
-// Required handoff (outside this maintenance-only slice):
-// - topologyReplacement must derive relay-root attach/one-hop replacement and
-//   preserve distinct owners/paths of a shared group, without changing snapshot.
+// Remaining lifecycle handoff (outside this pure-candidate/readiness slice):
 // - coordinator/materializer/worker must carry the same private candidate through
 //   the existing owned operation, PPP/readback and separate ingress checks.
 // - topologyOperationFinalizationRepository currently requires pathKey=main,
@@ -210,7 +207,7 @@ test('preservation: no selected healthy PPP exit generates block, never hidden d
     }
 });
 
-test('ACCEPTANCE RED FR-01/09: recreated R-to-B attaches privately for installed PPP without a portal', () => {
+test('FR-01/09: recreated R-to-B attaches privately for installed PPP without a portal', () => {
     // An empty installed path is a legacy/no-route baseline, not permission
     // for maintenance to invent ingress readiness or reinstall L2TP.
     const snapshot = installedSnapshot({ links: [link('new-exit', 'r', 'b', 'pending')],
@@ -227,7 +224,7 @@ test('ACCEPTANCE RED FR-01/09: recreated R-to-B attaches privately for installed
     assert.equal(result.topology.groups[0].paths[0].priority, 4);
 });
 
-test('ACCEPTANCE RED FR-09: one-hop installed PPP suffix can prepare replacement before old-path cutover', () => {
+test('FR-09: one-hop installed PPP suffix can prepare replacement before old-path cutover', () => {
     const snapshot = installedSnapshot({ links: [link('old-exit', 'r', 'b'),
         link('new-exit', 'r', 'b', 'pending')], paths: [path('mine', ['old-exit'], 4)] });
     const result = deriveWithoutMutation(deriveReplacementTopology, snapshot, {
@@ -240,7 +237,7 @@ test('ACCEPTANCE RED FR-09: one-hop installed PPP suffix can prepare replacement
     assert.equal(result.topology.groups[0].paths[0].priority, 4);
 });
 
-test('ACCEPTANCE RED FR-09: restoring one shared-group relay retains the separately owned peer path', () => {
+test('FR-09: restoring one shared-group relay retains the separately owned peer path', () => {
     const snapshot = installedSnapshot({
         links: [link('incoming', 'p', 'r'), link('new-exit', 'r', 'b', 'pending'),
             link('peer-incoming', 'p-peer', 'r-peer'), link('peer-exit', 'r-peer', 'b-peer')],
@@ -254,4 +251,103 @@ test('ACCEPTANCE RED FR-09: restoring one shared-group relay retains the separat
     assert.deepEqual(group.paths.find(entry => entry.pathKey === 'peer'), peerBefore);
     assert.deepEqual(group.paths.find(entry => entry.pathKey === 'mine').linkIds, ['new-exit']);
     assert.equal(group.paths.find(entry => entry.pathKey === 'mine').priority, 4);
+    assert.deepEqual(result.topology.links.map(entry => entry.id),
+        ['incoming', 'new-exit', 'peer-exit', 'peer-incoming']);
+    assert.deepEqual(result.compiled.relays.find(entry => entry.nodeId === 'r-peer')
+        .routeGroups[0].candidates[0].suffixLinks.map(entry => entry.id), ['peer-exit']);
+});
+
+test('FR-09: replacing a relay-root suffix preserves a disconnected shared-group owner and excludes pending neighbors', () => {
+    const snapshot = installedSnapshot({
+        links: [link('old-exit', 'r', 'b'), link('new-exit', 'r', 'b', 'pending'),
+            link('peer-incoming', 'p-peer', 'r-peer'), link('peer-exit', 'r-peer', 'b-peer'),
+            link('pending-input', 'p', 'r', 'pending')],
+        paths: [path('mine', ['old-exit'], 4), path('peer', ['peer-exit'], 9)], peer: true,
+    });
+    const result = deriveWithoutMutation(deriveReplacementTopology, snapshot, {
+        groupId: 'shared', pathKey: 'mine', oldLinkId: 'old-exit', newLinkId: 'new-exit',
+    });
+    assert.equal(result.ownerNodeId, 'r');
+    assert.equal(result.compiled.valid, true);
+    assert.deepEqual(result.topology.links.map(entry => entry.id), ['new-exit', 'peer-exit', 'peer-incoming']);
+    assert.deepEqual(result.topology.groups[0].paths[1], projectGroups(snapshot.groups)[0].paths[1]);
+    assert.deepEqual(result.topology.groups[0].paths[0].linkIds, ['new-exit']);
+});
+
+test('relay-root attach omits a save-only portal input rather than requiring it to be applied', () => {
+    const snapshot = installedSnapshot({
+        links: [link('saved-input', 'p', 'r', 'pending'), link('new-exit', 'r', 'b', 'pending')],
+        paths: [path('mine', [], 4)],
+    });
+    const result = deriveWithoutMutation(deriveAttachTopology, snapshot,
+        { groupId: 'shared', pathKey: 'mine', linkId: 'new-exit' });
+    assert.deepEqual(result.topology.links.map(entry => entry.id), ['new-exit']);
+    assert.deepEqual(result.topology.nodes.map(entry => entry.id), ['b', 'r']);
+});
+
+function sharedCandidate(kind, change = () => {}) {
+    const replacing = kind === 'replace';
+    const snapshot = installedSnapshot({
+        links: [...(replacing ? [link('old-exit', 'r', 'b')] : []),
+            link('new-exit', 'r', 'b', 'pending'), link('peer-exit', 'r-peer', 'b-peer')],
+        paths: [path('mine', replacing ? ['old-exit'] : [], 4), path('peer', ['peer-exit'], 9)], peer: true,
+    });
+    change(snapshot);
+    return () => deriveWithoutMutation(replacing ? deriveReplacementTopology : deriveAttachTopology, snapshot,
+        { groupId: 'shared', pathKey: 'mine', ...(replacing
+            ? { oldLinkId: 'old-exit', newLinkId: 'new-exit' } : { linkId: 'new-exit' }) });
+}
+
+test('shared-group candidates require the exact installed owner/key and do not borrow peer authority', () => {
+    for (const kind of ['attach', 'replace']) {
+        for (const change of [
+            snapshot => { snapshot.installedRouteOwners = snapshot.installedRouteOwners.slice(1); },
+            snapshot => { snapshot.installedRouteOwners[0].pathKey = 'wrong-key'; },
+            snapshot => { snapshot.installedRouteGroupIds = []; },
+        ]) {
+            assert.throws(sharedCandidate(kind, change), { code: 'GROUP_NOT_INSTALLED' });
+        }
+        assert.throws(sharedCandidate(kind, snapshot => {
+            snapshot.installedRouteOwners[0].nodeId = 'r-peer'; snapshot.installedRouteOwners.pop();
+        }), { code: kind === 'attach' ? 'INCOMPLETE_PATH' : 'GROUP_NOT_INSTALLED' });
+        for (const change of [
+            snapshot => { snapshot.installedRouteOwners.push(structuredClone(snapshot.installedRouteOwners[0])); },
+            snapshot => { snapshot.installedRouteOwners[1].nodeId = 'r'; },
+            snapshot => { snapshot.installedRouteOwners[1].pathKey = 'mine'; },
+        ]) {
+            assert.throws(sharedCandidate(kind, change),
+                { code: kind === 'attach' ? 'AMBIGUOUS_PATH' : 'GROUP_NOT_INSTALLED' });
+        }
+        assert.throws(sharedCandidate(kind, snapshot => { delete snapshot.installedRouteOwners[0].pathKey; }),
+            { code: kind === 'attach' ? 'MISSING_OWNER_PATH_KEY' : 'GROUP_NOT_INSTALLED' });
+    }
+});
+
+test('peer preservation never activates missing, disabled or pending peer path members', () => {
+    for (const kind of ['attach', 'replace']) {
+        for (const change of [
+            snapshot => { snapshot.links = snapshot.links.filter(entry => entry._id !== 'peer-exit'); },
+            snapshot => { snapshot.links.find(entry => entry._id === 'peer-exit').active = false; },
+            snapshot => { snapshot.links.find(entry => entry._id === 'peer-exit').status = 'pending'; },
+        ]) {
+            assert.throws(sharedCandidate(kind, change), { code: 'UNCONFIRMED_BASELINE' });
+        }
+        assert.throws(sharedCandidate(kind, snapshot => {
+            snapshot.groups[0].paths[1].linkIds.push('new-exit');
+        }), { code: 'AMBIGUOUS_LINK_OWNERSHIP' });
+    }
+});
+
+test('relay-root support keeps bridge-egress and confirmed-baseline guards', () => {
+    assert.throws(sharedCandidate('attach', snapshot => {
+        snapshot.links.find(entry => entry._id === 'new-exit').bridgeNode = 'r-peer';
+        snapshot.links = snapshot.links.filter(entry => entry._id !== 'peer-exit');
+        snapshot.groups[0].paths[1].linkIds = [];
+    }), { code: 'INCOMPLETE_PATH' });
+    assert.throws(sharedCandidate('replace', snapshot => {
+        snapshot.links.find(entry => entry._id === 'old-exit').status = 'pending';
+    }), { code: 'INVALID_LINK_STATE' });
+    assert.throws(sharedCandidate('replace', snapshot => {
+        snapshot.links.find(entry => entry._id === 'new-exit').mode = 'forward';
+    }), { code: 'REPLACEMENT_METADATA_MISMATCH' });
 });

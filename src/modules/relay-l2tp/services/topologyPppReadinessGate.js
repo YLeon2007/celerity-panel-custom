@@ -23,10 +23,12 @@ const drift = (verifiedRelayCount, relayNode, credentialRevision) => ({
 });
 const id = value => value == null ? '' : String(value);
 
-function stagedTerminalRelayRef(nodes) {
+function classifyStagedRelays(nodes) {
     let singlePortal = 0;
+    let defaultBridge = 0;
     const portalNumbers = new Set();
     const relayNumbers = new Set();
+    const geoBridgeNumbers = new Set();
     for (const node of nodes) {
         if (node?.role === 'portal' && node.nodeRef === 'portal') {
             singlePortal += 1;
@@ -38,20 +40,34 @@ function stagedTerminalRelayRef(nodes) {
             const number = Number(node.nodeRef.slice('relay-'.length));
             if (!Number.isSafeInteger(number) || relayNumbers.has(number)) return null;
             relayNumbers.add(number);
+        } else if (node?.role === 'bridge' && node.nodeRef === 'bridge') {
+            defaultBridge += 1;
+        } else if (node?.role === 'bridge' && /^bridge-[1-9]\d*$/.test(node.nodeRef)) {
+            const number = Number(node.nodeRef.slice('bridge-'.length));
+            if (!Number.isSafeInteger(number) || number < 2 || geoBridgeNumbers.has(number)) return null;
+            geoBridgeNumbers.add(number);
         } else {
             return null;
         }
     }
-    if (!(singlePortal === 1 && portalNumbers.size === 0
-        || singlePortal === 0 && portalNumbers.size >= 2)
-        || relayNumbers.size === 0) return null;
+    const hasPortalInput = singlePortal === 1 && portalNumbers.size === 0
+        || singlePortal === 0 && portalNumbers.size >= 2;
+    const sourceLessSuffix = singlePortal === 0 && portalNumbers.size === 0 && defaultBridge === 1;
+    if (relayNumbers.size === 0 || !(hasPortalInput && defaultBridge === 0 || sourceLessSuffix)) return null;
     for (let number = 1; number <= portalNumbers.size; number += 1) {
         if (!portalNumbers.has(number)) return null;
     }
     for (let number = 1; number <= relayNumbers.size; number += 1) {
         if (!relayNumbers.has(number)) return null;
     }
-    return `relay-${relayNumbers.size}`;
+    for (let number = 2; number <= geoBridgeNumbers.size + 1; number += 1) {
+        if (!geoBridgeNumbers.has(number)) return null;
+    }
+    // Missing portal input is not missing PPP egress. R-to-B remains staged
+    // for portal traffic, but every installed relay still needs its ordinary
+    // credential/user/node readback. Only a bridge-less prefix has a terminal
+    // relay at which legacy absent PPP can be explicitly recorded as skipped.
+    return { terminalRelayRef: sourceLessSuffix ? null : `relay-${relayNumbers.size}` };
 }
 
 class TopologyPppReadinessGate {
@@ -76,8 +92,9 @@ class TopologyPppReadinessGate {
         const skippedRelayRevisions = [];
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
-            const terminalRelayRef = plan.staged === true ? stagedTerminalRelayRef(plan.nodes) : null;
-            if (plan.staged === true && !terminalRelayRef) return failed(0);
+            const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes) : null;
+            if (plan.staged === true && !stagedRelays) return failed(0);
+            const terminalRelayRef = stagedRelays?.terminalRelayRef;
             for (const node of plan.nodes) {
                 if (node.role !== 'relay') continue;
                 const relayNode = id(node.node);
