@@ -393,7 +393,7 @@ test('staged plan is deterministic across compositions', () => {
     );
 });
 
-test('bridge-less graph without a portal stays a structural error', () => {
+test('source-less R1->R2 fragment stages with terminal transit blocked', () => {
     const input = stagedInput({
         snapshot: {
             nodes: [
@@ -409,10 +409,27 @@ test('bridge-less graph without a portal stays a structural error', () => {
     input.nodeMetadata = [nodeMeta('relay-1', 'relay', 2), nodeMeta('relay-2', 'relay', 3)];
     input.linkMetadata = [linkMeta('link-rr', 10102)];
     input.compiledTopology = { valid: true, relays: [{ nodeId: 'relay-1' }, { nodeId: 'relay-2' }] };
-    assert.throws(
-        () => composeFrozenTopologyDeploymentPlan(input),
-        error => ['INVALID_TOPOLOGY_ROLES', 'NON_LINEAR_TOPOLOGY'].includes(error.code),
-    );
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.equal(plan.staged, true, 'missing portal input and bridge exit are valid incomplete state');
+    assert.equal(plan.mode, 'reverse');
+    assert.deepEqual(plan.nodes.map(node => [node.nodeRef, node.node]).sort(), [
+        ['relay-1', 'relay-1'], ['relay-2', 'relay-2'],
+    ]);
+
+    const byRef = planByRef(plan);
+    const terminal = candidateJson(byRef.get('relay-2'));
+    const reverseBridge = terminal.reverse?.bridges?.[0];
+    assert.ok(reverseBridge, 'terminal relay must terminate the relay-to-relay tunnel');
+    assert.ok(terminal.routing.rules.some(rule => (
+        rule.inboundTag?.includes(reverseBridge.tag) && rule.outboundTag === 'block'
+    )), 'received relay transit must be explicitly blocked without a permitted exit');
+    assert.ok(terminal.outbounds.some(outbound => outbound.tag === 'block'
+        && outbound.protocol === 'blackhole'));
+    assert.deepEqual(transitLeakRules(terminal, [reverseBridge.tag,
+        ...terminal.inbounds.map(inbound => inbound.tag)]), [],
+    'incomplete source-less transit must never fall through to direct/freedom');
+    assert.ok(!terminal.inbounds.some(inbound => String(inbound.tag).startsWith('socks-path-')),
+        'no installed-path ingress may target a missing downstream');
 });
 
 test('bridge-less graph with geo-routing rules stays a structural error', () => {
