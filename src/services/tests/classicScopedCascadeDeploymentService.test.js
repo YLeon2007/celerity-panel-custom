@@ -46,7 +46,7 @@ function matches(row, filter) {
     });
 }
 function harness(overrides = {}) {
-    const calls = { remote: [], preview: [], updates: [], owner: [], transactionActive: false };
+    const calls = { remote: [], preview: [], updates: [], owner: [], lifecycleReads: [], transactionActive: false };
     let state = { _id: 'singleton', revision: 7, deployedRevision: 5, replacementEpoch: 2,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0, ...overrides.state };
     const rows = {
@@ -54,21 +54,41 @@ function harness(overrides = {}) {
             status: 'pending', tunnelPort: 10086, tunnelUuid: 'local-target-uuid' }, ...(overrides.links || [])],
         HyNode: [{ _id: A, cascadeRole: 'relay', active: true, type: 'xray', ip: '192.0.2.1', ssh: { password: 'fixture' } },
             { _id: B, cascadeRole: 'bridge', active: true, type: 'xray', ip: '192.0.2.2', ssh: { password: 'fixture' } },
-            { _id: C, cascadeRole: 'relay', active: true, type: 'xray' }],
+            { _id: C, cascadeRole: 'relay', active: true, type: 'xray', ip: '192.0.2.3' }],
         RelayL2tpState: overrides.relays || [], CascadeRouteGroup: overrides.groups || [],
         TopologyOperation: overrides.operations || [], TopologyCreateIntent: overrides.intents || [],
         TopologyIntentQueueState: overrides.queues || [], NodeOperationLock: overrides.locks || [],
     };
-    const query = fn => ({ session() { return this; }, select() { return this; }, setOptions() { return this; },
-        async lean() { return structuredClone(fn()); },
-        then(resolve, reject) { return Promise.resolve().then(fn).then(resolve, reject); } });
+    const query = (fn, onRead = () => {}) => {
+        let session, populate;
+        const read = () => {
+            onRead(session);
+            const result = structuredClone(fn());
+            if (!populate) return result;
+            const fill = row => row && Object.fromEntries(Object.entries(row).map(([key, value]) =>
+                [key, populate.includes(key) ? structuredClone(rows.HyNode.find(node => node._id === value)) : value]));
+            return Array.isArray(result) ? result.map(fill) : fill(result);
+        };
+        return { session(value) { session = value; return this; }, select() { return this; }, setOptions() { return this; },
+            populate(fields) { populate = fields.split(' '); return this; },
+            async lean() { return read(); },
+            then(resolve, reject) { return Promise.resolve().then(read).then(resolve, reject); } };
+    };
     const connection = { async transaction(work, options) {
         calls.transactionOptions = options;
         calls.transactionActive = true;
-        try { return await work({ fixture: true }); } finally { calls.transactionActive = false; }
+        const session = { fixture: true };
+        calls.session = session;
+        try { return await work(session); } finally { calls.transactionActive = false; calls.session = null; }
     } };
     const models = {};
     for (const [name, records] of Object.entries(rows)) models[name] = { db: connection,
+        // persistMutation re-reads lifecycle in its settlement session before
+        // DELETE. Keep the real repository guard, not an unlocked delete double.
+        findById: id => query(() => records.find(row => row._id === id) ?? null, session => {
+            if (name === 'CascadeLink') calls.lifecycleReads.push({ id, session, active: calls.transactionActive,
+                exactSession: session === calls.session });
+        }),
         find: filter => query(() => records.filter(row => matches(row, filter))),
         exists: filter => query(() => records.some(row => matches(row, filter))),
         async create() { throw Error('unused fixture create'); },
@@ -98,6 +118,19 @@ function harness(overrides = {}) {
             return state;
         }),
     };
+    if (overrides.actualCore) Object.assign(models.NodeOperationLock, {
+        findOne: filter => query(() => rows.NodeOperationLock.find(row => matches(row, filter)) ?? null),
+        async create(row) {
+            if (rows.NodeOperationLock.some(lock => lock.node === row.node)) throw Object.assign(Error('duplicate local node'), { code: 11000 });
+            rows.NodeOperationLock.push(structuredClone(row)); return structuredClone(row);
+        },
+        async deleteOne(filter) {
+            assert.deepEqual(Object.keys(filter).sort(), ['generation', 'node', 'operationId', 'owner', 'remoteUncertain']);
+            const index = rows.NodeOperationLock.findIndex(row => matches(row, filter));
+            if (index >= 0) rows.NodeOperationLock.splice(index, 1);
+            return { deletedCount: index >= 0 ? 1 : 0 };
+        },
+    });
     class PreviewSSH {
         constructor(node) { assert.equal(String(node._id), A); this.updatesBefore = calls.updates.length; }
         async connect() {
@@ -135,6 +168,9 @@ function harness(overrides = {}) {
             if (i < 0) return false; rows.NodeOperationLock.splice(i, 1); return true;
         },
     } });
+    const actualCore = overrides.actualCore && require('./classicLifecycleCoreFixture').createClassicLifecycleCoreFixture({
+        models, rows, calls, state: () => state, env: { ...env(), ...overrides.env }, options: overrides.actualCore,
+    });
     const dependencies = { ...models, lockService, env: { ...env(), ...overrides.env }, NodeSSH: PreviewSSH,
         logger: { warn(event) { assert.equal(typeof event, 'string', 'production logger stringifies objects without metadata'); calls.diagnostic = JSON.parse(event); } },
         topologyManagesNodeConfig: async node => {
@@ -146,7 +182,7 @@ function harness(overrides = {}) {
             assert.equal(calls.transactionActive, false);
             assert.ok(rows.CascadeLink.some(link => link._id === input.linkId), 'link retained during SSH');
             calls.remote.push(input);
-            const result = removed(input);
+            const result = actualCore ? await actualCore.removeScopedClassicLink(input) : removed(input);
             return overrides.removeWork ? overrides.removeWork({ state, rows, calls, result }) : result;
         }, async deployScopedClassicLink(input) {
             assert.equal(calls.transactionActive, false, 'remote work outside retryable transaction');
@@ -155,8 +191,8 @@ function harness(overrides = {}) {
             assert.equal(state.revision, 7);
             assert.equal(state.deployedRevision, 5);
             calls.remote.push(input);
-            return overrides.work ? overrides.work({ state, rows, calls, result: completed(input) })
-                : completed(input);
+            const result = actualCore ? await actualCore.deployScopedClassicLink(input) : completed(input);
+            return overrides.work ? overrides.work({ state, rows, calls, result }) : result;
         } },
     };
     return { service: createClassicScopedCascadeDeploymentService(dependencies), calls, rows,
@@ -165,12 +201,8 @@ function harness(overrides = {}) {
 const input = (linkIds = [LINK]) => ({ expectedTopologyRevision: 7,
     scope: { kind: 'link.apply', linkId: LINK, linkIds } });
 
-test('verified unconnected settlement warns without poisoning a manual retry or delete', async () => {
-    const h = harness({ work({ result }) {
-        result.receipt.kind = 'classic-scoped-reverse-unconnected';
-        result.receipt.configurationVerified = true; result.receipt.tunnelEstablished = false;
-        return result;
-    } });
+test('verified unconnected settlement warns without poisoning a manual retry or delete', async t => {
+    const h = harness({ actualCore: { t, applied: false, established: false } });
     h.rows.HyNode[0].cascadeRole = 'portal';
     for (let i = 0; i < 2; i++) {
         await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_TUNNEL_UNCONFIRMED' });
@@ -181,6 +213,9 @@ test('verified unconnected settlement warns without poisoning a manual retry or 
     assert.equal(h.calls.remote.length, 2);
     await h.service.deleteLink(deletion());
     assert.equal(h.rows.CascadeLink.length, 0); assert.equal(h.state().revision, 8);
+    assert.deepEqual(h.calls.core.receipts.map(result => result.receipt.kind),
+        ['classic-scoped-reverse-unconnected', 'classic-scoped-reverse-unconnected', 'classic-scoped-reverse-removal']);
+    assert.equal(h.rows.NodeOperationLock.length, 0);
 });
 
 test('verified unconnected receipt cannot hide a failed settlement', async () => {
@@ -583,9 +618,62 @@ function removed(coreInput = { linkId: LINK, expectedTopologyRevision: 7, baseli
 }
 const deletion = () => ({ expectedTopologyRevision: 7, linkId: LINK });
 
-test('checked DELETE keeps DB link through SSH then settles deletion and exact revision atomically', async () => {
-    const h = harness({ links: [{ _id: NEIGHBOR, portalNode: C, bridgeNode: B,
-        mode: 'reverse', active: true, status: 'online' }] });
+test('DELETE settlement re-reads the accepted delete marker instead of bypassing the repository lifecycle guard', async t => {
+    // The durable-intent change added findById(...).session(session).lean()
+    // before deletion. The old fixture omitted it and hid this guard behind
+    // CLASSIC_DEPLOY_UNCERTAIN, even for otherwise valid completion receipts.
+    const marker = { state: 'deleting', deleteJobId: FOREIGN, desiredVersion: 'a'.repeat(64) };
+    const h = harness({ actualCore: { t }, removeWork({ rows, result }) {
+        rows.CascadeLink[0].lifecycle = marker; return result;
+    } });
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+    assert.equal(h.calls.core.receipts[0].receipt.targetAbsent, true, 'actual remote completion reached settlement');
+    const read = h.calls.lifecycleReads.find(item => item.active);
+    assert.ok(read?.exactSession && read.session && read.id === LINK, 'same-session real repository lifecycle read');
+    assert.deepEqual(h.rows.CascadeLink[0].lifecycle, marker);
+    assert.equal(h.state().revision, 7); assert.equal(h.calls.updates.length, 1);
+    assert.equal(h.state().classicLifecycleAttempt.phase, 'dispatching');
+    assert.equal(h.state().replacementReservation.ownerToken, `classic-deploy:${h.state().classicLifecycleAttempt.operationId}`);
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_BUSY' });
+    assert.equal(h.calls.remote.length, 1);
+});
+
+test('actual DELETE lost transport completion retains its exact node generations and global admission', async t => {
+    let retained;
+    const h = harness({ actualCore: { t, afterExec({ command, rows }) {
+        if (!command.includes('mv --')) return;
+        retained = structuredClone(rows.NodeOperationLock);
+        throw Error('modeled transport loss after remote profile replacement');
+    } } });
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+    assert.equal(h.calls.core.receipts.length, 0);
+    assert.notEqual(h.calls.core.files.get(`${A}:${MAIN}`), h.calls.core.original.get(`${A}:${MAIN}`));
+    assert.equal(retained.length, 2); assert.deepEqual(h.rows.NodeOperationLock, retained);
+    assert.equal(h.rows.CascadeLink.length, 1); assert.equal(h.state().revision, 7);
+    assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);
+    await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_BUSY' });
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_BUSY' });
+    assert.equal(h.calls.remote.length, 1); assert.deepEqual(h.rows.NodeOperationLock, retained);
+});
+
+test('actual DELETE cannot release a foreign node generation replaced after staging', async t => {
+    let foreign;
+    const h = harness({ actualCore: { t, afterExec({ command, rows }) {
+        if (!command.includes('cat >')) return;
+        rows.NodeOperationLock.find(lock => lock.node === B).generation = 'foreign-node-generation';
+        foreign = structuredClone(rows.NodeOperationLock);
+    } } });
+    await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_UNCERTAIN' });
+    assert.equal(h.calls.core.receipts.length, 0);
+    assert.equal(foreign.length, 2); assert.deepEqual(h.rows.NodeOperationLock, foreign);
+    assert.equal(h.rows.CascadeLink.length, 1); assert.equal(h.state().revision, 7);
+    assert.ok(h.state().replacementReservation); assert.ok(h.state().classicLifecycleAttempt);
+    assert.equal(h.calls.core.commands.some(row => row.command.includes('mv --')), false);
+});
+
+test('checked DELETE keeps DB link through SSH then settles deletion and exact revision atomically', async t => {
+    const h = harness({ actualCore: { t }, links: [{ _id: NEIGHBOR, portalNode: C, bridgeNode: B,
+        mode: 'reverse', active: true, status: 'online', tunnelPort: 10087, tunnelUuid: 'local-neighbor-uuid' }] });
     const result = await h.service.deleteLink(deletion());
     assert.deepEqual(result, { revision: 8, deployedRevision: 5 });
     assert.deepEqual(h.calls.remote, [{ linkId: LINK, expectedTopologyRevision: 7, baselineLinkIds: [NEIGHBOR] }]);
@@ -595,6 +683,15 @@ test('checked DELETE keeps DB link through SSH then settles deletion and exact r
     assert.equal(h.state().replacementReservation, undefined);
     assert.equal(h.state().classicLifecycleAttempt, undefined);
     assert.equal(h.state().classicLifecycleLastSettlement.action, 'link.delete');
+    assert.ok(h.calls.core.commands.some(row => row.command.includes('mv --')), 'actual changed cleanup dispatched');
+    assert.equal(h.calls.core.receipts[0].receipt.targetAbsent, true);
+    assert.ok(h.calls.lifecycleReads.some(read => read.id === LINK && read.active && read.exactSession),
+        'real repository re-reads lifecycle in the exact settlement session');
+    assert.equal(h.rows.NodeOperationLock.length, 0);
+    assert.equal(h.calls.core.files.get(`${A}:${TRANSIT}`), h.calls.core.original.get(`${A}:${TRANSIT}`));
+    assert.equal(h.calls.core.files.get(`${B}:${MAIN}`), h.calls.core.original.get(`${B}:${MAIN}`));
+    const remaining = JSON.parse(h.calls.core.files.get(`${B}:${TRANSIT}`));
+    assert.deepEqual(remaining.reverse.bridges.map(row => row.tag), [`bridge-${NEIGHBOR.slice(-8)}`]);
 });
 
 test('durable server grant authorizes saved link through a reconstructed public service', async () => {
@@ -669,14 +766,15 @@ test('DELETE uncertain/throwing/malformed completion retains DB link, attempt an
     }
 });
 
-test('DELETE never infers remote absence from pending status and accepts only a checked unchanged receipt', async () => {
-    const h = harness({ removeWork: ({ result }) => {
-        result.receipt.profiles.forEach(p => { p.sha256 = p.beforeSha256; p.changed = false; });
-        return result;
-    } });
+test('DELETE never infers remote absence from pending status and accepts only a checked unchanged receipt', async t => {
+    const h = harness({ actualCore: { t, applied: false } });
     assert.equal(h.rows.CascadeLink[0].status, 'pending');
     assert.deepEqual(await h.service.deleteLink(deletion()), { revision: 8, deployedRevision: 5 });
     assert.equal(h.calls.remote.length, 1);
+    assert.ok(h.calls.core.receipts[0].receipt.profiles.every(profile => profile.changed === false));
+    assert.deepEqual(h.calls.core.files, h.calls.core.original);
+    assert.ok(h.calls.core.commands.some(row => row.command.includes('C3_READ_CONFIG')));
+    assert.equal(h.calls.core.commands.some(row => /mv --|systemctl restart/.test(row.command)), false);
 });
 
 test('DELETE performs no reservation for DB refusal or caller-supplied scope/bypass fields', async () => {
@@ -703,15 +801,21 @@ test('DELETE foreign owner, epoch, revision or attempt identity cannot settle or
     }
 });
 
-test('DELETE remains fenced across pending remote work and excludes apply/delete successors', async () => {
+test('DELETE remains fenced across pending remote work and excludes apply/delete successors', async t => {
     let finish, entered;
     const started = new Promise(r => { entered = r; }); const wait = new Promise(r => { finish = r; });
-    const h = harness({ removeWork: async ({ result }) => { entered(); await wait; return result; } });
+    const h = harness({ actualCore: { t, beforeExec: async ({ command }) => {
+        if (command.includes('cat >')) { entered(); await wait; }
+    } } });
     const pending = h.service.deleteLink(deletion()); await started;
     assert.equal(h.rows.CascadeLink.length, 1); assert.equal(h.state().classicLifecycleAttempt.phase, 'dispatching');
+    const retained = structuredClone(h.rows.NodeOperationLock);
+    assert.equal(retained.length, 2);
     await assert.rejects(h.service.queue(input()), { code: 'CLASSIC_DEPLOY_BUSY' });
     await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_BUSY' });
+    assert.deepEqual(h.rows.NodeOperationLock, retained);
     finish(); await pending; assert.equal(h.calls.remote.length, 1);
+    assert.equal(h.rows.NodeOperationLock.length, 0); assert.equal(h.rows.CascadeLink.length, 0);
 });
 
 test('fresh operation veto after claim refuses dispatch while retaining its admitted attempt', async () => {
@@ -726,8 +830,8 @@ test('fresh operation veto after claim refuses dispatch while retaining its admi
     assert.equal(h.calls.remote.length, 0); assert.ok(h.state().classicLifecycleAttempt);
 });
 
-test('DELETE confirmation requires the full exact settlement identity, not only an operation UUID', async () => {
-    const h = harness();
+test('DELETE confirmation requires the full exact settlement identity, not only an operation UUID', async t => {
+    const h = harness({ actualCore: { t } });
     const findOne = h.dependencies.CascadeTopologyState.findOne;
     h.dependencies.CascadeTopologyState.findOne = filter => {
         const q = findOne(filter), lean = q.lean;
@@ -737,6 +841,8 @@ test('DELETE confirmation requires the full exact settlement identity, not only 
         return q;
     };
     await assert.rejects(h.service.deleteLink(deletion()), { code: 'CLASSIC_DEPLOY_FENCE_LOST' });
+    assert.equal(h.calls.core.receipts[0].receipt.targetAbsent, true);
+    assert.equal(h.state().classicLifecycleLastSettlement.action, 'link.delete', 'only the returned confirmation was corrupted');
 });
 
 test('sparse removal node IDs are not a typed completion receipt', async () => {
