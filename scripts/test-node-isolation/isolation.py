@@ -123,7 +123,7 @@ def parse_runner(original, plan):
             valid_port = (set(check) == {'type', 'port', 'protocol', 'expectedState'} and
                           check.get('type') == 'port' and check.get('protocol') == 'tcp' and
                           type(check.get('port')) is int and 1 <= check['port'] <= 65535 and
-                          check.get('expectedState') == 'listening')
+                          check.get('expectedState') in ('listening', 'absent'))
             need(valid_service or valid_port, 'INVALID_CHECKS')
     return args
 
