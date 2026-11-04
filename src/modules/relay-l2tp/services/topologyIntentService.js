@@ -1,7 +1,28 @@
 'use strict';
 const { createHash, randomUUID } = require('node:crypto');
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
-const QUEUE_ID = 'create-v1';
+const QUEUE_ID = 'create-v1'; // One counter/order namespace for legacy and versioned intents.
+const INTENT_KINDS = new Set(['link.create', 'link.apply', 'link.delete']);
+// Health, timestamps, lifecycle markers and applied proofs are not desired config.
+const DESIRED_LINK_FIELDS = Object.freeze(['name', 'mode', 'portalNode', 'bridgeNode',
+    'tunnelUuid', 'tunnelPort', 'tunnelDomain', 'tunnelProtocol', 'tunnelSecurity', 'tunnelTransport',
+    'tcpFastOpen', 'tcpKeepAlive', 'tcpNoDelay', 'wsPath', 'wsHost', 'grpcServiceName',
+    'xhttpPath', 'xhttpHost', 'xhttpMode', 'realityDest', 'realitySni', 'realityPrivateKey',
+    'realityPublicKey', 'realityShortIds', 'realityFingerprint', 'muxEnabled', 'muxConcurrency',
+    'geoRouting', 'priority', 'active']);
+function desiredLinkPayload(link) {
+    return JSON.parse(JSON.stringify(Object.fromEntries(DESIRED_LINK_FIELDS
+        .filter(key => link[key] !== undefined).map(key => [key, link[key]]))));
+}
+// Content-addressed desired version: ordinary updateOne does not increment __v.
+function linkDesiredVersion(link) { return digest(desiredLinkPayload(link)); }
+function resourceIds(ids) {
+    if (!Array.isArray(ids) || !ids.length || ids.length > 128
+        || ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{24}$/.test(id))) {
+        throw intentError('TOPOLOGY_INTENT_RESOURCES_INVALID');
+    }
+    return [...new Set(ids)].sort();
+}
 function intentError(code) { return Object.assign(new Error(code), { code }); }
 function canonical(value) {
     if (Array.isArray(value)) return value.map(canonical);
@@ -17,6 +38,9 @@ function publicIntent(row) {
         ...(row.operationId ? { operationId: String(row.operationId), topologyRevision: row.topologyRevision } : {}),
         ...(row.createdLinkId ? { createdLinkId: String(row.createdLinkId) } : {}),
         ...(row.errorCode ? { errorCode: row.errorCode } : {}),
+        ...(row.version === 2 ? { version: 2, kind: row.kind, linkId: String(row.linkId),
+            desiredVersion: row.desiredVersion, desiredSaved: true, phase: row.status === 'waiting' ? 'waiting' : row.status,
+            ...(row.waitingReason ? { waitingReason: row.waitingReason } : {}) } : {}),
     };
 }
 class TopologyIntentService {
@@ -45,8 +69,135 @@ class TopologyIntentService {
         }
         return this.consumer.runOnce();
     }
-    get(id) { return this.TopologyCreateIntent.findById(id).lean().then(publicIntent); }
-    async accept({ expectedTopologyRevision, requestKey = randomUUID(), link, payloadHash } = {}) {
+    get(id) {
+        return this.TopologyCreateIntent.findOne({ _id: id,
+            'executionContext.target': this.#executionContext.target,
+            'executionContext.hostIdentity': this.#executionContext.hostIdentity }).lean().then(publicIntent);
+    }
+    accept(input = {}) {
+        if (input.version === 2) return this.acceptVersioned(input);
+        if (input.version !== undefined && input.version !== 1) return Promise.reject(intentError('INVALID_TOPOLOGY_INTENT_VERSION'));
+        if (input.kind !== undefined && input.kind !== 'link.create') return Promise.reject(intentError('INVALID_TOPOLOGY_INTENT'));
+        return this.acceptLegacy(input);
+    }
+    // v2 create accepts normalized user fields BEFORE credential generation.
+    // apply/delete require linkDesiredVersion(rawPersistedLink), a content pin.
+    // prepareLink is an optional LOCAL credential generator, never a remote preflight.
+    async acceptVersioned({ kind, expectedTopologyRevision, requestKey, link, linkId, desiredVersion, payloadHash } = {}) {
+        if (!INTENT_KINDS.has(kind) || payloadHash !== undefined) throw intentError('INVALID_TOPOLOGY_INTENT');
+        if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) throw intentError('INVALID_TOPOLOGY_REVISION');
+        if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw intentError('INVALID_IDEMPOTENCY_KEY');
+        let normalized;
+        if (kind === 'link.create') {
+            if (!link || typeof link !== 'object' || Array.isArray(link) || linkId !== undefined || desiredVersion !== undefined) throw intentError('INVALID_TOPOLOGY_INTENT');
+            // Fixed placeholder prevents even ObjectId generation before persisted-key lookup.
+            normalized = desiredLinkPayload(new this.CascadeLink({ ...link,
+                _id: link._id ?? '000000000000000000000000', active: true }).toObject());
+            if (link._id !== undefined) normalized._id = String(link._id);
+        } else if (link !== undefined || typeof linkId !== 'string' || !/^[a-f0-9]{24}$/.test(linkId)
+            || typeof desiredVersion !== 'string' || !/^[a-f0-9]{64}$/.test(desiredVersion)) {
+            throw intentError('INVALID_TOPOLOGY_INTENT');
+        }
+        const fingerprint = digest({ version: 2, kind, ...(normalized ? { link: normalized } : { linkId, desiredVersion }) });
+        if (Buffer.byteLength(JSON.stringify(normalized || {})) > 32768) throw intentError('TOPOLOGY_INTENT_PAYLOAD_TOO_LARGE');
+        const findExisting = async (session, confirmDurable = false) => {
+            const query = this.TopologyCreateIntent.findOne({ requestKey }).session(session);
+            if (confirmDurable) query.readConcern('majority').read('primary').maxTimeMS(5000);
+            const found = await query.lean();
+            if (found && !matchesTopologyExecutionContext(found.executionContext, this.#executionContext)) throw intentError('TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH');
+            if (found && (found.version !== 2 || found.payloadHash !== fingerprint)) throw intentError('TOPOLOGY_INTENT_KEY_CONFLICT');
+            return found;
+        };
+        try {
+            return await this.transactionRunner(async session => {
+                const existing = await findExisting(session);
+                if (existing) return publicIntent(existing);
+                if (kind === 'link.create') {
+                    if (['HyNode', 'CascadeRouteGroup', 'RelayL2tpState'].some(name => this.dependencies[name]?.db !== this.CascadeLink.db)) {
+                        throw intentError('TOPOLOGY_INTENT_DRAFT_CONNECTION_MISMATCH');
+                    }
+                    // Scoped commitDraft acknowledges its own runner before returning;
+                    // that wrapper cannot own an outer transaction's commit lifetime.
+                    const writer = this.dependencies.intentDraftWriter;
+                    if ((writer !== undefined && (writer?.db !== this.CascadeLink.db || typeof writer?.createLink !== 'function'))
+                        || (this.dependencies.withScopedNodeLocks && !writer)) throw intentError('TOPOLOGY_INTENT_DRAFT_TRANSACTION_UNAVAILABLE');
+                }
+                if (typeof this.dependencies.resolveIntentResources !== 'function') throw intentError('TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE');
+                const state = await this.CascadeTopologyState.findOneAndUpdate(
+                    { _id: 'singleton', revision: expectedTopologyRevision }, { $inc: { stateTransitionRevision: 1 } },
+                    { new: true, session, upsert: false }).lean();
+                if (!state) throw intentError('STALE_TOPOLOGY_REVISION');
+                let queue = await this.TopologyIntentQueueState.findById(QUEUE_ID).session(session).lean();
+                if (!queue) {
+                    if (await this.TopologyCreateIntent.exists({}).session(session)) throw intentError('TOPOLOGY_INTENT_STATE_MISSING');
+                    [queue] = await this.TopologyIntentQueueState.create([{ _id: QUEUE_ID, ordinal: 0, outstanding: 0 }], { session });
+                }
+                const counted = await this.TopologyIntentQueueState.findOneAndUpdate(
+                    { _id: QUEUE_ID, outstanding: { $lt: this.capacity } }, { $inc: { outstanding: 1, ordinal: 1 } },
+                    { new: true, session, runValidators: true }).lean();
+                if (!counted) throw intentError('TOPOLOGY_INTENT_BACKLOG_FULL');
+                const jobId = new this.TopologyCreateIntent()._id;
+                let target;
+                if (kind === 'link.create') {
+                    const prepared = this.dependencies.prepareLink
+                        ? await this.dependencies.prepareLink({ ...normalized })
+                        : { ...normalized, tunnelUuid: normalized.tunnelUuid || randomUUID() };
+                    const document = new this.CascadeLink({ ...prepared, active: true, status: 'pending', autoDeploy: true });
+                    await document.validate();
+                    target = JSON.parse(JSON.stringify(document.toObject()));
+                    let saved;
+                    if (this.dependencies.intentDraftWriter) {
+                        // Same contract as draftWriteService.createLink plus the
+                        // already-active session. Caller must hold any locks until
+                        // THIS admission transaction, not this callback, commits.
+                        saved = await this.dependencies.intentDraftWriter.createLink({ expectedTopologyRevision, link: target, session });
+                    } else {
+                        const { TopologyDraftRepository } = require('../repositories/topologyDraftRepository');
+                        const { TopologyDraftWriteService } = require('./topologyDraftWriteService');
+                        // The unscoped repository supports a joined transactionRunner.
+                        const repository = new TopologyDraftRepository({ ...this.dependencies, transactionRunner: work => work(session) });
+                        saved = await new TopologyDraftWriteService({ repository }).createLink({ expectedTopologyRevision, link: target });
+                    }
+                    const persisted = await this.CascadeLink.findById(target._id).session(session).lean();
+                    if (saved?.revision !== expectedTopologyRevision + 1 || !persisted
+                        || linkDesiredVersion(persisted) !== linkDesiredVersion(target)) throw intentError('TOPOLOGY_INTENT_DRAFT_BINDING_INVALID');
+                    target = persisted;
+                    linkId = String(target._id);
+                    desiredVersion = linkDesiredVersion(target);
+                } else {
+                    target = await this.CascadeLink.findById(linkId).session(session).lean();
+                    if (!target) throw intentError('CASCADE_LINK_NOT_FOUND');
+                    if (linkDesiredVersion(target) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+                }
+                const resourceNodeIds = resourceIds(await this.dependencies.resolveIntentResources({ kind, link: target, desiredVersion, session }));
+                if (kind === 'link.delete') {
+                    // CascadeLink's lifecycle schema is separately owned. Never substitute
+                    // draft deletion for a same-connection operation-owned tombstone.
+                    const writer = this.dependencies.deleteIntentWriter;
+                    if (writer?.db !== this.CascadeLink.db || typeof writer?.markDeleting !== 'function') throw intentError('TOPOLOGY_INTENT_DELETE_WRITER_UNAVAILABLE');
+                    const marked = await writer.markDeleting({ session, linkId, desiredVersion, jobId: String(jobId) });
+                    if (marked?.matchedCount !== 1) throw intentError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+                    const retained = await this.CascadeLink.findById(linkId).session(session).lean();
+                    if (!retained || linkDesiredVersion(retained) !== desiredVersion) throw intentError('TOPOLOGY_INTENT_DELETE_BINDING_INVALID');
+                }
+                const [row] = await this.TopologyCreateIntent.create([{
+                    _id: jobId, executionContext: this.#executionContext, requestKey, version: 2, kind,
+                    linkId, desiredVersion, resourceNodeIds, payloadHash: fingerprint,
+                    payload: { kind, linkId, desiredVersion }, ordinal: counted.ordinal,
+                    ...(kind === 'link.create' ? { createdLinkId: linkId } : {}),
+                    acceptanceRevision: expectedTopologyRevision, status: 'waiting', attempts: 0, generation: 0,
+                }], { session });
+                return publicIntent(row);
+            });
+        } catch (error) {
+            if (error?.code === 11000 || error?.hasErrorLabel?.('UnknownTransactionCommitResult')) {
+                const existing = await findExisting(null, true);
+                if (existing) return publicIntent(existing);
+            }
+            throw error;
+        }
+    }
+    async acceptLegacy({ expectedTopologyRevision, requestKey = randomUUID(), link, payloadHash } = {}) {
         if (!Number.isSafeInteger(expectedTopologyRevision) || expectedTopologyRevision < 0) throw intentError('INVALID_TOPOLOGY_REVISION');
         if (typeof requestKey !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(requestKey)) throw intentError('INVALID_IDEMPOTENCY_KEY');
         const document = new this.CascadeLink({ ...link, active: true, status: 'pending', autoDeploy: true });
@@ -106,4 +257,5 @@ class TopologyIntentService {
     }
 }
 function createTopologyIntentService(dependencies) { return new TopologyIntentService(dependencies); }
-module.exports = { TopologyIntentService, createTopologyIntentService, publicIntent, digest, intentError, QUEUE_ID };
+module.exports = { TopologyIntentService, createTopologyIntentService, publicIntent, digest, intentError, QUEUE_ID,
+    INTENT_KINDS, desiredLinkPayload, linkDesiredVersion, resourceIds };
