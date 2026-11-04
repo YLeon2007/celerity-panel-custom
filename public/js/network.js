@@ -107,6 +107,7 @@
     // so it can never leave an infinite timer behind.
     const OPERATION_POLL_INTERVAL_MS = 3000;
     const OPERATION_POLL_MAX_ATTEMPTS = 40; // ~2 minutes, then the 30s loop takes over
+    const TRACKED_OPERATION_STATUSES = ['queued', 'preparing', 'committing', 'rolling_back', 'succeeded'];
 
     function shouldContinueOperationPolling(state = {}) {
         const attempt = Number.isSafeInteger(state.attempt) ? state.attempt : 0;
@@ -146,8 +147,10 @@
         const outcome = isCompletedClassicDeploymentResult(result, result.topologyRevision)
             ? (labels.classicLinkApplied || 'Связь применена (classic)')
             : result.status === 'succeeded'
-                ? (labels.deployAlreadyDeployed || 'Topology already deployed')
-                : (labels.deployQueued || 'Deployment queued');
+                ? (labels.operationApplied || 'Конфигурация применена')
+                : result.status === 'queued'
+                    ? (labels.deployQueued || 'Deployment queued')
+                    : (labels.deployInProgress || 'Деплой выполняется');
         return outcome + ' — ' + (labels.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED);
     }
 
@@ -228,7 +231,7 @@
     let cy = null;
     let linkModalMode = 'create';
     let linkModalSavedFingerprint = null;
-    let pendingCreateRequest = null;
+    const pendingCreateRequests = { main: null, quick: null };
     const intentPolls = new Map();
     let topologyRevision = null;
     let deployedRevision = null;
@@ -932,7 +935,9 @@
             '<div class="info-grid">' +
             '<div class="info-summary">' +
             '<span class="beta-badge">' + escHtml(i18n.betaBadge || 'BETA') + '</span>' +
-            field(i18n.routePath || 'Traffic path', escHtml(summary.chain)) +
+            field(i18n.selectedSegment || 'Выбранный участок', escHtml(summary.chain)) +
+            '<p class="info-hint">' + escHtml(i18n.fullRouteUnconfirmed
+                || 'Полный применённый маршрут и выход не подтверждены.') + '</p>' +
             field('ti-login-2',     i18n.routeEntry     || 'Entry',             escHtml(summary.entry)) +
             field('ti-logout-2',    i18n.routeExit      || 'Exit',              escHtml(summary.exit)) +
             field('ti-shield-lock', i18n.routeEncryption || 'Tunnel encryption', escHtml(summary.encryption)) +
@@ -986,25 +991,11 @@
             ? (tgtNode.data('label') || tgtNode.data('ip') || edgeData.target)
             : edgeData.target;
 
-        // Walk the chain following edges with the same mode
-        const hops = ['Client', entryLabel];
-        const visited = new Set([edgeData.source]);
-        let curId = edgeData.target;
-        let safety = 0;
-        while (curId && !visited.has(curId) && safety++ < 8) {
-            visited.add(curId);
-            const node = cy.getElementById(curId);
-            const lbl = node.length ? (node.data('label') || node.data('ip') || curId) : curId;
-            hops.push(lbl);
-            const nextEdge = cy.edges().toArray().find(function (e) {
-                return e.data('mode') === edgeData.mode &&
-                    !e.data('isInternetEdge') &&
-                    e.data('source') === curId;
-            });
-            if (!nextEdge) break;
-            curId = nextEdge.data('target');
-        }
-        hops.push('Internet');
+        // The current snapshot describes desired arrows, not an applied path
+        // or exit policy. Show only this segment in traffic direction, for
+        // either transport mode. Never infer Client/Internet or follow a
+        // pending sibling (nor choose the first branch as the active exit).
+        // A full route needs a separately supplied, bound backend projection.
 
         const sec = edgeData.tunnelSecurity || 'none';
         const encLabel = sec === 'none'
@@ -1012,7 +1003,7 @@
             : sec.toUpperCase() + ' (' + (edgeData.tunnelProtocol || 'vless').toUpperCase() + ')';
 
         return {
-            chain: hops.join(' → '),
+            chain: entryLabel + ' → ' + exitLabel,
             entry: entryLabel,
             exit: exitLabel,
             encryption: encLabel,
@@ -1274,7 +1265,10 @@
     }
 
     function handleLinkAutoDeploy(snapshot, optedIn) {
-        if (!optedIn) return;
+        if (!optedIn) {
+            showToast(i18n.savedWithoutDeploy || 'Изменения сохранены. Деплой не запускался.');
+            return;
+        }
         const job = snapshot?.autoDeployJob;
         if (job?.jobId) {
             showToast('Запрос автодеплоя принят: ' + job.jobId + '. Связь ещё может ожидать создания.');
@@ -1287,9 +1281,9 @@
             return;
         }
         const operation = snapshot?.autoDeployOperation;
-        if (operation?.status === 'queued' && operation.operationId) {
+        if (TRACKED_OPERATION_STATUSES.includes(operation?.status) && operation.operationId) {
             startOperationPolling(operation);
-            showToast(deployResultMessage(operation));
+            showToast(deployResultMessage(operation, i18n));
             return;
         }
         // Saving a draft is not evidence of physical deployment. In
@@ -1308,6 +1302,20 @@
             + describeTopologyError({ error }, 'Автодеплой не подтверждён')
             + (classicRefusal ? '. Проверьте состояние и блокировки перед повторной попыткой.'
                 : '. Для применения используйте отдельный Deploy этой связи.'), 'error');
+    }
+
+    function createRequestHeaders(data, formKind) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (data.autoDeploy === true && window.crypto?.randomUUID) {
+            // Revision refresh is not a new logical create. Keep each form's
+            // identity through rejected/unknown deliveries; retire on acceptance.
+            const signature = JSON.stringify({ ...data, expectedTopologyRevision: undefined });
+            if (pendingCreateRequests[formKind]?.signature !== signature) {
+                pendingCreateRequests[formKind] = { signature, key: window.crypto.randomUUID() };
+            }
+            headers['Idempotency-Key'] = pendingCreateRequests[formKind].key;
+        }
+        return headers;
     }
 
     async function onAddLinkSubmit(e) {
@@ -1373,12 +1381,7 @@
         btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>';
 
         try {
-            const headers = { 'Content-Type': 'application/json' };
-            if (!linkId && data.autoDeploy === true && window.crypto?.randomUUID) {
-                const signature = JSON.stringify({ ...data, expectedTopologyRevision: undefined });
-                if (pendingCreateRequest?.signature !== signature) pendingCreateRequest = { signature, key: window.crypto.randomUUID() };
-                headers['Idempotency-Key'] = pendingCreateRequest.key;
-            }
+            const headers = linkId ? { 'Content-Type': 'application/json' } : createRequestHeaders(data, 'main');
             const res = await fetch(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
                 method: linkId ? 'PUT' : 'POST',
                 headers,
@@ -1386,7 +1389,7 @@
             });
             const savedSnapshot = await handleDraftMutationResponse(res);
             if (!savedSnapshot) return;
-            pendingCreateRequest = null;
+            if (!linkId) pendingCreateRequests.main = null;
             closeModal();
             await loadTopology();
             handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
@@ -1441,44 +1444,44 @@
         if (!res.ok) {
             throw new Error(describeTopologyError(data, 'HTTP ' + res.status));
         }
-        if (!['queued', 'succeeded'].includes(data.status)) {
+        if (!TRACKED_OPERATION_STATUSES.includes(data.status)) {
             throw new Error((i18n.deploymentEndedWithStatus || 'Deployment ended with status') + ': ' + (data.status || 'unknown'));
         }
-        if (data.status === 'queued') startOperationPolling(data);
+        startOperationPolling(data);
         return data;
     }
 
     // ==================== OPERATION-SPECIFIC POLLING ====================
 
-    let operationPollTimer = null;
-    let operationPollGeneration = 0;
-    function stopOperationPolling() {
-        operationPollGeneration += 1;
+    const operationPolls = new Map();
+    function stopOperationPolling(state) {
+        const operationPollTimer = state.timer;
         if (operationPollTimer) {
             clearTimeout(operationPollTimer);
-            operationPollTimer = null;
         }
+        operationPolls.delete(state.operationId);
     }
 
     function startOperationPolling(result) {
-        if (!result || result.status !== 'queued') return;
+        if (!TRACKED_OPERATION_STATUSES.includes(result?.status)) return;
         startBoundOperationPolling(result.operationId, result.kind);
     }
 
     function startBoundOperationPolling(operationId, kind) {
-        if (!/^[a-f0-9]{24}$/i.test(operationId || '')) return;
-        stopOperationPolling();
-        scheduleOperationPollStep({ operationId, kind: kind || null }, 0, operationPollGeneration);
+        if (!/^[a-f0-9]{24}$/i.test(operationId || '') || operationPolls.has(operationId)) return;
+        const state = { operationId, kind: kind || null, timer: null };
+        operationPolls.set(operationId, state);
+        scheduleOperationPollStep(state, 0);
     }
 
-    function scheduleOperationPollStep(state, attempt, generation) {
-        operationPollTimer = setTimeout(function () {
-            operationPollTimer = null;
-            runOperationPollStep(state, attempt, generation);
+    function scheduleOperationPollStep(state, attempt) {
+        state.timer = setTimeout(function () {
+            state.timer = null;
+            return runOperationPollStep(state, attempt);
         }, OPERATION_POLL_INTERVAL_MS);
     }
 
-    async function runOperationPollStep(state, attempt, generation) {
+    async function runOperationPollStep(state, attempt) {
         let operation = null;
         try {
             const res = await fetch('/api/cascade/topology/operations/' + encodeURIComponent(state.operationId));
@@ -1494,7 +1497,7 @@
         } catch (_) {
             // Transient failure: stay within the attempt budget and retry.
         }
-        if (generation !== operationPollGeneration) return;
+        if (operationPolls.get(state.operationId) !== state) return;
         const status = operation?.status || null;
         if (shouldContinueOperationPolling({
             attempt,
@@ -1503,11 +1506,12 @@
             clientReadiness: operation?.clientReadiness,
             clientProofState: operation?.clientProofState,
         })) {
-            scheduleOperationPollStep(state, attempt + 1, generation);
+            scheduleOperationPollStep(state, attempt + 1);
             return;
         }
         await loadTopology();
-        if (generation !== operationPollGeneration) return;
+        if (operationPolls.get(state.operationId) !== state) return;
+        stopOperationPolling(state);
         const applied = status === 'succeeded';
         const verified = applied && operation?.clientReadiness === 'verified';
         const degraded = applied && operation?.clientProofState === 'degraded';
@@ -1587,20 +1591,29 @@
         setActionLoading(i18n.undeploying || 'Undeploying...');
 
         const edge = cy.edges().filter(e => e.data('linkId') === linkId);
+        const prev = edge.length ? edge.data('status') : null;
         if (edge.length) edge.data('status', 'syncing');
 
         try {
-            await fetch('/api/cascade/links/' + linkId + '/undeploy', { method: 'POST' });
+            const response = await fetch('/api/cascade/links/' + linkId + '/undeploy', { method: 'POST' });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || payload.success !== true) {
+                throw new Error(describeTopologyError(payload,
+                    i18n.undeployFailed || 'Снятие деплоя не подтверждено'));
+            }
             showToast(i18n.undeploySuccess || 'Undeployed');
-            loadTopology();
+            await loadTopology();
             closeInfoModal();
         } catch (err) {
+            if (edge.length && prev) edge.data('status', prev);
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
+            await loadTopology();
         } finally { resetActionLoading(); }
     };
 
     window._cascadeDelete = async function (linkId) {
-        if (!confirm(i18n.confirmDeleteLink || 'Delete this cascade link?')) return;
+        if (!confirm(i18n.confirmDeleteLink
+            || 'Удалить каскадную связь? Удаление может прервать маршруты и трафик пользователей. Без другого разрешённого выхода маршрут останется без выхода.')) return;
         setActionLoading(i18n.deleting || 'Deleting...');
 
         try {
@@ -1913,11 +1926,12 @@
         try {
             var res = await fetch('/api/cascade/links', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: createRequestHeaders(data, 'quick'),
                 body: JSON.stringify(data),
             });
             const createdSnapshot = await handleDraftMutationResponse(res);
             if (!createdSnapshot) return;
+            pendingCreateRequests.quick = null;
             closeQuickModal();
             await loadTopology();
             handleLinkAutoDeploy(createdSnapshot, data.autoDeploy === true);

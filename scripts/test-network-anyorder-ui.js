@@ -1,8 +1,8 @@
 'use strict';
 
 // Local VM/DOM/API evidence only. No browser, HTTP server, DB or node transport.
-// [shipped] characterizes working current contracts; [spec-red] is deliberately
-// failing acceptance coverage of gaps reproducible with those same contracts.
+// [shipped] preserves working contracts; [regression] covers lifecycle repairs.
+// Full applied-route and async delete projections remain explicit API handoffs.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -29,7 +29,7 @@ const reply = (body, status = 200) => ({ ok: status >= 200 && status < 300, stat
     async json() { return JSON.parse(JSON.stringify(body)); } });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function harness(t, initial = snapshot()) {
+function harness(t, initial = snapshot(), locale = 'ru') {
     const requests = [], toasts = [], confirmations = [], timers = [], pendingReplies = [];
     const unexpected = [], errors = [], items = new Map(), elements = new Map();
     const state = { snapshot: initial, operations: new Map(), jobs: new Map(), confirm: true,
@@ -125,7 +125,7 @@ function harness(t, initial = snapshot()) {
         throw Error('Unexpected local fixture request: ' + request.method + ' ' + url);
     };
     const window = { crypto: { randomUUID }, _networkCsrfToken: 'local-csrf',
-        _networkI18n: require('../src/locales/ru.json').network,
+        _networkI18n: require('../src/locales/' + locale + '.json').network,
         showToast: (message, type) => toasts.push({ message, type }) };
     // Same VM boot-boundary seam as test-network-edit-ui.js/layout-preservation.
     // Keep real loadTopology, refreshStatuses, renderGraph, handlers and polling.
@@ -375,7 +375,7 @@ test('[shipped] blocked AutoDeploy says saved but not applied and never falls ba
     proofNotClaimed(h);
 });
 
-test('[spec-red] successful save-only create must explicitly confirm saved without claiming applied or connected', async t => {
+test('[regression] successful save-only create must explicitly confirm saved without claiming applied or connected', async t => {
     const h = harness(t), row = graphs.G1[0], next = snapshot([row], 8);
     h.respond('POST', '/api/cascade/links', { ...next, createdLinkId: row._id }, 201,
     () => { h.state.snapshot = next; });
@@ -384,15 +384,50 @@ test('[spec-red] successful save-only create must explicitly confirm saved witho
     assert(!h.toasts.some(x => /применен|применён|соединен|соединён|applied|connected/i.test(x.message)));
 });
 
-test('[spec-red] quick AutoDeploy must supply an Idempotency-Key for replay-safe durable create acceptance', async t => {
+test('[regression] quick AutoDeploy must supply an Idempotency-Key for replay-safe durable create acceptance', async t => {
     const h = harness(t), job = { jobId: id(330), status: 'waiting', acceptanceRevision: 7 };
     h.respond('POST', '/api/cascade/links', { autoDeployJob: job, acceptedTopologyRevision: 7 }, 202);
     await h.submit(graphs.G2[1], true, true);
     assert.match(writes(h)[0].headers['Idempotency-Key'] || '', /^[0-9a-f-]{36}$/, 'quick create omits the key, so the service default generates a new key per delivery');
 });
 
+test('[regression] quick create retries retain identity across revision refresh, change on payload or accepted new create', async t => {
+    const h = harness(t), row = graphs.G1[0];
+    for (const [candidate, status] of [[row, 409], [row, 503], [{ ...row, tunnelPort: row.tunnelPort + 1 }, 503], [row, 202], [row, 202]]) {
+        h.respond('POST', '/api/cascade/links', status === 202
+            ? { autoDeployJob: { jobId: id(331), status: 'waiting' }, acceptedTopologyRevision: 8 }
+            : { error: { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE' } }, status);
+        h.state.snapshot = snapshot([], 8);
+        await h.submit(candidate, true, true);
+    }
+    const keys = writes(h).map(r => r.headers['Idempotency-Key']);
+    assert.match(keys[0] || '', /^[0-9a-f-]{36}$/);
+    assert.equal(keys[0], keys[1], 'snapshot revision is not a new logical create');
+    assert.notEqual(keys[1], keys[2]);
+    assert.notEqual(keys[3], keys[4], 'an accepted new submission starts a new logical create');
+});
+
+test('[regression] both save-only forms and edit explicitly confirm a save without work or route claims', async t => {
+    const row = graphs.G1[0];
+    for (const quick of [false, true]) {
+        const h = harness(t), next = snapshot([row], 8);
+        h.respond('POST', '/api/cascade/links', { ...next, createdLinkId: row._id }, 201, () => { h.state.snapshot = next; });
+        await h.submit(row, false, quick);
+        assert(h.toasts.some(x => /сохранен|сохранён|saved/i.test(x.message)));
+        assert.equal(h.activeTimers().length, 0);
+        assert.equal(writes(h).length, 1);
+        proofNotClaimed(h);
+    }
+    const h = harness(t, snapshot([row]));
+    await h.ui.openEditLinkModal(row._id);
+    h.respond('PUT', '/api/cascade/links/' + row._id, snapshot([row], 8));
+    await h.ui.onAddLinkSubmit({ target: h.form, preventDefault() {} });
+    assert(h.toasts.some(x => /сохранен|сохранён|saved/i.test(x.message)));
+    assert.equal(h.activeTimers().length, 0);
+});
+
 for (const status of ['preparing', 'committing', 'succeeded']) {
-    test(`[spec-red] AutoDeploy must consume an actually accepted ${status} operation instead of reporting not started`, async t => {
+    test(`[regression] AutoDeploy must consume an actually accepted ${status} operation instead of reporting not started`, async t => {
         const h = harness(t), operationId = id(340);
         const next = snapshot([graphs.G1[0]], 8);
         h.respond('POST', '/api/cascade/links', { ...next, createdLinkId: graphs.G1[0]._id,
@@ -400,29 +435,56 @@ for (const status of ['preparing', 'committing', 'succeeded']) {
         await h.submit(graphs.G1[0], true);
         assert(!h.toasts.some(x => x.type === 'error'), 'queueAutoDeploy allows this status, but the UI reports an unstarted AutoDeploy');
         assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 1, 'accepted operation needs exact-ID status/proof tracking');
+        h.state.operations.set(operationId, { operationId, status: 'succeeded', clientReadiness: 'unverified', clientProofState: 'degraded' });
+        await h.poll();
+        assert.equal(h.requests.filter(r => r.url.endsWith('/operations/' + operationId)).length, 1);
+        assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 0);
+        proofNotClaimed(h);
     });
 }
 
-test('[spec-red] staged Portal-to-Relay drawer must not advertise an Internet path with no exit', async t => {
+test('[regression] manual Deploy consumes preparing/committing/succeeded operation IDs without replay or readiness inference', async t => {
+    for (const status of ['preparing', 'committing', 'succeeded']) {
+        const h = harness(t), operationId = id(342);
+        h.respond('POST', '/api/cascade/topology/deploy', { operationId, status, kind: 'link.apply', topologyRevision: 7 }, 202);
+        await h.window._cascadeDeploy(graphs.G1[0]._id); await tick();
+        assert(!h.toasts.some(x => x.type === 'error'));
+        h.state.operations.set(operationId, { operationId, status: 'succeeded', clientReadiness: 'verified' });
+        await h.poll();
+        assert.equal(writes(h).length, 1);
+        assert(h.toasts.some(x => /готовность подтверждена проверкой клиента/.test(x.message)));
+    }
+});
+
+test('[regression] staged Portal-to-Relay drawer must not advertise an Internet path with no exit', async t => {
     const row = link(50, P, R, { status: 'staged' });
     const h = harness(t, snapshot([row])); await h.load();
     assert.doesNotMatch(h.drawer(row._id), /Client → Portal → Relay → Internet/, 'buildRouteSummary appends Internet unconditionally to an incomplete prefix');
+    assert.equal(h.ui.buildRouteSummary(h.graph.getElementById('link-' + row._id).data()).chain, 'Portal → Relay');
 });
 
-test('[spec-red] applied drawer must not silently include a save-only sibling in the displayed route', async t => {
+test('[regression] applied drawer must not silently include a save-only sibling in the displayed route', async t => {
     const prefix = link(51, P, R, { status: 'deployed' }), pending = link(52, R, B1);
     const h = harness(t, snapshot([prefix, pending])); await h.load();
     assert.doesNotMatch(h.drawer(prefix._id), /Client → Portal → Relay → Bridge 1 → Internet/, 'drawer follows pending edges as though they were applied');
+    assert.equal(h.ui.buildRouteSummary(h.graph.getElementById('link-' + prefix._id).data()).chain, 'Portal → Relay');
 });
 
-test('[spec-red] mixed-mode drawer must not truncate the traffic path at the transport-mode boundary', async t => {
+test('[regression] mixed-mode drawer shows only the selected segment, not an inferred full applied route', async t => {
     const prefix = link(53, P, R, { status: 'online' }), suffix = link(54, R, B1, { status: 'online', mode: 'forward' });
     const h = harness(t, snapshot([prefix, suffix])); await h.load();
+    // The original RED required the full Portal→Relay→Bridge chain. Current
+    // fields do not prove an applied path/policy, so that assertion would force
+    // another browser graph planner. Repair the false route claim, not the API.
     const summary = h.ui.buildRouteSummary(h.graph.getElementById('link-' + prefix._id).data());
-    assert.match(summary.chain, /Portal → Relay → Bridge 1/, 'reverse/forward does not change user traffic direction');
+    assert.equal(summary.chain, 'Portal → Relay');
+    assert.equal(h.ui.buildRouteSummary(h.graph.getElementById('link-' + suffix._id).data()).chain, 'Relay → Bridge 1');
+    assert.match(h.drawer(prefix._id), /выбранный участок|Выбранный участок/);
+    assert.match(h.drawer(prefix._id), /маршрут.*не подтвержден|маршрут.*не подтверждён/);
+    proofNotClaimed(h);
 });
 
-test('[spec-red] deleting the only applied exit must warn about route interruption before dispatch', async t => {
+test('[regression] deleting the only applied exit must warn about route interruption before dispatch', async t => {
     const row = link(55, R, B1, { status: 'online' });
     const h = harness(t, snapshot([row])); await h.load(); h.state.confirm = false;
     await h.window._cascadeDelete(row._id);
@@ -430,16 +492,31 @@ test('[spec-red] deleting the only applied exit must warn about route interrupti
     assert.match(h.confirmations[0], /трафик|пользоват|выход|соединени|маршрут|traffic|user|exit|connect|route/i, 'current confirmation only asks to delete a link');
 });
 
-test('[spec-red] rejected legacy undeploy must not announce success on an HTTP error', async t => {
+test('[regression] rejected legacy undeploy must not announce success on an HTTP error', async t => {
     const row = link(56, P, B1, { status: 'online' });
     const h = harness(t, snapshot([row])); await h.load();
     h.respond('POST', '/api/cascade/links/' + row._id + '/undeploy', { error: { code: 'LEGACY_CASCADE_UNDEPLOY_BUSY' } }, 409);
     await h.window._cascadeUndeploy(row._id); await tick();
     assert(h.toasts.some(x => x.type === 'error'), 'fetch resolves HTTP errors; undeploy currently ignores response.ok');
     assert(!h.toasts.some(x => /undeployed|деплой отменен|отключена/i.test(x.message) && x.type !== 'error'));
+    assert.equal(h.graph.getElementById('link-' + row._id).data('status'), 'online');
+    assert(h.requests.some(r => r.url === '/api/cascade/topology'), 'refresh after refusal instead of leaving optimistic syncing');
 });
 
-test('[spec-red] a second accepted operation must not cancel visibility of the first pending operation', async t => {
+test('[regression] undeploy confirms only the current success receipt and never displays free-form backend errors', async t => {
+    for (const [body, status] of [[{ success: true }, 200], [{ error: 'private SSH credentials' }, 500], [{ success: false }, 200]]) {
+        const row = link(57, P, B1, { status: 'online' }), h = harness(t, snapshot([row]));
+        await h.load();
+        h.respond('POST', '/api/cascade/links/' + row._id + '/undeploy', body, status);
+        await h.window._cascadeUndeploy(row._id); await tick();
+        const errors = h.toasts.filter(x => x.type === 'error');
+        assert.equal(errors.length, body.success === true ? 0 : 1);
+        assert(!h.toasts.some(x => /private SSH credentials/.test(x.message)));
+        assert.equal(writes(h).length, 1);
+    }
+});
+
+test('[regression] a second accepted operation must not cancel visibility of the first pending operation', async t => {
     const h = harness(t);
     const accepted = [id(350), id(351)];
     for (const operationId of accepted) {
@@ -454,3 +531,59 @@ test('[spec-red] a second accepted operation must not cancel visibility of the f
     const polled = h.requests.filter(r => r.url.startsWith('/api/cascade/topology/operations/')).map(r => r.url.split('/').at(-1));
     assert.deepEqual([...new Set(polled)].sort(), accepted, 'one global operationPollTimer cancels the prior accepted operation');
 });
+
+test('[regression] duplicate tracking preserves one poll; one terminal operation does not stop another', async t => {
+    const h = harness(t), first = id(352), second = id(353);
+    for (const operationId of [first, second, first]) {
+        h.ui.handleLinkAutoDeploy({ autoDeployOperation: { operationId, status: 'queued' } }, true);
+    }
+    assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 2);
+    h.state.operations.set(first, { operationId: first, status: 'failed' });
+    h.state.operations.set(second, { operationId: second, status: 'committing' });
+    await h.poll(); await h.poll();
+    assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 1);
+    h.state.operations.set(second, { operationId: second, status: 'succeeded', clientReadiness: 'verified' });
+    await h.poll();
+    assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 0);
+    assert.equal(h.requests.filter(r => r.url.endsWith('/operations/' + first)).length, 1);
+    assert.equal(h.requests.filter(r => r.url.endsWith('/operations/' + second)).length, 2);
+});
+
+test('[regression] main and quick logical retry identities do not replace each other after delivery failures', async t => {
+    const h = harness(t), row = graphs.G1[0];
+    for (const quick of [false, true, false, true]) {
+        h.respond('POST', '/api/cascade/links', {}, 503, () => { throw Error('connection lost'); });
+        await h.submit(row, true, quick);
+    }
+    const keys = writes(h).map(r => r.headers['Idempotency-Key']);
+    assert.equal(keys[0], keys[2]); assert.equal(keys[1], keys[3]);
+    assert.notEqual(keys[0], keys[1]);
+    assert.equal(h.activeTimers().filter(timer => [1500, helpers.OPERATION_POLL_INTERVAL_MS].includes(timer.delay)).length, 0);
+});
+
+for (const locale of ['ru', 'en']) {
+    test(`[regression] ${locale} visible lifecycle strings use the actual nodes template bindings`, async t => {
+        const labels = require('../src/locales/' + locale + '.json').network;
+        const template = fs.readFileSync(path.join(__dirname, '../views/nodes.ejs'), 'utf8');
+        for (const key of ['savedWithoutDeploy', 'deployInProgress', 'operationApplied', 'selectedSegment',
+            'fullRouteUnconfirmed', 'undeployFailed', 'confirmDeleteLink']) {
+            assert(labels[key], key);
+            assert(template.includes(key + ": <%- JSON.stringify(t('network." + key + "')) %>"), key + ' must reach the shipped IIFE');
+        }
+        const row = graphs.G1[0], h = harness(t, snapshot(), locale), next = snapshot([row], 8);
+        h.respond('POST', '/api/cascade/links', { ...next, createdLinkId: row._id }, 201, () => { h.state.snapshot = next; });
+        await h.submit(row, false, true);
+        assert(h.toasts.some(x => x.message === labels.savedWithoutDeploy));
+        assert(h.drawer(row._id).includes(labels.selectedSegment));
+        assert(h.drawer(row._id).includes(labels.fullRouteUnconfirmed));
+        h.state.confirm = false;
+        await h.window._cascadeDelete(row._id);
+        assert.equal(h.confirmations[0], labels.confirmDeleteLink);
+        assert.equal(writes(h).length, 1, 'cancelled delete sends nothing');
+        const operationId = id(360);
+        h.ui.handleLinkAutoDeploy({ autoDeployOperation: { operationId, status: 'committing' } }, true);
+        assert(h.toasts.some(x => x.message.startsWith(labels.deployInProgress)));
+        assert(!h.toasts.some(x => x.message.startsWith(labels.deployQueued)));
+        proofNotClaimed(h);
+    });
+}
