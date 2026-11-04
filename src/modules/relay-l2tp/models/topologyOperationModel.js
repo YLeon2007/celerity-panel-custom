@@ -191,6 +191,9 @@ const topologyOperationSchema = new mongoose.Schema({
     clientProofLeaseOwner: { type: String, default: undefined },
     clientProofLeaseUntil: { type: Date, default: undefined },
     clientProofRevision: { type: Number, min: 0 },
+    // Private completion pins; a historical mutable readiness bit is not proof.
+    clientProofFingerprint: { type: String, match: DIGEST_PATTERN, select: false },
+    clientProofCredentialDigest: { type: String, match: DIGEST_PATTERN, select: false },
     clientProofState: { type: String, enum: ['active_unverified', 'degraded'] },
     clientProofReason: { type: String, enum: ['probe_unavailable', 'probe_failed', 'revision_stale', 'retry_exhausted'] },
     attempts: { type: Number, min: 0, default: 0, required: true },

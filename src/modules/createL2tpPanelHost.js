@@ -238,7 +238,12 @@ function createL2tpPanelHost({
             const { TopologyClientReadinessWorker } = require('./relay-l2tp/workers/topologyClientReadinessWorker');
             const { TopologyClientProofExecutor } = require('./relay-l2tp/services/topologyClientProofExecutor');
             const { TopologyPublishedProfileSource } = require('./relay-l2tp/services/topologyPublishedProfileSource');
+            const proofRepository = topologyDeploymentService.operationWorker.operationRepository
+                ?? new TopologyOperationRepository({ model: models.TopologyOperation, topologyStateModel: models.CascadeTopologyState });
             const proofExecutor = new TopologyClientProofExecutor({
+                selectedTopologyRepository: topologyDeploymentService.operationWorker.selectedTopologyRepository,
+                L2tpUser: models.L2tpUser,
+                pppReadinessGate: topologyDeploymentService.installedPppReadinessGate,
                 CascadeTopologyState: models.CascadeTopologyState,
                 HyNode: injectedHyNode,
                 CascadeLink: injectedCascadeLink,
@@ -247,12 +252,10 @@ function createL2tpPanelHost({
                 NodeSSH: NodeSSH ?? require('../services/nodeSSH'),
                 profileSource: new TopologyPublishedProfileSource({ probeUserId: topologyEnv.TOPOLOGY_PROBE_USER_ID }),
             });
+            proofRepository.clientProofExecutor = proofExecutor;
             clientProofWorker = new TopologyClientReadinessWorker({
                 executionContext,
-                repository: new TopologyOperationRepository({
-                    model: models.TopologyOperation,
-                    topologyStateModel: models.CascadeTopologyState,
-                }),
+                repository: proofRepository,
                 probeOperation: operation => proofExecutor.probeOperation(operation),
                 now: () => clock.now(),
             });

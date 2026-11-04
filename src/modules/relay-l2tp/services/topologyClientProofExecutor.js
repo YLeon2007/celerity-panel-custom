@@ -50,13 +50,90 @@ function completeFullGraph(roles, links, portalIds) {
 class TopologyClientProofExecutor {
     constructor({ HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState, CascadeTopologyState, NodeSSH,
         profileSource = new TopologyPublishedProfileSource(),
-        profileProbe = new TopologyClientProfileProbe(), timeoutMs = 30000 } = {}) {
+        profileProbe = new TopologyClientProfileProbe(), timeoutMs = 30000,
+        selectedTopologyRepository, L2tpUser, pppReadinessGate } = {}) {
         if (![HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState].every(model => typeof model?.find === 'function')
             || typeof NodeSSH !== 'function' || typeof profileSource?.load !== 'function'
             || typeof profileProbe?.probe !== 'function' || !Number.isSafeInteger(timeoutMs)
             || timeoutMs < 1 || timeoutMs > 60000) throw new TypeError('Invalid topology proof dependencies');
         Object.assign(this, { HyNode, CascadeLink, CascadeRouteGroup, RelayL2tpState,
-            NodeSSH, CascadeTopologyState, profileSource, profileProbe, timeoutMs });
+            NodeSSH, CascadeTopologyState, profileSource, profileProbe, timeoutMs,
+            selectedTopologyRepository, L2tpUser, pppReadinessGate });
+    }
+
+    async readSelectedSnapshot(op) {
+        try {
+            const { readSettledSelectedOperation } = require('./topologySelectedProofState');
+            const settled = await readSettledSelectedOperation(this.selectedTopologyRepository, op);
+            if (!settled) return null;
+            const nodeIds = settled.effectiveTopology.nodes.map(node => node.id);
+            const { NODE_METADATA_SELECT } = require('./topologyOperationPlanMaterializer');
+            const nodeRows = await this.HyNode.find({ _id: { $in: nodeIds } })
+                .select(`${NODE_METADATA_SELECT} name flag xray.realityPublicKey ssh groups`).lean();
+            if (nodeRows.length !== nodeIds.length || new Set(nodeRows.map(n => id(n._id))).size !== nodeIds.length) return null;
+            const same = require('node:util').isDeepStrictEqual;
+            const get = (row, path) => path.replace(/^\+/, '').split('.').reduce((value, key) => value?.[key], row);
+            const configFields = NODE_METADATA_SELECT.split(' ').filter(key => !['_id', 'type', 'active', 'cascadeRole'].includes(key));
+            for (const frozen of settled.effectiveTopology.nodes) {
+                const current = nodeRows.find(node => id(node._id) === frozen.id);
+                if (!current || current.cascadeRole !== frozen.role || current.active !== true || current.type !== frozen.type
+                    || configFields.some(key => !same(get(current, key), get(frozen, key)))) return null;
+            }
+            const portalNodes = nodeRows.filter(n => n.cascadeRole === 'portal').map(n => ({ ...n, _id: id(n._id) }))
+                .sort((a, b) => a._id.localeCompare(b._id));
+            const identity = portalNodes.length ? await this.profileSource.readProofIdentity(portalNodes) : null;
+            if (portalNodes.length && !identity) return null;
+            const relayIds = nodeRows.filter(n => n.cascadeRole === 'relay').map(n => id(n._id));
+            const states = relayIds.length ? await this.RelayL2tpState.find({ node: { $in: relayIds } })
+                .select('node desiredState status secretRevision routeGroup activePathKey appliedTopologyRevision').lean() : [];
+            const users = relayIds.length ? await this.L2tpUser.find({ relayNode: { $in: relayIds } })
+                .select('relayNode login ip +passwordEncrypted enabled desiredRevision appliedRevision syncStatus syncOperationId').lean() : [];
+            const canonical = value => value instanceof Date ? value.toISOString() : Array.isArray(value) ? value.map(canonical)
+                : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+            const sortRows = rows => rows.map(row => JSON.parse(JSON.stringify(row))).sort((a, b) => JSON.stringify(canonical(a)).localeCompare(JSON.stringify(canonical(b))));
+            const credentialDigest = require('node:crypto').createHash('sha256').update(JSON.stringify(canonical({
+                identity, nodes: sortRows(nodeRows), states: sortRows(states), users: sortRows(users),
+            }))).digest('hex');
+            const pppApplicable = relayIds.some(nodeId => {
+                const rows = states.filter(state => id(state.node) === nodeId);
+                return !(rows.length === 1 && rows[0].status === 'not_installed'
+                    && ['absent', 'not_installed'].includes(rows[0].desiredState)
+                    && !users.some(user => id(user.relayNode) === nodeId));
+            });
+            // The existing client path authenticates only the configured user.
+            // Pin all assignments, but do not turn that into runtime proof of
+            // any other user's presence or traffic.
+            const assignmentsCoveredByProbe = Boolean(identity && identity.assignments.every(assignment =>
+                assignment.users.length === 1 && assignment.users[0].userId === identity.probeUserId));
+            return { operation: settled, nodeRows, portalNodes, states, pppApplicable, assignmentsCoveredByProbe, credentialDigest };
+        } catch { return null; }
+    }
+
+    async probeSelectedOperation(op) {
+        const before = await bounded(() => this.readSelectedSnapshot(op), this.timeoutMs);
+        if (!before || !['complete', 'no_portal_input'].includes(before.operation.routeState)) return fail();
+        const settled = before.operation;
+        // Staged means missing portal input, not permission to skip installed PPP.
+        // Node users/readback is mandatory, but it is NOT a real PPP client test.
+        if (before.nodeRows.some(node => node.cascadeRole === 'relay')) {
+            const gate = await this.pppReadinessGate?.verifyPlan({ ...settled,
+                ...(settled.installedPath ? { ...settled.installedPath,
+                    ownerTopologyRevision: settled.topologyRevision } : {}) });
+            if (gate?.ok !== true) return fail();
+        }
+        if (!before.portalNodes.length) return fail(); // PPP Internet stays unverified.
+        const frozenLinks = settled.effectiveTopology.links.map(link => ({ ...link, _id: link.id,
+            portalNode: link.source, bridgeNode: link.target, active: true, status: 'deployed' }));
+        // Reuse the existing graph/default-exit and actual profile/client probe;
+        // replace only mutable graph reads with the exact settled descriptors.
+        const result = await this.probeGraphOperation({ ...settled, staged: false,
+            kind: 'link.apply', nodes: settled.nodes.filter(node => settled.effectiveTopology.nodes.some(n => n.id === id(node.node))),
+            linkIds: frozenLinks.map(link => link._id) }, [before.nodeRows, frozenLinks,
+            before.states.filter(s => s.desiredState === 'installed'), settled.effectiveTopology.groups]);
+        if (result?.passed !== true) return fail();
+        const after = await bounded(() => this.readSelectedSnapshot(op), this.timeoutMs);
+        return after && after.credentialDigest === before.credentialDigest
+            ? { passed: true, admissionFingerprint: settled.admissionFingerprint, credentialDigest: before.credentialDigest } : fail();
     }
 
     async currentFullRevision(op) {
@@ -68,6 +145,12 @@ class TopologyClientProofExecutor {
     }
 
     async probeOperation(op) {
+        try {
+            return op?.admissionScope === 'selected' ? await this.probeSelectedOperation(op) : await this.probeGraphOperation(op);
+        } catch { return fail(); }
+    }
+
+    async probeGraphOperation(op, pinnedSnapshot) {
         try {
             const full = !scopedFields.some(field => op?.[field] !== undefined);
             if (op?.status !== 'succeeded' || op.staged === true
@@ -82,7 +165,7 @@ class TopologyClientProofExecutor {
             if (roles.size !== op.nodes.length || roles.has('')) return fail();
             const portalIds = [...roles].filter(([, role]) => role === 'portal').map(([nodeId]) => nodeId);
             if (!portalIds.length) return fail();
-            const [nodeRows, linkRows, states, groups] = await bounded(() => Promise.all([
+            const [nodeRows, linkRows, states, groups] = pinnedSnapshot ?? await bounded(() => Promise.all([
                 this.HyNode.find(full ? { type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } }
                     : { _id: { $in: [...roles.keys()] } }).select('_id name flag domain ip port xray type active cascadeRole ssh').lean(),
                 this.CascadeLink.find(full ? { active: true } : { _id: { $in: op.linkIds } }).select('_id portalNode bridgeNode active status geoRouting.enabled').lean(),

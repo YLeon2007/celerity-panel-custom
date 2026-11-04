@@ -28,7 +28,12 @@ class TopologyClientReadinessWorker {
     hasCurrentClaim(operation) {
         return matchesTopologyOperationClaimBinding(operation, this.executionContext)
             && operation.status === 'succeeded' && operation.clientReadiness === 'unverified'
-            && !(operation.kind === 'link.apply' && operation.staged === true)
+            && !(operation.kind === 'link.apply' && operation.staged === true && operation.admissionScope !== 'selected')
+            && [undefined, 'selected'].includes(operation.admissionScope)
+            && (operation.admissionScope !== 'selected' || operation.heldTopologyAdmission === false
+                && typeof operation.admissionFingerprint === 'string'
+                && /^[a-f0-9]{64}$/.test(operation.admissionFingerprint)
+                && ['complete', 'no_portal_input'].includes(operation.routeState))
             && Number.isSafeInteger(operation.clientProofAttempts)
             && operation.clientProofAttempts >= 1 && operation.clientProofAttempts <= 3
             && operation.clientProofLeaseOwner === this.owner
@@ -43,6 +48,7 @@ class TopologyClientReadinessWorker {
         });
         if (!this.hasCurrentClaim(operation)) return null;
         let passed = false;
+        let proof;
         let reason = 'probe_unavailable';
         if (this.probeOperation) {
             const controller = new AbortController();
@@ -59,6 +65,7 @@ class TopologyClientReadinessWorker {
                     }),
                 ]);
                 passed = result?.passed === true;
+                proof = result;
                 reason = 'probe_failed';
             } catch (_) {
                 // Never persist/log exception text, returned diagnostics, or credentials.
@@ -69,7 +76,7 @@ class TopologyClientReadinessWorker {
         }
         if (!this.hasCurrentClaim(operation)) return null;
         return this.repository.completeClientProof({ operation, owner: this.owner, executionContext: this.executionContext,
-            now: this.now(), getNow: this.now, passed, reason, retryMs: this.retryMs });
+            now: this.now(), getNow: this.now, passed, proof, reason, retryMs: this.retryMs });
     }
 }
 

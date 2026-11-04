@@ -370,20 +370,31 @@ class TopologyOperationRepository {
 
     async findPublicById(operationId) {
         const operation = await this.model.findById(operationId)
-            .select('status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion')
+            .select('status topologyRevision priorDeployedRevision kind linkId idempotencyKey executionContext heldTopologyAdmission admissionFingerprint routeState clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion +clientProofFingerprint +clientProofCredentialDigest')
             .lean();
         if (!operation) return null;
+        const selectedSnapshot = operation.admissionScope === 'selected'
+            ? await this.clientProofExecutor?.readSelectedSnapshot(operation) : null;
+        const pppInstalled = selectedSnapshot?.pppApplicable;
         const verified = operation.status === 'succeeded'
             && operation.clientReadiness === 'verified'
             && Number.isSafeInteger(operation.clientProofRevision)
             && operation.clientProofRevision === operation.topologyRevision
-            && await this.isLiveRevision(operation);
+            && (operation.admissionScope === 'selected' ? selectedSnapshot?.portalNodes.length > 0
+                && selectedSnapshot.operation.routeState === 'complete'
+                && operation.clientProofFingerprint === operation.admissionFingerprint
+                && operation.clientProofCredentialDigest === selectedSnapshot.credentialDigest : await this.isLiveRevision(operation));
+        const xrayReady = verified && (operation.admissionScope !== 'selected' || selectedSnapshot?.assignmentsCoveredByProbe);
         // A missing legacy field (or unexpected persisted value) is never a
         // client-ready claim; status:succeeded remains execution-only.
         return {
             status: operation.status,
             topologyRevision: operation.topologyRevision,
-            clientReadiness: verified ? 'verified' : 'unverified',
+            clientReadiness: xrayReady && !pppInstalled ? 'verified' : 'unverified',
+            ...(operation.admissionScope === 'selected' ? { xrayReadiness: xrayReady ? 'verified' : 'unverified',
+                xrayInternetProof: verified ? 'verified' : 'unverified',
+                ...(verified ? { xrayProofScope: 'configured_probe_user' } : {}),
+                pppReadiness: selectedSnapshot && !pppInstalled ? 'not_applicable' : 'unverified' } : {}),
             ...(operation.status === 'succeeded' && operation.clientProofState
                 && !verified ? { clientProofState: operation.clientProofState,
                     ...(!operation.clientProofReason ? {} : { clientProofReason: operation.clientProofReason }) }
@@ -393,7 +404,7 @@ class TopologyOperationRepository {
 
     async isLiveRevision(operation) {
         if (operation.admissionScope === 'selected') {
-            try { return await this.selectedTopologyRepository?.isSelectedCurrent(operation) === true; } catch { return false; }
+            return Boolean(await require('../services/topologySelectedProofState').readSettledSelectedOperation(this.selectedTopologyRepository, operation));
         }
         if (!Number.isSafeInteger(operation?.topologyRevision) || !this.topologyStateModel?.findById) return false;
         try {
@@ -420,16 +431,19 @@ class TopologyOperationRepository {
         const leaseUntil = new Date(now.getTime() + leaseMs);
         return this.model.findOneAndUpdate({
             ...topologyOperationClaimBindingFilter(context),
-            // Selected persistence is preparatory only. The worker/finalizer
-            // still implement the legacy global protocol in this slice.
-            admissionScope: { $exists: false },
+            admissionScope: { $in: [null, 'selected'] },
             status: 'succeeded',
             clientReadiness: 'unverified',
-            $nor: [{ kind: 'link.apply', staged: true }],
+            $nor: [{ kind: 'link.apply', staged: true, admissionScope: { $exists: false } },
+                { admissionScope: 'selected', routeState: { $in: ['no_bridge_exit', 'policy_ambiguous'] } }],
             clientProofAttempts: { $exists: true, $gte: 0, $lt: maxAttempts },
             $and: [
                 { $or: [{ clientProofRetryAfter: { $lte: now } }, { clientProofRetryAfter: null }] },
                 { $or: [{ clientProofLeaseUntil: { $lte: now } }, { clientProofLeaseUntil: null }] },
+                { $or: [{ admissionScope: { $exists: false } }, { admissionScope: 'selected',
+                    heldTopologyAdmission: false, pppWait: null,
+                    admissionFingerprint: { $type: 'string', $regex: '^[a-f0-9]{64}$' },
+                    routeState: { $in: ['complete', 'no_portal_input'] } }] },
             ],
         }, {
             $set: { clientProofLeaseOwner: owner,
@@ -444,6 +458,7 @@ class TopologyOperationRepository {
                 status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1, staged: 1, clientReadiness: 1,
                 linkId: 1, linkIds: 1, oldLinkId: 1, oldPathLinkIds: 1, groupId: 1, pathKey: 1,
                 ownerNodeId: 1, ownerTopologyRevision: 1, ownerCredentialRevision: 1, newPathLinkIds: 1,
+                admissionScope: 1, admissionFingerprint: 1, routeState: 1,
                 heldTopologyAdmission: 1, pppWait: 1, clientProofAttempts: 1,
                 clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
                 'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1 },
@@ -451,15 +466,19 @@ class TopologyOperationRepository {
     }
 
     async completeClientProof({ operation, owner, now, executionContext, passed, reason, retryMs = 60000,
-        maxAttempts = 3, getNow = () => now }) {
+        maxAttempts = 3, getNow = () => now, proof }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
         if (!matchesTopologyExecutionContext(executionContext, context)) {
             throw new TypeError('Client proof completion requires an exact execution context');
         }
         const eligible = () => matchesTopologyOperationClaimBinding(operation, context)
-            && operation.admissionScope === undefined
+            && [undefined, 'selected'].includes(operation.admissionScope)
+            && (operation.admissionScope !== 'selected' || operation.heldTopologyAdmission === false
+                && operation.pppWait == null && typeof operation.admissionFingerprint === 'string'
+                && /^[a-f0-9]{64}$/.test(operation.admissionFingerprint))
             && operation.status === 'succeeded' && operation.clientReadiness === 'unverified'
-            && !(operation.kind === 'link.apply' && operation.staged === true)
+            && !(operation.kind === 'link.apply' && operation.staged === true && operation.admissionScope !== 'selected')
+            && !(operation.admissionScope === 'selected' && ['no_bridge_exit', 'policy_ambiguous'].includes(operation.routeState))
             && Number.isSafeInteger(operation.clientProofAttempts)
             && operation.clientProofAttempts >= 1 && operation.clientProofAttempts <= maxAttempts
             && operation.clientProofLeaseOwner === owner
@@ -470,7 +489,10 @@ class TopologyOperationRepository {
             throw new TypeError('Client proof requires a safe reason code');
         }
         // Check immediately before CAS. Public reads independently recheck live state.
-        const live = passed === true && await this.isLiveRevision(operation);
+        const selected = operation.admissionScope === 'selected';
+        const snapshot = selected && passed === true ? await this.clientProofExecutor?.readSelectedSnapshot(operation) : null;
+        const live = selected ? snapshot != null && proof?.admissionFingerprint === operation.admissionFingerprint
+            && proof?.credentialDigest === snapshot.credentialDigest : passed === true && await this.isLiveRevision(operation);
         // The state read may outlive the lease; never publish using its entry time.
         if (!eligible()) return null;
         now = getNow();
@@ -479,16 +501,19 @@ class TopologyOperationRepository {
         const exhausted = operation.clientProofAttempts >= maxAttempts;
         const result = await this.model.updateOne({
             _id: operation._id, status: 'succeeded', clientReadiness: 'unverified',
-            admissionScope: { $exists: false },
+            admissionScope: selected ? 'selected' : { $exists: false },
+            ...(selected ? { admissionFingerprint: operation.admissionFingerprint, heldTopologyAdmission: false } : {}),
             $and: [topologyOperationClaimBindingFilter(context)],
             idempotencyKey: operation.idempotencyKey,
-            $nor: [{ kind: 'link.apply', staged: true }],
+            $nor: [{ kind: 'link.apply', staged: true, admissionScope: { $exists: false } },
+                { admissionScope: 'selected', routeState: { $in: ['no_bridge_exit', 'policy_ambiguous'] } }],
             topologyRevision: operation.topologyRevision,
             clientProofAttempts: operation.clientProofAttempts,
             clientProofLeaseOwner: owner,
             clientProofLeaseUntil: { $gt: now },
         }, verified ? { $set: {
             clientReadiness: 'verified', clientProofRevision: operation.topologyRevision,
+            ...(selected ? { clientProofFingerprint: operation.admissionFingerprint, clientProofCredentialDigest: snapshot.credentialDigest } : {}),
             clientProofLeaseOwner: '', clientProofLeaseUntil: null,
             clientProofRetryAfter: null,
         }, $unset: { clientProofState: 1, clientProofReason: 1 } } : { $set: {

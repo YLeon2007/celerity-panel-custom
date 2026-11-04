@@ -44,11 +44,39 @@ function matchingProfile(profile, node, uuid) {
 
 class TopologyPublishedProfileSource {
     constructor({ HyUser = require('../../../models/hyUserModel'), probeUserId = process.env.TOPOLOGY_PROBE_USER_ID,
-        fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+        fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS,
+        resolveAssignedUsers = node => require('../../../services/syncService')._getUsersForNode(node) } = {}) {
+        this.resolveAssignedUsers = resolveAssignedUsers;
         this.HyUser = HyUser;
         this.probeUserId = probeUserId;
         this.fetchImpl = fetchImpl;
         this.timeoutMs = timeoutMs;
+    }
+
+    // Private identity pin for selected proof. Resolve the actual assignment
+    // policy (explicit nodes and groups), not a synthetic blanket assignment.
+    async readProofIdentity(portalNodes) {
+        const user = await this.HyUser.findOne({ userId: this.probeUserId, enabled: true })
+            .select('userId enabled expireAt trafficLimit traffic subscriptionToken xrayUuid nodes groups').lean();
+        const usable = row => row?.enabled === true && typeof row.userId === 'string'
+            && typeof row.xrayUuid === 'string' && UUID_PATTERN.test(row.xrayUuid)
+            && (!row.expireAt || new Date(row.expireAt).getTime() > Date.now())
+            && !(row.trafficLimit > 0 && (row.traffic?.tx || 0) + (row.traffic?.rx || 0) >= row.trafficLimit);
+        if (!usable(user) || typeof user.subscriptionToken !== 'string'
+            || !/^[A-Za-z0-9_-]{1,128}$/.test(user.subscriptionToken)) return null;
+        const assignments = [];
+        for (const node of portalNodes) {
+            const rows = await this.resolveAssignedUsers(node);
+            if (!Array.isArray(rows) || rows.some(row => !usable(row))
+                || new Set(rows.map(row => row.userId)).size !== rows.length
+                || !rows.some(row => row.userId === this.probeUserId && row.xrayUuid === user.xrayUuid)) return null;
+            assignments.push({ node: node._id, users: rows.map(row => ({ userId: row.userId,
+                xrayUuid: row.xrayUuid, enabled: row.enabled, expireAt: row.expireAt ?? null,
+                nodes: (row.nodes || []).map(String).sort(), groups: (row.groups || []).map(String).sort() }))
+                .sort((a, b) => a.userId.localeCompare(b.userId)) });
+        }
+        return { probeUserId: this.probeUserId, xrayUuid: user.xrayUuid,
+            subscriptionToken: user.subscriptionToken, assignments };
     }
 
     /**

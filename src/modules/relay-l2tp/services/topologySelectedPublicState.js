@@ -4,7 +4,7 @@ const { isDeepStrictEqual: same } = require('node:util');
 const { linkDesiredVersion } = require('./topologyIntentService');
 const { matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { selectedAdmissionFingerprint } = require('../repositories/topologyOperationRepository');
-const PRIVATE_SELECT = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion';
+const { PRIVATE_PROOF_SELECT: PRIVATE_SELECT } = require('./topologySelectedProofState');
 const ID = /^[a-f0-9]{24}$/;
 const VERSION = /^[a-f0-9]{64}$/;
 const STATUSES = new Set(['queued', 'preparing', 'committing', 'rolling_back', 'succeeded', 'failed', 'rolled_back']);
@@ -55,11 +55,25 @@ function createTopologySelectedPublicState({ topologyRepository, operationReposi
                     operationId: String(checked.operation._id),
                     applicationState: checked.link.lifecycle?.state === 'deleting' ? 'deleting' : 'applied',
                     routeState: checked.selected.routeState,
-                    // Executor/service readback is not a live tunnel/client proof.
-                    tunnelState: 'unknown', pppReadiness: 'unverified', xrayReadiness: 'unverified' });
+                    // A synthetic Xray request never establishes PPP traffic.
+                    tunnelState: 'unknown', ...await selectedReadiness(checked.operation) });
             } catch { /* Unreadable or changed owner/descriptor never paints ready. */ }
         }
         return states;
+    }
+
+    async function selectedReadiness(operation) {
+        const noExit = operation.routeState === 'no_bridge_exit';
+        const proof = await operationRepository.findPublicById(String(operation._id));
+        const portal = operation.effectiveTopology?.nodes.some(node => node.role === 'portal');
+        return { xrayReadiness: noExit || !portal ? 'not_applicable'
+            : proof?.xrayReadiness === 'verified' ? 'verified' : 'unverified',
+            xrayInternetProof: noExit || !portal ? 'not_applicable'
+                : proof?.xrayInternetProof === 'verified' ? 'verified' : 'unverified',
+            ...(proof?.xrayInternetProof === 'verified' && !noExit && portal
+                ? { xrayProofScope: 'configured_probe_user' } : {}),
+            pppReadiness: noExit || proof?.pppReadiness === 'not_applicable' ? 'not_applicable' : 'unverified',
+            pppInternetProof: noExit || proof?.pppReadiness === 'not_applicable' ? 'not_applicable' : 'unverified' };
     }
 
     async function readPublicOperation(operationId) {
@@ -71,24 +85,21 @@ function createTopologySelectedPublicState({ topologyRepository, operationReposi
         if (operation.admissionScope === 'selected' && operation.status === 'succeeded'
             && operation.heldTopologyAdmission === false) {
             try {
-                const checked = await appliedState(String(operation.linkId), operation.desiredVersion);
-                fresh = checked?.operation._id != null && String(checked.operation._id) === operationId
-                    && operation.admissionFingerprint === selectedAdmissionFingerprint(operation)
-                    && operation.selectedOwnerPins.every(pin => checked.selected.selectedOwnerPins.some(current =>
-                        current.node === pin.node && current.profile === pin.profile
-                        && current.lastSettledOperation === operationId));
+                fresh = await operationRepository.isLiveRevision(operation);
             } catch { /* Conservative stale/unverified projection. */ }
         }
         const legacy = operation.admissionScope === undefined
             ? await operationRepository.findPublicById(operationId) : null;
+        const readiness = operation.admissionScope === 'selected' && fresh ? await selectedReadiness(operation) : null;
         return { operationId, status: operation.status,
             ...(Number.isSafeInteger(operation.topologyRevision) && operation.topologyRevision >= 0
                 ? { topologyRevision: operation.topologyRevision } : {}),
             ...(KINDS.has(operation.kind) ? { kind: operation.kind } : {}),
             ...(typeof operation.linkId === 'string' && ID.test(operation.linkId) ? { linkId: operation.linkId } : {}),
-            // Selected scheduling is intentionally still disabled in the proof
-            // repository. No persisted/caller 'verified' flag can bypass that.
-            clientReadiness: legacy?.clientReadiness === 'verified' ? 'verified' : 'unverified',
+            clientReadiness: legacy?.clientReadiness === 'verified' || readiness?.xrayReadiness === 'verified'
+                && readiness.pppReadiness === 'not_applicable' ? 'verified' : 'unverified',
+            ...(readiness || (operation.admissionScope === 'selected'
+                ? { xrayReadiness: 'unverified', pppReadiness: 'unverified', pppInternetProof: 'unverified' } : {})),
             ...(operation.admissionScope === 'selected' ? {
                 applicationState: operation.status === 'succeeded' ? fresh ? 'applied' : 'reconcile_required'
                     : ['failed', 'rolled_back'].includes(operation.status)

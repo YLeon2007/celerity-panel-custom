@@ -369,7 +369,7 @@ test('public selected freshness ignores unrelated global drift, never upgrades u
         f.models.TopologyOperation.findOneAndUpdate = (f, u, o) => { filter = f; return proofClaim(f, u, o); };
         await f.deployments[0].operationWorker.operationRepository.claimNextClientProof({ owner: 'proof',
             now: new Date(), executionContext: context });
-        assert.deepEqual(filter.admissionScope, { $exists: false }, 'repository still explicitly excludes selected proof scheduling');
+        assert.deepEqual(filter.admissionScope, { $in: [null, 'selected'] }, 'selected claims use explicit settled eligibility and private fingerprint pins');
     } finally { provider.clearActiveHost(host); await host.stop(); }
 });
 

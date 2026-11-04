@@ -262,7 +262,8 @@ test('client proof claim skips staged link.apply and claims an eligible nonstage
                 && (op.clientProofRetryAfter === null || op.clientProofRetryAfter <= query.$and[0].$or[0].clientProofRetryAfter.$lte)
                 && (op.clientProofLeaseUntil === null || op.clientProofLeaseUntil <= query.$and[1].$or[0].clientProofLeaseUntil.$lte)
                 && !(query.$nor || []).some(excluded =>
-                    Object.entries(excluded).every(([key, value]) => op[key] === value)));
+                    Object.entries(excluded).every(([key, value]) => value?.$exists !== undefined
+                        ? (op[key] !== undefined) === value.$exists : Array.isArray(value?.$in) ? value.$in.includes(op[key]) : op[key] === value)));
             if (!eligible) return null;
             Object.assign(eligible, update.$set);
             eligible.clientProofAttempts += update.$inc.clientProofAttempts;
@@ -293,6 +294,7 @@ test('client proof claim projects only probe node fields, not candidate or backu
         status: 1, topologyRevision: 1, priorDeployedRevision: 1, kind: 1, staged: 1, clientReadiness: 1,
         linkId: 1, linkIds: 1, oldLinkId: 1, oldPathLinkIds: 1, groupId: 1, pathKey: 1,
         ownerNodeId: 1, ownerTopologyRevision: 1, ownerCredentialRevision: 1, newPathLinkIds: 1,
+        admissionScope: 1, admissionFingerprint: 1, routeState: 1,
         heldTopologyAdmission: 1, pppWait: 1, clientProofAttempts: 1,
         clientProofLeaseOwner: 1, clientProofLeaseUntil: 1,
         'nodes.node': 1, 'nodes.role': 1, 'nodes.state': 1,
@@ -333,7 +335,7 @@ test('public operation read fails closed on legacy missing or malformed readines
             status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified',
         });
     }
-    assert.equal(projection, 'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion');
+    assert.equal(projection, 'status topologyRevision priorDeployedRevision kind linkId idempotencyKey executionContext heldTopologyAdmission admissionFingerprint routeState clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion +clientProofFingerprint +clientProofCredentialDigest');
     stored = { status: 'succeeded', topologyRevision: 7, clientReadiness: 'verified' };
     assert.deepEqual(await repository.findPublicById('operation-1'), {
         ...stored, clientReadiness: 'unverified',
@@ -383,7 +385,7 @@ test('findPublicById returns only the public status projection', async () => {
     };
     const repository = new TopologyOperationRepository({ model });
     const result = await repository.findPublicById('operation-dup');
-    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision priorDeployedRevision kind linkId clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion' });
+    assert.deepEqual(captured, { id: 'operation-dup', projection: 'status topologyRevision priorDeployedRevision kind linkId idempotencyKey executionContext heldTopologyAdmission admissionFingerprint routeState clientReadiness clientProofRevision clientProofState clientProofReason +admissionScope +resourceNodeIds +selectedOwnerPins +desiredVersion +clientProofFingerprint +clientProofCredentialDigest' });
     assert.deepEqual(result, { status: 'succeeded', topologyRevision: 7, clientReadiness: 'unverified' });
 });
 
