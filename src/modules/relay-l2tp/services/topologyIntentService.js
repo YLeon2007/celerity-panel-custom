@@ -1,5 +1,6 @@
 'use strict';
 const { createHash, randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const QUEUE_ID = 'create-v1'; // One counter/order namespace for legacy and versioned intents.
 const INTENT_KINDS = new Set(['link.create', 'link.apply', 'link.delete']);
@@ -231,8 +232,15 @@ class TopologyIntentService {
                         const siblings = await this.CascadeLink.find({ active: true, tunnelPort: candidate.tunnelPort,
                             _id: { $ne: linkId } }).session(session).lean();
                         if (siblings.some(row => listener(row) === listener(candidate))) throw intentError('CASCADE_LINK_CONFLICT');
+                        // Pass the actual delta to draft validation. Its structural
+                        // snapshot intentionally omits secrets/transport defaults;
+                        // an unchanged full descriptor must not look like a key or
+                        // endpoint migration on an installed policy-only edit.
+                        const previous = desiredLinkPayload(target);
+                        const delta = Object.fromEntries(Object.entries(desiredLinkPayload(candidate))
+                            .filter(([key, value]) => !isDeepStrictEqual(previous[key], value)));
                         const saved = await this.dependencies.intentDraftWriter.updateLink({
-                            expectedTopologyRevision, linkId, changes: { ...desiredLinkPayload(candidate), autoDeploy: true }, session,
+                            expectedTopologyRevision, linkId, changes: { ...delta, autoDeploy: true }, session,
                         });
                         const persisted = await this.CascadeLink.findById(linkId).session(session).lean();
                         if (saved?.revision !== expectedTopologyRevision + 1 || !persisted

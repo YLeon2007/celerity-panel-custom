@@ -358,6 +358,71 @@ test('PUT Auto queue overflow rolls desired edit and intent admission back toget
     assert.equal(result.body.desiredSaved, undefined);
 });
 
+function installedPolicyFixture() {
+    const f = fixture();
+    f.data.HyNode[0].cascadeRole = 'relay';
+    f.data.CascadeRouteGroup.push({ _id: ids[6], mode: 'reverse', strategy: 'priority-failover',
+        paths: [{ pathKey: 'mine', linkIds: [ids[7]], priority: 1, enabled: true }] });
+    f.data.RelayL2tpState.push({ node: ids[0], routeGroup: ids[6], activePathKey: 'mine',
+        status: 'installed', desiredState: 'installed', appliedTopologyRevision: 5, secretRevision: 41 });
+    return f;
+}
+const policyEdit = overrides => ({ expectedTopologyRevision: 7, autoDeploy: true,
+    geoRouting: { enabled: true, domains: ['category-ru'], geoip: ['ru'] }, ...overrides });
+for (const fault of ['none', 'intent insertion', 'resources', 'overflow']) {
+    test(`installed PUT policy atomic desired+intent: ${fault}`, async () => {
+        const f = installedPolicyFixture();
+        if (fault === 'intent insertion') f.dependencies.TopologyCreateIntent.create = async () => { throw Error('modeled insert failure'); };
+        if (fault === 'resources') f.dependencies.resolveIntentResources = async () => {
+            throw Object.assign(Error('modeled admission refusal'), { code: 'TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE' });
+        };
+        if (fault === 'overflow') f.data.TopologyIntentQueueState[0].outstanding = 32;
+        const before = copy(f.data), result = await request(f, policyEdit(), `installed-${fault.replaceAll(' ', '-')}`);
+        if (fault !== 'none') {
+            assert.ok(result.status >= 400, JSON.stringify(result.body));
+            assert.deepEqual(f.data, before); assert.equal(result.body.desiredSaved, undefined);
+            if (fault !== 'overflow') assert.ok(f.trace.some(([kind, name]) => kind === 'update' && name === 'CascadeLink'),
+                'failure must occur after the actual policy draft validation/update');
+        } else {
+            assert.equal(result.status, 202, JSON.stringify(result.body));
+            assert.deepEqual(f.data.CascadeLink[0].geoRouting, policyEdit().geoRouting);
+            assert.deepEqual(f.data.CascadeRouteGroup, before.CascadeRouteGroup);
+            assert.deepEqual(f.data.RelayL2tpState, before.RelayL2tpState);
+            assert.equal(f.data.TopologyCreateIntent.length, 1); assert.equal(f.data.CascadeTopologyState[0].revision, 8);
+            const writes = f.trace.filter(([kind, name]) => kind === 'update' && name === 'CascadeLink'
+                || kind === 'create' && name === 'TopologyCreateIntent');
+            assert.equal(writes.length, 2); assert.ok(writes[0][2] === writes[1][2]);
+        }
+    });
+}
+for (const [field, value] of Object.entries({ mode: 'forward', tunnelPort: 18888, tunnelTransport: 'ws',
+    tunnelSecurity: 'reality', tunnelUuid: 'new-key', active: false, name: 'not-a-policy-edit' })) {
+    test(`installed policy PUT keeps ${field} migration guarded`, async () => {
+        const f = installedPolicyFixture(), before = copy(f.data);
+        const result = await request(f, policyEdit({ [field]: value }));
+        assert.equal(result.status, 409, JSON.stringify(result.body));
+        assert.equal(result.body.error.code, field === 'active' ? 'CASCADE_LINK_DISABLED' : 'CASCADE_LINK_IN_USE');
+        assert.deepEqual(f.data, before);
+    });
+}
+test('installed policy PUT stale/key conflicts and deleting marker retain existing atomic contract', async () => {
+    const f = installedPolicyFixture();
+    const stale = await request(f, policyEdit({ expectedTopologyRevision: 0 }), 'stale-policy');
+    assert.equal(stale.status, 409); assert.equal(stale.body.error.code, 'STALE_TOPOLOGY_REVISION');
+    const first = await request(f, policyEdit(), 'same-policy'); assert.equal(first.status, 202, JSON.stringify(first.body));
+    const before = copy(f.data);
+    const replay = await request(f, policyEdit({ expectedTopologyRevision: 0 }), 'same-policy');
+    assert.deepEqual(replay.body.job, first.body.job); assert.deepEqual(f.data, before);
+    const conflict = await request(f, policyEdit({ expectedTopologyRevision: 8, priority: 99 }), 'same-policy');
+    assert.equal(conflict.status, 409); assert.equal(conflict.body.error.code, 'TOPOLOGY_INTENT_KEY_CONFLICT');
+    assert.deepEqual(f.data, before);
+    f.data.CascadeLink[0].lifecycle = { state: 'deleting', deleteJobId: ids[5], desiredVersion: linkDesiredVersion(f.data.CascadeLink[0]) };
+    const marked = copy(f.data);
+    const refused = await request(f, policyEdit({ expectedTopologyRevision: 8 }), 'marked-policy');
+    assert.equal(refused.status, 409); assert.equal(refused.body.error.code, 'CASCADE_LINK_DELETING');
+    assert.deepEqual(f.data, marked);
+});
+
 test('PUT Auto joins actual draft update, desired pin, resource resolution and insert in one session', async () => {
     const f = fixture(); let maintenance = 0;
     const result = await request(f, edit({ tunnelPort: '10088', geoRouting: { enabled: true, domains: ['example.test'] } }),

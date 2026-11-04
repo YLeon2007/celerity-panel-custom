@@ -1,5 +1,5 @@
 'use strict';
-// Three bounded joined scenarios, reusing the existing background/runtime and
+// Bounded joined scenarios, reusing the existing background/runtime and
 // installed service/gate adapters. No topology success or sidecar is seeded.
 module.exports = function installedBackgroundCases({ test, assert, assembled, withEnv, request, settleTick, id, copy, key, MAIN, BRIDGE,
     randomUUID, modeledInstalledMain, configEffects, deferred }) {
@@ -13,6 +13,14 @@ module.exports = function installedBackgroundCases({ test, assert, assembled, wi
     }
     const group = f => f.data.CascadeRouteGroup.find(row => row._id === id(60));
     const config = f => JSON.parse(f.files.get(key(id(1), BRIDGE)));
+    function settledLink(f, linkId) {
+        const owner = f.data.TopologyConfigOwner.find(row => row.node === id(1) && row.profile === 'xray-bridge');
+        const operation = f.data.TopologyOperation.find(row => row._id === owner?.lastSettledOperation);
+        assert.equal(operation?.status, 'succeeded');
+        const link = operation.effectiveTopology.links.find(row => row.id === linkId);
+        assert.ok(link, 'applied descriptor must come from the actual settled owner, not a missing link-local field');
+        return copy(link);
+    }
     function chooseMainPath(f, pathKey) {
         // External installed MAIN/state selection is explicitly modeled;
         // sidecar listeners/rules still require actual job publication.
@@ -49,16 +57,43 @@ module.exports = function installedBackgroundCases({ test, assert, assembled, wi
             const peer = await create(f, id(4)); await f.drain(peer.jobId);
             assert.deepEqual(group(f).paths.find(row => row.pathKey === 'peer').linkIds, [peer.linkId]);
             chooseMainPath(f, 'mine');
-            const geo = await request(f.http, 'PUT', `/links/${peer.linkId}`, { expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
-                geoRouting: { enabled: true, geoip: ['ru'], domains: ['category-ru'] }, autoDeploy: true }, randomUUID());
-            // The existing installedFixture models a saved desired geo policy
-            // before explicit manual APPLY. Public PUT of an in-use installed
-            // link is deliberately refused; retain that fact, do not weaken it.
-            assert.equal(geo.status, 409, JSON.stringify(geo.body));
-            assert.equal(geo.body.error.code, 'CASCADE_LINK_IN_USE');
-            f.data.CascadeLink.find(row => row._id === peer.linkId).geoRouting = { enabled: true, geoip: ['ru'], domains: ['category-ru'] };
-            f.data.CascadeTopologyState[0].revision++;
-            await f.drain(await f.accept(peer.linkId));
+            const policy = { expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+                geoRouting: { enabled: true, geoip: ['ru'], domains: ['category-ru'] }, autoDeploy: true };
+            const editKey = randomUUID(), appliedBefore = copy(f.nativeFiles()), groupBefore = copy(group(f));
+            const priorOwners = copy(f.data.TopologyConfigOwner), priorOperations = f.data.TopologyOperation.length;
+            const oldDescriptor = settledLink(f, peer.linkId), priorGateCount = f.installed.options.gateCalls.length;
+            assert.notEqual(oldDescriptor.geoRouting?.enabled, true);
+            const geo = await request(f.http, 'PUT', `/links/${peer.linkId}`, policy, editKey);
+            assert.equal(geo.status, 202, JSON.stringify(geo.body));
+            assert.equal(geo.body.desiredSaved, true); assert.equal(geo.body.job.kind, 'link.apply');
+            assert.deepEqual(f.nativeFiles(), appliedBefore); assert.deepEqual(group(f), groupBefore);
+            assert.deepEqual(f.data.TopologyConfigOwner, priorOwners);
+            assert.equal(f.data.TopologyOperation.length, priorOperations, 'PUT admits desired+intent, never dispatches');
+            const desired = f.data.CascadeLink.find(row => row._id === peer.linkId);
+            assert.deepEqual(desired.geoRouting, policy.geoRouting); assert.deepEqual(settledLink(f, peer.linkId), oldDescriptor);
+            const replay = await request(f.http, 'PUT', `/links/${peer.linkId}`, { ...policy, expectedTopologyRevision: 0 }, editKey);
+            assert.deepEqual(replay.body.job, geo.body.job);
+            const editEntered = deferred(), editRelease = deferred();
+            // Always release this finite hold if an assertion above dispatch fails.
+            release.promise.then(() => editRelease.resolve());
+            f.setPause(async () => { editEntered.resolve(); await editRelease.promise; });
+            tick = f.timer.tick(); await editEntered.promise;
+            assert.deepEqual(f.nativeFiles(), appliedBefore); assert.deepEqual(group(f), groupBefore);
+            assert.deepEqual(f.data.TopologyConfigOwner, priorOwners);
+            assert.ok(f.data.NodeOperationLock.length > 0);
+            editRelease.resolve(); await tick; tick = undefined; f.setPause(undefined);
+            const appliedEdit = await f.drain(geo.body.job.jobId);
+            assert.ok(oldDescriptor.tunnelUuid, 'the pre-existing transport key is nonempty');
+            assert.deepEqual(settledLink(f, peer.linkId), { ...oldDescriptor, geoRouting: policy.geoRouting });
+            assert.equal(appliedEdit.installedPath.ownerCredentialRevision, 41);
+            const newGateCalls = f.installed.options.gateCalls.slice(priorGateCount);
+            assert.ok(newGateCalls.includes('ingress') && newGateCalls.includes('users'));
+            assert.deepEqual(f.data.L2tpUser, keptUsers);
+            const readback = await request(f.http, 'GET', `/links/auto-deploy-jobs/${geo.body.job.jobId}`);
+            assert.equal(readback.status, 200); assert.equal(readback.body.job.status, 'succeeded');
+            const finishedReplay = await request(f.http, 'PUT', `/links/${peer.linkId}`, policy, editKey);
+            assert.equal(finishedReplay.body.job.jobId, geo.body.job.jobId);
+            assert.equal(finishedReplay.body.job.status, 'succeeded');
             const target = await create(f); await f.drain(target.jobId);
             await background(f);
             const before = config(f), protectedPeer = copy(group(f).paths.find(row => row.pathKey === 'peer'));
@@ -98,6 +133,90 @@ module.exports = function installedBackgroundCases({ test, assert, assembled, wi
             assert.equal(f.installed.options.prepares.at(-1).pppInternetProof, 'unverified');
             assert.equal(f.data.NodeOperationLock.length, 0);
         } finally { release.resolve(); if (tick) await tick; await f.close(); }
+    }));
+    test('installed policy save-only stays unapplied through background ticks until explicit public Deploy', { timeout: 10000 }, async () => withEnv(async () => {
+        const f = await assembled({ installed: true });
+        try {
+            const target = await create(f); await f.drain(target.jobId);
+            const files = copy(f.nativeFiles()), groups = copy(f.data.CascadeRouteGroup), owners = copy(f.data.TopologyConfigOwner);
+            const users = copy(f.data.L2tpUser), state = copy(f.data.RelayL2tpState);
+            const priorJobs = f.data.TopologyCreateIntent.length, priorOps = f.data.TopologyOperation.length;
+            const linkBefore = settledLink(f, target.linkId);
+            const saved = await request(f.http, 'PUT', `/links/${target.linkId}`, {
+                expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+                geoRouting: { enabled: true, domains: ['saved.invalid'], geoip: ['ru'] }, priority: 23,
+            }, randomUUID());
+            assert.equal(saved.status, 200, JSON.stringify(saved.body));
+            assert.equal(saved.body.desiredSaved, true); assert.equal(saved.body.job, undefined);
+            assert.equal(f.data.CascadeLink.find(row => row._id === target.linkId).autoDeploy, true, 'persisted metadata is not opt-in');
+            assert.deepEqual(f.data.CascadeLink.find(row => row._id === target.linkId).geoRouting,
+                { enabled: true, domains: ['saved.invalid'], geoip: ['ru'] });
+            for (let i = 0; i < 3; i++) await settleTick(f);
+            await background(f);
+            assert.equal(f.data.TopologyCreateIntent.length, priorJobs); assert.equal(f.data.TopologyOperation.length, priorOps);
+            assert.deepEqual(f.nativeFiles(), files); assert.deepEqual(f.data.CascadeRouteGroup, groups);
+            assert.deepEqual(f.data.TopologyConfigOwner, owners); assert.deepEqual(f.data.RelayL2tpState, state);
+            assert.deepEqual(settledLink(f, target.linkId), linkBefore);
+            const operation = await f.drain(await f.accept(target.linkId));
+            assert.deepEqual(operation.effectiveTopology.links.find(row => row.id === target.linkId).geoRouting,
+                { enabled: true, domains: ['saved.invalid'], geoip: ['ru'] });
+            assert.deepEqual(config(f).routing.rules.filter(row => row.inboundTag?.includes('cascade-mine')),
+                [{ type: 'field', inboundTag: ['cascade-mine'], outboundTag: 'block' }]);
+            assert.deepEqual(group(f).paths.find(row => row.pathKey === 'mine').linkIds, [], 'a geo-only exit never becomes a default');
+            assert.equal(f.installed.options.prepares.at(-1).pppInternetProof, 'not_applicable');
+            assert.deepEqual(f.data.L2tpUser, users);
+        } finally { await f.close(); }
+    }));
+    for (const failure of ['unknown-users', 'main-readback', 'credential-epoch']) test(`installed public policy PUT ${failure} cannot publish after dispatch`, { timeout: 10000 }, async () => withEnv(async () => {
+        const f = await assembled({ installed: true });
+        try {
+            const target = await create(f); await f.drain(target.jobId);
+            // Model a changed desired epoch, NOT successful credential readback:
+            // the fixed node observation and PPP sync still report epoch 41.
+            if (failure === 'credential-epoch') f.installed.state.secretRevision = 42;
+            const groups = copy(f.data.CascadeRouteGroup), owners = copy(f.data.TopologyConfigOwner);
+            const users = copy(f.data.L2tpUser), state = copy(f.data.RelayL2tpState);
+            const applied = settledLink(f, target.linkId);
+            if (failure === 'unknown-users') f.installed.options.onUsers = () => { throw Error('modeled unknown user-runner readback'); };
+            else if (failure === 'main-readback') f.installed.options.changeMain = main => { main.routing.rules = []; };
+            const reply = await request(f.http, 'PUT', `/links/${target.linkId}`, {
+                expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+                geoRouting: { enabled: true, domains: ['failed.invalid'], geoip: [] }, autoDeploy: true,
+            }, randomUUID());
+            assert.equal(reply.status, 202, JSON.stringify(reply.body));
+            for (let i = 0; i < 3; i++) await settleTick(f);
+            const job = f.data.TopologyCreateIntent.find(row => row._id === reply.body.job.jobId);
+            const op = f.data.TopologyOperation.find(row => row._id === job.operationId);
+            assert.equal(op.status, 'committing'); assert.equal(op.heldTopologyAdmission, true);
+            if (failure === 'credential-epoch') assert.equal(op.installedPath.ownerCredentialRevision, 42);
+            assert.ok(op.nodes.every(row => row.state === 'committed'));
+            const locks = copy(f.data.NodeOperationLock); assert.ok(locks.length > 0);
+            assert.ok(locks.every(row => row.remoteUncertain && row.operationId === op._id));
+            assert.deepEqual(f.data.CascadeRouteGroup, groups); assert.deepEqual(f.data.TopologyConfigOwner, owners);
+            assert.deepEqual(f.data.L2tpUser, users); assert.deepEqual(f.data.RelayL2tpState, state);
+            assert.deepEqual(settledLink(f, target.linkId), applied);
+            assert.notEqual(job.status, 'succeeded'); await background(f); assert.deepEqual(f.data.NodeOperationLock, locks);
+        } finally { await f.close(); }
+    }));
+    test('installed public policy PUT known verification failure restores old bytes without publishing desired policy', { timeout: 10000 }, async () => withEnv(async () => {
+        const f = await assembled({ installed: true });
+        try {
+            const target = await create(f); await f.drain(target.jobId);
+            const files = copy(f.nativeFiles()), groups = copy(f.data.CascadeRouteGroup), owners = copy(f.data.TopologyConfigOwner);
+            const users = copy(f.data.L2tpUser), state = copy(f.data.RelayL2tpState), applied = settledLink(f, target.linkId);
+            f.failVerify = true;
+            const reply = await request(f.http, 'PUT', `/links/${target.linkId}`, {
+                expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
+                geoRouting: { enabled: true, domains: ['rolled-back.invalid'], geoip: [] }, autoDeploy: true,
+            }, randomUUID());
+            assert.equal(reply.status, 202, JSON.stringify(reply.body));
+            await f.drain(reply.body.job.jobId, 'rolled_back');
+            assert.deepEqual(f.nativeFiles(), files); assert.deepEqual(f.data.CascadeRouteGroup, groups);
+            assert.deepEqual(f.data.TopologyConfigOwner, owners); assert.deepEqual(f.data.RelayL2tpState, state);
+            assert.deepEqual(f.data.L2tpUser, users); assert.deepEqual(settledLink(f, target.linkId), applied);
+            assert.equal(f.data.CascadeLink.find(row => row._id === target.linkId).geoRouting.enabled, true, 'failed apply does not erase saved desired');
+            assert.ok(f.calls.some(([kind]) => kind === 'rollback')); await background(f);
+        } finally { await f.close(); }
     }));
     for (const failure of ['unknown-users', 'main-readback']) test(`installed PPP ${failure} after actual dispatch refuses publication and retains generations`, { timeout: 5000 }, async () => withEnv(async () => {
         const f = await assembled({ installed: true });

@@ -262,6 +262,29 @@ test('rejects all changed fields on an installed L2TP route link before persiste
     assert.equal(persisted, false);
 });
 
+test('installed policy-only desired edits project dotted geo flags without changing installed groups', async () => {
+    const snapshot = validSnapshot();
+    snapshot.activeRouteGroupIds = ['group-1'];
+    snapshot.links.push({ _id: 'link-2', portalNode: 'relay-1', bridgeNode: 'bridge-1', mode: 'forward', active: true });
+    snapshot.installedRouteOwners = [{ groupId: 'group-1', nodeId: 'relay-1', pathKey: 'primary',
+        ownerTopologyRevision: 5, ownerCredentialRevision: 41 }];
+    const before = structuredClone(snapshot);
+    let candidate;
+    const service = new TopologyDraftWriteService({ repository: {
+        async commitDraft({ prepare }) { return prepare(snapshot); },
+    }, validator(value) { candidate = value; return require('../domain/topologyValidator').validateTopology(value); } });
+    await service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-1',
+        changes: { 'geoRouting.enabled': true, 'geoRouting.geoip': ['ru'], priority: 23, autoDeploy: false } });
+    assert.equal(candidate.links.find(link => link.id === 'link-1').geo, true);
+    assert.deepEqual(snapshot, before);
+    for (const bad of [undefined, [], [{ ...snapshot.installedRouteOwners[0], ownerCredentialRevision: 0 }],
+        [{ ...snapshot.installedRouteOwners[0], groupId: 'foreign' }]]) {
+        snapshot.installedRouteOwners = bad;
+        await assert.rejects(service.updateLink({ expectedTopologyRevision: 7, linkId: 'link-1',
+            changes: { 'geoRouting.enabled': true } }), { code: 'CASCADE_LINK_IN_USE' });
+    }
+});
+
 test('allows installed link no-op edits and pending sibling link edits', async () => {
     const snapshot = validSnapshot();
     snapshot.activeRouteGroupIds = ['group-1'];

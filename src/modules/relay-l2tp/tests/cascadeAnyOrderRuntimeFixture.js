@@ -102,7 +102,11 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
         function update(row, changes, filter) {
             for (const [key, value] of Object.entries(changes.$set || {})) {
                 if (key.startsWith('nodes.$.')) row.nodes.find(n => n.node === filter['nodes.node'])[key.slice(8)] = copy(value);
-                else row[key] = copy(value);
+                else {
+                    const parts = key.split('.'); let target = row;
+                    for (const part of parts.slice(0, -1)) target = target[part] ||= {};
+                    target[parts.at(-1)] = copy(value);
+                }
             }
             for (const [key, value] of Object.entries(changes.$inc || {})) row[key] = (row[key] || 0) + value;
             for (const key of Object.keys(changes.$unset || {})) delete row[key];

@@ -98,6 +98,39 @@ function changedField(document, key, value) {
     return !isDeepStrictEqual(previous, value);
 }
 
+// This is a DESIRED policy edit, not permission to publish an installed path.
+// The selected apply operation still composes from the settled descriptor and
+// pins the installed owner/credential epochs before MAIN/PPP gates and cutover.
+function isInstalledPolicyUpdate(snapshot, groups, linkId, changedEntries) {
+    const policyFields = new Set(['geoRouting', 'geoRouting.enabled', 'geoRouting.domains',
+        'geoRouting.geoip', 'priority', 'autoDeploy']);
+    if (!changedEntries.every(([key]) => policyFields.has(key))) return false;
+    const active = new Set((snapshot.activeRouteGroupIds || []).map(entityId));
+    const using = groups.filter(group => active.has(entityId(group)) && (group.paths || [])
+        .some(path => (path.linkIds || []).some(id => entityId(id) === linkId)));
+    return using.length > 0 && using.every(group => {
+        const owners = (snapshot.installedRouteOwners || []).filter(owner => entityId(owner.groupId) === entityId(group));
+        const owner = owners[0];
+        return owners.length === 1 && typeof owner.pathKey === 'string' && owner.pathKey.length > 0
+            && Number.isSafeInteger(owner.ownerTopologyRevision) && owner.ownerTopologyRevision >= 0
+            && Number.isSafeInteger(owner.ownerCredentialRevision) && owner.ownerCredentialRevision > 0
+            && (snapshot.nodes || []).some(node => entityId(node) === entityId(owner.nodeId)
+                && (node.cascadeRole ?? node.role) === 'relay');
+    });
+}
+
+function applyDraftLinkChanges(link, changes) {
+    const updated = { ...link, ...changes, _id: link._id ?? link.id };
+    for (const field of ['enabled', 'domains', 'geoip']) {
+        const key = `geoRouting.${field}`;
+        if (Object.hasOwn(changes, key)) {
+            updated.geoRouting = { ...updated.geoRouting, [field]: changes[key] };
+            delete updated[key];
+        }
+    }
+    return updated;
+}
+
 function changedGroupField(group, key, value) {
     if (key === 'paths') {
         // Compare effective paths, not Mongoose defaults or ObjectId wrappers.
@@ -132,17 +165,14 @@ function buildCandidate(snapshot, mutation) {
                 linkId,
             });
         }
-        if (Object.entries(mutation.changes || {}).some(([key, value]) =>
-            changedField(links[linkIndex], key, value))) {
-            // Any real edit, including readiness or metadata, needs a dedicated
-            // replacement operation while an installed path uses this link.
+        const changedEntries = Object.entries(mutation.changes || {}).filter(([key, value]) =>
+            changedField(links[linkIndex], key, value));
+        if (changedEntries.length && !isInstalledPolicyUpdate(snapshot, groups, linkId, changedEntries)) {
+            // Structural, credential, readiness and unrelated metadata edits
+            // still require a dedicated replacement contract. No in-use flag.
             assertLinkNotInInstalledRoute(snapshot, groups, linkId);
         }
-        links[linkIndex] = {
-            ...links[linkIndex],
-            ...(mutation.changes || {}),
-            _id: links[linkIndex]._id ?? links[linkIndex].id,
-        };
+        links[linkIndex] = applyDraftLinkChanges(links[linkIndex], mutation.changes || {});
     } else if (mutation.kind === 'link.delete') {
         const linkId = entityId(mutation.id);
         const linkIndex = links.findIndex(link => entityId(link) === linkId);
