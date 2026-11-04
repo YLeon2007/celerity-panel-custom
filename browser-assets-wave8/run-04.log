@@ -1,0 +1,14 @@
+[90m21:39:49[0m [36m[INFO][0m: [SSHPool] Initialized
+PASS actual-template-minified-bundle-browser-boot
+[90m21:40:06[0m [36m[INFO][0m: [Cascade Links API] Created reverse link Pending P-R: P -> R
+PASS save-only-button-persists-pending-without-job-or-executor
+PASS auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost
+Error: Button unavailable #nodeInfoClose{"x":905,"y":107.5,"disabled":false,"width":28,"height":27,"hit":false}
+    at Firefox.click (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/firefox-bidi.cjs:61:54)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async closeDrawer (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:17:129)
+    at async /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:74:5
+    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)
+    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:67:3)
+[90m21:40:16[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)
+{"success":false,"totals":{"cases":4,"pass":3,"fail":1},"cleanup":{"browser":{"pid":79430,"exitCode":null,"signalCode":"SIGTERM","profileRemoved":true},"application":{"address":"http://127.0.0.1:36305","listening":false}}}

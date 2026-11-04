@@ -1,0 +1,169 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "f49e2fe9ab623d20d68d37795fa28a2514d691219f4dcc4c28ff7044aa7e6078",
+  "rawBytes": 156875,
+  "success": false,
+  "totals": {
+    "cases": 9,
+    "pass": 8,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 8121
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 2289
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 5327
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "PASS",
+      "durationMs": 4379
+    },
+    {
+      "name": "manual-selected-deploy-button-completes-route-no-full-sync",
+      "status": "PASS",
+      "durationMs": 2024
+    },
+    {
+      "name": "native-graph-drag-wheel-and-refresh-preserve-positions-zoom",
+      "status": "PASS",
+      "durationMs": 2360
+    },
+    {
+      "name": "actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job",
+      "status": "PASS",
+      "durationMs": 7413
+    },
+    {
+      "name": "lost-delete-http-responses-retain-arrow-and-one-idempotent-job",
+      "status": "PASS",
+      "durationMs": 7705
+    },
+    {
+      "name": "real-delete-terminal-plus-list-absence-removes-only-arrow-and-recreate-same-port",
+      "status": "FAIL",
+      "durationMs": 4299,
+      "error": "AssertionError [ERR_ASSERTION]: {\"revision\":11,\"links\":[{\"id\":\"6aeb7ea643250d6654d521d6\",\"name\":\"Pending P-R\",\"portalNode\":\"000000000000000000000001\",\"bridgeNode\":\"000000000000000000000002\",\"status\":\"deployed\",\"mode\":\"reverse\",\"port\":24501},{\"id\":\"6aeb7ea843250d6654d521da\",\"name\":\"Auto R-B\",\"portalNode\":\"000000000000000000000002\",\"bridgeNode\":\"000000000000000000000003\",\"status\":\"staged\",\"mode\":\"reverse\",\"port\":24502,\"lifecycle\":{\"state\":\"deleting\",\"deleteJobId\":\"6aeb7ebd43250d6654d521e1\",\"desiredVersion\":\"8032a53302b5f2fa24266523a64f785db360d3dddf7189f76606129b7a224733\"}},{\"id\":\"6aeb7eaa43250d6654d521de\",\"name\":\"Independent P2-B2\",\"portalNode\":\"000000000000000000000004\",\"bridgeNode\":\"000000000000000000000005\",\"status\":\"deployed\",\"mode\":\"forward\",\"port\":24503}],\"jobs\":[{\"id\":\"6aeb7ea843250d6654d521d9\",\"kind\":\"link.create\",\"linkId\":\"6aeb7ea843250d6654d521da\",\"status\":\"succeeded\",\"operationId\":\"2b1921e93d19d1f1b6519562\"},{\"id\":\"6aeb7eaa43250d6654d521dd\",\"kind\":\"link.create\",\"linkId\":\"6aeb7eaa43250d6654d521de\",\"status\":\"succeeded\",\"operationId\":\"b0811260aec062c77fdf78e4\"},{\"id\":\"6aeb7eb143250d6654d521e0\",\"kind\":\"link.apply\",\"linkId\":\"6aeb7ea643250d6654d521d6\",\"status\":\"succeeded\",\"operationId\":\"ed05d8c92f522957f364d7d4\"},{\"id\":\"6aeb7ebd43250d6654d521e1\",\"kind\":\"link.delete\",\"linkId\":\"6aeb7ea843250d6654d521da\",\"status\":\"failed\",\"operationId\":\"878a42aee12c1166f2206337\"}],\"operations\":[{\"id\":\"2b1921e93d19d1f1b6519562\",\"kind\":\"link.apply\",\"linkId\":\"6aeb7ea843250d6654d521da\",\"status\":\"succeeded\",\"routeState\":\"no_portal_input\",\"staged\":true,\"heldTopologyAdmission\":false,\"effectiveLinkIds\":[\"6aeb7ea843250d6654d521da\"]},{\"id\":\"b0811260aec062c77fdf78e4\",\"kind\":\"link.apply\",\"linkId\":\"6aeb7eaa43250d6654d521de\",\"status\":\"succeeded\",\"routeState\":\"complete\",\"staged\":false,\"heldTopologyAdmission\":false,\"effectiveLinkIds\":[\"6aeb7eaa43250d6654d521de\"]},{\"id\":\"ed05d8c92f522957f364d7d4\",\"kind\":\"link.apply\",\"linkId\":\"6aeb7ea643250d6654d521d6\",\"status\":\"succeeded\",\"routeState\":\"complete\",\"staged\":false,\"heldTopologyAdmission\":false,\"effectiveLinkIds\":[\"6aeb7ea643250d6654d521d6\",\"6aeb7ea843250d6654d521da\"]},{\"id\":\"878a42aee12c1166f2206337\",\"kind\":\"link.delete\",\"linkId\":\"6aeb7ea843250d6654d521da\",\"status\":\"rolled_back\",\"routeState\":\"no_bridge_exit\",\"heldTopologyAdmission\":false,\"effectiveLinkIds\":[\"6aeb7ea643250d6654d521d6\"]}],\"locks\":[],\"executorCalls\":[{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"e58aafb534e9197a2c500d477b0a1317988c11280215aa0b1c832de1a86c1b64\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"ff23b9fb4b0f427caecc7a9e6fd13cb2ad7b9ae00eb729aba4074508d6909155\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"e58aafb534e9197a2c500d477b0a1317988c11280215aa0b1c832de1a86c1b64\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"ff23b9fb4b0f427caecc7a9e6fd13cb2ad7b9ae00eb729aba4074508d6909155\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000005\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"7d27473f2cfd832c7e0685c61c1ea1a8c17af4c101578d4d40d0a4ed6278bbba\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000004\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"76da7f6d66eb8d837cfb72fc571e9062b1ddd93d953eda318a5ed1b82b991314\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000005\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"7d27473f2cfd832c7e0685c61c1ea1a8c17af4c101578d4d40d0a4ed6278bbba\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000004\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"76da7f6d66eb8d837cfb72fc571e9062b1ddd93d953eda318a5ed1b82b991314\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"5269fce89d1a33f11b9e5e21239b6200ffb387544afd4ea2049acf8fff26d539\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"6aab388709c69115299ed48c084ce5b48324152a2a0504c353ba86576e01275a\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"ff23b9fb4b0f427caecc7a9e6fd13cb2ad7b9ae00eb729aba4074508d6909155\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"5269fce89d1a33f11b9e5e21239b6200ffb387544afd4ea2049acf8fff26d539\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"6aab388709c69115299ed48c084ce5b48324152a2a0504c353ba86576e01275a\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"ff23b9fb4b0f427caecc7a9e6fd13cb2ad7b9ae00eb729aba4074508d6909155\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"5269fce89d1a33f11b9e5e21239b6200ffb387544afd4ea2049acf8fff26d539\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"96566bd2a474a82fc71e54d068340d5e3ead9f9976ab0b37620c57ba2cb16b66\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"5269fce89d1a33f11b9e5e21239b6200ffb387544afd4ea2049acf8fff26d539\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"96566bd2a474a82fc71e54d068340d5e3ead9f9976ab0b37620c57ba2cb16b66\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f\"}],\"errors\":[]}\n+ actual - expected\n\n+ 'rolled_back'\n- 'succeeded'\n\n    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:141:117\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:139:3)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 89315,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/browser-wave8-heavy/hermes-heavy-20261104T185100Z-89286.5xnuBH/firefox-wave8-RKvGNu",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    }
+  ],
+  "backendBlocker": null,
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 89315,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:37321",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "cfd8ba05-392b-46ec-90be-620144e09dee"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "70101932-e4fc-4c60-b217-03bf28eb2382"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "key": "8df9b98e-5ef8-4478-ad20-8b5c825f66fb"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/positions",
+      "status": 200,
+      "key": null
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7ea843250d6654d521da",
+      "status": 409,
+      "key": "a13da76b-b660-4afa-837e-0cab0d27944f"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7ea843250d6654d521da",
+      "status": 202,
+      "key": "a13da76b-b660-4afa-837e-0cab0d27944f",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7ea843250d6654d521da",
+      "status": 202,
+      "key": "a13da76b-b660-4afa-837e-0cab0d27944f",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7ea843250d6654d521da",
+      "status": 202,
+      "key": "a13da76b-b660-4afa-837e-0cab0d27944f",
+      "droppedAfterRealRoute": true
+    }
+  ]
+}

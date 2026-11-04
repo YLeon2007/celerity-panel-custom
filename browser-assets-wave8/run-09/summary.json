@@ -1,0 +1,230 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "287ede1c1128ac3a71e2f0794e1e75afa3d873b5458392a54cc487ea165a2d76",
+  "rawBytes": 188485,
+  "success": false,
+  "totals": {
+    "cases": 11,
+    "pass": 9,
+    "fail": 2
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 8109
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 2090
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 5096
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "PASS",
+      "durationMs": 4016
+    },
+    {
+      "name": "manual-selected-deploy-button-completes-route-no-full-sync",
+      "status": "PASS",
+      "durationMs": 2446
+    },
+    {
+      "name": "native-graph-drag-wheel-and-refresh-preserve-positions-zoom",
+      "status": "PASS",
+      "durationMs": 2474
+    },
+    {
+      "name": "actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job",
+      "status": "PASS",
+      "durationMs": 6370
+    },
+    {
+      "name": "lost-delete-http-responses-retain-arrow-and-one-idempotent-job",
+      "status": "PASS",
+      "durationMs": 7697
+    },
+    {
+      "name": "real-delete-terminal-plus-list-absence-removes-only-arrow-and-recreate-same-port",
+      "status": "FAIL",
+      "durationMs": 4105,
+      "error": "AssertionError [ERR_ASSERTION]: {\"revision\":11,\"links\":[{\"id\":\"6aeb8042dfaa0bcad83b6bad\",\"name\":\"Pending P-R\",\"portalNode\":\"000000000000000000000001\",\"bridgeNode\":\"000000000000000000000002\",\"status\":\"deployed\",\"mode\":\"reverse\",\"port\":24501},{\"id\":\"6aeb8043dfaa0bcad83b6bb1\",\"name\":\"Auto R-B\",\"portalNode\":\"000000000000000000000002\",\"bridgeNode\":\"000000000000000000000003\",\"status\":\"staged\",\"mode\":\"reverse\",\"port\":24502,\"lifecycle\":{\"state\":\"deleting\",\"deleteJobId\":\"6aeb8058dfaa0bcad83b6bb8\",\"desiredVersion\":\"469f0d85cf2bbc98d4e15dbc71f3f13b0e8546689239264c6b61a2f4d4621caa\"}},{\"id\":\"6aeb8045dfaa0bcad83b6bb5\",\"name\":\"Independent P2-B2\",\"portalNode\":\"000000000000000000000004\",\"bridgeNode\":\"000000000000000000000005\",\"status\":\"deployed\",\"mode\":\"forward\",\"port\":24503}],\"jobs\":[{\"id\":\"6aeb8043dfaa0bcad83b6bb0\",\"kind\":\"link.create\",\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"status\":\"succeeded\",\"operationId\":\"01ae41bfbd0b7e24afb7f9fc\"},{\"id\":\"6aeb8045dfaa0bcad83b6bb4\",\"kind\":\"link.create\",\"linkId\":\"6aeb8045dfaa0bcad83b6bb5\",\"status\":\"succeeded\",\"operationId\":\"339a7b1d299718bac588b606\"},{\"id\":\"6aeb804cdfaa0bcad83b6bb7\",\"kind\":\"link.apply\",\"linkId\":\"6aeb8042dfaa0bcad83b6bad\",\"status\":\"succeeded\",\"operationId\":\"4467bde9d18b077a0d2cd2e6\"},{\"id\":\"6aeb8058dfaa0bcad83b6bb8\",\"kind\":\"link.delete\",\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"status\":\"failed\",\"operationId\":\"a3d282d48d56878e7467377d\"}],\"operations\":[{\"id\":\"01ae41bfbd0b7e24afb7f9fc\",\"kind\":\"link.apply\",\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"status\":\"succeeded\",\"routeState\":\"no_portal_input\",\"staged\":true,\"heldTopologyAdmission\":false,\"nodeErrors\":[],\"effectiveLinkIds\":[\"6aeb8043dfaa0bcad83b6bb1\"]},{\"id\":\"339a7b1d299718bac588b606\",\"kind\":\"link.apply\",\"linkId\":\"6aeb8045dfaa0bcad83b6bb5\",\"status\":\"succeeded\",\"routeState\":\"complete\",\"staged\":false,\"heldTopologyAdmission\":false,\"nodeErrors\":[],\"effectiveLinkIds\":[\"6aeb8045dfaa0bcad83b6bb5\"]},{\"id\":\"4467bde9d18b077a0d2cd2e6\",\"kind\":\"link.apply\",\"linkId\":\"6aeb8042dfaa0bcad83b6bad\",\"status\":\"succeeded\",\"routeState\":\"complete\",\"staged\":false,\"heldTopologyAdmission\":false,\"nodeErrors\":[],\"effectiveLinkIds\":[\"6aeb8042dfaa0bcad83b6bad\",\"6aeb8043dfaa0bcad83b6bb1\"]},{\"id\":\"a3d282d48d56878e7467377d\",\"kind\":\"link.delete\",\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"status\":\"rolled_back\",\"routeState\":\"no_bridge_exit\",\"heldTopologyAdmission\":false,\"nodeErrors\":[],\"effectiveLinkIds\":[\"6aeb8042dfaa0bcad83b6bad\"]}],\"locks\":[],\"diagnostics\":[{\"time\":\"2026-11-04T18:58:25.193Z\",\"action\":\"link.delete\",\"phase\":\"draft.write\",\"code\":\"STALE_TOPOLOGY_REVISION\",\"revision\":10,\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\"},{\"action\":\"observer.ppp\",\"kind\":\"link.delete\",\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"routeState\":\"no_bridge_exit\",\"result\":{\"ok\":false,\"verifiedRelayCount\":0,\"reason\":\"PPP_UNKNOWN\"}},{\"time\":\"2026-11-04T18:58:42.679Z\",\"action\":\"topology.worker\",\"phase\":\"worker.ppp\",\"code\":\"TOPOLOGY_DEPLOYMENT_FAILED\",\"revision\":11,\"linkId\":\"6aeb8043dfaa0bcad83b6bb1\",\"operationId\":\"a3d282d48d56878e7467377d\"}],\"executorCalls\":[{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"a5e7bff750c3b027bb4f3cb2d79e8d428ac5eb2088b83b0636c0757476df3891\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"296f93cc906df8b6bd1ee7cce6296371bdcf8fc95699f09d6ffccd65fa83606a\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"a5e7bff750c3b027bb4f3cb2d79e8d428ac5eb2088b83b0636c0757476df3891\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"296f93cc906df8b6bd1ee7cce6296371bdcf8fc95699f09d6ffccd65fa83606a\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000005\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"e0633c6f20604b0e05c1a5e5a49c442ada008de8562e4c2f48331fc207bc47d3\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000004\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"822bcfefea6226576e5409f326ca2e328f80f2600bcfa819fbea53471fd624b8\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000005\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"e0633c6f20604b0e05c1a5e5a49c442ada008de8562e4c2f48331fc207bc47d3\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000004\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"822bcfefea6226576e5409f326ca2e328f80f2600bcfa819fbea53471fd624b8\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"109741403c6fd792a70c39a7fc43f2a50ec89864476c694a33d906be631d64b9\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"69231bc406f795d1d132d821db7405b42f40b5979fd0321fe6c3c5f3121eee14\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"296f93cc906df8b6bd1ee7cce6296371bdcf8fc95699f09d6ffccd65fa83606a\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"109741403c6fd792a70c39a7fc43f2a50ec89864476c694a33d906be631d64b9\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"69231bc406f795d1d132d821db7405b42f40b5979fd0321fe6c3c5f3121eee14\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"296f93cc906df8b6bd1ee7cce6296371bdcf8fc95699f09d6ffccd65fa83606a\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"109741403c6fd792a70c39a7fc43f2a50ec89864476c694a33d906be631d64b9\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"4266562b9656ab0e6d032f6287978fa4efd34fb297c7e669eb19a43871c832ff\"},{\"phase\":\"prepare\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000001\",\"nodeRef\":\"portal\",\"profile\":\"xray-main\",\"candidateHash\":\"109741403c6fd792a70c39a7fc43f2a50ec89864476c694a33d906be631d64b9\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000002\",\"nodeRef\":\"relay-1\",\"profile\":\"xray-bridge\",\"candidateHash\":\"4266562b9656ab0e6d032f6287978fa4efd34fb297c7e669eb19a43871c832ff\"},{\"phase\":\"commit\",\"node\":\"000000000000000000000003\",\"nodeRef\":\"bridge\",\"profile\":\"xray-bridge\",\"candidateHash\":\"0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f\"}],\"errors\":[]}\n+ actual - expected\n\n+ 'rolled_back'\n- 'succeeded'\n\n    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:143:117\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:141:9)"
+    },
+    {
+      "name": "rolled-back-reverse-delete-retains-arrow-and-failed-job",
+      "status": "PASS",
+      "durationMs": 1398
+    },
+    {
+      "name": "independent-forward-delete-removes-only-arrow-and-recreates-same-port",
+      "status": "FAIL",
+      "durationMs": 8185,
+      "error": "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:\n\n  assert.ok(!state.edges.some(e=>e.linkId===independent))\n\n    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:164:76\n    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:161:5)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200,
+    "browserSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444"
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 96353,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/browser-wave8-heavy/hermes-heavy-20261104T185752Z-96287.tfSR4d/firefox-wave8-CbA8gf",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    }
+  ],
+  "backendBlocker": {
+    "operationId": "a3d282d48d56878e7467377d",
+    "linkId": "6aeb8043dfaa0bcad83b6bb1",
+    "status": "rolled_back",
+    "routeState": "no_bridge_exit",
+    "diagnostics": [
+      {
+        "time": "2026-11-04T18:58:25.193Z",
+        "action": "link.delete",
+        "phase": "draft.write",
+        "code": "STALE_TOPOLOGY_REVISION",
+        "revision": 10,
+        "linkId": "6aeb8043dfaa0bcad83b6bb1"
+      },
+      {
+        "action": "observer.ppp",
+        "kind": "link.delete",
+        "linkId": "6aeb8043dfaa0bcad83b6bb1",
+        "routeState": "no_bridge_exit",
+        "result": {
+          "ok": false,
+          "verifiedRelayCount": 0,
+          "reason": "PPP_UNKNOWN"
+        }
+      },
+      {
+        "time": "2026-11-04T18:58:42.679Z",
+        "action": "topology.worker",
+        "phase": "worker.ppp",
+        "code": "TOPOLOGY_DEPLOYMENT_FAILED",
+        "revision": 11,
+        "linkId": "6aeb8043dfaa0bcad83b6bb1",
+        "operationId": "a3d282d48d56878e7467377d"
+      }
+    ]
+  },
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 96353,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:40245",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "aa6e2e36-d576-48c7-9528-0946a7e9f1c2"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "f7e892b9-4425-44aa-b9fb-c11a57895c9c"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "key": "fac6369e-1559-4813-a773-05e6007185e9"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/positions",
+      "status": 200,
+      "key": null
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb8043dfaa0bcad83b6bb1",
+      "status": 409,
+      "key": "49689c92-d015-4a5c-a817-88e15e700942"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb8043dfaa0bcad83b6bb1",
+      "status": 202,
+      "key": "49689c92-d015-4a5c-a817-88e15e700942",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb8043dfaa0bcad83b6bb1",
+      "status": 202,
+      "key": "49689c92-d015-4a5c-a817-88e15e700942",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb8043dfaa0bcad83b6bb1",
+      "status": 202,
+      "key": "49689c92-d015-4a5c-a817-88e15e700942",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb8045dfaa0bcad83b6bb5",
+      "status": 202,
+      "key": "acf7be10-cb13-489a-9d0d-bbcbc7d0eb27"
+    }
+  ]
+}

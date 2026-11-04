@@ -1,0 +1,88 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "b368360861be2a0590003f2777d129ca1c00dd0bf2ce458b95789878c4c01b4c",
+  "rawBytes": 58760,
+  "success": false,
+  "totals": {
+    "cases": 4,
+    "pass": 3,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 7702
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 2592
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 5592
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "FAIL",
+      "durationMs": 3995,
+      "error": "Error: Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false}\n    at Firefox.click (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/firefox-bidi.cjs:61:54)\n    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n    at async closeDrawer (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:17:129)\n    at async /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:74:5\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:67:3)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 79430,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/firefox-wave8-spDVXw",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [],
+  "backendBlocker": null,
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 79430,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:36305",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "4b1eeeff-a04b-4c2b-aaa6-7a178fafebba"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "9be4b23f-c0e1-43d4-b020-f9a21d95e3ae"
+    }
+  ]
+}

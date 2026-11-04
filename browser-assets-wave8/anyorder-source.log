@@ -1,0 +1,340 @@
+TAP version 13
+# Subtest: [v2] main/quick Auto and explicit PUT Auto consume real job alias and retain edit retry keys
+ok 1 - [v2] main/quick Auto and explicit PUT Auto consume real job alias and retain edit retry keys
+  ---
+  duration_ms: 43.620088
+  type: 'test'
+  ...
+# Subtest: [v2] manual apply accepts job without operation, reuses failed delivery key, and preserves independent jobs
+ok 2 - [v2] manual apply accepts job without operation, reuses failed delivery key, and preserves independent jobs
+  ---
+  duration_ms: 7.307315
+  type: 'test'
+  ...
+# Subtest: [v2] accepted delete retains arrow through list absence until exact terminal cleanup; repeated click sends no job
+ok 3 - [v2] accepted delete retains arrow through list absence until exact terminal cleanup; repeated click sends no job
+  ---
+  duration_ms: 8.206404
+  type: 'test'
+  ...
+# Subtest: [v2] projection uses real list fields, separates PPP/Xray, clears proof on refresh, and never traverses mixed desired neighbors
+ok 4 - [v2] projection uses real list fields, separates PPP/Xray, clears proof on refresh, and never traverses mixed desired neighbors
+  ---
+  duration_ms: 4.477947
+  type: 'test'
+  ...
+# Subtest: [v2] wrong-kind Auto acceptance is not retired; its explicit retry keeps the same key
+ok 5 - [v2] wrong-kind Auto acceptance is not retired; its explicit retry keeps the same key
+  ---
+  duration_ms: 3.46326
+  type: 'test'
+  ...
+# Subtest: [v2] deletion reload resumes marker polling, exact job/link/kind and terminal list absence are all required
+ok 6 - [v2] deletion reload resumes marker polling, exact job/link/kind and terminal list absence are all required
+  ---
+  duration_ms: 4.977241
+  type: 'test'
+  ...
+# Subtest: [v2] retained terminal delete and blocked job remain visible as reconcile, never successful or retried
+ok 7 - [v2] retained terminal delete and blocked job remain visible as reconcile, never successful or retried
+  ---
+  duration_ms: 13.031047
+  type: 'test'
+  ...
+# Subtest: [v2] unknown delete delivery retains exact request key after revision refresh without sending desired guesses
+ok 8 - [v2] unknown delete delivery retains exact request key after revision refresh without sending desired guesses
+  ---
+  duration_ms: 5.546435
+  type: 'test'
+  ...
+# Subtest: [v2] concurrent deletes settle only their own tombstone and read failure never substitutes for absence
+ok 9 - [v2] concurrent deletes settle only their own tombstone and read failure never substitutes for absence
+  ---
+  duration_ms: 5.89223
+  type: 'test'
+  ...
+# Subtest: [v2] stable request keys also work with getRandomValues on pages without randomUUID
+ok 10 - [v2] stable request keys also work with getRandomValues on pages without randomUUID
+  ---
+  duration_ms: 2.56257
+  type: 'test'
+  ...
+# Subtest: [shipped] G1 auto: 0b
+ok 11 - [shipped] G1 auto: 0b
+  ---
+  duration_ms: 4.003853
+  type: 'test'
+  ...
+# Subtest: [shipped] G1 save/manual: 0b
+ok 12 - [shipped] G1 save/manual: 0b
+  ---
+  duration_ms: 3.804556
+  type: 'test'
+  ...
+# Subtest: [shipped] G2 auto: 0c > 0d
+ok 13 - [shipped] G2 auto: 0c > 0d
+  ---
+  duration_ms: 4.164651
+  type: 'test'
+  ...
+# Subtest: [shipped] G2 save/manual: 0c > 0d
+ok 14 - [shipped] G2 save/manual: 0c > 0d
+  ---
+  duration_ms: 4.912542
+  type: 'test'
+  ...
+# Subtest: [shipped] G2 auto: 0d > 0c
+ok 15 - [shipped] G2 auto: 0d > 0c
+  ---
+  duration_ms: 6.613722
+  type: 'test'
+  ...
+# Subtest: [shipped] G2 save/manual: 0d > 0c
+ok 16 - [shipped] G2 save/manual: 0d > 0c
+  ---
+  duration_ms: 4.393649
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 0e > 0f > 10
+ok 17 - [shipped] G3 auto: 0e > 0f > 10
+  ---
+  duration_ms: 4.957642
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 0e > 0f > 10
+ok 18 - [shipped] G3 save/manual: 0e > 0f > 10
+  ---
+  duration_ms: 6.179527
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 0e > 10 > 0f
+ok 19 - [shipped] G3 auto: 0e > 10 > 0f
+  ---
+  duration_ms: 7.304414
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 0e > 10 > 0f
+ok 20 - [shipped] G3 save/manual: 0e > 10 > 0f
+  ---
+  duration_ms: 5.249339
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 0f > 0e > 10
+ok 21 - [shipped] G3 auto: 0f > 0e > 10
+  ---
+  duration_ms: 4.372448
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 0f > 0e > 10
+ok 22 - [shipped] G3 save/manual: 0f > 0e > 10
+  ---
+  duration_ms: 5.260438
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 0f > 10 > 0e
+ok 23 - [shipped] G3 auto: 0f > 10 > 0e
+  ---
+  duration_ms: 4.106152
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 0f > 10 > 0e
+ok 24 - [shipped] G3 save/manual: 0f > 10 > 0e
+  ---
+  duration_ms: 8.010806
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 10 > 0e > 0f
+ok 25 - [shipped] G3 auto: 10 > 0e > 0f
+  ---
+  duration_ms: 4.806843
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 10 > 0e > 0f
+ok 26 - [shipped] G3 save/manual: 10 > 0e > 0f
+  ---
+  duration_ms: 9.153092
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 auto: 10 > 0f > 0e
+ok 27 - [shipped] G3 auto: 10 > 0f > 0e
+  ---
+  duration_ms: 3.809355
+  type: 'test'
+  ...
+# Subtest: [shipped] G3 save/manual: 10 > 0f > 0e
+ok 28 - [shipped] G3 save/manual: 10 > 0f > 0e
+  ---
+  duration_ms: 4.592247
+  type: 'test'
+  ...
+# Subtest: [shipped] quick create consumes the existing durable job, then polls its exact admitted operation
+ok 29 - [shipped] quick create consumes the existing durable job, then polls its exact admitted operation
+  ---
+  duration_ms: 2.677069
+  type: 'test'
+  ...
+# Subtest: [shipped] save-only edit of an AutoDeploy link omits activation; classic completion is applied, not client-ready
+ok 30 - [shipped] save-only edit of an AutoDeploy link omits activation; classic completion is applied, not client-ready
+  ---
+  duration_ms: 2.250274
+  type: 'test'
+  ...
+# Subtest: [shipped] operation identity mismatch and newer global revision cannot impersonate success; polling stays bounded
+ok 31 - [shipped] operation identity mismatch and newer global revision cannot impersonate success; polling stays bounded
+  ---
+  duration_ms: 7.72401
+  type: 'test'
+  ...
+# Subtest: [shipped] applied but unverified keeps polling; degraded, failed and rolled_back stop without a readiness claim
+ok 32 - [shipped] applied but unverified keeps polling; degraded, failed and rolled_back stop without a readiness claim
+  ---
+  duration_ms: 8.440501
+  type: 'test'
+  ...
+# Subtest: [shipped] drawer separates saved, applied, connected and staged edge status from revision-bound client proof
+ok 33 - [shipped] drawer separates saved, applied, connected and staged edge status from revision-bound client proof
+  ---
+  duration_ms: 6.638322
+  type: 'test'
+  ...
+# Subtest: [shipped] checked DELETE failure retains the row; successful delete/recreate preserves node positions and viewport
+ok 34 - [shipped] checked DELETE failure retains the row; successful delete/recreate preserves node positions and viewport
+  ---
+  duration_ms: 3.243962
+  type: 'test'
+  ...
+# Subtest: [shipped] main create retains its idempotency key across a failed delivery and changes it with the payload
+ok 35 - [shipped] main create retains its idempotency key across a failed delivery and changes it with the payload
+  ---
+  duration_ms: 2.735968
+  type: 'test'
+  ...
+# Subtest: [shipped] blocked AutoDeploy says saved but not applied and never falls back to a new Deploy POST
+ok 36 - [shipped] blocked AutoDeploy says saved but not applied and never falls back to a new Deploy POST
+  ---
+  duration_ms: 2.355073
+  type: 'test'
+  ...
+# Subtest: [regression] successful save-only create must explicitly confirm saved without claiming applied or connected
+ok 37 - [regression] successful save-only create must explicitly confirm saved without claiming applied or connected
+  ---
+  duration_ms: 2.615469
+  type: 'test'
+  ...
+# Subtest: [regression] quick AutoDeploy must supply an Idempotency-Key for replay-safe durable create acceptance
+ok 38 - [regression] quick AutoDeploy must supply an Idempotency-Key for replay-safe durable create acceptance
+  ---
+  duration_ms: 2.074776
+  type: 'test'
+  ...
+# Subtest: [regression] quick create retries retain identity across revision refresh, change on payload or accepted new create
+ok 39 - [regression] quick create retries retain identity across revision refresh, change on payload or accepted new create
+  ---
+  duration_ms: 2.790068
+  type: 'test'
+  ...
+# Subtest: [regression] both save-only forms and edit explicitly confirm a save without work or route claims
+ok 40 - [regression] both save-only forms and edit explicitly confirm a save without work or route claims
+  ---
+  duration_ms: 6.073329
+  type: 'test'
+  ...
+# Subtest: [regression] AutoDeploy must consume an actually accepted preparing operation instead of reporting not started
+ok 41 - [regression] AutoDeploy must consume an actually accepted preparing operation instead of reporting not started
+  ---
+  duration_ms: 2.896766
+  type: 'test'
+  ...
+# Subtest: [regression] AutoDeploy must consume an actually accepted committing operation instead of reporting not started
+ok 42 - [regression] AutoDeploy must consume an actually accepted committing operation instead of reporting not started
+  ---
+  duration_ms: 2.61487
+  type: 'test'
+  ...
+# Subtest: [regression] AutoDeploy must consume an actually accepted succeeded operation instead of reporting not started
+ok 43 - [regression] AutoDeploy must consume an actually accepted succeeded operation instead of reporting not started
+  ---
+  duration_ms: 2.621269
+  type: 'test'
+  ...
+# Subtest: [regression] manual Deploy consumes preparing/committing/succeeded operation IDs without replay or readiness inference
+ok 44 - [regression] manual Deploy consumes preparing/committing/succeeded operation IDs without replay or readiness inference
+  ---
+  duration_ms: 5.90533
+  type: 'test'
+  ...
+# Subtest: [regression] staged Portal-to-Relay drawer must not advertise an Internet path with no exit
+ok 45 - [regression] staged Portal-to-Relay drawer must not advertise an Internet path with no exit
+  ---
+  duration_ms: 2.336072
+  type: 'test'
+  ...
+# Subtest: [regression] applied drawer must not silently include a save-only sibling in the displayed route
+ok 46 - [regression] applied drawer must not silently include a save-only sibling in the displayed route
+  ---
+  duration_ms: 2.266873
+  type: 'test'
+  ...
+# Subtest: [regression] mixed-mode drawer shows only the selected segment, not an inferred full applied route
+ok 47 - [regression] mixed-mode drawer shows only the selected segment, not an inferred full applied route
+  ---
+  duration_ms: 2.371772
+  type: 'test'
+  ...
+# Subtest: [regression] deleting the only applied exit must warn about route interruption before dispatch
+ok 48 - [regression] deleting the only applied exit must warn about route interruption before dispatch
+  ---
+  duration_ms: 2.212374
+  type: 'test'
+  ...
+# Subtest: [regression] rejected legacy undeploy must not announce success on an HTTP error
+ok 49 - [regression] rejected legacy undeploy must not announce success on an HTTP error
+  ---
+  duration_ms: 2.675169
+  type: 'test'
+  ...
+# Subtest: [regression] undeploy confirms only the current success receipt and never displays free-form backend errors
+ok 50 - [regression] undeploy confirms only the current success receipt and never displays free-form backend errors
+  ---
+  duration_ms: 10.338779
+  type: 'test'
+  ...
+# Subtest: [regression] a second accepted operation must not cancel visibility of the first pending operation
+ok 51 - [regression] a second accepted operation must not cancel visibility of the first pending operation
+  ---
+  duration_ms: 2.256274
+  type: 'test'
+  ...
+# Subtest: [regression] duplicate tracking preserves one poll; one terminal operation does not stop another
+ok 52 - [regression] duplicate tracking preserves one poll; one terminal operation does not stop another
+  ---
+  duration_ms: 2.406172
+  type: 'test'
+  ...
+# Subtest: [regression] main and quick logical retry identities do not replace each other after delivery failures
+ok 53 - [regression] main and quick logical retry identities do not replace each other after delivery failures
+  ---
+  duration_ms: 2.535471
+  type: 'test'
+  ...
+# Subtest: [regression] ru visible lifecycle strings use the actual nodes template bindings
+ok 54 - [regression] ru visible lifecycle strings use the actual nodes template bindings
+  ---
+  duration_ms: 4.743744
+  type: 'test'
+  ...
+# Subtest: [regression] en visible lifecycle strings use the actual nodes template bindings
+ok 55 - [regression] en visible lifecycle strings use the actual nodes template bindings
+  ---
+  duration_ms: 6.118828
+  type: 'test'
+  ...
+1..55
+# tests 55
+# suites 0
+# pass 55
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 408.587904

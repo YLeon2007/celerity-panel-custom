@@ -1,0 +1,109 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "c87015b4ff545ec88265be0f000e1c729c8b2802d5f1c0a8352ada16487a8c5d",
+  "rawBytes": 78697,
+  "success": false,
+  "totals": {
+    "cases": 6,
+    "pass": 5,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 8303
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 2980
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 4713
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "PASS",
+      "durationMs": 4507
+    },
+    {
+      "name": "manual-selected-deploy-button-completes-route-no-full-sync",
+      "status": "PASS",
+      "durationMs": 1996
+    },
+    {
+      "name": "native-graph-drag-wheel-and-refresh-preserve-positions-zoom",
+      "status": "FAIL",
+      "durationMs": 23,
+      "error": "Error: {\"realm\":\"d2f9bd43-793e-4fe6-be7b-62477ebe4aae\",\"type\":\"exception\",\"exceptionDetails\":{\"columnNumber\":15,\"exception\":{\"type\":\"error\"},\"lineNumber\":0,\"stackTrace\":{\"callFrames\":[{\"columnNumber\":15,\"functionName\":\"\",\"lineNumber\":0,\"url\":\"http://127.0.0.1:36241/panel/nodes?lang=ru\"},{\"columnNumber\":33,\"functionName\":\"InterpretGeneratorResume\",\"lineNumber\":1424,\"url\":\"self-hosted\"},{\"columnNumber\":26,\"functionName\":\"AsyncFunctionNext\",\"lineNumber\":799,\"url\":\"self-hosted\"},{\"columnNumber\":83,\"functionName\":\"\",\"lineNumber\":0,\"url\":\"http://127.0.0.1:36241/panel/nodes?lang=ru\"}]},\"text\":\"TypeError: cyclic object value\"}}\n    at Firefox.evaluate (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/firefox-bidi.cjs:46:33)\n    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n    at async /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:95:5\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:94:3)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 80403,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/firefox-wave8-GNOkoq",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    }
+  ],
+  "backendBlocker": null,
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 80403,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:36241",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "29c23a0e-f0cc-4032-bfcc-aba863e14b26"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "1bd759ea-d231-41ad-bb1b-729f91be6146"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "key": "4568dbb5-d3e6-4c19-bd54-47bc1d07aedf"
+    }
+  ]
+}

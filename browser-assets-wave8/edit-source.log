@@ -1,0 +1,196 @@
+TAP version 13
+# Subtest: main form warns about a source-config-only listener absent from cached DB links
+ok 1 - main form warns about a source-config-only listener absent from cached DB links
+  ---
+  duration_ms: 21.698445
+  type: 'test'
+  ...
+# Subtest: explicit occupied-port result prevents main create-and-deploy and edit-and-deploy
+ok 2 - explicit occupied-port result prevents main create-and-deploy and edit-and-deploy
+  ---
+  duration_ms: 5.497436
+  type: 'test'
+  ...
+# Subtest: quick form checks the forward listener after mode change and swap, and blocks occupied deploy only
+ok 3 - quick form checks the forward listener after mode change and swap, and blocks occupied deploy only
+  ---
+  duration_ms: 4.20605
+  type: 'test'
+  ...
+# Subtest: network loader cache key is bound to the exact shipped warning asset
+ok 4 - network loader cache key is bound to the exact shipped warning asset
+  ---
+  duration_ms: 1.552282
+  type: 'test'
+  ...
+# Subtest: both actual form templates expose accessible localized port status beside their inputs
+ok 5 - both actual form templates expose accessible localized port status beside their inputs
+  ---
+  duration_ms: 8.020305
+  type: 'test'
+  ...
+# Subtest: manual Deploy and saved auto-deploy conflict use readable RU/EN port diagnostics, not server prose
+ok 6 - manual Deploy and saved auto-deploy conflict use readable RU/EN port diagnostics, not server prose
+  ---
+  duration_ms: 8.971694
+  type: 'test'
+  ...
+# Subtest: verified-unconnected manual and auto warning is localized and never claims retained locks
+ok 7 - verified-unconnected manual and auto warning is localized and never claims retained locks
+  ---
+  duration_ms: 6.618722
+  type: 'test'
+  ...
+# Subtest: closing then immediately reopening the same modal invalidates its old occupied reply
+ok 8 - closing then immediately reopening the same modal invalidates its old occupied reply
+  ---
+  duration_ms: 7.69941
+  type: 'test'
+  ...
+# Subtest: stale occupied and available replies cannot overwrite a newer port or listening-node result
+ok 9 - stale occupied and available replies cannot overwrite a newer port or listening-node result
+  ---
+  duration_ms: 15.240021
+  type: 'test'
+  ...
+# Subtest: rapid input is debounced and main mode change probes Bridge instead of Portal
+ok 10 - rapid input is debounced and main mode change probes Bridge instead of Portal
+  ---
+  duration_ms: 2.387072
+  type: 'test'
+  ...
+# Subtest: editing owns its unchanged listener and includes exact linkId, excluding only its own cached row
+ok 11 - editing owns its unchanged listener and includes exact linkId, excluding only its own cached row
+  ---
+  duration_ms: 2.53637
+  type: 'test'
+  ...
+# Subtest: no port-check reads occur for invalid node, invalid port, or closed forms
+ok 12 - no port-check reads occur for invalid node, invalid port, or closed forms
+  ---
+  duration_ms: 25.030807
+  type: 'test'
+  ...
+# Subtest: unknown and checking states are distinct from free in both languages and do not forbid draft saving
+ok 13 - unknown and checking states are distinct from free in both languages and do not forbid draft saving
+  ---
+  duration_ms: 19.57117
+  type: 'test'
+  ...
+# Subtest: cached mixed-mode conflicts survive unknown or free probes and non-listening endpoints do not conflict
+ok 14 - cached mixed-mode conflicts survive unknown or free probes and non-listening endpoints do not conflict
+  ---
+  duration_ms: 15.768515
+  type: 'test'
+  ...
+# Subtest: normal main and quick creates retain port and activation intent after a free result
+ok 15 - normal main and quick creates retain port and activation intent after a free result
+  ---
+  duration_ms: 3.769955
+  type: 'test'
+  ...
+# Subtest: a stalled probe becomes unknown, aborts, and cannot later announce a free port
+ok 16 - a stalled probe becomes unknown, aborts, and cannot later announce a free port
+  ---
+  duration_ms: 1.988076
+  type: 'test'
+  ...
+# Subtest: accepted create intent polls its job without claiming a created link, saved draft or readiness
+ok 17 - accepted create intent polls its job without claiming a created link, saved draft or readiness
+  ---
+  duration_ms: 5.335737
+  type: 'test'
+  ...
+# Subtest: ordinary edit of a persisted autoDeploy link has no activation intent
+ok 18 - ordinary edit of a persisted autoDeploy link has no activation intent
+  ---
+  duration_ms: 1.65248
+  type: 'test'
+  ...
+# Subtest: explicit edit-and-deploy PUT consumes scoped operation without claiming readiness
+ok 19 - explicit edit-and-deploy PUT consumes scoped operation without claiming readiness
+  ---
+  duration_ms: 3.202462
+  type: 'test'
+  ...
+# Subtest: create retains checkbox opt-in and never starts unscoped deploy
+ok 20 - create retains checkbox opt-in and never starts unscoped deploy
+  ---
+  duration_ms: 1.377684
+  type: 'test'
+  ...
+# Subtest: explicit edit opt-in with blocked API response reports failure, never ready
+ok 21 - explicit edit opt-in with blocked API response reports failure, never ready
+  ---
+  duration_ms: 1.566082
+  type: 'test'
+  ...
+# Subtest: switching from edit to create clears edit intent while retaining create opt-in
+ok 22 - switching from edit to create clears edit intent while retaining create opt-in
+  ---
+  duration_ms: 1.288684
+  type: 'test'
+  ...
+# Subtest: unconfirmed domain anchor directs the user to separate Deploy without any mutation
+ok 23 - unconfirmed domain anchor directs the user to separate Deploy without any mutation
+  ---
+  duration_ms: 5.98953
+  type: 'test'
+  ...
+# Subtest: typed 409 busy response offers a manual retry after the current operation, never replays
+ok 24 - typed 409 busy response offers a manual retry after the current operation, never replays
+  ---
+  duration_ms: 4.724445
+  type: 'test'
+  ...
+# Subtest: blocked auto-deploy surfaces typed busy guidance after saving without retrying
+ok 25 - blocked auto-deploy surfaces typed busy guidance after saving without retrying
+  ---
+  duration_ms: 2.61347
+  type: 'test'
+  ...
+# Subtest: domain Sync explains confirmed-only scope despite legacy chain translations
+ok 26 - domain Sync explains confirmed-only scope despite legacy chain translations
+  ---
+  duration_ms: 2.199675
+  type: 'test'
+  ...
+# Subtest: all API-confirmed anchor states remain eligible for scoped Sync
+ok 27 - all API-confirmed anchor states remain eligible for scoped Sync
+  ---
+  duration_ms: 3.142463
+  type: 'test'
+  ...
+# Subtest: missing, disabled or newly unconfirmed anchors cannot submit domain Sync
+ok 28 - missing, disabled or newly unconfirmed anchors cannot submit domain Sync
+  ---
+  duration_ms: 3.146163
+  type: 'test'
+  ...
+# Subtest: cancelled domain Sync does not mutate while Full Sync requires its own explicit confirmation
+ok 29 - cancelled domain Sync does not mutate while Full Sync requires its own explicit confirmation
+  ---
+  duration_ms: 2.029976
+  type: 'test'
+  ...
+# Subtest: server-side unconfirmed rejection stays actionable without expanding scope
+ok 30 - server-side unconfirmed rejection stays actionable without expanding scope
+  ---
+  duration_ms: 1.277485
+  type: 'test'
+  ...
+# Subtest: dedicated link deploy still sends the linkId, never unscoped
+ok 31 - dedicated link deploy still sends the linkId, never unscoped
+  ---
+  duration_ms: 1.573281
+  type: 'test'
+  ...
+1..31
+# tests 31
+# suites 0
+# pass 31
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 297.055013

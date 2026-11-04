@@ -1,0 +1,12 @@
+[90m22:00:01[0m [36m[INFO][0m: [SSHPool] Initialized
+PASS actual-template-minified-bundle-browser-boot
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+
+1 !== 0
+
+    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:65:12
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)
+    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:63:3)
+[90m22:00:20[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)
+{"success":false,"totals":{"cases":2,"pass":1,"fail":1},"cleanup":{"browser":{"pid":98847,"exitCode":null,"signalCode":"SIGTERM","profileRemoved":true},"application":{"address":"http://127.0.0.1:44027","listening":false}}}

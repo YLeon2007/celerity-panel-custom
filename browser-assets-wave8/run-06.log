@@ -1,0 +1,18 @@
+[90m21:43:05[0m [36m[INFO][0m: [SSHPool] Initialized
+PASS actual-template-minified-bundle-browser-boot
+[90m21:43:25[0m [36m[INFO][0m: [Cascade Links API] Created reverse link Pending P-R: P -> R
+PASS save-only-button-persists-pending-without-job-or-executor
+PASS auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost
+PASS actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate
+PASS manual-selected-deploy-button-completes-route-no-full-sync
+PASS native-graph-drag-wheel-and-refresh-preserve-positions-zoom
+PASS actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+
+3 !== 2
+
+    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:124:12
+    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)
+    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:115:3)
+[90m21:43:56[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)
+{"success":false,"totals":{"cases":8,"pass":7,"fail":1},"cleanup":{"browser":{"pid":81051,"exitCode":null,"signalCode":"SIGTERM","profileRemoved":true},"application":{"address":"http://127.0.0.1:44337","listening":false}}}

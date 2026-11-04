@@ -1,0 +1,15 @@
+[90m22:01:54[0m [36m[INFO][0m: [SSHPool] Initialized
+PASS actual-template-minified-bundle-browser-boot
+[90m22:02:12[0m [36m[INFO][0m: [Cascade Links API] Created reverse link Pending P-R: P -> R
+PASS save-only-button-persists-pending-without-job-or-executor
+PASS auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost
+PASS actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate
+PASS manual-selected-deploy-button-completes-route-no-full-sync
+PASS native-graph-drag-wheel-and-refresh-preserve-positions-zoom
+PASS actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job
+PASS lost-delete-http-responses-retain-arrow-and-one-idempotent-job
+PASS rolled-back-reverse-delete-retains-arrow-and-failed-job
+PASS independent-forward-delete-removes-only-arrow-and-recreates-same-port
+PASS no-full-sync-or-extra-mutations-and-browser-served-hash
+[90m22:03:03[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)
+{"success":false,"totals":{"cases":12,"pass":11,"fail":1},"cleanup":{"browser":{"pid":99476,"exitCode":null,"signalCode":"SIGTERM","profileRemoved":true},"application":{"address":"http://127.0.0.1:40587","listening":false}}}

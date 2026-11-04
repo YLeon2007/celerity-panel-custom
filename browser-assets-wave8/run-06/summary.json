@@ -1,0 +1,152 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "b9c6f5dbee3cb4348d61ccb2f1e8ae73d23f97ff587da0f15267851591e98654",
+  "rawBytes": 121197,
+  "success": false,
+  "totals": {
+    "cases": 8,
+    "pass": 7,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 8697
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 3220
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 4982
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "PASS",
+      "durationMs": 4386
+    },
+    {
+      "name": "manual-selected-deploy-button-completes-route-no-full-sync",
+      "status": "PASS",
+      "durationMs": 2012
+    },
+    {
+      "name": "native-graph-drag-wheel-and-refresh-preserve-positions-zoom",
+      "status": "PASS",
+      "durationMs": 3099
+    },
+    {
+      "name": "actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job",
+      "status": "PASS",
+      "durationMs": 7992
+    },
+    {
+      "name": "lost-real-delete-acceptance-retains-arrow-unknown-and-single-job",
+      "status": "FAIL",
+      "durationMs": 7994,
+      "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n3 !== 2\n\n    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:124:12\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:115:3)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 81051,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/browser-wave8-heavy/hermes-heavy-20261104T184304Z-81020.X9zk4G/firefox-wave8-ezlyIf",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    }
+  ],
+  "backendBlocker": null,
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 81051,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:44337",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "a52a8520-bed8-490d-ba89-dba3ed5c943f"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "d20ac8d2-b084-42d5-9262-09a0abba2205"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "key": "e4ad254e-be8f-4b67-82b1-57b4ef64afe1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/positions",
+      "status": 200,
+      "key": null
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7cceee2d6d72f76af0f1",
+      "status": 409,
+      "key": "8085f284-3fab-4800-b5b2-9d3a268d88a4"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7cceee2d6d72f76af0f1",
+      "status": 202,
+      "key": "8085f284-3fab-4800-b5b2-9d3a268d88a4",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7cceee2d6d72f76af0f1",
+      "status": 202,
+      "key": "8085f284-3fab-4800-b5b2-9d3a268d88a4"
+    }
+  ]
+}

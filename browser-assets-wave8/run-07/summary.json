@@ -1,0 +1,162 @@
+{
+  "scope": "compact diagnostic attempt, not a final acceptance result; raw file remains local",
+  "rawSha256": "8af1194539463a1ab96b9199c3109cf26744c089863a83e55a14cf262398da63",
+  "rawBytes": 137869,
+  "success": false,
+  "totals": {
+    "cases": 9,
+    "pass": 8,
+    "fail": 1
+  },
+  "cases": [
+    {
+      "name": "actual-template-minified-bundle-browser-boot",
+      "status": "PASS",
+      "durationMs": 6995
+    },
+    {
+      "name": "save-only-button-persists-pending-without-job-or-executor",
+      "status": "PASS",
+      "durationMs": 1829
+    },
+    {
+      "name": "auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost",
+      "status": "PASS",
+      "durationMs": 4863
+    },
+    {
+      "name": "actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate",
+      "status": "PASS",
+      "durationMs": 3944
+    },
+    {
+      "name": "manual-selected-deploy-button-completes-route-no-full-sync",
+      "status": "PASS",
+      "durationMs": 2076
+    },
+    {
+      "name": "native-graph-drag-wheel-and-refresh-preserve-positions-zoom",
+      "status": "PASS",
+      "durationMs": 2895
+    },
+    {
+      "name": "actual-stale-revision-delete-error-keeps-arrow-and-creates-no-job",
+      "status": "PASS",
+      "durationMs": 7696
+    },
+    {
+      "name": "lost-delete-http-responses-retain-arrow-and-one-idempotent-job",
+      "status": "PASS",
+      "durationMs": 7584
+    },
+    {
+      "name": "real-delete-terminal-plus-list-absence-removes-only-arrow-and-recreate-same-port",
+      "status": "FAIL",
+      "durationMs": 3525,
+      "error": "AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:\n\n  assert.ok(del)\n\n    at /home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:139:102\n    at async check (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:14:67)\n    at async main (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/acceptance.cjs:137:3)"
+    }
+  ],
+  "asset": {
+    "diskSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "servedSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+    "httpStatus": 200
+  },
+  "engine": {
+    "acceptInsecureCerts": false,
+    "browserName": "firefox",
+    "browserVersion": "140.16.0",
+    "platformName": "linux",
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "moz:buildID": "20260908152208",
+    "moz:headless": true,
+    "moz:platformVersion": "6.12.107+deb13-amd64",
+    "moz:processID": 87686,
+    "moz:profile": "/home/leon/.hermes/cache/scratch/browser-wave8-heavy/hermes-heavy-20261104T184810Z-87600.HbcgLQ/firefox-wave8-LuGRqm",
+    "moz:shutdownTimeout": 60000,
+    "proxy": {}
+  },
+  "uiObstructions": [
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    },
+    {
+      "control": "nodeInfoClose",
+      "error": "Button unavailable #nodeInfoClose{\"x\":905,\"y\":107.5,\"disabled\":false,\"width\":28,\"height\":27,\"hit\":false,\"hitElement\":{\"tag\":\"BUTTON\",\"id\":\"btnAutoLayout\",\"className\":\"btn btn-sm\"}}"
+    }
+  ],
+  "backendBlocker": null,
+  "consoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "browserCleanup": {
+    "pid": 87686,
+    "exitCode": null,
+    "signalCode": "SIGTERM",
+    "profileRemoved": true
+  },
+  "applicationCleanup": {
+    "address": "http://127.0.0.1:46791",
+    "listening": false
+  },
+  "mutations": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "key": null
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "3e8bc744-a56c-4246-bc8b-8260fc55b16f"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "key": "6b4c656d-898b-4f4e-afd2-f4ac8368d670"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "key": "27ca5058-fd7e-4965-ab6b-078e343c37cd"
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/positions",
+      "status": 200,
+      "key": null
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7dfe9c82a044e556ef14",
+      "status": 409,
+      "key": "f129fc05-dd6f-4e4a-930f-22bf3e50ed42"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7dfe9c82a044e556ef14",
+      "status": 202,
+      "key": "f129fc05-dd6f-4e4a-930f-22bf3e50ed42",
+      "droppedAfterRealRoute": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7dfe9c82a044e556ef14",
+      "status": 202,
+      "key": "f129fc05-dd6f-4e4a-930f-22bf3e50ed42",
+      "droppedAfterRealRoute": true
+    }
+  ]
+}

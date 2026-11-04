@@ -1,0 +1,467 @@
+{
+  "scope": "HTTP-only diagnosis with same actual routes/runtime and same modeled backend, no stale revision or socket fault",
+  "requests": [
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 201,
+      "result": {
+        "topologyRevision": 8,
+        "deployedRevision": 3,
+        "links": [
+          {
+            "name": "P-R",
+            "mode": "reverse",
+            "portalNode": "000000000000000000000001",
+            "bridgeNode": "000000000000000000000002",
+            "tunnelUuid": "25707479-c271-4d32-b535-1e482558674d",
+            "tunnelPort": 24501,
+            "tunnelDomain": "reverse.tunnel.internal",
+            "tunnelProtocol": "vless",
+            "tunnelSecurity": "none",
+            "tunnelTransport": "tcp",
+            "tcpFastOpen": true,
+            "tcpKeepAlive": 100,
+            "tcpNoDelay": true,
+            "wsPath": "/cascade",
+            "wsHost": "",
+            "grpcServiceName": "cascade",
+            "xhttpPath": "/cascade",
+            "xhttpHost": "",
+            "xhttpMode": "auto",
+            "realityDest": "",
+            "realitySni": [],
+            "realityPrivateKey": "",
+            "realityPublicKey": "",
+            "realityShortIds": [
+              ""
+            ],
+            "realityFingerprint": "random",
+            "muxEnabled": false,
+            "muxConcurrency": 8,
+            "geoRouting": {
+              "enabled": false,
+              "domains": [],
+              "geoip": []
+            },
+            "priority": 100,
+            "active": true,
+            "autoDeploy": false,
+            "status": "pending",
+            "lastError": "",
+            "lastHealthCheck": null,
+            "latencyMs": null,
+            "_id": "6aeb7fb646e8851ceb19fe12",
+            "desiredVersion": "90efe3f5da70d85df75115208934811b10c981b8121205cd52c22b3db8f71430",
+            "applicationState": "not_applied",
+            "routeState": "unknown",
+            "tunnelState": "unknown"
+          }
+        ],
+        "createdLinkId": "6aeb7fb646e8851ceb19fe12",
+        "desiredSaved": true
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "result": {
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "desiredSaved": true,
+        "job": {
+          "jobId": "6aeb7fb646e8851ceb19fe15",
+          "status": "waiting",
+          "acceptanceRevision": 8,
+          "ordinal": 1,
+          "attempts": 0,
+          "createdLinkId": "6aeb7fb646e8851ceb19fe16",
+          "version": 2,
+          "kind": "link.create",
+          "linkId": "6aeb7fb646e8851ceb19fe16",
+          "desiredVersion": "7fd6ff54423edd0f5343fcc8a8b3c8401332404c6b4e94de2597a5a36c373a53",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "createdLinkId": "6aeb7fb646e8851ceb19fe16",
+        "autoDeployJob": {
+          "jobId": "6aeb7fb646e8851ceb19fe15",
+          "status": "waiting",
+          "acceptanceRevision": 8,
+          "ordinal": 1,
+          "attempts": 0,
+          "createdLinkId": "6aeb7fb646e8851ceb19fe16",
+          "version": 2,
+          "kind": "link.create",
+          "linkId": "6aeb7fb646e8851ceb19fe16",
+          "desiredVersion": "7fd6ff54423edd0f5343fcc8a8b3c8401332404c6b4e94de2597a5a36c373a53",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "acceptedTopologyRevision": 8
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/links",
+      "status": 202,
+      "result": {
+        "linkId": "6aeb7fb646e8851ceb19fe1a",
+        "desiredSaved": true,
+        "job": {
+          "jobId": "6aeb7fb646e8851ceb19fe19",
+          "status": "waiting",
+          "acceptanceRevision": 9,
+          "ordinal": 2,
+          "attempts": 0,
+          "createdLinkId": "6aeb7fb646e8851ceb19fe1a",
+          "version": 2,
+          "kind": "link.create",
+          "linkId": "6aeb7fb646e8851ceb19fe1a",
+          "desiredVersion": "bb5be6544663fc1bbd28c398117d5031f8421be99ce35eaedde8561b23290406",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "createdLinkId": "6aeb7fb646e8851ceb19fe1a",
+        "autoDeployJob": {
+          "jobId": "6aeb7fb646e8851ceb19fe19",
+          "status": "waiting",
+          "acceptanceRevision": 9,
+          "ordinal": 2,
+          "attempts": 0,
+          "createdLinkId": "6aeb7fb646e8851ceb19fe1a",
+          "version": 2,
+          "kind": "link.create",
+          "linkId": "6aeb7fb646e8851ceb19fe1a",
+          "desiredVersion": "bb5be6544663fc1bbd28c398117d5031f8421be99ce35eaedde8561b23290406",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "acceptedTopologyRevision": 9
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/api/cascade/topology/deploy",
+      "status": 202,
+      "result": {
+        "linkId": "6aeb7fb646e8851ceb19fe12",
+        "desiredSaved": true,
+        "job": {
+          "jobId": "6aeb7fb746e8851ceb19fe1c",
+          "status": "waiting",
+          "acceptanceRevision": 10,
+          "ordinal": 3,
+          "attempts": 0,
+          "version": 2,
+          "kind": "link.apply",
+          "linkId": "6aeb7fb646e8851ceb19fe12",
+          "desiredVersion": "90efe3f5da70d85df75115208934811b10c981b8121205cd52c22b3db8f71430",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "acceptedTopologyRevision": 10
+      }
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/cascade/links/6aeb7fb646e8851ceb19fe16",
+      "status": 202,
+      "result": {
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "desiredSaved": true,
+        "job": {
+          "jobId": "6aeb7fb746e8851ceb19fe1d",
+          "status": "waiting",
+          "acceptanceRevision": 10,
+          "ordinal": 4,
+          "attempts": 0,
+          "version": 2,
+          "kind": "link.delete",
+          "linkId": "6aeb7fb646e8851ceb19fe16",
+          "desiredVersion": "7fd6ff54423edd0f5343fcc8a8b3c8401332404c6b4e94de2597a5a36c373a53",
+          "desiredSaved": true,
+          "phase": "waiting"
+        },
+        "acceptedTopologyRevision": 10,
+        "applicationState": "deleting"
+      }
+    }
+  ],
+  "backend": {
+    "revision": 10,
+    "links": [
+      {
+        "id": "6aeb7fb646e8851ceb19fe12",
+        "name": "P-R",
+        "portalNode": "000000000000000000000001",
+        "bridgeNode": "000000000000000000000002",
+        "status": "deployed",
+        "mode": "reverse",
+        "port": 24501
+      },
+      {
+        "id": "6aeb7fb646e8851ceb19fe16",
+        "name": "R-B",
+        "portalNode": "000000000000000000000002",
+        "bridgeNode": "000000000000000000000003",
+        "status": "staged",
+        "mode": "reverse",
+        "port": 24502,
+        "lifecycle": {
+          "state": "deleting",
+          "deleteJobId": "6aeb7fb746e8851ceb19fe1d",
+          "desiredVersion": "7fd6ff54423edd0f5343fcc8a8b3c8401332404c6b4e94de2597a5a36c373a53"
+        }
+      },
+      {
+        "id": "6aeb7fb646e8851ceb19fe1a",
+        "name": "P2-B2",
+        "portalNode": "000000000000000000000004",
+        "bridgeNode": "000000000000000000000005",
+        "status": "deployed",
+        "mode": "forward",
+        "port": 24503
+      }
+    ],
+    "jobs": [
+      {
+        "id": "6aeb7fb646e8851ceb19fe15",
+        "kind": "link.create",
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "status": "succeeded",
+        "operationId": "56b12ea90dfbfdcef4864e74"
+      },
+      {
+        "id": "6aeb7fb646e8851ceb19fe19",
+        "kind": "link.create",
+        "linkId": "6aeb7fb646e8851ceb19fe1a",
+        "status": "succeeded",
+        "operationId": "9a54571f8533e787b484cb22"
+      },
+      {
+        "id": "6aeb7fb746e8851ceb19fe1c",
+        "kind": "link.apply",
+        "linkId": "6aeb7fb646e8851ceb19fe12",
+        "status": "succeeded",
+        "operationId": "7a6e9cd93a2316d1e7489094"
+      },
+      {
+        "id": "6aeb7fb746e8851ceb19fe1d",
+        "kind": "link.delete",
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "status": "failed",
+        "operationId": "1996e09f799547312c2361c5"
+      }
+    ],
+    "operations": [
+      {
+        "id": "56b12ea90dfbfdcef4864e74",
+        "kind": "link.apply",
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "status": "succeeded",
+        "routeState": "no_portal_input",
+        "staged": true,
+        "heldTopologyAdmission": false,
+        "nodeErrors": [],
+        "effectiveLinkIds": [
+          "6aeb7fb646e8851ceb19fe16"
+        ]
+      },
+      {
+        "id": "9a54571f8533e787b484cb22",
+        "kind": "link.apply",
+        "linkId": "6aeb7fb646e8851ceb19fe1a",
+        "status": "succeeded",
+        "routeState": "complete",
+        "staged": false,
+        "heldTopologyAdmission": false,
+        "nodeErrors": [],
+        "effectiveLinkIds": [
+          "6aeb7fb646e8851ceb19fe1a"
+        ]
+      },
+      {
+        "id": "7a6e9cd93a2316d1e7489094",
+        "kind": "link.apply",
+        "linkId": "6aeb7fb646e8851ceb19fe12",
+        "status": "succeeded",
+        "routeState": "complete",
+        "staged": false,
+        "heldTopologyAdmission": false,
+        "nodeErrors": [],
+        "effectiveLinkIds": [
+          "6aeb7fb646e8851ceb19fe12",
+          "6aeb7fb646e8851ceb19fe16"
+        ]
+      },
+      {
+        "id": "1996e09f799547312c2361c5",
+        "kind": "link.delete",
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "status": "rolled_back",
+        "routeState": "no_bridge_exit",
+        "heldTopologyAdmission": false,
+        "nodeErrors": [],
+        "effectiveLinkIds": [
+          "6aeb7fb646e8851ceb19fe12"
+        ]
+      }
+    ],
+    "locks": [],
+    "diagnostics": [
+      {
+        "time": "2026-11-04T18:55:51.287Z",
+        "action": "topology.worker",
+        "phase": "worker.ppp",
+        "code": "TOPOLOGY_DEPLOYMENT_FAILED",
+        "revision": 10,
+        "linkId": "6aeb7fb646e8851ceb19fe16",
+        "operationId": "1996e09f799547312c2361c5"
+      }
+    ],
+    "executorCalls": [
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "f84f959ec1d4281827a6a7f7c4e485e7f868cf3706364de1335f914402f17360"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "b3acae6ef6a9902a7255742cfaf4e890002e976074797bd8699c12bee7dc25ad"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "f84f959ec1d4281827a6a7f7c4e485e7f868cf3706364de1335f914402f17360"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "b3acae6ef6a9902a7255742cfaf4e890002e976074797bd8699c12bee7dc25ad"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000005",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "877f72f4273228dec7a7120f54a6f2c1b72eb9b805ccfb26d3e88b8ac550fc8f"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000004",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "6431f17caf4ebf288cba9c94380720704a0b14effa17d87f48ee4e262481297d"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000005",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "877f72f4273228dec7a7120f54a6f2c1b72eb9b805ccfb26d3e88b8ac550fc8f"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000004",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "6431f17caf4ebf288cba9c94380720704a0b14effa17d87f48ee4e262481297d"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000001",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "e81a611a62b3084c60366d150962d922bdb6dcb2ff38d0aedf28e6ae94b91bd2"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "64e8f22d6b97bb2ba9c628fe4c4d3b2baca7f6eb0facc25888ca0dfe90274215"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "b3acae6ef6a9902a7255742cfaf4e890002e976074797bd8699c12bee7dc25ad"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000001",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "e81a611a62b3084c60366d150962d922bdb6dcb2ff38d0aedf28e6ae94b91bd2"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "64e8f22d6b97bb2ba9c628fe4c4d3b2baca7f6eb0facc25888ca0dfe90274215"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "b3acae6ef6a9902a7255742cfaf4e890002e976074797bd8699c12bee7dc25ad"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000001",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "e81a611a62b3084c60366d150962d922bdb6dcb2ff38d0aedf28e6ae94b91bd2"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "e6a8b433ba654c2596afc084287c6eb09b0c1f31865b00956b1127e956a080bc"
+      },
+      {
+        "phase": "prepare",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000001",
+        "nodeRef": "portal",
+        "profile": "xray-main",
+        "candidateHash": "e81a611a62b3084c60366d150962d922bdb6dcb2ff38d0aedf28e6ae94b91bd2"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000002",
+        "nodeRef": "relay-1",
+        "profile": "xray-bridge",
+        "candidateHash": "e6a8b433ba654c2596afc084287c6eb09b0c1f31865b00956b1127e956a080bc"
+      },
+      {
+        "phase": "commit",
+        "node": "000000000000000000000003",
+        "nodeRef": "bridge",
+        "profile": "xray-bridge",
+        "candidateHash": "0353098123be3a44c8c065535c0c855fd8cb441e1924eafa396d2fdc558b7d4f"
+      }
+    ],
+    "errors": []
+  }
+}

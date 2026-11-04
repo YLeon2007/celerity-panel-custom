@@ -1,0 +1,12 @@
+[90m21:34:51[0m [36m[INFO][0m: [SSHPool] Initialized
+PASS actual-template-minified-bundle-browser-boot
+[90m21:35:09[0m [36m[INFO][0m: [Cascade Links API] Created reverse link Pending P-R: P -> R
+PASS save-only-button-persists-pending-without-job-or-executor
+PASS auto-buttons-accept-two-independent-jobs-and-poll-each-without-repost
+PASS actual-worker-source-less-incomplete-keeps-pending-and-native-drawer-readiness-separate
+Error: BiDi timeout input.performActions
+    at Timeout._onTimeout (/home/leon/c3-anyorder-browser-assets-20261104/browser-assets-wave8/firefox-bidi.cjs:42:147)
+    at listOnTimeout (node:internal/timers:585:17)
+    at process.processTimers (node:internal/timers:521:7)
+[90m21:36:15[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)
+{"success":false,"totals":{"cases":5,"pass":4,"fail":1},"cleanup":{"browser":{"pid":73447,"exitCode":null,"signalCode":"SIGTERM","profileRemoved":true},"application":{"address":"http://127.0.0.1:40043","listening":false}}}

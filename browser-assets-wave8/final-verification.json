@@ -1,0 +1,86 @@
+{
+  "evidenceVerified": true,
+  "acceptancePassed": false,
+  "backendBlocker": {
+    "operationId": "fa88023a8cfbf66552ef4d6e",
+    "linkId": "6aeb813620fc15d695ca1718",
+    "status": "rolled_back",
+    "routeState": "no_bridge_exit",
+    "diagnostics": [
+      {
+        "time": "2026-11-04T19:02:30.438Z",
+        "action": "link.delete",
+        "phase": "draft.write",
+        "code": "STALE_TOPOLOGY_REVISION",
+        "revision": 10,
+        "linkId": "6aeb813620fc15d695ca1718"
+      },
+      {
+        "action": "observer.ppp",
+        "kind": "link.delete",
+        "linkId": "6aeb813620fc15d695ca1718",
+        "routeState": "no_bridge_exit",
+        "result": {
+          "ok": false,
+          "verifiedRelayCount": 0,
+          "reason": "PPP_UNKNOWN"
+        }
+      },
+      {
+        "time": "2026-11-04T19:02:49.043Z",
+        "action": "topology.worker",
+        "phase": "worker.ppp",
+        "code": "TOPOLOGY_DEPLOYMENT_FAILED",
+        "revision": 11,
+        "linkId": "6aeb813620fc15d695ca1718",
+        "operationId": "fa88023a8cfbf66552ef4d6e"
+      }
+    ]
+  },
+  "totals": {
+    "cases": 12,
+    "pass": 11,
+    "fail": 1
+  },
+  "engine": "140.16.0",
+  "assetSha256": "5ea9f38d112a0a5cb362e3b080f104d0bd83b13854caf05b22fcfe8651381444",
+  "lockSha256": "5298202cf6ca2ce8da44f0578bd54c1146def29fd698c41bc62ac3b5982e6eac",
+  "installed": 399,
+  "knownConsoleErrors": [
+    "TypeError: can't access property \"memoize\", e._ is undefined"
+  ],
+  "obstructedCloseObservations": 6,
+  "requestCounts": {
+    "GET /js/network.min.js": 4,
+    "GET /panel/nodes": 1,
+    "GET /css/style.min.css": 1,
+    "GET /css/network.min.css": 1,
+    "GET /js/app.js": 1,
+    "GET /img/xray.svg": 1,
+    "GET /js/vendor/Sortable.min.js": 1,
+    "GET /img/favicon.svg": 2,
+    "GET /api/cascade/topology": 69,
+    "GET /api/cascade/links": 73,
+    "GET /api/nodes": 4,
+    "GET /api/cascade/links/port-check": 4,
+    "POST /api/cascade/links": 4,
+    "GET /api/cascade/links/auto-deploy-jobs/6aeb813620fc15d695ca1717": 3,
+    "GET /api/cascade/links/auto-deploy-jobs/6aeb813820fc15d695ca171b": 2,
+    "GET /api/cascade/topology/operations/d59a4da2462d7a2d55dc88fd": 13,
+    "GET /api/cascade/topology/operations/586ac16fb8927c47420d1207": 13,
+    "POST /api/cascade/topology/deploy": 1,
+    "GET /api/cascade/links/auto-deploy-jobs/6aeb814020fc15d695ca171e": 1,
+    "POST /api/cascade/topology/positions": 1,
+    "GET /api/cascade/topology/operations/16326053e01cfd86684314a9": 11,
+    "DELETE /api/cascade/links/6aeb813620fc15d695ca1718": 4,
+    "GET /api/cascade/links/auto-deploy-jobs/6aeb814e20fc15d695ca171f": 6,
+    "DELETE /api/cascade/links/6aeb813820fc15d695ca171c": 1,
+    "GET /api/cascade/links/auto-deploy-jobs/6aeb815e20fc15d695ca1720": 1,
+    "GET /api/cascade/topology/operations/c01924a358097d58d5e7d0b7": 1
+  },
+  "cleanupReadback": {
+    "firefoxPidAbsent": 99476,
+    "profileAbsent": true,
+    "loopbackListenerClosed": 40587
+  }
+}

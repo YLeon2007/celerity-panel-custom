@@ -1,0 +1,4 @@
+[90m21:55:50[0m [36m[INFO][0m: [SSHPool] Initialized
+[90m21:55:50[0m [36m[INFO][0m: [Cascade Links API] Created reverse link P-R: P -> R
+{"operation":{"id":"1996e09f799547312c2361c5","kind":"link.delete","linkId":"6aeb7fb646e8851ceb19fe16","status":"rolled_back","routeState":"no_bridge_exit","heldTopologyAdmission":false,"nodeErrors":[],"effectiveLinkIds":["6aeb7fb646e8851ceb19fe12"]},"diagnostics":[{"time":"2026-11-04T18:55:51.287Z","action":"topology.worker","phase":"worker.ppp","code":"TOPOLOGY_DEPLOYMENT_FAILED","revision":10,"linkId":"6aeb7fb646e8851ceb19fe16","operationId":"1996e09f799547312c2361c5"}]}
+[90m21:55:51[0m [36m[INFO][0m: [SSHPool] Shutting down (0 connections)

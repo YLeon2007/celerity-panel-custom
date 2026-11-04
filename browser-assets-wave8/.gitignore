@@ -1,0 +1,5 @@
+# Large diagnostic raw files remain local; compact summaries preserve failures.
+run-*/evidence.json
+!run-11/evidence.json
+__pycache__/
+.build.lock
