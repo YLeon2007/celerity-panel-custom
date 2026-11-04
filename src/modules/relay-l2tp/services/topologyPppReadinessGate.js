@@ -115,11 +115,14 @@ class TopologyPppReadinessGate {
             if (!Array.isArray(plan?.nodes)) return failed(0);
             const ownerBound = plan.ownerCredentialRevision !== undefined;
             const blocked = plan.routeState === 'no_bridge_exit';
-            if ((ownerBound || blocked) && (!ownedIngressRouteState(plan)
+            // Route incompleteness is independent of PPP installation. Ordinary
+            // non-PPP prefixes have no installed group/owner to bind; each relay
+            // still passes its persisted user/operation/credential fences below.
+            if (ownerBound && (!ownedIngressRouteState(plan)
                 || !Number.isSafeInteger(plan.ownerCredentialRevision) || plan.ownerCredentialRevision < 1
                 || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0)) return failed(0);
             const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes, plan.effectiveTopology) : null;
-            if (plan.staged === true && !stagedRelays && !blocked) return failed(0);
+            if (plan.staged === true && !stagedRelays && !(blocked && ownerBound)) return failed(0);
             const terminalRelayRef = stagedRelays?.terminalRelayRef;
             for (const node of plan.nodes) {
                 if (node.role !== 'relay') continue;
@@ -267,7 +270,7 @@ class TopologyPppReadinessGate {
             return { ok: true, verifiedRelayCount, ...(skippedRelayCount > 0 ? { skippedRelayCount } : {}),
                 relayRevisions, ...(skippedRelayRevisions.length ? { skippedRelayRevisions } : {}),
                 ...(blocked ? { routeOutcome: { state: 'no_bridge_exit', internetProof: 'not_applicable',
-                    blockedOwnerNodeId: plan.ownerNodeId } } : {}) };
+                    ...(ownerBound ? { blockedOwnerNodeId: plan.ownerNodeId } : {}) } } : {}) };
         } catch {
             // Includes SSH/runner, malformed result and database failures. Never
             // propagate stderr or credentials into topology operation logs.

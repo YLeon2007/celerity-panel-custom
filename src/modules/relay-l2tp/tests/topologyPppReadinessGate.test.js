@@ -178,6 +178,37 @@ const stagedTwoRelayPlan = { staged: true, nodes: [
     { role: 'relay', node: 'node-r', nodeRef: 'relay-1', checks: [] },
 ] };
 
+for (const shape of ['G4', 'G5']) test(`${shape} ordinary non-PPP no-exit plan needs no installed owner but retains absent-state fences`, async () => {
+    let failure;
+    const revisions = { 'node-r': 9, 'node-t': 4 };
+    const reads = new Map();
+    const { gate, calls } = fixture({
+        RelayL2tpState: { findOne: ({ node }) => ({ select: () => ({ lean: async () => {
+            const count = (reads.get(node) || 0) + 1; reads.set(node, count);
+            return { node, status: 'not_installed', desiredState: 'absent',
+                secretRevision: revisions[node] + (failure === 'epoch' && count > 1 ? 1 : 0) };
+        } }) }) },
+        L2tpUser: { find: () => ({ select: () => ({ lean: async () => failure === 'users' ? [{ _id: 'unexpected' }] : [] }) }) },
+        L2tpOperation: { findOne: () => ({ select: () => ({ lean: async () => failure === 'operation' ? { _id: 'active' } : null }) }) },
+    });
+    const ordinary = { ...stagedTwoRelayPlan, kind: 'link.apply', routeState: 'no_bridge_exit',
+        nodes: shape === 'G5' ? stagedTwoRelayPlan.nodes : [
+            { role: 'portal', node: 'node-p1', nodeRef: 'portal-1' },
+            { role: 'portal', node: 'node-p2', nodeRef: 'portal-2' },
+            { role: 'relay', node: 'node-r', nodeRef: 'relay-1' },
+        ] };
+    const result = await gate.verifyPlan(ordinary);
+    assert.equal(result.ok, true);
+    assert.equal(result.verifiedRelayCount, 0);
+    assert.equal(result.skippedRelayRevisions.length, shape === 'G5' ? 2 : 1);
+    assert.deepEqual(result.routeOutcome, { state: 'no_bridge_exit', internetProof: 'not_applicable' });
+    assert.deepEqual(calls, []);
+    for (failure of ['users', 'operation', 'epoch']) {
+        reads.clear();
+        assert.equal((await gate.verifyPlan(ordinary)).ok, false, failure);
+    }
+});
+
 test('staged intermediate without PPP fails even without L2TP ingress and terminal PPP', async () => {
     const { gate, calls } = fixture({ RelayL2tpState: { findOne: () => ({ select: () => ({ lean: async () => null }) }) } });
     assert.deepEqual(await gate.verifyPlan(stagedTwoRelayPlan), { ok: false, verifiedRelayCount: 0, reason: 'PPP_NOT_INSTALLED' });

@@ -76,6 +76,24 @@ async function remove(f, linkId, jobId = id(90)) {
     return f.coordinator.queueIntent({ session: f.session, executionContext: context, intentId: jobId,
         mutation: { kind: 'link.delete', linkId, desiredVersion }, expectedTopologyRevision: f.CascadeTopologyState.rows[0].revision, resourceNodeIds: resources });
 }
+for (const mode of ['forward', 'reverse']) test(`installed-path planner accepts incomplete ${mode} APPLY and pins kept-empty owner/peer epochs`, async () => {
+    const f = installedFixture({ mode });
+    Object.assign(f.CascadeLink.rows[0], { portalNode: id(3), bridgeNode: id(1) });
+    const before = structuredClone({ groups: f.CascadeRouteGroup.rows, states: f.RelayL2tpState.rows });
+    const selected = await f.deployment.readSelected({ snapshot: await f.deployment.snapshotReader.readDraft(f.session),
+        scope: { kind: 'link.apply', linkId: id(10) }, executionContext: context, session: f.session });
+    assert.equal(selected.routeState, 'no_bridge_exit');
+    assert.deepEqual(selected.installedPath.oldPathLinkIds, []);
+    assert.deepEqual(selected.installedPath.newPathLinkIds, []);
+    assert.equal(selected.installedPath.ownerNodeId, id(1));
+    assert.equal(selected.installedPath.ownerCredentialRevision, 41);
+    assert.equal(selected.installedPath.ownerTopologyRevision, 0);
+    assert.deepEqual(selected.installedPath.groupBefore, require('../domain/topologyDraft').projectGroups([f.group])[0]);
+    assert.deepEqual(selected.effectiveTopology.groups, [selected.installedPath.groupBefore]);
+    assert.deepEqual({ groups: f.CascadeRouteGroup.rows, states: f.RelayL2tpState.rows }, before);
+    assert.equal(f.TopologyOperation.rows.length, 0); assert.equal(f.calls.length, 0);
+});
+
 for (const absent of [false, true]) for (const mode of ['forward', 'reverse']) {
     test(`actual worker installed publication absent=${absent} ${mode}, no-exit delete and reattach preserve peers/credentials`, async () => {
         const f = installedFixture({ absent, mode });

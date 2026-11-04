@@ -719,7 +719,7 @@ class L2tpSimpleService {
         // branch is not authority to invent fallback. Blocking evidence is the
         // actual owned candidate, not absence of every edge in the component.
         if (routeState === 'egress_configured' && (!crossesOwner || nodes.get(cursor) !== 'bridge')
-            || plan.kind === 'link.delete' && links.has(plan.linkId)) {
+            || (plan.kind === 'link.delete' ? links.has(plan.linkId) : !links.has(plan.linkId))) {
             throw simpleError('INVALID_INGRESS_OPERATION', 'Prepared route does not match its exit outcome');
         }
         const ingress = await this.topologyIngressGate.verifyPlan(plan);

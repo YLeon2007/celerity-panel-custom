@@ -288,6 +288,70 @@ test('ordinary apply/staged flags cannot authorize last-exit blocking success', 
         { code: 'INVALID_INGRESS_OPERATION' });
 });
 
+for (const kind of ['link.apply', 'link.attach']) test(`incomplete installed ${kind} keeps an empty owned path blocked with actual user/epoch/readback proof`, async () => {
+    const f = fixture({ noExit: true, sourceLess: false });
+    f.plan.kind = kind; f.plan.linkId = 'input';
+    f.plan.oldPathLinkIds = []; f.snapshot.groups[0].paths[0].linkIds = [];
+    const before = structuredClone({ snapshot: f.snapshot, state: f.state, users: f.users });
+    const receipt = await f.service.prepareConfiguredRelayIngress({ operationPlan: freeze(f.plan) });
+    assert.equal(receipt.routeState, 'no_bridge_exit');
+    assert.equal(receipt.pppInternetProof, 'not_applicable');
+    assert.deepEqual(receipt.oldPathLinkIds, []); assert.deepEqual(receipt.newPathLinkIds, []);
+    assert.ok(f.calls.some(call => call[0] === 'ingress'));
+    assert.ok(f.calls.some(call => call[0] === 'ppp'));
+    assert.deepEqual({ snapshot: f.snapshot, state: f.state, users: f.users }, before);
+});
+
+test('subsequent deletion can keep the already empty owned path blocked without fabricating old membership', async () => {
+    const f = fixture({ noExit: true, sourceLess: false });
+    f.plan.linkId = 'input'; f.plan.oldPathLinkIds = []; f.snapshot.groups[0].paths[0].linkIds = [];
+    f.plan.effectiveTopology.links = [];
+    const before = structuredClone({ snapshot: f.snapshot, state: f.state, users: f.users });
+    const receipt = await f.service.prepareConfiguredRelayIngress({ operationPlan: freeze(f.plan) });
+    assert.equal(receipt.routeState, 'no_bridge_exit'); assert.equal(receipt.pppInternetProof, 'not_applicable');
+    assert.deepEqual(receipt.oldPathLinkIds, []); assert.deepEqual(receipt.newPathLinkIds, []);
+    assert.deepEqual({ snapshot: f.snapshot, state: f.state, users: f.users }, before);
+});
+
+test('incomplete installed APPLY prepares a blocked replacement without eagerly erasing the old path or nonempty peer', async () => {
+    const f = fixture({ noExit: true, sourceLess: false });
+    f.plan.kind = 'link.apply'; f.plan.linkId = 'input';
+    const peerPath = f.snapshot.groups[0].paths[1];
+    Object.assign(peerPath, { enabled: true, linkIds: ['peer-exit'] });
+    f.plan.effectiveTopology.groups[0].paths[1] = projectGroups(f.snapshot.groups)[0].paths[1];
+    f.plan.effectiveTopology.nodes.push({ id: 'peer-r', role: 'relay' }, { id: 'peer-b', role: 'bridge' });
+    f.plan.effectiveTopology.links.push({ id: 'peer-exit', source: 'peer-r', target: 'peer-b', mode: 'reverse', geo: false });
+    f.options.owners = [f.state, { ...f.state, node: 'peer-r', activePathKey: 'peer', secretRevision: 17 }];
+    const before = structuredClone({ snapshot: f.snapshot, state: f.state, users: f.users, owners: f.options.owners });
+    const receipt = await f.service.prepareConfiguredRelayIngress({ operationPlan: freeze(f.plan) });
+    assert.equal(receipt.routeState, 'no_bridge_exit'); assert.equal(receipt.pppInternetProof, 'not_applicable');
+    assert.deepEqual(receipt.oldPathLinkIds, ['old']); assert.deepEqual(receipt.newPathLinkIds, []);
+    assert.deepEqual({ snapshot: f.snapshot, state: f.state, users: f.users, owners: f.options.owners }, before);
+});
+
+test('repeated empty-path deletion still requires an actually present installed baseline path', async () => {
+    const f = fixture({ noExit: true, sourceLess: false });
+    f.plan.linkId = 'input'; f.plan.oldPathLinkIds = []; f.plan.effectiveTopology.links = [];
+    f.snapshot.groups[0].paths = f.snapshot.groups[0].paths.filter(path => path.pathKey !== 'mine');
+    await assert.rejects(f.service.prepareConfiguredRelayIngress({ operationPlan: freeze(f.plan) }),
+        { code: 'INGRESS_PATH_CONFLICT' });
+    assert.ok(!f.calls.some(call => Array.isArray(call)));
+});
+
+for (const [label, change, code] of [
+    ['actual nonempty baseline', f => { f.snapshot.groups[0].paths[0].linkIds = ['old']; }, 'INGRESS_PATH_CONFLICT'],
+    ['credential epoch', f => { f.state.secretRevision++; }, 'INGRESS_OWNER_CONFLICT'],
+    ['owner topology epoch', f => { f.state.appliedTopologyRevision++; }, 'INGRESS_OWNER_CONFLICT'],
+    ['unsynced user', f => { f.users[0].appliedRevision--; }, 'INGRESS_PPP_UNVERIFIED'],
+    ['changed peer', f => { f.plan.effectiveTopology.groups[0].paths[1].priority++; }, 'INGRESS_PATH_CONFLICT'],
+]) test(`incomplete installed apply retains ${label} checks`, async () => {
+    const f = fixture({ noExit: true, sourceLess: false });
+    f.plan.kind = 'link.apply'; f.plan.linkId = 'input'; f.plan.oldPathLinkIds = [];
+    f.snapshot.groups[0].paths[0].linkIds = [];
+    change(f);
+    await assert.rejects(f.service.prepareConfiguredRelayIngress({ operationPlan: freeze(f.plan) }), { code });
+});
+
 test('operation preparation refuses mutable or mixed draft-session requests and absent gates', async () => {
     const f = fixture();
     await assert.rejects(f.service.prepareConfiguredRelayIngress({ operationPlan: f.plan }),

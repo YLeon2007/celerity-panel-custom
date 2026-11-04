@@ -99,9 +99,13 @@ function ownedIngressRouteState(plan) {
     const owners = plan.nodes.filter(node => node?.node === plan.ownerNodeId && node.role === 'relay');
     if (owners.length !== 1) return null;
     const blocked = plan.routeState === 'no_bridge_exit';
-    if (blocked && (plan.kind !== 'link.delete' || !Array.isArray(plan.newPathLinkIds)
+    // APPLY may legitimately prepare an incomplete installed route, and a later
+    // DELETE may keep a previously emptied path blocked. Candidate blocking is
+    // proved here; the service checks actual old membership, owner and epochs.
+    if (blocked && (!Array.isArray(plan.newPathLinkIds)
         || plan.newPathLinkIds.length !== 0 || !Array.isArray(plan.oldPathLinkIds)
-        || plan.oldPathLinkIds.length === 0 || !plan.oldPathLinkIds.includes(plan.linkId))) return null;
+        || !Array.isArray(plan.effectiveTopology?.links)
+        || plan.effectiveTopology.links.some(link => link.id === plan.linkId) === (plan.kind === 'link.delete'))) return null;
     if (!blocked && plan.routeState !== undefined
         && !['complete', 'no_portal_input'].includes(plan.routeState)) return null;
     return routeToIngress(owners[0].candidate, cascadePathIngressTag(plan.pathKey),

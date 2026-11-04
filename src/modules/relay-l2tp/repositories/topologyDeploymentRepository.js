@@ -272,7 +272,9 @@ class TopologyDeploymentRepository {
             }
             const complete = (effective.nodes.find(node => node.id === cursor) || baseline.nodes.find(node => node.id === cursor))?.role === 'bridge';
             const newPathLinkIds = complete ? path : [];
-            if (!complete && scope.kind !== 'link.delete') throw selectedError('TOPOLOGY_INSTALLED_ROUTE_NO_EXIT');
+            // An explicit APPLY can extend a valid incomplete prefix too. Keep
+            // its installed path empty/blocked until a real bridge suffix exists;
+            // frozen candidate + MAIN/PPP proofs still precede publication.
             const proposed = plain(group);
             const owned = proposed.paths.find(path => path.pathKey === owner.pathKey);
             if (owned) owned.linkIds = newPathLinkIds;
