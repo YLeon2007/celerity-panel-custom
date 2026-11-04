@@ -24,7 +24,7 @@ const drift = (verifiedRelayCount, relayNode, credentialRevision) => ({
 });
 const id = value => value == null ? '' : String(value);
 
-function classifyStagedRelays(nodes) {
+function classifyStagedRelays(nodes, topology) {
     let singlePortal = 0;
     let defaultBridge = 0;
     const portalNumbers = new Set();
@@ -41,7 +41,9 @@ function classifyStagedRelays(nodes) {
             const number = Number(node.nodeRef.slice('relay-'.length));
             if (!Number.isSafeInteger(number) || relayNumbers.has(number)) return null;
             relayNumbers.add(number);
-        } else if (node?.role === 'bridge' && node.nodeRef === 'bridge') {
+        } else if (node?.role === 'bridge' && ['bridge', 'bridge-1'].includes(node.nodeRef)) {
+            // Multi-exit composition numbers the default bridge as bridge-1;
+            // it is still a real PPP exit when no portal has been added yet.
             defaultBridge += 1;
         } else if (node?.role === 'bridge' && /^bridge-[1-9]\d*$/.test(node.nodeRef)) {
             const number = Number(node.nodeRef.slice('bridge-'.length));
@@ -53,8 +55,11 @@ function classifyStagedRelays(nodes) {
     }
     const hasPortalInput = singlePortal === 1 && portalNumbers.size === 0
         || singlePortal === 0 && portalNumbers.size >= 2;
-    const sourceLessSuffix = singlePortal === 0 && portalNumbers.size === 0 && defaultBridge === 1;
-    if (relayNumbers.size === 0 || !(hasPortalInput && defaultBridge === 0 || sourceLessSuffix)) return null;
+    const noPortalInput = singlePortal === 0 && portalNumbers.size === 0;
+    const sourceLessSuffix = noPortalInput && defaultBridge === 1;
+    const relayOnlyFragment = noPortalInput && defaultBridge === 0 && geoBridgeNumbers.size === 0;
+    if (relayNumbers.size === 0 || !(hasPortalInput && defaultBridge === 0
+        || sourceLessSuffix || relayOnlyFragment)) return null;
     for (let number = 1; number <= portalNumbers.size; number += 1) {
         if (!portalNumbers.has(number)) return null;
     }
@@ -63,6 +68,21 @@ function classifyStagedRelays(nodes) {
     }
     for (let number = 2; number <= geoBridgeNumbers.size + 1; number += 1) {
         if (!geoBridgeNumbers.has(number)) return null;
+    }
+    if (relayOnlyFragment) {
+        // New source-less/bridge-less shapes need the actual pinned graph,
+        // not just two role labels. Keep malformed legacy ref-only plans out.
+        const ordered = [...nodes].sort((a, b) => Number(a.nodeRef.slice(6)) - Number(b.nodeRef.slice(6)));
+        if (ordered.length < 2 || !Array.isArray(topology?.nodes) || !Array.isArray(topology.links)
+            || topology.nodes.length !== ordered.length || topology.links.length !== ordered.length - 1
+            || new Set(ordered.map(node => id(node.node))).size !== ordered.length
+            || new Set(topology.nodes.map(node => node.id)).size !== ordered.length
+            || topology.nodes.some(node => node.role !== 'relay'
+                || ordered.filter(entry => entry.node === node.id).length !== 1)
+            || ordered.slice(0, -1).some((node, index) => topology.links.filter(link =>
+                link.source === node.node && link.target === ordered[index + 1].node
+                && ['forward', 'reverse'].includes(link.mode) && link.geo !== true
+                && link.geoRouting?.enabled !== true).length !== 1)) return null;
     }
     // Missing portal input is not missing PPP egress. R-to-B remains staged
     // for portal traffic, but every installed relay still needs its ordinary
@@ -98,7 +118,7 @@ class TopologyPppReadinessGate {
             if ((ownerBound || blocked) && (!ownedIngressRouteState(plan)
                 || !Number.isSafeInteger(plan.ownerCredentialRevision) || plan.ownerCredentialRevision < 1
                 || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0)) return failed(0);
-            const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes) : null;
+            const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes, plan.effectiveTopology) : null;
             if (plan.staged === true && !stagedRelays && !blocked) return failed(0);
             const terminalRelayRef = stagedRelays?.terminalRelayRef;
             for (const node of plan.nodes) {

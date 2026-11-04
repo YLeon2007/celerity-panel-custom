@@ -31,9 +31,9 @@ function installedFixture({ absent = false, mode = 'reverse' } = {}) {
     f.deployment.snapshotReader = new (require('../repositories/topologyDraftRepository').TopologyDraftRepository)({ ...f, transactionRunner: work => work(f.session) });
     const users = [{ _id: id(80), relayNode: id(1), login: 'kept-user', passwordEncrypted: 'kept-secret', ip: '10.255.30.10',
         enabled: true, desiredRevision: 41, appliedRevision: 41, syncStatus: 'synced', syncOperationId: id(81) }];
-    const models = { ...f, L2tpUser: { find: () => query(() => users) }, L2tpOperation: { findOne: () => query(() => ({
+    const options = { readbackOk: true, prepares: [], plans: [], gateCalls: [] };
+    const models = { ...f, L2tpUser: { find: () => query(() => users) }, L2tpOperation: { findOne: () => query(() => options.noSync ? null : ({
         _id: id(81), node: id(1), kind: 'sync_users', status: 'succeeded', plan: { operationId: id(81), relayId: id(1), desired: { credentialRevision: 41 } } })) } };
-    const options = { readbackOk: true, prepares: [], gateCalls: [] };
 
     const ingress = new TopologyAttachIngressGate({ nodeExecutionResolver: { async resolve() { return {
         async connect() {}, disconnect() {}, async exec(command, execOptions) {
@@ -42,12 +42,13 @@ function installedFixture({ absent = false, mode = 'reverse' } = {}) {
                 settings: { network: 'tcp,udp', followRedirect: true }, streamSettings: { sockopt: { tproxy: 'tproxy' } } }],
                 outbounds: [{ tag: 'cascade-mine', protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: cascadePathIngressPort(id(60), 'mine') }] } }],
                 routing: { rules: [{ type: 'field', inboundTag: [`relay-l2tp-${id(60)}`], outboundTag: 'cascade-mine' }] } };
+            if (options.changeMain) options.changeMain(main);
             const setup = `import builtins,io,subprocess\nbuiltins.open=lambda *a,**k:io.StringIO(${JSON.stringify(JSON.stringify(main))})\nsubprocess.run=lambda *a,**k:type('Result',(),{'returncode':0,'stdout':'active\\n','stderr':''})()\n`;
             const result = spawnSync('python3', ['-'], { input: setup + execOptions.stdin, encoding: 'utf8' });
             return { code: result.status, stdout: result.stdout, stderr: result.stderr };
         } }; } } });
     const ppp = createTopologyPppReadinessGate({ ...models, executionContext: context, readOnly: true,
-        NodeSSH: class { async exec() { options.gateCalls.push('users'); return { code: options.readbackOk ? 0 : 65, stderr: '', stdout: JSON.stringify({
+        NodeSSH: class { async exec() { options.gateCalls.push('users'); options.onUsers?.(); return { code: options.readbackOk ? 0 : 65, stderr: '', stdout: JSON.stringify({
             ok: options.readbackOk, code: 'USERS_VERIFIED', credentialRevision: 41, enabledUserCount: 1, managedUserCount: 1 }) + '\n' }; } } });
     const forbidden = () => { throw new Error('No credential or provisioning writes permitted'); };
     const service = new L2tpSimpleService({ ...models, allowRemoteExecution: true, topologyIngressGate: ingress, topologyPppReadinessGate: ppp,
@@ -56,21 +57,23 @@ function installedFixture({ absent = false, mode = 'reverse' } = {}) {
     f.worker.installedIngressPreparer = async ({ operationPlan: plan }) => {
         assert.ok(Object.isFrozen(plan));
         assert.equal(f.NodeOperationLock.rows.filter(row => row.operationId === plan.operationId).length, plan.resourceNodeIds.length);
-        const proof = await service.prepareConfiguredRelayIngress({ operationPlan: plan });
+        const proofPlan = options.changePlan ? options.changePlan(plan) : plan;
+        options.plans.push(proofPlan);
+        const proof = await service.prepareConfiguredRelayIngress({ operationPlan: proofPlan });
         options.prepares.push(proof); return proof;
     };
-    return { ...f, state, group, users, options };
+    return { ...f, state, group, users, options, service, ingress, ppp };
 }
 async function apply(f, linkId) {
     const queued = await f.coordinator.queue({ expectedTopologyRevision: f.CascadeTopologyState.rows[0].revision, scope: { kind: 'link.apply', linkId, linkIds: [linkId] } });
     const result = await f.worker.run(queued.operationId);
     assert.equal(result.status, 'succeeded', JSON.stringify(result)); return queued;
 }
-async function remove(f, linkId) {
+async function remove(f, linkId, jobId = id(90)) {
     const link = f.CascadeLink.rows.find(row => row._id === linkId), desiredVersion = linkDesiredVersion(link);
     const resources = await f.coordinator.resolveIntentResourcesForQueue({ kind: 'link.delete', link, desiredVersion, session: f.session });
-    link.lifecycle = { state: 'deleting', deleteJobId: id(90), desiredVersion };
-    return f.coordinator.queueIntent({ session: f.session, executionContext: context, intentId: id(90),
+    link.lifecycle = { state: 'deleting', deleteJobId: jobId, desiredVersion };
+    return f.coordinator.queueIntent({ session: f.session, executionContext: context, intentId: jobId,
         mutation: { kind: 'link.delete', linkId, desiredVersion }, expectedTopologyRevision: f.CascadeTopologyState.rows[0].revision, resourceNodeIds: resources });
 }
 for (const absent of [false, true]) for (const mode of ['forward', 'reverse']) {
@@ -211,7 +214,7 @@ test('missing installed dependency is rejected before dispatch and releases only
     assert.equal(result.errorCode, 'TOPOLOGY_INSTALLED_INGRESS_UNAVAILABLE'); assert.equal(f.calls.length, 0);
     assert.equal(f.NodeOperationLock.rows.length, 0); assert.equal(f.CascadeTopologyState.rows[0].topologyAdmissionCount, 0);
 });
-test('handoff characterization: installed geo ingress retains ownership rather than falsely publishing readiness', async () => {
+test('installed geo ingress accepts generated conditional policy without falsely publishing client readiness', async () => {
     const f = installedFixture(); await apply(f, id(10));
     f.CascadeLink.rows.push({ ...f.CascadeLink.rows[0], _id: id(13), bridgeNode: id(4), tunnelPort: 23500, status: 'pending',
         geoRouting: { enabled: true, geoip: ['ru'], domains: ['category-ru'] } });
@@ -219,8 +222,11 @@ test('handoff characterization: installed geo ingress retains ownership rather t
     const before = structuredClone(f.group);
     const queued = await f.coordinator.queue({ expectedTopologyRevision: 8, scope: { kind: 'link.apply', linkId: id(13), linkIds: [id(13)] } });
     const result = await f.worker.run(queued.operationId);
-    assert.equal(result.errorCode, 'INVALID_INGRESS_OPERATION'); assert.equal(result.status, 'committing');
-    assert.deepEqual(f.group, before); assert.ok(f.NodeOperationLock.rows.length);
+    assert.equal(result.status, 'succeeded', JSON.stringify(result));
+    assert.deepEqual(f.group, before);
+    assert.equal(f.options.prepares.at(-1).pppInternetProof, 'unverified');
+    assert.equal(f.NodeOperationLock.rows.length, 0);
+    assert.equal(f.CascadeLink.rows.find(row => row._id === id(13)).status, 'staged');
 });
 test('late tombstone CAS refusal rolls back owned publication, status, owner settlement and release together', async () => {
     const f = installedFixture(); await apply(f, id(10));
@@ -259,3 +265,5 @@ test('actual Mongoose private projection preserves installed/delete pins for dur
     assert.equal(row.deleteJobId, id(90)); assert.deepEqual(row.installedPath, source.installedPath);
     assert.equal(require('../repositories/topologyOperationRepository').selectedAdmissionFingerprint(row), source.admissionFingerprint);
 });
+
+module.exports = { installedFixture, apply, remove, enableV2 };

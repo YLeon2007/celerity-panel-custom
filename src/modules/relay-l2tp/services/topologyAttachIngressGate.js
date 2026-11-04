@@ -26,27 +26,68 @@ function routeToIngress(candidate, tag, port, { blocked = false, owned = false }
         || matches[0].settings?.ip !== '127.0.0.1'
         || matches[0].settings?.udp !== true) return false;
     const rules = config.routing?.rules;
-    const selected = Array.isArray(rules) ? rules.filter(rule =>
-        Array.isArray(rule?.inboundTag) && rule.inboundTag.includes(tag)) : [];
-    if (selected.length !== 1 || selected[0].type !== 'field'
-        || selected[0].inboundTag.length !== 1
-        || Object.keys(selected[0]).some(key => !['type', 'inboundTag', 'outboundTag'].includes(key))
-        || typeof selected[0].outboundTag !== 'string') return false;
-    const target = selected[0].outboundTag;
-    const outbounds = matchingTag(config.outbounds, target);
-    const portals = matchingTag(config.reverse?.portals, target);
-    if (outbounds.length + portals.length !== 1) return false;
+    if (!Array.isArray(rules) || rules.some(rule => !rule || typeof rule !== 'object'
+        || Array.isArray(rule) || rule.inboundTag !== undefined && (!Array.isArray(rule.inboundTag)
+            || rule.inboundTag.some(value => typeof value !== 'string' || !value)
+            || new Set(rule.inboundTag).size !== rule.inboundTag.length))) return false;
+    const selected = rules.filter(rule => rule.inboundTag?.includes(tag));
+    if (selected.length === 0) return false;
+    const fallback = selected.at(-1);
+    const fieldRule = (rule, condition) => rule.type === 'field'
+        && typeof rule.outboundTag === 'string'
+        && Object.keys(rule).every(key => ['type', 'inboundTag', 'outboundTag', ...condition].includes(key));
+    const uniqueTarget = target => {
+        const outbounds = matchingTag(config.outbounds, target);
+        const portals = matchingTag(config.reverse?.portals, target);
+        return outbounds.length + portals.length === 1 ? { outbound: outbounds[0], portal: portals[0] } : null;
+    };
+    const tunnelTarget = target => {
+        const resolved = uniqueTarget(target);
+        return target !== 'block' && target !== 'direct' && resolved
+            && (!owned || resolved.portal
+                || ['vless', 'vmess', 'trojan', 'shadowsocks'].includes(resolved.outbound?.protocol));
+    };
+    // The final rule must be the sole unconditional default. Earlier rules
+    // may split domain/geoip traffic, but each is checked, not ignored. Their
+    // target must also be a unique non-direct tunnel, never a balancer, freedom
+    // alias or an absent/ambiguous reverse portal. Generated mixed-mode rules
+    // can share the same policy with upstream transit inbound tags.
+    if (!fieldRule(fallback, [])) return false;
     if (blocked) {
-        // A rule without inboundTag can preempt this ingress too. A private-IP
-        // blackhole is safe; an earlier wildcard/direct/balancer is not.
-        const before = rules.slice(0, rules.indexOf(selected[0]));
-        if (before.some(rule => (!Array.isArray(rule?.inboundTag) || rule.inboundTag.length === 0)
-            && matchingTag(config.outbounds, rule?.outboundTag)[0]?.protocol !== 'blackhole')) return false;
+        if (selected.length !== 1 || fallback.inboundTag.length !== 1
+            || fallback.outboundTag !== 'block'
+            || uniqueTarget('block')?.outbound?.protocol !== 'blackhole') return false;
+    } else {
+        if (!tunnelTarget(fallback.outboundTag)) return false;
+        const conditions = new Set();
+        for (const rule of selected.slice(0, -1)) {
+            const fields = ['domain', 'ip'].filter(key => Object.hasOwn(rule, key));
+            if (fields.length !== 1 || !fieldRule(rule, fields)
+                || !Array.isArray(rule[fields[0]]) || rule[fields[0]].length === 0
+                || rule[fields[0]].some(value => typeof value !== 'string' || !value.trim())
+                || rule.outboundTag === fallback.outboundTag || !tunnelTarget(rule.outboundTag)) return false;
+            const key = JSON.stringify([fields[0], rule[fields[0]]]);
+            if (conditions.has(key)) return false;
+            conditions.add(key);
+        }
     }
-    if (blocked) return target === 'block' && outbounds[0]?.protocol === 'blackhole';
-    return target !== 'block' && target !== 'direct'
-        && (!owned || portals.length === 1
-            || ['vless', 'vmess', 'trojan', 'shadowsocks'].includes(outbounds[0]?.protocol));
+    // Reverse control traffic has one generated, exact reserved-domain route
+    // to its paired tunnel outbound. It is not a geo/default client route.
+    // Blocked ingress still must precede it (PPP must not escape via control).
+    const reverseHandshake = rule => {
+        if (blocked || !fieldRule(rule, ['domain']) || rule.inboundTag !== undefined
+            || !rule.outboundTag.startsWith('tunnel-')) return false;
+        const bridges = matchingTag(config.reverse?.bridges, `bridge-${rule.outboundTag.slice('tunnel-'.length)}`);
+        return bridges.length === 1 && typeof bridges[0].domain === 'string'
+            && Array.isArray(rule.domain) && rule.domain.length === 1
+            && rule.domain[0] === `full:${bridges[0].domain}` && tunnelTarget(rule.outboundTag);
+    };
+    // A global rule applies to PPP too. Apart from paired reverse control,
+    // only a unique blackhole can precede this policy without inbound scoping.
+    return !rules.slice(0, rules.indexOf(fallback)).some(rule =>
+        (!rule.inboundTag || rule.inboundTag.length === 0)
+        && uniqueTarget(rule.outboundTag)?.outbound?.protocol !== 'blackhole'
+        && !reverseHandshake(rule));
 }
 
 // Shared structural evidence only: executor readback still proves the candidate
