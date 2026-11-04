@@ -387,6 +387,16 @@ html {
     z-index: 1;
 }
 
+/* The embedded map contains fixed modals. Layer only its map surface so the
+   modals are not trapped beneath the sibling sticky toolbar/topbar. */
+.main-content > #viewNetwork {
+    z-index: auto;
+}
+
+.main-content > #viewNetwork > .network-page {
+    z-index: 1;
+}
+
 /* Stats Grid */
 .stats-grid {
     display: grid;
