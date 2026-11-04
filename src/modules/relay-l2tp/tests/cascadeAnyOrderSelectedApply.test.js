@@ -328,7 +328,9 @@ test('selected V2 settlement joins exact owner pointers, node releases, scoped p
     assert.equal(f.NodeOperationLock.rows.length, 0);
     assert.equal(operation.heldTopologyAdmission, false);
     const baseline = await f.deployment.readSelected({ scope: { kind: 'link.apply', linkId: id(11) }, executionContext: context, session });
-    assert.deepEqual(baseline.baselineTopology, operation.effectiveTopology);
+    assert.deepEqual(baseline.baselineTopology, { ...operation.effectiveTopology,
+        nodes: operation.effectiveTopology.nodes.map(node => ({ ...node,
+            profileConfig: Buffer.from(operation.nodes.find(entry => entry.node === node.id).candidate.bytes).toString('utf8') })) });
     await assert.rejects(repository.finalizeV2Succeeded({ operationId: operation._id, owner: 'v2-worker', leaseUntil,
         topologyRevision: 7, priorDeployedRevision: 3, now: new Date() }), { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' });
     assert.equal(f.CascadeTopologyState.rows[0].topologyAdmissionCount, 1);
@@ -349,7 +351,9 @@ test('endpoint change locks and cleans the old/new physical union without coupli
     const next = await apply(f, 12);
     const clean = f.TopologyOperation.rows.find(row => row._id === next.operationId);
     assert.deepEqual(clean.resourceNodeIds, [id(1), id(2)]);
-    assert.deepEqual(clean.baselineTopology, { nodes: [], links: [], groups: [] });
+    assert.deepEqual(clean.baselineTopology, { nodes: operation.nodes.filter(entry => [id(1), id(2)].includes(entry.node)).map(entry => ({
+        ...operation.baselineTopology.nodes.find(node => node.id === entry.node),
+        profileConfig: Buffer.from(entry.candidate.bytes).toString('utf8') })), links: [], groups: [] });
     assert.equal((await f.worker.run(next.operationId)).status, 'succeeded');
 });
 test('counted remote admission permits independent selected work in either order while same node and drain remain blocked', async () => {
