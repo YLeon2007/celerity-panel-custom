@@ -827,6 +827,7 @@ class CascadeService {
     }
 
     async _undeployLinkWithCompletion(link) {
+        const writerEnv = Object.freeze({ ...process.env });
         const portalNode = await HyNode.findById(link.portalNode);
         const bridgeNode = await HyNode.findById(link.bridgeNode);
 
@@ -846,29 +847,40 @@ class CascadeService {
         }
 
         if (bridgeNode && (bridgeNode.ssh?.password || bridgeNode.ssh?.privateKey)) {
-            if (link.mode === 'forward' && bridgeNode.type === 'xray' && bridgeNode.active) {
-                await this._deployPortalConfig(bridgeNode, opts);
-            } else {
-                const remainingLinks = await CascadeLink.find({
-                    bridgeNode: bridgeNode._id,
-                    active: true,
-                    mode: { $ne: 'forward' },
-                    _id: { $ne: link._id },
-                }).populate('portalNode');
-
-                if (remainingLinks.length > 0) {
-                    await this._deployBridgeConfig(remainingLinks[0], bridgeNode, remainingLinks[0].portalNode, opts);
+            // Hold the same local writer generation across neighbor selection,
+            // regeneration OR service teardown. Nested config writers borrow it;
+            // only this scope may release after every checked effect completes.
+            await withClassicNodeConfigWrite({ nodeId: bridgeNode._id, kind: 'undeploy-bridge', env: writerEnv }, async () => {
+                // The common helper is intentionally dormant without execution
+                // authorization. Adopted/history-owned profiles still veto stop.
+                if (await topologyManagesNodeConfig(bridgeNode, writerEnv)) {
+                    throw undeployUncertain('Topology-managed config cannot be removed by the classic writer');
+                }
+                if (link.mode === 'forward' && bridgeNode.type === 'xray' && bridgeNode.active) {
+                    await this._deployPortalConfig(bridgeNode, opts);
                 } else {
-                    const ssh = completionCheckedSSH(bridgeNode);
-                    try {
-                        await ssh.connect();
-                        await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
-                        logger.info(`[Cascade] Bridge service stopped on ${bridgeNode.name}`);
-                    } finally {
-                        ssh.disconnect();
+                    const remainingLinks = await CascadeLink.find({
+                        bridgeNode: bridgeNode._id,
+                        active: true,
+                        mode: { $ne: 'forward' },
+                        _id: { $ne: link._id },
+                    }).populate('portalNode');
+
+                    if (remainingLinks.length > 0) {
+                        await this._deployBridgeConfig(remainingLinks[0], bridgeNode, remainingLinks[0].portalNode, opts);
+                    } else {
+                        const ssh = completionCheckedSSH(bridgeNode);
+                        try {
+                            await ssh.connect();
+                            await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
+                            logger.info(`[Cascade] Bridge service stopped on ${bridgeNode.name}`);
+                        } finally {
+                            ssh.disconnect();
+                        }
                     }
                 }
-            }
+                return true;
+            });
         }
 
         await this._invalidateTopologyCache();
