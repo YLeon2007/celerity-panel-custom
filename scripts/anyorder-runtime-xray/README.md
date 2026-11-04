@@ -12,6 +12,13 @@ Do not relabel fresh resources as historical nodes, use historical endpoints, ra
 
 ## Independently available real data-plane extension
 
+The private loopback TLS target uses RSA-2048, explicit X25519, TLS 1.3/h2
+and four bounded workers. REALITY's pinned dependency expects a combined
+encrypted handshake record over 512 bytes or separate handshake records;
+a tiny OpenSSL Ed25519 flight can stall its record-layout detection. Its
+concurrent destination probes must not serialize actual client handshakes.
+These are TLS-target fixture properties, not product/generator changes.
+
 `run.cjs` runs one changed G3 output-first mixed case: reverse R→B1, forward R→B2 (explicit domain policy), reverse P→R. It uses real VLESS **REALITY + xtls-rprx-vision**, a private TLS 1.3/h2 destination, default B1 and domain-selected B2 nonce witnesses, and P/R direct-leak canaries. It deletes/recreates each edge with a new identity, fresh tunnel UUID and different port, checks removal of the old listeners/identities, and tests delete-all and a byte-no-op.
 
 Real path: existing compiler/materializer/composer/executor → pinned NodeSSH → exact candidate runner → systemd/Xray/socket/config readbacks → private HTTP.

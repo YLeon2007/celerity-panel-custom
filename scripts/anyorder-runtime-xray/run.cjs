@@ -194,8 +194,10 @@ async function main() {
         const own = JSON.parse(await ok(id, 'curl --silent --show-error --max-time 2 http://127.0.0.1:18080/?nonce=canary'));
         assert.equal(own.role, id);
     }
-    const tlsProbe = await ok('p', `python3 -c ${shell("import socket,ssl,json; c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; c.set_alpn_protocols(['h2']); s=c.wrap_socket(socket.create_connection(('127.0.0.1',18443),timeout=3),server_hostname='reality.anyorder.test'); print(json.dumps({'version':s.version(),'alpn':s.selected_alpn_protocol()})); s.close()")}`);
-    assert.deepEqual(JSON.parse(tlsProbe), { version: 'TLSv1.3', alpn: 'h2' });
+    const tlsProbe = await ok('p', `python3 -c ${shell("import socket,ssl,json; c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; c.set_alpn_protocols(['h2']); s=c.wrap_socket(socket.create_connection(('127.0.0.1',18443),timeout=3),server_hostname='reality.anyorder.test'); print(json.dumps({'version':s.version(),'alpn':s.selected_alpn_protocol(),'certificateBytes':len(s.getpeercert(binary_form=True))})); s.close()")}`);
+    assert.equal(JSON.parse(tlsProbe).version, 'TLSv1.3');
+    assert.equal(JSON.parse(tlsProbe).alpn, 'h2');
+    assert.ok(JSON.parse(tlsProbe).certificateBytes > 512, 'private destination must supply a non-tiny OpenSSL handshake flight');
     fs.writeFileSync(path.join(work, 'tls-destination-readback.json'), tlsProbe);
     // Seed is fixture-only; every subsequent install uses the unchanged native executor/runner.
     const initial = await materialize({ nodes: [], links: [], groups: [] }, state);

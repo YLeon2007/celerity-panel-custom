@@ -142,7 +142,7 @@ def main():
         'packageLock': digest((source / 'package-lock.json').read_bytes()),
         'installedLock': digest((DEPS / '.package-lock.json').read_bytes()),
         'wrapper': digest(WRAPPER.read_bytes())})
-    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ed25519', '-nodes', '-keyout', str(run / 'tls.key'),
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(run / 'tls.key'),
                     '-out', str(run / 'tls.crt'), '-days', '1', '-subj', '/CN=reality.anyorder.test'],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     fixture = {'runId': run_id, 'nodes': {}, 'clientUuid': str(uuid.uuid4()),
@@ -293,11 +293,20 @@ def main():
         save('launcher-error.json', {'type': type(exc).__name__, 'message': str(exc)})
         raise
     finally:
-        cleanup = {'containers': [], 'network': None}
+        cleanup = {'containers': [], 'network': None, 'resources': []}
         for name, cid in reversed(list(owned.items())):
             current = inspect([name])[0]
             assert current['Id'] == cid, 'cleanup identity changed'
-            assert current['State'].get('OOMKilled') is not True
+            observation = {'id': cid, 'name': name, 'oomKilled': current['State'].get('OOMKilled')}
+            row = next((row for row in physical if row['id'] == cid), None)
+            if row:
+                group = Path('/sys/fs/cgroup' + row['cgroup'])
+                for key in ['memory.peak', 'memory.events']:
+                    try:
+                        observation[key] = (group / key).read_text().strip()
+                    except FileNotFoundError:
+                        observation[key] = 'cgroup-already-exited'
+            cleanup['resources'].append(observation)
             stopped = pod('stop', '--time', '4', name, check=False)
             removed = pod('rm', '--force', name, check=False)
             absent = pod('container', 'exists', cid, check=False).returncode == 1
@@ -327,6 +336,12 @@ def main():
         print(json.dumps({'run': str(run), 'runnerExit': result_code, 'cleanup': cleanup['complete']}), flush=True)
         log.close()
         assert cleanup['complete'], 'exact-owned cleanup or historical preservation verification failed'
+        assert all(row['oomKilled'] is not True for row in cleanup['resources']), 'owned fixture OOM'
+        for row in cleanup['resources']:
+            events = row.get('memory.events', '')
+            if events and events != 'cgroup-already-exited':
+                values = dict(line.split() for line in events.splitlines())
+                assert values.get('oom', '0') == '0' and values.get('oom_kill', '0') == '0', 'owned fixture OOM event'
     return result_code
 
 
