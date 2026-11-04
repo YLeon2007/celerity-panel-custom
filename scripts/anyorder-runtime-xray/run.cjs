@@ -248,14 +248,18 @@ async function main() {
             const hasPort = port => sockets.split('\n').some(line => line.trim().split(/\s+/)[3]?.endsWith(':' + port));
             assert.equal(hasPort(edge.tunnelPort), false, 'old recreation listener remains');
             assert.equal(hasPort(replacement.tunnelPort), true, 'replacement listener absent');
+            const oldArtifactKey = sha('celerity-topology-link:' + edge.id).slice(0, 8);
+            const newArtifactKey = sha('celerity-topology-link:' + replacement.id).slice(0, 8);
+            let newArtifacts = 0;
             for (const id of Object.keys(cfg.nodes)) {
                 const file = id === 'p' ? '/usr/local/etc/xray/config.json' : '/usr/local/etc/xray-bridge/config.json';
                 const config = await ok(id, `cat ${file}`);
                 assert.equal(config.includes(edge.tunnelUuid), false, 'old VLESS credential survived recreate');
-                const strings = value => typeof value === 'string' ? [value] : value && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
-                assert.equal(strings(JSON.parse(config)).some(value => new RegExp('(?:^|[-.])' + edge.id + '(?:$|[.])').test(value)), false, 'old tag/domain survived recreate');
+                assert.equal(config.includes(oldArtifactKey), false, 'old generated tag/domain survived recreate');
+                if (config.includes(newArtifactKey)) newArtifacts++;
             }
-            ledger({ kind: 'recreation', oldId: edge.id, newId: replacement.id, oldPort: edge.tunnelPort, newPort: replacement.tunnelPort,
+            assert.equal(newArtifacts, 2, 'new link artifacts must be present on both endpoints');
+            ledger({ kind: 'recreation', oldArtifactKey, newArtifactKey, oldId: edge.id, newId: replacement.id, oldPort: edge.tunnelPort, newPort: replacement.tunnelPort,
                 mode: edge.mode, listener, oldCredentialSha256: sha(edge.tunnelUuid), newCredentialSha256: sha(replacement.tunnelUuid),
                 oldListenerAbsent: true, newListenerPresent: true, oldIdentityAbsent: true, status: 'passed' });
             graph = restored;
