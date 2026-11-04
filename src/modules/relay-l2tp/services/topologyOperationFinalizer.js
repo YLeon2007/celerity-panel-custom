@@ -26,9 +26,9 @@ function hasExactKeys(value, expectedKeys) {
 
 function assertFinalizationInput(input) {
     const hasPppProof = Boolean(input) && Object.hasOwn(input, 'pppProof');
-    const expectedKeys = hasPppProof
-        ? [...FINALIZATION_INPUT_KEYS, 'pppProof'].sort()
-        : FINALIZATION_INPUT_KEYS;
+    const expectedKeys = [...FINALIZATION_INPUT_KEYS,
+        ...(hasPppProof ? ['pppProof'] : []),
+        ...(input && Object.hasOwn(input, 'installedIngressProof') ? ['installedIngressProof'] : [])].sort();
     if (!hasExactKeys(input, expectedKeys)
         || typeof input.operationId !== 'string'
         || input.operationId.length === 0
@@ -46,7 +46,7 @@ function assertFinalizationInput(input) {
     }
 }
 
-const SCOPED_RESULT_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']);
+const SCOPED_RESULT_KINDS = new Set(['link.apply', 'link.delete', 'domain.reconcile', 'link.replace', 'link.attach']);
 
 function projectFinalized(result, input) {
     const scoped = SCOPED_RESULT_KINDS.has(result?.scopeKind);

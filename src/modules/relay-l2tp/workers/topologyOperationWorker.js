@@ -96,7 +96,7 @@ function validChecks(checks, target) {
                 && Number.isSafeInteger(check.port)
                 && check.port >= 1
                 && check.port <= 65535
-                && check.expectedState === 'listening';
+                && ['listening', 'absent'].includes(check.expectedState);
         }
         return false;
     });
@@ -168,7 +168,9 @@ function durablePlan(operation, operationId) {
         priorDeployedRevision: operation.priorDeployedRevision,
         ...(operation.admissionScope === 'selected' ? { admissionScope: 'selected',
             resourceNodeIds: [...operation.resourceNodeIds], kind: operation.kind,
-            linkId: operation.linkId, routeState: operation.routeState } : {}),
+            linkId: operation.linkId, routeState: operation.routeState,
+            baselineTopology: operation.baselineTopology, effectiveTopology: operation.effectiveTopology,
+            ...(operation.installedPath ? { installedPath: operation.installedPath, ...operation.installedPath } : {}) } : {}),
         ...(operation.kind === 'link.attach' ? {
             kind: 'link.attach',
             groupId: operation.groupId,
@@ -251,6 +253,7 @@ class TopologyOperationWorker {
         bindingProvisioner,
         bindingLifecycle,
         selectedTopologyRepository,
+        installedIngressPreparer,
         allowUnprovenTestExecution = false,
     } = {}) {
         const selectedContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -306,6 +309,8 @@ class TopologyOperationWorker {
         this.#bindingLifecycle = bindingLifecycle;
         this.operationRepository = operationRepository;
         this.selectedTopologyRepository = selectedTopologyRepository;
+        if (installedIngressPreparer !== undefined && typeof installedIngressPreparer !== 'function') throw new TypeError('Installed ingress preparer must be callable');
+        this.installedIngressPreparer = installedIngressPreparer;
         this.executor = executor;
         this.#retainExecutionOwnership = executor.executionProtocolVersion === 2;
         this.finalizer = finalizer;
@@ -1088,10 +1093,12 @@ class TopologyOperationWorker {
                 await assertCurrent();
                 if ((await this.userResync.resyncPlan(plan))?.ok !== true) throw new Error('User proof unconfirmed');
                 await assertCurrent();
-                const ppp = await this.pppReadinessGate.verifyPlan(plan);
+                const installed = plan.installedPath ? await this.prepareInstalledIngress(plan) : null;
+                const ppp = installed ? { ok: true, relayRevisions: installed.relayRevisions,
+                    skippedRelayRevisions: installed.skippedRelayRevisions } : await this.pppReadinessGate.verifyPlan(plan);
                 if (ppp?.ok !== true || !Array.isArray(ppp.relayRevisions)) throw new Error('PPP proof unconfirmed');
                 await assertCurrent();
-                if (plan.kind === 'link.attach') {
+                if (plan.kind === 'link.attach' && !installed) {
                     if (!this.attachIngressGate || (await this.attachIngressGate.verifyPlan(plan))?.ok !== true) {
                         throw new Error('Attach ingress unconfirmed');
                     }
@@ -1099,7 +1106,8 @@ class TopologyOperationWorker {
                 }
                 return { usersVerified: true, pppProof: ppp.relayRevisions,
                     ...(ppp.skippedRelayRevisions ? { skippedPppProof: ppp.skippedRelayRevisions } : {}),
-                    attachVerified: plan.kind === 'link.attach' };
+                    attachVerified: plan.installedPath ? true : plan.kind === 'link.attach',
+                    ...(installed ? { installedIngressProof: installed } : {}) };
             }));
             const proofs = [];
             for (const context of contexts) proofs.push(await heartbeat.run(() => this.executor.close(context)));
@@ -1119,6 +1127,21 @@ class TopologyOperationWorker {
             return { claimed: true, operationId, status: 'committing', stopped: true,
                 drainUncertain: true, errorCode: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' };
         }
+    }
+
+    async prepareInstalledIngress(plan) {
+        if (!this.installedIngressPreparer) throw new Error('Installed ingress preparation unavailable');
+        const proof = await this.installedIngressPreparer({ operationPlan: plan });
+        const same = require('node:util').isDeepStrictEqual;
+        if (proof?.ingressPrepared !== true || proof.deferred !== false
+            || proof.operationId !== plan.operationId || proof.revision !== plan.topologyRevision
+            || proof.routeGroupId !== plan.groupId || proof.pathKey !== plan.pathKey
+            || proof.ownerNodeId !== plan.ownerNodeId
+            || proof.ownerTopologyRevision !== plan.ownerTopologyRevision
+            || proof.ownerCredentialRevision !== plan.ownerCredentialRevision
+            || !same(proof.oldPathLinkIds, plan.oldPathLinkIds) || !same(proof.newPathLinkIds, plan.newPathLinkIds)
+            || !Array.isArray(proof.relayRevisions)) throw new Error('Installed ingress receipt mismatch');
+        return proof;
     }
 
     async run(operationIdentity) {
@@ -1273,6 +1296,8 @@ class TopologyOperationWorker {
             if (operation.admissionScope === 'selected') {
                 try {
                     if (!this.selectedTopologyRepository) throw new Error('Selected snapshot verifier unavailable');
+                    if (plan.installedPath && !this.installedIngressPreparer) throw Object.assign(
+                        new Error('Installed ingress preparer unavailable'), { code: 'TOPOLOGY_INSTALLED_INGRESS_UNAVAILABLE' });
                     await heartbeat.run(() => this.selectedTopologyRepository.verifySelected(operation));
                 } catch (error) {
                     await heartbeat.stop();
@@ -1505,7 +1530,15 @@ class TopologyOperationWorker {
                     );
                 }
             }
-            if (this.pppReadinessGate) {
+            let installedIngressProof;
+            if (plan.installedPath) {
+                try { installedIngressProof = await heartbeat.run(() => this.prepareInstalledIngress(plan)); }
+                catch (error) {
+                    return { claimed: true, operationId, status: 'committing', stopped: true,
+                        errorCode: error.code || 'TOPOLOGY_INSTALLED_INGRESS_UNVERIFIED' };
+                }
+            }
+            if (this.pppReadinessGate && !installedIngressProof) {
                 try {
                     await this.renew(operationId);
                     const readiness = await heartbeat.run(() => this.pppReadinessGate.verifyPlan(plan));
@@ -1558,7 +1591,7 @@ class TopologyOperationWorker {
                     );
                 }
             }
-            if (plan.kind === 'link.attach') {
+            if (plan.kind === 'link.attach' && !installedIngressProof) {
                 try {
                     if (!this.attachIngressGate) throw new Error('Attach ingress proof unavailable');
                     await this.renew(operationId);
@@ -1590,6 +1623,7 @@ class TopologyOperationWorker {
                     leaseUntil,
                     topologyRevision: plan.topologyRevision,
                     priorDeployedRevision: plan.priorDeployedRevision,
+                    ...(installedIngressProof ? { installedIngressProof } : {}),
                 });
                 if (!finalized) throw new Error('Topology operation finalization was rejected');
             } catch (error) {

@@ -72,7 +72,7 @@ function idFromIdempotencyKey(idempotencyKey) {
     return createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
 }
 
-const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'link.delete', 'domain.reconcile', 'link.replace']);
 // Legacy global-admission scope filter only. These statuses do not establish
 // selected applied-descriptor authority; that requires a verified settled
 // snapshot, never a reread of a status-labelled desired record.
@@ -222,9 +222,9 @@ function selectEffectiveTopology({ verifiedBaselineTopology, desiredTopology, sc
         throw new TopologyOperationCoordinatorError('APPLIED_BASELINE_REQUIRED',
             'A verified applied snapshot is required for selected topology');
     }
-    if (scope?.kind !== 'link.apply' || typeof scope.linkId !== 'string') {
+    if (!['link.apply', 'link.delete'].includes(scope?.kind) || typeof scope.linkId !== 'string') {
         throw new TopologyOperationCoordinatorError('INVALID_REQUEST',
-            'Selected topology currently requires one explicit link.apply mutation');
+            'Selected topology requires one explicit apply/delete mutation');
     }
     const applied = durableSelectedTopology(verifiedBaselineTopology);
     const desired = durableSelectedTopology(desiredTopology);
@@ -263,7 +263,17 @@ function selectEffectiveTopology({ verifiedBaselineTopology, desiredTopology, sc
         links: applied.links.filter(link => included.has(link.id)),
         groups: applied.groups.filter(group => groups.has(group._id)),
     };
-    const links = [...baselineTopology.links.filter(link => link.id !== requested.id), requested]
+    if (scope.kind === 'link.delete') {
+        // Endpoints without a settled edge have already passed the adopted
+        // empty-profile proof. Still take the ordinary cleanup/readback path;
+        // a mutable pending status is never a DB-only deletion shortcut.
+        for (const id of resources) if (!baselineTopology.nodes.some(node => node.id === id)) {
+            baselineTopology.nodes.push(desired.nodes.find(node => node.id === id));
+        }
+        baselineTopology.nodes.sort((a, b) => a.id.localeCompare(b.id, 'en'));
+    }
+    const links = [...baselineTopology.links.filter(link => link.id !== requested.id),
+        ...(scope.kind === 'link.delete' ? [] : [requested])]
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
     const linkedNodes = new Set(links.flatMap(link => [link.source, link.target]));
     const appliedNodes = new Map(applied.nodes.map(node => [node.id, node]));
@@ -423,7 +433,7 @@ function deriveScopedAttach(snapshot, scope, scopedTopology, operationId) {
         newPathLinkIds: [...newPathLinkIds] };
 }
 
-function nodeIdsByRef(topology, plan) {
+function nodeIdsByRef(topology, plan, resourceNodeIds) {
     // New materializers preserve the composer's exact physical-node identity.
     // Do not derive a second ordering for suffixes, geo leaves or fan-in. The
     // legacy walker below is only for older plans with no binding metadata.
@@ -450,7 +460,7 @@ function nodeIdsByRef(topology, plan) {
                     'Invalid materialized node reference set');
             }
         }
-        const linked = new Set(topology.links.flatMap(link => [link.source, link.target]));
+        const linked = new Set(resourceNodeIds || topology.links.flatMap(link => [link.source, link.target]));
         if (linked.size !== ids.size || [...linked].some(id => !ids.has(id))) {
             throw new TopologyOperationCoordinatorError('INVALID_TOPOLOGY_DEPLOYMENT',
                 'Incomplete materialized node identity');
@@ -526,8 +536,8 @@ function nodeIdsByRef(topology, plan) {
     return result;
 }
 
-function operationPlan({ operationId, topologyRevision, priorDeployedRevision, topology, plan }) {
-    const idsByRef = nodeIdsByRef(topology, plan);
+function operationPlan({ operationId, topologyRevision, priorDeployedRevision, topology, plan, resourceNodeIds }) {
+    const idsByRef = nodeIdsByRef(topology, plan, resourceNodeIds);
     const seenRefs = new Set();
     const seenIds = new Set();
     const rolesById = new Map(topology.nodes.map(node => [node.id, node.role]));
@@ -681,31 +691,44 @@ class TopologyOperationCoordinator {
     get db() { return this.topologyRepository.db; }
 
     async resolveIntentResourcesForQueue({ kind, link, desiredVersion, session }) {
-        if (!['link.create', 'link.apply'].includes(kind)) {
-            throw new TopologyOperationCoordinatorError('TOPOLOGY_DELETE_PLAN_UNAVAILABLE', 'Selected delete settlement and row cleanup are not integrated');
-        }
+        if (!['link.create', 'link.apply', 'link.delete'].includes(kind)) throw new TopologyOperationCoordinatorError('INVALID_REQUEST', 'Unknown mutation');
         const selected = await this.topologyRepository.readSelected({
             snapshot: await this.topologyRepository.snapshotReader.readDraft(session),
-            scope: { kind: 'link.apply', linkId: String(link._id) }, desiredVersion, session, executionContext: this.#executionContext,
+            scope: { kind: kind === 'link.delete' ? kind : 'link.apply', linkId: String(link._id) }, desiredVersion, session, executionContext: this.#executionContext,
         });
         return selected.resourceNodeIds;
     }
 
     async queueIntent({ session, executionContext, intentId, mutation, expectedTopologyRevision, resourceNodeIds }) {
         if (!session?.inTransaction?.() || !matchesTopologyExecutionContext(executionContext, this.#executionContext)
-            || mutation?.kind !== 'link.apply') {
-            throw new TopologyOperationCoordinatorError('TOPOLOGY_INTENT_ADMISSION_UNAVAILABLE', 'Selected apply transaction required');
+            || !['link.apply', 'link.delete'].includes(mutation?.kind)) {
+            throw new TopologyOperationCoordinatorError('TOPOLOGY_INTENT_ADMISSION_UNAVAILABLE', 'Selected mutation transaction required');
         }
-        return this.queueOnce({ expectedTopologyRevision, scope: { kind: 'link.apply', linkId: mutation.linkId, linkIds: [mutation.linkId] },
+        if (mutation.kind === 'link.delete') {
+            const replay = await this.operationRepository.findSelectedDeleteByJobId(String(intentId), session);
+            if (replay) {
+                if (!matchesTopologyOperationExecutionContext(replay, this.#executionContext)
+                    || replay.admissionScope !== 'selected' || replay.kind !== mutation.kind
+                    || replay.linkId !== mutation.linkId || replay.desiredVersion !== mutation.desiredVersion
+                    || JSON.stringify(replay.resourceNodeIds) !== JSON.stringify(resourceNodeIds)
+                    || replay.admissionFingerprint !== selectedAdmissionFingerprint(replay)) {
+                    throw new TopologyOperationCoordinatorError('TOPOLOGY_INTENT_BINDING_INVALID', 'Delete job identity changed');
+                }
+                return Object.freeze({ operationId: String(replay._id), topologyRevision: replay.topologyRevision,
+                    status: replay.status, kind: replay.kind, linkId: replay.linkId, linkIds: replay.linkIds });
+            }
+        }
+        return this.queueOnce({ expectedTopologyRevision, scope: { kind: mutation.kind, linkId: mutation.linkId, linkIds: [mutation.linkId] },
+            ...(mutation.kind === 'link.delete' ? { deleteJobId: String(intentId) } : {}),
             desiredVersion: mutation.desiredVersion, resourceNodeIds, session,
-            idempotencyKey: `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:link.apply:${mutation.linkId}` });
+            idempotencyKey: `topology:${this.#executionContext.target}:revision-${expectedTopologyRevision}:${mutation.kind}:${mutation.linkId}` });
     }
 
     deploy(input) {
         return this.queue(input);
     }
 
-    async queueOnce({ expectedTopologyRevision, scope, idempotencyKey, session: joinedSession, desiredVersion, resourceNodeIds }) {
+    async queueOnce({ expectedTopologyRevision, scope, idempotencyKey, session: joinedSession, desiredVersion, resourceNodeIds, deleteJobId }) {
         // Unique run suffix: node-side runner state is keyed by operation id,
         // so a re-queued revision must never reuse a previous operation id.
         const runIdempotencyKey = `${idempotencyKey}:host-${this.#executionContext.hostIdentity}:${randomUUID()}`;
@@ -744,9 +767,14 @@ class TopologyOperationCoordinator {
                             );
                         }
                     }
-                    const selected = scope?.kind === 'link.apply' && this.topologyRepository.selectedEnabled
+                    const selected = ['link.apply', 'link.delete'].includes(scope?.kind) && this.topologyRepository.selectedEnabled
                         ? await this.topologyRepository.readSelected({ snapshot, scope,
-                            executionContext: this.#executionContext, session, desiredVersion }) : null;
+                            executionContext: this.#executionContext, session, desiredVersion, deleteJobId }) : null;
+                    if (scope?.kind === 'link.delete' && (!selected || !deleteJobId)) throw new TopologyOperationCoordinatorError('INVALID_REQUEST', 'Delete requires an admitted tombstone job');
+                    // A retained cleanup owns these physical resources even if
+                    // its old edge makes a successor candidate structurally
+                    // impossible. Wait for that exact owner before composition.
+                    if (selected) await this.topologyRepository.assertSelectedAvailable(selected.resourceNodeIds, session);
                     const projected = projectTopology(snapshot);
                     // Scoped reconcile: plan only the caller-declared
                     // component (deployed links + the requested link). This
@@ -841,6 +869,7 @@ class TopologyOperationCoordinator {
                         operationId,
                         topologyRevision: admitted.revision,
                         priorDeployedRevision: admitted.deployedRevision,
+                        ...(admitted.admissionScope === 'selected' ? { resourceNodeIds: admitted.resourceNodeIds } : {}),
                         // Binding checks include removed profiles, not just the
                         // effective linked nodes. This union is never compiled.
                         topology: admitted.admissionScope === 'selected' ? {
@@ -853,7 +882,9 @@ class TopologyOperationCoordinator {
                     selectedIdentity = admitted.admissionScope === 'selected' ? { admissionScope: 'selected',
                         baselineTopology: admitted.baselineTopology, effectiveTopology: admitted.effectiveTopology,
                         resourceNodeIds: admitted.resourceNodeIds, desiredVersion: admitted.desiredVersion,
-                        selectedOwnerPins: admitted.selectedOwnerPins, routeState: admitted.routeState } : {};
+                        selectedOwnerPins: admitted.selectedOwnerPins, routeState: admitted.routeState,
+                        ...(scope.kind === 'link.delete' ? { deleteJobId } : {}),
+                        ...(admitted.installedPath ? { installedPath: admitted.installedPath } : {}) } : {};
                     scopedIdentity = scope
                         ? { kind: admitted.attach ? 'link.attach' : scope.kind,
                             linkId: scope.linkId, linkIds: admitted.admissionScope === 'selected'

@@ -7,7 +7,7 @@ const { durableSelectedTopology, selectedAdmissionFingerprint } = require('./top
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { linkDesiredVersion } = require('../services/topologyIntentService');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
-const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion';
+const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 const plain = value => JSON.parse(JSON.stringify(value));
 const ownerPin = row => plain(Object.fromEntries(['node', 'profile', 'executionContext', 'owner', 'generation',
     'nodeIdentity', 'originalSnapshot', 'adoptionReceipt', 'handbackReceipt', 'lastSettledOperation',
@@ -98,18 +98,22 @@ class TopologyDeploymentRepository {
         this.usesDefaultRunner = transactionRunner === undefined;
     }
 
-    async readSelected({ snapshot, scope, executionContext, session, desiredVersion }) {
+    async readSelected({ snapshot, scope, executionContext, session, desiredVersion, deleteJobId }) {
         executionContext = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
-        if (!executionContext || !this.selectedEnabled || scope?.kind !== 'link.apply') throw selectedError();
+        if (!executionContext || !this.selectedEnabled || !['link.apply', 'link.delete'].includes(scope?.kind)) throw selectedError();
         const { NODE_METADATA_SELECT, LINK_METADATA_SELECT } = require('../services/topologyOperationPlanMaterializer');
         const nodeRows = await withSession(this.snapshotReader.HyNode.find({ type: 'xray', active: true, cascadeRole: { $in: ['portal', 'relay', 'bridge'] } })
             .select(NODE_METADATA_SELECT), session).lean();
-        const linkRows = await withSession(this.snapshotReader.CascadeLink.find({ _id: scope.linkId, active: true })
-            .select(`${LINK_METADATA_SELECT} tunnelUuid active name priority`), session).lean();
+        const linkRows = await withSession(this.snapshotReader.CascadeLink.find({ _id: scope.linkId,
+            ...(scope.kind === 'link.apply' ? { active: true } : {}) })
+            .select(`${LINK_METADATA_SELECT} tunnelUuid active name priority lifecycle`), session).lean();
         const target = linkRows.find(row => String(row._id) === scope.linkId);
         if (!target) throw selectedError('CASCADE_LINK_NOT_FOUND');
         const version = linkDesiredVersion(target);
         if (desiredVersion !== undefined && desiredVersion !== version) throw selectedError('TOPOLOGY_INTENT_DESIRED_VERSION_CONFLICT');
+        if (scope.kind === 'link.apply' && target.lifecycle?.state === 'deleting') throw selectedError('CASCADE_LINK_DELETING');
+        if (deleteJobId !== undefined && (scope.kind !== 'link.delete' || target.lifecycle?.state !== 'deleting'
+            || String(target.lifecycle.deleteJobId) !== deleteJobId || target.lifecycle.desiredVersion !== version)) throw selectedError('TOPOLOGY_DELETE_TOMBSTONE_CHANGED');
         const desiredTopology = durableSelectedTopology({
             nodes: nodeRows.map(row => {
                 const { _id, cascadeRole, ...fields } = plain(row);
@@ -117,7 +121,7 @@ class TopologyDeploymentRepository {
                 return { ...fields, id: String(_id), role: cascadeRole };
             }),
             links: linkRows.map(row => {
-                const { _id, portalNode, bridgeNode, status, ...fields } = plain(row);
+                const { _id, portalNode, bridgeNode, status, lifecycle, ...fields } = plain(row);
                 delete fields.__v; delete fields.createdAt; delete fields.updatedAt;
                 return { ...fields, id: String(_id), source: String(portalNode), target: String(bridgeNode) };
             }),
@@ -215,14 +219,52 @@ class TopologyDeploymentRepository {
             const component = componentAt(durableSelectedTopology(source.effectiveTopology), node.id);
             if (component.nodes.some(member => owners.get(member.id)?.lastSettledOperation !== owner.lastSettledOperation)) throw selectedError();
         }
-        const selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
+        let selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
             verifiedBaselineTopology: baseline, desiredTopology, scope,
         });
-        if ((snapshot?.installedRouteOwners || []).some(owner => selected.resourceNodeIds.includes(String(owner.nodeId))
-            && !selected.effectiveTopology.groups.some(group => group._id === String(owner.groupId)))) {
-            // An installed empty group needs the separate ingress/readback and
-            // owned-path publication handoff, not merely a successful Xray write.
-            throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+        const installed = (snapshot?.installedRouteOwners || []).filter(owner => selected.resourceNodeIds.includes(String(owner.nodeId)));
+        if (installed.length) {
+            if (installed.length !== 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_OWNER_AMBIGUOUS');
+            const owner = installed[0];
+            if (!owner.pathKey || !Number.isSafeInteger(owner.ownerTopologyRevision)
+                || !Number.isSafeInteger(owner.ownerCredentialRevision) || owner.ownerCredentialRevision < 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            const group = require('../domain/topologyDraft').projectGroups(snapshot.groups)
+                .find(row => row._id === String(owner.groupId));
+            if (!group || new Set(group.paths.map(path => path.pathKey)).size !== group.paths.length) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            const oldPath = group.paths.find(path => path.pathKey === owner.pathKey);
+            if (oldPath?.enabled === false) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            const oldPathLinkIds = oldPath?.linkIds || [];
+            const effective = plain(selected.effectiveTopology), before = plain(selected.baselineTopology);
+            const ownerNode = effective.nodes.find(node => node.id === String(owner.nodeId))
+                || before.nodes.find(node => node.id === String(owner.nodeId));
+            if (!ownerNode || ownerNode.role !== 'relay') throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            if (!effective.nodes.some(node => node.id === ownerNode.id)) effective.nodes.push(ownerNode);
+            // All nonempty members must come from the verified applied graph,
+            // never mutable desired. Empty owned/peer paths carry no edge authority.
+            if (group.paths.some(path => path.linkIds.some(id => !baseline.links.some(link => link.id === id)))) throw selectedError();
+            let cursor = String(owner.nodeId);
+            const visited = new Set(), path = [];
+            while (!visited.has(cursor)) {
+                visited.add(cursor);
+                const outgoing = effective.links.filter(link => link.source === cursor && link.geoRouting?.enabled !== true && link.geo !== true);
+                if (outgoing.length !== 1) break;
+                path.push(outgoing[0].id); cursor = outgoing[0].target;
+            }
+            const complete = (effective.nodes.find(node => node.id === cursor) || baseline.nodes.find(node => node.id === cursor))?.role === 'bridge';
+            const newPathLinkIds = complete ? path : [];
+            if (!complete && scope.kind !== 'link.delete') throw selectedError('TOPOLOGY_INSTALLED_ROUTE_NO_EXIT');
+            const proposed = plain(group);
+            const owned = proposed.paths.find(path => path.pathKey === owner.pathKey);
+            if (owned) owned.linkIds = newPathLinkIds;
+            else proposed.paths.push({ pathKey: owner.pathKey, linkIds: newPathLinkIds, priority: 1, enabled: true });
+            before.groups = [...before.groups.filter(row => row._id !== group._id), group];
+            effective.groups = [...effective.groups.filter(row => row._id !== group._id), proposed];
+            selected = { ...selected, baselineTopology: before, effectiveTopology: effective,
+                installedPath: { groupId: group._id, pathKey: owner.pathKey, ownerNodeId: String(owner.nodeId),
+                    ownerTopologyRevision: owner.ownerTopologyRevision, ownerCredentialRevision: owner.ownerCredentialRevision,
+                    oldPathLinkIds, newPathLinkIds, groupBefore: group,
+                    kind: scope.kind === 'link.apply' && oldPathLinkIds.length === 0 ? 'link.attach' : scope.kind },
+                routeState: complete ? selected.routeState : 'no_bridge_exit' };
         }
         return { ...selected, desiredVersion: version,
             selectedOwnerPins: [...owners.values()].filter(owner => selected.resourceNodeIds.includes(String(owner.node))).sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin) };
@@ -242,9 +284,9 @@ class TopologyDeploymentRepository {
     async verifySelected(operation, session) {
         if (operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)) throw selectedError('TOPOLOGY_SELECTED_FINGERPRINT_CHANGED');
         const fresh = await this.readSelected({ snapshot: await this.snapshotReader.readDraft(session),
-            scope: { kind: 'link.apply', linkId: operation.linkId }, executionContext: operation.executionContext,
-            desiredVersion: operation.desiredVersion, session });
-        for (const key of ['baselineTopology', 'effectiveTopology', 'resourceNodeIds', 'selectedOwnerPins', 'desiredVersion']) {
+            scope: { kind: operation.kind === 'link.delete' ? 'link.delete' : 'link.apply', linkId: operation.linkId }, executionContext: operation.executionContext,
+            desiredVersion: operation.desiredVersion, deleteJobId: operation.deleteJobId, session });
+        for (const key of ['baselineTopology', 'effectiveTopology', 'resourceNodeIds', 'selectedOwnerPins', 'desiredVersion', 'installedPath']) {
             if (!same(fresh[key], operation[key])) throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED');
         }
         return fresh;

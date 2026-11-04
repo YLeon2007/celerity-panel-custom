@@ -3,7 +3,7 @@
 const { matchesTopologyOperationExecutionContext } = require('./topologyExecutionContext');
 
 // Bounded producer grammar. Do not adopt legacy keys or arbitrary middle segments.
-const SCOPE = '(?::(?:link\\.apply|domain\\.reconcile):[A-Za-z0-9._-]{1,128}'
+const SCOPE = '(?::(?:link\\.apply|link\\.delete|domain\\.reconcile):[A-Za-z0-9._-]{1,128}'
     + '|:(?:link\\.replace|link\\.attach):[A-Za-z0-9._-]{1,128}:[a-f0-9]{64})?';
 const UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
 function keyParts(context) {

@@ -14,7 +14,7 @@ const ACTIVE_STATUSES = Object.freeze([
 ]);
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'rolled_back']);
 const NODE_STATES = new Set(['pending', 'prepared', 'committed', 'failed', 'rolled_back']);
-const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'domain.reconcile', 'link.replace', 'link.attach']);
+const SCOPED_OPERATION_KINDS = new Set(['link.apply', 'link.delete', 'domain.reconcile', 'link.replace', 'link.attach']);
 const TARGET_BY_ROLE = Object.freeze({
     portal: Object.freeze({
         targetProfile: 'xray-main',
@@ -58,7 +58,7 @@ const CLAIM_PROJECTION = Object.freeze({
     heldTopologyAdmission: 1,
     pppWait: 1,
     admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
-    desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1,
+    desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1, deleteJobId: 1, installedPath: 1,
     'nodes.node': 1,
     'nodes.nodeRef': 1,
     'nodes.role': 1,
@@ -96,7 +96,7 @@ function validChecks(checks, target) {
                 && Number.isSafeInteger(check.port)
                 && check.port >= 1
                 && check.port <= 65535
-                && check.expectedState === 'listening';
+                && ['listening', 'absent'].includes(check.expectedState);
         }
         return false;
     });
@@ -190,7 +190,8 @@ function durableSelectedOperationScope({ admissionScope, resourceNodeIds, baseli
     const effective = durableSelectedTopology(effectiveTopology);
     const effectiveIds = new Set(effective.links.map(link => link.id));
     if (!Array.isArray(linkIds) || linkIds.length !== effectiveIds.size
-        || linkIds.some(id => !effectiveIds.has(id)) || !effectiveIds.has(linkId)) {
+        || linkIds.some(id => !effectiveIds.has(id))
+        || (kind === 'link.delete' ? effectiveIds.has(linkId) : !effectiveIds.has(linkId))) {
         throw new TypeError('Selected topology snapshot must match its scoped links');
     }
     const union = new Set([...baseline.nodes, ...effective.nodes].map(node => node.id));
@@ -208,7 +209,7 @@ function selectedAdmissionFingerprint(operation) {
     const metadata = operation.nodes.map(node => ({ ...node, node: operationId(node.node), ...TARGET_BY_ROLE[node.role] })).map(durableNodeMetadata);
     const fields = ['executionContext', 'idempotencyKey', 'topologyRevision', 'priorDeployedRevision', 'kind',
         'linkId', 'linkIds', 'staged', 'admissionScope', 'resourceNodeIds', 'baselineTopology', 'effectiveTopology',
-        'selectedOwnerPins', 'desiredVersion', 'routeState'];
+        'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath'];
     const value = { operationId: String(operation.operationId ?? operation._id), nodes: metadata,
         ...Object.fromEntries(fields.filter(key => operation[key] !== undefined).map(key => [key, operation[key]])) };
     return require('node:crypto').createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
@@ -224,6 +225,10 @@ class TopologyOperationRepository {
         this.model = model;
         this.topologyStateModel = topologyStateModel;
         this.selectedTopologyRepository = selectedTopologyRepository;
+    }
+
+    async findSelectedDeleteByJobId(deleteJobId, session) {
+        return this.model.findOne({ kind: 'link.delete', deleteJobId }).select(CLAIM_PROJECTION).session(session).lean();
     }
 
     async createFrozen({
@@ -251,7 +256,7 @@ class TopologyOperationRepository {
         resourceNodeIds,
         baselineTopology,
         effectiveTopology,
-        desiredVersion, selectedOwnerPins, routeState,
+        desiredVersion, selectedOwnerPins, routeState, deleteJobId, installedPath,
         session,
     }) {
         const context = topologyExecutionContext(executionContext?.target, executionContext?.hostIdentity);
@@ -266,10 +271,11 @@ class TopologyOperationRepository {
             || ownerCredentialRevision !== undefined;
         if (scoped && (!SCOPED_OPERATION_KINDS.has(kind)
             || typeof linkId !== 'string' || linkId.length === 0
-            || !Array.isArray(linkIds) || linkIds.length === 0
+            || !Array.isArray(linkIds) || (kind !== 'link.delete' && linkIds.length === 0)
             || !linkIds.every(id => typeof id === 'string' && id.length > 0)
             || new Set(linkIds).size !== linkIds.length
-            || !linkIds.includes(linkId)
+            || (kind === 'link.delete' ? linkIds.includes(linkId) || admissionScope !== 'selected'
+                || typeof deleteJobId !== 'string' || !/^[a-f0-9]{24}$/i.test(deleteJobId) : !linkIds.includes(linkId))
             || (kind === 'link.apply' ? typeof staged !== 'boolean' : staged !== undefined)
             || (kind === 'link.replace'
                 ? !['oldLinkId', 'groupId', 'pathKey', 'ownerNodeId'].every(key =>
@@ -315,7 +321,8 @@ class TopologyOperationRepository {
             topologyRevision,
             priorDeployedRevision,
             ...selected,
-            ...(admissionScope === 'selected' ? { desiredVersion, selectedOwnerPins, routeState } : {}),
+            ...(admissionScope === 'selected' ? { desiredVersion, selectedOwnerPins, routeState,
+                ...(kind === 'link.delete' ? { deleteJobId } : {}), ...(installedPath ? { installedPath } : {}) } : {}),
             ...(scoped ? { kind, linkId, linkIds: [...linkIds],
                 ...(kind === 'link.apply' ? { staged } : {}),
                 ...(kind === 'link.replace' ? { oldLinkId, groupId, pathKey,

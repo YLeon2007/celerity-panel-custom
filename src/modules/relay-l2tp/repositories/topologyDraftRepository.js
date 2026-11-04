@@ -128,7 +128,7 @@ const ACTIVE_ROUTE_GROUP_FILTER = Object.freeze({
     ]),
 });
 const NODE_SELECT = '_id cascadeRole';
-const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled';
+const LINK_SELECT = '_id portalNode bridgeNode mode active status geoRouting.enabled lifecycle';
 const GROUP_SELECT = '_id name mode strategy paths.pathKey paths.linkIds paths.priority paths.enabled';
 const ROUTE_GROUP_REFERENCE_SELECT = 'routeGroup status node activePathKey appliedTopologyRevision secretRevision';
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision replacementReservation topologyAdmissionCount';
@@ -291,6 +291,10 @@ class TopologyDraftRepository {
     }
 
     async persistMutation(mutation, session) {
+        if (['link.update', 'link.delete'].includes(mutation?.kind)) {
+            const target = await this.CascadeLink.findById(mutation.id).session(session).lean();
+            if (target?.lifecycle?.state === 'deleting') throw new TopologyDraftRepositoryError('CASCADE_LINK_DELETING', 'The link has an accepted delete job');
+        }
         if (mutation?.kind === 'link.create') {
             await this.CascadeLink.create([mutation.document], { session });
             return;

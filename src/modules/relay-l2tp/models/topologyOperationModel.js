@@ -34,7 +34,7 @@ const topologyCheckSchema = new mongoose.Schema({
     port: { type: Number, min: 1, max: 65535 },
     expectedState: {
         type: String,
-        enum: ['active', 'listening'],
+        enum: ['active', 'listening', 'absent'],
         required: true,
     },
 }, { _id: false, strict: true });
@@ -141,7 +141,8 @@ const topologyOperationSchema = new mongoose.Schema({
         min: 0,
     },
     // No default: legacy full-sync operations have no scoped identity.
-    kind: { type: String, enum: ['link.apply', 'domain.reconcile', 'link.replace', 'link.attach'] },
+    kind: { type: String, enum: ['link.apply', 'link.delete', 'domain.reconcile', 'link.replace', 'link.attach'] },
+    deleteJobId: { type: String, match: /^[a-f0-9]{24}$/i, immutable: true, select: false },
     linkId: { type: String, match: /^[a-f0-9]{24}$/i },
     linkIds: { type: [{ type: String, match: /^[a-f0-9]{24}$/i }], default: undefined },
     // Ordered route beginning at the installed owner; linkIds is the full scoped set.
@@ -167,6 +168,7 @@ const topologyOperationSchema = new mongoose.Schema({
     effectiveTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     desiredVersion: { type: String, match: DIGEST_PATTERN, immutable: true, select: false },
     selectedOwnerPins: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
+    installedPath: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     routeState: { type: String, immutable: true, enum: ['complete', 'no_portal_input', 'no_bridge_exit', 'policy_ambiguous'] },
     // Committing but unpublished; topology admission stays held during PPP sync.
     pppWait: { type: pppWaitSchema, default: undefined },
@@ -220,8 +222,10 @@ topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     if (!scoped) return;
     const ids = this.linkIds;
     if (!this.kind || typeof this.linkId !== 'string'
-        || !Array.isArray(ids) || ids.length === 0
-        || new Set(ids).size !== ids.length || !ids.includes(this.linkId)
+        || !Array.isArray(ids) || (this.kind !== 'link.delete' && ids.length === 0)
+        || new Set(ids).size !== ids.length
+        || (this.kind === 'link.delete' ? ids.includes(this.linkId) || this.admissionScope !== 'selected'
+            || typeof this.deleteJobId !== 'string' || !/^[a-f0-9]{24}$/i.test(this.deleteJobId) : !ids.includes(this.linkId))
         || (this.kind === 'link.apply' ? typeof this.staged !== 'boolean'
             : this.staged !== undefined)
         || (this.kind === 'link.attach'

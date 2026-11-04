@@ -59,7 +59,7 @@ function operationFilter(request) {
 }
 async function checked(repository, request, session, bindings) {
     models(repository);
-    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select('+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion').session(session).setOptions(OPTIONS).lean();
+    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select('+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath').session(session).setOptions(OPTIONS).lean();
     const context = operation?.executionContext;
     if (!operation || !matchesTopologyOperationClaimBinding(operation, topologyExecutionContext(context?.target, context?.hostIdentity))
         || operation.status !== 'committing' || operation.heldTopologyAdmission !== true
@@ -144,7 +144,7 @@ async function begin(repository, request) {
 }
 async function fenceSideEffects(repository, operation, effects, session) {
     if (!effects || effects.usersVerified !== true || typeof effects.attachVerified !== 'boolean'
-        || effects.attachVerified !== (operation.kind === 'link.attach')
+        || effects.attachVerified !== (operation.kind === 'link.attach' || Boolean(operation.installedPath))
         || !Array.isArray(effects.pppProof)
         || new Set(effects.pppProof.map(proof => proof.relayNode)).size !== effects.pppProof.length) refused();
     const relays = operation.nodes.filter(node => node.role === 'relay').map(node => String(node.node));
