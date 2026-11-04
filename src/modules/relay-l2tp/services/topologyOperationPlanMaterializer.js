@@ -183,19 +183,13 @@ function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     // (orderedChain / orderedFanInChain) performs the authoritative shape
     // validation. Here we only require the graph to be deployable at all.
     const portalCount = nodes.filter(node => node.role === 'portal').length;
-    if (portalCount < 1) {
-        fail(
-            'INVALID_TOPOLOGY_ROLES',
-            'Pinned topology requires at least one portal',
-        );
-    }
-    // A bridge-less snapshot is an incomplete scoped component: the plan is
-    // composed in explicitly staged mode (terminal relay blocks transit,
-    // never direct). The composer validates the staged shape and fails
-    // closed on anything but one portal-rooted run of relays.
-    const staged = !nodes.some(node => node.role === 'bridge');
-    if (staged && operationKind !== 'link.apply') {
-        fail('INVALID_TOPOLOGY_ROLES', 'Only a scoped link.apply may stage a bridge-less chain');
+
+    // Only an explicit scoped apply may compose incomplete endpoints. Pass
+    // permission, not a readiness inference from all roled assets: the
+    // composer checks linked nodes and the actual default path itself.
+    const incomplete = portalCount === 0 || !nodes.some(node => node.role === 'bridge');
+    if (incomplete && operationKind !== 'link.apply') {
+        fail('INVALID_TOPOLOGY_ROLES', 'Only a scoped link.apply may stage an incomplete chain');
     }
     const links = topology.links.map(snapshotLink)
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
@@ -207,7 +201,7 @@ function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     return {
         snapshot: { nodes, links, groups },
         compiledTopology: { valid: true, relays },
-        staged,
+        staged: operationKind === 'link.apply',
     };
 }
 

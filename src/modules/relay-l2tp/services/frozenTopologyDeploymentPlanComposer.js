@@ -142,7 +142,7 @@ function uniqueById(items, kind) {
     return byId;
 }
 
-function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
+function orderedChain(snapshot, geoLeafLinkIds = new Set(), staged = false) {
     if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.links)) {
         throw new FrozenTopologyDeploymentPlanError(
             'INVALID_TOPOLOGY_SNAPSHOT',
@@ -182,7 +182,7 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
         }
         roles[node.role].push(id);
     }
-    if (roles.portal.length !== 1 || roles.bridge.length < 1) {
+    if ((!staged && (roles.portal.length !== 1 || roles.bridge.length < 1)) || roles.portal.length > 1) {
         if (excludedNodeIds.length > 0) {
             // The link graph is incomplete: nodes with cascade roles exist
             // but are disconnected, so the chain lost its portal/bridge.
@@ -256,7 +256,9 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
     const orderedNodes = [];
     const orderedLinks = [];
     const visited = new Set();
-    let currentId = roles.portal[0];
+    const sources = [...nodesById.keys()].filter(id => !incoming.has(id) && !geoIncoming.has(id));
+    const rootId = roles.portal[0] ?? (staged && sources.length === 1 ? sources[0] : null);
+    let currentId = rootId;
     while (currentId) {
         if (visited.has(currentId)) {
             throw new FrozenTopologyDeploymentPlanError(
@@ -280,13 +282,13 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
         );
     }
     if (
-        orderedNodes.at(-1).node.role !== 'bridge'
-        || orderedNodes[0].node.role !== 'portal'
+        (orderedNodes.at(-1).node.role !== 'bridge' && !(staged && orderedNodes.at(-1).node.role === 'relay'))
+        || (orderedNodes[0].node.role !== 'portal' && !(staged && orderedNodes[0].node.role === 'relay'))
         || orderedNodes.slice(1, -1).some(entry => entry.node.role !== 'relay')
     ) {
         throw new FrozenTopologyDeploymentPlanError(
             'NON_LINEAR_TOPOLOGY',
-            'Topology must form a linear Portal to Relay to Bridge main chain',
+            'Topology must form a linear portal/relay to relay/bridge main chain; incomplete endpoints require staging',
         );
     }
 
@@ -342,6 +344,8 @@ function orderedChain(snapshot, geoLeafLinkIds = new Set()) {
 
     return {
         mode: linkModes.size === 1 ? [...linkModes][0] : 'mixed',
+        ...(orderedNodes[0].node.role !== 'portal' || orderedNodes.at(-1).node.role !== 'bridge'
+            ? { staged: true } : {}),
         orderedNodes,
         orderedLinks,
         geoLeafNodes,
@@ -644,7 +648,7 @@ function orderedFanInChain(snapshot, geoLeafLinkIds) {
 }
 
 /** Decide between the classic linear chain and the fan-in domain shape. */
-function selectChainShape(snapshot, geoLeafLinkIds) {
+function selectChainShape(snapshot, geoLeafLinkIds, staged = false) {
     const nonGeoTargets = new Set();
     const nonGeoSources = new Set();
     for (const link of snapshot.links) {
@@ -655,9 +659,13 @@ function selectChainShape(snapshot, geoLeafLinkIds) {
         if (target) nonGeoTargets.add(target);
     }
     const rootCount = [...nonGeoSources].filter(id => !nonGeoTargets.has(id)).length;
+    const linkedIds = new Set([...nonGeoSources, ...nonGeoTargets]);
+    const hasBridge = snapshot.nodes.some(node => linkedIds.has(entityId(node)) && node.role === 'bridge');
     return rootCount > 1
-        ? orderedFanInChain(snapshot, geoLeafLinkIds)
-        : orderedChain(snapshot, geoLeafLinkIds);
+        ? (staged && !hasBridge
+            ? orderedStagedChain(snapshot, geoLeafLinkIds)
+            : orderedFanInChain(snapshot, geoLeafLinkIds))
+        : orderedChain(snapshot, geoLeafLinkIds, staged);
 }
 
 /**
@@ -1437,8 +1445,8 @@ function buildFanInCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
  * tunnel exit tags (plus loopback L2TP path ingress) into the default
  * downstream artifact; geo-branch rules are placed before the default rule;
  * terminal nodes (default sink, geo leaves) route exits to `terminalEgressTag`
- * ('direct' for complete chains, 'block' for staged incomplete chains whose
- * terminal relay is a dead end and must never egress directly).
+ * ('block' for a staged relay dead end). An explicit bridge remains an
+ * allowed exit, including a geo leaf beside a missing default path.
  */
 function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadataById, groups = [], terminalEgressTag = 'direct' }) {
     const byEntryId = (left, right) => left.id.localeCompare(right.id, 'en');
@@ -1555,6 +1563,7 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
 
         // Geo-branch rules first, so branch matches win over the default rule.
         for (const entry of branches) {
+            if (ingressTags.length === 0) continue;
             const geo = projectGeoRouting(linkMetadataById.get(entry.id)) || {};
             const tag = egressTagOf(entry);
             if (Array.isArray(geo.domains) && geo.domains.length > 0) {
@@ -1578,11 +1587,11 @@ function buildMixedCandidateConfigs({ chain, refs, nodeMetadataById, linkMetadat
             }
         }
         if (isTerminal) {
-            for (const entry of [...ups, ...(geoLeafEntry ? [geoLeafEntry] : [])]) {
+            for (const tag of ingressTags) {
                 config.routing.rules.push({
                     type: 'field',
-                    inboundTag: [exitTagOf(entry)],
-                    outboundTag: terminalEgressTag,
+                    inboundTag: [tag],
+                    outboundTag: node.role === 'bridge' ? 'direct' : terminalEgressTag,
                 });
             }
         } else if (ingressTags.length > 0) {
@@ -1751,16 +1760,11 @@ function composeFrozenTopologyDeploymentPlan({
         geoLeafLinkIds.add(linkId);
     }
 
-    // A bridge-less graph is an incomplete chain. By default this stays a
-    // structural error (manual domain sync relies on diagnosing it per
-    // domain). Only an explicitly staged compose (scoped link.apply whose
-    // path does not reach a bridge yet) builds a staged plan whose terminal
-    // relay blocks transit. Graphs with a bridge keep the existing
-    // complete-chain walkers unchanged.
-    const hasBridgeNode = snapshot.nodes.some(node => node?.role === 'bridge');
-    const chain = !hasBridgeNode && staged === true
-        ? orderedStagedChain(snapshot, geoLeafLinkIds)
-        : selectChainShape(snapshot, geoLeafLinkIds);
+    // Staging is an explicit scoped-mutation permission, not readiness. Walk
+    // linked nodes only: a detached portal/bridge cannot complete a path, and
+    // a geo bridge is not an implicit default exit. Complete graphs keep
+    // their existing builders; incomplete endpoints use hop-by-hop routing.
+    const chain = selectChainShape(snapshot, geoLeafLinkIds, staged === true);
     const roleByNodeId = new Map(
         [...chain.orderedNodes, ...chain.geoLeafNodes].map(({ id, node }) => [id, node.role]),
     );
@@ -1827,8 +1831,8 @@ function composeFrozenTopologyDeploymentPlan({
         : topologyRefs(chain.orderedNodes, chain.geoLeafNodes);
     // Mixed-mode domains (and fan-in domains with any reverse link) are built
     // hop-by-hop; uniform domains keep their legacy builders. Staged chains
-    // are always built hop-by-hop with the terminal dead end routing transit
-    // to `block` instead of `direct` (fail closed: no direct egress).
+    // are always built hop-by-hop with terminal relays routing unmatched
+    // transit to `block`, while explicitly permitted bridges remain exits.
     const useMixedBuilder = chain.staged === true
         || chain.mode === 'mixed'
         || (chain.fanIn === true && chain.mode !== 'forward');

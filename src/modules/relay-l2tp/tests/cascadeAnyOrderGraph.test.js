@@ -104,3 +104,193 @@ test('R->B1; R->B2; P->R completes without dropping either bridge', async () => 
     assert.equal(final.plan.staged, undefined);
     assert.deepEqual([...configsOf(final.plan).keys()].sort(), ['bridge', 'bridge-2', 'portal', 'relay-1']);
 });
+
+function routeFor(config, tag, destination = 'public') {
+    return config.routing.rules.find(rule => (
+        (!rule.inboundTag || rule.inboundTag.includes(tag))
+        && (!rule.domain || rule.domain.includes(destination))
+        && (!rule.ip || rule.ip.includes(destination))
+    ))?.outboundTag;
+}
+
+for (const [name, ids, options] of [
+    ['bridge-less prefix with a detached bridge', ['pr'], { keepDetachedNodes: true }],
+    ['geo-only relay suffix without a default exit', ['rb2'], {}],
+    ['portal prefix with only a geo exit', ['pr', 'rb2'], {}],
+]) {
+    test(`${name} is staged and has no implicit direct on the relay`, async () => {
+        const { plan } = await materialize(fixture(), ids, options);
+        assert.equal(plan.staged, true);
+        const configs = configsOf(plan);
+        const relay = configs.get('relay-1');
+        assert.ok(relay);
+        for (const rule of relay.routing.rules) {
+            assert.ok(!['direct', 'freedom'].includes(rule.outboundTag), 'relay may not bypass its missing default');
+            assert.notDeepEqual(rule.inboundTag, [], 'an empty ingress must not emit a broad geo rule');
+        }
+        for (const bridge of relay.reverse?.bridges || []) {
+            assert.equal(routeFor(relay, bridge.tag), 'block');
+            if (ids.includes('rb2')) {
+                assert.match(routeFor(relay, bridge.tag, 'geoip:ru'), /^portal-/);
+            }
+        }
+        if (ids.includes('rb2')) {
+            const geo = configs.get('bridge-2');
+            assert.ok(geo, 'the permitted geo exit is preserved');
+            assert.equal(routeFor(geo, geo.reverse.bridges[0].tag), 'direct');
+        }
+    });
+}
+
+test('a relay-only R1->R2 fragment stages without a portal or bridge', async () => {
+    const data = fixture();
+    data.nodes.find(node => node.id === 'p').role = 'relay';
+    const { plan } = await materialize(data, ['pr']);
+    assert.equal(plan.staged, true);
+    const terminal = configsOf(plan).get('relay-2');
+    assert.equal(routeFor(terminal, terminal.reverse.bridges[0].tag), 'block');
+});
+
+function permutations(values) {
+    return values.length === 0 ? [[]] : values.flatMap((value, index) =>
+        permutations(values.filter((_, other) => other !== index)).map(rest => [value, ...rest]));
+}
+
+function modeVectors(length) {
+    return length === 0 ? [[]] : modeVectors(length - 1).flatMap(prefix =>
+        ['forward', 'reverse'].map(mode => [...prefix, mode]));
+}
+
+function listenerClients(plan, port) {
+    const matches = [...configsOf(plan).values()].flatMap(config => config.inbounds)
+        .filter(inbound => inbound.port === port);
+    assert.equal(matches.length, 1, `one listener for tunnel port ${port}`);
+    return matches[0].settings.clients;
+}
+
+// Enumerate actual candidate assembly, including every intermediate state.
+// Explicit policy: rb1 is default; rb2 is RU geo (no new failover strategy).
+for (const [graph, edgeIds] of [['G1', ['pr']], ['G2', ['pr', 'rb1']], ['G3', ['pr', 'rb1', 'rb2']]]) {
+    for (const modes of modeVectors(edgeIds.length)) {
+        for (const order of permutations(edgeIds)) {
+            test(`${graph} ${modes.join('/')} assembly ${order.join(';')} preserves policy and tunnel identity`, async () => {
+                const data = fixture(modes);
+                if (graph === 'G1') data.links[0].target = 'b1';
+                const expected = (await materialize(data, edgeIds)).plan;
+                const before = structuredClone(data);
+                const seen = [];
+                const clientsByLink = new Map();
+                let final;
+                for (const id of order) {
+                    seen.push(id);
+                    // Also vary the persisted/hydrated row order, not just the
+                    // set passed to a helper with otherwise fixed row ordering.
+                    const ordered = { ...data, nodes: [...data.nodes].reverse(),
+                        links: [...seen.map(key => data.links.find(link => link.id === key)),
+                            ...data.links.filter(link => !seen.includes(link.id))] };
+                    final = (await materialize(ordered, seen)).plan;
+                    const incomplete = graph !== 'G1' && !(seen.includes('pr') && seen.includes('rb1'));
+                    assert.equal(final.staged === true, incomplete);
+                    for (const key of seen) {
+                        const link = data.links.find(entry => entry.id === key);
+                        const clients = listenerClients(final, link.tunnelPort);
+                        if (clientsByLink.has(key)) assert.deepEqual(clients, clientsByLink.get(key));
+                        clientsByLink.set(key, clients);
+                        const refs = { p: 'portal', r: 'relay-1', b1: 'bridge', b2: 'bridge-2' };
+                        const listener = refs[link.mode === 'reverse' ? link.source : link.target];
+                        const dialer = refs[link.mode === 'reverse' ? link.target : link.source];
+                        assert.ok(configsOf(final).get(listener).inbounds.some(inbound => inbound.port === link.tunnelPort),
+                            'the listener follows this edge mode, not the component mode');
+                        assert.ok(final.nodes.find(node => node.nodeRef === listener).checks.some(check =>
+                            check.type === 'port' && check.port === link.tunnelPort));
+                        assert.ok(final.nodes.findIndex(node => node.nodeRef === listener)
+                            < final.nodes.findIndex(node => node.nodeRef === dialer), 'listener is planned before dialer');
+                    }
+                    if (graph !== 'G1' && !seen.includes('rb1')) {
+                        const relay = configsOf(final).get('relay-1');
+                        for (const tag of [
+                            ...(relay.reverse?.bridges || []).map(bridge => bridge.tag),
+                            ...relay.inbounds.filter(inbound => inbound.tag.startsWith('fwd-hop-')).map(inbound => inbound.tag),
+                        ]) assert.equal(routeFor(relay, tag), 'block', 'incomplete default may not leak direct');
+                    }
+                }
+                assert.deepEqual(final, expected, 'final config/policy must not depend on assembly order');
+                assert.deepEqual(data, before, 'assembly must not rewrite metadata or edge modes');
+            });
+        }
+    }
+}
+
+test('pinned scope preserves the sibling geo profile but excludes another pending exit', async () => {
+    const data = fixture(['forward', 'reverse', 'forward']);
+    const siblingBefore = compose(data, ['pr', 'rb1', 'rb2']);
+    data.nodes.push({ ...data.nodes[2], id: 'pending-bridge', ip: '192.0.2.90' });
+    data.links.push({ ...data.links[1], id: 'unrequested', target: 'pending-bridge',
+        status: 'pending', tunnelPort: 12999 });
+    const { plan, reads } = await materialize(data, ['pr', 'rb1', 'rb2']);
+    assert.deepEqual(configsOf(plan).get('bridge-2'), configsOf(siblingBefore).get('bridge-2'));
+    assert.equal(reads.some(filter => filter._id.$in.includes('unrequested')), false);
+    assert.equal(reads.some(filter => filter._id.$in.includes('pending-bridge')), false);
+    assert.equal(JSON.stringify([...configsOf(plan).values()]).includes('12999'), false);
+});
+
+test('source-less relay path ingress retains explicit default and geo policy in mixed modes', async () => {
+    const data = fixture(['reverse', 'forward', 'reverse']);
+    const options = { groups: [{ _id: 'group', mode: 'forward', strategy: 'priority-failover',
+        paths: [{ pathKey: 'main', linkIds: ['rb1'], priority: 1, enabled: true }] }] };
+    const { plan } = await materialize(data, ['rb1', 'rb2'], options);
+    const relay = configsOf(plan).get('relay-1');
+    assert.equal(plan.staged, true, 'server generation is not portal/client readiness');
+    assert.ok(relay.inbounds.some(inbound => inbound.tag === 'cascade-main'));
+    const main = routeFor(relay, 'cascade-main');
+    const geo = routeFor(relay, 'cascade-main', 'geoip:ru');
+    assert.equal(main, 'fwd-link-1');
+    assert.equal(relay.outbounds.find(outbound => outbound.tag === main).settings.vnext[0].address,
+        data.nodes.find(node => node.id === 'b1').ip);
+    assert.equal(geo, 'portal-link-2');
+    assert.ok(relay.reverse.portals.some(portal => portal.tag === geo));
+    assert.equal(routeFor(relay, 'cascade-main', 'geosite:category-ru'), geo);
+    assert.ok(relay.inbounds.some(inbound => inbound.port === 12003), 'reverse geo listener stays on relay');
+    assert.equal(relay.inbounds.some(inbound => inbound.port === 12002), false,
+        'forward default listener stays on its bridge');
+});
+
+for (const operationKind of [undefined, 'domain.reconcile', 'link.replace', 'link.attach']) {
+    test(`source-less materialization does not grant staging to ${String(operationKind)}`, async () => {
+        const data = fixture();
+        const topology = topologyFor(data, ['rb1']);
+        const { materializer, reads } = materializerFor(data);
+        await assert.rejects(materializer.materialize({
+            target: 'test', hostIdentity: 'test.infograd.online', operationKind,
+            pinnedSnapshot: { revision: 7, topology, compiled: compileTopology(topology) },
+        }), { code: 'INVALID_TOPOLOGY_ROLES' });
+        assert.deepEqual(reads, []);
+    });
+}
+
+for (const ids of [['rb1'], ['rb1', 'rb2'], ['pr'], ['rb2']]) {
+    test(`incomplete ${ids.join(',')} still requires explicit staging permission`, () => {
+        const data = fixture();
+        const snapshot = topologyFor(data, ids);
+        assert.throws(() => composeFrozenTopologyDeploymentPlan({
+            snapshot, nodeMetadata: data.nodes, linkMetadata: data.links,
+            compiledTopology: compileTopology(snapshot),
+        }), error => ['INVALID_TOPOLOGY_ROLES', 'NON_LINEAR_TOPOLOGY'].includes(error.code));
+    });
+}
+
+for (const [label, mutate] of [
+    ['self loop', data => { data.links[0].target = 'p'; }],
+    ['routing cycle through a geo edge', data => {
+        data.links.push({ ...data.links[0], id: 'cycle', source: 'b2', target: 'p', tunnelPort: 12004 });
+    }],
+    ['two ambiguous default exits', data => { delete data.links[2].geoRouting; }],
+    ['a bridge used as transit', data => { data.nodes[1].role = 'bridge'; }],
+]) {
+    test(`staging never permits ${label}`, () => {
+        const data = fixture();
+        mutate(data);
+        assert.throws(() => compose(data, data.links.map(link => link.id)),
+            error => ['NON_LINEAR_TOPOLOGY', 'MISSING_TOPOLOGY_LINK', 'GEO_LEAF_TARGET_CONFLICT'].includes(error.code));
+    });
+}
