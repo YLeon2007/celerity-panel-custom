@@ -299,9 +299,13 @@ function descriptorInstalledPath(value, before, after) {
     const owner = after.nodes.find(node => node.id === ownerNodeId) || before.nodes.find(node => node.id === ownerNodeId);
     const path = topology => topology.groups.find(group => String(group.id ?? group._id) === groupId)
         ?.paths.find(path => path.pathKey === pathKey);
+    const beforeGroup = before.groups.find(group => String(group.id ?? group._id) === groupId);
     const oldPath = path(before), newPath = path(after);
-    if (owner?.role !== 'relay' || !oldPath || !newPath || oldPath.enabled === false || newPath.enabled === false
-        || !isDeepStrictEqual(oldPath.linkIds, value.oldPathLinkIds)
+    // readSelected explicitly supports an installed owner whose path has not
+    // yet been inserted. Preserve that actual absent before-descriptor; it is
+    // not a kept-empty path and must not acquire fabricated old membership.
+    if (owner?.role !== 'relay' || !beforeGroup || !newPath || oldPath?.enabled === false || newPath.enabled === false
+        || !isDeepStrictEqual(oldPath?.linkIds || [], value.oldPathLinkIds)
         || !isDeepStrictEqual(newPath.linkIds, value.newPathLinkIds)) {
         fail('TOPOLOGY_INSTALLED_PATH_MISMATCH', 'Installed owner/path must match the trusted before and after descriptors');
     }
