@@ -8,7 +8,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { Firefox, sleep } = require('../browser-assets-wave8/firefox-bidi.cjs');
+// The current wrapper supplies native form fills; the frozen base driver's
+// historical fill() is a synthetic DOM setter and cannot close this gate.
+const { Firefox, sleep } = require('./anyorder-browser-acceptance/firefox.cjs');
 
 const root = path.resolve(__dirname, '..');
 const CY = "document.getElementById('cy')._cyreg.cy";
@@ -38,6 +40,10 @@ async function main() {
         return browser.evaluate(`(()=>{const c=${CY};return {nodes:c.nodes().map(n=>({id:n.id(),position:n.position()})),pan:c.pan(),zoom:c.zoom()};})()`);
     }
     async function nativeClick(selector) {
+        // Native select focus can scroll the tall form. Bring the actual
+        // control into view before the mandatory hit test (as the driver does).
+        await browser.evaluate(`(()=>{document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center',behavior:'instant'});return true;})()`);
+        await sleep(150);
         const hit = await browser.evaluate(`(()=>{
             const e=document.querySelector(${JSON.stringify(selector)});
             if(!e)throw Error('Missing control');
@@ -69,6 +75,8 @@ async function main() {
         browser = new Firefox();
         await browser.start(process.env.TMPDIR);
         evidence.engine = browser.session.capabilities;
+        evidence.browserProfile = browser.profile;
+        await browser.send('session.subscribe', { events: ['network.beforeRequestSent'] });
 
         await check('real nodes loader boots without unused edgehandles request or lodash exception', async () => {
             await browser.navigate(app.origin + '/panel/nodes?lang=ru');
@@ -76,7 +84,7 @@ async function main() {
             await browser.wait(`${CY.replace('._cyreg.cy', '._cyreg?.cy')}?.nodes().length>=5`, 30000);
             const scripts = await browser.evaluate('Array.from(document.scripts,s=>s.src)');
             assert.ok(!scripts.some(url => /edgehandles/i.test(url)));
-            assert.ok(!browser.events.some(e => e.method === 'network.responseCompleted'
+            assert.ok(!browser.events.some(e => e.method === 'network.beforeRequestSent'
                 && /edgehandles/i.test(e.params.request.url)));
             assertNoEdgehandles();
             const layers = await browser.evaluate(`({
@@ -87,13 +95,19 @@ async function main() {
             assert.deepEqual(layers, { wrapper: 'auto', surface: '1', modal: '1000' },
                 'the browser must receive the rebuilt CSS, not stale generated assets');
             const assets = [];
+            const loadedUrls = await browser.evaluate('Array.from(document.querySelectorAll("link[rel=stylesheet],script[src]"),e=>e.href||e.src)');
             for (const file of ['css/style.min.css', 'css/network.min.css', 'js/network.min.js']) {
-                const response = await fetch(app.origin + '/' + file);
+                const loadedUrl = loadedUrls.find(url => new URL(url).pathname === '/' + file);
+                assert.ok(loadedUrl, 'actual template must load ' + file);
+                const response = await fetch(loadedUrl);
                 assert.equal(response.status, 200);
                 const diskSha256 = sha(fs.readFileSync(path.join(root, 'public', file)));
                 const servedSha256 = sha(Buffer.from(await response.arrayBuffer()));
+                const browserSha256 = await browser.evaluate(`fetch(${JSON.stringify(loadedUrl)}).then(r=>{if(r.status!==200)throw Error('Asset HTTP '+r.status);return r.arrayBuffer();}).then(b=>crypto.subtle.digest('SHA-256',b)).then(b=>Array.from(new Uint8Array(b),x=>x.toString(16).padStart(2,'0')).join(''))`);
                 assert.equal(servedSha256, diskSha256);
-                assets.push({ file, diskSha256, servedSha256 });
+                assert.equal(browserSha256, diskSha256);
+                if (file === 'css/style.min.css') assert.equal(new URL(loadedUrl).searchParams.get('v'), diskSha256.slice(0, 16));
+                assets.push({ file, loadedUrl, diskSha256, servedSha256, browserSha256 });
             }
             return { scripts, layers, assets };
         });
@@ -143,6 +157,11 @@ async function main() {
             await nativeClick('#btnRefresh');
             await browser.wait("!document.querySelector('.network-loading')");
             await browser.wait(`${CY}.edges().some(e=>e.data('linkId')===${JSON.stringify(link._id)})`);
+            // Match the existing lifecycle's native graph viewport setup. The
+            // form's focus scrolling otherwise leaves the toolbar below the
+            // historical overlap band, which is not the regression under test.
+            await browser.evaluate("(()=>{document.getElementById('cy').scrollIntoView({block:'center'});return true;})()");
+            await sleep(350);
             const point = await browser.evaluate(`(()=>{
                 const e=${CY}.edges().filter(e=>e.data('linkId')===${JSON.stringify(link._id)});
                 const p=e[0].renderedMidpoint(),r=document.getElementById('cy').getBoundingClientRect();
@@ -177,6 +196,10 @@ async function main() {
     } finally {
         if (browser) {
             evidence.console = browser.events?.filter(e => e.method === 'log.entryAdded');
+            evidence.nativeFills = browser.nativeFills;
+            evidence.firefoxLog = browser.log;
+            evidence.edgehandlesRequests = browser.events.filter(e => e.method === 'network.beforeRequestSent'
+                && /edgehandles/i.test(e.params.request.url));
             try { evidence.browserCleanup = await browser.close(); }
             catch (error) { evidence.browserCleanupError = error.stack; process.exitCode = 1; }
         }

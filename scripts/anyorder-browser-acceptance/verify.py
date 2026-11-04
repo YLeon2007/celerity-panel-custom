@@ -63,9 +63,9 @@ for address in listeners:
             raise AssertionError('owned listener still accepts connections: ' + address)
     except (ConnectionRefusedError, TimeoutError):
         pass
-# These are disclosed UI-owner findings, not suppressed console acceptance.
+# The imported two-fix UI source must not retain the old loader exception.
 console_errors = [x['text'] for x in evidence['console'] if x.get('level') == 'error']
-assert all('memoize' in text and 'undefined' in text for text in console_errors), console_errors
+assert not console_errors, console_errors
 print(json.dumps({'status': 'PASS', 'cases': len(expected), 'nativeFills': len(evidence['nativeFills']),
                   'assetSha256': asset_hash, 'cleanup': 'pid/profile/app-and-bidi-listeners-absent',
                   'uiObstructions': evidence.get('uiObstructions', []), 'consoleErrors': console_errors,

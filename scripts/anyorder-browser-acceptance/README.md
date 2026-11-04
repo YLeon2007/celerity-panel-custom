@@ -6,9 +6,10 @@ This test reuses its actual local application composition and native BiDi driver
 it does not rewrite that evidence or change product UI/CSS/templates.
 
 Run from the repository root in a bounded `hermes-heavy` scope with a clean test
-environment, a private lock-exact `npm ci`, no repository `.env`, and freshly
+environment, a private lock-exact dependency install, no repository `.env`, and freshly
 rebuilt assets. Pass a **new**, nonexistent evidence directory below
-`/home/leon/c3-anyorder-execution-20261104/wave8-integration/`:
+`/home/leon/c3-anyorder-execution-20261104/wave8-integration/` or the fresh
+`/home/leon/c3-anyorder-execution-20261104/ui-final-wave10/`:
 
 ```sh
 node scripts/anyorder-browser-acceptance/acceptance.cjs "$NEW_EVIDENCE_DIR"
@@ -35,17 +36,22 @@ explicitly modeled node executor boundary, then requires the actual worker's
 rollback, failed job, retained arrow and untouched neighbor records. It does not
 reuse the old expectation that ordinary reverse deletion fails.
 
-## Limits and UI-owner handoff
+## Limits and separate native close-button gate
 
 Firefox and application route/runtime/consumer/worker/finalizer code are real.
 DB queries/transactions, config adoption, node executor/readback and empty user
 sync remain modeled. This is not Mongo atomicity, SSH/Xray/PPP/client traffic,
 full `index.js` startup, auth/CSRF, responsive-layout or production acceptance.
 
-Console `memoize` initialization errors and invalid Cytoscape shadow-style
-warnings remain disclosed. Sticky toolbar coverage of `nodeInfoClose` remains a
-UI-owner issue. The verifier fails on unrelated console errors; it does not turn
-these known UI defects into a clean-console claim.
+The historical wave8 packet retains its toolbar obstruction and `memoize`
+findings unchanged. On the imported two-fix UI source the current verifier
+requires zero console errors; non-error Cytoscape style/wheel warnings can still
+occur. The lifecycle helper retains its native backdrop fallback, so its pass
+is not proof that the close button was hit. Run the separate
+`scripts/test-network-ui-obstructions-browser.cjs` gate after the CSS rebuild for
+native Add Link and tall staged-drawer close hit tests, with no backdrop or JS
+click fallback, graph-state preservation, no edgehandles requests, and disk /
+HTTP / browser-WebCrypto CSS and JS equality.
 
 The separately imported `scripts/anyorder-runtime-xray/` harness does not supply
 native physical authority. Its construction-only authority probe must continue

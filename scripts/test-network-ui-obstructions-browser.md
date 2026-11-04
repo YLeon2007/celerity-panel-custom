@@ -25,12 +25,13 @@ This checks the narrow stacking policy and runs the actual lazy loader in a VM
 
 After importing this commit, rebuild assets using the integration owner's private
 lock-exact dependencies and existing sole-heavy budget. In particular,
-`public/css/style.min.css` in this source-only commit is intentionally unchanged;
+`public/css/style.min.css` in the canonical source-only import was unchanged;
 **do not test the old CSS and call that a fix verification**.
 
-The new isolated harness imports `browser-assets-wave8/firefox-bidi.cjs` and
-`local-app.cjs` read-only. It neither modifies nor writes into the frozen wave 8
-packet. Run it from the integrated repository, **inside the already-approved
+The isolated harness uses the current `anyorder-browser-acceptance/firefox.cjs`
+native-form wrapper and imports the frozen base driver and `local-app.cjs`
+read-only. It neither modifies nor writes into the frozen wave 8 packet.
+Run it from the integrated repository, **inside the already-approved
 bounded `hermes-heavy` scope**, with a fresh absolute evidence directory:
 
 ```bash
@@ -38,13 +39,13 @@ timeout 300 env -i PATH="$PATH" HOME=/home/leon TMPDIR="${TMPDIR:?}" \
   NODE_ENV=test PANEL_DOMAIN=panel.test.invalid ACME_EMAIL=admin@test.invalid \
   ENCRYPTION_KEY=test-encryption-key-32-characters-long SESSION_SECRET=test-session-secret \
   node scripts/test-network-ui-obstructions-browser.cjs \
-  /home/leon/c3-anyorder-execution-20261104/ui-polish-wave9/native-FRESH
+  /home/leon/c3-anyorder-execution-20261104/ui-final-wave10/native-FRESH
 ```
 
 The fixed synthetic values above are the existing local fixture's test-only
 configuration, not account credentials. No real login, `.env`, Mongo connection,
-SSH, cron, remote host or physical client is used. The native run is deferred in
-this slice: no install, asset build or browser was launched by the UI worker.
+SSH, cron, remote host or physical client is used. All form edits use native
+pointer/keyboard input, including Tab/Home/ArrowDown on closed selects.
 
 ### Exact assertions (three native cases)
 
@@ -52,7 +53,9 @@ this slice: no install, asset build or browser was launched by the UI worker.
    1440×1000 viewport, with real Cytoscape. No edgehandles script tag/request or
    edgehandles/memoize console exception. Browser-computed layers must be wrapper
    `auto`, map surface `1`, modal `1000`; stale generated CSS fails. Served built
-   asset digests must match disk.
+   asset digests must match disk in both HTTP-client and browser WebCrypto
+   readback of the actual template URLs. The layout style cache suffix must
+   equal the rebuilt CSS digest prefix.
 2. **Existing open button:** `document.elementFromPoint` at the rounded center of
    `#btnAddLink` must be the button or its descendant; native pointer input opens
    `#addLinkModal`. The same check/input on `#modalClose` dismisses it. No link is
@@ -72,6 +75,9 @@ Failures and exact hit/geometry/console/cleanup data go into the fresh directory
 `evidence.json`. A short popup is not accepted as the tall-drawer regression.
 Keep any failed attempt and use a different fresh directory for a retry.
 
-These checks supplement, not replace, the existing full native lifecycle matrix.
-They do not address or certify the separately owned reverse last-exit backend
-blocker recorded in wave 8, nor establish physical Xray/PPP readiness.
+These checks supplement, not replace, the existing full native lifecycle matrix
+under `scripts/anyorder-browser-acceptance/`. That current-source matrix requires
+successful reverse and forward deletion/recreation, independently of the old
+frozen failure expectation. Neither harness establishes physical Xray/PPP
+readiness; the full application/auth/bootstrap and physical boundaries remain
+outside this local modeled-backend acceptance.

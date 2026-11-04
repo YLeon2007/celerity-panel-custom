@@ -3,7 +3,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
 const {Firefox,sleep}=require('./firefox.cjs');
 const {createApp,sha}=require('../../browser-assets-wave8/local-app.cjs');
 const ROOT=path.resolve(__dirname,'../..');
-const OUT=path.resolve(process.argv[2]);assert.ok(OUT.startsWith('/home/leon/c3-anyorder-execution-20261104/wave8-integration/'));fs.mkdirSync(OUT,{recursive:false});
+const OUT=path.resolve(process.argv[2]);assert.ok(['/home/leon/c3-anyorder-execution-20261104/wave8-integration/','/home/leon/c3-anyorder-execution-20261104/ui-final-wave10/'].some(base=>OUT.startsWith(base)));fs.mkdirSync(OUT,{recursive:false});
 const CY="document.getElementById('cy')._cyreg.cy";
 const evidence={scope:{browser:'real installed Firefox ESR via native WebDriver BiDi pointer actions',
   application:'actual nodes.ejs/locales/minified JS and actual public route modules/default host/runtime/worker/finalizer',
