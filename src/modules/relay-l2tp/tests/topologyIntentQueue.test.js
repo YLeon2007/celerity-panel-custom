@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const mongoose = require('mongoose');
 const moduleEntry = require('..');
 const { TopologyOperationFinalizationRepository } = require('../repositories/topologyOperationFinalizationRepository');
@@ -83,6 +83,21 @@ function link(index) {
     return { _id: new mongoose.Types.ObjectId(), name: `rapid-${index + 1}`, mode: index % 2 ? 'reverse' : 'forward',
         portalNode: ids[source], bridgeNode: ids[target], tunnelUuid: `local-test-${index}`, tunnelPort: 10086 + index,
         autoDeploy: true, ...(index === 3 ? { geoRouting: { enabled: true, geoip: ['ru'] } } : {}) };
+}
+async function adoptedEmptyBaseline() {
+    // Same strict-schema fixture as cascadeAnyOrderMongo.reset(): existing
+    // selected-enabled models require adopted owners, even for these legacy
+    // queue cases. This is DB setup, NOT physical adoption or migration proof.
+    const sha = value => createHash('sha256').update(value).digest('hex');
+    const nodes = await models.HyNode.find({}).lean();
+    await models.TopologyConfigOwner.create(nodes.map((node, i) => ({ node: node._id,
+        profile: node.cascadeRole === 'portal' ? 'xray-main' : 'xray-bridge', executionContext: TEST_CONTEXT,
+        owner: 'topology', generation: '11111111-1111-4111-8111-111111111111',
+        nodeIdentity: { machineId: String(i + 1).repeat(32), sshHostKeySha256: String(i + 1).repeat(64) },
+        originalSnapshot: { configSha256: sha('{}'), unitSha256: sha('unit'), serviceActive: 'inactive', serviceEnabled: 'disabled' },
+        adoptionReceipt: { fromGeneration: '00000000-0000-4000-8000-000000000000', toGeneration: '11111111-1111-4111-8111-111111111111',
+            proofId: '22222222-2222-4222-8222-222222222222', maintenanceId: '33333333-3333-4333-8333-333333333333',
+            oldBackendInstanceId: 'local-simulated-owner', oldPid: 1, oldProcessStartTime: 'fixture-only', verifiedAt: new Date() } })));
 }
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to an isolated local MongoDB binary' };
 test('four acceptances are durable before any draft mutation; duplicate and overflow are transactional', local, async () => {
@@ -406,6 +421,7 @@ test('consumer rejects active or missing remote counters and rolls back draft as
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
     for (const remoteCount of [2, undefined]) await t.test(`remote counter ${remoteCount}`, async () => {
         await reset();
+        await adoptedEmptyBaseline();
         await models.CascadeTopologyState.collection.updateOne({ _id: 'singleton' },
             remoteCount === undefined ? { $unset: { remoteAdmissionCount: '' } }
                 : { $set: { remoteAdmissionCount: remoteCount } });
@@ -672,6 +688,7 @@ test('concurrent overflow admits exactly the bounded capacity and reports safe r
 });
 test('expired claim recovery fences an old generation before any draft mutation', local, async () => {
     await reset();
+    await adoptedEmptyBaseline();
     let instant = new Date(); const clock = { now: () => instant };
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
     const service = createIntentService(models);

@@ -1,6 +1,7 @@
 'use strict';
 // REAL local Mongo replica-set persistence, schemas, indexes, repositories,
-// coordinator, consumer and worker/finalizer. Only node execution is simulated.
+// coordinator, consumer and worker/finalizer. Node execution and external
+// subscription/client-proof transports are simulated and do not prove adoption.
 // No Docker, application .env, remote DB, SSH, Xray or PPP is involved.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -86,7 +87,7 @@ test.before(async () => {
         }
     });
     models = { ...moduleEntry.registerModels(), HyNode: require('../src/models/hyNodeModel'),
-        CascadeLink: require('../src/models/cascadeLinkModel') };
+        CascadeLink: require('../src/models/cascadeLinkModel'), HyUser: require('../src/models/hyUserModel') };
     for (const model of Object.values(models)) { assert.ok(model.db === connection); await model.init(); }
 });
 test.after(async () => {
@@ -156,6 +157,7 @@ function stack(overrides = {}) {
         workerId: `local-anyorder-${process.pid}`, leaseMs: 30000, allowUnprovenTestExecution: true,
         selectedTopologyRepository: deployment });
     const dependencies = { ...models, executionContext: context,
+        prepareLink: require('../src/routes/cascadeLinks').prepareIntentLink,
         intentDraftWriter: draft.createIntentDraftWriter({ selectedTopologyRepository: deployment }),
         intentOperationAdmission: { db: connection, queue: input => coordinator.queueIntent(input) },
         resolveIntentResources: input => coordinator.resolveIntentResourcesForQueue(input),
@@ -365,6 +367,188 @@ test('REQUIRED real consumer settles an actual selected success (explicit bindin
         outstanding: (await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding })); throw error; }
     assert.equal((await f.service.get(job.jobId)).status, 'succeeded');
     assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 0);
+});
+
+async function httpFixture(f, work) {
+    const express = require('express');
+    const app = express(); app.use(express.json());
+    app.use((req, res, next) => { req.session = { authenticated: true }; next(); });
+    app.use('/links', require('../src/routes/cascadeLinks').createCascadeLinksRouter({
+        Link: models.CascadeLink, Node: models.HyNode, TopologyState: models.CascadeTopologyState,
+        ClientProofOperation: models.TopologyOperation, topologyIntentService: f.service, deploymentEnv: {},
+        topologyDraftWriteService: { updateLink() { assert.fail('atomic PUT must not commit a separate draft transaction'); } },
+        maintainAutoL2tpPathsFn() { assert.fail('native mutation must not run classic path maintenance'); },
+        invalidateSubscriptions: async () => {}, invalidateTopology: async () => {},
+    }));
+    const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+    try {
+        await work(async (method, url, body, key) => {
+            const response = await fetch(`http://127.0.0.1:${server.address().port}/links${url}`, {
+                method, headers: { 'content-type': 'application/json', ...(key ? { 'idempotency-key': key } : {}) },
+                ...(method === 'GET' ? {} : { body: JSON.stringify(body) }),
+            });
+            return { status: response.status, body: await response.json() };
+        });
+    } finally { await new Promise(resolve => server.close(resolve)); }
+}
+async function acceptanceState() {
+    return { links: await models.CascadeLink.find({}).sort({ _id: 1 }).lean(),
+        state: await models.CascadeTopologyState.findById('singleton').lean(),
+        intents: await models.TopologyCreateIntent.find({}).lean(),
+        counters: await models.TopologyIntentQueueState.find({}).lean() };
+}
+for (const fault of ['after-draft-resources', 'after-queue-insert', 'draft-owner-refusal']) {
+    test(`real HTTP PUT Auto ${fault} rolls back actual desired/revision/job/counter transaction`, async () => {
+        await reset(); await models.CascadeLink.create(link());
+        if (fault === 'draft-owner-refusal') await models.CascadeTopologyState.updateOne({ _id: 'singleton' },
+            { $set: { remoteDrain: { ownerToken: 'fixture-drain', epoch: 1 } } }, { runValidators: true });
+        const before = await acceptanceState();
+        const f = stack(fault === 'after-draft-resources' ? { resolveIntentResources: async ({ session }) => {
+            const changed = await models.CascadeLink.findById(id(10)).session(session).lean();
+            assert.equal(changed.name, 'atomic edit');
+            throw Object.assign(Error('INJECTED local refusal after real joined draft update'), { code: 'TOPOLOGY_INTENT_RESOURCES_UNAVAILABLE' });
+        } } : {});
+        const originalCreate = models.TopologyCreateIntent.create;
+        if (fault === 'after-queue-insert') models.TopologyCreateIntent.create = async function (...args) {
+            await originalCreate.apply(this, args);
+            throw Error('INJECTED response after actual insert, before transaction commit');
+        };
+        try {
+            await httpFixture(f, async request => {
+                const result = await request('PUT', `/${id(10)}`, { expectedTopologyRevision: 7,
+                    autoDeploy: true, name: 'atomic edit', tunnelPort: 24111 }, `rollback-${fault}`);
+                assert.ok(result.status >= 400, JSON.stringify(result));
+                assert.equal(result.body.job, undefined); assert.equal(result.body.desiredSaved, undefined);
+            });
+        } finally { models.TopologyCreateIntent.create = originalCreate; }
+        assert.deepEqual(await acceptanceState(), before);
+        assert.deepEqual(f.calls, []);
+    });
+}
+test('real HTTP PUT concurrent same-key replay persists one edit/job/revision and conflicting replay changes nothing', async () => {
+    await reset(); await models.CascadeLink.create(link()); const f = stack();
+    const body = { expectedTopologyRevision: 7, autoDeploy: true, name: 'concurrent atomic edit',
+        tunnelPort: 24112, tunnelSecurity: 'reality', realityPrivateKey: '', realityPublicKey: '', realityShortIds: [] };
+    let accepted;
+    await httpFixture(f, async request => {
+        const results = await Promise.all(Array.from({ length: 5 }, () => request('PUT', `/${id(10)}`, body, 'same-put-key')));
+        assert.ok(results.every(result => result.status === 202), JSON.stringify(results));
+        accepted = results[0].body.job;
+        assert.ok(results.every(result => JSON.stringify(result.body.job) === JSON.stringify(accepted)));
+        assert.equal(await revision(), 8); assert.equal(await models.TopologyCreateIntent.countDocuments(), 1);
+        const counter = await models.TopologyIntentQueueState.findById('create-v1').lean();
+        assert.equal(counter.outstanding, 1); assert.equal(counter.ordinal, 1);
+        const saved = await models.CascadeLink.findById(id(10)).lean();
+        assert.match(saved.realityPrivateKey, /^[A-Za-z0-9_-]{43}$/);
+        assert.equal(linkDesiredVersion(saved), accepted.desiredVersion);
+        assert.doesNotMatch(JSON.stringify(results), new RegExp(saved.realityPrivateKey));
+        const before = await acceptanceState();
+        const conflict = await request('PUT', `/${id(10)}`, { ...body, tunnelPort: 24113 }, 'same-put-key');
+        assert.equal(conflict.status, 409); assert.equal(conflict.body.error.code, 'TOPOLOGY_INTENT_KEY_CONFLICT');
+        assert.deepEqual(await acceptanceState(), before);
+    });
+    await httpFixture(stack({ prepareLink() { assert.fail('restart replay cannot regenerate credentials'); } }), async request => {
+        const replay = await request('PUT', `/${id(10)}`, { ...body, expectedTopologyRevision: 0 }, 'same-put-key');
+        assert.equal(replay.status, 202); assert.deepEqual(replay.body.job, accepted);
+    });
+});
+test('real HTTP v2 job reaches actual consumer binding, worker settlement, delete and same-port recreation without manual binding', async () => {
+    await reset(); const f = stack();
+    async function settle(job) {
+        const claim = await f.consumer.claim(); assert.equal(String(claim._id), job.jobId);
+        const queued = await f.consumer.consumeVersioned(claim);
+        assert.equal((await f.worker.run(queued.operationId)).status, 'succeeded');
+        assert.equal(await f.consumer.settle(await models.TopologyCreateIntent.findById(job.jobId).lean()), true);
+        assert.equal((await f.service.get(job.jobId)).status, 'succeeded');
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 0);
+        assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+    }
+    await httpFixture(f, async request => {
+        const body = { expectedTopologyRevision: 7, name: 'HTTP durable lifecycle', portalNodeId: id(3),
+            bridgeNodeId: id(2), tunnelPort: 24114, tunnelSecurity: 'none', autoDeploy: true };
+        const created = await request('POST', '', body, 'http-create');
+        assert.equal(created.status, 202, JSON.stringify(created)); await settle(created.body.job);
+        const original = await models.CascadeLink.findById(created.body.linkId).lean();
+        const deleted = await request('DELETE', `/${created.body.linkId}`, { expectedTopologyRevision: await revision() }, 'http-delete');
+        assert.equal(deleted.status, 202, JSON.stringify(deleted));
+        assert.equal(String((await models.CascadeLink.findById(original._id).lean()).lifecycle.deleteJobId), deleted.body.job.jobId);
+        f.executor.verify = async () => { assert.ok(await models.CascadeLink.exists({ _id: original._id })); return { ok: true }; };
+        await settle(deleted.body.job); assert.equal(await models.CascadeLink.findById(original._id).lean(), null);
+        f.executor.verify = async () => ({ ok: true });
+        const recreated = await request('POST', '', { ...body, expectedTopologyRevision: await revision() }, 'http-recreate');
+        assert.equal(recreated.status, 202, JSON.stringify(recreated));
+        assert.notEqual(recreated.body.linkId, created.body.linkId); await settle(recreated.body.job);
+        assert.equal((await models.CascadeLink.findById(recreated.body.linkId).lean()).tunnelPort, original.tunnelPort);
+    });
+});
+test('selected proof claim/completion/private pins/public freshness use real persisted owners and queries (network proof modeled)', async () => {
+    await reset();
+    await models.HyNode.updateOne({ _id: id(3) }, { $set: { name: 'Proof portal', 'xray.security': 'reality',
+        'xray.realityPublicKey': 'fixture-public', 'xray.realitySni': ['front.invalid'], 'xray.realityShortIds': ['01234567'] } });
+    await models.HyNode.updateOne({ _id: id(2) }, { $set: { 'ssh.username': 'fixture', 'ssh.password': 'synthetic-fixture-password' } });
+    const uuid = '11111111-1111-4111-8111-111111111111';
+    await models.HyUser.collection.insertOne({ userId: 'mongo-probe', enabled: true, xrayUuid: uuid,
+        subscriptionToken: 'privateFixtureToken', nodes: [new mongoose.Types.ObjectId(id(3))], groups: [] });
+    await models.CascadeLink.create(link(10, 3, 2)); const f = stack();
+    const queued = await apply(f, id(10)); assert.equal((await f.worker.run(queued.operationId)).status, 'succeeded');
+    const { TopologyClientProofExecutor } = require('../src/modules/relay-l2tp/services/topologyClientProofExecutor');
+    const { TopologyPublishedProfileSource } = require('../src/modules/relay-l2tp/services/topologyPublishedProfileSource');
+    const { TopologyClientReadinessWorker } = require('../src/modules/relay-l2tp/workers/topologyClientReadinessWorker');
+    let profileCalls = 0;
+    const executor = new TopologyClientProofExecutor({ ...models, selectedTopologyRepository: f.deployment,
+        NodeSSH: class { async connect() {} async exec() { return { code: 0, stdout: '192.0.2.2', stderr: '' }; } disconnect() {} },
+        profileSource: new TopologyPublishedProfileSource({ HyUser: models.HyUser, probeUserId: 'mongo-probe',
+            fetchImpl: async () => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => JSON.stringify([
+                { remarks: 'Proof portal', outbounds: [{ protocol: 'vless', tag: 'proxy', settings: { vnext: [{ address: '192.0.2.3', port: 443,
+                    users: [{ id: uuid, encryption: 'none' }] }] }, streamSettings: { network: 'tcp', security: 'reality',
+                    realitySettings: { publicKey: 'fixture-public', serverName: 'front.invalid', shortId: '01234567' } } }] },
+            ]) }) }),
+        profileProbe: { async probe() { profileCalls++; return { ok: true, observedEgressIp: '192.0.2.2' }; } },
+    });
+    f.operations.clientProofExecutor = executor;
+    assert.ok(await executor.readSelectedSnapshot(await operation(queued.operationId)), 'real settled owner/credential snapshot is readable');
+    const proofWorker = new TopologyClientReadinessWorker({ repository: f.operations,
+        probeOperation: op => executor.probeOperation(op), executionContext: context, owner: 'real-mongo-proof' });
+    assert.equal(await proofWorker.runOnce(), 'verified'); assert.equal(profileCalls, 1);
+    const raw = await models.TopologyOperation.findById(queued.operationId)
+        .select('+clientProofFingerprint +clientProofCredentialDigest').lean();
+    assert.equal(raw.clientProofFingerprint, raw.admissionFingerprint);
+    assert.match(raw.clientProofCredentialDigest, /^[a-f0-9]{64}$/);
+    assert.equal((await models.TopologyOperation.findById(queued.operationId).lean()).clientProofCredentialDigest, undefined);
+    assert.equal((await f.operations.findPublicById(queued.operationId)).clientReadiness, 'verified');
+    await models.CascadeTopologyState.updateOne({ _id: 'singleton' }, { $inc: { revision: 1 } });
+    assert.equal((await f.operations.findPublicById(queued.operationId)).clientReadiness, 'verified');
+    await models.HyUser.updateOne({ userId: 'mongo-probe' }, { $set: { subscriptionToken: 'replacedFixtureToken' } });
+    const stale = await f.operations.findPublicById(queued.operationId);
+    assert.equal(stale.clientReadiness, 'unverified');
+    assert.doesNotMatch(JSON.stringify(stale), /privateFixtureToken|replacedFixtureToken|clientProofCredentialDigest|effectiveTopology/);
+});
+
+test('supported legacy attach producer retains its actual persisted owner epochs/path in worker durability (no invented selected snapshot)', async () => {
+    await reset(); await models.CascadeLink.create(link()); const f = stack();
+    const selected = await apply(f, id(10));
+    const bound = await f.operations.claim({ operationId: selected.operationId, owner: 'legacy-contract', leaseMs: 30000,
+        now: new Date(), executionContext: context });
+    assert.ok(bound);
+    const source = await operation(selected.operationId);
+    const operationId = id(90);
+    await connection.transaction(session => f.operations.createFrozen({ operationId, executionContext: context,
+        idempotencyKey: `topology:test:revision-7:link.attach:${id(10)}:${sha('attach')}:host-${context.hostIdentity}:${randomUUID()}`,
+        topologyRevision: 7, priorDeployedRevision: 3,
+        nodes: require('../src/modules/relay-l2tp/workers/topologyOperationWorker').durablePlan(source, selected.operationId).nodes,
+        kind: 'link.attach', linkId: id(10), linkIds: [id(10)], groupId: id(30), pathKey: 'main', ownerNodeId: id(1),
+        ownerTopologyRevision: 3, ownerCredentialRevision: 11, newPathLinkIds: [id(10)],
+        heldTopologyAdmission: true, admissionFingerprint: sha('legacy-attach-contract'), session,
+    }));
+    assert.ok(await f.operations.claim({ operationId, owner: 'legacy-contract', leaseMs: 30000, now: new Date(), executionContext: context }));
+    const stored = await operation(operationId);
+    const plan = require('../src/modules/relay-l2tp/workers/topologyOperationWorker').durablePlan(stored, operationId);
+    assert.equal(plan.ownerTopologyRevision, stored.ownerTopologyRevision);
+    assert.equal(plan.ownerCredentialRevision, stored.ownerCredentialRevision);
+    assert.deepEqual(plan.newPathLinkIds, stored.newPathLinkIds);
+    assert.equal(Object.isFrozen(plan.newPathLinkIds), true);
+    assert.equal(stored.effectiveTopology, undefined, 'legacy repository never persists a selected snapshot');
+    assert.equal(plan.effectiveTopology, undefined, 'worker cannot invent migration authority');
 });
 
 const permutations = values => values.length ? values.flatMap((value, index) =>
