@@ -20,7 +20,7 @@ Synthetic boundary retained from wave 7: frozen descriptors, in-memory binding/m
 
 ## Execution
 
-Only the designated private rootless wrapper and cached pinned images may run. No build/pull/npm, host root, privileged container, public port, remote SSH/PROD env, shared database or PPP. New maxima: five 256 MiB containers; live MemAvailable must also reserve 1400 MiB integration-Mongo plus 2048 MiB asset-build headroom. Actual PID/start/cgroup/namespace/limits and cleanup are recorded; historical containers are read-only inspect/hash subjects, never exec targets.
+Only the designated private rootless wrapper and cached pinned images may run. No build/pull/npm, host root, privileged container, public port, remote SSH/PROD env, shared database or PPP. New maxima after a recorded capacity refusal: four 128 MiB endpoints plus one 256 MiB runner (768 MiB total); live MemAvailable must also reserve 1400 MiB integration-Mongo plus 2048 MiB asset-build headroom. Actual PID/start/cgroup/namespace/limits and cleanup are recorded; historical containers are read-only inspect/hash subjects, never exec targets.
 
 ```sh
 NODE_PATH=/home/leon/celerity-l2tp-dev/node_modules node scripts/anyorder-runtime-xray/authority-probe.cjs /home/leon/c3-anyorder-execution-20261104/runtime-xray-wave8/authority-blocker.json

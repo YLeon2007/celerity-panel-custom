@@ -122,9 +122,9 @@ def main():
         assert json.loads(pod('image', 'inspect', image).stdout)[0]['Id'].removeprefix('sha256:') == expected
     mem = {a.rstrip(':'): int(b.split()[0]) for a, b in
            (line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())}
-    # New maximum 5*256MiB; reserve integration Mongo + asset build.
-    assert mem['MemAvailable'] > (1280 + 1400 + 2048) * 1024, 'insufficient live memory reserve'
-    save('resources-before.json', {'memAvailableKiB': mem['MemAvailable'], 'newMemoryMaxMiB': 1280,
+    # Endpoints 4*128MiB + runner 256MiB; keep both reserved phases.
+    assert mem['MemAvailable'] > (768 + 1400 + 2048) * 1024, 'insufficient live memory reserve'
+    save('resources-before.json', {'memAvailableKiB': mem['MemAvailable'], 'newMemoryMaxMiB': 768,
                                  'reservedOtherWorkerMiB': 1400, 'reservedHeadroomMiB': 2048,
                                  'endpointImage': ENDPOINT_ID, 'runnerImage': RUNNER_ID})
     source = run / 'candidate'
@@ -179,7 +179,7 @@ def main():
             name = run_id + '-' + node
             cid = pod('create', '--pull=never', '--name', name, '--hostname', name,
                       '--network', network_name, '--ip', ip, '--systemd=always', '--cgroupns=private',
-                      '--pid=private', '--memory=256m', '--memory-swap=256m', '--cpus=0.3',
+                      '--pid=private', '--memory=128m', '--memory-swap=128m', '--cpus=0.3',
                       '--pids-limit=128', '--security-opt=no-new-privileges',
                       '--volume', f'{directory / "machine-id"}:/etc/machine-id:ro', ENDPOINT).stdout.strip()
             owned[name] = cid
@@ -277,7 +277,7 @@ def main():
             group = Path('/sys/fs/cgroup' + scope)
             limits = {key: (group / key).read_text().strip() for key in
                       ['memory.max', 'memory.swap.max', 'memory.events', 'cpu.max', 'pids.max']}
-            assert limits['memory.max'] == str(256 * 1024 * 1024)
+            assert limits['memory.max'] == str((256 if c['Name'].endswith('-runner') else 128) * 1024 * 1024)
             assert c['Id'] in cg
             physical.append({'id': c['Id'], 'pid': pid, 'starttime': stat[19], 'cgroup': scope, 'limits': limits,
                              'uidMap': Path(f'/proc/{pid}/uid_map').read_text(),
