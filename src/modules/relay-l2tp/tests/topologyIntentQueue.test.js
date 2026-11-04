@@ -2,20 +2,36 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
-const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { randomUUID, createHash } = require('node:crypto');
 const mongoose = require('mongoose');
 const moduleEntry = require('..');
-const { TopologyOperationFinalizationRepository } = require('../repositories/topologyOperationFinalizationRepository');
 const ids = Array.from({ length: 5 }, (_, i) => `507f1f77bcf86cd79943903${i + 1}`);
 const databaseName = `c3_anyorder_${randomUUID().replaceAll('-', '')}`;
-let models, processHandle, directory;
+let models, processHandle, directory, port;
+const commands = [];
 const TEST_CONTEXT = Object.freeze({ target: 'test', hostIdentity: 'test.infograd.online' });
 function createIntentService(dependencies = models) {
-    return moduleEntry.createTopologyIntentService({ executionContext: TEST_CONTEXT, ...dependencies });
+    const { TopologyDraftRepository } = require('../repositories/topologyDraftRepository');
+    const { TopologyDeploymentRepository } = require('../repositories/topologyDeploymentRepository');
+    const { TopologyOperationRepository } = require('../repositories/topologyOperationRepository');
+    const { TopologyOperationCoordinator } = require('../services/topologyOperationCoordinator');
+    const { TopologyOperationPlanMaterializer } = require('../services/topologyOperationPlanMaterializer');
+    const input = { executionContext: TEST_CONTEXT, ...dependencies };
+    const draft = new TopologyDraftRepository(input);
+    const deployment = new TopologyDeploymentRepository({ ...input, snapshotReader: draft });
+    const coordinator = new TopologyOperationCoordinator({ executionContext: input.executionContext,
+        topologyRepository: deployment,
+        operationRepository: new TopologyOperationRepository({ model: models.TopologyOperation,
+            topologyStateModel: models.CascadeTopologyState, selectedTopologyRepository: deployment }),
+        planMaterializer: input.planMaterializer || new TopologyOperationPlanMaterializer(input) });
+    return moduleEntry.createTopologyIntentService({ ...input,
+        prepareLink: input.prepareLink ?? require('../../../routes/cascadeLinks').prepareIntentLink,
+        intentDraftWriter: draft.createIntentDraftWriter({ selectedTopologyRepository: deployment }),
+        intentOperationAdmission: { db: models.CascadeTopologyState.db, queue: request => coordinator.queueIntent(request) },
+        resolveIntentResources: request => coordinator.resolveIntentResourcesForQueue(request) });
 }
 async function until(work) {
     let error;
@@ -30,7 +46,7 @@ test.before(async () => {
     assert.ok(process.env.TMPDIR, 'explicit local scratch root required');
     assert.ok((await fs.realpath(process.env.TMPDIR)).startsWith('/home/leon/.hermes/cache/scratch/'));
     directory = await fs.mkdtemp(path.join(process.env.TMPDIR, 'c3-intent-db-'));
-    const port = await new Promise(resolve => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const p = server.address().port; server.close(() => resolve(p)); }); });
+    port = await new Promise(resolve => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const p = server.address().port; server.close(() => resolve(p)); }); });
     processHandle = spawn(process.env.C3_MONGOD, ['--dbpath', directory, '--port', String(port), '--bind_ip', '127.0.0.1', '--replSet', 'intentScratch', '--wiredTigerCacheSizeGB', '0.25', '--oplogSize', '32', '--setParameter', 'enableTestCommands=1', '--logpath', path.join(directory, 'mongo.log')], { stdio: 'ignore' });
     const uri = `mongodb://127.0.0.1:${port}/${databaseName}`;
     const client = new mongoose.mongo.MongoClient(`${uri}?directConnection=true`, { serverSelectionTimeoutMS: 100 });
@@ -38,7 +54,18 @@ test.before(async () => {
     await client.db('admin').command({ replSetInitiate: { _id: 'intentScratch', members: [{ _id: 0, host: `127.0.0.1:${port}` }] } });
     await until(async () => { assert.equal((await client.db('admin').command({ hello: 1 })).isWritablePrimary, true); });
     await client.close();
-    await mongoose.connect(`${uri}?replicaSet=intentScratch`, { monitorCommands: true });
+    await mongoose.connect(`${uri}?replicaSet=intentScratch`, { monitorCommands: true, serverSelectionTimeoutMS: 5000, maxPoolSize: 5 });
+    mongoose.connection.getClient().on('commandStarted', event => {
+        if (['find', 'insert', 'update', 'delete', 'commitTransaction', 'abortTransaction'].includes(event.commandName)) {
+            // Exact command semantics without private credentials/config payloads.
+            commands.push({ name: event.commandName, databaseName: event.databaseName,
+                collection: event.command[event.commandName], autocommit: event.command.autocommit,
+                readConcern: event.command.readConcern, readPreference: event.command.$readPreference,
+                maxTimeMS: event.command.maxTimeMS, projection: event.command.projection,
+                requestKey: event.command.filter?.requestKey,
+                id: event.command.filter?._id?.toHexString?.() });
+        }
+    });
     models = { ...moduleEntry.registerModels(), HyNode: require('../../../models/hyNodeModel'), CascadeLink: require('../../../models/cascadeLinkModel') };
     await Promise.all(Object.values(models).map(model => model.init()));
 });
@@ -56,7 +83,8 @@ test.after(async () => {
     await mongoose.disconnect();
     if (processHandle && processHandle.exitCode === null) {
         const exited = new Promise(resolve => processHandle.once('exit', resolve));
-        processHandle.kill('SIGTERM'); await exited;
+        processHandle.kill('SIGTERM');
+        await Promise.race([exited, new Promise((_, reject) => { const timer = setTimeout(() => reject(Error('owned mongod shutdown deadline')), 15000); timer.unref(); })]);
     }
     if (directory && process.env.C3_ANYORDER_MONGO_EVIDENCE) {
         await fs.mkdir(process.env.C3_ANYORDER_MONGO_EVIDENCE, { recursive: true });
@@ -66,16 +94,29 @@ test.after(async () => {
         await fs.rm(directory, { recursive: true, force: true });
         assert.equal(require('node:fs').existsSync(directory), false);
     }
-    if (process.env.C3_ANYORDER_MONGO_EVIDENCE) await fs.writeFile(path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'legacy-queue-cleanup.json'),
-        JSON.stringify({ databaseName, databaseAbsent, pid: processHandle?.pid, processExited: processHandle?.exitCode !== null, directory, directoryAbsent: !require('node:fs').existsSync(directory) }, null, 2));
+    const portClosed = port === undefined || await new Promise(resolve => { const socket = net.connect({ host: '127.0.0.1', port });
+        socket.once('connect', () => { socket.destroy(); resolve(false); }); socket.once('error', () => resolve(true)); });
+    assert.equal(portClosed, true);
+    if (process.env.C3_ANYORDER_MONGO_EVIDENCE) {
+        await fs.writeFile(path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'commands.json'), JSON.stringify(commands, null, 2));
+        await fs.writeFile(path.join(process.env.C3_ANYORDER_MONGO_EVIDENCE, 'legacy-queue-cleanup.json'),
+            JSON.stringify({ databaseName, databaseAbsent, pid: processHandle?.pid, processExited: processHandle?.exitCode !== null,
+                directory, directoryAbsent: !require('node:fs').existsSync(directory), port, portClosed }, null, 2));
+    }
 });
-async function reset() {
+async function reset(context = TEST_CONTEXT) {
+    assert.match(databaseName, /^c3_anyorder_[a-f0-9]{32}$/);
     assert.equal(mongoose.connection.name, databaseName);
+    assert.equal(mongoose.connection.host, '127.0.0.1'); assert.equal(mongoose.connection.port, port);
     // Registered immutable binding/enrollment models must retain their public
     // mutation guards. Reset only the isolated fixture via its raw collections.
     for (const model of Object.values(models)) await model.collection.deleteMany({});
     await models.CascadeTopologyState.create({ _id: 'singleton', revision: 7, deployedRevision: 5, topologyAdmissionCount: 0, remoteAdmissionCount: 0 });
     await models.HyNode.collection.insertMany(ids.map((_id, index) => ({ _id: new mongoose.Types.ObjectId(_id), type: 'xray', active: true, cascadeRole: ['portal', 'portal', 'relay', 'bridge', 'bridge'][index], ip: `192.0.2.${index + 1}`, domain: `node-${index}.test`, port: 443, xray: { security: 'none', transport: 'tcp', inboundTag: 'vless-in', apiPort: 10085 } })));
+    await adoptedEmptyBaseline(context);
+    // Explicit absent/non-PPP transit. Missing state is not completed-chain readiness.
+    await models.RelayL2tpState.collection.insertOne({ node: new mongoose.Types.ObjectId(ids[2]),
+        status: 'not_installed', desiredState: 'absent', secretRevision: 0 });
 }
 function link(index) {
     const pairs = [[0, 2], [1, 2], [2, 3], [2, 4]];
@@ -84,23 +125,38 @@ function link(index) {
         portalNode: ids[source], bridgeNode: ids[target], tunnelUuid: `local-test-${index}`, tunnelPort: 10086 + index,
         autoDeploy: true, ...(index === 3 ? { geoRouting: { enabled: true, geoip: ['ru'] } } : {}) };
 }
-async function adoptedEmptyBaseline() {
-    // Same strict-schema fixture as cascadeAnyOrderMongo.reset(): existing
-    // selected-enabled models require adopted owners, even for these legacy
-    // queue cases. This is DB setup, NOT physical adoption or migration proof.
+async function adoptedEmptyBaseline(context) {
+    // Exercise the PUBLIC owner CAS and majority readback, not a seeded adopted
+    // row. Physical identity, old-PID exclusion and empty original profiles are
+    // explicitly SIMULATED local evidence, never operational adoption authority.
+    const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
     const sha = value => createHash('sha256').update(value).digest('hex');
-    const nodes = await models.HyNode.find({}).lean();
-    await models.TopologyConfigOwner.create(nodes.map((node, i) => ({ node: node._id,
-        profile: node.cascadeRole === 'portal' ? 'xray-main' : 'xray-bridge', executionContext: TEST_CONTEXT,
-        owner: 'topology', generation: '11111111-1111-4111-8111-111111111111',
-        nodeIdentity: { machineId: String(i + 1).repeat(32), sshHostKeySha256: String(i + 1).repeat(64) },
-        originalSnapshot: { configSha256: sha('{}'), unitSha256: sha('unit'), serviceActive: 'inactive', serviceEnabled: 'disabled' },
-        adoptionReceipt: { fromGeneration: '00000000-0000-4000-8000-000000000000', toGeneration: '11111111-1111-4111-8111-111111111111',
-            proofId: '22222222-2222-4222-8222-222222222222', maintenanceId: '33333333-3333-4333-8333-333333333333',
-            oldBackendInstanceId: 'local-simulated-owner', oldPid: 1, oldProcessStartTime: 'fixture-only', verifiedAt: new Date() } })));
+    const nodes = await models.HyNode.find({}).sort({ _id: 1 }).lean();
+    for (const [i, node] of nodes.entries()) {
+        const profile = node.cascadeRole === 'portal' ? 'xray-main' : 'xray-bridge';
+        const nodeIdentity = { machineId: String(i + 1).repeat(32), sshHostKeySha256: String(i + 1).repeat(64) };
+        const transfer = new TopologyConfigTransfer({ executionContext: context, TopologyConfigOwner: models.TopologyConfigOwner,
+            async withVerifiedMaintenance({ binding, proofRef }, work) {
+                assert.equal(proofRef, 'SIMULATED-empty-original');
+                assert.equal(binding.node, String(node._id)); assert.equal(binding.profile, profile);
+                assert.deepEqual(binding.nodeIdentity, nodeIdentity); assert.deepEqual(binding.executionContext, context);
+                await work({ status: 'verified', authority: 'external-maintenance-v1', binding,
+                    proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
+                    oldBackend: { instanceId: 'SIMULATED-old-backend', pid: 42, processStartTime: 'SIMULATED-start',
+                        processTree: 'stopped', dispatch: 'disabled' },
+                    readback: { source: 'node-readback', configSha256: sha('{}'), unitSha256: sha('SIMULATED-unit'),
+                        serviceActive: 'inactive', serviceEnabled: 'disabled' } });
+            } });
+        const classic = await transfer.initializeClassic({ node: String(node._id), profile, nodeIdentity });
+        const adopted = await transfer.adopt({ node: String(node._id), profile, generation: classic.generation,
+            proofRef: 'SIMULATED-empty-original' });
+        const persisted = await models.TopologyConfigOwner.findById(adopted._id).read('primary').readConcern('majority').lean();
+        assert.equal(persisted.owner, 'topology'); assert.equal(persisted.generation, adopted.generation);
+        assert.equal(persisted.adoptionReceipt.fromGeneration, classic.generation);
+    }
 }
 const local = { skip: !process.env.C3_MONGOD && 'Set C3_MONGOD to an isolated local MongoDB binary' };
-test('four acceptances are durable before any draft mutation; duplicate and overflow are transactional', local, async () => {
+test('v1 acceptances remain durable before draft mutation; duplicate and overflow are transactional', local, async () => {
     await reset();
     assert.equal(typeof moduleEntry.createTopologyIntentService, 'function', 'the runtime must expose persisted-intent admission');
     const service = createIntentService({ ...models, capacity: 4 });
@@ -238,7 +294,8 @@ test('ambiguous and duplicate acceptance readbacks enforce the exact payload ide
     });
 });
 test('PROD HTTP acceptance pins the immutable server identity through consumer admission', local, async () => {
-    await reset();
+    const prod = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+    await reset(prod);
     const express = require('express');
     const { createCascadeLinksRouter } = require('../../../routes/cascadeLinks');
     const context = { target: 'production', hostIdentity: 'lm1.infograd.online' };
@@ -266,9 +323,10 @@ test('PROD HTTP acceptance pins the immutable server identity through consumer a
         });
         const body = await response.json();
         assert.equal(response.status, 202, JSON.stringify(body));
-        assert.equal(await models.CascadeLink.countDocuments(), 0);
-        const jobId = body.autoDeployJob.jobId;
-        const prod = { target: 'production', hostIdentity: 'lm1.infograd.online' };
+        assert.equal(await models.CascadeLink.countDocuments(), 1, 'new HTTP v2 persists desired state at acceptance');
+        assert.equal(body.desiredSaved, true); assert.equal(body.job.version, 2);
+        assert.deepEqual(body.autoDeployJob, body.job, 'legacy response alias carries the current v2 envelope');
+        const jobId = body.job.jobId;
         const persisted = await models.TopologyCreateIntent.findById(jobId).lean();
         assert.deepEqual(persisted.executionContext, prod);
         await models.TopologyCreateIntent.updateOne({ _id: jobId }, { $set: {
@@ -288,10 +346,12 @@ test('PROD HTTP acceptance pins the immutable server identity through consumer a
         assert.deepEqual(unchanged.executionContext, prod);
         assert.equal(unchanged.idempotencyKey, operation.idempotencyKey);
         assert.match(operation.idempotencyKey, /production.*lm1\.infograd\.online/);
-        await finish(operation);
+        // Admission is not operational PROD authority. Never relabel it TEST or
+        // manually fabricate success just to exercise queue settlement.
+        assert.equal(operation.status, 'queued'); assert.equal(operation.heldTopologyAdmission, true);
         await service.runOnce();
-        assert.equal((await service.get(jobId)).status, 'succeeded');
-        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 0);
+        assert.equal((await service.get(jobId)).status, 'admitted');
+        assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 1);
     } finally { await new Promise(resolve => server.close(resolve)); }
 });
 test('cloned, missing and cross-paired queue identities never acquire or release ownership', local, async t => {
@@ -364,21 +424,25 @@ test('intent replay cannot acknowledge a different or unbound execution identity
     });
 });
 test('settlement rejects cloned and unbound operations without releasing queue ownership', local, async t => {
-    const prod = { target: 'production', hostIdentity: 'lm1.infograd.online' };
     const cases = [
         { name: 'missing context', unset: { executionContext: '' }, code: 'TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH' },
-        { name: 'cross context', set: { executionContext: { target: 'test', hostIdentity: 'test.infograd.online' } }, code: 'TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH' },
+        { name: 'cross context', set: { executionContext: { target: 'production', hostIdentity: 'lm1.infograd.online' } }, code: 'TOPOLOGY_INTENT_EXECUTION_CONTEXT_MISMATCH' },
         { name: 'missing key', unset: { idempotencyKey: '' }, code: 'TOPOLOGY_INTENT_BINDING_INVALID' },
-        { name: 'foreign key', set: { idempotencyKey: 'topology:test:revision-8:host-test.infograd.online:00000000-0000-0000-0000-000000000000' }, code: 'TOPOLOGY_INTENT_BINDING_INVALID' },
-        { name: 'other run on same host', set: { idempotencyKey: 'topology:production:revision-8:host-lm1.infograd.online:00000000-0000-0000-0000-000000000000' }, code: 'TOPOLOGY_INTENT_BINDING_INVALID' },
+        { name: 'foreign key', set: { idempotencyKey: 'topology:production:revision-8:host-lm1.infograd.online:00000000-0000-0000-0000-000000000000' }, code: 'TOPOLOGY_INTENT_BINDING_INVALID' },
+        { name: 'other run on same host', set: { idempotencyKey: 'topology:test:revision-8:host-test.infograd.online:00000000-0000-0000-0000-000000000000' }, code: 'TOPOLOGY_INTENT_BINDING_INVALID' },
     ];
-    for (const item of cases) await t.test(item.name, async () => {
+    for (const phase of ['queued', 'terminal']) for (const item of cases) await t.test(`${phase}: ${item.name}`, async () => {
         await reset();
-        const service = createIntentService({ ...models, executionContext: prod });
-        const job = await service.accept({ expectedTopologyRevision: 7, requestKey: 'settle-identity', link: link(0) });
+        const service = createIntentService(models);
+        const job = await service.accept({ expectedTopologyRevision: 7, requestKey: 'settle-identity', link: link(2) });
         await service.runOnce();
         const intent = await models.TopologyCreateIntent.findById(job.jobId).lean();
-        await finish(await models.TopologyOperation.findById(intent.operationId).lean());
+        assert.equal(intent.status, 'admitted', 'identity corruption must reach a genuine queue binding');
+        const operation = await models.TopologyOperation.findById(intent.operationId).lean();
+        assert.equal(operation.status, 'queued'); assert.equal(operation.heldTopologyAdmission, true);
+        await service.runOnce();
+        assert.equal((await service.get(job.jobId)).status, 'admitted', 'a valid nonterminal operation retains capacity');
+        if (phase === 'terminal') await finish(operation);
         await models.TopologyOperation.collection.updateOne({ _id: intent.operationId }, {
             ...(item.set ? { $set: item.set } : {}), ...(item.unset ? { $unset: item.unset } : {}),
         });
@@ -391,15 +455,84 @@ test('settlement rejects cloned and unbound operations without releasing queue o
     });
 });
 async function finish(operation) {
-    const now = new Date(); const leaseUntil = new Date(now.getTime() + 60000);
-    await models.TopologyOperation.updateOne({ _id: operation._id }, { $set: { status: 'committing', leaseOwner: 'local-finalizer', leaseUntil } });
-    const finalizer = new TopologyOperationFinalizationRepository(models);
-    // Publication reads kind/link/staged identity from the frozen operation;
-    // the public boundary accepts only the exact claim/revision request fields.
-    assert.ok(await finalizer.finalizeSucceeded({ operationId: String(operation._id), owner: 'local-finalizer', leaseUntil, now,
-        topologyRevision: operation.topologyRevision, priorDeployedRevision: operation.priorDeployedRevision,
-    }), 'the unchanged exact finalizer must accept the frozen operation');
+    assert.ok(operation, 'the intended boundary requires a real admitted operation');
+    const { createTopologyOperationRuntime } = require('../runtime/createTopologyOperationRuntime');
+    const { TopologyOperationWorker } = require('../workers/topologyOperationWorker');
+    const calls = [];
+    const state = await models.RelayL2tpState.findOne({ node: ids[2] }).select('node status desiredState secretRevision routeGroup activePathKey appliedTopologyRevision').lean();
+    assert.equal(state.status, 'not_installed'); assert.equal(state.secretRevision, 0);
+    assert.deepEqual(await models.L2tpUser.find({ relayNode: ids[2] }).select('_id').lean(), []);
+    assert.equal(await models.L2tpOperation.findOne({ node: ids[2], status: { $in: ['queued', 'running', 'rolling_back'] } }).select('_id').lean(), null);
+    const executor = { async prepare(input) { calls.push(['prepare', input.node.node]); return { backupId: `SIMULATED-${input.node.node}`, prepared: {} }; },
+        async commit(input) { calls.push(['commit', input.node.node]); return { ok: true }; },
+        async verify(input) { calls.push(['verify', input.node.node]); return { ok: true }; },
+        async cleanupPrepared() { return { ok: true }; }, async rollback() { assert.fail('unexpected rollback'); } };
+    const runtime = createTopologyOperationRuntime({ ...models,
+        env: { L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', PANEL_DOMAIN: TEST_CONTEXT.hostIdentity },
+        createTopologyOperationExecutor: () => executor,
+        OperationWorker: class extends TopologyOperationWorker {
+            constructor(input) { super({ ...input, userResync: { async resyncPlan() { return { ok: true }; } },
+                pppReadinessGate: { async verifyPlan(plan) {
+                    const result = await input.pppReadinessGate.verifyPlan(plan);
+                    calls.push(['ppp', result, { staged: plan.staged, kind: plan.kind, routeState: plan.routeState,
+                        nodes: plan.nodes.map(({ node, nodeRef, role }) => ({ node, nodeRef, role })) }]);
+                    return result;
+                } } }); }
+        } });
+    assert.ok(runtime.operationWorker, 'real local worker/finalizer must assemble');
+    const result = await runtime.operationWorker.run(String(operation._id));
+    assert.equal(result.status, 'succeeded', JSON.stringify({ result, calls }));
+    const persisted = await models.TopologyOperation.findById(operation._id).lean();
+    assert.equal(persisted.status, 'succeeded'); assert.equal(persisted.heldTopologyAdmission, false);
+    assert.equal(await models.NodeOperationLock.countDocuments({ operationId: String(operation._id) }), 0);
+    assert.equal(calls.filter(([method]) => method === 'verify').length, operation.nodes.length);
 }
+async function continueStoredV1(index) {
+    await reset();
+    // Historical storage shape, inserted independently of today's accept API.
+    // Exercise both forms: prefix staging must not require an installed owner.
+    const desired = link(index);
+    const payload = JSON.parse(JSON.stringify(new models.CascadeLink({ ...desired,
+        active: true, status: 'pending', autoDeploy: true }).toObject()));
+    const canonical = value => Array.isArray(value) ? value.map(canonical)
+        : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+    const { _id, ...content } = payload;
+    const payloadHash = createHash('sha256').update(JSON.stringify(canonical(content))).digest('hex');
+    const stored = { _id: new mongoose.Types.ObjectId(), version: 1, executionContext: TEST_CONTEXT,
+        requestKey: 'existing-v1-record', payload, payloadHash, ordinal: 1, acceptanceRevision: 7,
+        status: 'waiting', attempts: 0, generation: 0, createdAt: new Date(0), updatedAt: new Date(0) };
+    await models.TopologyCreateIntent.collection.insertOne(stored);
+    await models.TopologyIntentQueueState.create({ _id: 'create-v1', ordinal: 1, outstanding: 1 });
+    const persisted = await models.TopologyCreateIntent.findById(stored._id).select('+payload').lean();
+    assert.equal((await models.TopologyCreateIntent.findById(stored._id).lean()).payload, undefined, 'real select:false remains intact');
+    assert.equal(persisted.kind, undefined); assert.equal(persisted.linkId, undefined);
+    assert.equal(persisted.desiredVersion, undefined); assert.equal(persisted.resourceNodeIds, undefined);
+    assert.deepEqual(persisted.payload, payload); assert.equal(await models.CascadeLink.countDocuments(), 0);
+    const restarted = createIntentService({ ...models, prepareLink() { assert.fail('stored v1 must not regenerate credentials'); } });
+    const start = commands.length;
+    await restarted.runOnce();
+    const bound = await restarted.get(String(stored._id));
+    assert.equal(bound.status, 'admitted', JSON.stringify(bound));
+    assert.equal(bound.createdLinkId, String(desired._id));
+    assert.equal(await models.CascadeLink.countDocuments(), 1); assert.equal(await models.TopologyOperation.countDocuments(), 1);
+    const operation = await models.TopologyOperation.findById(bound.operationId).lean();
+    assert.equal(operation.kind, 'link.apply'); assert.equal(operation.topologyRevision, 8);
+    assert.equal((await models.CascadeLink.findById(desired._id).lean()).tunnelUuid, desired.tunnelUuid);
+    assert.ok(commands.slice(start).some(command => command.name === 'find' && command.collection === models.TopologyCreateIntent.collection.name
+        && command.id === String(stored._id) && command.projection?.payload !== 0), 'real consumer must load the exact private stored payload');
+    await finish(operation);
+    await createIntentService(models).runOnce();
+    assert.equal((await restarted.get(String(stored._id))).status, 'succeeded');
+    assert.equal((await models.TopologyIntentQueueState.findById('create-v1').lean()).outstanding, 0);
+    assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).topologyAdmissionCount, 0);
+    assert.equal(await models.TopologyOperation.countDocuments(), 1);
+    const terminal = await models.TopologyCreateIntent.findById(stored._id).select('+payload').lean();
+    assert.equal(terminal.version, 1); assert.deepEqual(terminal.payload, payload); assert.equal(terminal.payloadHash, payloadHash);
+}
+test('existing stored v1 backlog continues without a new acceptance or a v2 desired envelope', local, async t => {
+    for (const index of [2, 0]) await t.test(index === 2 ? 'source-less suffix' : 'bridge-less prefix', () => continueStoredV1(index));
+});
+
 test('legacy autoDeploy pending drafts are neither inferred as intents nor included in a scoped baseline', local, async () => {
     await reset();
     const legacy = link(1);
@@ -421,7 +554,6 @@ test('consumer rejects active or missing remote counters and rolls back draft as
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
     for (const remoteCount of [2, undefined]) await t.test(`remote counter ${remoteCount}`, async () => {
         await reset();
-        await adoptedEmptyBaseline();
         await models.CascadeTopologyState.collection.updateOne({ _id: 'singleton' },
             remoteCount === undefined ? { $unset: { remoteAdmissionCount: '' } }
                 : { $set: { remoteAdmissionCount: remoteCount } });
@@ -585,10 +717,6 @@ test('assembled TEST panel host exposes the durable service and supervises start
 });
 test('four actual HTTP POSTs while deployment is suspended survive assembled-host restart and never use general Sync', local, async () => {
     await reset();
-    // Explicit non-PPP transit identity. A missing row is not permission to
-    // bypass PPP readiness once the chain has a bridge.
-    await models.RelayL2tpState.collection.insertOne({ node: new mongoose.Types.ObjectId(ids[2]),
-        status: 'not_installed', desiredState: 'absent', secretRevision: 0 });
     const express = require('express');
     const { createCascadeLinksRouter } = require('../../../routes/cascadeLinks');
     const { l2tpActiveHostProvider } = require('../../l2tpActiveHostProvider');
@@ -646,15 +774,17 @@ test('four actual HTTP POSTs while deployment is suspended survive assembled-hos
             const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': `http-${i}` }, body: JSON.stringify(body) });
             const accepted = await response.json();
             assert.equal(response.status, 202, JSON.stringify(accepted));
-            assert.equal(accepted.createdLinkId, undefined); assert.equal(accepted.autoDeployOperation, undefined);
-            jobs.push(accepted.autoDeployJob);
+            assert.equal(accepted.desiredSaved, true); assert.equal(accepted.job.version, 2);
+            assert.equal(accepted.createdLinkId, accepted.job.linkId); assert.equal(accepted.autoDeployOperation, undefined);
+            assert.deepEqual(accepted.autoDeployJob, accepted.job);
+            jobs.push(accepted.job);
             if (i === 0) { firstHost.start(); await until(async () => { assert.equal(executions.length, 1); }); }
         }
-        assert.equal(await models.CascadeLink.countDocuments(), 1);
+        assert.equal(await models.CascadeLink.countDocuments(), 4, 'HTTP v2 saves all desired drafts immediately');
         assert.equal(await models.TopologyCreateIntent.countDocuments(), 4);
-        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 8);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).revision, 11);
         const queued = await (await fetch(`${url}/auto-deploy-jobs/${jobs[3].jobId}`)).json();
-        assert.equal(queued.autoDeployJob.status, 'waiting'); assert.equal(queued.autoDeployJob.createdLinkId, undefined);
+        assert.equal(queued.job.status, 'waiting'); assert.equal(queued.job.createdLinkId, jobs[3].linkId);
         let drained = false; const stopping = firstHost.stop().then(() => { drained = true; });
         await new Promise(resolve => setImmediate(resolve)); assert.equal(drained, false);
         release(); await stopping; l2tpActiveHostProvider.clearActiveHost(firstHost);
@@ -664,7 +794,9 @@ test('four actual HTTP POSTs while deployment is suspended survive assembled-hos
         assert.equal(await models.TopologyCreateIntent.countDocuments({ status: 'succeeded' }), 4,
             JSON.stringify({ jobs: await models.TopologyCreateIntent.find({}).lean(), ops: await models.TopologyOperation.find({}).select('status heldTopologyAdmission topologyRevision nodes.state').lean() }));
         const operations = await models.TopologyOperation.find({}).sort({ topologyRevision: 1 }).lean();
-        assert.deepEqual(operations.map(row => row.topologyRevision), [8, 9, 10, 11]);
+        // All desired creates committed while the first worker was suspended;
+        // selected v2 admission pins the then-current revision without writing it.
+        assert.deepEqual(operations.map(row => row.topologyRevision), [8, 11, 11, 11]);
         assert(operations.every(row => row.kind === 'link.apply'), 'every operation is scoped, never general Sync');
         for (const operation of operations) for (const node of operation.nodes.filter(row => row.role === 'portal')) {
             const config = JSON.parse(Buffer.from(node.candidate.bytes).toString('utf8'));
@@ -688,7 +820,6 @@ test('concurrent overflow admits exactly the bounded capacity and reports safe r
 });
 test('expired claim recovery fences an old generation before any draft mutation', local, async () => {
     await reset();
-    await adoptedEmptyBaseline();
     let instant = new Date(); const clock = { now: () => instant };
     const { TopologyIntentConsumer } = require('../services/topologyIntentConsumer');
     const service = createIntentService(models);
