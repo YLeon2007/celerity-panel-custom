@@ -31,6 +31,10 @@ const schema = new mongoose.Schema({
     originalSnapshot: { type: snapshotSchema },
     adoptionReceipt: { type: receiptSchema },
     handbackReceipt: { type: receiptSchema },
+    // Private, exact observed classic descriptors/profile bytes. Written only
+    // with adoption, never an invented settled operation or mutable desired.
+    // No default: legacy records do not silently become imported baselines.
+    legacyAppliedTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
     // No defaults: an unbound/cloned/legacy row is not an adoption permit.
     owner: { type: String, required: true, enum: ['classic', 'topology'] },
     // Operation settlement metadata never hands permanent ownership to classic.

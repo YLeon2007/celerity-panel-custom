@@ -127,10 +127,15 @@ class TopologyDeploymentRepository {
             }),
             groups: [], // Only settled policies may be preserved by a link apply.
         });
-        const catalog = await withSession(this.TopologyConfigOwner.find({}), session).lean();
+        const catalog = await withSession(this.TopologyConfigOwner.find({}).select('+legacyAppliedTopology'), session).lean();
         const resources = new Set([String(target.portalNode), String(target.bridgeNode)]);
+        for (const row of catalog) {
+            if (row.lastSettledOperation !== undefined || !Array.isArray(row.legacyAppliedTopology?.links)) continue;
+            const old = row.legacyAppliedTopology.links.find(link => link.id === scope.linkId);
+            if (old) { resources.add(old.source); resources.add(old.target); }
+        }
         // Endpoint edits must also clean the OLD applied profiles. Discover the
-        // old selected link only through existing owner settlement pointers;
+        // old selected link through adoption evidence or settlement pointers;
         // the loop below verifies every discovered owner/component in full.
         const pointers = [...new Set(catalog.map(row => row.lastSettledOperation).filter(Boolean))];
         if (pointers.length) {
@@ -179,11 +184,18 @@ class TopologyDeploymentRepository {
             }
             owners.set(node, owner);
             if (owner.lastSettledOperation === undefined) {
-                if (!EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)
-                    || owner.lastSettledGeneration !== undefined || owner.lastSettledRevision !== undefined
+                if (owner.lastSettledGeneration !== undefined || owner.lastSettledRevision !== undefined
                     || owner.lastSettledCloseId !== undefined) throw selectedError();
-                // The adopted original {} proves an empty managed graph, not a
-                // fictitious terminal operation. Retain the real owner pin below.
+                if (owner.legacyAppliedTopology !== undefined) {
+                    try {
+                        const imported = require('../../../services/topologyConfigTransfer').verifyLegacyAppliedProfile(
+                            owner.legacyAppliedTopology, { node, profile, originalSnapshot: owner.originalSnapshot });
+                        if (!same(imported, owner.legacyAppliedTopology)) throw selectedError();
+                        add(imported);
+                    } catch { throw selectedError('TOPOLOGY_LEGACY_IMPORT_MISMATCH'); }
+                } else if (!EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)) throw selectedError();
+                // A real adoption readback proves the imported profile (or {})
+                // without manufacturing a terminal operation or tunnel proof.
                 continue;
             }
             const operation = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation)
@@ -215,6 +227,14 @@ class TopologyDeploymentRepository {
         // snapshot. A stale partial pointer is not a source of old descriptors.
         for (const node of baseline.nodes) {
             const owner = owners.get(node.id);
+            if (owner.lastSettledOperation === undefined) {
+                const imported = owner.legacyAppliedTopology;
+                if (!imported || imported.nodes.some(member => {
+                    const peer = owners.get(member.id);
+                    return !peer || peer.lastSettledOperation !== undefined || !same(peer.legacyAppliedTopology, imported);
+                })) throw selectedError('TOPOLOGY_LEGACY_IMPORT_INCOMPLETE');
+                continue;
+            }
             const source = await withSession(this.TopologyOperation.findById(owner.lastSettledOperation).select(SELECTED_FIELDS), session).lean();
             const component = componentAt(durableSelectedTopology(source.effectiveTopology), node.id);
             if (component.nodes.some(member => owners.get(member.id)?.lastSettledOperation !== owner.lastSettledOperation)) throw selectedError();
