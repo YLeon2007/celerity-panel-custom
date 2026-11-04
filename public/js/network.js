@@ -144,6 +144,8 @@
     }
 
     function deployResultMessage(result, labels = {}) {
+        const job = result?.job || result?.autoDeployJob;
+        if (job?.jobId) return (labels.jobAccepted || 'Намерение сохранено; задание принято. Применение ещё не подтверждено.') + ' ' + job.jobId;
         const outcome = isCompletedClassicDeploymentResult(result, result.topologyRevision)
             ? (labels.classicLinkApplied || 'Связь применена (classic)')
             : result.status === 'succeeded'
@@ -233,6 +235,10 @@
     let linkModalSavedFingerprint = null;
     const pendingCreateRequests = { main: null, quick: null };
     const intentPolls = new Map();
+    const deleteTombstones = new Map();
+    const confirmedDeletions = new Set();
+    const linkProgress = new Map();
+    let listedLinkIds = new Set();
     let topologyRevision = null;
     let deployedRevision = null;
     let _allLinks = [];
@@ -245,20 +251,67 @@
         }
         topologyRevision = snapshot.topologyRevision;
         deployedRevision = snapshot.deployedRevision;
-        _allLinks = snapshot.links;
+        listedLinkIds = new Set(snapshot.links.map(link => link._id));
+        for (const link of snapshot.links) {
+            if (link.lifecycle?.state === 'deleting' && /^[a-f0-9]{24}$/.test(link.lifecycle.deleteJobId || '')) {
+                retainDeletion(link, link.lifecycle.deleteJobId);
+                startIntentPolling({ jobId: link.lifecycle.deleteJobId, version: 2, kind: 'link.delete', linkId: link._id });
+            }
+        }
+        _allLinks = snapshot.links.map(link => deleteTombstones.has(link._id)
+            ? deletionLink(link, deleteTombstones.get(link._id)) : link);
+        for (const [linkId, state] of deleteTombstones) {
+            if (!listedLinkIds.has(linkId)) _allLinks.push(deletionLink(state.link, state));
+        }
         return snapshot;
     }
 
-    async function handleDraftMutationResponse(response) {
+    function retainDeletion(link, jobId) {
+        if (!link) return;
+        const previous = deleteTombstones.get(link._id);
+        if (previous?.jobId && previous.jobId !== jobId) return;
+        deleteTombstones.set(link._id, previous?.jobId ? previous : { link: { ...(previous?.link || link) }, jobId, reconcile: !jobId });
+    }
+
+    function deletionLink(link, state) {
+        return { ...link, lifecycle: state.jobId ? { ...link.lifecycle, state: 'deleting', deleteJobId: state.jobId } : link.lifecycle,
+            applicationState: state.reconcile ? 'reconcile_required' : 'deleting', clientReadiness: undefined,
+            xrayReadiness: 'unverified' };
+    }
+
+    function responseJob(payload, expectedKind, expectedLinkId) {
+        const job = payload?.job || payload?.autoDeployJob;
+        if (!job) return null;
+        if (typeof job.jobId !== 'string' || !/^[a-f0-9]{24}$/.test(job.jobId)
+            || (job.version !== undefined && job.version !== 2)
+            || (expectedKind && expectedKind !== 'link.create' && job.version !== 2)
+            || (payload.job && payload.autoDeployJob && payload.job.jobId !== payload.autoDeployJob.jobId)
+            || (job.version === 2 && (!['link.create', 'link.apply', 'link.delete'].includes(job.kind)
+                || typeof job.linkId !== 'string' || !/^[a-f0-9]{24}$/.test(job.linkId)
+                || job.desiredSaved !== true || (expectedKind && job.kind !== expectedKind)
+                || (expectedLinkId && job.linkId !== expectedLinkId)))) {
+            throw new Error(i18n.operationUnconfirmed || 'Ответ задания не подтверждён; обновите топологию.');
+        }
+        return job;
+    }
+
+    async function handleDraftMutationResponse(response, expectedKind, expectedLinkId) {
         const payload = await response.json().catch(() => ({}));
-        const errorMessage = describeTopologyError(payload, 'HTTP ' + response.status);
+        const errorMessage = (payload.desiredSaved === true
+            ? (i18n.savedApplyUnconfirmed || 'Изменения сохранены; принятие применения не подтверждено. Обновите топологию.') + ' ' : '')
+            + describeTopologyError(payload, 'HTTP ' + response.status);
+        if (!response.ok && payload.desiredSaved === true) await loadTopology();
         if (response.status === 409) {
             await loadTopology();
             showToast((i18n.networkError || 'Error') + ': ' + errorMessage, 'error');
             return null;
         }
         if (!response.ok) throw new Error(errorMessage);
-        if (response.status === 202 && /^[a-f0-9]{24}$/i.test(payload?.autoDeployJob?.jobId || '')) {
+        const job = response.status === 202 ? responseJob(payload, expectedKind, expectedLinkId) : null;
+        if (job) {
+            if (job.version === 2 && (payload.desiredSaved !== true || payload.linkId !== job.linkId)) {
+                throw new Error(i18n.operationUnconfirmed || 'Ответ задания не подтверждён');
+            }
             // Acceptance is not a draft snapshot and must not advance the visible revision.
             return payload;
         }
@@ -378,8 +431,10 @@
             const data = await topologyRes.json();
             applyLinkSnapshot(await linksRes.json());
             renderGraph(data);
+            return true;
         } catch (err) {
             console.error('[Network] Topology load error:', err);
+            return false;
         } finally {
             showLoading(false);
         }
@@ -387,26 +442,11 @@
 
     async function refreshStatuses() {
         try {
-            const res = await fetch('/api/cascade/topology');
-            if (!res.ok) return;
+            const [res, linksRes] = await Promise.all([fetch('/api/cascade/topology'), fetch('/api/cascade/links')]);
+            if (!res.ok || !linksRes.ok) return;
             const data = await res.json();
-            cy.batch(function () {
-                for (const n of data.nodes) {
-                    const ele = cy.getElementById(n.data.id);
-                    if (ele.length) {
-                        ele.data('status', n.data.status);
-                        ele.data('onlineUsers', n.data.onlineUsers);
-                    }
-                }
-                for (const e of data.edges) {
-                    const ele = cy.getElementById(e.data.id);
-                    if (ele.length) {
-                        ele.data('status', e.data.status);
-                        ele.data('latencyMs', e.data.latencyMs);
-                        ele.data('clientReadiness', e.data.clientReadiness);
-                    }
-                }
-            });
+            applyLinkSnapshot(await linksRes.json());
+            renderGraph(data);
         } catch (_) {}
     }
 
@@ -452,11 +492,25 @@
         // can survive in cached graphs; they must not break every other edge.
         // The link inventory and deployment authorization remain unchanged.
         const visibleNodeIds = new Set(data.nodes.map(n => n.data.id));
-        for (const e of data.edges) {
+        const edges = [...data.edges];
+        const edgeIds = new Set(edges.map(edge => edge.data.linkId));
+        for (const link of _allLinks) {
+            if (!deleteTombstones.has(link._id) || edgeIds.has(link._id)) continue;
+            const nodeId = node => typeof node === 'string' ? node : node?._id;
+            edges.push({ data: { ...link, id: 'link-' + link._id, linkId: link._id,
+                source: nodeId(link.portalNode), target: nodeId(link.bridgeNode), label: link.name } });
+        }
+        for (const e of edges) {
             if (!e?.data || !visibleNodeIds.has(e.data.source) || !visibleNodeIds.has(e.data.target)) continue;
+            if (confirmedDeletions.has(e.data.linkId) && !listedLinkIds.has(e.data.linkId)) continue;
+            const link = _allLinks.find(link => link._id === e.data.linkId);
+            const projection = {};
+            if (link) for (const key of ['applicationState', 'routeState', 'tunnelState', 'pppReadiness',
+                'xrayReadiness', 'clientReadiness', 'appliedOperationId', 'desiredVersion', 'lifecycle']) projection[key] = link[key];
+            const edgeData = { ...e.data, ...projection, progress: linkProgress.get(e.data.linkId) };
             elements.push({
                 group: 'edges',
-                data: { ...e.data, edgeLabel: buildEdgeLabel(e.data) },
+                data: { ...edgeData, edgeLabel: buildEdgeLabel(edgeData) },
             });
         }
 
@@ -475,6 +529,8 @@
 
     function buildEdgeLabel(d) {
         const parts = [];
+        if (deleteTombstones.has(d.linkId)) parts.push(d.applicationState === 'reconcile_required'
+            ? (i18n.reconcileRequired || 'Ожидает сверки') : (i18n.linkDeleting || 'Удаляется'));
         const modePrefix = d.mode === 'forward' ? 'F' : 'R';
         parts.push(modePrefix);
         if (d.tunnelProtocol) parts.push(d.tunnelProtocol.toUpperCase());
@@ -944,8 +1000,9 @@
             '</div>' +
             field(i18n.drawerStatus || 'Status',
                 '<div class="info-status ' + sc + '">\u25CF ' + (d.status || 'pending') + '</div>') +
-            field('ti-shield-check', 'Готовность клиента',
-                escHtml(clientReadinessMessage(d.clientReadiness, topologyRevision, deployedRevision))) +
+            linkStateFields(d) +
+            (d.xrayReadiness === undefined ? field('ti-shield-check', 'Готовность клиента',
+                escHtml(clientReadinessMessage(d.clientReadiness, topologyRevision, deployedRevision))) : '') +
             field(i18n.linkMode || 'Mode', modeLabel) +
             field('ti-plug',           i18n.drawerTunnelPort        || 'Tunnel Port',         d.tunnelPort || '—') +
             field('ti-arrows-exchange',i18n.drawerProtocolTransport || 'Protocol / Transport',
@@ -973,6 +1030,29 @@
             '<p class="info-hint">' + escHtml(syncDomainScope) + '</p>' +
             (domainSyncAnchorError(lid)
                 ? '<p class="info-hint">' + escHtml(domainSyncAnchorError(lid)) + '</p>' : ''));
+    }
+
+    function linkStateFields(d) {
+        const application = { not_applied: i18n.linkNotApplied || 'Не применено', applying: i18n.deployInProgress || 'Применяется',
+            applied: i18n.linkApplied || 'Конфигурация участка применена', deleting: i18n.linkDeleting || 'Удаляется',
+            reconcile_required: i18n.reconcileRequired || 'Ожидает сверки' };
+        const routes = { complete: i18n.routeComplete || 'Маршрут завершён; клиентские проверки отдельно',
+            no_portal_input: i18n.routeNoPortal || 'Нет входящего пути от портала',
+            no_bridge_exit: i18n.routeNoBridge || 'Нет выхода к бриджу', policy_ambiguous: i18n.routeAmbiguous || 'Политика выхода неоднозначна',
+            unknown: i18n.routeUnknown || 'Целостность маршрута не подтверждена' };
+        const tunnels = { connected: i18n.tunnelConnected || 'Соединён', disconnected: i18n.tunnelDisconnected || 'Не соединён',
+            unknown: i18n.tunnelUnknown || 'Соединение не подтверждено' };
+        const verified = i18n.readinessVerified || 'Подтверждено';
+        const unverified = i18n.clientReadinessUnverified || CLIENT_READINESS_UNVERIFIED;
+        const xrayVerified = d.xrayReadiness === 'verified' && d.applicationState === 'applied'
+            && d.routeState === 'complete' && d.tunnelState === 'connected'
+            && typeof d.appliedOperationId === 'string' && /^[a-f0-9]{24}$/.test(d.appliedOperationId);
+        return field(i18n.applicationStateLabel || 'Применение', escHtml(application[d.applicationState] || '—'))
+            + field(i18n.routeStateLabel || 'Целостность маршрута', escHtml(routes[d.routeState] || routes.unknown))
+            + field(i18n.tunnelStateLabel || 'Туннель', escHtml(tunnels[d.tunnelState] || tunnels.unknown))
+            + field('PPP/L2TP', escHtml(d.pppReadiness === 'verified' ? verified : unverified))
+            + field('Xray/VLESS/REALITY', escHtml(xrayVerified ? verified : unverified))
+            + (d.progress ? field(i18n.operationProgress || 'Задание / фаза / причина / следующее действие', escHtml(progressMessage(d.progress))) : '');
     }
 
     function escHtml(v) {
@@ -1230,33 +1310,67 @@
         if (domGroup) domGroup.style.display = '';
     }
 
+    function progressMessage(progress) {
+        const parts = [];
+        if (/^[a-f0-9]{24}$/.test(progress?.jobId || '')) parts.push('Job: ' + progress.jobId);
+        if (/^[a-f0-9]{24}$/.test(progress?.operationId || '')) parts.push('Operation: ' + progress.operationId);
+        const phases = { waiting: i18n.phaseWaiting, admitted: i18n.phaseAdmitted, preparing: i18n.phasePreparing,
+            applying: i18n.phaseApplying, rolling_back: i18n.phaseRollback, completed: i18n.phaseCompleted,
+            failed: i18n.phaseFailed, rolled_back: i18n.phaseRollback, succeeded: i18n.phaseCompleted,
+            blocked: i18n.reconcileRequired, reconcile_required: i18n.reconcileRequired };
+        if (Object.hasOwn(phases, progress?.phase)) parts.push(phases[progress.phase] || progress.phase);
+        const reasons = { TOPOLOGY_INTENT_RESOURCE_BUSY: i18n.waitResources, TOPOLOGY_DEPLOY_BUSY: i18n.waitResources,
+            TOPOLOGY_RECONCILE_REQUIRED: i18n.reconcileRequired, PPP_SYNC_PENDING: i18n.waitPPP };
+        if (Object.hasOwn(reasons, progress?.waitingReason)) parts.push((reasons[progress.waitingReason] || '') + ' (' + progress.waitingReason + ')');
+        if (/^[a-f0-9]{24}$/.test(progress?.nodeId || '')) parts.push((i18n.operationNode || 'Узел') + ': ' + progress.nodeId);
+        const actions = { poll_operation: i18n.pollOperation, inspect_operation: i18n.inspectOperation,
+            refresh_topology: i18n.refreshTopology, retry_later: i18n.retryLater };
+        if (Object.hasOwn(actions, progress?.nextAction)) parts.push(actions[progress.nextAction] || progress.nextAction);
+        return parts.join(' · ');
+    }
+
     function startIntentPolling(job) {
         const jobId = job?.jobId;
-        if (!/^[a-f0-9]{24}$/i.test(jobId || '') || intentPolls.has(jobId) || intentPolls.size >= 128) return;
-        const state = { failures: 0 };
+        if (!/^[a-f0-9]{24}$/.test(jobId || '') || intentPolls.has(jobId)
+            || [...intentPolls.values()].filter(state => !state.done).length >= 128) return;
+        const state = { failures: 0, attempts: 0, done: false, job };
+        if (job.linkId) linkProgress.set(job.linkId, job);
         const step = async () => {
             try {
                 const response = await fetch('/api/cascade/links/auto-deploy-jobs/' + encodeURIComponent(jobId));
                 if (!response.ok) throw new Error('Job status unavailable');
-                const current = (await response.json()).autoDeployJob;
-                if (current?.jobId !== jobId) throw new Error('Job identity mismatch');
+                const current = responseJob(await response.json(), job.kind, job.linkId);
+                if (current?.jobId !== jobId || (job.version === 2 && current.version !== 2)) throw new Error('Job identity mismatch');
                 state.failures = 0;
+                if (current.linkId) linkProgress.set(current.linkId, current);
                 if (['failed', 'blocked'].includes(current.status)) {
-                    intentPolls.delete(jobId);
-                    showToast('Автодеплой ' + jobId + ': ' + (current.status === 'blocked' ? 'заблокирован; требуется проверка' : 'завершился ошибкой'), 'error');
+                    state.done = true;
+                    const tombstone = deleteTombstones.get(job.linkId);
+                    if (tombstone) tombstone.reconcile = true;
+                    showToast((current.status === 'blocked' ? (i18n.reconcileRequired || 'Ожидает сверки')
+                        : (i18n.deployFailed || 'Операция не выполнена')) + ': ' + jobId
+                        + ' ' + describeTopologyError({ error: { code: current.errorCode } }, ''), 'error');
                     await loadTopology(); return;
                 }
-                if (current.operationId && ['admitted', 'succeeded'].includes(current.status)) {
-                    intentPolls.delete(jobId);
-                    startBoundOperationPolling(current.operationId, 'link.apply');
+                if (typeof current.operationId === 'string' && /^[a-f0-9]{24}$/.test(current.operationId) && ['admitted', 'succeeded'].includes(current.status)) {
+                    state.done = true;
+                    startBoundOperationPolling(current.operationId, current.kind === 'link.delete' ? 'link.delete' : 'link.apply', current.linkId, jobId);
                     await loadTopology(); return;
                 }
+                const message = progressMessage(current);
+                if (message !== state.message) { state.message = message; showToast(message); }
+                await loadTopology();
             } catch (_) {
                 if (++state.failures >= 6) {
-                    intentPolls.delete(jobId);
-                    showToast('Статус задания ' + jobId + ' недоступен. Принятый запрос остаётся на сервере.', 'error');
+                    state.done = true;
+                    showToast((i18n.jobUnavailable || 'Статус задания недоступен. Принятый запрос остаётся на сервере.') + ' ' + jobId, 'error');
                     return;
                 }
+            }
+            if (++state.attempts >= 80) {
+                state.done = true;
+                showToast((i18n.jobStillWaiting || 'Задание остаётся на сервере; завершение не подтверждено.') + ' ' + jobId, 'error');
+                return;
             }
             state.timer = setTimeout(step, 1500);
         };
@@ -1264,14 +1378,21 @@
         state.timer = setTimeout(step, 1500);
     }
 
+    function jobAcceptedMessage(job) {
+        const message = job.version === 2 && job.desiredSaved === true
+            ? (i18n.jobAccepted || 'Намерение сохранено; задание принято. Применение ещё не подтверждено.')
+            : (i18n.legacyJobAccepted || 'Запрос принят. Создание связи и применение ещё не подтверждены.');
+        return message + ' ' + job.jobId;
+    }
+
     function handleLinkAutoDeploy(snapshot, optedIn) {
         if (!optedIn) {
             showToast(i18n.savedWithoutDeploy || 'Изменения сохранены. Деплой не запускался.');
             return;
         }
-        const job = snapshot?.autoDeployJob;
+        const job = responseJob(snapshot);
         if (job?.jobId) {
-            showToast('Запрос автодеплоя принят: ' + job.jobId + '. Связь ещё может ожидать создания.');
+            showToast(jobAcceptedMessage(job));
             startIntentPolling(job);
             return;
         }
@@ -1306,12 +1427,20 @@
 
     function createRequestHeaders(data, formKind) {
         const headers = { 'Content-Type': 'application/json' };
-        if (data.autoDeploy === true && window.crypto?.randomUUID) {
+        if (data.autoDeploy === true) {
             // Revision refresh is not a new logical create. Keep each form's
             // identity through rejected/unknown deliveries; retire on acceptance.
             const signature = JSON.stringify({ ...data, expectedTopologyRevision: undefined });
             if (pendingCreateRequests[formKind]?.signature !== signature) {
-                pendingCreateRequests[formKind] = { signature, key: window.crypto.randomUUID() };
+                let key = window.crypto?.randomUUID?.();
+                if (!key && window.crypto?.getRandomValues) {
+                    // getRandomValues remains available on HTTP pages where
+                    // randomUUID may require a secure context.
+                    key = 'ui-' + Array.from(window.crypto.getRandomValues(new Uint8Array(16)),
+                        byte => byte.toString(16).padStart(2, '0')).join('');
+                }
+                if (!key) throw new Error(i18n.operationUnconfirmed || 'Не удалось создать ключ запроса.');
+                pendingCreateRequests[formKind] = { signature, key };
             }
             headers['Idempotency-Key'] = pendingCreateRequests[formKind].key;
         }
@@ -1381,15 +1510,16 @@
         btn.innerHTML = '<i class="ti ti-loader-2 spin"></i>';
 
         try {
-            const headers = linkId ? { 'Content-Type': 'application/json' } : createRequestHeaders(data, 'main');
+            const requestScope = linkId ? 'edit:' + linkId : 'main';
+            const headers = createRequestHeaders(data, requestScope);
             const res = await fetch(linkId ? ('/api/cascade/links/' + linkId) : '/api/cascade/links', {
                 method: linkId ? 'PUT' : 'POST',
                 headers,
                 body: JSON.stringify(data),
             });
-            const savedSnapshot = await handleDraftMutationResponse(res);
+            const savedSnapshot = await handleDraftMutationResponse(res, linkId ? 'link.apply' : 'link.create', linkId || undefined);
             if (!savedSnapshot) return;
-            if (!linkId) pendingCreateRequests.main = null;
+            pendingCreateRequests[requestScope] = null;
             closeModal();
             await loadTopology();
             handleLinkAutoDeploy(savedSnapshot, data.autoDeploy === true);
@@ -1432,9 +1562,12 @@
         const payload = { expectedTopologyRevision: topologyRevision };
         if (linkId) payload.linkId = linkId;
         if (domainLinkId) payload.domainLinkId = domainLinkId;
+        const scope = 'apply:' + linkId;
+        const headers = linkId ? createRequestHeaders({ ...payload, autoDeploy: true,
+            desiredVersion: _allLinks.find(link => link._id === linkId)?.desiredVersion }, scope) : { 'Content-Type': 'application/json' };
         const res = await fetch('/api/cascade/topology/deploy', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken },
+            headers: { ...headers, 'x-csrf-token': csrfToken },
             body: JSON.stringify(payload),
         });
         const data = await res.json().catch(() => ({}));
@@ -1444,10 +1577,18 @@
         if (!res.ok) {
             throw new Error(describeTopologyError(data, 'HTTP ' + res.status));
         }
+        const job = responseJob(data, 'link.apply', linkId);
+        if (res.status === 202 && job) {
+            if (data.desiredSaved !== true || data.linkId !== job.linkId) throw new Error(i18n.operationUnconfirmed || 'Ответ задания не подтверждён');
+            pendingCreateRequests[scope] = null;
+            startIntentPolling(job);
+            return data;
+        }
         if (!TRACKED_OPERATION_STATUSES.includes(data.status)) {
             throw new Error((i18n.deploymentEndedWithStatus || 'Deployment ended with status') + ': ' + (data.status || 'unknown'));
         }
         startOperationPolling(data);
+        pendingCreateRequests[scope] = null;
         return data;
     }
 
@@ -1464,12 +1605,12 @@
 
     function startOperationPolling(result) {
         if (!TRACKED_OPERATION_STATUSES.includes(result?.status)) return;
-        startBoundOperationPolling(result.operationId, result.kind);
+        startBoundOperationPolling(result.operationId, result.kind, result.linkId);
     }
 
-    function startBoundOperationPolling(operationId, kind) {
+    function startBoundOperationPolling(operationId, kind, linkId, jobId) {
         if (!/^[a-f0-9]{24}$/i.test(operationId || '') || operationPolls.has(operationId)) return;
-        const state = { operationId, kind: kind || null, timer: null };
+        const state = { operationId, kind: kind || null, linkId, jobId, timer: null };
         operationPolls.set(operationId, state);
         scheduleOperationPollStep(state, 0);
     }
@@ -1483,35 +1624,53 @@
 
     async function runOperationPollStep(state, attempt) {
         let operation = null;
+        let freshList = false;
         try {
             const res = await fetch('/api/cascade/topology/operations/' + encodeURIComponent(state.operationId));
             if (res.ok) {
                 const payload = await res.json();
-                if (payload?.operationId === state.operationId) operation = payload;
-                const linksResponse = await fetch('/api/cascade/links');
-                if (linksResponse.ok) {
-                    applyLinkSnapshot(await linksResponse.json());
-                    refreshStatuses();
-                }
+                if (payload?.operationId === state.operationId
+                    && (!state.jobId || (payload.kind === state.kind && payload.linkId === state.linkId))) operation = payload;
             }
+            if (operation && state.linkId) linkProgress.set(state.linkId, { ...operation, jobId: state.jobId });
+            freshList = await loadTopology();
         } catch (_) {
-            // Transient failure: stay within the attempt budget and retry.
+            // Reads alone may be retried; accepted mutations are never replayed.
         }
         if (operationPolls.get(state.operationId) !== state) return;
         const status = operation?.status || null;
-        if (shouldContinueOperationPolling({
-            attempt,
-            maxAttempts: OPERATION_POLL_MAX_ATTEMPTS,
-            status,
-            clientReadiness: operation?.clientReadiness,
-            clientProofState: operation?.clientProofState,
-        })) {
+        const reconcile = operation?.phase === 'reconcile_required'
+            || operation?.waitingReason === 'TOPOLOGY_RECONCILE_REQUIRED';
+        const tombstone = deleteTombstones.get(state.linkId);
+        if (reconcile && tombstone) tombstone.reconcile = true;
+        const deleted = state.kind === 'link.delete' && status === 'succeeded'
+            && operation?.phase === 'completed' && !reconcile && freshList && !listedLinkIds.has(state.linkId);
+        const keepPolling = state.kind === 'link.delete'
+            ? !deleted && !reconcile && !['failed', 'rolled_back'].includes(status) && attempt < OPERATION_POLL_MAX_ATTEMPTS
+            : !reconcile && shouldContinueOperationPolling({ attempt, status,
+                clientReadiness: operation?.clientReadiness, clientProofState: operation?.clientProofState });
+        const progress = progressMessage(operation);
+        if (keepPolling) {
+            if (progress && progress !== state.message) { state.message = progress; showToast(progress); }
             scheduleOperationPollStep(state, attempt + 1);
             return;
         }
-        await loadTopology();
-        if (operationPolls.get(state.operationId) !== state) return;
         stopOperationPolling(state);
+        if (deleted) {
+            confirmedDeletions.add(state.linkId);
+            deleteTombstones.delete(state.linkId);
+            linkProgress.delete(state.linkId);
+            await loadTopology();
+            showToast(i18n.deleteSuccess || 'Связь удалена');
+            return;
+        }
+        if (reconcile || state.kind === 'link.delete') {
+            if (tombstone) tombstone.reconcile = true;
+            await loadTopology();
+            showToast((i18n.reconcileRequired || 'Ожидает сверки; завершение не подтверждено.') + ' ' + state.operationId
+                + (progress ? ' · ' + progress : ''), 'error');
+            return;
+        }
         const applied = status === 'succeeded';
         const verified = applied && operation?.clientReadiness === 'verified';
         const degraded = applied && operation?.clientProofState === 'degraded';
@@ -1612,21 +1771,52 @@
     };
 
     window._cascadeDelete = async function (linkId) {
+        const pending = deleteTombstones.get(linkId);
+        if (pending?.jobId) {
+            showToast((pending.reconcile ? (i18n.reconcileRequired || 'Ожидает сверки')
+                : (i18n.linkDeleting || 'Удаляется')) + ' · ' + pending.jobId, pending.reconcile ? 'error' : undefined);
+            return;
+        }
         if (!confirm(i18n.confirmDeleteLink
             || 'Удалить каскадную связь? Удаление может прервать маршруты и трафик пользователей. Без другого разрешённого выхода маршрут останется без выхода.')) return;
         setActionLoading(i18n.deleting || 'Deleting...');
 
+        const link = _allLinks.find(link => link._id === linkId);
+        let response;
         try {
-            const response = await fetch('/api/cascade/links/' + linkId, {
+            const scope = 'delete:' + linkId;
+            response = await fetch('/api/cascade/links/' + linkId, {
                 method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
+                headers: createRequestHeaders({ autoDeploy: true, linkId }, scope),
                 body: JSON.stringify({ expectedTopologyRevision: topologyRevision }),
             });
-            if (!await handleDraftMutationResponse(response)) return;
+            const result = await handleDraftMutationResponse(response, 'link.delete', linkId);
+            if (!result) return;
+            const job = responseJob(result, 'link.delete', linkId);
+            if (job) {
+                retainDeletion(link, job.jobId);
+                const tombstone = deleteTombstones.get(linkId);
+                if (tombstone && (result.applicationState === 'reconcile_required' || ['blocked', 'failed'].includes(job.status))) tombstone.reconcile = true;
+                startIntentPolling(job);
+                pendingCreateRequests[scope] = null;
+                showToast(jobAcceptedMessage(job));
+                await loadTopology();
+                return;
+            }
+            if (result.links.some(link => link._id === linkId)) throw new Error(i18n.operationUnconfirmed || 'Удаление не подтверждено');
+            deleteTombstones.delete(linkId);
+            confirmedDeletions.add(linkId);
+            pendingCreateRequests[scope] = null;
             showToast(i18n.deleteSuccess || 'Deleted');
-            loadTopology();
+            await loadTopology();
             closeInfoModal();
         } catch (err) {
+            if (!response || response.ok || response.status >= 500) {
+                // A lost/malformed acceptance is not proof of no accepted job.
+                // Retain the segment, but do not invent a server job or marker.
+                retainDeletion(link, null);
+                await loadTopology();
+            }
             showToast((i18n.networkError || 'Error') + ': ' + err.message, 'error');
         } finally { resetActionLoading(); }
     };
@@ -1929,7 +2119,7 @@
                 headers: createRequestHeaders(data, 'quick'),
                 body: JSON.stringify(data),
             });
-            const createdSnapshot = await handleDraftMutationResponse(res);
+            const createdSnapshot = await handleDraftMutationResponse(res, 'link.create');
             if (!createdSnapshot) return;
             pendingCreateRequests.quick = null;
             closeQuickModal();

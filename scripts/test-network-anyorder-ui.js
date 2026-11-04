@@ -2,7 +2,8 @@
 
 // Local VM/DOM/API evidence only. No browser, HTTP server, DB or node transport.
 // [shipped] preserves working contracts; [regression] covers lifecycle repairs.
-// Full applied-route and async delete projections remain explicit API handoffs.
+// Envelopes below follow HTTP 51fd18d and its real-handler acceptance tests.
+// Replies model transport/persistence; they do not claim backend execution.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -102,8 +103,10 @@ function harness(t, initial = snapshot(), locale = 'ru') {
             throw Error('Unsupported DOM selector: ' + selector);
         }, createElement: () => element(Symbol('created')) };
     const topology = () => ({ nodes: nodes.map(n => ({ data: { id: n._id, label: n.name, cascadeRole: n.cascadeRole } })),
-        edges: state.snapshot.links.map(l => ({ data: { ...l, id: 'link-' + l._id, linkId: l._id,
-            source: l.portalNode, target: l.bridgeNode, label: l.name } })) });
+        edges: state.snapshot.links.map(l => ({ data: Object.fromEntries(Object.entries({ ...l, id: 'link-' + l._id, linkId: l._id,
+            source: l.portalNode, target: l.bridgeNode, label: l.name }).filter(([key]) => ![
+                'applicationState', 'routeState', 'tunnelState', 'pppReadiness', 'xrayReadiness', 'desiredVersion',
+                'clientReadiness', 'appliedOperationId', 'lifecycle'].includes(key))) })) });
     const fetch = async (url, options = {}) => {
         const request = { url, method: options.method || 'GET', headers: options.headers || {},
             ...(options.body ? { body: JSON.parse(options.body) } : {}) };
@@ -149,7 +152,7 @@ ${boundary}`);
         assert.deepEqual(errors, [], 'real graph loader must not hide harness errors');
         assert.equal(pendingReplies.length, 0, 'each configured response must be consumed');
     });
-    return { state, requests, toasts, confirmations, timers, elements, graph, form,
+    return { state, requests, toasts, confirmations, timers, elements, graph, form, errors,
         window, ui: window.__ui,
         respond(method, url, body, status = 200, after = () => {}) {
             pendingReplies.push({ method, url, respond(request) { after(request); return reply(body, status); } });
@@ -194,6 +197,237 @@ const graphs = {
 const cases = Object.entries(graphs).flatMap(([name, links]) => permutations(links).map(order => ({ name, order })));
 const writes = h => h.requests.filter(r => r.method !== 'GET');
 const proofNotClaimed = h => assert(!h.toasts.some(x => /готовность подтверждена проверкой клиента/.test(x.message)));
+// publicIntent + acceptedIntentResponse, not a hypothetical delete endpoint.
+const v2Job = (n, kind, row, extra = {}) => ({ jobId: id(n), version: 2, kind, linkId: row._id,
+    ...(kind === 'link.create' ? { createdLinkId: row._id } : {}),
+    desiredVersion: 'a'.repeat(64), desiredSaved: true, status: 'waiting', phase: 'waiting',
+    acceptanceRevision: 7, ordinal: n, attempts: 0, ...extra });
+const accepted = job => ({ linkId: job.linkId, desiredSaved: true, job,
+    ...(job.createdLinkId ? { createdLinkId: job.createdLinkId } : {}),
+    ...(job.operationId ? { operationId: job.operationId } : {}),
+    acceptedTopologyRevision: job.acceptanceRevision });
+
+test('[v2] main/quick Auto and explicit PUT Auto consume real job alias and retain edit retry keys', async t => {
+    for (const kind of ['main', 'quick', 'edit']) {
+        const row = graphs.G1[0], h = harness(t, snapshot(kind === 'edit' ? [row] : []));
+        const job = v2Job(400, kind === 'edit' ? 'link.apply' : 'link.create', row);
+        if (kind === 'edit') {
+            await h.ui.openEditLinkModal(row._id); h.form.autoDeploy.checked = true;
+            for (const status of [503, 202]) {
+                h.respond('PUT', '/api/cascade/links/' + row._id, status === 202 ? accepted(job)
+                    : { desiredSaved: true, error: { code: 'TOPOLOGY_DEPLOYMENT_UNAVAILABLE', phase: 'intent.accept', nextAction: 'refresh_topology' } }, status);
+                await h.ui.onAddLinkSubmit({ target: h.form, preventDefault() {} });
+            }
+            assert.equal(writes(h)[0].headers['Idempotency-Key'], writes(h)[1].headers['Idempotency-Key']);
+            assert.match(writes(h)[0].headers['Idempotency-Key'] || '', /^[A-Za-z0-9_.:-]{1,128}$/);
+            assert(h.toasts.some(x => /сохранен|сохранён|saved/i.test(x.message) && x.type === 'error'));
+        } else {
+            h.respond('POST', '/api/cascade/links', accepted(job), 202);
+            await h.submit(row, true, kind === 'quick');
+        }
+        assert.equal(h.activeTimers(1500).length, 1, kind + ' tracks actual job alias');
+        assert(!h.toasts.some(x => /snapshot/i.test(x.message)));
+        const op = { operationId: id(401), kind: 'link.apply', linkId: row._id, status: 'queued', phase: 'waiting' };
+        h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job, status: 'admitted', operationId: op.operationId } });
+        await h.poll(1500);
+        h.state.operations.set(op.operationId, { ...op, status: 'succeeded', phase: 'completed', clientReadiness: 'unverified', clientProofState: 'degraded' });
+        await h.poll(); proofNotClaimed(h);
+    }
+});
+
+test('[v2] manual apply accepts job without operation, reuses failed delivery key, and preserves independent jobs', async t => {
+    const h = harness(t, snapshot(graphs.G2)), jobs = graphs.G2.map((row, i) => v2Job(410 + i, 'link.apply', row));
+    h.respond('POST', '/api/cascade/topology/deploy', {}, 503, () => { throw Error('connection lost'); });
+    await h.window._cascadeDeploy(graphs.G2[0]._id);
+    for (const job of jobs) {
+        h.respond('POST', '/api/cascade/topology/deploy', accepted(job), 202);
+        await h.window._cascadeDeploy(job.linkId); await tick();
+    }
+    assert.match(writes(h)[0].headers['Idempotency-Key'] || '', /^[A-Za-z0-9_.:-]{1,128}$/);
+    assert.equal(writes(h)[0].headers['Idempotency-Key'], writes(h)[1].headers['Idempotency-Key']);
+    assert.notEqual(writes(h)[1].headers['Idempotency-Key'], writes(h)[2].headers['Idempotency-Key']);
+    assert.equal(h.activeTimers(1500).length, 2);
+    for (const [i, job] of jobs.entries()) {
+        h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job, status: 'admitted', operationId: id(420 + i) } });
+        await h.poll(1500);
+        h.state.operations.set(id(420 + i), { operationId: id(420 + i), kind: 'link.apply', linkId: job.linkId,
+            status: i === 0 ? 'succeeded' : 'committing', phase: i === 0 ? 'reconcile_required' : 'waiting',
+            waitingReason: i === 0 ? 'TOPOLOGY_RECONCILE_REQUIRED' : 'PPP_SYNC_PENDING', clientReadiness: 'unverified', nextAction: i === 0 ? 'inspect_operation' : 'poll_operation' });
+    }
+    await h.poll(); await h.poll();
+    assert(!h.toasts.some(x => x.type === 'success' && /топология применена|конфигурация применена|связь установлена/i.test(x.message)));
+    assert(h.toasts.some(x => /сверк|reconcil/i.test(x.message)));
+    assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 1, 'PPP wait continues independently');
+    assert.equal(writes(h).length, 3);
+});
+
+test('[v2] accepted delete retains arrow through list absence until exact terminal cleanup; repeated click sends no job', async t => {
+    const row = link(430, P, R, { status: 'online' }), neighbor = graphs.G2[1];
+    const h = harness(t, snapshot([row, neighbor])); await h.load();
+    h.graph.getElementById(P).position({ x: 91, y: 32 }); h.graph.pan({ x: 5, y: 7 }); h.graph.zoom(1.8);
+    const job = v2Job(431, 'link.delete', row);
+    h.respond('DELETE', '/api/cascade/links/' + row._id, { ...accepted(job), applicationState: 'deleting' }, 202);
+    await h.window._cascadeDelete(row._id); await tick();
+    assert.match(writes(h)[0].headers['Idempotency-Key'] || '', /^[A-Za-z0-9_.:-]{1,128}$/);
+    assert.equal(h.graph.getElementById('link-' + row._id).length, 1);
+    assert.match(h.drawer(row._id), /Удаляется|deleting/i);
+    await h.window._cascadeDelete(row._id); assert.equal(writes(h).length, 1);
+    h.state.snapshot = snapshot([neighbor], 8); await h.load();
+    assert.equal(h.graph.getElementById('link-' + row._id).length, 1, 'list absence alone is not cleanup proof');
+    h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId,
+        { job: { ...job, status: 'admitted', operationId: id(432) } }); await h.poll(1500);
+    h.state.operations.set(id(432), { operationId: id(432), kind: 'link.delete', linkId: row._id,
+        status: 'succeeded', phase: 'completed', clientReadiness: 'unverified' });
+    await h.poll();
+    assert.equal(h.graph.getElementById('link-' + row._id).length, 0);
+    assert(h.toasts.some(x => x.message === h.window._networkI18n.deleteSuccess));
+    assert.deepEqual(h.graph.getElementById(P).position(), { x: 91, y: 32 });
+    assert.deepEqual(h.graph.pan(), { x: 5, y: 7 }); assert.equal(h.graph.zoom(), 1.8);
+    assert.equal(h.graph.getElementById('link-' + neighbor._id).length, 1);
+    assert.equal(h.activeTimers().length, 0); proofNotClaimed(h);
+});
+
+test('[v2] projection uses real list fields, separates PPP/Xray, clears proof on refresh, and never traverses mixed desired neighbors', async t => {
+    const prefix = link(440, P, R, { status: 'online', applicationState: 'applied', routeState: 'no_bridge_exit',
+        tunnelState: 'connected', pppReadiness: 'unverified', xrayReadiness: 'unverified', appliedOperationId: id(441) });
+    const h = harness(t, snapshot([prefix, graphs.G2[1]])); await h.load();
+    assert.equal(h.graph.getElementById('link-' + prefix._id).data('routeState'), 'no_bridge_exit');
+    const labels = h.window._networkI18n;
+    let html = h.drawer(prefix._id);
+    assert(html.includes(labels.routeNoBridge), 'localized missing exit is not a global failure');
+    assert(html.includes('PPP/L2TP')); assert(html.includes('Xray/VLESS/REALITY'));
+    h.state.snapshot = snapshot([{ ...prefix, routeState: 'no_portal_input', pppReadiness: 'verified' }], 8);
+    await h.ui.refreshStatuses(); await tick(); html = h.drawer(prefix._id);
+    assert(html.includes(labels.routeNoPortal));
+    assert.match(html, /PPP\/L2TP<\/div><div>Подтверждено/);
+    assert.match(html, /Xray\/VLESS\/REALITY<\/div><div>Готовность клиента не подтверждена/);
+    h.state.snapshot = snapshot([{ ...prefix, routeState: 'complete', pppReadiness: 'unverified', xrayReadiness: 'verified' }], 9);
+    await h.ui.refreshStatuses(); await tick(); html = h.drawer(prefix._id);
+    assert.match(html, /Xray\/VLESS\/REALITY<\/div><div>Подтверждено/);
+    assert(html.includes(labels.fullRouteUnconfirmed), 'a complete flag is not the applied path or exit policy');
+    h.state.snapshot = snapshot([{ ...prefix, routeState: 'unknown', xrayReadiness: undefined, pppReadiness: undefined }], 10);
+    await h.ui.refreshStatuses(); await tick(); html = h.drawer(prefix._id);
+    assert(!html.includes('Подтверждено'));
+    assert.equal(h.ui.buildRouteSummary(h.graph.getElementById('link-' + prefix._id).data()).chain, 'Portal → Relay');
+});
+
+test('[v2] wrong-kind Auto acceptance is not retired; its explicit retry keeps the same key', async t => {
+    const row = graphs.G1[0], h = harness(t), job = v2Job(450, 'link.delete', row);
+    h.respond('POST', '/api/cascade/links', accepted(job), 202); await h.submit(row, true);
+    assert.equal(h.activeTimers(1500).length, 0);
+    assert(h.toasts.some(x => x.type === 'error'));
+    h.respond('POST', '/api/cascade/links', accepted({ ...job, kind: 'link.create' }), 202); await h.submit(row, true);
+    assert.equal(writes(h)[0].headers['Idempotency-Key'], writes(h)[1].headers['Idempotency-Key']);
+});
+
+test('[v2] deletion reload resumes marker polling, exact job/link/kind and terminal list absence are all required', async t => {
+    const row = link(460, P, R, { status: 'online', lifecycle: { state: 'deleting', deleteJobId: id(461), desiredVersion: 'a'.repeat(64) } });
+    const h = harness(t, snapshot([row])); await h.load();
+    const job = v2Job(461, 'link.delete', row), opId = id(462);
+    assert.equal(h.activeTimers(1500).length, 1, 'server marker restores this delete after page reload');
+    await h.window._cascadeDelete(row._id); assert.equal(writes(h).length, 0);
+    h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job, linkId: id(999), status: 'admitted', operationId: opId } });
+    await h.poll(1500); assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 0);
+    h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job, status: 'admitted', operationId: opId } });
+    await h.poll(1500);
+    for (const wrong of [{ kind: 'link.apply', linkId: row._id }, { kind: 'link.delete', linkId: id(999) }]) {
+        h.state.operations.set(opId, { operationId: opId, status: 'succeeded', phase: 'completed', ...wrong });
+        await h.poll();
+        assert.equal(h.graph.getElementById('link-' + row._id).length, 1);
+        assert(!h.toasts.some(x => x.message === h.window._networkI18n.deleteSuccess));
+    }
+    h.state.operations.set(opId, { operationId: opId, kind: 'link.delete', linkId: row._id, status: 'succeeded', phase: 'completed', clientReadiness: 'unverified' });
+    await h.poll();
+    assert.equal(h.graph.getElementById('link-' + row._id).length, 1, 'terminal operation with row still present is not final removal');
+    h.state.snapshot = snapshot([], 8);
+    const staleTopology = { nodes: nodes.map(n => ({ data: { id: n._id, label: n.name, cascadeRole: n.cascadeRole } })),
+        edges: [{ data: { ...row, id: 'link-' + row._id, linkId: row._id, source: P, target: R } }] };
+    // /topology is independently cached. A fresh /links absence must win only
+    // after the exact completed delete, not before it.
+    h.respond('GET', '/api/cascade/topology', staleTopology); h.respond('GET', '/api/cascade/topology', staleTopology);
+    await h.poll(); assert.equal(h.graph.getElementById('link-' + row._id).length, 0);
+    assert.equal(h.activeTimers().length, 0); assert.equal(writes(h).length, 0);
+});
+
+test('[v2] retained terminal delete and blocked job remain visible as reconcile, never successful or retried', async t => {
+    for (const terminal of ['blocked', 'reconcile_required', 'failed']) {
+        const row = link(470, P, R, { status: 'online' }), h = harness(t, snapshot([row])); await h.load();
+        const job = v2Job(471, 'link.delete', row), opId = id(472);
+        h.respond('DELETE', '/api/cascade/links/' + row._id, { ...accepted(job), applicationState: 'deleting' }, 202);
+        await h.window._cascadeDelete(row._id);
+        h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job,
+            status: terminal === 'blocked' ? 'blocked' : 'admitted', errorCode: 'TOPOLOGY_RECONCILE_REQUIRED',
+            ...(terminal === 'blocked' ? {} : { operationId: opId }) } }); await h.poll(1500);
+        if (terminal !== 'blocked') {
+            h.state.operations.set(opId, { operationId: opId, kind: 'link.delete', linkId: row._id,
+                status: terminal === 'failed' ? 'failed' : 'succeeded', phase: 'reconcile_required',
+                waitingReason: 'TOPOLOGY_RECONCILE_REQUIRED', clientReadiness: 'unverified', nextAction: 'inspect_operation' });
+            await h.poll();
+        }
+        h.state.snapshot = snapshot([], 8); await h.load();
+        assert.equal(h.graph.getElementById('link-' + row._id).length, 1);
+        assert(h.drawer(row._id).includes(h.window._networkI18n.reconcileRequired));
+        assert(!h.toasts.some(x => x.message === h.window._networkI18n.deleteSuccess));
+        await h.window._cascadeDelete(row._id); assert.equal(writes(h).length, 1);
+        assert.equal(h.activeTimers().length, 0); proofNotClaimed(h);
+    }
+});
+
+test('[v2] unknown delete delivery retains exact request key after revision refresh without sending desired guesses', async t => {
+    const row = link(480, P, R, { status: 'pending', desiredVersion: 'a'.repeat(64) }), h = harness(t, snapshot([row]));
+    h.respond('DELETE', '/api/cascade/links/' + row._id, {}, 503, () => { throw Error('connection lost'); });
+    await h.window._cascadeDelete(row._id);
+    h.state.snapshot = snapshot([], 8); await h.load();
+    assert.equal(h.graph.getElementById('link-' + row._id).length, 1, 'lost acceptance and list absence cannot silently hide an unfinished delete');
+    assert(h.drawer(row._id).includes(h.window._networkI18n.reconcileRequired));
+    const job = v2Job(481, 'link.delete', row);
+    h.respond('DELETE', '/api/cascade/links/' + row._id, { ...accepted(job), applicationState: 'deleting' }, 202);
+    await h.window._cascadeDelete(row._id);
+    assert.equal(writes(h)[0].headers['Idempotency-Key'], writes(h)[1].headers['Idempotency-Key']);
+    assert.deepEqual(writes(h)[1].body, { expectedTopologyRevision: 8 });
+    assert.equal(h.activeTimers(1500).length, 1);
+});
+
+test('[v2] concurrent deletes settle only their own tombstone and read failure never substitutes for absence', async t => {
+    const rows = [link(490, P, R, { status: 'online' }), link(491, R, B1, { status: 'online', mode: 'forward' })];
+    const h = harness(t, snapshot(rows)); await h.load();
+    const jobs = rows.map((row, i) => v2Job(492 + i, 'link.delete', row));
+    for (const job of jobs) {
+        h.respond('DELETE', '/api/cascade/links/' + job.linkId, { ...accepted(job), applicationState: 'deleting' }, 202);
+        await h.window._cascadeDelete(job.linkId);
+    }
+    for (const [i, job] of jobs.entries()) {
+        h.respond('GET', '/api/cascade/links/auto-deploy-jobs/' + job.jobId, { job: { ...job, status: 'admitted', operationId: id(494 + i) } }); await h.poll(1500);
+        h.state.operations.set(id(494 + i), { operationId: id(494 + i), kind: 'link.delete', linkId: job.linkId,
+            status: i === 0 ? 'succeeded' : 'committing', phase: i === 0 ? 'completed' : 'applying' });
+    }
+    h.state.snapshot = snapshot([rows[1]], 8);
+    // Failed list read is not an empty list, even beside exact terminal success.
+    h.respond('GET', '/api/cascade/links', { error: { code: 'INTERNAL_ERROR' } }, 503);
+    await h.poll();
+    assert.equal(h.errors.length, 1); assert.match(String(h.errors.pop()), /Topology load error/);
+    assert.equal(h.graph.getElementById('link-' + rows[0]._id).length, 1);
+    await h.poll(); // second delete is still applying
+    await h.poll(); // first delete now has successful list-absence readback
+    assert.equal(h.graph.getElementById('link-' + rows[0]._id).length, 0);
+    assert.equal(h.graph.getElementById('link-' + rows[1]._id).length, 1);
+    assert.equal(h.activeTimers(helpers.OPERATION_POLL_INTERVAL_MS).length, 1);
+    h.state.snapshot = snapshot([], 9);
+    h.state.operations.set(id(495), { operationId: id(495), kind: 'link.delete', linkId: rows[1]._id, status: 'succeeded', phase: 'completed' });
+    await h.poll();
+    assert.equal(h.graph.getElementById('link-' + rows[1]._id).length, 0);
+    assert.equal(writes(h).length, 2); assert.equal(h.activeTimers().length, 0);
+});
+
+test('[v2] stable request keys also work with getRandomValues on pages without randomUUID', async t => {
+    const row = graphs.G1[0], h = harness(t, snapshot([row]));
+    h.window.crypto = { getRandomValues: buffer => require('node:crypto').randomFillSync(buffer) };
+    const job = v2Job(510, 'link.apply', row);
+    h.respond('POST', '/api/cascade/topology/deploy', accepted(job), 202);
+    await h.window._cascadeDeploy(row._id);
+    assert.equal(writes(h).length, 1, 'missing randomUUID must not disable otherwise supported manual/classic controls');
+    assert.match(writes(h)[0].headers['Idempotency-Key'], /^[A-Za-z0-9_.:-]{1,128}$/);
+});
 
 // This matrix proves UI request targeting ONLY: API replies are explicit
 // fixtures, not a replacement backend that claims any-order graph admission.
@@ -566,7 +800,13 @@ for (const locale of ['ru', 'en']) {
         const labels = require('../src/locales/' + locale + '.json').network;
         const template = fs.readFileSync(path.join(__dirname, '../views/nodes.ejs'), 'utf8');
         for (const key of ['savedWithoutDeploy', 'deployInProgress', 'operationApplied', 'selectedSegment',
-            'fullRouteUnconfirmed', 'undeployFailed', 'confirmDeleteLink']) {
+            'fullRouteUnconfirmed', 'undeployFailed', 'confirmDeleteLink', 'jobAccepted', 'legacyJobAccepted', 'linkApplied',
+            'jobUnavailable', 'jobStillWaiting', 'operationUnconfirmed', 'savedApplyUnconfirmed', 'linkDeleting',
+            'reconcileRequired', 'linkNotApplied', 'applicationStateLabel', 'routeStateLabel', 'tunnelStateLabel',
+            'routeComplete', 'routeNoPortal', 'routeNoBridge', 'routeAmbiguous', 'routeUnknown', 'readinessVerified',
+            'tunnelConnected', 'tunnelDisconnected', 'tunnelUnknown', 'operationProgress', 'operationNode',
+            'phaseWaiting', 'phasePreparing', 'phaseApplying', 'phaseRollback', 'phaseCompleted', 'phaseFailed',
+            'phaseAdmitted', 'waitResources', 'waitPPP', 'inspectOperation', 'pollOperation', 'refreshTopology', 'retryLater']) {
             assert(labels[key], key);
             assert(template.includes(key + ": <%- JSON.stringify(t('network." + key + "')) %>"), key + ' must reach the shipped IIFE');
         }
@@ -584,6 +824,12 @@ for (const locale of ['ru', 'en']) {
         h.ui.handleLinkAutoDeploy({ autoDeployOperation: { operationId, status: 'committing' } }, true);
         assert(h.toasts.some(x => x.message.startsWith(labels.deployInProgress)));
         assert(!h.toasts.some(x => x.message.startsWith(labels.deployQueued)));
+        h.state.confirm = true;
+        const job = v2Job(500, 'link.delete', row);
+        h.respond('DELETE', '/api/cascade/links/' + row._id, { ...accepted(job), applicationState: 'deleting' }, 202);
+        await h.window._cascadeDelete(row._id);
+        assert(h.toasts.some(x => x.message === labels.jobAccepted + ' ' + job.jobId));
+        assert(h.drawer(row._id).includes(labels.linkDeleting));
         proofNotClaimed(h);
     });
 }
