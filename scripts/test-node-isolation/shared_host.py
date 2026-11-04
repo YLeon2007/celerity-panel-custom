@@ -19,18 +19,23 @@ NAMES = PAYLOADS | {'hysteria-backend', 'hysteria-updater'}
 
 
 def validate_plan(p, m):
-    m.need(isinstance(p, dict) and set(p) == m.PLAN_KEYS | {'mode', 'hostHold'}, 'INVALID_SHARED_PLAN')
-    m.need(p['mode'] == 'shared-test' and p['nodeId'] == NODE and
-           p['endpointIp'] == ENDPOINT and p['targetProfile'] == 'xray-bridge' and
-           p['machineId'] == MACHINE, 'SHARED_TEST_IDENTITY_REQUIRED')
-    m.validate_common_plan({k: p[k] for k in m.PLAN_KEYS})
+    m.need(isinstance(p, dict) and set(p) == m.plan_keys(p) | {'mode', 'hostHold'}, 'INVALID_SHARED_PLAN')
+    if p.get('version') == 2:
+        inventory = m.accepted_inventory(p)
+        m.inventory_node(p, inventory=inventory)
+        m.need(p['mode'] == 'shared-test' and p['nodeId'] == inventory['sharedNodeId'], 'SHARED_TEST_IDENTITY_REQUIRED')
+    else:
+        m.need(p['mode'] == 'shared-test' and p['nodeId'] == NODE and
+               p['endpointIp'] == ENDPOINT and p['targetProfile'] == 'xray-bridge' and
+               p['machineId'] == MACHINE, 'SHARED_TEST_IDENTITY_REQUIRED')
+    m.validate_common_plan({k: p[k] for k in m.plan_keys(p)})
     hold = p['hostHold']
     m.need(isinstance(hold, dict) and set(hold) == {'owner', 'freezerSha256', 'expected'}, 'HOST_HOLD_REQUIRED')
     m.need(isinstance(hold['owner'], str) and str(uuid.UUID(hold['owner'])) == hold['owner'], 'HOST_OWNER_REQUIRED')
     m.need(isinstance(hold['freezerSha256'], str) and re.fullmatch('[a-f0-9]{64}', hold['freezerSha256']), 'FREEZER_PIN_REQUIRED')
     e = hold['expected']
     m.need(isinstance(e, dict) and e.get('schema') == 1 and
-           e.get('host') == {'machineId': MACHINE, 'bootId': p['bootId']} and
+           e.get('host') == {'machineId': p['machineId'], 'bootId': p['bootId']} and
            e.get('controls') == CONTROLS and 'relaunch' not in e and 'proxyGroup' not in e,
            'ACCEPTED_HOST_INVENTORY_REQUIRED')
     containers = e.get('containers')
@@ -279,7 +284,7 @@ def make_engine(directory, p, m, host=None):
             # No receipt/boolean/frozen-candidate shortcut for remote effects.
             return {**self.evidence(state), 'status': 'partial-unknown-retained',
                     'candidate': 'closed', 'localNodeEffects': local['nodeEffects'],
-                    'unknownNodes': sorted(m.TEST_NODES), 'nodeEffects': 'unknown',
+                    'unknownNodes': sorted(pin['nodeId'] for pin in m.accepted_inventory(p)['nodes']) if p.get('version') == 2 else sorted(m.TEST_NODES), 'nodeEffects': 'unknown',
                     'handbackAllowed': False, 'ownershipRetained': True}
 
         def restore(self):
@@ -380,12 +385,13 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                         # host. Read its real same-run COMMIT, never a JSON GO.
                         raw_commit = m.secure_file(pathlib.Path(directory) / 'handoff-commit.json')
                         commit = m.decode_json(raw_commit)
-                        expected_peer = commit['nodePeers'][NODE]
+                        node = p['nodeId']
+                        expected_peer = commit['nodePeers'][node]
                         m.need(m.digest(raw_commit) == frame['commitSha256'] and
                                commit['context'] == p['context'] and
                                commit['activationSet'] == ['existing-classic-backend'] and
                                expected_peer == {k: m.proc_identity(peer_pid)[k] for k in ('pid', 'start')} and
-                               commit['nodePins'][NODE]['identity']['planHash'] == plan_hash(p, m),
+                               commit['nodePins'][node]['identity']['planHash'] == plan_hash(p, m),
                                'SAME_HOLDER_COMMIT_REQUIRED')
                         fence.activate_classic(identity['owner'], frame['commitSha256'])
                         check()

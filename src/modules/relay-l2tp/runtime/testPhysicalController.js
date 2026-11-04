@@ -10,6 +10,7 @@ const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST, matchesTopologyExecutionContext }
 const { freeze, UUID, exact, validTerminalReceipt } = require('../models/topologyExecutionBindingContract');
 const { withAttestedPreinstalledRunner } = require('../services/topologyRunnerBootstrapper');
 const CONFIG = '/etc/celerity/topology-test-physical.json';
+const INVENTORY = '/etc/celerity/topology-test-inventory.json';
 const COMMAND = '/usr/bin/sudo -n /usr/local/libexec/c3-test-physical-attestor';
 const SHARED = '6ab189dc63913ebd4a917399';
 const NODES = Object.freeze({
@@ -61,21 +62,61 @@ function configBytes(value) {
     }
     return { ...blobs, readback: freeze(structuredClone(value.readback)) };
 }
-function validateConfig(input) {
+function canonical(value) {
+    return JSON.stringify(value, function (_key, current) {
+        return current && !Array.isArray(current) && typeof current === 'object'
+            ? Object.fromEntries(Object.keys(current).sort().map(key => [key, current[key]])) : current;
+    });
+}
+function validateInventory(input) {
+    const inventory = structuredClone(input);
+    need(exact(inventory, ['version', 'profile', 'executionContext', 'nodes', 'sharedNodeId'])
+        && inventory.version === 1 && inventory.profile === 'accepted-test-v1'
+        && matchesTopologyExecutionContext(inventory.executionContext, TEST)
+        && Array.isArray(inventory.nodes) && inventory.nodes.length >= 1 && inventory.nodes.length <= 5);
+    const ids = new Set(), machines = new Set(), keys = new Set(), endpoints = new Set();
+    for (const pin of inventory.nodes) {
+        need(exact(pin, ['nodeId', 'targetProfile', 'endpoint', 'physical', 'profiles'])
+            && digest(pin.nodeId, 24) && !ids.has(pin.nodeId) && Object.hasOwn(PROFILES, pin.targetProfile));
+        ids.add(pin.nodeId);
+        const ip = pin.endpoint?.ip;
+        need(exact(pin.endpoint, ['ip', 'port', 'username']) && typeof ip === 'string'
+            && require('node:net').isIPv4(ip) && (ip.startsWith('10.') || ip.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip))
+            && pin.endpoint.port === 2222 && pin.endpoint.username === 'c3-test-runner' && !endpoints.has(ip));
+        endpoints.add(ip);
+        need(exact(pin.physical, ['machineId', 'bootId', 'sshHostKeySha256']) && digest(pin.physical.machineId, 32)
+            && digest(pin.physical.sshHostKeySha256, 64) && uuid(pin.physical.bootId)
+            && !machines.has(pin.physical.machineId) && !keys.has(pin.physical.sshHostKeySha256));
+        machines.add(pin.physical.machineId); keys.add(pin.physical.sshHostKeySha256);
+        need(equal(pin.profiles, [pin.targetProfile]) || equal(pin.profiles, ['xray-main', 'xray-bridge']));
+    }
+    const shared = inventory.nodes.find(pin => pin.nodeId === inventory.sharedNodeId);
+    need(shared?.targetProfile === 'xray-bridge' && equal(shared.profiles, ['xray-main', 'xray-bridge']));
+    return freeze(inventory);
+}
+function sharedNode(config, inventory) { return config.version === 2 ? inventory.sharedNodeId : SHARED; }
+function validateConfig(input, accepted) {
     const config = structuredClone(input);
-    need(exact(config, ['version', 'executionContext', 'nodes', 'host']) && config.version === 1 && matchesTopologyExecutionContext(config.executionContext, TEST));
-    need(Array.isArray(config.nodes) && config.nodes.length === 5 && config.host);
+    need([1, 2].includes(config.version) && exact(config, ['version', 'executionContext', 'nodes', 'host', ...(config.version === 2 ? ['inventorySha256'] : [])])
+        && matchesTopologyExecutionContext(config.executionContext, TEST));
+    const inventory = config.version === 2 ? validateInventory(accepted) : undefined;
+    if (inventory) need(digest(config.inventorySha256, 64) && createHash('sha256').update(canonical(inventory)).digest('hex') === config.inventorySha256);
+    const shared = sharedNode(config, inventory);
+    need(Array.isArray(config.nodes) && config.nodes.length === (inventory ? inventory.nodes.length : 5) && config.host);
     const seen = new Set(), machines = new Set(), keys = new Set();
     for (const pin of config.nodes) {
         need(exact(pin, ['nodeId', 'targetProfile', 'endpoint', 'physical', 'maintenanceId', 'planHash', 'guard', 'operatorKeyPath',
             ...(Object.hasOwn(pin, 'originalSnapshot') ? ['originalSnapshot'] : [])])
             && (!Object.hasOwn(pin, 'originalSnapshot') || originalPin(pin.originalSnapshot))
-            && typeof pin.nodeId === 'string' && !seen.has(pin.nodeId) && NODES[pin.nodeId]); seen.add(pin.nodeId);
-        const [ip, targetProfile] = NODES[pin.nodeId];
+            && typeof pin.nodeId === 'string' && !seen.has(pin.nodeId)); seen.add(pin.nodeId);
+        const acceptedPin = inventory?.nodes.find(node => node.nodeId === pin.nodeId);
+        need(inventory ? acceptedPin : Object.hasOwn(NODES, pin.nodeId));
+        const [ip, targetProfile] = inventory ? [acceptedPin.endpoint.ip, acceptedPin.targetProfile] : NODES[pin.nodeId];
         need(equal(pin.endpoint, { ip, port: 2222, username: 'c3-test-runner' }) && pin.targetProfile === targetProfile);
         need(exact(pin.physical, ['machineId', 'bootId', 'sshHostKeySha256']) && digest(pin.physical?.machineId, 32) && digest(pin.physical?.sshHostKeySha256, 64) && uuid(pin.physical?.bootId)
             && uuid(pin.maintenanceId) && digest(pin.planHash, 64));
-        if (pin.nodeId === SHARED) need(pin.physical.machineId === '7fa266f995fe4aa69e96cf7d01359e34');
+        if (inventory) need(equal(pin.physical, acceptedPin.physical));
+        else if (pin.nodeId === SHARED) need(pin.physical.machineId === '7fa266f995fe4aa69e96cf7d01359e34');
         need(!machines.has(pin.physical.machineId) && !keys.has(pin.physical.sshHostKeySha256));
         machines.add(pin.physical.machineId); keys.add(pin.physical.sshHostKeySha256);
         need(exact(pin.guard, ['pid', 'start', 'socket']) && Number.isSafeInteger(pin.guard.pid) && pin.guard.pid > 1
@@ -90,7 +131,7 @@ function validateConfig(input) {
         && exact(config.host.guard, ['pid', 'start', 'socket', 'owner', 'planHash', 'session'])
         && typeof config.host.guard.start === 'string' && /^\d+$/.test(config.host.guard.start)
         && config.host.guard.socket === '/var/lib/c3-test-node-isolation/host.sock'
-        && config.host.guard.planHash === config.nodes.find(pin => pin.nodeId === SHARED).planHash
+        && config.host.guard.planHash === config.nodes.find(pin => pin.nodeId === shared).planHash
         && exact(config.host.guard.session, ['pid', 'start']) && Number.isSafeInteger(config.host.guard.session.pid)
         && config.host.guard.session.pid > 1 && typeof config.host.guard.session.start === 'string' && /^\d+$/.test(config.host.guard.session.start));
     return freeze(config);
@@ -155,8 +196,10 @@ async function openSshChannel(pin) {
             hostVerifier: raw => Buffer.isBuffer(raw) && createHash('sha256').update(raw).digest('hex') === pin.physical.sshHostKeySha256 });
     });
 }
-function createTestPhysicalController({ config: input, openChannel = openSshChannel, withDurableNodeOriginals, readObservations, requireDurableOriginals = false } = {}) {
-    const config = validateConfig(input), channels = new Map();
+function createTestPhysicalController({ config: input, inventory, openChannel = openSshChannel, withDurableNodeOriginals, readObservations, requireDurableOriginals = false } = {}) {
+    // Only the trusted root factory supplies a separately accepted inventory.
+    // The programmatic seam is not populated from HyNode, HTTP or environment.
+    const config = validateConfig(input, inventory), channels = new Map(), shared = sharedNode(config, inventory);
     // Original secret bytes remain lexical/private and never enter Mongo proofs,
     // logs, error messages or public return values. No recapture after uncertainty.
     const originals = new Map();
@@ -183,7 +226,7 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
                         alive(scope);
                         need(value.nodeId === pin.nodeId && value.targetProfile === pin.targetProfile && value.maintenanceId === pin.maintenanceId
                             && value.planHash === pin.planHash && equal(value.physical, pin.physical) && equal(value.endpoint, pin.endpoint)
-                            && equal(value.guard, pin.guard) && (pin.nodeId === SHARED ? equal(value.host, config.host) : value.host === null));
+                            && equal(value.guard, pin.guard) && (pin.nodeId === shared ? equal(value.host, config.host) : value.host === null));
                         if (requireDurableOriginals) {
                             const durable = value.durableOriginals;
                             const { proofRef: _ref, ...accepted } = pin.originalSnapshot;
@@ -217,7 +260,7 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
                                 bootId: pin.physical.bootId, maintenanceId: pin.maintenanceId, planHash: pin.planHash,
                                 guard: pin.guard, originalSnapshot: pin.originalSnapshot };
                         });
-                        const challenge = freeze({ version: 1, executionContext: TEST, nodes, host: config.host });
+                        const challenge = freeze({ version: config.version, ...(config.version === 2 ? { inventorySha256: config.inventorySha256 } : {}), executionContext: TEST, nodes, host: config.host });
                         let invoked = false, finished = false, open = true, pending, result;
                         const checkOriginals = () => {
                             for (const pin of config.nodes) {
@@ -285,7 +328,7 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
                             };
                             const proof = freeze({ authority: 'external-maintenance-v1', status: 'verified', binding,
                                 proofId: randomUUID(), maintenanceId: pin.maintenanceId, maintenance: 'held', allWriters: 'drained',
-                                oldBackend: { ...observations.get(SHARED).host.backend, processTree: 'stopped', dispatch: 'disabled' },
+                                oldBackend: { ...observations.get(shared).host.backend, processTree: 'stopped', dispatch: 'disabled' },
                                 readback: current.readback });
                             try { await check(); const result = await callback(proof, check); await check(); return result; }
                             finally { callbackOpen = false; }
@@ -317,7 +360,7 @@ function createTestPhysicalController({ config: input, openChannel = openSshChan
                             physicalIdentity: { machineId: value.physical.machineId, sshHostKeySha256: value.physical.sshHostKeySha256 }, predecessor,
                             connectionAttestation: { authority: 'server-physical-ssh-endpoint-v1', endpoint: value.endpoint, physicalIdentity: identity,
                                 maintenanceId: value.maintenanceId, aliases: 'excluded', hostKeyDigest: 'raw-ssh-public-key-sha256', endpointReassignment: 'excluded' },
-                            oldBackend: { ...values.get(SHARED).host.backend, processTree: 'stopped', dispatch: 'disabled' } });
+                            oldBackend: { ...values.get(shared).host.backend, processTree: 'stopped', dispatch: 'disabled' } });
                         const result = await callback(proof); await assertHeld(); return result;
                     },
                     async withVerifiedPreinstalledRunner(challenge, callback) {
@@ -359,19 +402,23 @@ function createRootTestPhysicalAuthority({ env = process.env, read = privateRead
     let raw;
     try { raw = read(CONFIG); } catch (error) { if (error.code === 'ENOENT') return undefined; refuse(); }
     need(typeof ownerEnrollment === 'boolean');
+    let config, inventory;
+    try {
+        const input = JSON.parse(raw);
+        inventory = input.version === 2 ? validateInventory(JSON.parse(read(INVENTORY))) : undefined;
+        config = validateConfig(input, inventory);
+    } catch { refuse(); }
     if (!ownerEnrollment) {
         // Trusted root composition selects read-only runtime, never missing-pin
         // detection, an environment switch, or replay of the one-shot capture.
-        const config = validateConfig(JSON.parse(raw));
         need(config.nodes.every(pin => pin.originalSnapshot));
-        return createTestPhysicalController({ config, openChannel, requireDurableOriginals: true });
+        return createTestPhysicalController({ config, inventory, openChannel, requireDurableOriginals: true });
     }
     const { createDurableNodeOriginals } = require('./testDurableOriginals');
     const withDurableNodeOriginals = createDurableNodeOriginals({
         ...(read !== privateRead ? { read } : {}), ...(captureSpawn ? { spawn: captureSpawn } : {}),
     });
-    const config = validateConfig(JSON.parse(raw));
-    const challenge = freeze({ version: 1, executionContext: TEST, host: config.host, nodes: config.nodes.map(pin => {
+    const challenge = freeze({ version: config.version, ...(config.version === 2 ? { inventorySha256: config.inventorySha256 } : {}), executionContext: TEST, host: config.host, nodes: config.nodes.map(pin => {
         need(pin.originalSnapshot);
         return { nodeId: pin.nodeId, targetProfile: pin.targetProfile, endpoint: pin.endpoint,
             nodeIdentity: { machineId: pin.physical.machineId, sshHostKeySha256: pin.physical.sshHostKeySha256 },
@@ -379,7 +426,7 @@ function createRootTestPhysicalAuthority({ env = process.env, read = privateRead
             guard: pin.guard, originalSnapshot: pin.originalSnapshot };
     }) });
     let captured;
-    const controller = createTestPhysicalController({ config,
+    const controller = createTestPhysicalController({ config, inventory,
         readObservations(selected, predecessor) { need(captured); return captured.observeAll(selected, predecessor); },
         // The capture-holder performs fresh actual observation. Never open a
         // second SSH observer that would contend for the retained outer lock.

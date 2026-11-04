@@ -23,6 +23,7 @@ import time
 RUNNER = '/usr/local/bin/celerity-topology-node-runner-v2'
 HELPER = '/usr/local/libexec/c3-test-node-isolation'
 CONFIG = '/etc/c3-test-node-isolation.json'
+INVENTORY = '/etc/celerity/topology-test-inventory.json'
 STATE = '/var/lib/c3-test-node-isolation'
 # Export only with the actual sticky Engine.dispatch admission gate below.
 # Installed helper SHA256 must still be independently accepted by the restorer.
@@ -163,16 +164,79 @@ def assert_readiness_receipt(receipt, request, fields, plan):
 
 
 def validate_plan(p):
-    need(isinstance(p, dict) and set(p) == PLAN_KEYS, 'INVALID_PLAN_FIELDS')
-    need(isinstance(p['nodeId'], str) and p['nodeId'] in TEST_NODES, 'DEDICATED_TEST_NODE_ONLY')
-    need((p['endpointIp'], p['targetProfile']) == TEST_NODES[p['nodeId']], 'ENDPOINT_PROFILE_MISMATCH')
+    need(isinstance(p, dict) and set(p) == plan_keys(p), 'INVALID_PLAN_FIELDS')
+    if p.get('version') == 2:
+        inventory = accepted_inventory(p)
+        need(p['nodeId'] != inventory['sharedNodeId'], 'DEDICATED_TEST_NODE_ONLY')
+        inventory_node(p, inventory=inventory)
+    else:
+        need(isinstance(p['nodeId'], str) and p['nodeId'] in TEST_NODES, 'DEDICATED_TEST_NODE_ONLY')
+        need((p['endpointIp'], p['targetProfile']) == TEST_NODES[p['nodeId']], 'ENDPOINT_PROFILE_MISMATCH')
     return validate_common_plan(p)
+
+
+def plan_keys(p):
+    return PLAN_KEYS | ({'inventorySha256'} if p.get('version') == 2 else set())
+
+
+def validate_inventory(value):
+    """Independent root policy, never derived from mutable node/HTTP/env data."""
+    import ipaddress
+    need(isinstance(value, dict) and set(value) == {'version','profile','executionContext','nodes','sharedNodeId'}
+         and type(value['version']) is int and value['version'] == 1 and value['profile'] == 'accepted-test-v1'
+         and value['executionContext'] == {'target':'test','hostIdentity':'test.infograd.online'}
+         and isinstance(value['nodes'], list) and 1 <= len(value['nodes']) <= 5, 'INVALID_ACCEPTED_INVENTORY')
+    ids, machines, keys, endpoints = set(), set(), set(), set()
+    for pin in value['nodes']:
+        need(isinstance(pin, dict) and set(pin) == {'nodeId','targetProfile','endpoint','physical','profiles'}
+             and isinstance(pin['nodeId'], str) and re.fullmatch('[a-f0-9]{24}', pin['nodeId'])
+             and pin['nodeId'] not in ids and pin['targetProfile'] in ('xray-main','xray-bridge'), 'INVALID_INVENTORY_NODE')
+        ids.add(pin['nodeId'])
+        endpoint = pin['endpoint']
+        need(isinstance(endpoint, dict) and set(endpoint) == {'ip','port','username'} and isinstance(endpoint['ip'], str)
+             and type(endpoint['port']) is int and endpoint['port'] == 2222 and endpoint['username'] == RUNNER_USER, 'INVALID_INVENTORY_ENDPOINT')
+        try:
+            ip = ipaddress.IPv4Address(endpoint['ip'])
+        except ipaddress.AddressValueError:
+            raise Refusal('INVALID_INVENTORY_ENDPOINT') from None
+        need(any(ip in ipaddress.IPv4Network(net) for net in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16'))
+             and str(ip) == endpoint['ip'] and str(ip) not in endpoints, 'INVALID_INVENTORY_ENDPOINT')
+        endpoints.add(str(ip))
+        physical = pin['physical']
+        need(isinstance(physical, dict) and set(physical) == {'machineId','bootId','sshHostKeySha256'}, 'INVALID_INVENTORY_PHYSICAL')
+        for field, pattern in (('machineId','[a-f0-9]{32}'),('bootId','[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'),('sshHostKeySha256','[a-f0-9]{64}')):
+            need(isinstance(physical[field], str) and re.fullmatch(pattern, physical[field]), 'INVALID_INVENTORY_PHYSICAL')
+        need(physical['machineId'] not in machines and physical['sshHostKeySha256'] not in keys, 'ALIASED_NODE_RETAINED')
+        machines.add(physical['machineId']); keys.add(physical['sshHostKeySha256'])
+        need(pin['profiles'] in ([pin['targetProfile']], ['xray-main','xray-bridge']), 'INVALID_INVENTORY_PROFILES')
+    shared = next((pin for pin in value['nodes'] if pin['nodeId'] == value['sharedNodeId']), None)
+    need(shared is not None and shared['targetProfile'] == 'xray-bridge' and shared['profiles'] == ['xray-main','xray-bridge'], 'SHARED_INVENTORY_REQUIRED')
+    return value
+
+
+def accepted_inventory(p, read=None):
+    need(type(p.get('version')) is int and p['version'] == 2 and isinstance(p.get('inventorySha256'), str)
+         and re.fullmatch('[a-f0-9]{64}', p['inventorySha256']), 'ACCEPTED_INVENTORY_REQUIRED')
+    inventory = validate_inventory(decode_json((read or secure_file)(INVENTORY)))
+    raw = json.dumps(inventory, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    need(digest(raw) == p['inventorySha256'], 'ACCEPTED_INVENTORY_DRIFT')
+    return inventory
+
+
+def inventory_node(p, read=None, *, inventory=None):
+    inventory = accepted_inventory(p, read) if inventory is None else inventory
+    pin = next((pin for pin in inventory['nodes'] if pin['nodeId'] == p.get('nodeId')), None)
+    need(pin is not None and p.get('context') == 'test.infograd.online' and pin['endpoint']['ip'] == p.get('endpointIp')
+         and pin['targetProfile'] == p.get('targetProfile') and all(p.get(k) == v for k,v in pin['physical'].items()), 'ACCEPTED_NODE_IDENTITY_DRIFT')
+    return pin
 
 
 def validate_common_plan(p):
     # Shared mode uses this shape/policy check, never the dedicated node allowlist.
-    need(isinstance(p, dict) and set(p) == PLAN_KEYS, 'INVALID_PLAN_FIELDS')
-    need(type(p['version']) is int and p['version'] == 1 and p['context'] == 'test.infograd.online', 'TEST_ONLY')
+    need(isinstance(p, dict) and set(p) == plan_keys(p), 'INVALID_PLAN_FIELDS')
+    need(type(p['version']) is int and p['version'] in (1, 2) and p['context'] == 'test.infograd.online', 'TEST_ONLY')
+    if p['version'] == 2:
+        inventory_node(p)
     for name, pattern in [('machineId', r'[a-f0-9]{32}'), ('bootId', r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}'),
                           ('maintenanceId', r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')]:
         need(isinstance(p[name], str) and re.fullmatch(pattern, p[name]) is not None, 'INVALID_IDENTITY')

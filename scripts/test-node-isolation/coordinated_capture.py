@@ -78,30 +78,55 @@ def decode(raw):
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: need(False))
 
 
+def accepted_inventory(config):
+    # Reuse the installed isolation contract, pinned BEFORE executing its bytes.
+    # No new controller/helper, import path or caller-selected inventory path.
+    pins = [pin['files']['isolation'] for pin in config['nodes'].values()]
+    need(pins and len(set(pins)) == 1, 'ISOLATION_PIN_MISMATCH')
+    module = load_module('c3_capture_inventory', '/usr/local/libexec/c3-test-node-isolation', pins[0])
+    return module.accepted_inventory(config, read=trusted_read)
+
+
+def shared_node(config):
+    return accepted_inventory(config)['sharedNodeId'] if config['version'] == 2 else SHARED_NODE
+
+
 def validate(config):
-    need(isinstance(config, dict) and set(config) == {'version','context','lifetimeSeconds','origin','nodes','keySha256','protocolSha256','ownerChallenge'})
-    need(type(config['version']) is int and config['version'] == 1 and config['context'] == 'test.infograd.online')
+    need(isinstance(config, dict) and set(config) == {'version','context','lifetimeSeconds','origin','nodes','keySha256','protocolSha256','ownerChallenge'} | ({'inventorySha256'} if config.get('version') == 2 else set()))
+    need(type(config['version']) is int and config['version'] in (1, 2) and config['context'] == 'test.infograd.online')
+    inventory = accepted_inventory(config) if config['version'] == 2 else None
+    nodes = {p['nodeId']:(p['endpoint']['ip'],p['targetProfile']) for p in inventory['nodes']} if inventory else NODES
+    shared = inventory['sharedNodeId'] if inventory else SHARED_NODE
+    if inventory:
+        shared_physical = next(pin['physical'] for pin in inventory['nodes'] if pin['nodeId'] == shared)
+        need(all(config['origin'][key] == shared_physical[key] for key in ('machineId','bootId')), 'COORDINATOR_SHARED_HOST_MISMATCH')
     need(type(config['lifetimeSeconds']) is int and 80 <= config['lifetimeSeconds'] <= 120)
     need(set(config['origin']) == {'machineId','bootId','cgroup','uid'} and type(config['origin']['uid']) is int and config['origin']['uid'] == 0
          and isinstance(config['origin']['cgroup'], str) and config['origin']['cgroup'] and 'candidate' not in config['origin']['cgroup'])
     need(re.fullmatch('[a-f0-9]{32}',config['origin']['machineId']) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',config['origin']['bootId']))
     need(all(isinstance(config[k], str) and DIGEST.fullmatch(config[k]) for k in ('keySha256','protocolSha256')))
-    need(set(config['nodes']) == set(NODES), 'EXACT_FIVE_NODES_REQUIRED')
+    need(set(config['nodes']) == set(nodes), 'EXACT_ACCEPTED_NODES_REQUIRED' if inventory else 'EXACT_FIVE_NODES_REQUIRED')
     challenge = config['ownerChallenge']
-    need(set(challenge) == {'version','executionContext','nodes','host'} and type(challenge['version']) is int and challenge['version'] == 1
-         and challenge['executionContext'] == {'target':'test','hostIdentity':'test.infograd.online'} and isinstance(challenge['nodes'], list) and len(challenge['nodes']) == 5)
-    need({p['nodeId'] for p in challenge['nodes']} == set(NODES))
+    need(set(challenge) == {'version','executionContext','nodes','host'} | ({'inventorySha256'} if inventory else set()) and type(challenge['version']) is int and challenge['version'] == config['version']
+         and challenge['executionContext'] == {'target':'test','hostIdentity':'test.infograd.online'} and isinstance(challenge['nodes'], list) and len(challenge['nodes']) == len(nodes))
+    need({p['nodeId'] for p in challenge['nodes']} == set(nodes))
+    if inventory: need(challenge['inventorySha256'] == config['inventorySha256'], 'OWNER_INVENTORY_DRIFT')
     machines, keys = set(), set()
     for node, pin in config['nodes'].items():
         need(set(pin) == {'identity','profiles','guard','files','hostKey'})
         ident = pin['identity']
-        need(set(ident) == {'context','nodeId','endpointIp','targetProfile','machineId','bootId','sshHostKeySha256','maintenanceId','planHash'})
-        need(ident['context'] == config['context'] and ident['nodeId'] == node and (ident['endpointIp'],ident['targetProfile']) == NODES[node])
-        profiles = ['xray-main','xray-bridge'] if ident['endpointIp'] == '104.143.201.72' or node == SHARED_NODE else [ident['targetProfile']]
+        need(set(ident) == {'context','nodeId','endpointIp','targetProfile','machineId','bootId','sshHostKeySha256','maintenanceId','planHash'} | ({'inventorySha256'} if inventory else set()))
+        need(ident['context'] == config['context'] and ident['nodeId'] == node and (ident['endpointIp'],ident['targetProfile']) == nodes[node])
+        if inventory:
+            accepted = next(p for p in inventory['nodes'] if p['nodeId'] == node)
+            need(ident['inventorySha256'] == config['inventorySha256'] and all(ident[k] == v for k,v in accepted['physical'].items()), 'ACCEPTED_PHYSICAL_DRIFT')
+            profiles = accepted['profiles']
+        else:
+            profiles = ['xray-main','xray-bridge'] if ident['endpointIp'] == '104.143.201.72' or node == shared else [ident['targetProfile']]
         need(pin['profiles'] == profiles and isinstance(pin['guard'],dict) and pin['guard'])
         need(re.fullmatch('[a-f0-9]{32}',ident['machineId']) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',ident['bootId'])
              and re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,127}',ident['maintenanceId']))
-        names = {'self','originals','isolation','accepted','attestor'} | ({'shared','freezer'} if node == SHARED_NODE else set())
+        names = {'self','originals','isolation','accepted','attestor'} | ({'shared','freezer'} if node == shared else set())
         need(set(pin['files']) == names and all(isinstance(v,str) and DIGEST.fullmatch(v) for v in [*pin['files'].values(), ident['planHash'],ident['sshHostKeySha256']]))
         raw = base64.b64decode(pin['hostKey'],validate=True)
         need(base64.b64encode(raw).decode() == pin['hostKey'] and len(raw) == 51 and raw[:19] == struct.pack('>I',11)+b'ssh-ed25519'+struct.pack('>I',32) and sha(raw) == ident['sshHostKeySha256'])
@@ -120,7 +145,7 @@ def validate(config):
     # Complete host proof is independently fixed in the owner challenge; the
     # installed shared engine freshly validates its guard/backend while held.
     host = challenge['host']
-    need(set(host) == {'owner','guard','backend'} and host['owner'] == host['guard']['owner'] and host['guard']['planHash'] == config['nodes'][SHARED_NODE]['identity']['planHash'])
+    need(set(host) == {'owner','guard','backend'} and host['owner'] == host['guard']['owner'] and host['guard']['planHash'] == config['nodes'][shared]['identity']['planHash'])
     return config
 
 
@@ -267,6 +292,9 @@ class NodeServer:
         self.writer, self.n, self.config, self.wire, self.c, self.shared = writer, originals, validate(config), wire, protocol, shared
         self.attestor = attestor
         self.node = writer.engine.plan['nodeId']
+        self.shared_node = shared_node(config)
+        if config['version'] == 2:
+            need(writer.engine.plan.get('version') == 2 and writer.engine.plan.get('inventorySha256') == config['inventorySha256'], 'NODE_INVENTORY_DRIFT')
         self.pin = config['nodes'][self.node]
         self.nonce = secrets.token_hex(32)
         self.session = writer.engine.host.operator_session()
@@ -276,7 +304,7 @@ class NodeServer:
         need(self.n.identity(self.writer.engine) == self.pin['identity'] and self.writer.profiles == self.pin['profiles'])
         need(self.writer.held()['guard'] == self.pin['guard'] and self.writer.engine.host.operator_session() == self.session, 'GUARD_OPERATOR_PIN_DRIFT_RETAINED')
         paths = {'self':SELF,'originals':ORIGINALS,'isolation':self.n.HELPER,'accepted':self.n.ACCEPTED,'attestor':ATTESTOR}
-        if self.node == SHARED_NODE:
+        if self.node == self.shared_node:
             paths.update(shared=SHARED,freezer=FREEZER)
         for name,path in paths.items():
             need(sha(self.writer.fs.read(path)[0]) == self.pin['files'][name], 'INSTALLED_PIN_DRIFT_RETAINED')
@@ -286,7 +314,7 @@ class NodeServer:
         snap = owner['originalSnapshot']
         need(snap['configSha256'] == accepted['files']['config']['sha256'] and snap['unitSha256'] == accepted['files']['unit']['sha256']
              and snap['serviceActive'] == accepted['service']['ActiveState'] and snap['serviceEnabled'] == accepted['service']['UnitFileState'], 'OWNER_ORIGINAL_PIN_DRIFT_RETAINED')
-        if self.node == SHARED_NODE:
+        if self.node == self.shared_node:
             need(self.shared is not None, 'SHARED_HOLD_REQUIRED')
             current = self.shared.check_hold(self.writer.engine.plan,STATE,self.writer.module)
             backend = next(p for p in current['containers'] if p['name'] == 'hysteria-backend')
@@ -397,6 +425,7 @@ class Coordinator:
     def live(self):
         need(self.active and time.monotonic() < self.deadline, 'CAPTURE_CAPABILITY_REVOKED')
         need(self.fs.read_json(CONFIG) == self.config and self.fs.read_json(INTENT) == self.intent, 'COORDINATOR_DRIFT_RETAINED')
+        if self.config['version'] == 2: validate(self.config)
         if self.fs.fixture is None:
             need(self.c.local_origin(self.config) == self.origin and sha(self.fs.read(KEY)[0]) == self.config['keySha256'])
         for channel in self.nodes:
@@ -406,7 +435,7 @@ class Coordinator:
     def check(self, *, captured=True):
         try:
             self.live()
-            need(len(self.nodes) == 5 and (not captured or all(c.captured for c in self.nodes)), 'FIVE_CAPTURED_HOLDS_REQUIRED')
+            need(len(self.nodes) == len(self.config['nodes']) and (not captured or all(c.captured for c in self.nodes)), 'ALL_CAPTURED_HOLDS_REQUIRED' if self.config['version'] == 2 else 'FIVE_CAPTURED_HOLDS_REQUIRED')
             for channel in self.nodes:
                 channel.request('check',self.watch(channel))
             self.live()
@@ -486,7 +515,7 @@ class Coordinator:
                     return
                 observation = {}
                 if frame['op'] == 'observe-all':
-                    need(frame['nodeId'] is None or frame['nodeId'] in NODES, 'FOREIGN_OBSERVATION_NODE')
+                    need(frame['nodeId'] is None or frame['nodeId'] in self.config['nodes'], 'FOREIGN_OBSERVATION_NODE')
                     observation['observation'] = {c.node:c.observe(frame['predecessor'] if c.node == frame['nodeId'] else None,self.watch(c)) for c in self.nodes}
                     self.live()
                 if frame['op'] == 'observe':
@@ -495,7 +524,7 @@ class Coordinator:
                     observation['observation'] = channel.observe(frame['predecessor'],self.watch(channel))
                     self.check()
                 next_nonce = secrets.token_hex(32)
-                wire.send({**frame,'op':'capture-held','nodeCount':5,'handbackAllowed':False,'nextNonce':next_nonce,**observation})
+                wire.send({**frame,'op':'capture-held','nodeCount':len(self.config['nodes']),'handbackAllowed':False,'nextNonce':next_nonce,**observation})
                 nonce = next_nonce
         finally:
             if not completed:
@@ -514,6 +543,7 @@ class CaptureChannel:
     def state(self):
         need(self.active and self.conn is not None, 'CAPTURE_CHANNEL_REVOKED')
         need(self.fs.read_json(CONFIG) == self.config and self.fs.read_json(INTENT) == self.intent, 'CAPTURE_STATE_DRIFT_RETAINED')
+        if self.config['version'] == 2: validate(self.config)
         pid,uid,_ = struct.unpack('3i',self.conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
         need(uid == self.fs.uid and pid == self.intent['origin']['pid'] and self.c.proc_start(pid) == self.intent['origin']['start'], 'ROOT_COORDINATOR_PEER_REQUIRED')
 
@@ -522,8 +552,8 @@ class CaptureChannel:
             need(os.geteuid() == self.fs.uid, 'ROOT_OWNER_REQUIRED')
             self.config = validate(self.fs.read_json(CONFIG))
             self.intent = self.fs.read_json(INTENT)
-            need(self.intent['phase'] == 'captured-held' and self.intent['inFlightNode'] is None and len(self.intent['capturedNodes']) == 5
-                 and set(self.intent['capturedNodes']) == set(NODES) and self.intent['configSha256'] == sha(canonical(self.config)), 'LIVE_CAPTURE_REQUIRED')
+            need(self.intent['phase'] == 'captured-held' and self.intent['inFlightNode'] is None and len(self.intent['capturedNodes']) == len(self.config['nodes'])
+                 and set(self.intent['capturedNodes']) == set(self.config['nodes']) and self.intent['configSha256'] == sha(canonical(self.config)), 'LIVE_CAPTURE_REQUIRED')
             if self.fs.fixture is None:
                 with self.fs.opened(STATE,directory=True) as fd:
                     info = os.stat(Path(SOCKET).name,dir_fd=fd,follow_symlinks=False)
@@ -555,7 +585,7 @@ class CaptureChannel:
             self.wire.send(frame)
             reply = self.wire.receive()
             need(set(reply) == {*frame,'nodeCount','handbackAllowed','nextNonce'} | ({'observation'} if node or all_nodes else set()) and type(reply['version']) is int and type(reply['nodeCount']) is int
-                 and reply['nodeCount'] == 5 and {k:reply[k] for k in frame} == {**frame,'op':'capture-held'} and reply['handbackAllowed'] is False
+                 and reply['nodeCount'] == len(self.config['nodes']) and {k:reply[k] for k in frame} == {**frame,'op':'capture-held'} and reply['handbackAllowed'] is False
                  and isinstance(reply['nextNonce'],str) and DIGEST.fullmatch(reply['nextNonce']) and reply['nextNonce'] != self.nonce)
             self.nonce = reply['nextNonce']; self.state()
             if node or all_nodes: return reply['observation']
@@ -592,7 +622,7 @@ def owner_bridge(fs, protocol, wire, *, fixture_socket=None):
                 return
             observation = {}
             if frame['op'] in ('observe','observe-all'):
-                need(frame['nodeId'] in NODES or (frame['op'] == 'observe-all' and frame['nodeId'] is None), 'FOREIGN_OBSERVATION_NODE')
+                need(frame['nodeId'] in config['nodes'] or (frame['op'] == 'observe-all' and frame['nodeId'] is None), 'FOREIGN_OBSERVATION_NODE')
                 observation['observation'] = held.check(frame['nodeId'],frame['predecessor'],all_nodes=frame['op'] == 'observe-all')
             wire.send({'version':1,'op':'capture-held','seq':seq,'nonce':frame['nonce'],**observation})
             opened = True; seq += 1
@@ -633,7 +663,7 @@ def ssh_argv(config, node):
             '-o','ControlMaster=no','-o','ControlPath=none','-o','ControlPersist=no','-o','ClearAllForwardings=yes',
             '-o','ForwardAgent=no','-o','ForwardX11=no','-o','PermitLocalCommand=no','-o','ProxyCommand=none','-o','ProxyJump=none',
             '-o','ConnectionAttempts=1','-o','ConnectTimeout=8','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2',
-            'c3-test-operator@'+NODES[node][0],COMMAND]
+            'c3-test-operator@'+config['nodes'][node]['identity']['endpointIp'],COMMAND]
 
 
 def main():
@@ -659,7 +689,7 @@ def main():
         proposed = decode(fs.read(module.CONFIG)[0])
         need(proposed['nodeId'] == accepted['nodeId'])
         shared = None
-        if accepted['nodeId'] == SHARED_NODE:
+        if accepted['nodeId'] == shared_node(config):
             need(sha(fs.read(FREEZER)[0]) == pin['files']['freezer'])
             shared = load_module('c3_capture_shared',SHARED,pin['files']['shared'])
             plan = shared.validate_plan(proposed,module)

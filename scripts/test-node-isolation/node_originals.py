@@ -96,7 +96,8 @@ def runner_journal(profile):
 
 
 def identity(engine):
-    return {**{k:engine.plan[k] for k in IDENTITY}, 'planHash':engine.plan_hash}
+    return {**{k:engine.plan[k] for k in IDENTITY}, 'planHash':engine.plan_hash,
+            **({'inventorySha256':engine.plan['inventorySha256']} if engine.plan.get('version') == 2 else {})}
 
 
 class Fixture:
@@ -278,9 +279,13 @@ class NodeOriginals:
         self.system = fixture.system if fixture else System()
         self.fixture = fixture
         plan = engine.plan
-        need(plan.get('nodeId') in NODES and (plan.get('endpointIp'),plan.get('targetProfile')) == NODES[plan['nodeId']]
-             and plan.get('context') == 'test.infograd.online', 'FIXED_TEST_NODE_REQUIRED')
-        self.profiles = ['xray-main','xray-bridge'] if plan['endpointIp'] == '104.143.201.72' or plan['nodeId'] == '6ab189dc63913ebd4a917399' else [plan['targetProfile']]
+        if plan.get('version') == 2:
+            pin = module.inventory_node(plan, read=lambda path:self.fs.read(path)[0])
+            self.profiles = list(pin['profiles'])
+        else:
+            need(plan.get('nodeId') in NODES and (plan.get('endpointIp'),plan.get('targetProfile')) == NODES[plan['nodeId']]
+                 and plan.get('context') == 'test.infograd.online', 'FIXED_TEST_NODE_REQUIRED')
+            self.profiles = ['xray-main','xray-bridge'] if plan['endpointIp'] == '104.143.201.72' or plan['nodeId'] == '6ab189dc63913ebd4a917399' else [plan['targetProfile']]
         self.accepted = self.fs.read_json(ACCEPTED)
         need(set(self.accepted) == {'version',*identity(engine),'isolationSha256','xraySha256','profiles'} and
              type(self.accepted['version']) is int and self.accepted['version'] == 1 and
@@ -311,6 +316,9 @@ class NodeOriginals:
 
     def checkpoint(self):
         self.held(self.guard)
+        if self.engine.plan.get('version') == 2:
+            pin = self.module.inventory_node(self.engine.plan, read=lambda path:self.fs.read(path)[0])
+            need(pin['profiles'] == self.profiles, 'ACCEPTED_PROFILE_DRIFT_RETAINED')
         for path, fd in self.lock_paths.items():
             with self.fs.opened(path) as current:
                 a,b = os.fstat(fd),os.fstat(current)
@@ -461,6 +469,8 @@ class NodeOriginals:
     def preserved_profile(self, profile):
         # The shared relay executes ONLY bridge. Its independent main instance
         # is captured/checked, never stopped, rewritten, or assigned a runner head.
+        if self.engine.plan.get('version') == 2:
+            return profile in self.profiles and profile != self.engine.plan['targetProfile']
         return self.engine.plan['nodeId'] == '6ab189dc63913ebd4a917399' and profile == 'xray-main'
 
     def terminal(self, profile, pin):

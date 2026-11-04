@@ -163,7 +163,11 @@ def durable_originals(engine, m, read=secure_read):
     identity = {k: engine.plan[k] for k in ('context', 'nodeId', 'endpointIp', 'targetProfile', 'machineId', 'bootId',
                                           'sshHostKeySha256', 'maintenanceId')}
     identity['planHash'] = engine.plan_hash
-    profiles = ['xray-main', 'xray-bridge'] if identity['endpointIp'] == '104.143.201.72' or identity['nodeId'] == '6ab189dc63913ebd4a917399' else [identity['targetProfile']]
+    if engine.plan.get('version') == 2:
+        identity['inventorySha256'] = engine.plan['inventorySha256']
+        profiles = m.inventory_node(engine.plan, read=lambda path:read(path)[0])['profiles']
+    else:
+        profiles = ['xray-main', 'xray-bridge'] if identity['endpointIp'] == '104.143.201.72' or identity['nodeId'] == '6ab189dc63913ebd4a917399' else [identity['targetProfile']]
     need(set(accepted) == {'version', *identity, 'isolationSha256', 'xraySha256', 'profiles'} and
          type(accepted['version']) is int and accepted['version'] == 1 and
          all(accepted[k] == v for k, v in identity.items()) and set(accepted['profiles']) == set(profiles), 'ORIGINAL_ACCEPTED_IDENTITY_DRIFT')
@@ -238,6 +242,10 @@ def runner_state(plan, m, predecessor):
 def observe(engine, m, shared, predecessor=None):
     state = engine.assert_held()  # live nonce/PID/start/root-peer + current exclusion
     plan = engine.plan
+    if plan.get('version') == 2:
+        inventory = m.accepted_inventory(plan, read=lambda path:secure_read(path)[0])
+        m.inventory_node(plan, inventory=inventory)
+        need(bool(shared) == (plan['nodeId'] == inventory['sharedNodeId']), 'SHARED_HOST_HOLD_REQUIRED')
     physical = engine.host.physical()  # NEVER echo plan identity as observation
     need(physical == {k: plan[k] for k in ('machineId', 'bootId', 'sshHostKeySha256')}, 'PHYSICAL_IDENTITY_DRIFT')
     value = {'physical': physical, 'nodeId': plan['nodeId'], 'targetProfile': plan['targetProfile'],
