@@ -102,10 +102,8 @@ test('settled endpoint cleanup supplies the detached profile on its next selecte
     const f = await adoptedFixture();
     try {
         await f.deploy(id(10));
-        const edit = await request(f.http, 'PUT', `/links/${id(11)}`, { expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
-            name: 'new endpoint', bridgeNodeId: id(4), autoDeploy: true }, randomUUID());
-        const moved = await f.drain(edit);
-        assert.ok(moved.nodes.some(node => node.node === id(3)), 'old endpoint is actually cleaned by worker');
+        const moved = await f.remove(id(11));
+        assert.ok(moved.nodes.some(node => node.node === id(3)), 'detached endpoint is actually cleaned by worker');
         const saved = await request(f.http, 'POST', '/links', { expectedTopologyRevision: f.data.CascadeTopologyState[0].revision,
             name: 'reuse old endpoint', portalNodeId: id(2), bridgeNodeId: id(3), mode: 'reverse', tunnelPort: 25012, tunnelSecurity: 'none', autoDeploy: false }, randomUUID());
         assert.equal(saved.status, 201, JSON.stringify(saved.body));
@@ -113,6 +111,55 @@ test('settled endpoint cleanup supplies the detached profile on its next selecte
         assert.equal(selected.baselineTopology.nodes.find(node => node.id === id(3))?.profileConfig, f.physical.get(id(3)), 'detached cleanup candidate remains checked current profile evidence');
         await f.deploy(saved.body.createdLinkId);
         assert.ok(JSON.parse(f.physical.get(id(3))).inbounds.some(n => n.tag === 'unrelated-client'));
+    } finally { await f.close(); }
+});
+// Corrupt the result of a REAL TEST worker settlement. The constructed V2
+// receipt below is only a reader-validation control, NOT V2 execution evidence.
+function terminalControl(f) {
+    const op = f.data.TopologyOperation.at(-1);
+    op.v2Terminal = { state: 'proven', bindings: [], proofs: [] };
+    for (const entry of op.nodes) {
+        const owner = f.data.TopologyConfigOwner.find(row => row.node === entry.node);
+        const commandId = randomUUID(), bootId = randomUUID();
+        owner.lastSettledCloseId = commandId;
+        const binding = { nodeId: entry.node, operationId: op._id, targetProfile: entry.targetProfile,
+            candidateHash: `sha256:${entry.candidateHash}`, backupId: entry.backupId,
+            executionContext: context.hostIdentity, owner: op.leaseOwner, attempt: op.attempts,
+            topologyRevision: op.topologyRevision, priorDeployedRevision: op.priorDeployedRevision,
+            generation: owner.lastSettledGeneration, commandIds: { close: commandId }, bootId,
+            attemptId: randomUUID(), predecessorGeneration: 'none' };
+        const proof = Object.fromEntries(['operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile',
+            'executionContext', 'attemptId', 'generation', 'predecessorGeneration'].map(key => [key, binding[key]]));
+        Object.assign(proof, { ok: true, command: 'status', commandId, protocolVersion: 2, completion: 'completed',
+            phase: 'closed', terminal: true, ownershipRetained: true, terminalOutcome: 'verified', bootId,
+            systemdJob: 'completed', serviceState: 'active:running', completedCommand: 'close' });
+        op.v2Terminal.bindings.push(binding); op.v2Terminal.proofs.push(proof);
+    }
+    return op;
+}
+for (const [name, mutate] of [
+    ['unsettled operation', (f, op) => { op.status = 'committing'; }],
+    ['held admission', (f, op) => { op.heldTopologyAdmission = true; }],
+    ['uncommitted candidate', (f, op) => { op.nodes[0].state = 'prepared'; }],
+    ['candidate byte/hash drift', (f, op) => { op.nodes[0].candidate.bytes[0] ^= 1; }],
+    ['candidate hash substitution', (f, op) => { op.nodes[0].candidateHash = 'a'.repeat(64); }],
+    ['terminal candidate from another readback', (f, op) => { op.v2Terminal.bindings[0].candidateHash = op.v2Terminal.proofs[0].candidateHash = `sha256:${'b'.repeat(64)}`; }],
+    ['terminal operation mismatch', (f, op) => { op.v2Terminal.bindings[0].operationId = op.v2Terminal.proofs[0].operationId = 'foreign-operation'; }],
+    ['terminal owner-generation mismatch', (f, op) => { op.v2Terminal.bindings[0].generation = op.v2Terminal.proofs[0].generation = randomUUID(); }],
+    ['terminal wrong profile', (f, op) => { op.v2Terminal.bindings[0].targetProfile = op.v2Terminal.proofs[0].targetProfile = 'xray-bridge'; }],
+    ['nonverified terminal outcome', (f, op) => { op.v2Terminal.proofs[0].terminalOutcome = 'rolledback'; }],
+]) test(`selected reader never promotes ${name} into current profile evidence`, async () => {
+    const f = await adoptedFixture();
+    try {
+        await f.deploy(id(10));
+        const op = terminalControl(f);
+        assert.ok((await f.read(id(11))).baselineTopology.nodes.every(node => node.profileConfig === f.physical.get(node.id)), 'coherent reader control reaches candidate publication');
+        mutate(f, op);
+        const before = copy(f.data);
+        await assert.rejects(f.read(id(11)), name.startsWith('candidate ')
+            ? { name: 'TypeError', message: 'Invalid canonical Xray topology candidate' }
+            : { code: 'APPLIED_BASELINE_REQUIRED' });
+        assert.deepEqual(f.data, before, 'refused read is mutation-free');
     } finally { await f.close(); }
 });
 module.exports = { adoptedFixture };
