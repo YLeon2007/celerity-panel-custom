@@ -2,6 +2,9 @@
 
 const { createHash, randomBytes } = require('node:crypto');
 const mongoose = require('mongoose');
+const { isDeepStrictEqual } = require('node:util');
+const { projectGroups } = require('../domain/topologyDraft');
+const { ownedIngressRouteState } = require('./topologyAttachIngressGate');
 const { L2tpStateManagementRepository } = require('../repositories/l2tpStateManagementRepository');
 const {
     DefaultChainPathError,
@@ -257,6 +260,8 @@ class L2tpSimpleService {
         configWriteGuard,
         secretBox = null,
         secretKey = null,
+        topologyIngressGate,
+        topologyPppReadinessGate,
     } = {}) {
         if (!HyNode || typeof HyNode.find !== 'function' || typeof HyNode.findById !== 'function') {
             throw new TypeError('L2TP simple service requires the HyNode model');
@@ -310,6 +315,13 @@ class L2tpSimpleService {
             TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: configWriteEnv.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED });
         this.secretBox = secretBox;
         this.secretKey = secretKey;
+        for (const gate of [topologyIngressGate, topologyPppReadinessGate]) {
+            if (gate !== undefined && typeof gate?.verifyPlan !== 'function') {
+                throw new TypeError('Installed topology ingress requires readiness gates');
+            }
+        }
+        this.topologyIngressGate = topologyIngressGate;
+        this.topologyPppReadinessGate = topologyPppReadinessGate;
     }
 
     revealAccountPassword(passwordEncrypted) {
@@ -518,10 +530,17 @@ class L2tpSimpleService {
         }
     }
 
-    // Prepare only an already configured, uninstalled relay for this exact
-    // link.apply scope. The group and revision commit together before the
-    // coordinator freezes the Xray candidate (which needs the SOCKS ingress).
-    async prepareConfiguredRelayIngress({ linkId, linkIds = [linkId], expectedTopologyRevision, session: externalSession } = {}) {
+    // Legacy draft preparation is uninstalled-only and commits the group with
+    // its revision before composition. Installed changes instead validate the
+    // operation's private candidate below; they never use this path writer.
+    async prepareConfiguredRelayIngress({ linkId, linkIds = [linkId], expectedTopologyRevision,
+        session: externalSession, operationPlan } = {}) {
+        if (operationPlan !== undefined) {
+            if (externalSession !== undefined || linkId !== undefined || expectedTopologyRevision !== undefined) {
+                throw simpleError('INVALID_INGRESS_OPERATION', 'Operation ingress cannot join a draft path writer');
+            }
+            return this.prepareInstalledOperationIngress(operationPlan);
+        }
         if (!mongoose.Types.ObjectId.isValid(linkId)
             || !Number.isSafeInteger(expectedTopologyRevision)) {
             throw simpleError('INVALID_TOPOLOGY_REVISION', 'An exact link and topology revision are required');
@@ -612,6 +631,126 @@ class L2tpSimpleService {
                 deferred: !changed && !routeGroupId,
             };
         }, expectedTopologyRevision, externalSession);
+    }
+
+    // Called by the existing worker under its held node/owner generation. MAIN
+    // already targets this stable group/path SOCKS endpoint; the operation's
+    // sidecar candidate changes the suffix, not PPP installation or secrets.
+    // This is a read-only preparation receipt, never route publication.
+    async prepareInstalledOperationIngress(plan) {
+        this.assertRemoteExecutionAllowed();
+        const frozen = value => !value || typeof value !== 'object'
+            || Object.isFrozen(value) && Object.values(value).every(frozen);
+        const validIds = ids => Array.isArray(ids)
+            && ids.every(id => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id))
+            && new Set(ids).size === ids.length;
+        const routeState = ownedIngressRouteState(plan);
+        if (!frozen(plan) || !routeState || typeof plan.operationId !== 'string' || !plan.operationId
+            || !Number.isSafeInteger(plan.topologyRevision) || plan.topologyRevision < 0
+            || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0
+            || !Number.isSafeInteger(plan.ownerCredentialRevision) || plan.ownerCredentialRevision < 1
+            || !validIds(plan.oldPathLinkIds) || !validIds(plan.newPathLinkIds)
+            || !Array.isArray(plan.effectiveTopology?.nodes) || !Array.isArray(plan.effectiveTopology?.links)
+            || !Array.isArray(plan.effectiveTopology?.groups)
+            || !this.topologyIngressGate || !this.topologyPppReadinessGate) {
+            throw simpleError('INVALID_INGRESS_OPERATION', 'A frozen owner-bound ingress candidate and gates are required');
+        }
+        const readOwner = async () => {
+            const states = await this.RelayL2tpState.find({ routeGroup: plan.groupId }).lean();
+            const owners = states.filter(state => entityId(state.routeGroup) === plan.groupId
+                && (state.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.has(state.status)));
+            const matches = owners.filter(state => entityId(state.node) === plan.ownerNodeId);
+            if (matches.length !== 1 || owners.filter(state => state.activePathKey === plan.pathKey).length !== 1
+                || matches[0].activePathKey !== plan.pathKey || matches[0].status !== 'installed'
+                || matches[0].desiredState !== 'installed'
+                || matches[0].secretRevision !== plan.ownerCredentialRevision
+                || matches[0].appliedTopologyRevision !== plan.ownerTopologyRevision) {
+                throw simpleError('INGRESS_OWNER_CONFLICT', 'Installed ingress owner or credential epoch changed');
+            }
+            const group = await this.CascadeRouteGroup.findById(plan.groupId).lean();
+            if (!group || !Array.isArray(group.paths)
+                || new Set(group.paths.map(path => path.pathKey)).size !== group.paths.length) {
+                throw simpleError('INGRESS_PATH_CONFLICT', 'Installed ingress path is missing or ambiguous');
+            }
+            const path = group.paths.find(path => path.pathKey === plan.pathKey);
+            const absentAttach = !path && plan.kind === 'link.attach' && plan.oldPathLinkIds.length === 0;
+            if (!absentAttach && (!path || path.enabled === false || !Array.isArray(path.linkIds)
+                || !isDeepStrictEqual(path.linkIds.map(entityId), plan.oldPathLinkIds))) {
+                throw simpleError('INGRESS_PATH_CONFLICT', 'Installed ingress path changed');
+            }
+            return { state: matches[0], group };
+        };
+        const before = await readOwner();
+        const proposed = projectGroups([before.group])[0];
+        const ownedPath = proposed.paths.find(path => path.pathKey === plan.pathKey);
+        if (ownedPath) ownedPath.linkIds = [...plan.newPathLinkIds];
+        else proposed.paths.push(projectGroups([{ _id: plan.groupId, paths: [{
+            pathKey: plan.pathKey, linkIds: plan.newPathLinkIds, priority: 1, enabled: true,
+        }] }])[0].paths[0]);
+        const groups = plan.effectiveTopology.groups.filter(group => entityId(group) === plan.groupId);
+        if (groups.length !== 1 || !isDeepStrictEqual(projectGroups(groups)[0], proposed)) {
+            throw simpleError('INGRESS_PATH_CONFLICT', 'Only the owned path may change in the prepared group');
+        }
+        const nodes = new Map(plan.effectiveTopology.nodes.map(node => [node.id, node.role]));
+        const links = new Map(plan.effectiveTopology.links.map(link => [link.id, link]));
+        if (nodes.size !== plan.effectiveTopology.nodes.length || links.size !== plan.effectiveTopology.links.length
+            || nodes.get(plan.ownerNodeId) !== 'relay') {
+            throw simpleError('INVALID_INGRESS_OPERATION', 'Prepared path identities must be unique');
+        }
+        let cursor = null;
+        const visited = new Set();
+        let crossesOwner = false;
+        for (const id of plan.newPathLinkIds) {
+            const link = links.get(id);
+            if (!link || link.geo === true || !['forward', 'reverse'].includes(link.mode)
+                || !nodes.has(link.source) || !nodes.has(link.target)
+                || cursor !== null && cursor !== link.source || visited.has(link.target)
+                || link.source === link.target
+                || !['portal', 'relay'].includes(nodes.get(link.source))
+                || cursor === null && link.source !== plan.ownerNodeId && nodes.get(link.source) !== 'portal') {
+                throw simpleError('INVALID_INGRESS_OPERATION', 'Prepared owned path is discontinuous');
+            }
+            visited.add(link.source);
+            visited.add(link.target);
+            crossesOwner ||= link.source === plan.ownerNodeId;
+            cursor = link.target;
+        }
+        // The graph owner selects policy; a retained relay prefix or a peer
+        // branch is not authority to invent fallback. Blocking evidence is the
+        // actual owned candidate, not absence of every edge in the component.
+        if (routeState === 'egress_configured' && (!crossesOwner || nodes.get(cursor) !== 'bridge')
+            || plan.kind === 'link.delete' && links.has(plan.linkId)) {
+            throw simpleError('INVALID_INGRESS_OPERATION', 'Prepared route does not match its exit outcome');
+        }
+        const ingress = await this.topologyIngressGate.verifyPlan(plan);
+        if (ingress?.ok !== true) throw simpleError('INGRESS_UNVERIFIED', 'Installed ingress readback failed');
+        const ppp = await this.topologyPppReadinessGate.verifyPlan(plan);
+        if (ppp?.ok !== true || !ppp.relayRevisions?.some(entry => entry.relayNode === plan.ownerNodeId
+            && entry.credentialRevision === plan.ownerCredentialRevision)) {
+            const error = simpleError('INGRESS_PPP_UNVERIFIED', 'Installed PPP users or credential epoch are unverified');
+            // Preserve only the gate's typed, safe retry contract. The service
+            // itself never enqueues sync or releases an operation's ownership.
+            error.pppReadiness = Object.freeze({ ok: false,
+                verifiedRelayCount: Number.isSafeInteger(ppp?.verifiedRelayCount) ? ppp.verifiedRelayCount : 0,
+                reason: ['PPP_DRIFT', 'PPP_UNAVAILABLE', 'PPP_NOT_INSTALLED'].includes(ppp?.reason)
+                    ? ppp.reason : 'PPP_UNKNOWN',
+                ...(ppp?.reason === 'PPP_DRIFT' ? { relayNode: ppp.relayNode,
+                    credentialRevision: ppp.credentialRevision } : {}) });
+            throw error;
+        }
+        const after = await readOwner();
+        if (!isDeepStrictEqual(before, after)) {
+            throw simpleError('INGRESS_OWNER_CONFLICT', 'Installed ingress changed during preparation');
+        }
+        return Object.freeze({ revision: plan.topologyRevision, routeGroupId: plan.groupId,
+            operationId: plan.operationId, ownerNodeId: plan.ownerNodeId, pathKey: plan.pathKey,
+            ownerTopologyRevision: plan.ownerTopologyRevision, ownerCredentialRevision: plan.ownerCredentialRevision,
+            oldPathLinkIds: Object.freeze([...plan.oldPathLinkIds]), newPathLinkIds: Object.freeze([...plan.newPathLinkIds]),
+            relayRevisions: Object.freeze(ppp.relayRevisions.map(entry => Object.freeze({ ...entry }))),
+            ...(ppp.skippedRelayRevisions ? { skippedRelayRevisions: Object.freeze(
+                ppp.skippedRelayRevisions.map(entry => Object.freeze({ ...entry }))) } : {}),
+            ingressPrepared: true, deferred: false, routeState,
+            pppInternetProof: routeState === 'no_bridge_exit' ? 'not_applicable' : 'unverified' });
     }
 
     async ensureRouteGroup(nodeId) {

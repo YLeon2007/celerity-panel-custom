@@ -1,6 +1,7 @@
 'use strict';
 
 const { selectExecutionContext } = require('../domain/l2tpExecutionAuthorization');
+const { ownedIngressRouteState } = require('./topologyAttachIngressGate');
 
 const { createL2tpNodeTransportResolver } = require('./l2tpNodeTransportFactory');
 const { L2tpNodeExecutionResolver } = require('./l2tpNodeExecutionResolver');
@@ -92,15 +93,27 @@ class TopologyPppReadinessGate {
         const skippedRelayRevisions = [];
         try {
             if (!Array.isArray(plan?.nodes)) return failed(0);
+            const ownerBound = plan.ownerCredentialRevision !== undefined;
+            const blocked = plan.routeState === 'no_bridge_exit';
+            if ((ownerBound || blocked) && (!ownedIngressRouteState(plan)
+                || !Number.isSafeInteger(plan.ownerCredentialRevision) || plan.ownerCredentialRevision < 1
+                || !Number.isSafeInteger(plan.ownerTopologyRevision) || plan.ownerTopologyRevision < 0)) return failed(0);
             const stagedRelays = plan.staged === true ? classifyStagedRelays(plan.nodes) : null;
-            if (plan.staged === true && !stagedRelays) return failed(0);
+            if (plan.staged === true && !stagedRelays && !blocked) return failed(0);
             const terminalRelayRef = stagedRelays?.terminalRelayRef;
             for (const node of plan.nodes) {
                 if (node.role !== 'relay') continue;
                 const relayNode = id(node.node);
                 if (!relayNode) return failed(verifiedRelayCount);
                 const state = await this.RelayL2tpState.findOne({ node: relayNode })
-                    .select('node status desiredState secretRevision').lean();
+                    .select('node status desiredState secretRevision routeGroup activePathKey appliedTopologyRevision').lean();
+                const isOwner = ownerBound && relayNode === plan.ownerNodeId;
+                const ownerMatches = current => !isOwner || current?.status === 'installed'
+                    && current.desiredState === 'installed' && id(current.routeGroup) === plan.groupId
+                    && current.activePathKey === plan.pathKey
+                    && current.appliedTopologyRevision === plan.ownerTopologyRevision
+                    && current.secretRevision === plan.ownerCredentialRevision;
+                if (!ownerMatches(state)) return failed(verifiedRelayCount);
                 // A non-PPP relay can be transit in a complete or staged
                 // plan. A staged terminal with legacy explicit not_installed
                 // state uses the same fenced checks, then stays blocked.
@@ -159,9 +172,9 @@ class TopologyPppReadinessGate {
                 if (users.every(validUser)
                     && users.some(user => user.appliedRevision !== user.desiredRevision)) {
                     const current = await this.RelayL2tpState.findOne({ node: relayNode })
-                        .select('status desiredState secretRevision').lean();
+                        .select('status desiredState secretRevision routeGroup activePathKey appliedTopologyRevision').lean();
                     if (current?.status !== 'installed' || current.desiredState !== 'installed'
-                        || current.secretRevision !== revision) return failed(verifiedRelayCount);
+                        || current.secretRevision !== revision || !ownerMatches(current)) return failed(verifiedRelayCount);
                     return drift(verifiedRelayCount, relayNode, revision);
                 }
                 const operation = await this.L2tpOperation.findOne({
@@ -216,23 +229,25 @@ class TopologyPppReadinessGate {
                         && actual.managedUserCount >= 0;
                     if (!provenDrift) return failed(verifiedRelayCount);
                     const current = await this.RelayL2tpState.findOne({ node: relayNode })
-                        .select('status desiredState secretRevision').lean();
+                        .select('status desiredState secretRevision routeGroup activePathKey appliedTopologyRevision').lean();
                     return current?.status === 'installed' && current.desiredState === 'installed'
-                        && current.secretRevision === revision
+                        && current.secretRevision === revision && ownerMatches(current)
                         ? drift(verifiedRelayCount, relayNode, revision)
                         : failed(verifiedRelayCount);
                 }
                 // Concurrent user edits increment the state revision. Never accept
                 // a readback against a snapshot already superseded in Mongo.
                 const current = await this.RelayL2tpState.findOne({ node: relayNode })
-                    .select('status desiredState secretRevision').lean();
+                    .select('status desiredState secretRevision routeGroup activePathKey appliedTopologyRevision').lean();
                 if (current?.status !== 'installed' || current.desiredState !== 'installed'
-                    || current.secretRevision !== revision) return failed(verifiedRelayCount);
+                    || current.secretRevision !== revision || !ownerMatches(current)) return failed(verifiedRelayCount);
                 verifiedRelayCount += 1;
                 relayRevisions.push({ relayNode, credentialRevision: revision });
             }
             return { ok: true, verifiedRelayCount, ...(skippedRelayCount > 0 ? { skippedRelayCount } : {}),
-                relayRevisions, ...(skippedRelayRevisions.length ? { skippedRelayRevisions } : {}) };
+                relayRevisions, ...(skippedRelayRevisions.length ? { skippedRelayRevisions } : {}),
+                ...(blocked ? { routeOutcome: { state: 'no_bridge_exit', internetProof: 'not_applicable',
+                    blockedOwnerNodeId: plan.ownerNodeId } } : {}) };
         } catch {
             // Includes SSH/runner, malformed result and database failures. Never
             // propagate stderr or credentials into topology operation logs.
