@@ -2,7 +2,7 @@
 // Assembled source regression: actual public adoption, host/queue/worker/
 // settlement, classic writers, health and maintenance targets. Only persistence,
 // settings/cache and SSH/agent/TCP IO are modeled. Not Mongo/SSH/systemd,
-// operational maintenance authority, installed PPP cutover or handback evidence.
+// operational maintenance authority, real PPP sessions/Internet or handback evidence.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
@@ -16,6 +16,7 @@ const { fixture, app, request, settleTick, id, sha, copy, env, context, provider
 const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
 const { maintainAutoL2tpPaths } = require('../services/autoL2tpPathMaintenance');
 const generator = require('../../../services/configGenerator');
+const { installedIngressAdapters, modeledInstalledMain } = require('./helpers/cascadeInstalledIngressFixture');
 const ROOT = path.resolve(__dirname, '../../../..');
 const MAIN = '/usr/local/etc/xray/config.json';
 const BRIDGE = '/usr/local/etc/xray-bridge/config.json';
@@ -202,8 +203,9 @@ function honorProjection(model) {
         };
     }
 }
-async function assembled() {
-    const f = fixture({ roles: ['portal', 'relay', 'bridge', 'portal', 'standalone', 'standalone'] });
+async function assembled({ installed = false } = {}) {
+    const f = fixture({ roles: installed ? ['relay', 'bridge', 'portal', 'bridge', 'standalone', 'standalone']
+        : ['portal', 'relay', 'bridge', 'portal', 'standalone', 'standalone'] });
     // The shared fixture intentionally ignores select(); background health
     // writes require the real consumer's projections at this DB boundary.
     honorProjection(f.models.HyNode); honorProjection(f.models.CascadeLink);
@@ -215,13 +217,16 @@ async function assembled() {
         f.runtimeUsers.set(node._id, nativeNodes.includes(node) ? [copy(runtimeUser)] : []);
     }
     const nodes = nativeNodes.map(({ _id, cascadeRole, ...rest }) => ({ ...copy(rest), id: _id, role: cascadeRole }));
-    const links = [[10, 1, 2], [11, 2, 3], [12, 4, 3]].map(([n, source, target]) => ({ id: id(n), source: id(source), target: id(target),
+    const links = (installed ? [] : [[10, 1, 2], [11, 2, 3], [12, 4, 3]]).map(([n, source, target]) => ({ id: id(n), source: id(source), target: id(target),
         mode: 'reverse', active: true, tunnelPort: 25000 + n, tunnelUuid: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`,
         tunnelSecurity: 'none', tunnelTransport: 'tcp', tunnelDomain: 'legacy.invalid', priority: n }));
     const populated = links.map(link => ({ ...copy(link), _id: link.id,
         portalNode: { ...nodes.find(node => node.id === link.source), _id: link.source },
         bridgeNode: { ...nodes.find(node => node.id === link.target), _id: link.target } }));
     for (const node of nodes) {
+        // Installed setup starts with genuinely empty adopted role profiles.
+        // Every sidecar listener/path below must be produced by a real job.
+        if (installed) { node.profileConfig = '{}'; continue; }
         let config;
         if (node.role === 'portal') {
             config = JSON.parse(generator.generateXrayConfig({ ...node, _id: node.id }, []));
@@ -236,19 +241,38 @@ async function assembled() {
     }
     const topology = { nodes, links, groups: [] };
     f.data.CascadeLink.push(...links.map(({ id: linkId, source, target, ...rest }) => ({ ...copy(rest), _id: linkId, portalNode: source, bridgeNode: target, status: 'online', name: linkId })));
-    const pending = { ...copy(f.data.CascadeLink[2]), _id: id(13), portalNode: id(1), tunnelPort: 25113,
+    const pending = { mode: 'reverse', active: true, bridgeNode: id(4), ...copy(f.data.CascadeLink[2]), _id: id(13), portalNode: id(1), tunnelPort: 25113,
         tunnelUuid: '00000000-0000-4000-8000-000000000013', status: 'pending', autoDeploy: false };
     const inactive = { ...copy(pending), _id: id(14), active: false, tunnelPort: 25114 };
     const classic = { ...copy(pending), _id: id(15), portalNode: id(5), bridgeNode: id(6), tunnelPort: 25115 };
     delete classic.status;
     f.data.CascadeLink.push(pending, inactive, classic);
-    f.data.RelayL2tpState.push({ node: id(2), status: 'not_installed', desiredState: 'absent', secretRevision: 0 });
+    let installedAdapters;
+    if (installed) {
+        const state = { _id: id(70), node: id(1), routeGroup: id(60), activePathKey: 'mine', status: 'installed', desiredState: 'installed',
+            secretRevision: 41, appliedTopologyRevision: 0, pskEncrypted: 'modeled-preserved-psk', clientCidr: '10.255.30.0/24',
+            localAddress: '10.255.30.1', poolStart: '10.255.30.10', poolEnd: '10.255.30.250', dnsServers: ['1.1.1.1'],
+            tproxyPort: 12345, fwmark: 100, routeTable: 100 };
+        f.data.RelayL2tpState.push(state);
+        f.data.CascadeRouteGroup.push({ _id: id(60), name: 'installed', mode: 'reverse', strategy: 'priority-failover', paths: [
+            { pathKey: 'mine', linkIds: [], priority: 4, enabled: true }, { pathKey: 'peer', linkIds: [], priority: 17, enabled: false }] });
+        f.data.L2tpUser.push({ _id: id(80), relayNode: id(1), login: 'kept-user', passwordEncrypted: 'kept-secret', ip: '10.255.30.10',
+            enabled: true, desiredRevision: 41, appliedRevision: 41, syncStatus: 'synced', syncOperationId: id(81) });
+        // Explicit pre-existing PPP sync fact, NOT a topology operation or
+        // manufactured terminal publication. PPP/session IO remains modeled.
+        f.data.L2tpOperation.push({ _id: id(81), node: id(1), kind: 'sync_users', status: 'succeeded',
+            plan: { operationId: id(81), relayId: id(1), desired: { credentialRevision: 41 } } });
+        installedAdapters = installedIngressAdapters({ models: f.models, state,
+            readMain: () => JSON.parse(f.files.get(key(id(1), MAIN))) });
+        f.installed = { state, ...installedAdapters };
+    } else f.data.RelayL2tpState.push({ node: id(2), status: 'not_installed', desiredState: 'absent', secretRevision: 0 });
     f.data.TopologyConfigOwner.length = 0;
     for (const node of f.data.HyNode) {
         const main = generator.generateXrayConfig(node, nativeNodes.includes(node) ? [user] : []);
         f.files.set(key(node._id, MAIN), nodes.find(row => row.id === node._id && row.role === 'portal')?.profileConfig || main);
         f.files.set(key(node._id, BRIDGE), nodes.find(row => row.id === node._id && row.role !== 'portal')?.profileConfig || '{}\n');
     }
+    if (installed) f.files.set(key(id(1), MAIN), JSON.stringify(modeledInstalledMain(f.installed.state)));
     const Owner = f.models.TopologyConfigOwner;
     Owner.collection = { indexes: async () => [{ key: { node: 1, profile: 1 }, unique: true }] };
     const create = Owner.create.bind(Owner);
@@ -262,7 +286,20 @@ async function assembled() {
     for (const [index, node] of nativeNodes.entries()) {
         const original = await transfer.initializeClassic({ node: node._id, profile: node.cascadeRole === 'portal' ? 'xray-main' : 'xray-bridge',
             nodeIdentity: { machineId: String(index + 1).repeat(32), sshHostKeySha256: String(index + 1).repeat(64) } });
-        await transfer.adopt({ node: node._id, profile: original.profile, generation: original.generation, proofRef: 'modeled-held', legacyTopology: topology });
+        await transfer.adopt({ node: node._id, profile: original.profile, generation: original.generation, proofRef: 'modeled-held',
+            ...(installed ? {} : { legacyTopology: topology }) });
+    }
+    assert.equal(f.data.TopologyOperation.length, 0, 'public adoption never fabricates settled topology');
+    // Test-only dependency handoff at the real default-host/runtime boundary,
+    // not mutation of the assembled worker or a successful service substitute.
+    // The ordinary L2TP lifecycle is intentionally dormant in this fixture.
+    if (installed) {
+        const originalHost = f.host;
+        f.host = () => originalHost({ moduleEntry: { ...require('..'), registerModels: () => f.models,
+            createTopologyDeploymentService(options) {
+                const runtime = require('..').createTopologyDeploymentService({ ...options, installedIngressPreparer: installedAdapters.prepare });
+                f.deployments.push(runtime); return runtime;
+            } } });
     }
     const bg = backgroundCallers(f), createHost = f.host;
     let host = createHost(); provider.installActiveHost(host); f.http = app(f);
@@ -529,3 +566,6 @@ test('actual managed Sync fails closed for missing/erroring agent without SSH fa
         assert.deepEqual(f.nativeFiles(), before); assert.deepEqual(f.runtimeUsers, runtimeBefore);
     } finally { await f.close(); }
 }));
+
+require('./helpers/cascadeInstalledBackgroundCases')({ test, assert, assembled, withEnv, request, settleTick, id, copy, key, MAIN, BRIDGE,
+    randomUUID, modeledInstalledMain, configEffects, deferred });
