@@ -58,7 +58,7 @@ function isExactResolutionRequest(request) {
 
 function validChecks(checks, targetProfile) {
     const serviceUnit = SERVICE_BY_TARGET_PROFILE[targetProfile];
-    return Array.isArray(checks) && checks.every(check => {
+    return Array.isArray(checks) && checks.length <= 64 && checks.every(check => {
         if (check?.type === 'service') {
             return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
                 && check.serviceUnit === serviceUnit
@@ -70,7 +70,7 @@ function validChecks(checks, targetProfile) {
                 && Number.isSafeInteger(check.port)
                 && check.port >= 1
                 && check.port <= 65535
-                && check.expectedState === 'listening';
+                && ['listening', 'absent'].includes(check.expectedState);
         }
         return false;
     });

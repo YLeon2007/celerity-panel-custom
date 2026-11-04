@@ -1659,7 +1659,7 @@ function canonicalize(value) {
     );
 }
 
-function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [] }) {
+function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [], previousListeningPorts = [] }) {
     const target = TARGETS_BY_ROLE[node.role];
     // Tunnel listeners live on the target of forward links and on the source
     // of reverse links (the dialer connects to them).
@@ -1668,7 +1668,12 @@ function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataByI
             .filter(entry => (entry.link.mode === 'reverse' ? entry.source : entry.target) === nodeId)
             .map(entry => assertPort(linkMetadataById.get(entry.id).tunnelPort)),
         ...ingressPorts,
+        // A shared owner/blocked PPP input can deliberately keep the port.
+        ...previousListeningPorts.filter(port => config.inbounds.some(inbound => inbound.port === port)),
     ])].sort((left, right) => left - right);
+    const removedPorts = [...new Set(previousListeningPorts)]
+        .filter(port => !config.inbounds.some(inbound => inbound.port === port))
+        .sort((left, right) => left - right);
     const checks = [
         { type: 'service', serviceUnit: target.serviceUnit, expectedState: 'active' },
         ...listeningPorts.map(port => ({
@@ -1677,6 +1682,7 @@ function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataByI
             port,
             expectedState: 'listening',
         })),
+        ...removedPorts.map(port => ({ type: 'port', protocol: 'tcp', port, expectedState: 'absent' })),
     ];
     const bytes = Buffer.from(`${JSON.stringify(canonicalize(config))}\n`, 'utf8');
 
@@ -1900,6 +1906,9 @@ function composeDescriptorTransition(before, after) {
         }
         return candidateForNode({ nodeId: id, node, nodeRef: refs.get(id), orderedLinks: entries,
             linkMetadataById, config: composeXrayConfig(config, []),
+            previousListeningPorts: before.links
+                .filter(link => (link.mode === 'reverse' ? link.source : link.target) === id)
+                .map(link => assertPort(link.tunnelPort)),
             ingressPorts: config.inbounds.filter(inbound => inbound.tag?.startsWith('cascade-')).map(inbound => inbound.port) });
     });
     return deepFreeze({ schemaVersion: 1, mode: newPlan?.mode ?? oldPlan?.mode ?? 'mixed',

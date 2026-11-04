@@ -97,6 +97,41 @@ def sync_artifacts(state, binding, config):
             os.close(fd)
 
 
+def profile_bytes(path):
+    # Read only fixed profile/snapshot paths. An absent profile is distinct
+    # from an empty one, and unreadable/oversized/symlink state is not absence.
+    if not os.path.lexists(path):
+        if os.path.islink(os.path.dirname(path)):
+            refuse('PEER_PROFILE_UNPROVEN')
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4194304:
+            refuse('PEER_PROFILE_UNPROVEN')
+        value = handle.read(4194305)
+        if len(value) > 4194304:
+            refuse('PEER_PROFILE_UNPROVEN')
+        return value
+
+
+def peer_snapshot(backup, value):
+    target = backup + ('/peer.config.absent' if value is None else '/peer.config.json')
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(b'' if value is None else value)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def checked_peer_snapshot(backup):
+    saved = profile_bytes(backup + '/peer.config.json')
+    absent = profile_bytes(backup + '/peer.config.absent')
+    if (saved is None) == (absent is None) or (absent is not None and absent != b''):
+        refuse('PEER_PROFILE_UNPROVEN')
+    return saved
+
+
 def readiness_checks(token, boot, safe, command):
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,8192}', token):
         refuse('INVALID_READINESS', 64)
@@ -384,6 +419,15 @@ def main():
     current['phase'] = command + '-running'
     current['commands'][command_id] = dict(state='running', command=command)
     durable(fence, journal)  # Write-ahead: any crash now permanently retains it.
+    peer = root + '/usr/local/etc/' + ('xray-bridge' if binding['targetProfile'] == 'xray-main' else 'xray') + '/config.json'
+    backup = state + '/backups/' + binding['backupId'] + '/' + binding['targetProfile']
+    # Snapshot the profile we do NOT own; never adopt, rewrite, stop or kill it.
+    # Prepared operations from an older runner without this evidence refuse
+    # rather than silently manufacturing a preservation receipt.
+    check_peer = command != 'close' or previous_phase != 'new'
+    peer_before = profile_bytes(peer) if command == 'prepare' else (checked_peer_snapshot(backup) if check_peer else None)
+    if check_peer and profile_bytes(peer) != peer_before:
+        refuse('PEER_PROFILE_CHANGED')
     with open(script) as handle:
         payload = handle.read().split('# BEGIN_FENCED_SHELL_PAYLOAD\n', 1)[1]
     legacy_args = args[:12]
@@ -416,6 +460,10 @@ def main():
                 set(lines) != {'Job=', 'ActiveState=' + expected_state[0], 'SubState=' + expected_state[1]}):
             refuse('SYSTEMD_COMPLETION_UNPROVEN')
         job, service_state = 'completed', ':'.join(expected_state)
+    if command == 'prepare':
+        peer_snapshot(backup, peer_before)
+    if check_peer and profile_bytes(peer) != peer_before:
+        refuse('PEER_PROFILE_CHANGED')
     if command != 'close':
         sync_artifacts(state, binding, config)
     current['phase'] = dict(prepare='prepared', commit='committed', verify='verified',
@@ -614,7 +662,7 @@ PY
 }
 
 parse_checks() {
-    /usr/bin/python3 - "$CHECKS_TOKEN" "$SERVICE_NAME" <<'PY'
+    /usr/bin/python3 - "$CHECKS_TOKEN" "$SERVICE_NAME" "$BACKUP_CONFIG" "$CANDIDATE_PATH" <<'PY'
 import base64
 import json
 import re
@@ -634,8 +682,8 @@ def reject_constant(_value):
     raise ValueError('invalid number')
 
 
-token, service_name = sys.argv[1:]
-if re.fullmatch(r'[A-Za-z0-9_-]+', token) is None:
+token, service_name, backup_path, candidate_path = sys.argv[1:]
+if re.fullmatch(r'[A-Za-z0-9_-]{1,8192}', token) is None:
     raise SystemExit(1)
 try:
     raw = base64.b64decode(
@@ -652,7 +700,7 @@ try:
     )
 except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-if type(checks) is not list:
+if type(checks) is not list or len(checks) > 64:
     raise SystemExit(1)
 for check in checks:
     if type(check) is not dict or type(check.get('type')) is not str:
@@ -669,9 +717,23 @@ for check in checks:
                 or check.get('protocol') != 'tcp'
                 or type(port) is not int
                 or not 1 <= port <= 65535
-                or check.get('expectedState') != 'listening'):
+                or check.get('expectedState') not in ('listening', 'absent')):
             raise SystemExit(1)
-        print(port)
+        if check['expectedState'] == 'absent':
+            # Absence probes can only retire a listener in the actual prepared
+            # target-profile baseline, never an arbitrary host port or a port
+            # deliberately retained by the candidate (PPP/shared ownership).
+            try:
+                with open(backup_path) as handle:
+                    before = json.load(handle, object_pairs_hook=unique_object)
+                with open(candidate_path) as handle:
+                    after = json.load(handle, object_pairs_hook=unique_object)
+                if (not any(item.get('port') == port for item in before['inbounds'])
+                        or any(item.get('port') == port for item in after['inbounds'])):
+                    raise ValueError('unowned or retained port')
+            except (OSError, ValueError, KeyError, TypeError):
+                raise SystemExit(1)
+        print(check['expectedState'] + '\t' + str(port))
         continue
     raise SystemExit(1)
 PY
@@ -784,6 +846,21 @@ commit_candidate() {
     if [[ -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
         [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] || fail 'INVALID_TARGET' 73
     fi
+    # Compare actual prepared bytes, not a plan-supplied/guessed baseline hash.
+    # Drift after prepare is never an authorization to overwrite a new owner.
+    if [[ -f "$BACKUP_CONFIG" && ! -L "$BACKUP_CONFIG" ]]; then
+        [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] \
+            && /usr/bin/cmp -s -- "$BACKUP_CONFIG" "$CONFIG_PATH" \
+            || fail 'BASELINE_CHANGED' 65
+        if /usr/bin/cmp -s -- "$BACKUP_CONFIG" "$CANDIDATE_PATH"; then
+            # Keep commit -> verify -> close -> exact status and all ownership
+            # evidence. Only the redundant config replace/restart is omitted.
+            emit_receipt
+            return
+        fi
+    else
+        [[ ! -e "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] || fail 'BASELINE_CHANGED' 65
+    fi
     temporary="$(/usr/bin/mktemp --tmpdir="$target_parent" '.celerity-topology.XXXXXX')" \
         || fail 'ACTIVATION_FAILED' 70
     TEMPORARY_FILE="$temporary"
@@ -799,7 +876,7 @@ commit_candidate() {
 }
 
 verify_candidate() {
-    local port listeners
+    local port listeners expected check
     assert_bound_state
     file_hash_matches "$CONFIG_PATH" || fail 'VERIFICATION_FAILED' 65
     [[ -x "$XRAY_PATH" && -x "$SYSTEMCTL_PATH" ]] \
@@ -814,10 +891,15 @@ verify_candidate() {
         || fail 'VERIFICATION_FAILED' 65
     if [[ "${#REQUIRED_TCP_PORTS[@]}" -gt 0 ]]; then
         [[ -x "$SS_PATH" ]] || fail 'VERIFICATION_UNAVAILABLE' 69
-        for port in "${REQUIRED_TCP_PORTS[@]}"; do
+        for check in "${REQUIRED_TCP_PORTS[@]}"; do
+            IFS=$'\t' read -r expected port <<<"$check"
             listeners="$("$SS_PATH" -H -ltn "sport = :$port" 2>/dev/null)" \
                 || fail 'VERIFICATION_UNAVAILABLE' 69
-            [[ -n "$listeners" ]] || fail 'VERIFICATION_FAILED' 65
+            if [[ "$expected" == 'absent' ]]; then
+                [[ -z "$listeners" ]] || fail 'REMOVED_LISTENER_PRESENT' 65
+            else
+                [[ -n "$listeners" ]] || fail 'VERIFICATION_FAILED' 65
+            fi
         done
     fi
     emit_receipt
@@ -831,6 +913,11 @@ rollback_candidate() {
     if [[ -f "$BACKUP_CONFIG" && ! -L "$BACKUP_CONFIG" && ! -e "$BACKUP_ABSENT" ]]; then
         if [[ -e "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
             [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] || fail 'INVALID_TARGET' 73
+        fi
+        if [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] \
+            && /usr/bin/cmp -s -- "$BACKUP_CONFIG" "$CONFIG_PATH"; then
+            emit_receipt
+            return
         fi
         temporary="$(/usr/bin/mktemp --tmpdir="$target_parent" '.celerity-topology.XXXXXX')" \
             || fail 'ROLLBACK_FAILED' 70

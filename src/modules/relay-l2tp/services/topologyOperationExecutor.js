@@ -112,7 +112,7 @@ function executionFailed() {
 const { validNodeRef } = require('./topologyNodeRef');
 
 function validChecks(checks, target) {
-    return Array.isArray(checks) && checks.every(check => {
+    return Array.isArray(checks) && checks.length <= 64 && checks.every(check => {
         if (check?.type === 'service') {
             return hasExactKeys(check, ['expectedState', 'serviceUnit', 'type'])
                 && check.serviceUnit === target.serviceUnit
@@ -124,7 +124,7 @@ function validChecks(checks, target) {
                 && Number.isSafeInteger(check.port)
                 && check.port >= 1
                 && check.port <= 65535
-                && check.expectedState === 'listening';
+                && ['listening', 'absent'].includes(check.expectedState);
         }
         return false;
     });
