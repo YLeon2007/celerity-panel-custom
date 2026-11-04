@@ -685,7 +685,10 @@ test('does not project hostile fields, object ids, or secrets into a candidate p
     const untouched = structuredClone(input);
 
     const plan = composeFrozenTopologyDeploymentPlan(input);
-    const serialized = JSON.stringify(plan);
+    const serialized = JSON.stringify({ ...plan, nodes: plan.nodes.map(({ node, ...descriptor }) => descriptor) });
+    assert.deepEqual(plan.nodes.map(node => node.node), [
+        'node-portal-object-id', 'node-relay-object-id', 'node-bridge-object-id',
+    ], 'physical IDs belong only to explicit internal node bindings');
     const forbiddenKeys = new Set([
         '_id', 'nodeId', 'linkId', 'objectId',
         'command', 'argv', 'shell', 'stdin', 'password', 'privateKey', 'agentToken', 'tunnelUuid',

@@ -255,7 +255,7 @@ test('source-less relay path ingress retains explicit default and geo policy in 
         'forward default listener stays on its bridge');
 });
 
-for (const operationKind of [undefined, 'domain.reconcile', 'link.replace', 'link.attach']) {
+for (const operationKind of [undefined, 'domain.reconcile']) {
     test(`source-less materialization does not grant staging to ${String(operationKind)}`, async () => {
         const data = fixture();
         const topology = topologyFor(data, ['rb1']);

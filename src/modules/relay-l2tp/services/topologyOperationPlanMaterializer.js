@@ -4,12 +4,14 @@ const {
     composeFrozenTopologyDeploymentPlan,
 } = require('./frozenTopologyDeploymentPlanComposer');
 const { projectGroups } = require('../domain/topologyDraft');
+const { isDeepStrictEqual } = require('node:util');
 
 const { topologyExecutionContext, TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
 const TEST_TOPOLOGY_TARGET = 'test';
 const TEST_TOPOLOGY_HOST_IDENTITY = 'test.infograd.online';
 const SUPPORTED_ROLES = Object.freeze(['portal', 'relay', 'bridge']);
 const SUPPORTED_MODES = Object.freeze(['forward', 'reverse']);
+const STAGED_OPERATION_KINDS = new Set(['link.apply', 'link.attach', 'link.replace', 'link.delete']);
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NODE_METADATA_FILTER = Object.freeze({
     type: 'xray',
@@ -184,12 +186,12 @@ function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     // validation. Here we only require the graph to be deployable at all.
     const portalCount = nodes.filter(node => node.role === 'portal').length;
 
-    // Only an explicit scoped apply may compose incomplete endpoints. Pass
+    // Only an explicit scoped mutation may compose incomplete endpoints. Pass
     // permission, not a readiness inference from all roled assets: the
     // composer checks linked nodes and the actual default path itself.
     const incomplete = portalCount === 0 || !nodes.some(node => node.role === 'bridge');
-    if (incomplete && operationKind !== 'link.apply') {
-        fail('INVALID_TOPOLOGY_ROLES', 'Only a scoped link.apply may stage an incomplete chain');
+    if (incomplete && !STAGED_OPERATION_KINDS.has(operationKind)) {
+        fail('INVALID_TOPOLOGY_ROLES', 'Only an explicit scoped mutation may stage an incomplete chain');
     }
     const links = topology.links.map(snapshotLink)
         .sort((left, right) => left.id.localeCompare(right.id, 'en'));
@@ -201,7 +203,7 @@ function projectPinnedSnapshot(pinnedSnapshot, operationKind) {
     return {
         snapshot: { nodes, links, groups },
         compiledTopology: { valid: true, relays },
-        staged: operationKind === 'link.apply',
+        staged: STAGED_OPERATION_KINDS.has(operationKind),
     };
 }
 
@@ -251,6 +253,52 @@ function projectLinkMetadata(rows) {
     }).sort((left, right) => left.id.localeCompare(right.id, 'en'));
 }
 
+// Internal admission input only. These are complete, verified applied/effective
+// descriptors, not HTTP authority and not IDs to hydrate from mutable desired.
+function descriptorTopology(value) {
+    function assertJson(item) {
+        if (item === null || typeof item === 'string' || typeof item === 'boolean') return;
+        if (typeof item === 'number' && Number.isFinite(item)) return;
+        if (Array.isArray(item)) { item.forEach(assertJson); return; }
+        if (item && Object.getPrototypeOf(item) === Object.prototype) {
+            Object.values(item).forEach(assertJson);
+            return;
+        }
+        fail('INVALID_TOPOLOGY_DESCRIPTORS', 'Topology descriptors must be complete JSON snapshots');
+    }
+    try { assertJson(value); } catch {
+        fail('INVALID_TOPOLOGY_DESCRIPTORS', 'Topology descriptors must be complete JSON snapshots');
+    }
+    if (!value || !['nodes', 'links', 'groups'].every(key => Array.isArray(value[key]))) {
+        fail('INVALID_TOPOLOGY_DESCRIPTORS', 'Both topology descriptor snapshots are required');
+    }
+    const snapshot = structuredClone(value);
+    const nodeIds = new Set();
+    const linkIds = new Set();
+    for (const node of snapshot.nodes) {
+        snapshotNode(node);
+        if (nodeIds.has(node.id)) fail('INVALID_TOPOLOGY_DESCRIPTORS', 'Descriptor identities must be unique');
+        nodeIds.add(node.id);
+    }
+    for (const link of snapshot.links) {
+        snapshotLink(link);
+        if (linkIds.has(link.id) || !nodeIds.has(link.source) || !nodeIds.has(link.target)) {
+            fail('INVALID_TOPOLOGY_DESCRIPTORS', 'Descriptor links require unique known endpoints');
+        }
+        linkIds.add(link.id);
+    }
+    projectPinnedGroups(snapshot.groups);
+    return snapshot;
+}
+
+function descriptorIdentity(topology) {
+    return {
+        nodes: topology.nodes.map(snapshotNode).sort((a, b) => a.id.localeCompare(b.id, 'en')),
+        links: topology.links.map(snapshotLink).sort((a, b) => a.id.localeCompare(b.id, 'en')),
+        groups: projectPinnedGroups(topology.groups),
+    };
+}
+
 class TopologyOperationPlanMaterializer {
     #HyNode;
 
@@ -267,7 +315,8 @@ class TopologyOperationPlanMaterializer {
         this.#CascadeLink = CascadeLink;
     }
 
-    async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session } = {}) {
+    async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session,
+        baselineTopology, effectiveTopology } = {}) {
         if (!TOPOLOGY_EXECUTION_CONTEXTS.some(context => context.target === target)) {
             fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations require an allowlisted server target');
         }
@@ -278,7 +327,24 @@ class TopologyOperationPlanMaterializer {
             );
         }
 
+        if (operationKind === 'link.delete' && (baselineTopology === undefined || effectiveTopology === undefined)) {
+            fail('TOPOLOGY_DELETE_BASELINE_REQUIRED', 'Deletion requires trusted before and after descriptors');
+        }
         const input = projectPinnedSnapshot(pinnedSnapshot, operationKind);
+        if (baselineTopology !== undefined || effectiveTopology !== undefined) {
+            const before = descriptorTopology(baselineTopology);
+            const after = descriptorTopology(effectiveTopology);
+            if (!isDeepStrictEqual(descriptorIdentity(after), input.snapshot)) {
+                fail('TOPOLOGY_DESCRIPTOR_MISMATCH', 'Effective descriptors must match the pinned topology');
+            }
+            return composeFrozenTopologyDeploymentPlan({
+                ...input,
+                snapshot: after,
+                nodeMetadata: after.nodes,
+                linkMetadata: after.links,
+                baselineTopology: before,
+            });
+        }
         const nodeIds = input.snapshot.nodes.map(node => node.id);
         const linkIds = input.snapshot.links.map(link => link.id);
         let nodeRows;
