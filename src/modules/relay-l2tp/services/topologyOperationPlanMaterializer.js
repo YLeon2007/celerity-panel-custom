@@ -291,6 +291,23 @@ function descriptorTopology(value) {
     return snapshot;
 }
 
+function descriptorInstalledPath(value, before, after) {
+    if (value === undefined) return undefined;
+    const groupId = assertSafeId(value?.groupId, 'TOPOLOGY_INSTALLED_PATH_MISMATCH');
+    const pathKey = assertSafeId(value?.pathKey, 'TOPOLOGY_INSTALLED_PATH_MISMATCH');
+    const ownerNodeId = assertSafeId(value?.ownerNodeId, 'TOPOLOGY_INSTALLED_PATH_MISMATCH');
+    const owner = after.nodes.find(node => node.id === ownerNodeId) || before.nodes.find(node => node.id === ownerNodeId);
+    const path = topology => topology.groups.find(group => String(group.id ?? group._id) === groupId)
+        ?.paths.find(path => path.pathKey === pathKey);
+    const oldPath = path(before), newPath = path(after);
+    if (owner?.role !== 'relay' || !oldPath || !newPath || oldPath.enabled === false || newPath.enabled === false
+        || !isDeepStrictEqual(oldPath.linkIds, value.oldPathLinkIds)
+        || !isDeepStrictEqual(newPath.linkIds, value.newPathLinkIds)) {
+        fail('TOPOLOGY_INSTALLED_PATH_MISMATCH', 'Installed owner/path must match the trusted before and after descriptors');
+    }
+    return { groupId, pathKey, ownerNodeId };
+}
+
 function descriptorIdentity(topology) {
     return {
         nodes: topology.nodes.map(snapshotNode).sort((a, b) => a.id.localeCompare(b.id, 'en')),
@@ -316,7 +333,7 @@ class TopologyOperationPlanMaterializer {
     }
 
     async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session,
-        baselineTopology, effectiveTopology } = {}) {
+        baselineTopology, effectiveTopology, installedPath } = {}) {
         if (!TOPOLOGY_EXECUTION_CONTEXTS.some(context => context.target === target)) {
             fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations require an allowlisted server target');
         }
@@ -343,6 +360,7 @@ class TopologyOperationPlanMaterializer {
                 nodeMetadata: after.nodes,
                 linkMetadata: after.links,
                 baselineTopology: before,
+                installedPath: descriptorInstalledPath(installedPath, before, after),
             });
         }
         const nodeIds = input.snapshot.nodes.map(node => node.id);

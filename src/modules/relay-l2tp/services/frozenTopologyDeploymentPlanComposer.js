@@ -977,6 +977,9 @@ function projectCascadeLink(entry, index, metadata, nodeConfigsById, linkRefsByI
 
 function parseGeneratedConfig(generated) {
     const config = typeof generated === 'string' ? JSON.parse(generated) : structuredClone(generated);
+    // Classic outbounds-only bridge profiles legitimately omit this empty
+    // section. Normalize only this private composition copy, not pinned bytes.
+    if (isPlainObject(config) && config.inbounds === undefined) config.inbounds = [];
     if (!isPlainObject(config)
         || !Array.isArray(config.inbounds)
         || !Array.isArray(config.outbounds)
@@ -1792,6 +1795,9 @@ function preserveProfileConfig(profile, previous, next, clientTags) {
             current.reverse[kind] = values;
         }
     }
+    for (const field of ['api', 'stats']) {
+        if (current[field] === undefined && next[field] !== undefined) current[field] = structuredClone(next[field]);
+    }
     return composeXrayConfig(current, []);
 }
 
@@ -1825,15 +1831,93 @@ function includeBlockedPathReadback(topology, node, config) {
                 && profile.inbounds.some(current => key(current) === key(inbound))
                 && profile.routing.rules.some(current => key(current) === key(rule))) {
                 config.inbounds.push(inbound);
-                config.routing.rules.push(rule);
+                config.routing.rules.unshift(rule);
             }
         }
     }
 }
 
+// The selected reader carries exact installed owner/path identity even when
+// its settled path is already empty and descriptors have no profile readback.
+// Do not infer that identity from an arbitrary empty peer path or all relays.
+function includeInstalledEmptyPath(topology, node, config, installedPath) {
+    if (!installedPath || node.id !== installedPath.ownerNodeId || node.role !== 'relay') return;
+    const group = topology.groups.find(group => entityId(group) === installedPath.groupId);
+    const path = group?.paths.find(path => path.pathKey === installedPath.pathKey);
+    if (!path || path.enabled === false || path.linkIds.length !== 0) return;
+    const fragment = { inbounds: [], routing: { rules: [] } };
+    configGenerator.applyCascadePathIngress(fragment, [{ pathKey: path.pathKey,
+        port: cascadePathIngressPort(entityId(group), path.pathKey), egressTag: 'block' }]);
+    const inbound = fragment.inbounds[0], rule = fragment.routing.rules[0];
+    const key = value => JSON.stringify(canonicalize(value));
+    const existing = config.inbounds.find(item => item.tag === inbound.tag);
+    if (existing && key(existing) !== key(inbound)) {
+        throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_INSTALLED_PATH_MISMATCH', 'Installed ingress identity changed');
+    }
+    if (!existing) config.inbounds.push(inbound);
+    config.routing.rules = [rule, ...config.routing.rules.filter(item => key(item) !== key(rule))];
+}
+
+// Import recognition is exact generator matching, never status/desired-data
+// authority. The public adoption reader already checked each original digest.
+// Reuse its ownership delta; a new hop-by-hop before-config is not evidence of
+// which classic artifacts may be removed.
+function matchedClassicConfigs(topology, refs) {
+    const configs = new Map();
+    const { legacyProfileArtifacts } = require('../../../services/topologyConfigTransfer');
+    const key = value => JSON.stringify(canonicalize(value));
+    for (const component of connectedSnapshots(topology)) {
+        if (!component.nodes.every(node => typeof node.profileConfig === 'string')) continue;
+        for (const node of component.nodes) {
+            let delta;
+            try { delta = parseGeneratedConfig(legacyProfileArtifacts(component, node.id)); }
+            catch (error) {
+                if (!error.code?.startsWith('CONFIG_LEGACY_IMPORT_')) throw error;
+                continue; // ordinary topology artifacts still require the checks below
+            }
+            if (node.role === 'portal') {
+                const current = parseGeneratedConfig(node.profileConfig);
+                const metadata = projectNodeConfig(node, node, refs.get(node.id));
+                const base = parseGeneratedConfig(configGenerator.generateXrayConfig(metadata, []));
+                configGenerator.applyXrayApi(base, metadata.xray.apiPort || 61000);
+                configGenerator.ensurePrivateIpBlock(base);
+                // The helper independently checks base client metadata without
+                // runtime clients. Claim other base members only on exact match.
+                const clientTags = clientInboundTags(metadata);
+                for (const section of ['inbounds', 'outbounds']) {
+                    delta[section].push(...base[section].filter(item => !delta[section].some(old => old.tag === item.tag)
+                        && current[section].some(actual => key(actual) === key(item)
+                            || (section === 'inbounds' && actual.tag === item.tag && clientTags.includes(item.tag)))));
+                }
+                delta.routing.rules.push(...base.routing.rules.filter(rule => current.routing.rules.some(actual => key(actual) === key(rule))
+                    && !delta.routing.rules.some(old => key(old) === key(rule))));
+            }
+            configs.set(node.id, delta);
+        }
+    }
+    return configs;
+}
+
+function transitionLinkRefs(before, unionLinks) {
+    const profiles = new Map(before.nodes.filter(node => node.profileConfig !== undefined)
+        .map(node => [node.id, parseGeneratedConfig(node.profileConfig)]));
+    const previous = new Map(before.links.map(link => [link.id, link]));
+    return new Map([...unionLinks.keys()].map(id => {
+        const synthetic = `link-${createHash('sha256').update(`celerity-topology-link:${id}`).digest('hex').slice(0, 8)}`;
+        const link = previous.get(id);
+        if (link?.mode !== 'reverse') return [id, synthetic];
+        const domain = `${id.slice(-8)}.${link.tunnelDomain || 'reverse.tunnel.internal'}`;
+        const observed = [profiles.get(link.source)?.reverse?.portals, profiles.get(link.target)?.reverse?.bridges]
+            .some(entries => entries?.some(entry => entry.domain === domain));
+        // Preserve the original classic domain suffix on both ends, including
+        // subsequent transitions after the classic generic tags are converted.
+        return [id, observed ? id : synthetic];
+    }));
+}
+
 // Generate both sides with the existing generators. Stable private link refs
 // keep a surviving tunnel's tags/domain independent of removed siblings.
-function composeDescriptorTransition(before, after) {
+function composeDescriptorTransition(before, after, installedPath) {
     const beforeNodes = uniqueById(before.nodes, 'NODE');
     const afterNodes = uniqueById(after.nodes, 'NODE');
     const nodesById = new Map([...beforeNodes, ...afterNodes]);
@@ -1845,9 +1929,8 @@ function composeDescriptorTransition(before, after) {
     const unionLinks = new Map([...before.links, ...after.links].map(link => [entityId(link), link]));
     const usedIds = new Set(nodesById.keys());
     const refs = componentRefs({ nodes: [...nodesById.values()] });
-    const linkRefs = new Map([...unionLinks.keys()].map(id => [id,
-        `link-${createHash('sha256').update(`celerity-topology-link:${id}`).digest('hex').slice(0, 8)}`]));
-    if (new Set(linkRefs.values()).size !== linkRefs.size) {
+    const linkRefs = transitionLinkRefs(before, unionLinks);
+    if (new Set([...linkRefs.values()].map(ref => ref.slice(-8))).size !== linkRefs.size) {
         throw new FrozenTopologyDeploymentPlanError('DUPLICATE_LINK_REF', 'Frozen link artifact identities collide');
     }
     const generate = topology => {
@@ -1863,12 +1946,44 @@ function composeDescriptorTransition(before, after) {
         parseGeneratedConfig(Buffer.from(node.candidate.bytes).toString('utf8'))]));
     const oldConfigs = configMap(oldPlan);
     const newConfigs = configMap(newPlan);
+    for (const [id, config] of matchedClassicConfigs(before, refs)) oldConfigs.set(id, config);
     for (const [id, node] of beforeNodes) {
         if (!oldConfigs.has(id)) oldConfigs.set(id, isolatedProfileConfig(node, refs.get(id)));
         includeBlockedPathReadback(before, node, oldConfigs.get(id));
+        includeInstalledEmptyPath(before, node, oldConfigs.get(id), installedPath);
         if (node.profileConfig !== undefined) {
             const profile = parseGeneratedConfig(node.profileConfig);
             const key = value => JSON.stringify(canonicalize(value));
+            const expectedConfig = oldConfigs.get(id);
+            const cascadeTagged = item => /^(?:bridge-conn-|conn-down-|fwd-|tunnel-)/.test(item.tag || '');
+            // A failed classic match must not become an unchecked dialer-side
+            // fallback merely because this node has no tunnel listener.
+            for (const [actual, expected] of [
+                [profile.inbounds, expectedConfig.inbounds.filter(cascadeTagged)],
+                [profile.outbounds, expectedConfig.outbounds.filter(cascadeTagged)],
+                [profile.reverse?.portals || [], expectedConfig.reverse?.portals || []],
+                [profile.reverse?.bridges || [], expectedConfig.reverse?.bridges || []],
+            ]) {
+                if (expected.some(item => actual.filter(value => key(value) === key(item)).length !== 1)) {
+                    throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_BASELINE_MISMATCH',
+                        'The verified profile does not match its owned cascade artifacts');
+                }
+            }
+            const cascadeTags = new Set([
+                ...expectedConfig.inbounds.filter(cascadeTagged), ...expectedConfig.outbounds.filter(cascadeTagged),
+                ...(expectedConfig.reverse?.portals || []), ...(expectedConfig.reverse?.bridges || []),
+            ].map(item => item.tag));
+            const ownsRule = rule => cascadeTags.has(rule.outboundTag)
+                || rule.inboundTag?.some(tag => cascadeTags.has(tag));
+            const expectedRules = expectedConfig.routing.rules.filter(ownsRule);
+            const expectedRuleKeys = new Set(expectedRules.map(key));
+            // Additional rules can belong to a separately owned same-profile
+            // ingress that deliberately shares this outbound. Do not claim
+            // those as ours; require each exact generated rule in order.
+            if (key(profile.routing.rules.filter(rule => expectedRuleKeys.has(key(rule)))) !== key(expectedRules)) {
+                throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_BASELINE_MISMATCH',
+                    'The verified profile does not match its ordered cascade rules');
+            }
             for (const link of before.links.filter(link => (link.mode === 'reverse' ? link.source : link.target) === id)) {
                 const expected = oldConfigs.get(id).inbounds.find(inbound => inbound.port === link.tunnelPort);
                 if (!expected || !profile.inbounds.some(inbound => key(inbound) === key(expected))) {
@@ -1888,6 +2003,8 @@ function composeDescriptorTransition(before, after) {
         let config = newConfigs.get(id);
         if (!config) config = isolatedProfileConfig(node, refs.get(id));
         if (node.role !== 'portal') config = stripServerInbounds(config, nodeConfig);
+        includeBlockedPathReadback(after, beforeNodes.get(id) || node, config);
+        includeInstalledEmptyPath(after, node, config, installedPath);
         // A removed final egress must still accept the installed loopback PPP
         // path and block it. Removing that listener can expose a default path
         // in a separately preserved PPP fragment and is not a no-route plan.
@@ -1927,6 +2044,7 @@ function composeFrozenTopologyDeploymentPlan({
     nodeRefsById,
     linkRefsById,
     baselineTopology,
+    installedPath,
     hopByHop = false,
 } = {}) {
     if (compiledTopology?.valid !== true || !Array.isArray(compiledTopology.relays)) {
@@ -1935,7 +2053,7 @@ function composeFrozenTopologyDeploymentPlan({
             'A valid compiled topology is required',
         );
     }
-    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot);
+    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot, installedPath);
     const nodeMetadataById = uniqueById(nodeMetadata, 'NODE_METADATA');
     const linkMetadataById = uniqueById(linkMetadata, 'LINK_METADATA');
     const components = staged === true ? connectedSnapshots(snapshot) : [];

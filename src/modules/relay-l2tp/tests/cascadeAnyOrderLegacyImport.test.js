@@ -328,7 +328,7 @@ test('a shared legacy bridge imports both old links and refuses an omitted peer 
     assert.deepEqual(selected.resourceNodeIds, [id(1), id(2), id(3)]);
 });
 
-test('conversion prerequisite: actual descriptor materialization still refuses old classic artifact identities before dispatch', async () => {
+test('conversion prerequisite: actual descriptor materialization converts matched classic artifacts without changing their domains', async () => {
     const f = fixture(TEST, { relay: true });
     for (const node of f.topology.nodes) await f.adopt(node);
     const selected = await f.read();
@@ -337,11 +337,14 @@ test('conversion prerequisite: actual descriptor materialization still refuses o
     const materializer = new TopologyOperationPlanMaterializer({
         HyNode: { find() { assert.fail('verified imported descriptors must not rehydrate mutable nodes'); } },
         CascadeLink: { find() { assert.fail('verified imported descriptors must not rehydrate mutable links'); } } });
-    await assert.rejects(materializer.materialize({ target: TEST.target, hostIdentity: TEST.hostIdentity, operationKind: 'link.apply',
+    const plan = await materializer.materialize({ target: TEST.target, hostIdentity: TEST.hostIdentity, operationKind: 'link.apply',
         pinnedSnapshot: { revision: 7, topology: selected.effectiveTopology, compiled: compileTopology(selected.effectiveTopology) },
-        baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology }),
-    { code: 'TOPOLOGY_PROFILE_BASELINE_MISMATCH' });
-    // This is an explicit unresolved generator seam, NOT a completed migration.
+        baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology });
+    const configs = new Map(plan.nodes.map(node => [node.node, JSON.parse(Buffer.from(node.candidate.bytes))]));
+    assert.equal(configs.get(id(1)).inbounds.filter(row => row.tag === 'bridge-conn-0000000a').length, 1);
+    assert.deepEqual(configs.get(id(2)).reverse.bridges, [{ tag: 'bridge-0000000a', domain: '0000000a.old-tunnel.invalid' }]);
+    assert.equal(configs.get(id(2)).outbounds.some(row => row.tag === 'tunnel-up'), false);
+    // Candidate generation is not operation settlement, client proof or physical activation.
     const { legacyProfileArtifacts } = require('../../../services/topologyConfigTransfer');
     const portal = legacyProfileArtifacts(f.topology, id(1));
     const relay = legacyProfileArtifacts(f.topology, id(2));
@@ -349,3 +352,5 @@ test('conversion prerequisite: actual descriptor materialization still refuses o
     assert.equal(relay.outbounds[0].tag, 'tunnel-up');
     assert.equal(f.Operation.rows.length, 0);
 });
+
+module.exports = { fixture, id };
