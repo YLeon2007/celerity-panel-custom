@@ -147,7 +147,7 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
         RunnerBootstrapper: LocalBootstrapper, ...(reader ? { executionBindingReader: reader } : {}) });
     return { executor, events, Node };
 }
-async function setup(authority = goodAuthority) {
+async function setup(authority = goodAuthority, { publicOwner = false } = {}) {
     if (!models) {
         const bind = (name, location) => connection.model(name, require(location).schema);
         models = {
@@ -176,16 +176,40 @@ async function setup(authority = goodAuthority) {
     await repository.claim({ operationId, executionContext: PROD, owner: 'worker-17', now: new Date(), leaseMs: 120000 });
     await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
         owner: 'worker-17', generation: context.executionFence.generation, leaseUntil: new Date(Date.now() + 120000) });
-    await models.Owner.create({ executionContext: PROD, node: NODE, profile: 'xray-main', nodeIdentity: IDENTITY,
-        owner: 'topology', generation: OWNER_GENERATION,
-        originalSnapshot: { configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' },
+    const originalSnapshot = { configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+    let ownerGeneration = OWNER_GENERATION;
+    if (publicOwner) {
+        // Receipt-contract regression uses the real native owner producer too.
+        // Only external maintenance/readback is modeled; no owner authority seed.
+        const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
+        const transfer = new TopologyConfigTransfer({ executionContext: PROD, TopologyConfigOwner: models.Owner,
+            async withVerifiedMaintenance({ binding, proofRef }, work) {
+                assert.equal(proofRef, 'SIMULATED-native-original');
+                assert.equal(binding.node, NODE); assert.equal(binding.profile, 'xray-main');
+                assert.deepEqual(binding.nodeIdentity, IDENTITY);
+                await work({ status: 'verified', authority: 'external-maintenance-v1', binding: structuredClone(binding),
+                    proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
+                    oldBackend: { instanceId: 'simulated-old-prod', pid: 42, processStartTime: 'simulated-start',
+                        processTree: 'stopped', dispatch: 'disabled' }, readback: { source: 'node-readback', ...originalSnapshot } });
+            } });
+        const classic = await transfer.initializeClassic({ node: NODE, profile: 'xray-main', nodeIdentity: IDENTITY });
+        assert.equal(classic.owner, 'classic'); assert.equal(classic.adoptionReceipt, undefined);
+        const adopted = await transfer.adopt({ node: NODE, profile: 'xray-main', generation: classic.generation,
+            proofRef: 'SIMULATED-native-original' });
+        assert.equal(adopted.owner, 'topology');
+        assert.equal(adopted.adoptionReceipt.fromGeneration, classic.generation);
+        assert.equal(adopted.adoptionReceipt.toGeneration, adopted.generation);
+        assert.deepEqual(adopted.originalSnapshot, originalSnapshot);
+        ownerGeneration = adopted.generation;
+    } else await models.Owner.create({ executionContext: PROD, node: NODE, profile: 'xray-main', nodeIdentity: IDENTITY,
+        owner: 'topology', generation: OWNER_GENERATION, originalSnapshot,
         adoptionReceipt: { proofId: randomUUID(), maintenanceId: randomUUID(), fromGeneration: randomUUID(),
             toGeneration: OWNER_GENERATION, oldBackendInstanceId: 'simulated-old-prod', oldPid: 42,
             oldProcessStartTime: 'simulated-start', verifiedAt: new Date() } });
     const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
     const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority, ...models });
     return { store, context, expected: freeze(expected), enrollment: freeze({ nodeId: NODE, targetProfile: 'xray-main',
-        endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration: OWNER_GENERATION, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
+        endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
 
 test('server-attested exact endpoint is snapshotted immutably with physical enrollment', async () => {
@@ -1038,9 +1062,9 @@ test('real commit writeConcern uncertainty remains conservative with one bounded
     assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
 });
 
-async function terminalFixture(t, { authority = goodAuthority, onCommand } = {}) {
+async function terminalFixture(t, { authority = goodAuthority, onCommand, publicOwner = false } = {}) {
     const { fakeRunner } = require('./helpers/topologyTerminalFakeRunner');
-    const state = await setup(authority);
+    const state = await setup(authority, { publicOwner });
     const { store, expected, enrollment, context } = state;
     await store.preEnroll(enrollment);
     const row = await store.createBinding(expected);
@@ -1055,8 +1079,8 @@ async function terminalFixture(t, { authority = goodAuthority, onCommand } = {})
     return { ...state, ...assembledState, row, localRunner, prefix, lifecycle };
 }
 
-async function settlementPrepared(t) {
-    const state = await terminalFixture(t);
+async function settlementPrepared(t, options) {
+    const state = await terminalFixture(t, options);
     await state.executor.verify(state.lifecycle);
     const Topology = connection.models.SettlementTopology || connection.model('SettlementTopology',
         require('../models/cascadeTopologyStateModel').schema);
@@ -1185,7 +1209,7 @@ test('assembled TEST worker uses real Mongo finalizer and real runner while PROD
 
 test('V2 native persisted receipt contracts preserve distinct proof authorities and refuse owner root drift', async t => {
     for (const drift of ['unchanged', 'adoption-proof', 'original-snapshot']) await t.test(drift, async t => {
-        const f = await settlementPrepared(t);
+        const f = await settlementPrepared(t, { publicOwner: true });
         const durable = await models.Binding.findOne().lean();
         const enrolled = await models.Enrollment.findById(durable.enrollmentId).lean();
         const owner = await models.Owner.findOne().lean();
