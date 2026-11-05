@@ -478,7 +478,7 @@ test('bridge-less fan-in stages two portal sources to the shared relay without d
         second.nodes.map(node => node.candidate.sha256));
 });
 
-test('bridge-less multi-portal with two different relay sinks remains rejected', () => {
+test('bridge-less disconnected portal-to-relay components stage independently without direct egress', () => {
     const input = stagedInput({
         snapshot: {
             nodes: [
@@ -493,8 +493,83 @@ test('bridge-less multi-portal with two different relay sinks remains rejected',
     });
     input.nodeMetadata.push(nodeMeta('portal-2', 'portal', 4), nodeMeta('relay-2', 'relay', 5));
     input.linkMetadata.push(linkMeta('link-p2r', 10103));
-    assert.throws(() => composeFrozenTopologyDeploymentPlan(input),
-        error => error.code === 'MULTIPLE_DEFAULT_EGRESS');
+    // These are two routing domains, not competing default exits of one
+    // connected fan-in graph. Both prefixes stay staged and fail closed.
+    const plan = composeFrozenTopologyDeploymentPlan(input);
+    assert.equal(plan.staged, true);
+    assert.equal(plan.mode, 'reverse');
+    assert.deepEqual(plan.nodes.map(node => [node.nodeRef, node.node, node.role]), [
+        ['portal-1', 'portal-1', 'portal'], ['relay-1', 'relay-1', 'relay'],
+        ['portal-2', 'portal-2', 'portal'], ['relay-2', 'relay-2', 'relay'],
+    ], 'exactly both components are planned, with each listener before its own dialer');
+    const byRef = planByRef(plan);
+    for (const node of plan.nodes) {
+        assert.deepEqual([node.targetProfile, node.serviceUnit, node.serviceUnitPath, node.configPath],
+            node.role === 'portal'
+                ? ['xray-main', 'xray.service', '/etc/systemd/system/xray.service', '/usr/local/etc/xray/config.json']
+                : ['xray-bridge', 'xray-bridge.service', '/etc/systemd/system/xray-bridge.service', '/usr/local/etc/xray-bridge/config.json']);
+    }
+
+    for (const component of [
+        { portalRef: 'portal-1', relayRef: 'relay-1', linkRef: 'link-2', linkId: 'link-pr',
+            clientTag: 'client-portal-1', address: '192.0.2.1', tunnelPort: 10101 },
+        { portalRef: 'portal-2', relayRef: 'relay-2', linkRef: 'link-1', linkId: 'link-p2r',
+            clientTag: 'client-portal-4', address: '192.0.2.4', tunnelPort: 10103 },
+    ]) {
+        const { portalRef, relayRef, linkRef, linkId, clientTag, address, tunnelPort } = component;
+        const portalNode = byRef.get(portalRef);
+        const relayNode = byRef.get(relayRef);
+        const portal = candidateJson(portalNode);
+        const relay = candidateJson(relayNode);
+        const domain = `${linkRef}.reverse.tunnel.internal`;
+        const portalTag = `portal-${linkRef}`;
+        const connectorTag = `bridge-conn-${linkRef}`;
+        const bridgeTag = `bridge-${linkRef}`;
+        const tunnelTag = `tunnel-${linkRef}`;
+        const uuid = tunnelUuidOf(linkId);
+
+        assert.deepEqual(portal.reverse, { portals: [{ domain, tag: portalTag }] });
+        assert.deepEqual(portal.inbounds.map(inbound => inbound.tag).sort(),
+            ['API_INBOUND', connectorTag, clientTag].sort(), 'no peer or path ingress is added');
+        const listener = portal.inbounds.find(inbound => inbound.tag === connectorTag);
+        assert.equal(listener.protocol, 'vless');
+        assert.equal(listener.listen, '0.0.0.0');
+        assert.equal(listener.port, tunnelPort);
+        assert.deepEqual(listener.settings.clients, [{ id: uuid }]);
+        assert.deepEqual(portal.routing.rules, [
+            { type: 'field', inboundTag: ['API_INBOUND'], outboundTag: 'API' },
+            { type: 'field', domain: [`full:${domain}`], inboundTag: [connectorTag], outboundTag: portalTag },
+            { type: 'field', inboundTag: [clientTag], outboundTag: portalTag },
+            { type: 'field', ip: ['geoip:private'], outboundTag: 'block' },
+        ], 'client traffic uses only its own reverse portal, never direct or a peer component');
+        assert.deepEqual(portal.outbounds.map(outbound => [outbound.tag, outbound.protocol]),
+            [['direct', 'freedom'], ['block', 'blackhole']]);
+        assert.deepEqual(portalNode.checks, [
+            { type: 'service', serviceUnit: 'xray.service', expectedState: 'active' },
+            { type: 'port', protocol: 'tcp', port: tunnelPort, expectedState: 'listening' },
+        ]);
+
+        assert.deepEqual(relay.reverse, { bridges: [{ domain, tag: bridgeTag }] });
+        assert.deepEqual(relay.inbounds, [], 'terminal relays bind neither client nor L2TP path ingress');
+        assert.deepEqual(relay.outbounds.map(outbound => [outbound.tag, outbound.protocol]),
+            [[tunnelTag, 'vless'], ['direct', 'freedom'], ['block', 'blackhole']]);
+        const tunnel = relay.outbounds.find(outbound => outbound.tag === tunnelTag);
+        assert.deepEqual(tunnel.settings.vnext, [{ address, port: tunnelPort,
+            users: [{ encryption: 'none', id: uuid }] }], 'each relay dials only its own portal');
+        assert.deepEqual(relay.routing.rules, [
+            { type: 'field', domain: [`full:${domain}`], outboundTag: tunnelTag },
+            { type: 'field', inboundTag: [bridgeTag], outboundTag: 'block' },
+            { type: 'field', ip: ['geoip:private'], outboundTag: 'block' },
+        ], 'only reverse control returns upstream; all received transit has an explicit blackhole');
+        assert.deepEqual(relayNode.checks, [
+            { type: 'service', serviceUnit: 'xray-bridge.service', expectedState: 'active' },
+        ], 'a relay dialer must not claim a reverse listener or nonexistent downstream ingress');
+        for (const config of [portal, relay]) {
+            assert.ok(!config.routing.rules.some(rule => (
+                ['direct', 'freedom'].includes(rule.outboundTag)
+            )), 'a base freedom outbound is not an active egress route or fallback');
+        }
+    }
 });
 
 test('staged chain ending at a non-relay node is rejected', () => {
