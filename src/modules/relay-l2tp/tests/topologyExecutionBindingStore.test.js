@@ -768,13 +768,27 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
         await models.Lock.updateOne({}, { $set: { leaseUntil: untilDate } });
         const find = models.Owner.findOne;
         const startSession = connection.startSession;
-        let confirmations = 0;
+        let confirmations = 0, postcommitWitness = false, commits = 0;
+        const committed = event => { if (event.commandName === 'commitTransaction') commits++; };
+        if (boundary === 'read') connection.getClient().on('commandSucceeded', committed);
         models.Owner.findOne = function (...args) {
             const query = find.apply(this, args);
             const lean = query.lean;
             query.lean = async function (...leanArgs) {
                 const row = await lean.apply(this, leanArgs);
                 if (this.getOptions().readConcern?.level !== 'majority') return row;
+                // A1 also reads the owner before the transaction. Only the
+                // postcommit confirmation carries the committed CAS nonce.
+                if (boundary === 'read') {
+                    const nonce = this.getFilter().executionBindingCheck;
+                    if (typeof nonce !== 'string') return row;
+                    assert.equal(this.getOptions().session, undefined);
+                    assert.equal(this.getOptions().readPreference.mode, 'primary');
+                    assert.equal(commits, 1, 'the actual transaction must have committed');
+                    assert.equal(row.executionBindingCheck, nonce);
+                    assert.equal(await models.Binding.countDocuments(), 1);
+                    postcommitWitness = true;
+                }
                 confirmations++;
                 if (!delayed && (boundary === 'executor' ? execution.events.includes('ssh-adapter') : confirmations === 1)) {
                     delayed = true;
@@ -797,7 +811,11 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
             await assert.rejects(execution ? execution.executor.prepare(context) : store.readVerified(expected),
                 execution ? { code: 'TOPOLOGY_OPERATION_EXECUTION_FAILED', remoteOutcomeUncertain: true }
                     : { code: 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' });
-        } finally { models.Owner.findOne = find; connection.startSession = startSession; }
+        } finally {
+            models.Owner.findOne = find; connection.startSession = startSession;
+            if (boundary === 'read') connection.getClient().off('commandSucceeded', committed);
+        }
+        if (boundary === 'read') assert.equal(postcommitWitness, true, 'expiry fault must fire at postcommit confirmation');
         assert.equal(delayed, true);
         assert.ok(Date.now() > untilDate.getTime(), 'lease must actually expire at this boundary');
         if (execution) assert.equal(execution.events.filter(event => typeof event === 'object').length, 0);
@@ -900,14 +918,25 @@ test('majority confirmation refuses authority fields changed after commit, inclu
         const { store, expected, enrollment } = await setup();
         await store.preEnroll(enrollment);
         const find = models[name].findOne;
-        let injected = false;
+        let injected = false, postcommitWitness = false, commits = 0;
+        const committed = event => { if (event.commandName === 'commitTransaction') commits++; };
+        if (name === 'Owner') connection.getClient().on('commandSucceeded', committed);
         models[name].findOne = function (...args) {
             const query = find.apply(this, args);
             const lean = query.lean;
             query.lean = async function (...leanArgs) {
-                if (!injected && this.getOptions().readConcern?.level === 'majority') {
-                    injected = true;
+                if (!injected && this.getOptions().readConcern?.level === 'majority'
+                    && (name !== 'Owner' || typeof this.getFilter().executionBindingCheck === 'string')) {
                     const row = await models[name].collection.findOne({});
+                    if (name === 'Owner') {
+                        assert.equal(commits, 1, 'the actual create transaction must have committed');
+                        assert.equal(this.getOptions().session, undefined);
+                        assert.equal(this.getOptions().readPreference.mode, 'primary');
+                        assert.equal(row.executionBindingCheck, this.getFilter().executionBindingCheck);
+                        assert.equal(await models.Binding.countDocuments(), 1);
+                        postcommitWitness = true;
+                    }
+                    injected = true;
                     await models[name].updateOne({}, [{ $set: { [key]: { $literal: key === 'originalSnapshot' ? null : [row[key]] } } }],
                         { runValidators: true });
                 }
@@ -916,7 +945,11 @@ test('majority confirmation refuses authority fields changed after commit, inclu
             return query;
         };
         try { await assert.rejects(store.createBinding(expected), { code: 'TOPOLOGY_EXECUTION_BINDING_UNCONFIRMED' }); }
-        finally { models[name].findOne = find; }
+        finally {
+            models[name].findOne = find;
+            if (name === 'Owner') connection.getClient().off('commandSucceeded', committed);
+        }
+        if (name === 'Owner') assert.equal(postcommitWitness, true, 'owner fault must fire at postcommit confirmation');
         assert.equal(injected, true);
         assert.equal(await models.Binding.countDocuments(), 1, 'refused readback must retain the real commit');
         assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
