@@ -1,4 +1,5 @@
 const express = require('express');
+const { isDeepStrictEqual } = require('node:util');
 const router = express.Router();
 
 const HyNode = require('../../models/hyNodeModel');
@@ -594,8 +595,9 @@ router.get('/nodes/:id', async (req, res) => {
 router.post('/nodes/:id', async (req, res) => {
     const nodeId = req.params.id;
     try {
-        // Full doc (not partial) — we .save() it below; +manualKey is select:false.
-        const existingNode = await HyNode.findById(nodeId).select('+xray.manualKey');
+        // Both private Xray fields must survive the full subdocument merge below.
+        const existingNode = await HyNode.findById(nodeId)
+            .select('+xray.manualKey +xray.accessLogs.ingestTokenEncrypted');
         if (!existingNode) {
             return res.redirect('/panel/nodes');
         }
@@ -705,10 +707,27 @@ router.post('/nodes/:id', async (req, res) => {
         }
 
         // Use doc.save() — $set on subdoc with select:false field hits Mongoose 8 path collision.
+        const before = existingNode.toObject({ depopulate: true });
         existingNode.set(updates);
         await existingNode.save();
 
-        syncService.schedulePush(nodeId, updates);
+        // The form always submits config defaults and replaces xray. Classify
+        // the actual schema-cast saved delta, not the presence of those fields.
+        const after = existingNode.toObject({ depopulate: true });
+        const changedUpdates = Object.fromEntries(Object.entries(updates).filter(([key]) => {
+            const root = key.split('.')[0];
+            return !isDeepStrictEqual(before[root], after[root]);
+        }));
+        // Ordinary SSH pool entries are keyed by node ID, not endpoint. Retire
+        // that old connection after a successful transport edit, before dispatch.
+        if (!isDeepStrictEqual(before.ip, after.ip) || !isDeepStrictEqual(before.ssh, after.ssh)) {
+            await require('../../services/sshPoolService').close(nodeId);
+        }
+        // Type/role/activation transitions retain the full-form push semantics;
+        // unlike cosmetic edits they can change which runtime is managed.
+        const lifecycleChanged = before.type !== after.type || before.cascadeRole !== after.cascadeRole
+            || before.active !== after.active;
+        syncService.schedulePush(nodeId, lifecycleChanged ? updates : changedUpdates);
 
         // Sync SSH credentials to sibling node on the same IP (if SSH was part of this update)
         const sshChanged = updates['ssh.password'] !== undefined
