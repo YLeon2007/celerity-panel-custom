@@ -119,9 +119,11 @@ function backgroundCallers(f) {
                 if (result !== undefined) return result;
             }
             const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)?.[0];
-            const stdout = command.includes('command -v xray') ? '/usr/bin/xray\n'
-                : command.includes('is-active xray-bridge') ? 'active\n'
-                    : command.includes('ss -tnH') ? '1\n' : '';
+            const file = command.match(/cat (\/usr\/local\/etc\/xray(?:-bridge)?\/config\.json)/)?.[1];
+            const stdout = file ? f.files.get(key(this.node._id, file)) ?? 'C3_CLASSIC_PROFILE_ABSENT'
+                : command.includes('command -v xray') ? '/usr/bin/xray\n'
+                    : command.includes('is-active xray-bridge') ? 'active\n'
+                        : command.includes('ss -tnH') ? '1\n' : '';
             return { code: 0, stdout: stdout + (receipt ? `\n${receipt}\n` : ''), stderr: '' };
         }
     }
@@ -272,6 +274,16 @@ async function assembled({ installed = false } = {}) {
         f.files.set(key(node._id, MAIN), nodes.find(row => row.id === node._id && row.role === 'portal')?.profileConfig || main);
         f.files.set(key(node._id, BRIDGE), nodes.find(row => row.id === node._id && row.role !== 'portal')?.profileConfig || '{}\n');
     }
+    // The no-status classic peer below is a preservation control, not a
+    // desired-only row that background Sync should activate. Materialize its
+    // actual installed profiles with the same product generators as the peers.
+    const classicPeer = { ...copy(classic), portalNode: f.data.HyNode.find(node => node._id === classic.portalNode),
+        bridgeNode: f.data.HyNode.find(node => node._id === classic.bridgeNode) };
+    const classicMain = JSON.parse(f.files.get(key(classic.portalNode, MAIN)));
+    generator.applyReversePortal(classicMain, [classicPeer], ['client-in']);
+    generator.ensurePrivateIpBlock(classicMain);
+    f.files.set(key(classic.portalNode, MAIN), JSON.stringify(classicMain));
+    f.files.set(key(classic.bridgeNode, BRIDGE), generator.generateCombinedBridgeConfig([classicPeer]));
     if (installed) f.files.set(key(id(1), MAIN), JSON.stringify(modeledInstalledMain(f.installed.state)));
     const Owner = f.models.TopologyConfigOwner;
     Owner.collection = { indexes: async () => [{ key: { node: 1, profile: 1 }, unique: true }] };

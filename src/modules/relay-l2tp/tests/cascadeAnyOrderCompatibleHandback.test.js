@@ -55,7 +55,7 @@ function classicCaller(f) {
         } });
     const stub = (file, value) => stubs.set(path.resolve(root, file), value);
     stub('config.js', { PANEL_DOMAIN: context.hostIdentity, ENCRYPTION_KEY: 'local-only' });
-    stub('src/utils/logger.js', { info() {}, warn() {}, error() {}, debug() {} });
+    stub('src/utils/logger.js', Object.fromEntries(['info', 'warn', 'error', 'debug'].map(level => [level, (...args) => events.push(['log', level, ...args])])));
     stub('src/utils/helpers.js', { invalidateNodesCache: async () => {}, invalidateUserCache: async () => {} });
     stub('src/services/cacheService.js', { invalidateNodes: async () => {}, invalidateAllSubscriptions: async () => {}, invalidateDashboardCounts: async () => {} });
     stub('src/services/nodeSetup.js', { reloadCcAgent: async () => {} });
@@ -76,7 +76,18 @@ function classicCaller(f) {
         async connect() { events.push(['connect', this.node._id]); }
         disconnect() {}
         async uploadContent(bytes, file) { events.push(['upload', this.node._id, file]); f.files.set(key(this.node._id, file), bytes); }
-        async exec(command) { events.push(['exec', this.node._id, command]); return { code: 0, stdout: command.includes('command -v xray') ? '/usr/bin/xray\n' : '', stderr: '' }; }
+        async exec(command) {
+            events.push(['exec', this.node._id, command]);
+            const file = command.match(/cat (\/usr\/local\/etc\/xray(?:-bridge)?\/config\.json)/)?.[1];
+            if (file && require('../domain/l2tpExecutionAuthorization').resolveL2tpExecutionAuthorization(process.env).enableInstallAdmission) {
+                assert.ok(f.data.NodeOperationLock.some(row => row.node === this.node._id
+                    && row.owner === 'classic-config-writer' && row.remoteUncertain), 'read restored bytes inside an enabled classic generation');
+            }
+            const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)?.[0];
+            const stdout = file ? f.files.get(key(this.node._id, file)) ?? 'C3_CLASSIC_PROFILE_ABSENT'
+                : command.includes('command -v xray') ? '/usr/bin/xray\n' : '';
+            return { code: 0, stdout: stdout + (receipt ? `\n${receipt}\n` : ''), stderr: '' };
+        }
     }
     stub('src/services/nodeSSH.js', SSH);
     const axios = async options => { events.push(['agent', options.url]); return { status: 200, data: {} }; };
@@ -227,6 +238,13 @@ test('settled native history survives checked original handback while ordinary c
         assert.equal(await f.bg.service._topologyManagesNode(f.data.HyNode[0]), false);
         assert.equal(await f.bg.service.updateXrayNodeConfig(f.data.HyNode[0]), true, JSON.stringify({ node: f.data.HyNode[0], events: f.bg.events }));
         assert.ok(f.bg.events.some(([kind, node]) => kind === 'upload' && node === id(1)), 'actual classic caller reaches modeled upload under its real shared generation');
+        // Also exercise ordinary checked-profile composition, not only the
+        // historical TEST compatibility-status branch used above.
+        process.env.TOPOLOGY_TEST_EXECUTION_ENABLED = 'false';
+        assert.equal(require('../../../services/topologyConfigOwnership').usesTestTopologyConfig(f.data.HyNode[0]), false);
+        assert.equal(await f.bg.service.updateXrayNodeConfig(f.data.HyNode[0]), true, JSON.stringify(f.bg.events));
+        assert.ok(f.bg.events.some(([kind, node, command]) => kind === 'exec' && node === id(1)
+            && command.includes('cat /usr/local/etc/xray/config.json')), 'new checked classic Sync actually reads the restored profile');
         assert.deepEqual(f.data.NodeOperationLock, []);
         assert.deepEqual({ operations: f.data.TopologyOperation, bindings: f.data.TopologyExecutionBinding, enrollments: f.data.TopologyExecutionEnrollment, jobs: f.data.TopologyCreateIntent }, history);
         assert.deepEqual([...f.files].filter(([name]) => name.startsWith(`${id(3)}:`) || name.startsWith(`${id(4)}:`)), independent);
