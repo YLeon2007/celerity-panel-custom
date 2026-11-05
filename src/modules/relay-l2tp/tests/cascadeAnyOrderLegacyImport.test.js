@@ -162,17 +162,57 @@ for (const context of [TEST, PROD]) test(`${context.target}: public handback res
     // equality and native owner rows. Only DB/history reads are local seams.
     const mongoose = require('mongoose');
     const Operation = require('../models/topologyOperationModel');
-    const previousDb = mongoose.connection.db, previousExists = Operation.exists;
+    const previousDb = mongoose.connection.db, historyReads = [];
+    const previousCollection = Operation.collection.collection, previousBuffer = Operation.collection.buffer;
+    const sift = require('sift').default;
+    let historyFailure;
     mongoose.connection.db = { collection(name) {
-        assert.equal(name, 'topologyconfigowners');
-        return { find(filter) { return { toArray: async () => structuredClone(f.Owner.rows.filter(row => row.node === String(filter.node))) }; } };
+        if (name === 'topologyconfigowners') return { find(filter) {
+            assert.ok(filter.node instanceof mongoose.Types.ObjectId, 'native owner filter retains BSON identity');
+            return { toArray: async () => structuredClone(f.Owner.rows.filter(row => row.node === String(filter.node))) };
+        } };
+        assert.equal(name, 'topologyoperations');
+        // Keep the actual Mongoose exists/find/casting path. Empty history is
+        // the real fixture inventory, not a fabricated settled operation or a
+        // replacement of the ownership reader's history/handback predicate.
+        return {
+            async findOne(filter) { return f.Operation.rows.find(sift(filter)) || null; },
+            find(filter, options) {
+                assert.ok(filter['nodes.node'] instanceof mongoose.Types.ObjectId, 'history read casts the exact BSON node');
+                assert.deepEqual(Object.keys(filter), ['nodes.node']);
+                assert.equal(options.readPreference.mode, 'primary');
+                assert.deepEqual(options.readConcern, { level: 'majority' });
+                assert.equal(options.maxTimeMS, 5000);
+                historyReads.push(String(filter['nodes.node']));
+                return { toArray: async () => {
+                    if (historyFailure) throw historyFailure;
+                    return f.Operation.rows.filter(sift(filter));
+                } };
+            },
+        };
     } };
-    Operation.exists = async () => false;
+    // Bind only this model's disconnected driver seam; do not mark a connection
+    // ready or bypass real query casting. Restore both cache/buffer afterwards.
+    Operation.collection.collection = mongoose.connection.db.collection('topologyoperations');
+    Operation.collection.buffer = false;
     try {
         const { topologyManagesNodeConfig } = require('../../../services/topologyConfigOwnership');
         for (const node of f.topology.nodes) assert.equal(await topologyManagesNodeConfig({ _id: node.id, cascadeRole: node.role },
             { PANEL_DOMAIN: context.hostIdentity }), false);
-    } finally { mongoose.connection.db = previousDb; Operation.exists = previousExists; }
+        assert.deepEqual(historyReads, f.topology.nodes.map(node => node.id), 'every handed-back node checks actual empty history');
+        assert.deepEqual(f.Operation.rows, [], 'no successful native history is invented');
+        const owners = structuredClone(f.Owner.rows);
+        historyFailure = new Error('modeled unknown operation-history read');
+        for (const node of f.topology.nodes) await assert.rejects(topologyManagesNodeConfig({ _id: node.id, cascadeRole: node.role },
+            { PANEL_DOMAIN: context.hostIdentity }), /modeled unknown operation-history read/);
+        assert.deepEqual(f.Owner.rows, owners, 'unknown history cannot alter the public handback generations/receipts');
+        assert.deepEqual(f.Operation.rows, []);
+        assert.deepEqual([...f.physical], originalPhysical);
+    } finally {
+        Operation.collection.collection = previousCollection;
+        Operation.collection.buffer = previousBuffer;
+        mongoose.connection.db = previousDb;
+    }
 });
 
 for (const [name, mutate, code] of [
