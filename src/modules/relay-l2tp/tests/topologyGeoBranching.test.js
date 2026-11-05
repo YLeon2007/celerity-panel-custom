@@ -141,9 +141,15 @@ test('reverse chain with a geo-routing branch bridge composes end-to-end', () =>
     assert.ok(geoRuleIndex < defaultRuleIndex, 'geo rules precede the default rule');
     assert.ok(privateIndex > defaultRuleIndex, 'geoip:private stays last');
 
-    // Plan nodes intentionally carry no durable ids (candidate plans must not
-    // project object ids); the coordinator maps refs via nodeIdsByRef.
-    assert.ok(plan.nodes.every(node => node.node === undefined), 'plan nodes stay id-less');
+    // Internal descriptors bind the exact physical node; the coordinator must
+    // consume these bindings instead of independently reordering geo leaves.
+    // This does not authorize IDs or private metadata in generated config bytes.
+    assert.deepEqual(plan.nodes.map(({ nodeRef, node }) => [nodeRef, node]), [
+        ['portal', 'node-portal'], ['relay-1', 'node-relay'],
+        ['bridge', 'node-bridge'], ['bridge-2', 'node-bridge-geo'],
+    ]);
+    for (const node of plan.nodes) assert.doesNotMatch(Buffer.from(node.candidate.bytes).toString('utf8'),
+        /node-portal|node-relay|node-bridge/);
 
     // The geo bridge is configured like a regular bridge for its own link:
     // in reverse mode it dials out through its tunnel outbound.

@@ -31,12 +31,12 @@ function get(row, key) {
         ? value.flatMap(child => walk(child, parts)) : walk(value?.[parts[0]], parts.slice(1));
     return walk(row, key.split('.'));
 }
-function matches(row, filter) {
+function matches(row, filter, executionContext = context) {
     return Object.entries(filter).every(([key, value]) => {
-        if (key === '$or') return value.some(f => matches(row, f));
-        if (key === '$and') return value.every(f => matches(row, f));
-        if (key === '$nor') return value.every(f => !matches(row, f));
-        if (key === '$expr') return require('../domain/topologyOperationClaimBinding').matchesTopologyOperationClaimBinding(row, context);
+        if (key === '$or') return value.some(f => matches(row, f, executionContext));
+        if (key === '$and') return value.every(f => matches(row, f, executionContext));
+        if (key === '$nor') return value.every(f => !matches(row, f, executionContext));
+        if (key === '$expr') return require('../domain/topologyOperationClaimBinding').matchesTopologyOperationClaimBinding(row, executionContext);
         const actual = get(row, key);
         if (value && typeof value === 'object' && !(value instanceof Date) && !Array.isArray(value)
             && Object.keys(value).some(k => k.startsWith('$'))) return Object.entries(value).every(([op, v]) => {
@@ -57,7 +57,12 @@ function matches(row, filter) {
         return same(actual, value) || (Array.isArray(actual) && actual.includes(value));
     });
 }
-function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } = {}) {
+function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'],
+    executionContext = context, deploymentEnv = env } = {}) {
+    // Explicit synthetic server selection, fixed before owners/host/HTTP exist.
+    assert.strictEqual(require('../domain/l2tpExecutionAuthorization').selectExecutionContext(executionContext), executionContext);
+    assert.strictEqual(require('../runtime/createTopologyOperationRuntime').resolveTopologyExecutionContext(deploymentEnv), executionContext);
+    const selected = (row, filter) => matches(row, filter, executionContext);
     let depth = 0;
     const calls = [], sessions = [], errors = [], deployments = [];
     const db = { async transaction(work) {
@@ -77,7 +82,7 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
     };
     data.TopologyConfigOwner = data.HyNode.map((node, i) => ({ node: node._id,
         profile: node.cascadeRole === 'portal' ? 'xray-main' : 'xray-bridge',
-        executionContext: context, owner: 'topology', generation: '11111111-1111-4111-8111-111111111111',
+        executionContext, owner: 'topology', generation: '11111111-1111-4111-8111-111111111111',
         nodeIdentity: { machineId: String(i + 1).repeat(32), sshHostKeySha256: String(i + 1).repeat(64) },
         originalSnapshot: { configSha256: sha('{}'), unitSha256: sha('unit'), serviceActive: 'inactive', serviceEnabled: 'disabled' },
         adoptionReceipt: { toGeneration: '11111111-1111-4111-8111-111111111111', proofId: '22222222-2222-4222-8222-222222222222',
@@ -112,11 +117,11 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
             for (const key of Object.keys(changes.$unset || {})) delete row[key];
         }
         Object.assign(Model, { db, rows,
-            find: f => query(() => rows.filter(r => matches(r, f))),
-            findOne: f => query(() => rows.find(r => matches(r, f)) || null),
+            find: f => query(() => rows.filter(r => selected(r, f))),
+            findOne: f => query(() => rows.find(r => selected(r, f)) || null),
             findById: k => query(() => rows.find(r => String(r._id) === String(k)) || null),
-            exists: f => query(() => rows.find(r => matches(r, f)) ? { _id: 'exists' } : null),
-            countDocuments: f => query(() => rows.filter(r => matches(r, f)).length),
+            exists: f => query(() => rows.find(r => selected(r, f)) ? { _id: 'exists' } : null),
+            countDocuments: f => query(() => rows.filter(r => selected(r, f)).length),
             async create(docs, options = {}) {
                 if (name !== 'NodeOperationLock') assert.ok(options.session?.inTransaction(), `${name} create joins an active transaction`);
                 const many = Array.isArray(docs);
@@ -125,10 +130,10 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
                 for (const row of result) { if (row.node && rows.some(r => r.node === row.node)) throw Object.assign(Error('duplicate'), { code: 11000 }); rows.push(row); }
                 return copy(many ? result : result[0]);
             },
-            findOneAndUpdate: (f, u) => query(() => { const row = rows.find(r => matches(r, f)); if (row) update(row, u, f); return row || null; }),
-            async updateOne(f, u) { const row = rows.find(r => matches(r, f)); if (row) update(row, u, f); return { matchedCount: row ? 1 : 0 }; },
-            async updateMany(f, u) { const selected = rows.filter(r => matches(r, f)); selected.forEach(r => update(r, u, f)); return { matchedCount: selected.length }; },
-            async deleteOne(f) { const index = rows.findIndex(r => matches(r, f)); if (index >= 0) rows.splice(index, 1); return { deletedCount: index >= 0 ? 1 : 0 }; },
+            findOneAndUpdate: (f, u) => query(() => { const row = rows.find(r => selected(r, f)); if (row) update(row, u, f); return row || null; }),
+            async updateOne(f, u) { const row = rows.find(r => selected(r, f)); if (row) update(row, u, f); return { matchedCount: row ? 1 : 0 }; },
+            async updateMany(f, u) { const chosen = rows.filter(r => selected(r, f)); chosen.forEach(r => update(r, u, f)); return { matchedCount: chosen.length }; },
+            async deleteOne(f) { const index = rows.findIndex(r => selected(r, f)); if (index >= 0) rows.splice(index, 1); return { deletedCount: index >= 0 ? 1 : 0 }; },
         });
         return Model;
     }
@@ -145,7 +150,7 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
     const timer = { callbacks: new Set(), setInterval(fn) { this.callbacks.add(fn); return fn; }, clearInterval(fn) { this.callbacks.delete(fn); },
         async tick() { for (const fn of this.callbacks) await fn(); } };
     function host(overrides = {}) {
-        return createL2tpPanelHost({ env, ...models, NodeSSH: class { constructor() { assert.fail('no real SSH'); } },
+        return createL2tpPanelHost({ env: deploymentEnv, ...models, NodeSSH: class { constructor() { assert.fail('no real SSH'); } },
             moduleEntry: { ...moduleEntry, registerModels: () => models,
                 createTopologyDeploymentService(options) {
                     const service = moduleEntry.createTopologyDeploymentService(options);
@@ -164,7 +169,7 @@ function fixture({ roles = ['portal', 'relay', 'bridge', 'portal', 'bridge'] } =
             ...overrides,
         });
     }
-    return { models, data, calls, errors, sessions, host, timer, deployments, setPause(fn) { pause = fn; } };
+    return { executionContext, deploymentEnv, models, data, calls, errors, sessions, host, timer, deployments, setPause(fn) { pause = fn; } };
 }
 function app(f) {
     const app = express(); app.use(express.json());
@@ -172,10 +177,10 @@ function app(f) {
     const draft = new TopologyDraftWriteService({ repository: new TopologyDraftRepository(f.models) });
     app.use('/links', createCascadeLinksRouter({ Link: f.models.CascadeLink, Node: f.models.HyNode,
         TopologyState: f.models.CascadeTopologyState, ClientProofOperation: f.models.TopologyOperation,
-        topologyDraftWriteService: draft, deploymentEnv: env,
+        topologyDraftWriteService: draft, deploymentEnv: f.deploymentEnv,
         maintainAutoL2tpPathsFn: async () => {}, invalidateSubscriptions: async () => {}, invalidateTopology: async () => {} }));
     const next = (req, res, next) => next();
-    app.use('/topology', createCascadeTopologyDeployRouter({ models: f.models, deploymentEnv: env,
+    app.use('/topology', createCascadeTopologyDeployRouter({ models: f.models, deploymentEnv: f.deploymentEnv,
         requireAuth: next, requireScope: () => next, csrf: next, deployRateLimiter: next, operationStatusRateLimiter: next }));
     return app;
 }
