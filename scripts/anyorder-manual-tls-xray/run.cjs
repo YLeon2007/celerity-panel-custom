@@ -156,8 +156,12 @@ async function transition(links, name, kind = 'link.apply', noop = false) {
 }
 async function traffic(port, expected, name) {
     const nonce = randomUUID(); let last, observed;
+    // Unrelated selected-profile clients retain classic private-IP protection.
+    // A TEST-only benchmark address is redirected by their own frozen freedom
+    // outbound to the local witness; no packet leaves the private stand.
+    const destination = name.includes(':selected-fragment-') ? '198.18.35.1' : '127.0.0.1';
     for (let attempt = 0; attempt < (expected ? 10 : 2); attempt++) {
-        last = await exec('p', `curl --silent --show-error --connect-timeout 1 --max-time 2 --socks5-hostname 127.0.0.1:${port} ${shell(`http://127.0.0.1:18080/probe?nonce=${nonce}`)}`);
+        last = await exec('p', `curl --silent --show-error --connect-timeout 1 --max-time 2 --socks5-hostname 127.0.0.1:${port} ${shell(`http://${destination}:18080/probe?nonce=${nonce}`)}`);
         fs.appendFileSync(path.join(work, 'http-results.jsonl'), JSON.stringify({label: name, nonce, port, expected, code: last.code, raw: last.stdout, sha256: sha(last.stdout)}) + '\n');
         if (last.code === 0) { observed = JSON.parse(last.stdout); break; }
         if (expected) await new Promise(resolve => setTimeout(resolve, 400));
@@ -254,7 +258,7 @@ async function main() {
         base.inbounds ||= [];
         base.inbounds.push({tag: 'unrelated-in', listen: '0.0.0.0', port: 24543, protocol: 'vless',
             settings: {clients: [{id: unrelatedUuid, email: `independent-${id}@invalid`}], decryption: 'none'}, streamSettings: {network: 'tcp', security: 'none'}});
-        base.outbounds.push({tag: 'unrelated-out', protocol: 'freedom'});
+        base.outbounds.push({tag: 'unrelated-out', protocol: 'freedom', settings: {redirect: '127.0.0.1:18080'}});
         base.routing.rules.push({type: 'field', inboundTag: ['unrelated-in'], outboundTag: 'unrelated-out'});
         base.policy = {levels: {0: {statsUserUplink: true, statsUserDownlink: true}}};
         node.profileConfig = JSON.stringify(base, null, 2) + '\n';

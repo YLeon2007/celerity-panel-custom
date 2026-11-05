@@ -7,7 +7,7 @@ Variants are exactly reverse G1 P→B, `groups:[]`:
 - `primary`: primary VLESS/TCP/manual TLS, reverse tunnel `none`;
 - `extra`: primary `none` plus extra VLESS/TCP/manual TLS, reverse tunnel `reality`.
 
-Selected profiles are **Portal MAIN / Bridge SIDECAR**. Both contain credentialed unrelated clients; **Portal SIDECAR / Bridge MAIN** are independent, nonempty, actually running traffic controls. No generated candidate is manually repaired.
+Selected profiles are **Portal MAIN / Bridge SIDECAR**. Both contain credentialed unrelated clients; **Portal SIDECAR / Bridge MAIN** are independent, nonempty, actually running traffic controls. The unrelated selected-profile clients use a TEST-only benchmark destination `198.18.35.1` and their preserved freedom redirect to the local witness, so classic private-IP protections remain intact and no external packet is needed. Selected cascade probes and independent profiles use the same loopback witness directly. No generated candidate is manually repaired.
 
 `launch.py --execute-local-fixture --variant primary|extra` freezes the committed source/harness, checks existing image IDs, memory reserves and nonoverlapping internal subnet, then uses only the designated private rootless Podman wrapper. Run `batch.py` inside a separate bounded `hermes-heavy-*` user scope (384MiB high / 512MiB max / zero swap / CPU100% / TasksMax256); endpoints have separate 192MiB/CPU50%/PIDs192 limits, runner 256MiB/CPU50%/PIDs96, Go concurrency2. No downloads/build/install/public ports/host sockets or namespaces. All new evidence is beneath `/home/leon/c3-anyorder-execution-20261104/manual-tls-xray-wave35/`.
 
