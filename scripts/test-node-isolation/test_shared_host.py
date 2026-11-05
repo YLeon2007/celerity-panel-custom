@@ -75,6 +75,221 @@ class SharedPlanTests(unittest.TestCase):
                 s.validate_plan({**p, **change}, m)
 
 
+class FreezerPrecheckTests(unittest.TestCase):
+    """MODELED OS/root-policy inputs; real loader, inventory and host precheck."""
+    MACHINE = '2' * 32  # Synthetic, not an attestation of any installed host.
+
+    def setUp(self):
+        import os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.proc = self.root / 'proc'
+        self.cg = self.root / 'cgroup'
+        self.cg.mkdir()
+        (self.cg / 'cgroup.controllers').write_text('cpu memory pids\n')
+        self.machine = self.root / 'machine-id'
+        self.machine.write_text(self.MACHINE)
+        boot = self.proc / 'sys/kernel/random/boot_id'
+        boot.parent.mkdir(parents=True)
+        boot.write_text('22222222-2222-4222-8222-222222222222')
+        for who in ('self', '1'):
+            directory = self.proc / who / 'ns'
+            directory.mkdir(parents=True)
+            for ns in ('mnt', 'pid', 'cgroup'):
+                (directory / ns).symlink_to(ns + ':[modeled-host]')
+        self.legacy = plan()
+        self.source = HERE.parent / 'panel-host-freezer.py'
+        self.legacy['hostHold']['freezerSha256'] = m.digest(self.source.read_bytes())
+        pin = {'nodeId': '2' * 24, 'targetProfile': 'xray-bridge',
+               'endpoint': {'ip': '10.204.11.2', 'port': 2222, 'username': m.RUNNER_USER},
+               'physical': {'machineId': self.MACHINE, 'bootId': boot.read_text(),
+                            'sshHostKeySha256': '2' * 64},
+               'profiles': ['xray-main', 'xray-bridge']}
+        self.inventory = {'version': 1, 'profile': 'accepted-test-v1',
+                          'executionContext': {'target': 'test', 'hostIdentity': 'test.infograd.online'},
+                          'sharedNodeId': pin['nodeId'], 'nodes': [pin]}
+        self.inventory_file = self.root / 'modeled-accepted-inventory.json'
+        raw = m.json.dumps(self.inventory, sort_keys=True, separators=(',', ':')).encode()
+        self.inventory_file.write_bytes(raw)
+        self.p = copy.deepcopy(self.legacy)
+        self.p.update(version=2, inventorySha256=m.digest(raw), nodeId=pin['nodeId'],
+                      endpointIp=pin['endpoint']['ip'], **pin['physical'])
+        self.p['hostHold']['expected']['host'] = {k: self.p[k] for k in ('machineId', 'bootId')}
+        self.euid = 0
+        self.inventory_error = None
+        self.loaded = []
+        self.real_readlink = os.readlink
+
+    def load(self, p=None, *, validate_before=False):
+        import os
+        import subprocess
+        from unittest.mock import patch
+        assert s is not None
+        original_spec = importlib.util.spec_from_file_location
+
+        def installed_spec(name, path):
+            self.assertEqual(path, str(self.source))
+            spec = original_spec(name, path)
+            assert spec is not None and spec.loader is not None
+            execute = spec.loader.exec_module
+            def modeled_paths(module):
+                execute(module)
+                # Redirect only the kernel's filesystem roots. Neither host()
+                # nor host_precheck() nor the historical machine pin is replaced.
+                kernel_type = module.LinuxKernel
+                module.LinuxKernel = lambda: kernel_type(proc=self.proc, cgroup=self.cg, machine=self.machine)
+                self.loaded.append(module)
+            spec.loader.exec_module = modeled_paths
+            return spec
+
+        def trusted_read(path):
+            # Root ownership acceptance alone is modeled; validators/digests are real.
+            if str(path) == m.INVENTORY:
+                if self.inventory_error is not None:
+                    raise self.inventory_error
+                return self.inventory_file.read_bytes()
+            self.assertEqual(str(path), str(self.source))
+            return self.source.read_bytes()
+
+        def namespace_read(path):
+            self.assertIn(path, ['/proc/' + who + '/ns/' + ns
+                                for who in ('self', '1') for ns in ('mnt', 'pid', 'cgroup')])
+            return self.real_readlink(self.proc / path.removeprefix('/proc/'))
+
+        with patch.object(s, 'FREEZER', str(self.source)), \
+             patch.object(m, 'secure_file', side_effect=trusted_read), \
+             patch.object(importlib.util, 'spec_from_file_location', side_effect=installed_spec), \
+             patch.object(os, 'geteuid', side_effect=lambda: self.euid), \
+             patch.object(os, 'readlink', side_effect=namespace_read), \
+             patch.object(subprocess, 'run', side_effect=AssertionError('no external probes allowed')):
+            p = self.p if p is None else p
+            if validate_before:
+                self.assertEqual(s.validate_plan(p, m), p)
+            return s.load_freezer(p, m)
+
+    def test_v2_accepted_new_machine_reaches_existing_host_precheck(self):
+        # Reproduces the real caller's already-validated v2 plan, then the loader.
+        try:
+            module, kernel = self.load(validate_before=True)
+        except RuntimeError as error:
+            self.fail('accepted synthetic v2 host must pass precheck: ' + str(error))
+        self.assertEqual(kernel.host(), self.p['hostHold']['expected']['host'])
+        self.assertNotEqual(self.MACHINE, module.TEST_MACHINE_ID)
+        self.assertIsInstance(kernel.barrier, module.SystemdRelaunchBarrier)
+
+    def test_legacy_correct_machine_keeps_historical_default(self):
+        assert s is not None
+        self.machine.write_text(s.MACHINE)
+        module, kernel = self.load(self.legacy)
+        self.assertEqual(kernel.host()['machineId'], module.TEST_MACHINE_ID)
+        # A later default call must not inherit the v2 accepted-machine pin.
+        self.machine.write_text(self.MACHINE)
+        self.load()
+        self.machine.write_text(s.MACHINE)
+        self.load(self.legacy)
+
+    def test_legacy_wrong_machine_cannot_override_default_through_plan(self):
+        for override in (False, True):
+            with self.subTest(plan_override=override):
+                p = copy.deepcopy(self.legacy)
+                if override:
+                    p['machineId'] = self.MACHINE
+                    p['hostHold']['expected']['host']['machineId'] = self.MACHINE
+                with self.assertRaisesRegex(RuntimeError, 'TEST host identity required'):
+                    self.load(p)
+
+    def test_v2_actual_wrong_machine_refuses_including_historical_host(self):
+        assert s is not None
+        for machine in ('3' * 32, s.MACHINE):
+            with self.subTest(actual_machine=machine):
+                self.machine.write_text(machine)
+                with self.assertRaisesRegex(RuntimeError, 'TEST host identity required'):
+                    self.load()
+
+    def test_v2_plan_pin_mismatch_refuses_before_freezer_load(self):
+        p = copy.deepcopy(self.p)
+        p['machineId'] = '3' * 32
+        p['hostHold']['expected']['host']['machineId'] = p['machineId']
+        self.machine.write_text(p['machineId'])
+        with self.assertRaisesRegex(m.Refusal, 'ACCEPTED_NODE_IDENTITY_DRIFT'):
+            self.load(p)
+        self.assertEqual(self.loaded, [])
+
+    def test_v2_unvalidated_inventory_refuses_before_freezer_load(self):
+        original = self.inventory_file.read_bytes()
+        for fault in ('missing', 'untrusted', 'digest-drift', 'invalid-schema'):
+            with self.subTest(fault=fault):
+                self.inventory_file.write_bytes(original)
+                self.inventory_error = None
+                p = copy.deepcopy(self.p)
+                error, message = m.Refusal, 'ACCEPTED_INVENTORY_DRIFT'
+                if fault == 'missing':
+                    self.inventory_file.unlink()
+                    error, message = FileNotFoundError, ''
+                elif fault == 'untrusted':
+                    self.inventory_error = m.Refusal('UNTRUSTED_PATH')
+                    message = 'UNTRUSTED_PATH'
+                elif fault == 'digest-drift':
+                    p['inventorySha256'] = 'f' * 64
+                else:
+                    invalid = {**self.inventory, 'profile': 'not-accepted'}
+                    raw = m.json.dumps(invalid, sort_keys=True, separators=(',', ':')).encode()
+                    self.inventory_file.write_bytes(raw)
+                    p['inventorySha256'] = m.digest(raw)
+                    message = 'INVALID_ACCEPTED_INVENTORY'
+                with self.assertRaisesRegex(error, message):
+                    self.load(p)
+                self.assertEqual(self.loaded, [])
+
+    def test_v2_other_valid_inventory_node_cannot_supply_shared_pin(self):
+        other = copy.deepcopy(self.inventory['nodes'][0])
+        other.update(nodeId='3' * 24, targetProfile='xray-main', profiles=['xray-main'])
+        other['endpoint']['ip'] = '10.204.11.3'
+        other['physical'].update(machineId='3' * 32, sshHostKeySha256='3' * 64)
+        self.inventory['nodes'].append(other)
+        raw = m.json.dumps(self.inventory, sort_keys=True, separators=(',', ':')).encode()
+        self.inventory_file.write_bytes(raw)
+        p = copy.deepcopy(self.p)
+        p.update(inventorySha256=m.digest(raw), nodeId=other['nodeId'],
+                 targetProfile=other['targetProfile'], endpointIp=other['endpoint']['ip'], **other['physical'])
+        p['hostHold']['expected']['host'] = {k: p[k] for k in ('machineId', 'bootId')}
+        self.machine.write_text(p['machineId'])
+        with self.assertRaisesRegex(m.Refusal, 'SHARED_TEST_IDENTITY_REQUIRED'):
+            self.load(p)
+        self.assertEqual(self.loaded, [])
+
+    def test_v2_host_inventory_must_match_accepted_identity(self):
+        self.p['hostHold']['expected']['host']['machineId'] = '3' * 32
+        with self.assertRaisesRegex(m.Refusal, 'ACCEPTED_HOST_INVENTORY_REQUIRED'):
+            self.load()
+        self.assertEqual(self.loaded, [])
+
+    def test_v2_keeps_freezer_checksum_pin(self):
+        self.p['hostHold']['freezerSha256'] = 'f' * 64
+        with self.assertRaisesRegex(m.Refusal, 'FREEZER_SOURCE_DRIFT'):
+            self.load()
+        self.assertEqual(self.loaded, [])
+
+    def test_v2_keeps_root_namespace_and_cgroup_prechecks(self):
+        self.euid = 1000
+        with self.assertRaisesRegex(RuntimeError, 'host root required'):
+            self.load()
+        self.euid = 0
+        for ns in ('mnt', 'pid', 'cgroup'):
+            with self.subTest(namespace=ns):
+                link = self.proc / 'self/ns' / ns
+                link.unlink()
+                link.symlink_to(ns + ':[modeled-container]')
+                with self.assertRaisesRegex(RuntimeError, 'host namespace required'):
+                    self.load()
+                link.unlink()
+                link.symlink_to(ns + ':[modeled-host]')
+        (self.cg / 'cgroup.controllers').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'cgroup v2 required'):
+            self.load()
+
+
 class FixtureKernelSurvivors:
     """Simulated immutable singleton payloads; NOT a live proof adapter."""
     def pid(self, number):

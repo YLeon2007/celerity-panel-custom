@@ -160,13 +160,22 @@ def assert_payload_lineage(expected, kernel, m):
 
 def load_freezer(p, m):
     import importlib.util
+    expected_machine_id = None
+    if p.get('version') == 2:
+        # This loader is also reached by hold readback: never trust a prior
+        # caller validation or forward the plan's machineId as authority.
+        validate_plan(p, m)
+        expected_machine_id = m.inventory_node(p)['physical']['machineId']
     m.need(m.digest(m.secure_file(FREEZER)) == p['hostHold']['freezerSha256'], 'FREEZER_SOURCE_DRIFT')
     spec = importlib.util.spec_from_file_location('c3_host_freezer', FREEZER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     kernel = module.LinuxKernel()
     kernel.barrier = module.SystemdRelaunchBarrier()
-    module.host_precheck(kernel)
+    if expected_machine_id is None:
+        module.host_precheck(kernel)
+    else:
+        module.host_precheck(kernel, expected_machine_id=expected_machine_id)
     return module, kernel
 
 

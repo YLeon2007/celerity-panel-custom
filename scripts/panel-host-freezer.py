@@ -910,9 +910,11 @@ class Fence:
             raise
 
 
-def host_precheck(kernel):
+def host_precheck(kernel, *, expected_machine_id=TEST_MACHINE_ID):
+    # Internal shared-v2 callers supply only an independently accepted root pin;
+    # the standalone CLI and legacy callers retain the historical TEST default.
     need(os.geteuid() == 0, 'host root required')
-    need(kernel.host()['machineId'] == TEST_MACHINE_ID, 'TEST host identity required; PROD not supported')
+    need(kernel.host()['machineId'] == expected_machine_id, 'TEST host identity required; PROD not supported')
     for ns in ('mnt', 'pid', 'cgroup'):
         need(os.readlink('/proc/self/ns/' + ns) == os.readlink('/proc/1/ns/' + ns), 'host namespace required')
     need((kernel.root / 'cgroup.controllers').is_file(), 'cgroup v2 required')
