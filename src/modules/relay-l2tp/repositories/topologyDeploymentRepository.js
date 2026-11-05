@@ -153,6 +153,7 @@ class TopologyDeploymentRepository {
         const visited = new Set();
         const owners = new Map();
         const settledProfiles = new Map();
+        const initialImportedGroups = new Map();
         const add = topology => {
             for (const kind of ['nodes', 'links', 'groups']) for (const value of topology[kind]) {
                 const key = kind === 'groups' ? '_id' : 'id';
@@ -223,6 +224,13 @@ class TopologyDeploymentRepository {
                             owner.legacyAppliedTopology, { node, profile, originalSnapshot: owner.originalSnapshot });
                         if (!same(imported, owner.legacyAppliedTopology)) throw selectedError();
                         add(imported);
+                        for (const group of imported.groups) {
+                            // The verified bounded G2 import carries the R -> B
+                            // suffix, not the portal path or mutable desired policy.
+                            const path = group.paths[0];
+                            const suffix = imported.links.find(link => link.id === path.linkIds[0]);
+                            initialImportedGroups.set(group._id, { group, pathKey: path.pathKey, ownerNodeId: suffix.source });
+                        }
                     } catch { throw selectedError('TOPOLOGY_LEGACY_IMPORT_MISMATCH'); }
                 } else if (!EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)) throw selectedError();
                 // A real adoption readback proves the imported profile (or {})
@@ -312,13 +320,41 @@ class TopologyDeploymentRepository {
         let selected = require('../services/topologyOperationCoordinator').selectEffectiveTopology({
             verifiedBaselineTopology: baseline, desiredTopology, scope,
         });
-        const installed = (snapshot?.installedRouteOwners || []).filter(owner => selected.resourceNodeIds.includes(String(owner.nodeId)));
+        const installed = (snapshot?.installedRouteOwners || []).filter(owner => selected.resourceNodeIds.includes(String(owner.nodeId))
+            || initialImportedGroups.has(String(owner.groupId)));
+        let importedGroup;
+        if (initialImportedGroups.size) {
+            // Only initial imported provenance needs this join. After genuine
+            // settlement the checked committed candidate above is authoritative;
+            // historical import policy must not veto empty-path/recreate work.
+            if (initialImportedGroups.size !== 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_OWNER_AMBIGUOUS');
+            const imported = [...initialImportedGroups.values()][0];
+            const states = await withSession(this.snapshotReader.RelayL2tpState.find({ routeGroup: imported.group._id })
+                .select('node routeGroup status desiredState activePathKey appliedTopologyRevision secretRevision'), session).lean();
+            const { ACTIVE_RELAY_STATUSES } = require('./topologyDraftRepository');
+            const references = states.filter(row => row.desiredState === 'installed' || ACTIVE_RELAY_STATUSES.includes(row.status));
+            if (references.length > 1 || installed.length > 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_OWNER_AMBIGUOUS');
+            const state = references[0], owner = installed[0];
+            if (references.length !== 1 || installed.length !== 1
+                || state.status !== 'installed' || state.desiredState !== 'installed'
+                || String(state.node) !== imported.ownerNodeId || String(state.routeGroup) !== imported.group._id
+                || state.activePathKey !== imported.pathKey
+                || !Number.isSafeInteger(state.appliedTopologyRevision) || state.appliedTopologyRevision < 0
+                || !Number.isSafeInteger(state.secretRevision) || state.secretRevision < 1
+                || String(owner.nodeId) !== imported.ownerNodeId || String(owner.groupId) !== imported.group._id
+                || owner.pathKey !== imported.pathKey || owner.ownerTopologyRevision !== state.appliedTopologyRevision
+                || owner.ownerCredentialRevision !== state.secretRevision) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            const groups = require('../domain/topologyDraft').projectGroups(snapshot.groups)
+                .filter(group => group._id === imported.group._id);
+            if (groups.length !== 1 || !same(groups[0], imported.group)) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
+            importedGroup = imported.group;
+        }
         if (installed.length) {
             if (installed.length !== 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_OWNER_AMBIGUOUS');
             const owner = installed[0];
             if (!owner.pathKey || !Number.isSafeInteger(owner.ownerTopologyRevision)
                 || !Number.isSafeInteger(owner.ownerCredentialRevision) || owner.ownerCredentialRevision < 1) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
-            const group = require('../domain/topologyDraft').projectGroups(snapshot.groups)
+            const group = importedGroup || require('../domain/topologyDraft').projectGroups(snapshot.groups)
                 .find(row => row._id === String(owner.groupId));
             if (!group || new Set(group.paths.map(path => path.pathKey)).size !== group.paths.length) throw selectedError('TOPOLOGY_INSTALLED_ROUTE_PUBLICATION_REQUIRED');
             const oldPath = group.paths.find(path => path.pathKey === owner.pathKey);
