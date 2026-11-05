@@ -65,12 +65,19 @@ function legacyAppliedTopology(input) {
             invalid('CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH');
         }
     }
-    // TLS can consult live certificate files; groups/installed paths and mixed
-    // legacy-forward graphs are not observation-only import contracts.
+    // Only a portal's descriptor-backed manual client TLS is observation-only.
+    // Extras inherit the NODE source, exactly as the existing generator does;
+    // a per-extra source cannot authorize panel/default or file-backed TLS.
+    const supportedReverseClient = (node, security) => ['none', 'reality'].includes(security)
+        || (security === 'tls' && node.role === 'portal' && node.type === 'xray' && node.active === true
+            && node.xray?.tlsSource === 'manual'
+            && ['manualCert', 'manualKey'].every(key => typeof node.xray[key] === 'string' && node.xray[key].trim()));
+    // Groups/installed paths, TLS tunnels and mixed legacy-forward graphs keep
+    // their existing refusal. Exact generated metadata/readback checks follow.
     if (!forward && (topology.groups.length || topology.links.some(link => link.mode !== 'reverse'
         || !['none', 'reality'].includes(link.tunnelSecurity || 'none'))
-        || topology.nodes.some(node => !['none', 'reality'].includes(node.xray?.security || 'none')
-            || node.xray?.extraInbounds?.some(inbound => !['none', 'reality'].includes(inbound.security || 'reality'))))) {
+        || topology.nodes.some(node => !supportedReverseClient(node, node.xray?.security || 'none')
+            || node.xray?.extraInbounds?.some(inbound => !supportedReverseClient(node, inbound.security || 'reality'))))) {
         invalid('CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED');
     }
     for (const node of topology.nodes) {
