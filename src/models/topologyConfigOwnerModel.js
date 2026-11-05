@@ -1,6 +1,8 @@
 'use strict';
 const mongoose = require('mongoose');
 const { topologyExecutionContext } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
+const { createProfileTargetPinSchema } = require('../modules/relay-l2tp/models/topologyProfileTargetPinSchema');
+const { assertProfileTargetPin } = require('../modules/relay-l2tp/services/topologyProfileTarget');
 const strict = { _id: false, versionKey: false, strict: 'throw' };
 const digest = { type: String, required: true, match: /^[a-f0-9]{64}$/ };
 const contextSchema = new mongoose.Schema({
@@ -35,6 +37,11 @@ const schema = new mongoose.Schema({
     // with adoption, never an invented settled operation or mutable desired.
     // No default: legacy records do not silently become imported baselines.
     legacyAppliedTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
+    // Private adoption-epoch evidence, not immutable for the row's lifetime:
+    // classic -> adoption and a future ownership epoch can write a new pin.
+    // Validate raw presence before Mongoose can cast null/undefined away.
+    profileTargetPin: { type: createProfileTargetPinSchema(), default: undefined,
+        select: false, set: assertProfileTargetPin },
     // No defaults: an unbound/cloned/legacy row is not an adoption permit.
     owner: { type: String, required: true, enum: ['classic', 'topology'] },
     // Operation settlement metadata never hands permanent ownership to classic.

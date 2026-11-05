@@ -6,12 +6,15 @@ const { validTerminalReceipt, UUID } = require('../models/topologyExecutionBindi
 const { durableSelectedTopology, selectedAdmissionFingerprint } = require('./topologyOperationRepository');
 const { matchesTopologyExecutionContext, topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { linkDesiredVersion } = require('../services/topologyIntentService');
+const { verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
 const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 const plain = value => JSON.parse(JSON.stringify(value));
 const ownerPin = row => plain(Object.fromEntries(['node', 'profile', 'executionContext', 'owner', 'generation',
     'nodeIdentity', 'originalSnapshot', 'adoptionReceipt', 'handbackReceipt', 'lastSettledOperation',
-    'lastSettledGeneration', 'lastSettledRevision', 'lastSettledCloseId'].filter(key => row[key] !== undefined).map(key => [key, row[key]])));
+    'lastSettledGeneration', 'lastSettledRevision', 'lastSettledCloseId', 'profileTargetPin'].filter(key => row[key] !== undefined).map(key => [key, row[key]])));
+const OWNER_TARGET_SELECT = '+legacyAppliedTopology +profileTargetPin';
+const hasTargetPin = row => row && Object.hasOwn(row, 'profileTargetPin');
 function selectedError(code = 'APPLIED_BASELINE_REQUIRED') {
     return new TopologyDeploymentRepositoryError(code, 'The selected applied baseline could not be verified');
 }
@@ -127,7 +130,7 @@ class TopologyDeploymentRepository {
             }),
             groups: [], // Only settled policies may be preserved by a link apply.
         });
-        const catalog = await withSession(this.TopologyConfigOwner.find({}).select('+legacyAppliedTopology'), session).lean();
+        const catalog = await withSession(this.TopologyConfigOwner.find({}).select(OWNER_TARGET_SELECT), session).lean();
         const resources = new Set([String(target.portalNode), String(target.bridgeNode)]);
         for (const row of catalog) {
             if (row.lastSettledOperation !== undefined || !Array.isArray(row.legacyAppliedTopology?.links)) continue;
@@ -164,7 +167,34 @@ class TopologyDeploymentRepository {
             visited.add(node);
             const metadata = desiredTopology.nodes.find(row => row.id === node);
             if (!metadata) throw selectedError('TOPOLOGY_SELECTED_NODE_CHANGED');
-            const profile = metadata.role === 'portal' ? 'xray-main' : 'xray-bridge';
+            // A non-default profile is selected only from an independently
+            // verified imported owner root, never from desired/role/tags. An
+            // independent generic SIDECAR is not a competing applied source.
+            const nodeOwners = catalog.filter(row => String(row.node) === node);
+            const importedOwners = nodeOwners.filter(hasTargetPin);
+            const sources = nodeOwners.filter(row => row.legacyAppliedTopology !== undefined
+                || row.lastSettledOperation !== undefined || hasTargetPin(row));
+            if (sources.length > 1) throw selectedError('TOPOLOGY_PROFILE_TARGET_AMBIGUOUS');
+            let profile = metadata.role === 'portal' ? 'xray-main' : 'xray-bridge';
+            if (importedOwners.length > 1) throw selectedError('TOPOLOGY_PROFILE_TARGET_AMBIGUOUS');
+            // A raw forward descriptor without its saved pin is not an older
+            // compatible native source and must not fall back to SIDECAR.
+            if (nodeOwners.some(row => !hasTargetPin(row)
+                && row.legacyAppliedTopology?.links?.some(link => link.mode === 'forward'))) {
+                throw selectedError('TOPOLOGY_LEGACY_IMPORT_MISMATCH');
+            }
+            if (importedOwners.length) {
+                const imported = importedOwners[0];
+                try {
+                    const pin = verifyImportedProfileTargetPin({ owner: imported,
+                        profileTargetPin: imported.profileTargetPin, executionContext });
+                    profile = resolveTopologyProfileTarget({ nodeId: node, role: metadata.role,
+                        targetProfile: pin.targetProfile, profileTargetPin: pin }).targetProfile;
+                } catch { throw selectedError('TOPOLOGY_LEGACY_IMPORT_MISMATCH'); }
+                // Keep both original endpoints selected even after a settled
+                // delete has no remaining links/tags. Never rewrite this root.
+                imported.legacyAppliedTopology.nodes.forEach(peer => resources.add(peer.id));
+            }
             const matches = catalog.filter(row => String(row.node) === node && row.profile === profile);
             const owner = matches[0];
             if (matches.length !== 1 || owner.owner !== 'topology'
@@ -209,10 +239,13 @@ class TopologyDeploymentRepository {
                 || !operation.selectedOwnerPins?.some(pin => pin.node === node && pin.profile === profile
                     && pin.generation === owner.generation && same(pin.nodeIdentity, plain(owner.nodeIdentity))
                     && same(pin.originalSnapshot, plain(owner.originalSnapshot))
-                    && same(pin.adoptionReceipt, plain(owner.adoptionReceipt)))) throw selectedError();
+                    && same(pin.adoptionReceipt, plain(owner.adoptionReceipt))
+                    && same(pin.profileTargetPin, owner.profileTargetPin))) throw selectedError();
+            try { assertSelectedProfileTargets(operation); } catch { throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED'); }
             const entries = operation.nodes?.filter(item => String(item.node) === node && item.targetProfile === profile);
             const entry = entries?.[0];
             if (entries?.length !== 1 || entry.state !== 'committed' || entry.role !== metadata.role
+                || !same(entry.profileTargetPin, owner.profileTargetPin)
                 || !UUID.test(owner.lastSettledGeneration)) throw selectedError();
             let currentProfile;
             try {
@@ -232,8 +265,9 @@ class TopologyDeploymentRepository {
                     || binding.priorDeployedRevision !== operation.priorDeployedRevision
                     || binding.generation !== owner.lastSettledGeneration
                     || binding.commandIds?.close !== owner.lastSettledCloseId
+                    || !same(binding.profileTargetPin, owner.profileTargetPin)
                     || !validTerminalReceipt(proof, binding) || proof.terminalOutcome !== 'verified') throw selectedError();
-            } else if (executionContext.target !== 'test') throw selectedError();
+            } else if (hasTargetPin(owner) || executionContext.target !== 'test') throw selectedError();
             const settled = durableSelectedTopology(operation.effectiveTopology);
             const component = componentAt(settled, node);
             // A cleaned detached endpoint is absent from effectiveTopology but
@@ -253,6 +287,12 @@ class TopologyDeploymentRepository {
         // snapshot. A stale partial pointer is not a source of old descriptors.
         for (const node of baseline.nodes) {
             const owner = owners.get(node.id);
+            if (hasTargetPin(owner) && owner.legacyAppliedTopology.nodes.some(member => {
+                const peer = owners.get(member.id);
+                return !hasTargetPin(peer) || !same(peer.legacyAppliedTopology, owner.legacyAppliedTopology)
+                    || peer.profileTargetPin.descriptorSha256 !== owner.profileTargetPin.descriptorSha256
+                    || peer.lastSettledOperation !== owner.lastSettledOperation;
+            })) throw selectedError('TOPOLOGY_LEGACY_IMPORT_INCOMPLETE');
             if (owner.lastSettledOperation === undefined) {
                 const imported = owner.legacyAppliedTopology;
                 if (!imported || imported.nodes.some(member => {
@@ -318,15 +358,25 @@ class TopologyDeploymentRepository {
                     kind: scope.kind === 'link.apply' && oldPathLinkIds.length === 0 ? 'link.attach' : scope.kind },
                 routeState: complete ? selected.routeState : 'no_bridge_exit' };
         }
-        return { ...selected, desiredVersion: version,
-            selectedOwnerPins: [...owners.values()].filter(owner => selected.resourceNodeIds.includes(String(owner.node))).sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin) };
+        const selectedOwnerPins = [...owners.values()].filter(owner => selected.resourceNodeIds.includes(String(owner.node)))
+            .sort((a, b) => String(a.node).localeCompare(String(b.node), 'en')).map(ownerPin);
+        try {
+            assertSelectedProfileTargets({ ...selected, executionContext, admissionScope: 'selected', kind: scope.kind,
+                linkId: scope.linkId, linkIds: selected.effectiveTopology.links.map(link => link.id), selectedOwnerPins,
+                nodes: selectedOwnerPins.filter(hasTargetPin).map(owner => ({ node: owner.node, role: owner.profileTargetPin.role,
+                    targetProfile: owner.profile, profileTargetPin: owner.profileTargetPin })) });
+        } catch { throw selectedError('TOPOLOGY_SELECTED_PIN_CHANGED'); }
+        return { ...selected, desiredVersion: version, selectedOwnerPins };
     }
 
     async isSelectedCurrent(operation) {
         if (!Array.isArray(operation.selectedOwnerPins) || !operation.selectedOwnerPins.length) return false;
+        if (operation.selectedOwnerPins.some(hasTargetPin) || operation.nodes?.some(hasTargetPin)) {
+            return Boolean(await require('../services/topologySelectedProofState').readSettledSelectedOperation(this, operation));
+        }
         for (const pin of operation.selectedOwnerPins) {
-            const owner = await this.TopologyConfigOwner.findOne({ node: pin.node, profile: pin.profile }).lean();
-            if (!owner || owner.lastSettledOperation !== String(operation._id) || owner.owner !== 'topology'
+            const owner = await this.TopologyConfigOwner.findOne({ node: pin.node, profile: pin.profile }).select(OWNER_TARGET_SELECT).lean();
+            if (!owner || hasTargetPin(owner) || owner.lastSettledOperation !== String(operation._id) || owner.owner !== 'topology'
                 || owner.generation !== pin.generation || !same(plain(owner.nodeIdentity), pin.nodeIdentity)) return false;
         }
         const link = await this.snapshotReader.CascadeLink.findById(operation.linkId).lean();

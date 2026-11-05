@@ -843,7 +843,7 @@ class TopologyOperationCoordinator {
                         ...this.#executionContext,
                         operationKind: attach ? 'link.attach' : scope?.kind,
                         ...(selected ? { baselineTopology: selected.baselineTopology, effectiveTopology: selected.effectiveTopology,
-                            installedPath: selected.installedPath } : {}),
+                            installedPath: selected.installedPath, selectedOwnerPins: selected.selectedOwnerPins } : {}),
                         session,
                         pinnedSnapshot: deepFreeze({
                             revision: snapshot.revision,

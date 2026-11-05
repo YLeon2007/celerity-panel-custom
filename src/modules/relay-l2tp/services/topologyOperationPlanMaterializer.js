@@ -337,7 +337,7 @@ class TopologyOperationPlanMaterializer {
     }
 
     async materialize({ target, hostIdentity, pinnedSnapshot, operationKind, session,
-        baselineTopology, effectiveTopology, installedPath } = {}) {
+        baselineTopology, effectiveTopology, installedPath, selectedOwnerPins } = {}) {
         if (!TOPOLOGY_EXECUTION_CONTEXTS.some(context => context.target === target)) {
             fail('UNSAFE_TOPOLOGY_TARGET', 'Topology operations require an allowlisted server target');
         }
@@ -365,7 +365,11 @@ class TopologyOperationPlanMaterializer {
                 linkMetadata: after.links,
                 baselineTopology: before,
                 installedPath: descriptorInstalledPath(installedPath, before, after),
+                selectedOwnerPins,
             });
+        }
+        if (selectedOwnerPins?.some(pin => Object.hasOwn(pin, 'profileTargetPin'))) {
+            fail('TOPOLOGY_PROFILE_TARGET_INVALID', 'Imported targets require trusted before and after descriptors');
         }
         const nodeIds = input.snapshot.nodes.map(node => node.id);
         const linkIds = input.snapshot.links.map(link => link.id);

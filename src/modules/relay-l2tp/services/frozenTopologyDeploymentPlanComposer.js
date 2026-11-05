@@ -4,6 +4,7 @@ const { createHash } = require('node:crypto');
 const configGenerator = require('../../../services/configGenerator');
 const { composeXrayConfig } = require('./xrayConfigComposer');
 const { compileTopology } = require('../domain/topologyCompiler');
+const { assertProfileTargetPin, assertSelectedProfileTargets, resolveTopologyProfileTarget } = require('./topologyProfileTarget');
 const {
     cascadePathIngressPort,
 } = require('../domain/cascadePathIngress');
@@ -1662,8 +1663,9 @@ function canonicalize(value) {
     );
 }
 
-function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [], previousListeningPorts = [] }) {
-    const target = TARGETS_BY_ROLE[node.role];
+function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataById, config, ingressPorts = [], previousListeningPorts = [], profileTargetPin }) {
+    const target = profileTargetPin === undefined ? TARGETS_BY_ROLE[node.role]
+        : resolveTopologyProfileTarget({ nodeId, role: node.role, targetProfile: profileTargetPin.targetProfile, profileTargetPin });
     // Tunnel listeners live on the target of forward links and on the source
     // of reverse links (the dialer connects to them).
     const listeningPorts = [...new Set([
@@ -1694,6 +1696,7 @@ function candidateForNode({ nodeId, node, nodeRef, orderedLinks, linkMetadataByI
         nodeRef,
         role: node.role,
         ...target,
+        ...(profileTargetPin === undefined ? {} : { profileTargetPin: assertProfileTargetPin(profileTargetPin) }),
         candidate: {
             mediaType: 'application/vnd.celerity.xray-topology-node+json;version=1',
             bytes: [...bytes],
@@ -1917,7 +1920,10 @@ function transitionLinkRefs(before, unionLinks) {
 
 // Generate both sides with the existing generators. Stable private link refs
 // keep a surviving tunnel's tags/domain independent of removed siblings.
-function composeDescriptorTransition(before, after, installedPath) {
+function composeDescriptorTransition(before, after, installedPath, selectedOwnerPins) {
+    if (selectedOwnerPins?.some(owner => owner && Object.hasOwn(owner, 'profileTargetPin'))) {
+        return composeImportedForwardTransition(before, after, installedPath, selectedOwnerPins);
+    }
     const beforeNodes = uniqueById(before.nodes, 'NODE');
     const afterNodes = uniqueById(after.nodes, 'NODE');
     const nodesById = new Map([...beforeNodes, ...afterNodes]);
@@ -2035,6 +2041,99 @@ function composeDescriptorTransition(before, after, installedPath) {
         ...(newPlan?.staged === true || after.links.length === 0 ? { staged: true } : {}), nodes });
 }
 
+// Pure internal consumer of the selected reader's verified carrier. This is
+// NOT an import recognizer or a root verifier: public adoption stays closed
+// until verifyLegacyAppliedProfile itself supports this layout (B1).
+function composeImportedForwardTransition(before, after, installedPath, selectedOwnerPins) {
+    const pins = selectedOwnerPins.map(owner => assertProfileTargetPin(owner.profileTargetPin));
+    const metadata = pins.map(pin => ({ node: pin.nodeId, role: pin.role,
+        targetProfile: pin.targetProfile, profileTargetPin: pin }));
+    assertSelectedProfileTargets({ executionContext: selectedOwnerPins[0]?.executionContext,
+        admissionScope: 'selected', kind: after.links.length ? 'link.apply' : 'link.delete',
+        nodes: metadata, selectedOwnerPins, resourceNodeIds: pins.map(pin => pin.nodeId),
+        baselineTopology: before, effectiveTopology: after, installedPath,
+        linkId: (after.links[0] || before.links[0])?.id, linkIds: after.links.map(link => link.id) });
+    const beforeNodes = uniqueById(before.nodes, 'NODE');
+    const nodes = new Map([...beforeNodes, ...uniqueById(after.nodes, 'NODE')]);
+    const emptyDelta = () => ({ inbounds: [], outbounds: [], routing: { rules: [] } });
+    const key = value => JSON.stringify(canonicalize(value));
+    const mismatch = () => { throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_BASELINE_MISMATCH',
+        'The verified MAIN profile does not match its owned forward artifacts'); };
+    const delta = (topology, node, ref) => {
+        const config = emptyDelta();
+        const nodeConfig = projectNodeConfig(node, node, node.role);
+        if (!topology.links.length) {
+            // A retired portal must not silently fall through to direct. This
+            // exact block is also the owned delta for delete -> recreate.
+            if (node.role === 'portal') config.routing.rules.push({ type: 'field',
+                inboundTag: clientInboundTags(nodeConfig), outboundTag: 'block' });
+            return config;
+        }
+        const link = topology.links[0];
+        if (link.tunnelSecurity === 'reality') {
+            const missing = ['realityDest', 'realityPrivateKey', 'realityPublicKey']
+                .filter(field => typeof link[field] !== 'string' || link[field].length === 0);
+            if (missing.length) throw new FrozenTopologyDeploymentPlanError('INCOMPLETE_REALITY_PARAMETERS',
+                `Reality link is missing required parameters: ${missing.join(', ')}`);
+        }
+        const configs = new Map(topology.nodes.map(value => [value.id, projectNodeConfig(value, value, value.role)]));
+        const projected = projectCascadeLink({ id: link.id, link, source: link.source, target: link.target },
+            0, link, configs, new Map([[link.id, ref]]));
+        if (node.role === 'portal') configGenerator.applyForwardChain(config, [projected], clientInboundTags(nodeConfig));
+        else configGenerator.applyForwardHopInbound(config, [projected]);
+        return config;
+    };
+    const profiles = new Map(pins.map(pin => {
+        const node = beforeNodes.get(pin.nodeId);
+        if (typeof node?.profileConfig !== 'string') mismatch();
+        return [pin.nodeId, parseGeneratedConfig(node.profileConfig)];
+    }));
+    const matches = (profile, expected) => {
+        const reserved = item => /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/.test(item.tag || '');
+        for (const section of ['inbounds', 'outbounds']) {
+            const actual = profile[section].filter(reserved), wanted = expected[section];
+            if (actual.length !== wanted.length || wanted.some(item => actual.filter(value => key(value) === key(item)).length !== 1)) return false;
+        }
+        if (profile.reverse?.portals?.length || profile.reverse?.bridges?.length) return false;
+        const owned = rule => /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/.test(rule.outboundTag || '')
+            || rule.inboundTag?.some(tag => /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/.test(tag))
+            || expected.routing.rules.some(value => key(value) === key(rule));
+        return key(profile.routing.rules.filter(owned)) === key(expected.routing.rules);
+    };
+    // Historical classic IDs and current native artifact IDs are both finite
+    // generator projections. Neither tag shape alone nor desired metadata is
+    // authority: every member/rule is checked against the verified readback.
+    const synthetic = link => `link-${createHash('sha256').update(`celerity-topology-link:${link.id}`).digest('hex').slice(0, 8)}`;
+    const oldLink = before.links[0];
+    const refs = oldLink ? [oldLink.id, synthetic(oldLink)] : [undefined];
+    const oldRef = refs.find(ref => pins.every(pin => matches(profiles.get(pin.nodeId), delta(before, beforeNodes.get(pin.nodeId), ref))));
+    if (oldLink && oldRef === undefined || !oldLink && !pins.every(pin => matches(profiles.get(pin.nodeId), delta(before, beforeNodes.get(pin.nodeId))))) mismatch();
+    const newLink = after.links[0];
+    const newRef = newLink && (newLink.id === oldLink?.id ? oldRef : synthetic(newLink));
+    const order = [...pins].sort((a, b) => (a.role === 'bridge' ? 0 : 1) - (b.role === 'bridge' ? 0 : 1));
+    const entries = after.links.map(link => ({ id: link.id, link, source: link.source, target: link.target }));
+    const result = order.map(pin => {
+        const node = nodes.get(pin.nodeId), profile = profiles.get(pin.nodeId);
+        const previous = delta(before, beforeNodes.get(pin.nodeId), oldRef);
+        const next = delta(after, node, newRef);
+        const config = preserveProfileConfig(JSON.stringify(profile), previous, next, []);
+        // Replace only the owned ordered rule block at its original position;
+        // MAIN base/client/API/policy and all unrelated routing stay unchanged.
+        const oldRules = new Set(previous.routing.rules.map(key));
+        let inserted = false;
+        config.routing = { ...profile.routing, rules: profile.routing.rules.flatMap(rule => {
+            if (!oldRules.has(key(rule))) return [rule];
+            if (inserted) return [];
+            inserted = true; return structuredClone(next.routing.rules);
+        }) };
+        if (!inserted) config.routing.rules.push(...structuredClone(next.routing.rules));
+        return candidateForNode({ nodeId: pin.nodeId, node, nodeRef: node.role,
+            profileTargetPin: pin, orderedLinks: entries, linkMetadataById: uniqueById(after.links, 'LINK_METADATA'), config,
+            previousListeningPorts: before.links.filter(link => link.target === pin.nodeId).map(link => assertPort(link.tunnelPort)) });
+    });
+    return deepFreeze({ schemaVersion: 1, mode: 'forward', ...(after.links.length ? {} : { staged: true }), nodes: result });
+}
+
 function composeFrozenTopologyDeploymentPlan({
     snapshot,
     nodeMetadata = [],
@@ -2045,6 +2144,7 @@ function composeFrozenTopologyDeploymentPlan({
     linkRefsById,
     baselineTopology,
     installedPath,
+    selectedOwnerPins,
     hopByHop = false,
 } = {}) {
     if (compiledTopology?.valid !== true || !Array.isArray(compiledTopology.relays)) {
@@ -2053,7 +2153,10 @@ function composeFrozenTopologyDeploymentPlan({
             'A valid compiled topology is required',
         );
     }
-    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot, installedPath);
+    if (baselineTopology !== undefined) return composeDescriptorTransition(baselineTopology, snapshot, installedPath, selectedOwnerPins);
+    if (selectedOwnerPins?.some(owner => owner && Object.hasOwn(owner, 'profileTargetPin'))) {
+        throw new FrozenTopologyDeploymentPlanError('TOPOLOGY_PROFILE_TARGET_INVALID', 'Imported targets require verified descriptors');
+    }
     const nodeMetadataById = uniqueById(nodeMetadata, 'NODE_METADATA');
     const linkMetadataById = uniqueById(linkMetadata, 'LINK_METADATA');
     const components = staged === true ? connectedSnapshots(snapshot) : [];
