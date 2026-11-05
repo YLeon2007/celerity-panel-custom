@@ -1870,6 +1870,10 @@ function matchedClassicConfigs(topology, refs) {
     const { legacyProfileArtifacts } = require('../../../services/topologyConfigTransfer');
     const key = value => JSON.stringify(canonicalize(value));
     for (const component of connectedSnapshots(topology)) {
+        // Forward MAIN imports require the separate selected-pin branch. The
+        // generic fallback may match classic reverse only; native forward
+        // profiles still pass the exact role-target artifact checks below.
+        if (component.links.some(link => link.mode === 'forward')) continue;
         if (!component.nodes.every(node => typeof node.profileConfig === 'string')) continue;
         for (const node of component.nodes) {
             let delta;

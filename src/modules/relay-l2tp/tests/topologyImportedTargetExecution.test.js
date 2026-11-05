@@ -248,7 +248,7 @@ test('store preEnroll keeps seven caller keys and explicitly selects private roo
     const { verifyImportedProfileTargetPin } = require('../services/topologyProfileTarget');
     const root = ownerRoot();
     assert.throws(() => verifyImportedProfileTargetPin({ owner: root, profileTargetPin: root.profileTargetPin, executionContext: TEST }),
-        { code: 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED' }, 'B1 remains the real qualification dependency');
+        { code: 'CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH' }, 'shape-only root lacks the required MAIN artifacts and key metadata');
     const { models, events } = modeledModels(root); let authority = 0;
     const store = new TopologyExecutionBindingStore({ executionContext: TEST, ...models,
         async withVerifiedAuthority() { authority++; } });

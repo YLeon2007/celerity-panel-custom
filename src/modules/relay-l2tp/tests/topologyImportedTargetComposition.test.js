@@ -1,6 +1,6 @@
 'use strict';
 // Pure internal composition inputs are MODELED, not public imported authority.
-// Reader qualification uses the real, still-closed verifier; never inject one.
+// Reader qualification uses the real verifier; never inject one.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash, randomUUID } = require('node:crypto');
@@ -120,7 +120,7 @@ test('materializer forwards selected owner carrier without hydrating mutable des
 });
 for (const [name, mutate] of [
     // Only modeled carrier inputs are supplied; the authority boundary below
-    // uses the real closed verifier instead of accepting this shape as proof.
+    // uses the real verifier instead of accepting this shape as proof.
     ['partial carrier', pins => pins.pop()], ['malformed-present pin', pins => { pins[1].profileTargetPin = null; }],
     ['different descriptor', pins => { pins[1].profileTargetPin.descriptorSha256 = 'f'.repeat(64); }],
     ['owner epoch drift', pins => { pins[1].generation = randomUUID(); }],
@@ -169,6 +169,35 @@ test('raw descriptor and desired metadata alone do not permit Bridge MAIN', () =
     const f = fixture();
     assert.throws(() => f.plan(f.topology, f.topology, []), { code: 'TOPOLOGY_PROFILE_BASELINE_MISMATCH' });
 });
+for (const security of ['none', 'reality']) {
+    test(`raw ${security}: no pin refuses baseline artifacts before profile preservation`, () => {
+        const f = fixture(security), original = copy(f.topology);
+        // Both an unchanged desired graph and a deletion must check the actual
+        // baseline; neither duplicate base tags nor desired placement is a guard.
+        for (const after of [f.topology, { nodes: [], links: [], groups: [] }]) {
+            assert.throws(() => f.plan(f.topology, after, []), {
+                code: 'TOPOLOGY_PROFILE_BASELINE_MISMATCH',
+                message: 'The verified profile does not match its owned cascade artifacts',
+            });
+        }
+        assert.deepEqual(f.topology, original);
+    });
+    test(`native ${security}: unpinned forward apply/replay/delete keeps role-default targets`, () => {
+        const f = fixture(security), native = copy(f.topology), empty = { nodes: [], links: [], groups: [] };
+        for (const node of native.nodes) delete node.profileConfig;
+        const first = f.plan(empty, native, []);
+        for (const node of native.nodes) node.profileConfig = Buffer.from(first.nodes.find(entry => entry.node === node.id).candidate.bytes).toString();
+        const replay = f.plan(native, native, []);
+        assert.deepEqual(replay.nodes.map(node => node.candidate), first.nodes.map(node => node.candidate));
+        const deleted = f.plan(native, empty, []);
+        for (const plan of [first, replay, deleted]) for (const node of plan.nodes) {
+            assert.equal(node.targetProfile, node.role === 'portal' ? 'xray-main' : 'xray-bridge');
+            assert.equal(Object.hasOwn(node, 'profileTargetPin'), false);
+        }
+        assert.ok(deleted.nodes.find(node => node.role === 'bridge').checks.some(check =>
+            check.type === 'port' && check.port === 25000 && check.expectedState === 'absent'));
+    });
+}
 // Real Mongoose queries/casting/projections over a disconnected modeled driver.
 // This is negative qualification, NOT seeded authority / public adoption.
 async function withOwnerDriver(rows, work) {
@@ -192,10 +221,12 @@ function reader(f) {
         CascadeLink: { find: () => query(links), findById: key => query(links.find(link => link._id === key) || null) } },
         CascadeTopologyState: { findOneAndUpdate() {} }, TopologyConfigOwner: Owner, TopologyOperation: {}, NodeOperationLock: {}, transactionRunner: async work => work({}) });
 }
-for (const [name, mutate] of [
+for (const [name, mutate, code = 'TOPOLOGY_LEGACY_IMPORT_MISMATCH'] of [
     ['missing pin', owner => { delete owner.profileTargetPin; }], ['malformed pin', owner => { owner.profileTargetPin = null; }],
     ['stale root', owner => { owner.originalSnapshot.unitSha256 = 'f'.repeat(64); }],
-    ['shape-only matching root while B1 recognizer remains closed', () => {}],
+    // Recognition now succeeds, but the independently owned SIDECAR below
+    // aliases the bridge's physical identity. This is not public adoption proof.
+    ['shape-only matching root with a physical-alias SIDECAR', () => {}, 'TOPOLOGY_PHYSICAL_NODE_ALIAS'],
 ]) test(`reader refuses ${name} instead of silently selecting an independent SIDECAR`, async () => {
     const f = fixture(); mutate(f.owners[0]);
     const rows = f.owners.map(owner => ({ ...owner, node: new mongoose.Types.ObjectId(owner.node) }));
@@ -203,7 +234,7 @@ for (const [name, mutate] of [
         originalSnapshot: { configSha256: sha('{"nonempty":"independent-sidecar"}') } });
     delete rows[2].legacyAppliedTopology; delete rows[2].profileTargetPin;
     await withOwnerDriver(rows, async reads => {
-        await assert.rejects(reader(f).readSelected({ scope: { kind: 'link.apply', linkId: id(10) }, executionContext: context }), { code: 'TOPOLOGY_LEGACY_IMPORT_MISMATCH' });
+        await assert.rejects(reader(f).readSelected({ scope: { kind: 'link.apply', linkId: id(10) }, executionContext: context }), { code });
         assert.ok(reads.length);
         assert.notEqual(reads[0].projection?.legacyAppliedTopology, 0);
         assert.notEqual(reads[0].projection?.profileTargetPin, 0);
