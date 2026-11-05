@@ -42,6 +42,42 @@ These are prerequisites for a later separately authorized deployment, not comman
 5. Require the actual selected reader to accept the entire component before normal admission. An already topology-owned nonempty profile without an imported snapshot cannot be blessed by updating a field: retain/refuse it, or restore/hand back via the existing protocol and make a fresh explicit adoption under the same external exclusion. No direct DB seeding.
 6. Only after all source/runtime and physical prerequisites are satisfied enable the ordinary existing execution path for those owners. No native-to-classic fallback. Import itself establishes neither tunnel health, complete routing nor Internet/PPP/REALITY client readiness.
 
+## Real-Mongo native control and pending forward acceptance
+
+`cascadeAnyOrderLegacyForwardInPlaceMongo.test.js` adds a separate real-Mongo
+acceptance harness. Select `--test-name-pattern='native positive'` to exercise
+only the currently supported **reverse/native-profile control**. It uses public
+`initializeClassic → adopt(legacyTopology) → preEnroll`, the real selected
+coordinator/materializer, durable operation claim, store, typed executor,
+path-rebased `runner.sh`, branded close/status proofs, atomic V2 settlement and
+a new repository read. A serial native control also exercises byte-no-op,
+public durable delete-to-empty and create-with-new-ID without re-enrollment.
+No owner, enrollment, binding or successful-operation authority is seeded;
+`allowUnprovenTestExecution` is false. Existing inventory/draft records alone
+are fixture inputs, not execution permission.
+
+The fixture independently initializes both profiles with nonempty config/unit
+bytes and active/enabled states. The real user-resync service consumes an
+independent accepted client-in inventory; the real PPP gate must find no PPP
+nodes. **External exclusion, SSH identity/transport, preinstalled runner,
+Xray validation/runtime-user effects, socket and systemd observations remain
+modeled.** Other-profile bytes/state/restart counts are checked throughout.
+This proves neither physical writer exclusion nor actual Xray, tunnel, client
+traffic or production readiness. Read-only access to the independent profile
+for modeled observations is not a service/config mutation.
+
+The same suite contains genuine `none` and REALITY forward-positive bodies for
+public import, in-place MAIN on the actual Bridge role, end-to-end target-pin
+continuity, apply/replay/no-op, delete-empty and new-ID recreation with the same
+owner generation/pin. **Those bodies are pending B1's public producer; they
+are not skipped-positive or expected-refusal acceptance.** Do not run/count
+them as green before integrating B1. `cascadeAnyOrderLegacyForwardInPlace.red.test.js`
+retains no-pin/cross-profile/arbitrary-override refusal controls separately;
+its greens do not prove forward import. This acceptance-only addition does
+not widen the V1 producer scope documented above or implement a physical
+controller. Source-run results and cleanup receipts belong to the acceptance
+handoff, not a claim of completed forward conversion.
+
 ## Compatible return to the previous owner
 
 Use unchanged public `handback({node, profile, generation: adopted.generation, proofRef})`.
