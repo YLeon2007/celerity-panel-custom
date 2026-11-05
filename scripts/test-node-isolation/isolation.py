@@ -367,7 +367,16 @@ class Host:
                           '--type=service,socket,timer,scope'])
         files = self.run(['/usr/bin/systemctl', 'list-unit-files', '--no-legend', '--no-pager',
                           '--type=service,socket,timer'])
-        names = {l.split()[0] for l in (units + files).splitlines() if l.split()}
+        loaded = {l.split()[0] for l in units.splitlines() if l.split()}
+        unit_files = {parts[0]: parts[1:] for l in files.splitlines()
+                      if (parts := l.split()) and UNIT.fullmatch(parts[0])}
+        # Uninstantiated template files are not runtime units: systemctl show
+        # rejects them. Retain their file-list columns as diagnostic observations,
+        # never invent an instance. Loaded names and concrete instances still
+        # require show; their fragment/drop-in pins are collected below as before.
+        templates = {u: fields for u, fields in unit_files.items()
+                     if u.count('@') == 1 and u.endswith(('@.service', '@.socket', '@.timer'))}
+        names = loaded | (unit_files.keys() - templates.keys())
         details = {u: self.unit(u) for u in sorted(names) if UNIT.fullmatch(u)}
         pins = {}
         for item in details.values():
@@ -386,7 +395,7 @@ class Host:
                     if f.is_file():
                         sched[str(f)] = digest(f.read_bytes())
         return {'diagnosticOnly': True, 'notAuthority': True, 'physicalObservation': self.physical(),
-                'processes': self.processes(), 'units': details, 'unitFilePins': pins,
+                'processes': self.processes(), 'units': details, 'unitFileTemplates': templates, 'unitFilePins': pins,
                 'schedulerFileDigests': sched, 'jobsPresent': bool(jobs.strip())}
 
     def check_ssh_runtime(self, p):

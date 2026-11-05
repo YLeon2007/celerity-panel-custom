@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from contextlib import contextmanager
+import subprocess
 import unittest
 from unittest.mock import patch
 import coordinated_capture as capture
@@ -137,5 +139,153 @@ class InventoryTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): capture.validate(broken)
                 broken=copy.deepcopy(config); broken['origin']['machineId']='f'*32
                 with self.assertRaisesRegex(RuntimeError,'COORDINATOR_SHARED_HOST_MISMATCH'): capture.validate(broken)
+
+class HostInventoryTests(unittest.TestCase):
+    # Exact failed show argv/stdout/stderr captured on BOTH hosts in wave61.
+    TEMPLATE = 'apport-coredump-hook@.service'
+    TEMPLATE_SHOW = ['/usr/bin/systemctl', 'show', '--no-pager',
+        '--property=Id,LoadState,ActiveState,SubState,UnitFileState,ControlGroup,MainPID,Job,FragmentPath,DropInPaths,KillMode,Triggers,TriggeredBy,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,User,Group',
+        '--', TEMPLATE]
+    TEMPLATE_STDERR = ('Failed to get properties: Unit name apport-coredump-hook@.service '
+                       'is neither a valid invocation ID nor unit name.\n')
+
+    @contextmanager
+    def host(self, units='', files='', shows=None, file_bytes=None, jobs=''):
+        # Only the systemd/proc/filesystem observations are modeled. Exercise the
+        # actual Host.run/unit/inventory/check_inventory and their refusal paths.
+        shows = shows or {}
+        file_bytes = file_bytes or {}
+        def run(argv, **kwargs):
+            self.assertEqual(argv[0], '/usr/bin/systemctl')
+            self.assertEqual(kwargs, {'env': m.CLEAN_ENV, 'stdin': subprocess.DEVNULL,
+                'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'timeout': 40})
+            if argv[1] == 'show':
+                if argv[-1] == self.TEMPLATE:
+                    self.assertEqual(argv, self.TEMPLATE_SHOW)
+                    return subprocess.CompletedProcess(argv, 1, b'', self.TEMPLATE_STDERR.encode())
+                self.assertIn(argv[-1], shows, 'unexpected unit observation')
+                reply = shows[argv[-1]]
+                if isinstance(reply, subprocess.CompletedProcess):
+                    return reply
+            else:
+                self.assertIn(argv[1], ('list-units', 'list-unit-files', 'list-jobs'))
+                reply = {'list-units': units, 'list-unit-files': files, 'list-jobs': jobs}[argv[1]]
+            return subprocess.CompletedProcess(argv, 0, reply.encode(), b'')
+        def path(value):
+            value = str(value)
+            return SimpleNamespace(is_file=lambda: value in file_bytes, is_dir=lambda: False,
+                                   read_bytes=lambda: file_bytes[value])
+        with patch.object(m.subprocess, 'run', side_effect=run) as execute, \
+             patch.object(m.pathlib, 'Path', side_effect=path), \
+             patch.object(m.Host, 'physical', return_value={'modeled': True}), \
+             patch.object(m.Host, 'processes', return_value=[]):
+            yield m.Host(), execute
+
+    def test_uninstantiated_template_file_is_diagnostic_not_a_live_unit(self):
+        # The listing row is modeled; the failed show response above is captured.
+        with self.host(files=self.TEMPLATE + ' static -\n') as (host, execute):
+            inventory = host.inventory()
+            self.assertEqual(inventory['units'], {})
+            self.assertEqual(inventory['unitFileTemplates'], {self.TEMPLATE: ['static', '-']})
+            self.assertEqual(inventory['unitFilePins'], {})
+            self.assertIs(inventory['diagnosticOnly'], True)
+            self.assertIs(inventory['notAuthority'], True)
+            self.assertNotIn('authority', inventory)
+            self.assertFalse(any(call.args[0][1] == 'show' for call in execute.call_args_list))
+            with self.assertRaises(m.Refusal):
+                m.validate_inventory(inventory)
+
+
+    def test_concrete_instance_retains_template_fragment_and_dropin_pins(self):
+        fragment = '/usr/lib/systemd/system/foo@.service'
+        dropin = '/etc/systemd/system/foo@.service.d/10-preserve.conf'
+        instance_dropin = '/etc/systemd/system/foo@bar.service.d/20-preserve.conf'
+        contents = {fragment: b'[Service]\nExecStart=/bin/true\n',
+                    dropin: b'[Service]\nRestart=no\n', instance_dropin: b'[Service]\nUser=nobody\n'}
+        reply = ('Id=foo@bar.service\nLoadState=loaded\nActiveState=active\n'
+                 f'FragmentPath={fragment}\nDropInPaths={dropin} {instance_dropin}\n')
+        for source in ('loaded', 'file-only'):
+            with self.subTest(source=source), self.host(
+                    units='foo@bar.service loaded active running Foo\n' if source == 'loaded' else '',
+                    files='foo@.service static -\nfoo@bar.service enabled enabled\n',
+                    shows={'foo@bar.service': reply}, file_bytes=contents) as (host, execute):
+                inventory = host.inventory()
+                self.assertEqual(inventory['units'], {'foo@bar.service': {
+                    'Id': 'foo@bar.service', 'LoadState': 'loaded', 'ActiveState': 'active',
+                    'FragmentPath': fragment, 'DropInPaths': dropin + ' ' + instance_dropin}})
+                self.assertEqual(inventory['unitFileTemplates'], {'foo@.service': ['static', '-']})
+                self.assertEqual(inventory['unitFilePins'], {p: m.digest(raw) for p, raw in contents.items()})
+                self.assertEqual([c.args[0][-1] for c in execute.call_args_list if c.args[0][1] == 'show'],
+                                 ['foo@bar.service'])
+
+    def test_uninstantiated_socket_and_timer_files_do_not_fabricate_runtime_states(self):
+        with self.host(files='foo@.socket disabled enabled\nfoo@.timer disabled -\n') as (host, _):
+            inventory = host.inventory()
+            self.assertEqual(inventory['units'], {})
+            self.assertEqual(inventory['unitFileTemplates'], {
+                'foo@.socket': ['disabled', 'enabled'], 'foo@.timer': ['disabled', '-']})
+
+    def test_concrete_unit_show_failure_is_still_fatal(self):
+        for name in ('broken.service', 'foo@bar.service'):
+            with self.subTest(name=name), self.host(files=self.TEMPLATE + ' static -\n' + name + ' enabled -\n',
+                    shows={name: subprocess.CompletedProcess([], 5, b'', b'arbitrary failure\n')}) as (host, execute):
+                with self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
+                    host.inventory()
+                self.assertEqual(execute.call_args_list[-1].args[0][-1], name)
+
+    def test_loaded_template_name_is_not_hidden_by_file_template_classification(self):
+        with self.host(units=self.TEMPLATE + ' loaded active running Unexpected\n',
+                       files=self.TEMPLATE + ' static -\n') as (host, execute):
+            with self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
+                host.inventory()
+            self.assertEqual(execute.call_args_list[-1].args[0], self.TEMPLATE_SHOW)
+
+    def test_malformed_name_handling_is_unchanged(self):
+        # Invalid UNIT names remain ignored; malformed names admitted by the
+        # existing grammar must still reach show and fail, not become templates.
+        invalid = ('../bad@.service', 'bad/name@.service', 'bad@.service;touch', r'bad\xZZ@.service')
+        with self.host(files=''.join(name + ' static -\n' for name in invalid)) as (host, execute):
+            inventory = host.inventory()
+            self.assertEqual(inventory['units'], {})
+            self.assertEqual(inventory['unitFileTemplates'], {})
+            self.assertFalse(any(c.args[0][1] == 'show' for c in execute.call_args_list))
+        for name in ('bad@@.service', 'bad@bar@.timer', 'bad@.scope'):
+            with self.subTest(name=name), self.host(files=name + ' static -\n',
+                    shows={name: subprocess.CompletedProcess([], 1, b'', b'invalid unit name\n')}) as (host, _):
+                with self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
+                    host.inventory()
+
+    def test_concrete_ssh_instance_still_requires_review(self):
+        with self.host(files='sshd@.service static -\nsshd@bar.service enabled -\n',
+                       shows={'sshd@bar.service': 'LoadState=loaded\nActiveState=active\n'}) as (host, _):
+            with self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_ACTIVATION_UNIT$'):
+                host.check_inventory(ti.PlanTests().plan())
+
+    def test_concrete_instance_template_file_pins_are_still_required_by_consumer(self):
+        plan = ti.PlanTests().plan()
+        fragment = '/usr/lib/systemd/system/foo@.service'
+        raw = b'[Service]\nExecStart=/bin/true\n'
+        shows = {u: 'LoadState=not-found\nActiveState=inactive\n' for u in plan['isolateUnits']}
+        shows['foo@bar.service'] = f'LoadState=loaded\nActiveState=active\nFragmentPath={fragment}\n'
+        with self.host(files='foo@.service static -\nfoo@bar.service enabled -\n',
+                       shows=shows, file_bytes={fragment: raw}) as (host, _):
+            with self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                host.check_inventory(plan)
+            plan['unitFilePins'][fragment] = m.digest(raw)
+            self.assertIn('foo@bar.service', host.check_inventory(plan)['units'])
+            plan['unitFilePins'][fragment] = '0' * 64
+            with self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                host.check_inventory(plan)
+
+    def test_inventory_list_command_failures_are_not_swallowed(self):
+        for command in ('list-units', 'list-unit-files', 'list-jobs'):
+            with self.subTest(command=command), self.host() as (host, _):
+                def run(argv, **kwargs):
+                    return subprocess.CompletedProcess(argv, 1 if argv[1] == command else 0,
+                                                       b'', b'arbitrary command failure\n')
+                with patch.object(m.subprocess, 'run', side_effect=run), \
+                     self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
+                    host.inventory()
+
 
 if __name__=='__main__': unittest.main()
