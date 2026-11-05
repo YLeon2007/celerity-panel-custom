@@ -1,0 +1,22 @@
+# Reverse manual-TLS ingress: private real-Xray subset
+
+TEST-only finite fixture, not PROD/full TLS or native-authority acceptance.
+
+Variants are exactly reverse G1 P→B, `groups:[]`:
+
+- `primary`: primary VLESS/TCP/manual TLS, reverse tunnel `none`;
+- `extra`: primary `none` plus extra VLESS/TCP/manual TLS, reverse tunnel `reality`.
+
+Selected profiles are **Portal MAIN / Bridge SIDECAR**. Both contain credentialed unrelated clients; **Portal SIDECAR / Bridge MAIN** are independent, nonempty, actually running traffic controls. No generated candidate is manually repaired.
+
+`launch.py --execute-local-fixture --variant primary|extra` freezes the committed source/harness, checks existing image IDs, memory reserves and nonoverlapping internal subnet, then uses only the designated private rootless Podman wrapper. Run `batch.py` inside a separate bounded `hermes-heavy-*` user scope (384MiB high / 512MiB max / zero swap / CPU100% / TasksMax256); endpoints have separate 192MiB/CPU50%/PIDs192 limits, runner 256MiB/CPU50%/PIDs96, Go concurrency2. No downloads/build/install/public ports/host sockets or namespaces. All new evidence is beneath `/home/leon/c3-anyorder-execution-20261104/manual-tls-xray-wave35/`.
+
+Fresh TEST-only SAN-bearing RSA certificate/key are created before initial descriptors/configs. TLS+Vision clients use only the private test trust, expected server name, system roots disabled; no insecure waiver. Each stage independently checks real TLS hostname/certificate validation and rejects wrong-name/untrusted controls. Certificate/key are retained inline and never reissued by adoption/apply. The REALITY tunnel uses the unchanged generator and actual authenticated data path, backed by a private TLS1.3/h2/X25519 destination.
+
+Actual public `initializeClassic/adopt` constructs ownership receipts/pins for all four profiles from real SSH config/unit/service bytes; only the selected profiles import the legacy descriptor. Accepted pin verifier, generator/compiler/materializer/composer, typed executor, host-key-pinned NodeSSH, unchanged runner, systemd and Xray are real. Local owner query/transactions, external maintenance/exclusion, bindings and image bootstrap/units are explicitly **synthetic**. There is no Mongo/HTTP/worker/native physical enrollment join and no terminal success injection/module-loader patch. The no-binding-reader executor must refuse before dispatch.
+
+Five stages: baseline before first apply; apply; a subsequent genuine byte-no-op; delete-to-empty; fresh ID/port/UUID recreate. Matrix has five probes/stage for primary, six for extra (also checks its plaintext primary). After each operation verify whole retained listeners/clients/TLS fields, policy/unrelated routing and byte-identical independent profiles. No-op additionally checks bytes/inode/PID/start/restarts. Delete preserves TLS ingress but blocks selected traffic without direct canary or old tunnel artifacts; recreate restores traffic over a new listener/identity. First apply can canonically rewrite/restart; no zero-downtime claim.
+
+`verify.py RUN...` independently checks exact matrix completeness, terminal receipts against raw response hashes, raw identity/nonce traffic against exit witness logs, candidate/client preservation, cert validation, binary/dependency pins and cleanup. Failed attempts remain separate. Finally cleanup is restricted to exact-owned container/network IDs with absence/PID-start/cgroup readback, preserving historical profiles and gateway. Known netavark/aardvark stop125 requires subsequent exact removal and verified absence, not a success assumption.
+
+Do not add a fake controller/Docker backend, reprobe the known unavailable native authority primitive, modify product/existing fixtures, or combine this real data-plane result with separate Mongo acceptance into full-native PASS. IDs are fixture inputs, not public-POST allocation. PPP, live certificates, public country egress, all permutations, broad suites, migrations and production remain outside scope.
