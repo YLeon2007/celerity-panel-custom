@@ -4,6 +4,7 @@ const { createHash } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
+const { resolveTopologyProfileTarget } = require('./topologyProfileTarget');
 
 const TOPOLOGY_RUNNER_PATH = '/usr/local/bin/celerity-topology-node-runner-v2';
 const TOPOLOGY_RUNNER_UPLOAD_PATH = '/usr/local/bin/.celerity-topology-node-runner-v2.upload';
@@ -167,12 +168,13 @@ function success(changed) {
 class TopologyRunnerBootstrapper {
     /** @type {TopologyRunnerNodeSSH} */
     #nodeSSH;
-    #role;
+    #targetProfile;
 
     // The caller must forward the authorized panel pair and the resolved/frozen
     // node role. Do not infer either from a transport facade or default to TEST.
     constructor(options) {
-        if (!hasExactKeys(options, ['hostIdentity', 'nodeSSH', 'role', 'target'])
+        if (!hasExactKeys(options, options && Object.hasOwn(options, 'profileTargetPin')
+            ? ['hostIdentity', 'nodeId', 'nodeSSH', 'profileTargetPin', 'role', 'target'] : ['hostIdentity', 'nodeSSH', 'role', 'target'])
             || !((options.target === 'test' && options.hostIdentity === 'test.infograd.online')
                 || (options.target === 'production' && options.hostIdentity === 'lm1.infograd.online'))
             || !['portal', 'relay', 'bridge'].includes(options.role)
@@ -183,7 +185,12 @@ class TopologyRunnerBootstrapper {
             throw new TopologyRunnerBootstrapperError();
         }
         this.#nodeSSH = options.nodeSSH;
-        this.#role = options.role;
+        try {
+            this.#targetProfile = Object.hasOwn(options, 'profileTargetPin')
+                ? resolveTopologyProfileTarget({ nodeId: options.nodeId, role: options.role,
+                    targetProfile: 'xray-main', profileTargetPin: options.profileTargetPin }).targetProfile
+                : options.role === 'portal' ? 'xray-main' : 'xray-bridge';
+        } catch { throw new TopologyRunnerBootstrapperError(); }
     }
 
     /** @returns {Promise<EnsureRunnerResult>} */
@@ -197,9 +204,9 @@ class TopologyRunnerBootstrapper {
                 throw new TopologyRunnerBootstrapperError();
             }
             // Decide ownership and reject incompatible units before even mkdir/upload.
-            const unitMissing = this.#role !== 'portal'
+            const unitMissing = this.#targetProfile === 'xray-bridge'
                 && !parseBridgeUnitInspection(await this.#nodeSSH.exec(INSPECT_BRIDGE_UNIT_COMMAND));
-            const dirsCommand = this.#role === 'portal'
+            const dirsCommand = this.#targetProfile === 'xray-main'
                 ? ENSURE_PORTAL_CONFIG_DIR_COMMAND : ENSURE_CONFIG_DIRS_COMMAND;
             if (!isSilentSuccess(await this.#nodeSSH.exec(dirsCommand))) {
                 throw new TopologyRunnerBootstrapperError();
@@ -241,6 +248,14 @@ class TopologyRunnerBootstrapper {
 // still-held server attestor may confirm the exact installed bytes and profile.
 async function withAttestedPreinstalledRunner(authority, challenge, work) {
     const unavailable = () => { throw new TopologyRunnerBootstrapperError(); };
+    try {
+        // Pure placement checking is not the installation/exclusion authority.
+        if (Object.hasOwn(challenge.binding, 'profileTargetPin')) {
+            resolveTopologyProfileTarget({ nodeId: challenge.binding.nodeId, role: challenge.role,
+                targetProfile: challenge.binding.targetProfile, profileTargetPin: challenge.binding.profileTargetPin });
+        } else if ((challenge.role === 'portal' ? 'xray-main' : ['relay', 'bridge'].includes(challenge.role) ? 'xray-bridge' : null)
+            !== challenge.binding.targetProfile) unavailable();
+    } catch { unavailable(); }
     if (typeof authority?.withVerifiedPreinstalledRunner !== 'function'
         || challenge.binding.executionContext !== 'test.infograd.online'
         || challenge.connection.expectedEndpoint.port !== 2222
@@ -256,8 +271,8 @@ async function withAttestedPreinstalledRunner(authority, challenge, work) {
                 mode: TOPOLOGY_RUNNER_MODE, owner: 'root', regularFile: true,
                 symlink: false, writableByRunner: false },
             profile: { targetProfile: challenge.binding.targetProfile, configDirectoryReady: true,
-                bridgeUnitSha256: challenge.role === 'portal' ? null : `sha256:${BRIDGE_UNIT_DIGEST}`,
-                bridgeUnitDropIns: challenge.role === 'portal' ? null : 'absent' },
+                bridgeUnitSha256: challenge.binding.targetProfile === 'xray-main' ? null : `sha256:${BRIDGE_UNIT_DIGEST}`,
+                bridgeUnitDropIns: challenge.binding.targetProfile === 'xray-main' ? null : 'absent' },
             writers: 'excluded',
         };
         if (typeof assertCurrent !== 'function') unavailable();

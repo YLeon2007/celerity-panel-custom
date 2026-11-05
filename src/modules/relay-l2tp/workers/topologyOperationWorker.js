@@ -4,6 +4,9 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { isDeepStrictEqual: same } = require('node:util');
+const { assertProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
+const { selectedAdmissionFingerprint } = require('../repositories/topologyOperationRepository');
 const { topologyExecutionContext, matchesTopologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { matchesTopologyOperationClaimBinding } = require('../domain/topologyOperationClaimBinding');
 
@@ -104,7 +107,12 @@ function validChecks(checks, target) {
 
 function durableNodePlan(metadata) {
     const node = entityId(metadata?.node);
-    const target = TARGET_BY_ROLE[metadata?.role];
+    let target;
+    try {
+        target = metadata && Object.hasOwn(metadata, 'profileTargetPin')
+            ? resolveTopologyProfileTarget({ nodeId: node, role: metadata.role,
+                targetProfile: metadata.targetProfile, profileTargetPin: metadata.profileTargetPin }) : TARGET_BY_ROLE[metadata?.role];
+    } catch { throw new TypeError('Invalid durable topology candidate'); }
     const state = metadata?.state;
     const backupId = metadata?.backupId;
     if (!SAFE_ID_PATTERN.test(node)
@@ -133,6 +141,7 @@ function durableNodePlan(metadata) {
         nodeRef: metadata.nodeRef,
         role: metadata.role,
         ...target,
+        ...(Object.hasOwn(metadata, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(metadata.profileTargetPin) } : {}),
         candidate,
         candidateHash: metadata.candidateHash,
         checks: metadata.checks.map(check => ({ ...check })),
@@ -155,6 +164,11 @@ function durablePlan(operation, operationId) {
     if (new Set(nodes.map(node => node.node)).size !== nodes.length) {
         throw new TypeError('Invalid durable topology operation');
     }
+    assertSelectedProfileTargets(operation);
+    if (nodes.some(node => Object.hasOwn(node, 'profileTargetPin'))
+        && operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)) {
+        throw new TypeError('Invalid durable topology admission fingerprint');
+    }
     if (operation.kind === 'link.attach'
         && (!SAFE_ID_PATTERN.test(operation.groupId)
             || !SAFE_ID_PATTERN.test(operation.pathKey)
@@ -170,6 +184,9 @@ function durablePlan(operation, operationId) {
             resourceNodeIds: [...operation.resourceNodeIds], kind: operation.kind,
             linkId: operation.linkId, routeState: operation.routeState,
             baselineTopology: operation.baselineTopology, effectiveTopology: operation.effectiveTopology,
+            ...(nodes.some(node => Object.hasOwn(node, 'profileTargetPin')) ? {
+                executionContext: { ...operation.executionContext }, selectedOwnerPins: structuredClone(operation.selectedOwnerPins),
+                linkIds: [...operation.linkIds], admissionFingerprint: operation.admissionFingerprint } : {}),
             ...(operation.installedPath ? { installedPath: operation.installedPath, ...operation.installedPath } : {}) } : {}),
         ...(operation.kind === 'link.attach' ? {
             kind: 'link.attach',
@@ -230,6 +247,10 @@ function matchesFrozenMetadata(operation, plan, nodes) {
     return operation.nodes.every((metadata, index) => (
         entityId(metadata.node) === entityId(nodes[index].node)
         && metadata.candidateHash === nodes[index].candidateHash
+        && (!(Object.hasOwn(metadata, 'profileTargetPin') || Object.hasOwn(nodes[index], 'profileTargetPin'))
+            || metadata.role === nodes[index].role && metadata.targetProfile === nodes[index].targetProfile
+                && Object.hasOwn(metadata, 'profileTargetPin') === Object.hasOwn(nodes[index], 'profileTargetPin')
+                && same(metadata.profileTargetPin, nodes[index].profileTargetPin))
     ));
 }
 
@@ -1229,6 +1250,11 @@ class TopologyOperationWorker {
             }
             let nodes;
             let entries;
+            if (operation.nodes?.some(node => Object.hasOwn(node, 'profileTargetPin'))
+                && (!this.#bindingLifecycle || !this.#retainExecutionOwnership)) {
+                return { claimed: true, operationId, stopped: true,
+                    errorCode: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+            }
             try {
                 plan = durablePlan(operation, operationId);
                 nodes = orderedPlanNodes(plan);
@@ -1339,6 +1365,7 @@ class TopologyOperationWorker {
                         await heartbeat.run(() => this.#bindingProvisioner.reserveBinding(Object.freeze({
                             executionContext: this.executionContext.hostIdentity, operationId, nodeId: node.node,
                             candidateHash, backupId, targetProfile: node.targetProfile,
+                            ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}),
                             topologyRevision: plan.topologyRevision, priorDeployedRevision: plan.priorDeployedRevision,
                             ...context.executionFence,
                         })));

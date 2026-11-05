@@ -1,6 +1,7 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
+const { resolveTopologyProfileTarget } = require('./topologyProfileTarget');
 
 const {
     TOPOLOGY_NODE_ARTIFACT_ID,
@@ -49,7 +50,8 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function isExactResolutionRequest(request) {
-    return hasExactKeys(request, ['nodeId', 'role'])
+    return hasExactKeys(request, request && Object.hasOwn(request, 'profileTargetPin')
+        ? ['nodeId', 'profileTargetPin', 'role'] : ['nodeId', 'role'])
         && typeof request.nodeId === 'string'
         && SAFE_ID_PATTERN.test(request.nodeId)
         && typeof request.role === 'string'
@@ -192,6 +194,13 @@ class TopologyNodeTransportFactory {
             throw new TopologyNodeTransportFactoryError();
         }
 
+        let targetProfile;
+        try {
+            targetProfile = Object.hasOwn(request, 'profileTargetPin')
+                ? resolveTopologyProfileTarget({ nodeId: request.nodeId, role: request.role,
+                    targetProfile: 'xray-main', profileTargetPin: request.profileTargetPin }).targetProfile
+                : TARGET_PROFILE_BY_ROLE[request.role];
+        } catch { throw new TopologyNodeTransportFactoryError(); }
         let nodeSSH;
         try {
             nodeSSH = await this.#nodeExecutionResolver.resolve({
@@ -210,7 +219,7 @@ class TopologyNodeTransportFactory {
                 invokeArtifact: createArtifactInvoker(nodeSSH, {
                     nodeId: request.nodeId,
                     executionContext: this.#executionContext,
-                    targetProfile: TARGET_PROFILE_BY_ROLE[request.role],
+                    targetProfile,
                 }),
             });
         } catch {

@@ -1,14 +1,54 @@
 'use strict';
 
 const { isDeepStrictEqual: same } = require('node:util');
-const { RECORD_KEYS, UUID, validTerminalReceipt, freeze } = require('../models/topologyExecutionBindingContract');
+const { recordKeysFor, exact, UUID, validTerminalReceipt, freeze } = require('../models/topologyExecutionBindingContract');
+const { assertProfileTargetPin, verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
+const { selectedAdmissionFingerprint } = require('./topologyOperationRepository');
 const { matchesTopologyOperationClaimBinding } = require('../domain/topologyOperationClaimBinding');
 const { topologyExecutionContext } = require('../domain/topologyExecutionContext');
 const { isTopologyTerminalProof } = require('../services/topologyOperationExecutor');
 const OPTIONS = { maxTimeMS: 5000, timeoutMS: 5000 };
 const DEADLINES = new WeakMap();
 function refused() { throw Object.assign(new Error('V2 terminal settlement unconfirmed'), { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' }); }
-function record(row) { return Object.fromEntries(RECORD_KEYS.map(key => [key, row?.[key]])); }
+function record(row) {
+    try {
+        return freeze(Object.fromEntries(recordKeysFor(row).map(key => [key, key === 'profileTargetPin'
+            ? assertProfileTargetPin(row[key]) : key === 'commandIds' ? { ...row[key] } : row?.[key]])));
+    } catch { refused(); }
+}
+function samePin(left, right) {
+    return left && right && Object.hasOwn(left, 'profileTargetPin') === Object.hasOwn(right, 'profileTargetPin')
+        && same(left.profileTargetPin, right.profileTargetPin);
+}
+function operationTargets(operation) {
+    try {
+        assertSelectedProfileTargets(operation);
+        if (operation.nodes?.some(node => Object.hasOwn(node, 'profileTargetPin'))
+            && operation.admissionFingerprint !== selectedAdmissionFingerprint(operation)) refused();
+    } catch { refused(); }
+}
+function checkedTargets(operation, binding, row, enrolled, owner) {
+    try {
+        if (!exact(binding, recordKeysFor(binding))) refused();
+        const nodes = operation.nodes.filter(node => String(node.node) === binding.nodeId);
+        if (nodes.length !== 1 || !samePin(nodes[0], binding) || !samePin(row, binding)
+            || !samePin(enrolled, binding) || !samePin(owner, binding)) refused();
+        const node = nodes[0];
+        resolveTopologyProfileTarget({ nodeId: binding.nodeId, role: node.role, targetProfile: node.targetProfile,
+            ...(Object.hasOwn(binding, 'profileTargetPin') ? { profileTargetPin: binding.profileTargetPin } : {}) });
+        if (operation.admissionScope === 'selected') {
+            const pins = operation.selectedOwnerPins?.filter(pin => String(pin.node) === binding.nodeId);
+            if (pins?.length !== 1 || !samePin(pins[0], binding)) refused();
+        }
+        if (Object.hasOwn(binding, 'profileTargetPin')) {
+            verifyImportedProfileTargetPin({ owner, profileTargetPin: binding.profileTargetPin, executionContext: operation.executionContext });
+            if (binding.profileTargetPin.ownerGeneration !== row.ownerGeneration
+                || row.ownerGeneration !== enrolled.ownerGeneration || row.ownerGeneration !== owner.generation) refused();
+        } else if (owner.legacyAppliedTopology?.links?.some(link => link.mode === 'forward')) refused();
+    } catch { refused(); }
+}
+const OWNER_PRIVATE_FIELDS = '+legacyAppliedTopology +profileTargetPin';
+const OPERATION_PRIVATE_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 function ownerFence(owner) {
     return { node: String(owner.node), profile: owner.profile, executionContext: owner.executionContext,
         owner: owner.owner, generation: owner.generation, nodeIdentity: owner.nodeIdentity,
@@ -49,8 +89,10 @@ function models(repository) {
         'TopologyExecutionBinding', 'TopologyExecutionEnrollment'].map(key => repository[key]);
     if (entries.some(model => !model?.db || model.db !== entries[0].db)) refused();
 }
-async function majority(model, filter) {
-    return model.findOne(filter).read('primary').readConcern('majority').setOptions(OPTIONS).lean();
+async function majority(model, filter, privateFields) {
+    const query = model.findOne(filter).read('primary').readConcern('majority').setOptions(OPTIONS);
+    if (privateFields) query.select(privateFields);
+    return query.lean();
 }
 function operationFilter(request) {
     return { _id: request.operationId, status: 'committing', heldTopologyAdmission: true,
@@ -59,7 +101,7 @@ function operationFilter(request) {
 }
 async function checked(repository, request, session, bindings) {
     models(repository);
-    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select('+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath').session(session).setOptions(OPTIONS).lean();
+    const operation = await repository.TopologyOperation.findOne(operationFilter(request)).select(OPERATION_PRIVATE_FIELDS).session(session).setOptions(OPTIONS).lean();
     const context = operation?.executionContext;
     if (!operation || !matchesTopologyOperationClaimBinding(operation, topologyExecutionContext(context?.target, context?.hostIdentity))
         || operation.status !== 'committing' || operation.heldTopologyAdmission !== true
@@ -69,6 +111,7 @@ async function checked(repository, request, session, bindings) {
         || !Number.isSafeInteger(operation.attempts) || operation.attempts < 1
         || !Array.isArray(bindings) || bindings.length !== operation.nodes?.length || !bindings.length
         || new Set(bindings.map(binding => binding.nodeId)).size !== bindings.length) refused();
+    operationTargets(operation);
     const topology = await repository.CascadeTopologyState.findById('singleton').session(session).setOptions(OPTIONS).lean();
     if (operation.admissionScope === 'selected') {
         if (!repository.selectedTopologyRepository || topology?.topologyAdmissionCount < 1
@@ -99,11 +142,12 @@ async function checked(repository, request, session, bindings) {
             || lock.generation !== binding.generation || lock.remoteUncertain !== true
             || !(lock.leaseUntil instanceof Date) || lock.leaseUntil <= new Date()) refused();
         const owner = await repository.TopologyConfigOwner.findOne({ node: binding.nodeId, profile: binding.targetProfile })
-            .session(session).setOptions(OPTIONS).lean();
+            .select(OWNER_PRIVATE_FIELDS).session(session).setOptions(OPTIONS).lean();
         if (!owner || !same(owner.executionContext, context) || owner.owner !== 'topology'
             || owner.generation !== row.ownerGeneration || !same(owner.nodeIdentity, row.nodeIdentity)
             || !owner.originalSnapshot || !owner.adoptionReceipt || owner.handbackReceipt !== undefined
             || owner.adoptionReceipt.toGeneration !== row.ownerGeneration) refused();
+        checkedTargets(operation, binding, row, enrolled, owner);
         // Exact row predicates below turn snapshot checks into write conflicts;
         // never delete a replacement/foreign generation, even after lease expiry.
         deadline = Math.min(deadline, lock.leaseUntil.getTime());
@@ -129,17 +173,23 @@ async function fence(repository, rows, session, settle) {
     }
 }
 async function begin(repository, request) {
+    let bindings;
+    try {
+        if (!Array.isArray(request.bindings) || request.bindings.some(binding => !exact(binding, recordKeysFor(binding)))) refused();
+        bindings = freeze(request.bindings.map(record));
+    } catch { refused(); }
     return once(repository, async session => {
-        const { operation, rows } = await checked(repository, request, session, request.bindings);
+        const { operation, rows } = await checked(repository, request, session, bindings);
         if (operation.v2Terminal !== undefined) refused();
         await fence(repository, rows, session, false);
-        const terminal = { bindings: request.bindings, ownerFences: rows.map(({ owner }) => ownerFence(owner)), proofs: [], state: 'closing' };
+        const terminal = { bindings, ownerFences: rows.map(({ owner }) => ownerFence(owner)), proofs: [], state: 'closing' };
         if ((await repository.TopologyOperation.updateOne({ ...operationFilter(request), v2Terminal: { $exists: false } },
             { $set: { v2Terminal: terminal } }, { session, ...OPTIONS, runValidators: true })).matchedCount !== 1) refused();
         return terminal;
     }, async terminal => {
-        const current = await majority(repository.TopologyOperation, operationFilter(request));
+        const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
         if (!same(current?.v2Terminal, terminal)) refused();
+        await confirmRoots(repository, current, terminal);
     });
 }
 async function fenceSideEffects(repository, operation, effects, session) {
@@ -201,7 +251,9 @@ async function persist(repository, request) {
             { $set: { v2Terminal: next } }, { session, ...OPTIONS, runValidators: true })).matchedCount !== 1) refused();
         return next;
     }, async terminal => {
-        if (!same((await majority(repository.TopologyOperation, operationFilter(request)))?.v2Terminal, terminal)) refused();
+        const current = await majority(repository.TopologyOperation, operationFilter(request), OPERATION_PRIVATE_FIELDS);
+        if (!same(current?.v2Terminal, terminal)) refused();
+        await confirmRoots(repository, current, terminal);
     });
 }
 async function settle(repository, request, publish) {
@@ -220,7 +272,7 @@ async function settle(repository, request, publish) {
         if (!finalized) refused();
         return { ...finalized, terminal, selected: operation.admissionScope === 'selected' };
     }, async result => {
-        const operation = await majority(repository.TopologyOperation, { _id: request.operationId });
+        const operation = await majority(repository.TopologyOperation, { _id: request.operationId }, OPERATION_PRIVATE_FIELDS);
         const topology = await majority(repository.CascadeTopologyState, { _id: 'singleton' });
         if (operation?.status !== 'succeeded' || operation.heldTopologyAdmission !== false
             || !same(operation.v2Terminal, result.terminal)
@@ -228,19 +280,23 @@ async function settle(repository, request, publish) {
             || (!result.selected && (topology?.topologyAdmissionCount !== 0 || topology.deployedRevision !== result.deployedRevision))) refused();
         for (const binding of result.terminal.bindings) {
             if (await majority(repository.NodeOperationLock, { node: binding.nodeId, generation: binding.generation })) refused();
-            const owner = await majority(repository.TopologyConfigOwner, { node: binding.nodeId, profile: binding.targetProfile });
+            const owner = await majority(repository.TopologyConfigOwner, { node: binding.nodeId, profile: binding.targetProfile }, OWNER_PRIVATE_FIELDS);
             if (owner?.owner !== 'topology' || owner.lastSettledOperation !== binding.operationId
                 || owner.lastSettledGeneration !== binding.generation || owner.lastSettledCloseId !== binding.commandIds.close) refused();
         }
+        await confirmRoots(repository, operation, result.terminal);
     });
 }
 async function probe(repository, operationId) {
     models(repository);
-    const operation = await majority(repository.TopologyOperation, { _id: operationId });
+    const operation = await majority(repository.TopologyOperation, { _id: operationId }, OPERATION_PRIVATE_FIELDS);
     if (!operation?.v2Terminal) return null;
     const terminal = operation.v2Terminal;
     if (!Array.isArray(terminal.bindings) || !terminal.bindings.length
-        || terminal.bindings.length !== operation.nodes?.length || !['closing', 'proven'].includes(terminal.state)) refused();
+        || terminal.bindings.length !== operation.nodes?.length
+        || new Set(terminal.bindings.map(binding => binding.nodeId)).size !== terminal.bindings.length
+        || !['closing', 'proven'].includes(terminal.state)) refused();
+    await confirmRoots(repository, operation, terminal);
     for (const [index, binding] of terminal.bindings.entries()) {
         const row = await majority(repository.TopologyExecutionBinding, { operationId, nodeId: binding.nodeId,
             targetProfile: binding.targetProfile });
@@ -256,6 +312,27 @@ async function probe(repository, operationId) {
     // Read-only recovery: no lease renewal/claim, remote bootstrap, new command
     // IDs, publication retry, rollback, release or admission decrement.
     return freeze({ operationId, status: operation.status, retained: operation.heldTopologyAdmission !== false,
-        terminal: structuredClone(operation.v2Terminal), nodes: operation.nodes.map(node => ({ nodeId: String(node.node), role: node.role })) });
+        terminal: structuredClone(operation.v2Terminal), nodes: operation.nodes.map(node => ({ nodeId: String(node.node), role: node.role,
+            ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}) })) });
+}
+async function confirmRoots(repository, operation, terminal) {
+    operationTargets(operation);
+    const owners = [];
+    for (const binding of terminal.bindings) {
+        const row = await majority(repository.TopologyExecutionBinding, { operationId: binding.operationId,
+            nodeId: binding.nodeId, targetProfile: binding.targetProfile });
+        if (!row || !same(record(row), binding)) refused();
+        const enrolled = await majority(repository.TopologyExecutionEnrollment, { _id: row.enrollmentId });
+        const owner = await majority(repository.TopologyConfigOwner, { node: binding.nodeId, profile: binding.targetProfile }, OWNER_PRIVATE_FIELDS);
+        if (!owner || !enrolled || ['nodeId', 'targetProfile', 'executionContext', 'bootId', 'maintenanceId', 'ownerGeneration'].some(key => enrolled[key] !== row[key])
+            || !same(enrolled.nodeIdentity, row.nodeIdentity) || !same(enrolled.endpoint, row.endpoint)
+            || owner.owner !== 'topology' || owner.generation !== row.ownerGeneration
+            || !same(owner.executionContext, operation.executionContext) || !same(owner.nodeIdentity, row.nodeIdentity)
+            || owner.handbackReceipt !== undefined || owner.adoptionReceipt?.toGeneration !== row.ownerGeneration
+            || owner.adoptionReceipt?.proofId !== row.ownerReceiptProofId) refused();
+        checkedTargets(operation, binding, row, enrolled, owner);
+        owners.push({ owner });
+    }
+    assertOwnerFences(terminal, owners);
 }
 module.exports = { begin, persist, settle, probe };

@@ -4,6 +4,7 @@ const {
     projectCanonicalXrayCandidate,
 } = require('../services/topologyXrayCandidate');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { assertProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
 const { topologyExecutionContext, matchesTopologyExecutionContext, matchesTopologyOperationExecutionContext } = require('../domain/topologyExecutionContext');
 const { topologyOperationClaimBindingFilter, matchesTopologyOperationClaimBinding } = require('../domain/topologyOperationClaimBinding');
 
@@ -63,6 +64,7 @@ const CLAIM_PROJECTION = Object.freeze({
     'nodes.nodeRef': 1,
     'nodes.role': 1,
     'nodes.targetProfile': 1,
+    'nodes.profileTargetPin': 1,
     'nodes.checks': 1,
     'nodes.state': 1,
     'nodes.candidateHash': 1,
@@ -112,7 +114,12 @@ function durableCandidate(candidate, candidateHash) {
 }
 
 function durableNodeMetadata(node) {
-    const target = TARGET_BY_ROLE[node?.role];
+    let target;
+    try {
+        target = node && Object.hasOwn(node, 'profileTargetPin')
+            ? resolveTopologyProfileTarget({ nodeId: operationId(node.node), role: node.role,
+                targetProfile: node.targetProfile, profileTargetPin: node.profileTargetPin }) : TARGET_BY_ROLE[node?.role];
+    } catch { throw new TypeError('Topology operation requires bound node metadata'); }
     if (!target
         || !validNodeRef(node.role, node.nodeRef)
         || node.targetProfile !== target.targetProfile
@@ -127,6 +134,7 @@ function durableNodeMetadata(node) {
         nodeRef: node.nodeRef,
         role: node.role,
         targetProfile: node.targetProfile,
+        ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}),
         checks: node.checks.map(check => ({ ...check })),
         state: 'pending',
         candidateHash: node.candidateHash,
@@ -206,7 +214,13 @@ function durableSelectedOperationScope({ admissionScope, resourceNodeIds, baseli
 function selectedAdmissionFingerprint(operation) {
     const canonical = value => Array.isArray(value) ? value.map(canonical)
         : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
-    const metadata = operation.nodes.map(node => ({ ...node, node: operationId(node.node), ...TARGET_BY_ROLE[node.role] })).map(durableNodeMetadata);
+    assertSelectedProfileTargets(operation);
+    // Native normalization is unchanged. Persisted nodes omit paths: restore
+    // only the fixed paths for a pin, never overwrite its placement from role.
+    const metadata = operation.nodes.map(node => ({ ...node, node: operationId(node.node),
+        ...(Object.hasOwn(node, 'profileTargetPin')
+            ? resolveTopologyProfileTarget({ nodeId: operationId(node.node), role: node.role,
+                targetProfile: node.targetProfile, profileTargetPin: node.profileTargetPin }) : TARGET_BY_ROLE[node.role]) })).map(durableNodeMetadata);
     const fields = ['executionContext', 'idempotencyKey', 'topologyRevision', 'priorDeployedRevision', 'kind',
         'linkId', 'linkIds', 'staged', 'admissionScope', 'resourceNodeIds', 'baselineTopology', 'effectiveTopology',
         'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath'];
@@ -306,6 +320,12 @@ class TopologyOperationRepository {
         const metadata = nodes.map(durableNodeMetadata);
         const selected = durableSelectedOperationScope({ admissionScope, resourceNodeIds,
             baselineTopology, effectiveTopology, kind, linkId, linkIds, nodes: metadata });
+        if (new Set(metadata.map(node => operationId(node.node))).size !== metadata.length) {
+            throw new TypeError('Topology operation requires unique physical nodes');
+        }
+        assertSelectedProfileTargets({ executionContext: context, admissionScope, resourceNodeIds,
+            baselineTopology, effectiveTopology, kind, linkId, linkIds, nodes: metadata,
+            selectedOwnerPins, installedPath, groupId, pathKey });
         if (heldTopologyAdmission === true || admissionFingerprint !== undefined) {
             if (session === undefined || heldTopologyAdmission !== true
                 || !/^[a-f0-9]{64}$/.test(admissionFingerprint)) {
@@ -345,6 +365,10 @@ class TopologyOperationRepository {
             leaseUntil: null,
             nodes: metadata,
         };
+        if (metadata.some(node => Object.hasOwn(node, 'profileTargetPin'))
+            && (heldTopologyAdmission !== true || admissionFingerprint !== selectedAdmissionFingerprint(document))) {
+            throw new TypeError('Imported topology operation requires its exact selected admission fingerprint');
+        }
         if (session === undefined) {
             throw new TypeError('Topology operation requires an active Mongo session');
         }

@@ -349,6 +349,8 @@ class TopologyOperationFinalizationRepository {
                     .session(session)
                     .lean();
                 if (!admission || (admission.v2Terminal && !settlementSession)
+                    || (!settlementSession && (admission.nodes?.some(node => Object.hasOwn(node, 'profileTargetPin'))
+                        || admission.selectedOwnerPins?.some(pin => Object.hasOwn(pin, 'profileTargetPin'))))
                     || (settlementSession && (session !== settlementSession || !session.inTransaction()
                         || admission.v2Terminal?.state !== 'proven'))) rejectFinalization();
                 const selected = admission.admissionScope === 'selected';

@@ -1,6 +1,9 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
+const { isDeepStrictEqual: same } = require('node:util');
+const { recordKeysFor, expectedKeysFor } = require('../models/topologyExecutionBindingContract');
+const { assertProfileTargetPin, resolveTopologyProfileTarget } = require('./topologyProfileTarget');
 
 const {
     TopologyNodeTransportFactory,
@@ -139,12 +142,18 @@ function projectFrozenNode(context, durableBackupId) {
         || !Number.isSafeInteger(context.priorDeployedRevision)
         || context.priorDeployedRevision < 0
         || !isDeepFrozen(context.node)
-        || !hasExactKeys(context.node, NODE_KEYS)) {
+        || !hasExactKeys(context.node, context.node && Object.hasOwn(context.node, 'profileTargetPin')
+            ? [...NODE_KEYS, 'profileTargetPin'].sort() : NODE_KEYS)) {
         throw invalidPlan();
     }
 
     const node = context.node;
-    const target = TARGET_BY_ROLE[node.role];
+    let target;
+    try {
+        target = Object.hasOwn(node, 'profileTargetPin')
+            ? resolveTopologyProfileTarget({ nodeId: node.node, role: node.role,
+                targetProfile: node.targetProfile, profileTargetPin: node.profileTargetPin }) : TARGET_BY_ROLE[node.role];
+    } catch { throw invalidPlan(); }
     if (!target
         || typeof node.node !== 'string'
         || !SAFE_ID_PATTERN.test(node.node)
@@ -179,6 +188,7 @@ function projectFrozenNode(context, durableBackupId) {
         nodeId: node.node,
         role: node.role,
         candidateHash,
+        ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}),
         backupId,
         targetProfile: node.targetProfile,
         checks: node.checks,
@@ -188,11 +198,7 @@ function projectFrozenNode(context, durableBackupId) {
 
 const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback', 'close']);
 const FENCE_KEYS = Object.freeze(['executionContext', 'attemptId', 'generation', 'predecessorGeneration']);
-const RECORD_KEYS = Object.freeze([
-    'operationId', 'nodeId', 'candidateHash', 'backupId', 'targetProfile',
-    'topologyRevision', 'priorDeployedRevision', 'owner', 'attempt',
-    ...FENCE_KEYS, 'commandIds', 'bootId', 'maintenanceId',
-].sort());
+
 const V2_RECEIPT_KEYS = Object.freeze([
     ...PUBLIC_RECEIPT_KEYS, ...FENCE_KEYS, 'commandId', 'protocolVersion',
     'completion', 'phase', 'terminal', 'terminalOutcome', 'ownershipRetained',
@@ -205,10 +211,15 @@ function unprovenBinding() {
     );
 }
 function sameRecord(left, right) {
-    return hasExactKeys(left, RECORD_KEYS) && RECORD_KEYS.every(key => key === 'commandIds'
-        ? hasExactKeys(left.commandIds, [...COMMANDS].sort())
-            && COMMANDS.every(command => left.commandIds[command] === right.commandIds[command])
-        : left[key] === right[key]);
+    try {
+        return hasExactKeys(left, recordKeys(left)) && hasExactKeys(right, recordKeys(right))
+            && hasExactKeys(left.commandIds, [...COMMANDS].sort())
+            && hasExactKeys(right.commandIds, [...COMMANDS].sort()) && same(left, right);
+    } catch { return false; }
+}
+function recordKeys(value) {
+    try { return [...recordKeysFor(value)].sort(); }
+    catch { throw unprovenBinding(); }
 }
 function validTrustedConnection(pin) {
     return hasExactKeys(pin, ['expectedEndpoint', 'expectedHostKeySha256'])
@@ -375,23 +386,23 @@ class TopologyOperationExecutor {
             candidateHash: binding.candidateHash, backupId: binding.backupId,
             targetProfile: binding.targetProfile,
             topologyRevision: context.topologyRevision,
+            ...(Object.hasOwn(binding, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(binding.profileTargetPin) } : {}),
             priorDeployedRevision: context.priorDeployedRevision,
             ...fence,
         });
         let durable;
         try { durable = await reader.readVerified(expected); }
         catch { throw unprovenBinding(); }
-        if (!hasExactKeys(durable, RECORD_KEYS) || !isDeepFrozen(durable)
-            || Object.entries(expected).some(([key, value]) => durable[key] !== value)
+        if (!hasExactKeys(durable, recordKeys(durable)) || !isDeepFrozen(durable)
+            || Object.hasOwn(expected, 'profileTargetPin') !== Object.hasOwn(durable, 'profileTargetPin')
+            || Object.entries(expected).some(([key, value]) => !same(durable[key], value))
             || !safeToken(durable.attemptId) || !safeToken(durable.predecessorGeneration)
             || !safeToken(durable.bootId) || !safeToken(durable.maintenanceId)
             || durable.generation === 'none' || durable.predecessorGeneration === durable.generation
             || !hasExactKeys(durable.commandIds, [...COMMANDS].sort())
             || !Object.values(durable.commandIds).every(safeToken)
             || new Set(Object.values(durable.commandIds)).size !== COMMANDS.length
-            || (previous && RECORD_KEYS.some(key => key === 'commandIds'
-                ? COMMANDS.some(command => durable.commandIds[command] !== previous.commandIds[command])
-                : durable[key] !== previous[key]))) throw unprovenBinding();
+            || (previous && !sameRecord(durable, previous))) throw unprovenBinding();
         let authority;
         try {
             // Separate server-authority capability: never synthesize trust from
@@ -440,6 +451,8 @@ class TopologyOperationExecutor {
                 target: this.#target,
                 hostIdentity: this.#hostIdentity,
                 role: binding.role,
+                ...(Object.hasOwn(binding, 'profileTargetPin') ? { nodeId: binding.nodeId,
+                    profileTargetPin: assertProfileTargetPin(binding.profileTargetPin) } : {}),
             });
             await bootstrapper.ensureRunner();
         }
@@ -452,6 +465,7 @@ class TopologyOperationExecutor {
         return factory.create({
             nodeId: binding.nodeId,
             role: binding.role,
+            ...(Object.hasOwn(binding, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(binding.profileTargetPin) } : {}),
         });
     }
 
@@ -550,7 +564,9 @@ class TopologyOperationExecutor {
             || projected.role !== state.binding.role
             || projected.candidateHash !== state.binding.candidateHash
             || projected.backupId !== state.binding.backupId
-            || projected.targetProfile !== state.binding.targetProfile) {
+            || projected.targetProfile !== state.binding.targetProfile
+            || Object.hasOwn(projected, 'profileTargetPin') !== Object.hasOwn(state.binding, 'profileTargetPin')
+            || !same(projected.profileTargetPin, state.binding.profileTargetPin)) {
             throw invalidPlan();
         }
         return state;
@@ -651,17 +667,23 @@ class TopologyOperationExecutor {
 
     // Recovery performs only the exact immutable close-ID status query. No
     // bootstrap/upload, close retry, lease claim, generation or ID allocation.
-    async probeTerminalBinding(durable, role = durable?.targetProfile === 'xray-main' ? 'portal' : undefined) {
-        if (!hasExactKeys(durable, RECORD_KEYS) || !isDeepFrozen(durable)
+    async probeTerminalBinding(durable, role = !Object.hasOwn(durable || {}, 'profileTargetPin') && durable?.targetProfile === 'xray-main' ? 'portal' : undefined) {
+        if (!hasExactKeys(durable, recordKeys(durable)) || !isDeepFrozen(durable)
             || durable.executionContext !== this.#hostIdentity
             || typeof this.#executionBindingReader?.withReadOnlyVerifiedBinding !== 'function') throw unprovenBinding();
-        const expectedKeys = RECORD_KEYS.filter(key => !['attemptId', 'predecessorGeneration', 'commandIds', 'bootId', 'maintenanceId'].includes(key));
+        try {
+            if (Object.hasOwn(durable, 'profileTargetPin')) {
+                resolveTopologyProfileTarget({ nodeId: durable.nodeId, role, targetProfile: durable.targetProfile,
+                    profileTargetPin: durable.profileTargetPin });
+            } else if (!(durable.targetProfile === 'xray-main' ? role === 'portal' : ['relay', 'bridge'].includes(role))) throw unprovenBinding();
+        } catch { throw unprovenBinding(); }
+        const expectedKeys = expectedKeysFor(durable);
         const expected = Object.freeze(Object.fromEntries(expectedKeys.map(key => [key, durable[key]])));
         return this.#executionBindingReader.withReadOnlyVerifiedBinding(expected, async (current, assertCurrent) => {
             if (!sameRecord(current, durable)) throw unprovenBinding();
             const authority = await this.#executionBindingReader.readVerifiedConnection(expected, current);
             if (!sameRecord(authority.binding, current) || !validTrustedConnection(authority.connection)) throw unprovenBinding();
-            if (!(durable.targetProfile === 'xray-main' ? role === 'portal' : ['relay', 'bridge'].includes(role))) throw unprovenBinding();
+
             const probe = async assertRunner => {
                 await assertRunner();
                 const nodeSSH = await this.#nodeExecutionResolver.resolve({ nodeId: durable.nodeId, role }, authority.connection);
@@ -670,7 +692,8 @@ class TopologyOperationExecutor {
                 if (!sameRecord(fresh.binding, current) || !validTrustedConnection(fresh.connection)
                     || !sameConnection(fresh.connection, authority.connection)) throw unprovenBinding();
                 const transport = await new this.#NodeTransportFactory({ executionContext: this.#hostIdentity,
-                    nodeExecutionResolver: { resolve: async () => nodeSSH } }).create({ nodeId: durable.nodeId, role });
+                    nodeExecutionResolver: { resolve: async () => nodeSSH } }).create({ nodeId: durable.nodeId, role,
+                    ...(Object.hasOwn(durable, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(durable.profileTargetPin) } : {}) });
                 await assertCurrent();
                 await assertRunner();
                 const proof = assertTerminalReceipt(await transport.status({ ...transportRequest({ ...durable, durable }, 'close'),

@@ -2,6 +2,8 @@
 
 const mongoose = require('mongoose');
 const { validNodeRef } = require('../services/topologyNodeRef');
+const { assertProfileTargetPin, assertSelectedProfileTargets, resolveTopologyProfileTarget } = require('../services/topologyProfileTarget');
+const { createProfileTargetPinSchema } = require('./topologyProfileTargetPinSchema');
 const { durableSelectedOperationScope } = require('../repositories/topologyOperationRepository');
 
 const OPERATION_STATUSES = [
@@ -100,6 +102,16 @@ const topologyNodeSchema = new mongoose.Schema({
         type: topologyCandidateSchema,
         required: true,
     },
+    profileTargetPin: { type: createProfileTargetPinSchema(), default: undefined, immutable: true,
+        set: assertProfileTargetPin,
+        validate(value) {
+            if (value === undefined) return true;
+            try {
+                resolveTopologyProfileTarget({ nodeId: String(this.node), role: this.role,
+                    targetProfile: this.targetProfile, profileTargetPin: value });
+                return true;
+            } catch { return false; }
+        } },
     backupId: { type: String, default: '', trim: true },
 }, { _id: false, strict: true });
 
@@ -204,6 +216,10 @@ const topologyOperationSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
+    assertSelectedProfileTargets(this);
+    if (new Set(this.nodes.map(node => String(node.node))).size !== this.nodes.length) {
+        throw new Error('Topology operation requires unique physical nodes');
+    }
     durableSelectedOperationScope({ admissionScope: this.admissionScope,
         resourceNodeIds: this.resourceNodeIds, baselineTopology: this.baselineTopology,
         effectiveTopology: this.effectiveTopology, kind: this.kind,
