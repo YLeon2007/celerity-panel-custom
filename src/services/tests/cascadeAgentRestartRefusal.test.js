@@ -42,7 +42,9 @@ function stubPortalDeployment(t, agentError) {
     t.mock.method(NodeSSH.prototype, 'exec', async command => {
         calls.execs.push(command);
         const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
-        return { code: 0, stdout: receipt ? `\n${receipt[0]}\n` : '', stderr: '' };
+        const baseline = command.includes('cat /usr/local/etc/xray/config.json')
+            ? JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } }) : '';
+        return { code: 0, stdout: baseline + (receipt ? `\n${receipt[0]}\n` : ''), stderr: '' };
     });
     t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
     t.mock.method(syncService, '_agentRequest', async (_node, method, path) => {
@@ -71,7 +73,8 @@ test('explicit cc-agent HTTP restart refusal never triggers SSH restart or repor
 
     assert.deepEqual(calls.agent, [['POST', '/restart']]);
     assert.equal(calls.uploads.length, 1, 'the earlier config upload is independent of the restart refusal');
-    assert.deepEqual(calls.execs, [], 'SSH must not override an explicit agent denial');
+    assert.equal(calls.execs.some(command => command.includes('systemctl')), false, 'SSH must not override an explicit agent denial');
+    assert.equal(calls.execs.length, 1, 'only the checked applied baseline read is allowed');
     assert.equal(calls.connections, 1, 'only the prior config upload may connect via SSH');
     assert.equal(result.success, false);
     assert.match(result.error, /HTTP 403/);
@@ -87,7 +90,8 @@ test('HTTP 423 refusal also propagates without an SSH restart', async t => {
     assert.deepEqual(calls.agent, [['POST', '/restart']]);
     assert.equal(calls.uploads.length, 1);
     assert.equal(calls.connections, 1);
-    assert.deepEqual(calls.execs, []);
+    assert.equal(calls.execs.length, 1);
+    assert.equal(calls.execs.some(command => command.includes('systemctl')), false);
 });
 
 test('agent transport failure propagates without SSH restart fallback', async t => {
@@ -97,7 +101,8 @@ test('agent transport failure propagates without SSH restart fallback', async t 
     assert.deepEqual(calls.agent, [['POST', '/restart']]);
     assert.equal(calls.uploads.length, 1);
     assert.equal(calls.connections, 1);
-    assert.deepEqual(calls.execs, []);
+    assert.equal(calls.execs.length, 1);
+    assert.equal(calls.execs.some(command => command.includes('systemctl')), false);
 });
 
 test('no-agent portal retains direct SSH restart', async t => {
@@ -108,7 +113,7 @@ test('no-agent portal retains direct SSH restart', async t => {
     assert.deepEqual(calls.agent, []);
     assert.equal(calls.uploads.length, 1);
     assert.equal(calls.connections, 2);
-    assert.equal(calls.execs.length, 1);
-    assert.match(calls.execs[0], /systemctl restart xray/);
-    assert.match(calls.execs[0], /C3_LEGACY_DONE_[a-f0-9]+/);
+    assert.equal(calls.execs.length, 2);
+    assert.match(calls.execs[1], /systemctl restart xray/);
+    assert.match(calls.execs[1], /C3_LEGACY_DONE_[a-f0-9]+/);
 });

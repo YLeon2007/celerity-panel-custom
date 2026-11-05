@@ -801,8 +801,9 @@ class CascadeService {
      * rebuilt from all active reverse links that share this bridge node.
      */
     async _deployReverseLink(link, portalNode, bridgeNode) {
-        await this._deployPortalConfig(portalNode);
-        await this._deployBridgeConfig(link, bridgeNode, portalNode);
+        const opts = { selectedLinkIds: [String(link._id)] };
+        await this._deployPortalConfig(portalNode, opts);
+        await this._deployBridgeConfig(link, bridgeNode, portalNode, opts);
         await this._openFirewallPort(portalNode, link.tunnelPort || 10086);
     }
 
@@ -813,7 +814,7 @@ class CascadeService {
     async _deployForwardLink(link, portalNode, bridgeNode) {
         await this._deployForwardHopConfig(bridgeNode, [link]);
         await this._openFirewallPort(bridgeNode, link.tunnelPort || 10086);
-        await this._deployPortalConfig(portalNode);
+        await this._deployPortalConfig(portalNode, { selectedLinkIds: [String(link._id)] });
     }
 
     /**
@@ -858,26 +859,12 @@ class CascadeService {
                 }
                 if (link.mode === 'forward' && bridgeNode.type === 'xray' && bridgeNode.active) {
                     await this._deployPortalConfig(bridgeNode, opts);
+                } else if (link.mode === 'forward') {
+                    await this._deployForwardHopConfig(bridgeNode, [], opts);
                 } else {
-                    const remainingLinks = await CascadeLink.find({
-                        bridgeNode: bridgeNode._id,
-                        active: true,
-                        mode: { $ne: 'forward' },
-                        _id: { $ne: link._id },
-                    }).populate('portalNode');
-
-                    if (remainingLinks.length > 0) {
-                        await this._deployBridgeConfig(remainingLinks[0], bridgeNode, remainingLinks[0].portalNode, opts);
-                    } else {
-                        const ssh = completionCheckedSSH(bridgeNode);
-                        try {
-                            await ssh.connect();
-                            await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
-                            logger.info(`[Cascade] Bridge service stopped on ${bridgeNode.name}`);
-                        } finally {
-                            ssh.disconnect();
-                        }
-                    }
+                    // Desired row counts are not installed-neighbor evidence.
+                    // The same checked profile selector decides rebuild vs stop.
+                    await this._deployBridgeConfig(link, bridgeNode, portalNode, opts);
                 }
                 return true;
             });
@@ -1218,31 +1205,43 @@ class CascadeService {
      * @param {Object} node - HyNode document
      * @param {Array} hopLinks - Array of CascadeLink documents for this node
      */
-    async _deployForwardHopConfig(node, hopLinks) {
+    async _deployForwardHopConfig(node, hopLinks, opts = {}) {
         return withClassicNodeConfigWrite({ nodeId: node._id, kind: '_deployForwardHopConfig' }, () =>
-            this.#deployForwardHopConfigUnfenced(node, hopLinks));
+            this.#deployForwardHopConfigUnfenced(node, hopLinks, opts));
     }
 
-    async #deployForwardHopConfigUnfenced(node, hopLinks) {
+    async #deployForwardHopConfigUnfenced(node, hopLinks, opts) {
         if (!node.ssh?.password && !node.ssh?.privateKey) {
             throw new Error(`Forward hop node ${node.name} has no SSH credentials`);
         }
 
         // Existing Xray server: cascade inbounds are added via _deployPortalConfig
         if (node.type === 'xray' && node.active && node.status !== 'error') {
-            return this._deployPortalConfig(node);
+            return this._deployPortalConfig(node, { selectedLinkIds: hopLinks.map(link => String(link._id)), ...opts });
         }
 
         // Standalone: generate combined config with all hop inbounds
-        const hopConfig = configGenerator.generateForwardHopConfig(hopLinks);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
         const ssh = completionCheckedSSH(node);
         try {
             await ssh.connect();
 
+            const { BRIDGE, readClassicProfile, selectClassicForwardHop } = require('./classicAppliedConfig');
+            const selectedLinkIds = hopLinks.map(link => String(link._id));
+            const current = await readClassicProfile(ssh, BRIDGE, { allowAbsent: selectedLinkIds.length > 0 });
+            const candidates = await CascadeLink.find({ bridgeNode: node._id, active: true, mode: 'forward' });
+            const selection = selectClassicForwardHop({ current, links: candidates, selectedLinkIds, ...opts });
+            const composed = selection.compose();
+            if (!selection.links.length && !composed.inbounds?.length) {
+                await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
+                return true;
+            }
+            const hopConfig = JSON.stringify(composed, null, 2);
+
             const xrayCheck = await ssh.exec('command -v xray');
             if (!xrayCheck.stdout || !xrayCheck.stdout.trim()) {
+                if (opts.requireCompletion) throw undeployUncertain('Legacy undeploy cannot join an Xray installer');
                 logger.info(`[Cascade] Installing Xray on forward-hop ${node.name}`);
                 await ssh.exec(
                     'curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install.sh ' +
@@ -1637,21 +1636,21 @@ class CascadeService {
                 .filter(Boolean),
         ];
 
-        if (reverseLinks.length > 0) {
+        if (allowedStatuses && reverseLinks.length > 0) {
             configGenerator.applyReversePortal(config, reverseLinks, inboundTags);
         }
-        if (forwardLinks.length > 0) {
+        if (allowedStatuses && forwardLinks.length > 0) {
             configGenerator.applyForwardChain(config, forwardLinks, inboundTags);
         }
 
         const forwardHopLinks = allBridgeLinks.filter(link => link.mode === 'forward');
         // This path is classic-owned; topology-owned nodes returned before
         // generation. Keep legacy forward listeners in the main config.
-        if (forwardHopLinks.length > 0) {
+        if (allowedStatuses && forwardHopLinks.length > 0) {
             configGenerator.applyForwardHopInbound(config, forwardHopLinks);
         }
 
-        await this._applyClassicL2tpPathIngress(config, portalNode, { mode: 'forward', ...opts });
+        if (allowedStatuses) await this._applyClassicL2tpPathIngress(config, portalNode, { mode: 'forward', ...opts });
 
         // geoip:private block must be the very last routing rule
         configGenerator.ensurePrivateIpBlock(config);
@@ -1666,7 +1665,21 @@ class CascadeService {
                 const configPath = portalNode.type === 'xray'
                     ? '/usr/local/etc/xray/config.json'
                     : (portalNode.paths?.config || '/etc/hysteria/config.yaml');
-                if (portalNode.type === 'xray' && portalNode.cascadeRole === 'relay') {
+                if (!allowedStatuses && portalNode.type === 'xray') {
+                    const { BRIDGE, readClassicProfile, selectClassicMain } = require('./classicAppliedConfig');
+                    const current = await readClassicProfile(ssh, configPath);
+                    // Recognition includes removed rows: cleanup needs their
+                    // exact old artifacts, not a status-based absence guess.
+                    const portalLinks = await CascadeLink.find({ portalNode: portalNode._id, active: true }).populate('bridgeNode');
+                    const hopLinks = await CascadeLink.find({ bridgeNode: portalNode._id, active: true }).populate('portalNode');
+                    const candidates = await CascadeLink.find({ mode: 'forward', active: true }).populate('bridgeNode');
+                    const bridgeCurrent = portalLinks.some(link => link.mode !== 'forward') && hopLinks.some(link => link.mode !== 'forward')
+                        ? await readClassicProfile(ssh, BRIDGE, { allowAbsent: true }) : null;
+                    const selection = selectClassicMain({ node: portalNode, current, bridgeCurrent, portalLinks, hopLinks,
+                        forwardLinks: candidates, ...opts });
+                    finalConfig = JSON.stringify(selection.compose(JSON.parse(configStr)), null, 2);
+                }
+                if (allowedStatuses && portalNode.type === 'xray' && portalNode.cascadeRole === 'relay') {
                     const RelayL2tpState = require('../modules/relay-l2tp/models/relayL2tpStateModel');
                     if (await RelayL2tpState.exists({ node: portalNode._id, desiredState: 'installed' })) {
                         const live = await ssh.exec('cat /usr/local/etc/xray/config.json');
@@ -1677,7 +1690,7 @@ class CascadeService {
                             || !current.inbounds.some(row => row.tag?.startsWith('relay-l2tp-'))) {
                             throw new Error('Installed L2TP Xray sections are unavailable');
                         }
-                        const merged = mergePreservedL2tpSections(config, current);
+                        const merged = mergePreservedL2tpSections(JSON.parse(finalConfig), current);
                         finishClassicConfigRouting(merged);
                         finalConfig = JSON.stringify(merged, null, 2);
                     }
@@ -1728,36 +1741,25 @@ class CascadeService {
             throw new Error(`Bridge node ${bridgeNode.name} has no SSH credentials`);
         }
 
-        // Check if this bridgeNode is also a portal for other links (i.e., it's a relay)
-        const excludeSet = new Set((opts.excludeLinkIds || []).map(String));
-        const downstreamLinks = (await CascadeLink.find({
-            portalNode: bridgeNode._id,
-            active: true,
-        })).filter(row => !excludeSet.has(String(row._id)));
-        const isRelay = downstreamLinks.length > 0;
-
-        let bridgeConfig;
-        if (isRelay) {
-            logger.info(`[Cascade] Node ${bridgeNode.name} is a RELAY (${downstreamLinks.length} downstream link(s))`);
-            bridgeConfig = configGenerator.generateRelayConfig(link, portalNode, downstreamLinks, [], opts.additionalUpstreams);
-            const relay = JSON.parse(bridgeConfig);
-            await this._applyClassicL2tpPathIngress(relay, bridgeNode, { mode: 'reverse', ...opts });
-            bridgeConfig = JSON.stringify(relay, null, 2);
-        } else {
-            const bridgeLinks = (await CascadeLink.find({
-                bridgeNode: bridgeNode._id,
-                active: true,
-                mode: { $ne: 'forward' },
-            }).populate('portalNode')).filter(row => !excludeSet.has(String(row._id)));
-            logger.info(`[Cascade] Node ${bridgeNode.name} is a BRIDGE (${bridgeLinks.length} reverse link(s))`);
-            bridgeConfig = configGenerator.generateCombinedBridgeConfig(bridgeLinks);
-        }
-
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
         const ssh = completionCheckedSSH(bridgeNode);
         try {
             await ssh.connect();
+
+            const { BRIDGE, readClassicProfile, selectClassicBridge } = require('./classicAppliedConfig');
+            const current = await readClassicProfile(ssh, BRIDGE, { allowAbsent: !!opts.selectedLinkIds?.length });
+            const candidates = await CascadeLink.find({ bridgeNode: bridgeNode._id, active: true, mode: { $ne: 'forward' } }).populate('portalNode');
+            const downstreamLinks = await CascadeLink.find({ portalNode: bridgeNode._id, active: true });
+            const selection = selectClassicBridge({ current, links: candidates, downstreamLinks,
+                allowEmpty: !!opts.excludeLinkIds?.length, ...opts });
+            const composed = selection.compose();
+            if (!selection.links.length && !composed.inbounds?.length) {
+                await ssh.exec('systemctl stop xray-bridge && systemctl disable xray-bridge');
+                return true;
+            }
+            const bridgeConfig = JSON.stringify(composed, null, 2);
+            const isRelay = !!composed.reverse?.portals?.length;
 
             // Ensure Xray is installed
             const xrayCheck = await ssh.exec('command -v xray');

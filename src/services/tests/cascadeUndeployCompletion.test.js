@@ -35,13 +35,20 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
     const state = { _id: 'singleton', revision: 7, deployedRevision: 5, replacementEpoch: 0,
         topologyAdmissionCount: 0, remoteAdmissionCount: 0 };
     const nodes = {
-        portal: { _id: '507f1f77bcf86cd799439011', name: 'portal', type: 'xray', active: true, ssh: { password: 'local-mock' } },
-        bridge: { _id: '507f1f77bcf86cd799439012', name: 'bridge', type: mode === 'forward' ? 'xray' : 'hysteria', active: true,
+        portal: { _id: '507f1f77bcf86cd799439011', ip: '192.0.2.1', name: 'portal', type: 'xray', active: true, ssh: { password: 'local-mock' } },
+        bridge: { _id: '507f1f77bcf86cd799439012', ip: '192.0.2.2', name: 'bridge', type: mode === 'forward' ? 'xray' : 'hysteria', active: true,
             ssh: { password: 'local-mock' } },
     };
-    const link = { _id: 'removed', name: 'removed', portalNode: 'portal', bridgeNode: 'bridge', mode };
+    const fields = { active: true, tunnelSecurity: 'none', tunnelTransport: 'tcp', tunnelPort: 11000,
+        tunnelUuid: '00000000-0000-4000-8000-000000000001' };
+    const link = { ...fields, _id: 'removed', name: 'removed', portalNode: 'portal', bridgeNode: 'bridge', mode };
     if (agent) for (const node of Object.values(nodes)) node.xray = { agentToken: 'local-only' };
-    const survivor = { _id: 'survivor', portalNode: nodes.portal, bridgeNode: 'bridge', mode: 'reverse' };
+    const survivor = { ...fields, _id: 'survivor', tunnelPort: 11001, portalNode: nodes.portal, bridgeNode: 'bridge', mode: 'reverse' };
+    const populated = row => ({ ...row, portalNode: nodes.portal });
+    // Completion tests have a concrete installed-profile readback too; never
+    // substitute empty stdout or '{}' for a trustworthy applied baseline.
+    const installedMain = JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } });
+    const installedBridge = generator.generateCombinedBridgeConfig([link, ...(remaining ? [survivor] : [])].map(populated));
     const calls = { commands: [], uploads: [], releases: 0, liveWriter: false, agent: 0, generatedLinks: [] };
     t.mock.method(State.db, 'transaction', async work => work({ localOnly: true }));
     t.mock.method(State, 'findById', () => query(state));
@@ -63,14 +70,15 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
     t.mock.method(Link, 'updateOne', async () => ({ acknowledged: true, matchedCount: 1 }));
     t.mock.method(Link, 'find', filter => {
         if (filter.bridgeNode === nodes.bridge?._id && filter.mode?.$ne === 'forward') {
-            return query(remaining ? (filter._id ? [survivor] : [link, survivor]) : []);
+            return query((filter._id ? remaining ? [survivor] : [] : [link, ...(remaining ? [survivor] : [])]).map(populated));
         }
         return query([]);
     });
     t.mock.method(sync, '_getUsersForNode', async () => []);
     t.mock.method(sync, '_agentRequest', async () => { calls.agent++; return { success: true }; });
     t.mock.method(generator, 'generateXrayConfigWithApi', () => JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } }));
-    t.mock.method(generator, 'generateCombinedBridgeConfig', links => { calls.generatedLinks = links.map(row => row._id); return '{}'; });
+    const generateCombined = generator.generateCombinedBridgeConfig;
+    t.mock.method(generator, 'generateCombinedBridgeConfig', links => { calls.generatedLinks = links.map(row => row._id); return generateCombined(links); });
     t.mock.method(generator, 'generateBridgeSystemdService', () => 'local unit');
     t.mock.method(cascade, '_invalidateTopologyCache', async () => {});
     const originalTimeout = global.setTimeout;
@@ -84,7 +92,9 @@ function fixture(t, { mode = 'reverse', remaining = false, fault = () => null, d
             if (failure === 'timeout') { calls.liveWriter = true; return; }
             setImmediate(() => {
                 const marker = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
-                const output = command.includes('command -v xray') ? '/usr/bin/xray\n'
+                const output = command.includes('cat /usr/local/etc/xray/config.json') ? installedMain
+                    : command.includes('cat /usr/local/etc/xray-bridge/config.json') ? installedBridge
+                    : command.includes('command -v xray') ? '/usr/bin/xray\n'
                     : command.includes('is-active xray-bridge') ? 'active\n' : '';
                 stream.emit('data', Buffer.from(output + (marker && failure !== 'missing-receipt' ? `\n${marker[0]}\n` : '')));
                 if (failure) calls.liveWriter = true;

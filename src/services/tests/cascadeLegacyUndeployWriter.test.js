@@ -60,9 +60,10 @@ test('ordinary dormant classic teardown retains checked stop/disable without opt
     assert.deepEqual(await f.cascade.undeployLink(f.links[0]), { success: true, remoteQuiescent: true });
     assert.equal(f.events.some(event => event.kind === 'acquire'), false);
     const commands = remote(f, f.nodes[1]._id).filter(event => event.kind === 'exec');
-    assert.equal(commands.length, 1);
-    assert.match(commands[0].command, /systemctl stop xray-bridge && systemctl disable xray-bridge/);
-    assert.match(commands[0].command, /C3_LEGACY_DONE_[a-f0-9]+/);
+    assert.equal(commands.length, 2);
+    assert.match(commands[0].command, /cat \/usr\/local\/etc\/xray-bridge\/config.json/);
+    assert.match(commands[1].command, /systemctl stop xray-bridge && systemctl disable xray-bridge/);
+    assert.ok(commands.every(row => /C3_LEGACY_DONE_[a-f0-9]+/.test(row.command)));
 }));
 
 for (const failure of ['nonzero', 'missing-exit', 'missing-stderr', 'missing-receipt', 'stale-receipt', 'timeout']) {
@@ -107,7 +108,7 @@ for (const guard of ['adopted', 'history', 'unreadable']) {
 
 test('bridge neighbor selection occurs inside the acquired writer scope', async () => withEnv({}, async () => {
     const f = fixture({ onFindLinks: ({ filter, locks }) => {
-        if (filter._id?.$ne) assert.equal(locks.get(String(filter.bridgeNode))?.remoteUncertain, true);
+        if (filter.bridgeNode && filter.mode?.$ne === 'forward') assert.equal(locks.get(String(filter.bridgeNode))?.remoteUncertain, true);
     } });
     assert.deepEqual(await f.cascade.undeployLink(f.links[0]), { success: true, remoteQuiescent: true });
     assert.equal(f.locks.size, 0);

@@ -193,8 +193,8 @@ function syncFixture(options = {}) {
         async connect() { events.push('connect'); }
         disconnect() { events.push('disconnect'); }
         async exec(command) {
-            events.push(command.startsWith('cat ') ? 'read' : 'exec');
-            return options.execResult || { code: 0, stdout: options.liveConfig || '' };
+            events.push(command.includes('cat /usr/local/etc/xray/config.json') ? 'read' : 'exec');
+            return options.execResult || { code: 0, stderr: '', stdout: options.liveConfig ?? JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } }) };
         }
         async uploadContent(content) {
             events.push('upload'); f.upload = content;
@@ -208,6 +208,7 @@ function syncFixture(options = {}) {
     loaded.require = id => {
         if (id === './classicNodeConfigWrite') return f;
         if (id === './classicL2tpConfigComposition') return Module.prototype.require.call(loaded, id);
+        if (id === './classicAppliedConfig') return Module.prototype.require.call(loaded, id);
         // This fixture has no cascade links/groups; the actual composition is
         // exercised by l2tpDefaultRootIntegration with persisted path records.
         if (id === './cascadeService') return { _applyClassicL2tpPathIngress: async config => config };
@@ -277,7 +278,9 @@ for (const options of [
     test(`sync retains uncertain lock on swallowed transport outcome ${JSON.stringify(options)}`, async () => {
         const f = syncFixture(options);
         if (options.agentError || options.reloadError) f.target.xray.agentToken = 'not-a-real-token';
-        await inEnabledEnv(async () => assert.equal(await f.sync.updateXrayNodeConfig(f.target), false));
+        await inEnabledEnv(async () => options.liveConfig === ''
+            ? assert.rejects(f.sync.updateXrayNodeConfig(f.target), { code: 'CLASSIC_APPLIED_BASELINE_UNAVAILABLE' })
+            : assert.equal(await f.sync.updateXrayNodeConfig(f.target), false));
         assert.equal(f.rows.size, 1);
         assert.equal(f.rows.get(NODE).remoteUncertain, true);
         assert.equal(f.events.includes('release'), false);
@@ -286,7 +289,7 @@ for (const options of [
 
 test('invalid live L2TP JSON must not authorize overwriting preserved sections', async () => {
     const f = syncFixture({ installed: true, liveConfig: 'not-json' });
-    await inEnabledEnv(async () => assert.equal(await f.sync.updateXrayNodeConfig(f.target), false));
+    await inEnabledEnv(async () => assert.rejects(f.sync.updateXrayNodeConfig(f.target), { code: 'CLASSIC_APPLIED_BASELINE_UNAVAILABLE' }));
     assert.equal(f.events.includes('upload'), false);
     assert.equal(f.events.includes('release'), false);
     assert.equal(f.rows.size, 1);

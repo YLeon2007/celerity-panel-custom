@@ -32,7 +32,7 @@ function link(n, source, target, fields = {}) {
         tunnelSecurity: 'none', tunnelTransport: 'tcp', tunnelDomain: 'reverse.tunnel.internal', priority: n, ...fields };
 }
 function fixture({ nodes = [node(1), node(2, 'bridge'), node(3), node(4, 'bridge')], links,
-    onExec, onOwnerRead, onFindLinks } = {}) {
+    onExec, onOwnerRead, onFindLinks, installedL2tp = false } = {}) {
     links ||= [link(10, nodes[0], nodes[1])];
     const locks = new Map(), owners = [], operations = [], events = [], files = new Map();
     const users = [{ userId: 'preserved-user', xrayUuid: '11111111-1111-4111-8111-111111111111' }];
@@ -96,7 +96,9 @@ function fixture({ nodes = [node(1), node(2, 'bridge'), node(3), node(4, 'bridge
             const overridden = await onExec?.({ node: this.node, command, locks, events });
             if (overridden !== undefined) return overridden;
             const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)?.[0];
-            const output = command.includes('command -v xray') ? '/usr/bin/xray\n'
+            const configPath = command.match(/cat (\/usr\/local\/etc\/xray(?:-bridge)?\/config\.json)/)?.[1];
+            const output = configPath ? files.get(key(this.node._id, configPath)) ?? 'C3_CLASSIC_PROFILE_ABSENT'
+                : command.includes('command -v xray') ? '/usr/bin/xray\n'
                 : command.includes('is-active xray-bridge') ? 'active\n' : '';
             return { code: 0, stdout: output + (receipt ? `\n${receipt}\n` : ''), stderr: '' };
         }
@@ -123,13 +125,13 @@ function fixture({ nodes = [node(1), node(2, 'bridge'), node(3), node(4, 'bridge
             if (request === './cacheService') return cache;
             if (request === './webhookService' || request === './nodeSetup') return {};
             if (request === './nodeSSH') return SSH;
-            if (['./cascadeService', './syncService', './configGenerator', './classicL2tpConfigComposition', './topologyConfigOwnership', './classicNodeConfigWrite'].includes(request)) return load(request.slice(2));
+            if (['./cascadeService', './syncService', './configGenerator', './classicAppliedConfig', './classicL2tpConfigComposition', './topologyConfigOwnership', './classicNodeConfigWrite'].includes(request)) return load(request.slice(2));
             if (request.endsWith('/nodeOperationLockModel')) return Lock;
             if (request.endsWith('/topologyOperationModel')) return { exists: filter => query(() => operations.find(sift(filter)) || null) };
             if (request.endsWith('/cascadeLinkModel')) return Link;
             if (request.endsWith('/hyNodeModel')) return Node;
             if (request.endsWith('/settingsModel') || request.endsWith('/hyUserModel')) return {};
-            if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => null };
+            if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => installedL2tp || null };
             if (request.endsWith('/cascadeRouteGroupModel')) return { find: () => query(() => []) };
             // The service's invocation is exercised, but global undeploy admission
             // has its own completion suite; this fixture owns local node fences.
@@ -142,6 +144,23 @@ function fixture({ nodes = [node(1), node(2, 'bridge'), node(3), node(4, 'bridge
     sync._getUsersForNode = async () => structuredClone(users);
     sync.checkXrayAgentHealth = async () => ({ online: true });
     sync._agentRequest = async () => { throw new Error('unexpected agent call'); };
+    // Existing controls model already installed classic profiles, not DB status
+    // as evidence. The pending-neighbor cases replace these with their narrower
+    // independently generated working-only readback before invoking the writer.
+    const generator = load('configGenerator');
+    for (const target of nodes) {
+        const outgoing = links.filter(link => link.active && link.portalNode === target._id)
+            .map(link => ({ ...link, bridgeNode: row(link.bridgeNode) }));
+        const incoming = links.filter(link => link.active && link.bridgeNode === target._id);
+        const main = JSON.parse(generator.generateXrayConfigWithApi(target, users));
+        if (!incoming.some(link => link.mode !== 'forward')) generator.applyReversePortal(main, outgoing.filter(link => link.mode !== 'forward'), ['clients']);
+        generator.applyForwardChain(main, outgoing.filter(link => link.mode === 'forward'), ['clients']);
+        generator.applyForwardHopInbound(main, incoming.filter(link => link.mode === 'forward'));
+        generator.ensurePrivateIpBlock(main);
+        files.set(key(target._id, MAIN), JSON.stringify(main));
+        const reverse = incoming.filter(link => link.mode !== 'forward').map(link => ({ ...link, portalNode: row(link.portalNode) }));
+        if (reverse.length) files.set(key(target._id, BRIDGE), generator.generateCombinedBridgeConfig(reverse));
+    }
     return { cascade, sync, fence, generator: load('configGenerator'), nodes, links, locks, owners, operations, users, events, files, key,
         adopt(nodeId, profile = 'xray-bridge') { owners.push({ node: nodeId, profile, executionContext: PROD,
             owner: 'topology', generation: randomUUID(), nodeIdentity: { machineId: '1'.repeat(32), sshHostKeySha256: '2'.repeat(64) } }); },

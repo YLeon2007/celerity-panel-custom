@@ -575,8 +575,19 @@ class SyncService {
                 // Apply cascade settings (reverse-portal + forward-chain + forward-hop inbounds)
                 try {
                     const CascadeLink = require('../models/cascadeLinkModel');
-                    // Drafts have not been deployed. Keep the old all-active
-                    // classic behavior when topology execution is disabled.
+                    if (!allowedStatuses) {
+                        const { MAIN, BRIDGE, readClassicProfile, selectClassicMain } = require('./classicAppliedConfig');
+                        const current = await readClassicProfile(ssh, MAIN);
+                        const portalLinks = await CascadeLink.find({ portalNode: node._id, active: true }).populate('bridgeNode');
+                        const hopLinks = await CascadeLink.find({ bridgeNode: node._id, active: true }).populate('portalNode');
+                        const forwardLinks = await CascadeLink.find({ mode: 'forward', active: true }).populate('bridgeNode');
+                        const bridgeCurrent = portalLinks.some(link => link.mode !== 'forward') && hopLinks.some(link => link.mode !== 'forward')
+                            ? await readClassicProfile(ssh, BRIDGE, { allowAbsent: true }) : null;
+                        const selection = selectClassicMain({ node, current, bridgeCurrent, portalLinks, hopLinks, forwardLinks });
+                        configContent = JSON.stringify(selection.compose(JSON.parse(configContent)), null, 2);
+                    } else {
+                    // Preserve the existing exact paired-TEST compatibility
+                    // policy; ordinary classic writers use installed bytes above.
                     const statusFilter = allowedStatuses ? { status: { $in: allowedStatuses } } : {};
                     const allPortalLinks = await CascadeLink.find({ portalNode: node._id, active: true, ...statusFilter }).populate('bridgeNode');
                     const allBridgeLinks = await CascadeLink.find({ bridgeNode: node._id, active: true, ...statusFilter });
@@ -626,8 +637,10 @@ class SyncService {
                         finishClassicConfigRouting(configObj);
                         configContent = JSON.stringify(configObj, null, 2);
                     }
+                    }
                 } catch (cascadeErr) {
-                    if (fenced) throw cascadeErr;
+                    // Never degrade an unknown baseline into a base-only push.
+                    if (!allowedStatuses || fenced) throw cascadeErr;
                     logger.warn(`[Xray Sync] Node ${node.name}: cascade apply skipped: ${cascadeErr.message}`);
                 }
 
@@ -640,7 +653,9 @@ class SyncService {
                         node: node._id,
                         desiredState: 'installed',
                     });
-                    if (hasInstalledL2tp) {
+                    // The checked classic baseline already retains all L2TP
+                    // sections. Re-merging them would duplicate routing rules.
+                    if (hasInstalledL2tp && allowedStatuses) {
                         const current = await ssh.exec('cat /usr/local/etc/xray/config.json 2>/dev/null || true');
                         if (fenced && !current?.stdout) throw new Error('CLASSIC_CONFIG_L2TP_READ_UNCERTAIN');
                         if (current?.stdout) {
@@ -702,7 +717,8 @@ class SyncService {
                     }
                 }
             } catch (error) {
-                if (fenced) return false;
+                if (error?.code?.startsWith('CLASSIC_APPLIED_')) throw error;
+                if (!allowedStatuses || fenced) return false;
                 logger.warn(`[Xray Sync] Node ${node.name}: config upload failed (SSH): ${error.message}`);
             } finally {
                 ssh.disconnect();

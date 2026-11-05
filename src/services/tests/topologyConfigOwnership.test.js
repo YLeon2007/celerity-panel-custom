@@ -49,6 +49,12 @@ function node(role = 'portal') {
 
 function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = [], operations = [], owners = [] } = {}) {
     const calls = { queries: [], updates: [], uploads: [], sshConnections: 0, agent: [], generated: 0, ownerReads: [] };
+    // Compatibility controls model installed artifacts, not status authority.
+    const installed = { inbounds: [], outbounds: [], routing: { rules: [] } };
+    configGenerator.applyReversePortal(installed, links.filter(row => row.portalNode === node()._id && row.mode !== 'forward'), ['vless-in']);
+    configGenerator.applyForwardChain(installed, links.filter(row => row.portalNode === node()._id && row.mode === 'forward'), ['vless-in']);
+    configGenerator.applyForwardHopInbound(installed, links.filter(row => row.bridgeNode === node()._id && row.mode === 'forward'));
+    const installedBytes = JSON.stringify(installed);
     // Actual helper/service/repository, local persistence seam only.
     const Lock = require('../../modules/relay-l2tp/models/nodeOperationLockModel');
     const locks = new Map();
@@ -104,7 +110,11 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
     t.mock.method(NodeSSH.prototype, 'connect', async () => { calls.sshConnections++; });
     t.mock.method(NodeSSH.prototype, 'disconnect', () => {});
     t.mock.method(NodeSSH.prototype, 'uploadContent', async (content, path) => { calls.uploads.push({ content, path }); });
-    t.mock.method(NodeSSH.prototype, 'exec', async () => ({ code: 0, stdout: '' }));
+    t.mock.method(NodeSSH.prototype, 'exec', async command => {
+        const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/)?.[0];
+        return { code: 0, stdout: (command.includes('cat /usr/local/etc/xray/config.json') ? installedBytes : '')
+            + (receipt ? `\n${receipt}\n` : ''), stderr: '' };
+    });
     t.mock.method(configGenerator, 'generateXrayConfigWithApi', () => {
         calls.generated++;
         return JSON.stringify({ inbounds: [], outbounds: [], routing: { rules: [] } });
@@ -207,7 +217,8 @@ test('legacy sync with a disabled topology flag still applies pending classic li
     const calls = stubSync(t, { links });
     const applied = [];
     for (const method of ['applyReversePortal', 'applyForwardChain', 'applyForwardHopInbound']) {
-        t.mock.method(configGenerator, method, () => { applied.push(method); });
+        const generate = configGenerator[method];
+        t.mock.method(configGenerator, method, (...args) => { applied.push(method); return generate(...args); });
     }
     await withFlags([true, true, false], async () => {
         assert.equal(await syncService.updateXrayNodeConfig(node()), true);

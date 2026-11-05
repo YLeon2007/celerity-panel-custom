@@ -229,9 +229,6 @@ async function reconcileNode(node, settings) {
             const completed = await withClassicNodeConfigWrite({ nodeId: fresh._id, kind: 'access-logs-bridge', env: writerEnv }, async () => {
                 const links = await readLinks();
                 if (links.length === 0) throw new Error('No active reverse links for bridge access logging');
-                const bridgeConfig = configGenerator.generateCombinedBridgeConfig(links, {
-                    accessLog: shouldShip ? accessLogPathForNode(fresh) : undefined,
-                });
                 const ssh = new NodeSSH(fresh);
                 let completionFailed = false;
                 // Check nested agent-config effects too. A swallowed transport
@@ -254,6 +251,14 @@ async function reconcileNode(node, settings) {
                 try {
                     await assertClassicNodeConfigWriteHeld(fresh._id);
                     await ssh.connect();
+                    const { BRIDGE, readClassicProfile, selectClassicBridge } = require('../classicAppliedConfig');
+                    const current = await readClassicProfile(ssh, BRIDGE);
+                    const downstreamLinks = await CascadeLink.find({ portalNode: fresh._id, active: true }).populate('bridgeNode');
+                    const selection = selectClassicBridge({ current, links, downstreamLinks });
+                    const config = selection.compose();
+                    if (shouldShip) (config.log ||= {}).access = accessLogPathForNode(fresh);
+                    else if (config.log) delete config.log.access;
+                    const bridgeConfig = JSON.stringify(config, null, 2);
                     await ssh.exec('mkdir -p /var/log/xray-bridge && chown nobody:nogroup /var/log/xray-bridge');
                     await ssh.uploadContent(bridgeConfig, '/usr/local/etc/xray-bridge/config.json');
                     await ssh.exec('chown root:root /usr/local/etc/xray-bridge/config.json && chmod 644 /usr/local/etc/xray-bridge/config.json && systemctl restart xray-bridge');
@@ -266,7 +271,7 @@ async function reconcileNode(node, settings) {
             if (completed !== true) throw new Error('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
         } else {
             const syncService = require('../syncService');
-            await syncService.updateXrayNodeConfig(fresh);
+            if (await syncService.updateXrayNodeConfig(fresh) !== true) throw new Error('CLASSIC_CONFIG_WRITE_OUTCOME_UNCERTAIN');
         }
 
         await HyNode.updateOne({ _id: node._id }, {

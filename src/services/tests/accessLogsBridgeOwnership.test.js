@@ -123,7 +123,10 @@ function fixture(options = {}) {
         async exec(command) {
             events.push({ type: 'exec', node: this.node._id, command });
             const configured = typeof options.execResult === 'function' ? options.execResult(command) : options.execResult;
-            return configured || { code: 0, stdout: '' };
+            const target = command.match(/cat (\/usr\/local\/etc\/xray(?:-bridge)?\/config\.json)/)?.[1];
+            // A read-only installed-file seam; do not fabricate a successful
+            // readback independently of the bytes the test put on the node.
+            return configured || { code: 0, stdout: target ? files.get(`${this.node._id}:${target}`) ?? 'C3_CLASSIC_PROFILE_ABSENT' : '', stderr: '' };
         }
     }
     stub('src/services/nodeSSH.js', SSH);
@@ -215,6 +218,7 @@ test('held foreign bridge generation survives background reconciliation while un
         delete legacy.status; return legacy;
     });
     f.links.push(...otherLinks);
+    f.files.set(`${OTHER}:${CONFIG}`, f.generator.generateCombinedBridgeConfig(otherLinks));
     const before = f.hashes();
     const result = await withEnv(ENV, () => f.provision.reconcileAll());
     assert.deepEqual(effects(f).filter(event => event.node === BRIDGE), [], 'foreign lock must prevent bridge dispatch');
@@ -438,6 +442,47 @@ test('classic disabled logging still applies through the shared fence without ch
         assert.equal(f.events.filter(event => event.type === 'release').length, 2);
         assert.equal(f.locks.size, 0);
     });
+});
+
+for (const status of ['pending', 'offline', 'error', undefined]) {
+    test(`access-log background rewrite preserves installed ${status} peers and excludes an absent save-only peer`, async () => {
+        const f = fixture({ nativeProfile: false });
+        f.links.forEach(row => { if (status === undefined) delete row.status; else row.status = status; });
+        const saved = { ...clone(f.links[0]), _id: '507f1f77bcf86cd799439039', status: 'pending', autoDeploy: false,
+            tunnelUuid: '00000000-0000-4000-8000-000000000099' };
+        f.links.push(saved);
+        const original = JSON.parse(f.files.get(`${BRIDGE}:${CONFIG}`));
+        const clients = { tag: 'retained-client', protocol: 'vless', port: 24443,
+            settings: { clients: [{ id: '00000000-0000-4000-8000-000000000007' }] },
+            streamSettings: { security: 'reality', realitySettings: { privateKey: 'dummy-private' } } };
+        original.inbounds = [clients];
+        f.files.set(`${BRIDGE}:${CONFIG}`, JSON.stringify(original));
+        const main = f.files.get(`${BRIDGE}:${MAIN}`);
+        const result = await withEnv(ENV, () => f.provision.reconcileNode(clone(f.nodes.get(BRIDGE)), f.settings));
+        assert.equal(result.status, 'active');
+        const after = JSON.parse(f.files.get(`${BRIDGE}:${CONFIG}`));
+        assert.deepEqual(after.inbounds, [clients]);
+        assert.deepEqual(after.reverse, original.reverse);
+        assert.deepEqual(after.outbounds, original.outbounds);
+        assert.deepEqual(after.routing, original.routing);
+        assert.equal(JSON.stringify(after).includes(saved.tunnelUuid), false);
+        assert.equal(f.files.get(`${BRIDGE}:${MAIN}`), main);
+        assert.equal(f.locks.size, 0);
+    });
+}
+
+test('access-log background rewrite refuses an unrecognized installed profile without publishing a fingerprint', async () => {
+    const f = fixture({ nativeProfile: false });
+    const original = JSON.parse(f.files.get(`${BRIDGE}:${CONFIG}`));
+    original.reverse.bridges.push({ tag: 'unknown-peer', domain: 'foreign.invalid' });
+    f.files.set(`${BRIDGE}:${CONFIG}`, JSON.stringify(original));
+    const before = f.hashes();
+    const result = await withEnv(ENV, () => f.provision.reconcileNode(clone(f.nodes.get(BRIDGE)), f.settings));
+    assert.equal(result.status, 'error');
+    assert.match(result.error, /CLASSIC_APPLIED_/);
+    assert.deepEqual(f.hashes(), before);
+    assert.equal(f.events.some(row => row.type === 'upload'), false);
+    assert.equal(f.nodes.get(BRIDGE).xray.accessLogs.appliedFingerprint, undefined);
 });
 
 test('PROD legacy selection remains fixed if the environment changes during ownership read', async () => {

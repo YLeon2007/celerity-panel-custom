@@ -15,6 +15,7 @@ const group = { _id: 'group', mode: 'reverse', paths: [{ pathKey: 'main', linkId
 const users = [{ userId: 'subscriber', xrayUuid: '00000000-0000-4000-8000-000000000001' }];
 const uploads = [];
 let live = '{}';
+let sidecar = null;
 let groups = [group];
 let links = [upstream, down];
 const query = rows => Object.assign(Promise.resolve(rows), { populate: () => query(rows), lean: async () => rows });
@@ -28,8 +29,15 @@ const matches = (row, filter) => Object.entries(filter).every(([key, value]) => 
 class SSH {
     async connect() {}
     disconnect() {}
-    async uploadContent(content, path) { uploads.push({ content, path }); }
+    async uploadContent(content, path) {
+        uploads.push({ content, path });
+        if (path === '/usr/local/etc/xray-bridge/config.json') sidecar = content;
+    }
     async exec(command) {
+        if (command.includes('cat /usr/local/etc/xray-bridge/config.json')) {
+            const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
+            return { code: 0, stdout: (sidecar ?? 'C3_CLASSIC_PROFILE_ABSENT') + (receipt ? '\n' + receipt[0] + '\n' : ''), stderr: '' };
+        }
         if (command.includes('cat /usr/local/etc/xray/config.json')) {
             const receipt = command.match(/C3_LEGACY_DONE_[a-f0-9]+/);
             return { code: 0, stdout: live + (receipt ? '\n' + receipt[0] + '\n' : ''), stderr: '' };
@@ -47,7 +55,7 @@ Module._load = function(request, parent, isMain) {
         if (request === '../models/hyUserModel' || request === '../models/settingsModel') return {};
         if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => true };
         if (request === './nodeSSH') return SSH;
-        if (request === './topologyConfigOwnership') return { usesTestTopologyConfig: () => false, topologyManagesNodeConfig: async () => false };
+        if (request === './topologyConfigOwnership') return { APPLIED_LINK_STATUSES: Object.freeze(['staged', 'deployed', 'online']), usesTestTopologyConfig: () => false, topologyManagesNodeConfig: async () => false };
         if (request === './cacheService' || request === './webhookService') return {};
         if (request === './nodeSetup') return {};
         if (request === '../utils/helpers') return { invalidateNodesCache: async () => {} };
@@ -59,7 +67,7 @@ Module._load = function(request, parent, isMain) {
         if (request.endsWith('/relayL2tpStateModel')) return { exists: async () => true };
         if (request === '../models/hyNodeModel' || request === '../models/settingsModel') return {};
         if (request === './nodeSSH') return SSH;
-        if (request === './topologyConfigOwnership') return { usesTestTopologyConfig: () => false, topologyManagesNodeConfig: async () => false };
+        if (request === './topologyConfigOwnership') return { APPLIED_LINK_STATUSES: Object.freeze(['staged', 'deployed', 'online']), usesTestTopologyConfig: () => false, topologyManagesNodeConfig: async () => false };
         if (request === './syncService') return { _getUsersForNode: async () => users };
         if (request === './cacheService' || request === './webhookService') return {};
         if (request === '../utils/logger') return { info() {}, warn() {}, error() {} };
@@ -86,7 +94,7 @@ test('classic portal regeneration preserves installed L2TP sections and subscrip
 });
 
 for (const writer of ['sync', 'cascade']) test(`${writer}: mixed transit relay leaves reverse listeners exclusively in sidecar and preserves ordinary main data`, async t => {
-    const prior = { links, groups, live };
+    const prior = { links, groups, live, sidecar };
     const node = { ...relay,
         outbounds: [{ name: 'operator', type: 'socks5', addr: '192.0.2.99:1080' }],
         aclRules: ['operator(all)'],
@@ -106,10 +114,15 @@ for (const writer of ['sync', 'cascade']) test(`${writer}: mixed transit relay l
         // survive regeneration or the preservation of the installed fragment.
         const old = JSON.parse(generator.generateXrayConfigWithApi(node, users, { fragments: [fragment] }));
         generator.applyReversePortal(old, [down, geo], ['vless-in', 'extra-vless']);
+        // These assertions concern already installed forward artifacts, not
+        // implicit deployment of desired-only neighbors during background Sync.
+        generator.applyForwardChain(old, [forwardOut], ['vless-in', 'extra-vless']);
+        generator.applyForwardHopInbound(old, [forwardIn]);
         live = JSON.stringify(old);
         t.mock.method(sync, '_getUsersForNode', async () => users);
         t.mock.method(sync, 'checkXrayAgentHealth', async () => ({ online: true }));
         const secondary = JSON.parse(generator.generateRelayConfig(upstream, upstream.portalNode, [down, geo], [], [{ link: { ...upstream, _id: 'up000002' }, portal: upstream.portalNode }]));
+        sidecar = JSON.stringify(secondary);
         const sidecarBefore = JSON.stringify(secondary);
         for (let repeat = 0; repeat < 2; repeat++) {
             uploads.length = 0;
@@ -134,11 +147,11 @@ for (const writer of ['sync', 'cascade']) test(`${writer}: mixed transit relay l
             assert.equal(secondary.reverse.bridges.length, 2, 'both transit upstreams remain');
             live = JSON.stringify(main);
         }
-    } finally { links = prior.links; groups = prior.groups; live = prior.live; }
+    } finally { links = prior.links; groups = prior.groups; live = prior.live; sidecar = prior.sidecar; }
 });
 
 for (const writer of ['sync', 'cascade']) test(`${writer}: actual upstream mode, not declared node role, determines reverse listener profile`, async t => {
-    const prior = { links, live };
+    const prior = { links, live, sidecar };
     const fragment = require('../../modules/relay-l2tp/services/l2tpXrayFragmentProvider').buildL2tpXrayFragment({
         plan: { relay: { controlPlaneIps: [relay.ip] }, group: { id: 'group' }, paths: [{ pathKey: 'main', healthy: true, outboundTag: 'cascade-main' }], selectedPathKey: 'main' },
         tags: { inbound: 'relay-l2tp-group', blockOutbound: 'block' }, tproxyPort: 12345,
@@ -150,11 +163,15 @@ for (const writer of ['sync', 'cascade']) test(`${writer}: actual upstream mode,
             for (const incoming of [null, { ...upstream, mode: 'forward' }, upstream, { ...upstream, mode: undefined }, { ...upstream, active: false }]) {
                 const node = { ...relay, cascadeRole: role };
                 links = [down, ...(incoming ? [incoming] : [])];
-                live = generator.generateXrayConfigWithApi(node, users, { fragments: [fragment] });
+                const installed = JSON.parse(generator.generateXrayConfigWithApi(node, users, { fragments: [fragment] }));
+                const reverseTransit = incoming?.active === true && incoming.mode !== 'forward';
+                if (!reverseTransit) generator.applyReversePortal(installed, [down], ['vless-in']);
+                if (incoming?.active && incoming.mode === 'forward') generator.applyForwardHopInbound(installed, [incoming]);
+                live = JSON.stringify(installed);
+                sidecar = reverseTransit ? generator.generateRelayConfig(incoming, incoming.portalNode, [down]) : null;
                 uploads.length = 0;
                 assert.equal(await (writer === 'sync' ? sync.updateXrayNodeConfig(node) : cascade._deployPortalConfig(node)), true);
                 const main = JSON.parse(uploads[0].content);
-                const reverseTransit = incoming?.active === true && incoming.mode !== 'forward';
                 assert.equal(main.inbounds.some(row => row.tag === 'bridge-conn-down0001'), !reverseTransit,
                     `${role}: only a real active reverse upstream transfers downstream listeners to sidecar`);
             }
@@ -162,12 +179,13 @@ for (const writer of ['sync', 'cascade']) test(`${writer}: actual upstream mode,
         if (writer === 'cascade') {
             links = [upstream, down];
             live = generator.generateXrayConfigWithApi(relay, users, { fragments: [fragment] });
+            sidecar = generator.generateRelayConfig(upstream, upstream.portalNode, [down]);
             uploads.length = 0;
             await cascade._deployPortalConfig(relay, { excludeLinkIds: [upstream._id] });
             assert(JSON.parse(uploads[0].content).inbounds.some(row => row.tag === 'bridge-conn-down0001'),
                 'removed upstream must not keep the remaining portal sidecar-owned');
         }
-    } finally { links = prior.links; live = prior.live; }
+    } finally { links = prior.links; live = prior.live; sidecar = prior.sidecar; }
 });
 
 test('classic forward main upload exposes its accepted path ingress without changing tunnel credentials', async () => {
@@ -180,7 +198,12 @@ test('classic forward main upload exposes its accepted path ingress without chan
             plan: { relay: { controlPlaneIps: [relay.ip] }, group: { id: 'group' }, paths: [{ pathKey: 'main', healthy: true, outboundTag: 'cascade-main' }], selectedPathKey: 'main' },
             tags: { inbound: 'relay-l2tp-group', blockOutbound: 'block' }, tproxyPort: 12345,
         });
-        live = generator.generateXrayConfigWithApi(relay, users, { fragments: [fragment] });
+        const installed = JSON.parse(generator.generateXrayConfigWithApi(relay, users, { fragments: [fragment] }));
+        generator.applyForwardChain(installed, links, ['vless-in']);
+        require('../classicL2tpConfigComposition').applyClassicL2tpPathIngress(installed, {
+            nodeId: relay._id, groups, links, mode: 'forward',
+        });
+        live = JSON.stringify(installed);
         uploads.length = 0;
         await cascade._deployPortalConfig(relay);
         const config = JSON.parse(uploads.find(row => row.path === '/usr/local/etc/xray/config.json').content);
@@ -201,6 +224,8 @@ test('installed L2TP with unreadable live sections refuses before upload', async
 });
 
 test('classic reverse relay and bridge deployment upload the selected SOCKS ingress using persisted tunnel UUID', async () => {
+    // The first actual writer installs the sidecar read by the second writer.
+    sidecar = null;
     for (const deploy of [
         () => cascade._deployRelayNode(relay, upstream, upstream.portalNode, [down]),
         () => cascade._deployBridgeConfig(upstream, relay, upstream.portalNode),
