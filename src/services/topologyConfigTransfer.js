@@ -36,15 +36,41 @@ function legacyAppliedTopology(input) {
     } catch { invalid(); }
     if (!topology.nodes.length || topology.nodes.length > 32 || !topology.links.length || topology.links.length > 64
         || Buffer.byteLength(JSON.stringify(topology)) > 4 * 1024 * 1024) invalid();
-    // V1 imports existing reverse classic layouts. Classic forward listeners can
-    // live in MAIN on a non-portal; guessing their profile would lose ownership.
-    // TLS generation can consult panel certificate files, so it is not part of
-    // this bounded, observation-only import. Installed policies need their own
-    // existing owner/path evidence, not a group copied from desired.
-    if (topology.groups.length || topology.links.some(link => link.mode !== 'reverse'
+    // Forward MAIN is a bounded, checked imported layout, never a global
+    // role-to-profile exception. Reverse imports retain their historical path.
+    const forward = topology.links.some(link => link.mode === 'forward');
+    if (forward) {
+        const [link] = topology.links;
+        const portal = topology.nodes.find(node => node.role === 'portal');
+        const bridge = topology.nodes.find(node => node.role === 'bridge');
+        const supportedClient = value => value && typeof value === 'object' && !Array.isArray(value)
+            && (value.security === undefined || ['none', 'reality'].includes(value.security))
+            && (value.protocol === undefined || value.protocol === 'vless')
+            && (value.transport === undefined || value.transport === 'tcp');
+        if (topology.groups.length || topology.nodes.length !== 2 || topology.links.length !== 1
+            || !portal || !bridge || portal.id === bridge.id || link.source !== portal.id || link.target !== bridge.id
+            || link.mode !== 'forward' || !Number.isSafeInteger(link.tunnelPort) || link.tunnelPort < 1 || link.tunnelPort > 65535
+            || (link.tunnelProtocol !== undefined && link.tunnelProtocol !== 'vless')
+            || (link.tunnelTransport !== undefined && link.tunnelTransport !== 'tcp')
+            || (link.tunnelSecurity !== undefined && !['none', 'reality'].includes(link.tunnelSecurity))
+            || topology.nodes.some(node => node.type !== 'xray' || node.active !== true || !supportedClient(node.xray === undefined ? {} : node.xray)
+                || (node.xray?.extraInbounds !== undefined && (!Array.isArray(node.xray.extraInbounds)
+                    || !node.xray.extraInbounds.every(supportedClient))))) invalid('CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED');
+        if (link.tunnelSecurity === 'reality' && ['realityPrivateKey', 'realityPublicKey', 'realityDest']
+            .some(key => typeof link[key] !== 'string' || !link[key])) invalid('CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH');
+        // MAIN's actual generator default is REALITY. Its empty-key fallback
+        // cannot qualify an observed client listener as a supported profile.
+        if (topology.nodes.some(node => [node.xray || {}, ...(node.xray?.extraInbounds || [])].some(inbound =>
+            inbound.security !== 'none' && (typeof inbound.realityPrivateKey !== 'string' || !inbound.realityPrivateKey)))) {
+            invalid('CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH');
+        }
+    }
+    // TLS can consult live certificate files; groups/installed paths and mixed
+    // legacy-forward graphs are not observation-only import contracts.
+    if (!forward && (topology.groups.length || topology.links.some(link => link.mode !== 'reverse'
         || !['none', 'reality'].includes(link.tunnelSecurity || 'none'))
         || topology.nodes.some(node => !['none', 'reality'].includes(node.xray?.security || 'none')
-            || node.xray?.extraInbounds?.some(inbound => !['none', 'reality'].includes(inbound.security || 'reality')))) {
+            || node.xray?.extraInbounds?.some(inbound => !['none', 'reality'].includes(inbound.security || 'reality'))))) {
         invalid('CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED');
     }
     for (const node of topology.nodes) {
@@ -66,7 +92,7 @@ function legacyAppliedTopology(input) {
             || (link.status !== undefined && !['online', 'deployed'].includes(link.status))) invalid();
         // Lifecycle is mutable desired state, not imported applied authority.
         if (link.lifecycle !== undefined) invalid();
-        delete link.status;
+        if (!forward) delete link.status;
     }
     const reached = new Set([topology.nodes[0].id]);
     for (let changed = true; changed;) {
@@ -96,7 +122,8 @@ function legacyProfileArtifacts(input, nodeId) {
     const incoming = links.filter(link => link.target === nodeId), outgoing = links.filter(link => link.source === nodeId);
     const current = JSON.parse(node.profileConfig);
     const generated = [];
-    if (node.role === 'portal') {
+    const forward = topology.links[0].mode === 'forward';
+    if (node.role === 'portal' || forward) {
         // Verify client listener/transport/key metadata too, without claiming
         // current runtime clients were generated from a mutable user catalog.
         const baseline = JSON.parse(generator.generateXrayConfig(metadata(node), []));
@@ -112,8 +139,12 @@ function legacyProfileArtifacts(input, nodeId) {
             }
         }
         const delta = { inbounds: [], outbounds: [], routing: { rules: [] } };
-        generator.applyReversePortal(delta, outgoing, [node.xray?.inboundTag || 'vless-in',
-            ...(node.xray?.extraInbounds || []).map(item => item.inboundTag).filter(Boolean)]);
+        const clientTags = [node.xray?.inboundTag || 'vless-in',
+            ...(node.xray?.extraInbounds || []).map(item => item.inboundTag).filter(Boolean)];
+        if (forward) {
+            if (node.role === 'portal') generator.applyForwardChain(delta, outgoing, clientTags);
+            else generator.applyForwardHopInbound(delta, incoming);
+        } else generator.applyReversePortal(delta, outgoing, clientTags);
         generated.push(delta);
     } else if (node.role === 'relay') {
         generated.push(JSON.parse(generator.generateRelayConfig(incoming[0], incoming[0].portalNode, outgoing)));
@@ -121,7 +152,8 @@ function legacyProfileArtifacts(input, nodeId) {
         generated.push(JSON.parse(generator.generateCombinedBridgeConfig(incoming)));
         if (incoming.length === 1) generated.push(JSON.parse(generator.generateBridgeConfig(incoming[0], incoming[0].portalNode)));
     }
-    const reserved = /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-in-)/;
+    const reserved = forward ? /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/
+        : /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-in-)/;
     const sections = config => [config.inbounds || [], config.outbounds || [], config.reverse?.portals || [],
         config.reverse?.bridges || [], config.routing.rules];
     const matched = generated.find(expected => {
@@ -130,12 +162,13 @@ function legacyProfileArtifacts(input, nodeId) {
         const owns = item => reserved.test(item.tag || '') || tags.has(item.tag);
         const ownsRule = item => tags.has(item.outboundTag) || tags.has(item.balancerTag)
             || item.inboundTag?.some(tag => tags.has(tag) || reserved.test(tag))
-            || reserved.test(item.outboundTag || '');
+            || reserved.test(item.outboundTag || '') || (forward && reserved.test(item.balancerTag || ''));
         for (let i = 0; i < 4; i++) {
             // A whole shared reverse profile must be represented, including
             // older generic bridge/tunnel tags; unknown reverse entries cannot
             // be classified as unrelated merely because their names differ.
             const actual = i >= 2 ? actualSections[i] : actualSections[i].filter(owns), wanted = expectedSections[i];
+            if (forward && !isDeepStrictEqual(actual, wanted)) return false;
             if (actual.length !== wanted.length
                 || wanted.some(item => actual.filter(value => isDeepStrictEqual(value, item)).length !== 1)) return false;
         }
@@ -143,6 +176,10 @@ function legacyProfileArtifacts(input, nodeId) {
         const actualRules = current.routing.rules.filter(ownsRule);
         const expectedRules = expected.routing.rules.filter(ownsRule);
         if (!isDeepStrictEqual(actualRules, expectedRules)) return false;
+        // Independent MAIN balancers are not tunnel artifacts. Reserved or
+        // tunnel-referencing ones cannot be reclassified as unrelated.
+        if (forward) return !(current.routing.balancers || []).some(item => reserved.test(item.tag || '')
+            || item.selector?.some(tag => reserved.test(tag) || tags.has(tag)));
         return isDeepStrictEqual(current.routing.balancers || [], expected.routing.balancers || []);
     });
     if (!matched) throw failure('CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH');
@@ -152,11 +189,14 @@ function legacyProfileArtifacts(input, nodeId) {
 function verifyLegacyAppliedProfile(input, { node, profile, originalSnapshot }) {
     const topology = legacyAppliedTopology(input);
     const descriptor = topology.nodes.find(item => item.id === node);
-    if (!descriptor || (descriptor.role === 'portal' ? 'xray-main' : 'xray-bridge') !== profile
+    const forward = topology.links[0].mode === 'forward';
+    if (!descriptor || (forward || descriptor.role === 'portal' ? 'xray-main' : 'xray-bridge') !== profile
         || createHash('sha256').update(descriptor.profileConfig).digest('hex') !== originalSnapshot?.configSha256) {
         throw failure('CONFIG_LEGACY_IMPORT_READBACK_MISMATCH');
     }
-    legacyProfileArtifacts(topology, node);
+    // A locally matching half never blesses an incomplete/forged peer inventory.
+    // Each peer's physical bytes still need its own independent public adoption.
+    for (const member of forward ? topology.nodes : [descriptor]) legacyProfileArtifacts(topology, member.id);
     return topology;
 }
 
@@ -260,6 +300,12 @@ class TopologyConfigTransfer {
                 fromGeneration: generation, toGeneration: binding.nextGeneration,
                 oldBackendInstanceId: proof.oldBackend.instanceId, oldPid: proof.oldBackend.pid,
                 oldProcessStartTime: proof.oldBackend.processStartTime, verifiedAt: new Date() };
+            const profileTargetPin = legacy?.links[0].mode === 'forward'
+                ? require('../modules/relay-l2tp/services/topologyProfileTarget').projectImportedProfileTargetPin({
+                    executionContext: this.executionContext, node, profile, nodeIdentity: row.nodeIdentity,
+                    owner: nextOwner, generation: binding.nextGeneration, originalSnapshot: readback,
+                    adoptionReceipt: receipt, legacyAppliedTopology: legacy,
+                }) : undefined;
             // External verification/remote reads NEVER run inside Mongo retry.
             await this.Model.db.transaction(async session => {
                 if (!scopeOpen) throw failure('CONFIG_TRANSFER_PROOF_INVALID');
@@ -267,12 +313,14 @@ class TopologyConfigTransfer {
                     ...(action === 'handback' ? { originalSnapshot: row.originalSnapshot, adoptionReceipt: row.adoptionReceipt } : {}) };
                 const fields = action === 'adopt'
                     ? { originalSnapshot: readback, adoptionReceipt: receipt,
-                        ...(legacy === undefined ? {} : { legacyAppliedTopology: legacy }) }
+                        ...(legacy === undefined ? {} : { legacyAppliedTopology: legacy }),
+                        ...(profileTargetPin === undefined ? {} : { profileTargetPin }) }
                     : { handbackReceipt: receipt };
                 const updated = await this.Model.findOneAndUpdate(fence,
                     { $set: { owner: nextOwner, generation: binding.nextGeneration, ...fields },
                         ...(action === 'adopt' ? { $unset: { handbackReceipt: 1,
-                            ...(legacy === undefined ? { legacyAppliedTopology: 1 } : {}) } } : {}) },
+                            ...(legacy === undefined ? { legacyAppliedTopology: 1 } : {}),
+                            ...(profileTargetPin === undefined ? { profileTargetPin: 1 } : {}) } } : {}) },
                     { session, new: true, runValidators: true });
                 if (!scopeOpen) throw failure('CONFIG_TRANSFER_PROOF_INVALID');
                 if (!updated) throw failure('CONFIG_OWNERSHIP_CONFLICT');
@@ -281,9 +329,18 @@ class TopologyConfigTransfer {
             // Preserve the old transfer projection/return protocol unless this
             // adoption is explicitly importing private profile descriptors.
             if (legacy !== undefined) confirmation = confirmation.select('+legacyAppliedTopology');
+            if (profileTargetPin !== undefined) confirmation = confirmation.select('+profileTargetPin');
             confirmed = await confirmation.read('primary').readConcern('majority').maxTimeMS(5000).lean();
             if (!confirmed || (legacy !== undefined && !isDeepStrictEqual(confirmed.legacyAppliedTopology, legacy))) {
                 throw failure('CONFIG_TRANSFER_UNCONFIRMED');
+            }
+            if (profileTargetPin !== undefined) {
+                try {
+                    const verified = require('../modules/relay-l2tp/services/topologyProfileTarget').verifyImportedProfileTargetPin({
+                        owner: confirmed, profileTargetPin, executionContext: this.executionContext,
+                    });
+                    if (!isDeepStrictEqual(verified, profileTargetPin)) throw failure('CONFIG_TRANSFER_UNCONFIRMED');
+                } catch { throw failure('CONFIG_TRANSFER_UNCONFIRMED'); }
             }
         };
         try {

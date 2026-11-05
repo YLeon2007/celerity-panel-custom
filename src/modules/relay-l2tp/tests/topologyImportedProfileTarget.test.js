@@ -42,6 +42,22 @@ function selected() {
         selectedOwnerPins: pins.map(p => ({ node: p.nodeId, profile: p.targetProfile, owner: 'topology',
             generation: p.ownerGeneration, executionContext: { ...TEST }, profileTargetPin: { ...p } })) };
 }
+// Qualification positives use the real classic generators/fixed verifier,
+// not the intentionally shape-only digest fixtures above.
+function qualifiedOwner() {
+    const root = owner(), descriptor = root.legacyAppliedTopology;
+    const generator = require('../../../services/configGenerator');
+    const link = { ...descriptor.links[0], _id: L, portalNode: descriptor.nodes[0], bridgeNode: descriptor.nodes[1] };
+    for (const node of descriptor.nodes) {
+        node.port = 24443;
+        const config = JSON.parse(generator.generateXrayConfig({ ...node, _id: node.id }, []));
+        if (node.role === 'portal') generator.applyForwardChain(config, [link], ['vless-in']);
+        else generator.applyForwardHopInbound(config, [link]);
+        node.profileConfig = JSON.stringify(config) + '\n';
+    }
+    root.originalSnapshot.configSha256 = sha(descriptor.nodes[1].profileConfig);
+    return root;
+}
 const invalid = fn => assert.throws(fn, { code: 'TOPOLOGY_PROFILE_TARGET_INVALID' });
 const stale = fn => assert.throws(fn, { code: 'TOPOLOGY_PROFILE_TARGET_STALE' });
 
@@ -181,11 +197,10 @@ test('serialization rejects type repair, unknown JSON values and noncanonical da
     }
 });
 
-test('full owner projector refuses unqualified roots and keeps the existing forward verifier dependency', () => {
-    const root = owner();
-    // Modeled shape only. No accepted/public forward producer exists in A0;
-    // the real current verifier must refuse even this structurally valid root.
-    assert.throws(() => helper().projectImportedProfileTargetPin(root), { code: 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED' });
+test('full owner projector qualifies classic forward bytes and still refuses unqualified roots', () => {
+    const root = qualifiedOwner();
+    assert.deepEqual(helper().projectImportedProfileTargetPin(root), { ...pin(), ...helper().importedProfileTargetDigests(root) });
+    assert.throws(() => helper().projectImportedProfileTargetPin(owner()), { code: 'CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH' });
     for (const change of [r => { r.owner = 'classic'; }, r => { r.handbackReceipt = null; },
         r => { r.adoptionReceipt.toGeneration = RUNNER; }, r => { r.node = P; },
         r => { r.profile = 'xray-bridge'; }, r => { r.legacyAppliedTopology.links[0].tunnelProtocol = ''; },
@@ -197,14 +212,15 @@ test('full owner projector refuses unqualified roots and keeps the existing forw
     }
 });
 
-test('public forward adoption remains closed for none/reality before any authority or model access', async () => {
+test('unsupported public forward layouts stay closed before authority or model access', async () => {
     const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
     let accessed = 0;
     const transfer = new TopologyConfigTransfer({ executionContext: TEST,
         withVerifiedMaintenance: async () => { accessed++; throw new Error('must not dispatch'); },
         TopologyConfigOwner: new Proxy({}, { get() { accessed++; throw new Error('must not access DB'); } }) });
-    for (const security of ['none', 'reality']) {
-        const descriptor = topology(); descriptor.links[0].tunnelSecurity = security;
+    for (const change of [t => { t.links[0].tunnelSecurity = 'tls'; }, t => { t.groups.push({ _id: L, paths: [] }); },
+        t => { t.links.push({ ...t.links[0], id: P, mode: 'reverse' }); }]) {
+        const descriptor = topology(); change(descriptor);
         await assert.rejects(transfer.adopt({ node: B, profile: 'xray-main', generation: RUNNER,
             proofRef: 'modeled-contract-only', legacyTopology: descriptor }), { code: 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED' });
     }
@@ -212,19 +228,18 @@ test('public forward adoption remains closed for none/reality before any authori
 });
 
 test('full pin verification requires saved pin and independent exact context; no caller verifier seam', () => {
-    const root = owner();
+    const root = qualifiedOwner();
     stale(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: pin(), executionContext: TEST }));
     invalid(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: null, executionContext: TEST }));
     root.profileTargetPin = { ...pin(), ...helper().importedProfileTargetDigests(root) };
     const target = root.profileTargetPin;
     stale(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: target, executionContext: { ...TEST, extra: true } }));
     stale(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: { ...target, descriptorSha256: 'd'.repeat(64) }, executionContext: TEST }));
-    assert.throws(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: target, executionContext: TEST }),
-        { code: 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED' });
+    assert.deepEqual(helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: target, executionContext: TEST }), target);
 });
 
-test('changed independent root is stale before the unsupported forward authority dependency', () => {
-    const root = owner(), target = { ...pin(), ...helper().importedProfileTargetDigests(root) };
+test('changed independent root is stale before exact forward artifact qualification', () => {
+    const root = qualifiedOwner(), target = { ...pin(), ...helper().importedProfileTargetDigests(root) };
     root.profileTargetPin = target;
     for (const change of [r => { r.originalSnapshot.unitSha256 = 'd'.repeat(64); },
         r => { r.nodeIdentity.machineId = 'd'.repeat(32); }, r => { r.adoptionReceipt.oldPid++; },
@@ -233,8 +248,7 @@ test('changed independent root is stale before the unsupported forward authority
         const changed = structuredClone(root); change(changed);
         stale(() => helper().verifyImportedProfileTargetPin({ owner: changed, profileTargetPin: target, executionContext: TEST }));
     }
-    assert.throws(() => helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: target, executionContext: TEST }),
-        { code: 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED' });
+    assert.deepEqual(helper().verifyImportedProfileTargetPin({ owner: root, profileTargetPin: target, executionContext: TEST }), target);
 });
 
 test('selected pure contract allows bounded apply/delete/recreate and does not constrain native graphs', () => {

@@ -221,7 +221,7 @@ for (const [name, mutate, code] of [
     ['different raw bytes', t => { t.nodes[1].profileConfig += '\n'; }, 'CONFIG_LEGACY_IMPORT_READBACK_MISMATCH'],
     ['pending inclusion', t => { t.links[0].status = 'pending'; }, 'CONFIG_LEGACY_IMPORT_INVALID'],
     ['inactive inclusion', t => { t.links[0].active = false; }, 'CONFIG_LEGACY_IMPORT_INVALID'],
-    ['classic forward MAIN layout', t => { t.links[0].mode = 'forward'; }, 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED'],
+    ['reverse bytes relabeled forward on SIDECAR', t => { t.links[0].mode = 'forward'; }, 'CONFIG_LEGACY_IMPORT_READBACK_MISMATCH'],
     ['TLS extra inbound with live certificate dependency', t => { t.nodes[0].xray.extraInbounds = [{ inboundTag: 'tls-extra', security: 'tls', tlsSource: 'panel' }]; }, 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED'],
     ['unobserved installed policy', t => { t.groups.push({ _id: id(50), paths: [{ linkIds: [id(10)], pathKey: 'unverified', enabled: true }] }); }, 'CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED'],
 ]) test(`import refuses ${name} before publishing topology ownership`, async () => {
