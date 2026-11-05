@@ -326,9 +326,21 @@ function settlementFixture(imported = false) {
             endpoint: { ip: '192.0.2.2', port: 22, username: 'synthetic' }, ownerGeneration: EPOCH,
             ...(imported ? { profileTargetPin: owner.profileTargetPin } : {}) };
         const enrollmentId = randomUUID();
-        tables.TopologyExecutionEnrollment.push({ _id: enrollmentId, ...common });
-        tables.TopologyExecutionBinding.push({ _id: randomUUID(), ...common, ...binding, enrollmentId,
-            ownerReceiptProofId: owner.adoptionReceipt.proofId });
+        // Use the actual strict immutable schemas, not a synthetic receipt alias.
+        // proofId belongs to external execution enrollment/binding authority;
+        // the independently adopted owner's receipt is fenced by ownerFences.
+        const Enrollment = require('../models/topologyExecutionEnrollmentModel');
+        const Binding = require('../models/topologyExecutionBindingModel');
+        const enrolled = new Enrollment({ _id: enrollmentId, ...common,
+            predecessorGeneration: binding.predecessorGeneration, proofId: randomUUID() });
+        const durable = new Binding({ ...enrolled.toObject(), ...binding, _id: randomUUID(), enrollmentId,
+            commandTokens: Object.values(binding.commandIds) });
+        assert.ifError(enrolled.validateSync()); assert.ifError(durable.validateSync());
+        assert.equal(Binding.schema.path('ownerReceiptProofId'), undefined);
+        assert.equal(Object.hasOwn(durable.toObject(), 'ownerReceiptProofId'), false);
+        assert.notEqual(durable.proofId, owner.adoptionReceipt.proofId);
+        tables.TopologyExecutionEnrollment.push(enrolled.toObject());
+        tables.TopologyExecutionBinding.push(durable.toObject());
         tables.TopologyConfigOwner.push(owner);
         tables.NodeOperationLock.push({ node: new ObjectId(metadata.node), operationId: O,
             owner: 'worker', generation: RUNNER, remoteUncertain: true, leaseUntil: operation.leaseUntil });

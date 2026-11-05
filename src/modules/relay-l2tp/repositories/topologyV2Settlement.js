@@ -328,8 +328,9 @@ async function confirmRoots(repository, operation, terminal) {
             || !same(enrolled.nodeIdentity, row.nodeIdentity) || !same(enrolled.endpoint, row.endpoint)
             || owner.owner !== 'topology' || owner.generation !== row.ownerGeneration
             || !same(owner.executionContext, operation.executionContext) || !same(owner.nodeIdentity, row.nodeIdentity)
-            || owner.handbackReceipt !== undefined || owner.adoptionReceipt?.toGeneration !== row.ownerGeneration
-            || owner.adoptionReceipt?.proofId !== row.ownerReceiptProofId) refused();
+            || owner.handbackReceipt !== undefined || owner.adoptionReceipt?.toGeneration !== row.ownerGeneration) refused();
+        // The complete adoption receipt/snapshot are bound by ownerFences below.
+        // row.proofId is separate external execution authority, not adoption proof.
         checkedTargets(operation, binding, row, enrolled, owner);
         owners.push({ owner });
     }

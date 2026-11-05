@@ -1150,6 +1150,43 @@ test('assembled TEST worker uses real Mongo finalizer and real runner while PROD
     });
 });
 
+test('V2 native persisted receipt contracts preserve distinct proof authorities and refuse owner root drift', async t => {
+    for (const drift of ['unchanged', 'adoption-proof', 'original-snapshot']) await t.test(drift, async t => {
+        const f = await settlementPrepared(t);
+        const durable = await models.Binding.findOne().lean();
+        const enrolled = await models.Enrollment.findById(durable.enrollmentId).lean();
+        const owner = await models.Owner.findOne().lean();
+        assert.equal(models.Binding.schema.path('ownerReceiptProofId'), undefined);
+        assert.equal(Object.hasOwn(durable, 'ownerReceiptProofId'), false);
+        assert.notEqual(durable.proofId, owner.adoptionReceipt.proofId);
+        assert.notEqual(enrolled.proofId, owner.adoptionReceipt.proofId);
+        const terminal = (await models.Operation.findOne().lean()).v2Terminal;
+        assert.deepEqual(terminal.ownerFences[0].adoptionReceipt, owner.adoptionReceipt);
+        assert.deepEqual(terminal.ownerFences[0].originalSnapshot, owner.originalSnapshot);
+        if (drift !== 'unchanged') {
+            const key = drift === 'adoption-proof' ? 'adoptionReceipt.proofId' : 'originalSnapshot.unitSha256';
+            const value = drift === 'adoption-proof' ? randomUUID() : 'e'.repeat(64);
+            await models.Owner.updateOne({ _id: owner._id }, { $set: { [key]: value } });
+            const changed = await models.Owner.findOne().lean();
+            assert.equal(key.split('.').reduce((row, part) => row[part], changed), value);
+            await assert.rejects(f.repository.probeV2Settlement({ operationId: f.request.operationId }),
+                { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' });
+            await assert.rejects(f.repository.persistV2TerminalProofs({ ...f.request, proofs: [f.proof], sideEffects: f.sideEffects }),
+                { code: 'TOPOLOGY_V2_SETTLEMENT_UNCONFIRMED' });
+            assert.deepEqual((await models.Operation.findOne().lean()).v2Terminal, terminal);
+            assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+            assert.equal(await models.Lock.countDocuments(), 1);
+            assert.equal((await f.Topology.findOne().lean()).topologyAdmissionCount, 1);
+        } else {
+            await f.repository.persistV2TerminalProofs({ ...f.request, proofs: [f.proof], sideEffects: f.sideEffects });
+            assert.ok(await f.repository.finalizeV2Succeeded(f.request));
+            assert.equal((await f.repository.probeV2Settlement({ operationId: f.request.operationId })).status, 'succeeded');
+            assert.equal(await models.Lock.countDocuments(), 0);
+            assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, false);
+        }
+    });
+});
+
 test('V2 settlement rejects forged proof, changed bindings, ownership and lease fences without partial publication', async t => {
     for (const fault of ['unbranded', 'close-id', 'boot', 'attempt', 'operation', 'foreign-lock', 'expired-lock',
         'expired-lease', 'array-status', 'owner-snapshot', 'topology-drift', 'transaction-abort']) await t.test(fault, async t => {
