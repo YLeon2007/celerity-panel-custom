@@ -1,0 +1,28 @@
+[Unit]
+Description=C3 TEST ordinary native backend (manual activation only)
+After=network-online.target
+Wants=network-online.target
+# No ConditionPathExists/guard token substitutes for the actual v2 attestor.
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/c3-test/native/app
+EnvironmentFile=/opt/c3-test/secrets/native.env
+Environment=NODE_ENV=production PANEL_DOMAIN=test.infograd.online USE_CADDY=true PORT=3001
+Environment=L2TP_EXECUTION_ENABLED=true L2TP_MIGRATIONS_ENABLED=true TOPOLOGY_TEST_EXECUTION_ENABLED=true
+Environment=TOPOLOGY_PRODUCTION_EXECUTION_ENABLED=false L2TP_PRODUCTION_EXECUTION_ENABLED=false CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED=false CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED=false
+UnsetEnvironment=C3_SETTINGS NODE_PATH NODE_OPTIONS
+ExecStart=/opt/c3-test/native/runtime/node /opt/c3-test/native/app/index.js
+Restart=no
+TimeoutStopSec=1900
+KillMode=control-group
+Nice=5
+CPUQuota=75%
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=512M
+UMask=0077
+# Deliberately no [Install], auto-restart, ExecStartPre authority minting,
+# Docker dependency, credential bundle, source updater or activation timer.

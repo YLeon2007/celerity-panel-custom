@@ -1,0 +1,121 @@
+# PREPARATION TEMPLATE ONLY. Combine with the exact pinned app/docker-compose.yml.
+# No invocation of `up`, `build`, `pull`, `start` or `stop` belongs to packaging.
+# Required substitutions are intentionally unresolved; use --no-interpolate for
+# secret-free offline rendering. !override / !reset require Compose >= 2.24.4.
+name: c3-test
+services:
+  backend:
+    image: ${C3_OLD_BACKEND_IMAGE:?accepted existing backend image ID required}
+    # Keep the ordinary root `build: .` for the real source-mode updater.
+    # Packaging never invokes it; a reviewed installation must retain its git checkout.
+    restart: "no"
+    cpus: 0.50
+    mem_limit: 384m
+    ports: !override ["127.0.0.1:3000:3000"]
+    env_file: !override ["${C3_BACKEND_ENV_FILE:-/opt/c3-test/secrets/compose-backend.env}"]
+    volumes: !override
+      - ${C3_PROJECT_DIR:?pinned future root project required}:/opt/hysteria-panel-host
+      - backend_logs:/app/logs
+      - backend_backups:/app/backups
+      - backend_data:/app/data
+      - caddy_data:/caddy_data:ro
+    environment:
+      MONGO_URI: ${C3_DOCKER_MONGO_URI:?private existing credentials and rs0 URI required}
+      REDIS_URL: ${C3_DOCKER_REDIS_URL:?private existing Redis URI required}
+      PANEL_DOMAIN: test.infograd.online
+      PORT: "3000"
+      USE_CADDY: "true"
+      L2TP_EXECUTION_ENABLED: "false"
+      L2TP_MIGRATIONS_ENABLED: "false"
+      TOPOLOGY_TEST_EXECUTION_ENABLED: "false"
+      TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: "false"
+      L2TP_PRODUCTION_EXECUTION_ENABLED: "false"
+      CLASSIC_TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: "false"
+      CLASSIC_TOPOLOGY_LIFECYCLE_ENABLED: "false"
+      UPDATER_URL: http://updater:8484
+  updater:
+    image: ${C3_UPDATER_IMAGE:?bounded reviewed build of product updater required}
+    build: !reset null
+    restart: "no"
+    cpus: 0.25
+    mem_limit: 96m
+    environment:
+      UPDATE_MODE: source
+      PROJECT_DIR: ${C3_PROJECT_DIR:?pinned future root project required}
+      COMPOSE_FILE: compose.test-native.rendered.json
+      SERVICE: backend
+      UPDATER_SECRET: ${UPDATER_SECRET:?existing private HMAC secret required}
+    working_dir: ${C3_PROJECT_DIR:?pinned future root project required}
+    volumes: !override
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${C3_PROJECT_DIR:?pinned future root project required}:${C3_PROJECT_DIR:?pinned future root project required}
+  mongo:
+    image: ${C3_MONGO_IMAGE:?accepted existing Mongo 7 image ID required}
+    restart: "no"
+    cpus: 0.50
+    mem_limit: 320m
+    ports: !override ["127.0.0.1:27017:27017"]
+    volumes: !override
+      - mongo_data:/data/db
+      - mongo_configdb:/data/configdb
+      - /opt/c3-test/secrets/mongo-keyfile:/etc/mongo/keyfile:ro
+    environment:
+      MONGO_INITDB_DATABASE: hysteria
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?existing user required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?existing private password required}
+  redis:
+    image: ${C3_REDIS_IMAGE:?accepted existing Redis image ID required}
+    restart: "no"
+    cpus: 0.25
+    mem_limit: 96m
+    command: [redis-server, /usr/local/etc/redis/redis.conf]
+    ports: !override ["127.0.0.1:6379:6379"]
+    volumes: !override
+      - redis_data:/data
+      - /opt/c3-test/secrets/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    # Future private file contains REDISCLI_AUTH copied from the existing TEST
+    # Redis configuration; no password is interpolated into this template.
+    env_file: !override ["${C3_REDIS_HEALTH_ENV_FILE:-/opt/c3-test/secrets/redis-health.env}"]
+    healthcheck: !override
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+  caddy:
+    image: ${C3_CADDY_IMAGE:?reviewed exact Caddy image digest required}
+    restart: "no"
+    cpus: 0.25
+    mem_limit: 96m
+    network_mode: host
+    networks: !reset []
+    ports: !reset []
+    volumes: !override
+      - ${C3_PROJECT_DIR:?pinned future root project required}/Caddyfile.test:/etc/caddy/Caddyfile:ro
+      - /opt/c3-test/secrets/test-tls.crt:/etc/caddy/test-tls.crt:ro
+      - /opt/c3-test/secrets/test-tls.key:/etc/caddy/test-tls.key:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  mongo_data:
+    external: true
+    name: c3-test_mongo_data
+  mongo_configdb:
+    external: true
+    name: ${C3_MONGO_CONFIGDB_VOLUME:?actual existing anonymous configdb volume required}
+  redis_data:
+    external: true
+    name: c3-test_redis_data
+  backend_logs:
+    external: true
+    name: c3-test_backend_logs
+  backend_backups:
+    external: true
+    name: c3-test_backend_backups
+  backend_data:
+    external: true
+    name: c3-test_backend_data
+  caddy_data:
+    name: c3-test-v2-caddy_data
+  caddy_config:
+    name: c3-test-v2-caddy_config

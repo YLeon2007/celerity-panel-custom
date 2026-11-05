@@ -1,0 +1,19 @@
+{
+    admin 127.0.0.1:2019
+    auto_https off
+    servers {
+        protocols h1 h2
+    }
+}
+
+https://test.infograd.online:8443 {
+    tls /etc/caddy/test-tls.crt /etc/caddy/test-tls.key
+    encode gzip zstd
+    # Initial upstream is the legitimate OLD backend. A later reviewed
+    # cutover uses the host-local admin API, never docker exec after freeze.
+    reverse_proxy 127.0.0.1:3000 {
+        transport http {
+            versions 1.1
+        }
+    }
+}
