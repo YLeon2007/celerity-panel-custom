@@ -298,17 +298,18 @@ def main():
                     except FileNotFoundError:
                         observation[key] = 'cgroup-already-exited'
             cleanup['resources'].append(observation)
-            stopped = pod('stop', '--time', '4', name, check=False)
-            removed = pod('rm', '--force', name, check=False)
+            stopped = pod('stop', '--time', '4', cid, check=False)
+            removed = pod('rm', '--force', cid, check=False)
             absent = pod('container', 'exists', cid, check=False).returncode == 1
             cleanup['containers'].append({'name': name, 'id': cid, 'stopExit': stopped.returncode,
                                            'removeExit': removed.returncode, 'absent': absent})
         if network_id:
             current = json.loads(pod('network', 'inspect', network_name).stdout)[0]
             assert current['id'] == network_id
-            removed = pod('network', 'rm', network_name, check=False)
-            absent = pod('network', 'exists', network_name, check=False).returncode == 1
-            cleanup['network'] = {'name': network_name, 'removeExit': removed.returncode, 'absent': absent}
+            removed = pod('network', 'rm', network_id, check=False)
+            absent = (pod('network', 'exists', network_id, check=False).returncode == 1
+                      and pod('network', 'exists', network_name, check=False).returncode == 1)
+            cleanup['network'] = {'id': network_id, 'name': network_name, 'removeExit': removed.returncode, 'absent': absent}
         readback = []
         for row in physical:
             try:
