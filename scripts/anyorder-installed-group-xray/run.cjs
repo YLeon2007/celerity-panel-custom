@@ -35,6 +35,7 @@ async function exec(id, command, options) {
     let receipt;
     if (command.includes('--command ')) { try { receipt = JSON.parse(result.stdout); } catch {} }
     if (receipt) fs.appendFileSync(path.join(work, 'runner-responses.jsonl'), JSON.stringify({label, node: id, action, raw: result.stdout, sha256: sha(result.stdout)}) + '\n');
+    fs.appendFileSync(path.join(work, 'ssh-commands.private.jsonl'), JSON.stringify({label, node: id, command, code: result.code}) + '\n');
     fs.appendFileSync(path.join(work, 'ssh-exits.jsonl'), JSON.stringify({label, node: id, action, code: result.code,
         stdoutSha256: sha(result.stdout || ''), stderr: result.stderr.slice(0, 2000), ...(receipt ? {receipt} : {})}) + '\n');
     return result;
@@ -336,6 +337,7 @@ async function main(){
     assert.equal(sha(JSON.stringify(modeledInventory)),inventoryHash);
     save('recreation.json',{allocation:'synthetic fixture, NOT public POST',groupId:group._id,pathKey:'legacy-main',stableIngress:ingress,
         oldId:old.id,newId:replacement.id,oldPort:old.tunnelPort,newPort:replacement.tunnelPort,oldCredentialSha256:sha(old.tunnelUuid),newCredentialSha256:sha(replacement.tunnelUuid),importedPinsUnchanged:true});
+    save('loaded-inputs.json',Object.fromEntries(Object.keys(require.cache).filter(p=>p.startsWith(root+'/')||p.startsWith('/deps/')).sort().map(p=>[p,sha(fs.readFileSync(p))])));
     ledger({kind:'scenario',name:cfg.scenario,status:'passed'});
     save('result.json',{status:'passed',scenario:cfg.scenario,planExecutions:sequence,
         authorityAdapter:'synthetic-external-hold/local-query-model/in-memory-bindings',publication:'MODELED descriptor transitions; no installed finalizer/worker physical join',
