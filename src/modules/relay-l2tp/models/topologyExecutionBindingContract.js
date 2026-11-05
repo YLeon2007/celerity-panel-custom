@@ -1,6 +1,8 @@
 'use strict';
 const mongoose = require('mongoose');
 const { TOPOLOGY_EXECUTION_CONTEXTS } = require('../domain/topologyExecutionContext');
+const { assertProfileTargetPin } = require('../services/topologyProfileTarget');
+const { createProfileTargetPinSchema } = require('./topologyProfileTargetPinSchema');
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const ID = /^[a-f0-9]{24}$/;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -8,6 +10,20 @@ const COMMANDS = Object.freeze(['prepare', 'commit', 'verify', 'rollback', 'clos
 const EXPECTED_KEYS = Object.freeze(['executionContext', 'operationId', 'nodeId', 'candidateHash', 'backupId',
     'targetProfile', 'topologyRevision', 'priorDeployedRevision', 'owner', 'attempt', 'generation']);
 const RECORD_KEYS = Object.freeze([...EXPECTED_KEYS, 'attemptId', 'predecessorGeneration', 'commandIds', 'bootId', 'maintenanceId']);
+const IMPORTED_EXPECTED_KEYS = Object.freeze([...EXPECTED_KEYS, 'profileTargetPin']);
+const IMPORTED_RECORD_KEYS = Object.freeze([...RECORD_KEYS, 'profileTargetPin']);
+function keysFor(value, nativeKeys, importedKeys) {
+    if (!value || !Object.hasOwn(value, 'profileTargetPin')) return nativeKeys;
+    const pin = assertProfileTargetPin(value.profileTargetPin);
+    if (pin.nodeId !== value.nodeId || pin.targetProfile !== value.targetProfile) {
+        throw Object.assign(new Error('TOPOLOGY_PROFILE_TARGET_INVALID'), { code: 'TOPOLOGY_PROFILE_TARGET_INVALID' });
+    }
+    // Do not compare pin.ownerGeneration with binding.generation: the latter is
+    // the short-lived lock/runner epoch, not the permanent adopted owner epoch.
+    return importedKeys;
+}
+function expectedKeysFor(value) { return keysFor(value, EXPECTED_KEYS, IMPORTED_EXPECTED_KEYS); }
+function recordKeysFor(value) { return keysFor(value, RECORD_KEYS, IMPORTED_RECORD_KEYS); }
 const strict = { _id: false, versionKey: false, strict: 'throw' };
 function exact(value, keys) {
     return value && typeof value === 'object' && !Array.isArray(value)
@@ -60,6 +76,18 @@ const common = () => ({
     nodeIdentity: { type: identitySchema, required: true, immutable: true },
     ownerGeneration: string(UUID), predecessorGeneration: string(/^(?:none|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/), bootId: string(UUID),
     proofId: string(UUID), maintenanceId: string(UUID),
+    profileTargetPin: { type: createProfileTargetPinSchema(), default: undefined, immutable: true,
+        // Validate the raw value before Mongoose can cast or discard fields.
+        // An explicitly present undefined/null is malformed, not native absence.
+        set: assertProfileTargetPin,
+        validate(value) {
+            if (value === undefined) return true; // genuinely absent old row
+            try {
+                const pin = assertProfileTargetPin(value);
+                return pin.nodeId === this.nodeId && pin.targetProfile === this.targetProfile
+                    && pin.ownerGeneration === this.ownerGeneration;
+            } catch { return false; }
+        } },
 });
-module.exports = { UUID, ID, TOKEN, COMMANDS, EXPECTED_KEYS, RECORD_KEYS, exact, freeze, failure, immutable,
+module.exports = { UUID, ID, TOKEN, COMMANDS, EXPECTED_KEYS, RECORD_KEYS, expectedKeysFor, recordKeysFor, exact, freeze, failure, immutable,
     string, common, strict, validTerminalReceipt };
