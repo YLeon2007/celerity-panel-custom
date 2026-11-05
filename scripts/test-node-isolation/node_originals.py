@@ -367,6 +367,11 @@ class NodeOriginals:
         return result.stdout
 
     def runtime_layout(self, raw, active):
+        # Match the repository's exact fresh-empty bytes, not arbitrary JSON
+        # lacking inbounds. Only a validated inactive service can use this path:
+        # active config bytes alone cannot exclude RPC-only runtime users.
+        if raw in (b'{}', b'{}\n') and active == 'inactive':
+            return None, []
         config = decode(raw)
         need(isinstance(config,dict) and isinstance(config.get('inbounds'),list) and len(config['inbounds']) <= 64,
              'UNSUPPORTED_RUNTIME_LAYOUT_RETAINED')

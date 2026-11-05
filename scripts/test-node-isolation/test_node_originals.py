@@ -134,6 +134,251 @@ class OriginalsTests(unittest.TestCase):
             self.assertEqual(f.path(f.config).read_bytes(), f.original)
 
 
+class CanonicalEmptyOriginalTests(unittest.TestCase):
+    """Canonical raw bytes only; external service/physical authority is MODELED."""
+    def test_repository_canonical_empty_inactive_capture_and_held_restore_without_rpc_or_start(self):
+        import fcntl
+        import re
+        import subprocess
+        from unittest.mock import patch
+        import test_isolation as isolation_fixture
+
+        # Evaluate the actual repository hash-set declaration, without importing
+        # models or starting infrastructure. Bind its actual fresh-owner use too.
+        source = (HERE.parents[1] / 'src/modules/relay-l2tp/repositories/topologyDeploymentRepository.js').read_text()
+        declaration, = re.findall(r'^const EMPTY_CONFIG_HASHES = .*;$', source, re.MULTILINE)
+        self.assertIn('else if (!EMPTY_CONFIG_HASHES.has(owner.originalSnapshot.configSha256)) throw selectedError();', source)
+        result = subprocess.run(['node', '-e', "const { createHash } = require('node:crypto');\n" + declaration +
+                                 '\nconsole.log(JSON.stringify([...EMPTY_CONFIG_HASHES]));'],
+                                capture_output=True, check=True, timeout=5)
+        self.assertEqual(result.stderr, b'')
+        raw_variants = (b'{}', b'{}\n')
+        self.assertEqual(set(json.loads(result.stdout)), {n.sha(raw) for raw in raw_variants})
+
+        for raw, profile in ((raw, profile) for raw in raw_variants for profile in ('xray-main', 'xray-bridge')):
+            with self.subTest(raw=raw, profile=profile), Fixture() as f:
+                if profile == 'xray-main':
+                    f.node, f.profile = '6ab18adc63913ebd4a917471', profile
+                    f.plan.update(nodeId=f.node, endpointIp='132.243.230.19', targetProfile=profile)
+                    f.config, f.unit = n.profile_paths(profile)
+                    f.put(f.unit, b'[Service]\n# modeled original main unit\n')
+                    f.put(n.runner_lock(profile), b'')
+                    f.system.states[n.service_name(profile)] = {**f.system.states['xray-bridge.service'],
+                        'Id':n.service_name(profile), 'FragmentPath':f.unit}
+                    f.accepted['profiles'] = {profile:f.accepted['profiles']['xray-bridge']}
+                f.original = raw
+                f.put(f.config, raw)
+                state = f.system.states[n.service_name(f.profile)]
+                state['ActiveState'] = 'inactive'
+                f.accepted['profiles'][f.profile].update(files=f.writer_files(), service=copy.deepcopy(state))
+                plan = isolation_fixture.PlanTests().plan()
+                plan.update(f.plan)
+                host = isolation_fixture.EngineTests.FixtureHost()
+                setattr(host, 'physical', f.engine.host.physical)
+                f.engine = isolation_fixture.m.Engine(f.path(n.STATE), plan, host)
+                isolation_fixture.fixture_hold(f.engine)
+                f.plan = plan
+                f.put(n.HELPER, (HERE / 'isolation.py').read_bytes())
+                f.accepted.update(n.identity(f.engine))
+                f.accepted['isolationSha256'] = n.sha(f.path(n.HELPER).read_bytes())
+                f.put(n.ACCEPTED, n.canonical(f.accepted))
+                f.writer = n.NodeOriginals(f.engine, isolation_fixture.m, fixture=f.fixture)
+                before = f.engine.read()
+                with patch.object(n.NodeOriginals, 'rpc', side_effect=AssertionError('empty inactive must not call RPC')) as rpc:
+                    receipt = f.writer.capture()
+                    self.assertEqual(f.writer.runtime_layout(raw, 'inactive'), (None, []))
+                    original = f.fs.read_json(n.BUNDLE)['profiles'][f.profile]
+                    self.assertEqual(original['runtime'], {'mode':'none', 'inbounds':{}})
+                    self.assertEqual(base64.b64decode(original['files']['config']['data']), raw)
+                    self.assertEqual(original['service'], state)
+                    self.assertEqual(f.system.events, [])
+                    f.mutate_and_admit(receipt)  # Actual disposable runner terminal journal.
+                    state['ActiveState'] = 'active'
+                    f.restore_pins['profiles'][f.profile]['service'] = copy.deepcopy(state)
+                    f.put(n.RESTORE_ACCEPTED, n.canonical(f.restore_pins))
+                    writer = n.NodeOriginals(f.engine, isolation_fixture.m, fixture=f.fixture)
+                    with writer.restoration_hold() as held:
+                        restored = held.restore()
+                        held.verify()
+                        for path in writer.lock_paths:
+                            with open(f.path(path), 'rb') as competitor:
+                                with self.assertRaises(BlockingIOError):
+                                    fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    rpc.assert_not_called()
+                self.assertEqual(restored['code'], 'NODE_ORIGINALS_RESTORED_RETAINED')
+                self.assertEqual(f.system.events, [('stop', n.service_name(f.profile)), ('daemon-reload', None)])
+                self.assertEqual(writer.snapshot(f.profile), original)
+                self.assertEqual(f.path(f.config).read_bytes(), raw)
+                self.assertEqual(f.fs.read_json(n.RESTORE_STATE)['phase'], 'verified-retained')
+                self.assertEqual(f.fs.read_json(n.ADMISSION)['state'], 'closed')
+                self.assertEqual(f.engine.read(), before)
+                self.assertFalse(any(event[0] == 'restore' for event in host.events))
+
+
+    def test_canonical_empty_active_or_unknown_service_never_captures_zero_users(self):
+        from unittest.mock import patch
+        for raw in (b'{}', b'{}\n'):
+            for active in ('active', 'activating', 'failed', '', None):
+                with self.subTest(raw=raw, active=active), Fixture() as f:
+                    f.put(f.config, raw)
+                    f.system.states[n.service_name(f.profile)]['ActiveState'] = active
+                    with patch.object(f.writer, 'rpc') as rpc:
+                        with self.assertRaisesRegex(n.Refusal, 'UNSUPPORTED_RUNTIME_LAYOUT'):
+                            f.writer.runtime_layout(raw, active)
+                        code = 'UNSUPPORTED_RUNTIME_LAYOUT' if active == 'active' else 'SERVICE_UNPROVEN'
+                        with self.assertRaisesRegex(n.Refusal, code):
+                            f.writer.capture()
+                        rpc.assert_not_called()
+                    self.assertTrue(f.fs.absent(n.BUNDLE))
+                    self.assertTrue(f.fs.absent(n.RESTORE_STATE))
+                    self.assertEqual(f.path(f.config).read_bytes(), raw)
+                    self.assertEqual(f.system.events, [])
+
+    def test_noncanonical_empty_or_missing_inbounds_is_not_fresh_empty(self):
+        from unittest.mock import patch
+        variants = (b'{ }', b' {}', b'{}\r\n', b'{}\n\n', b'{}\t', b'\xef\xbb\xbf{}',
+                    b'{"other":true}', b'{"inbounds":null}', b'{"api":{}}', b'null', b'[]')
+        for raw in variants:
+            with self.subTest(raw=raw), Fixture() as f:
+                f.put(f.config, raw)
+                f.system.states[n.service_name(f.profile)]['ActiveState'] = 'inactive'
+                with patch.object(f.writer, 'rpc') as rpc:
+                    with self.assertRaisesRegex(n.Refusal, 'UNSUPPORTED_RUNTIME_LAYOUT'):
+                        f.writer.capture()
+                    rpc.assert_not_called()
+                self.assertTrue(f.fs.absent(n.BUNDLE))
+                self.assertEqual(f.path(f.config).read_bytes(), raw)
+                self.assertEqual(f.system.events, [])
+
+    def test_canonical_empty_still_requires_trusted_files_service_held_scope_and_zero_user_pins(self):
+        from unittest.mock import patch
+        for case in ('mode', 'dropin', 'service-drift', 'file-pin', 'runtime-pin', 'guard'):
+            with self.subTest(case=case), Fixture() as f:
+                f.put(f.config, b'{}')
+                state = f.system.states[n.service_name(f.profile)]
+                state['ActiveState'] = 'inactive'
+                f.accepted['profiles'][f.profile].update(files=f.writer_files(), service=copy.deepcopy(state))
+                if case == 'mode':
+                    f.path(f.config).chmod(0o666)
+                elif case == 'dropin':
+                    state['DropInPaths'] = '/unaccepted.conf'
+                elif case == 'file-pin':
+                    f.accepted['profiles'][f.profile]['files']['config']['sha256'] = '0'*64
+                elif case == 'runtime-pin':
+                    # Even independently pinned nonzero users cannot be replaced
+                    # by a zero-user bundle merely because disk bytes are {}.
+                    f.accepted['profiles'][f.profile]['runtimeSha256'] = n.sha(n.canonical(
+                        {'mode':'rpc', 'inbounds':{'subscription':[{'email':'retained@example.test'}]}}))
+                elif case == 'guard':
+                    f.engine.phase = 'lost'
+                f.put(n.ACCEPTED, n.canonical(f.accepted))
+                writer = n.NodeOriginals(f.engine, f.module, fixture=f.fixture)
+                if case == 'service-drift':
+                    runtime = writer.runtime
+                    def changed(*args):
+                        value = runtime(*args)
+                        state['ActiveState'] = 'active'
+                        return value
+                    writer.runtime = changed
+                code = {'mode':'UNTRUSTED_FILE', 'dropin':'SERVICE_UNPROVEN', 'service-drift':'SERVICE_CHANGED',
+                        'file-pin':'ORIGINAL_PIN_MISMATCH', 'runtime-pin':'ORIGINAL_PIN_MISMATCH', 'guard':'GUARD_LOST'}[case]
+                with patch.object(writer, 'rpc') as rpc:
+                    with self.assertRaisesRegex(RuntimeError, code):
+                        writer.capture()
+                    rpc.assert_not_called()
+                self.assertFalse(f.path(n.BUNDLE).exists())
+                self.assertEqual(f.path(f.config).read_bytes(), b'{}')
+                self.assertEqual(f.system.events, [])
+
+    def test_empty_restore_runtime_cannot_discard_saved_runtime_users_or_rpc_mode(self):
+        from unittest.mock import patch
+        for expected in ({'mode':'rpc', 'inbounds':{'subscription':[{'email':'lost@example.test'}]}},
+                         {'mode':'rpc', 'inbounds':{}}):
+            with self.subTest(expected=expected), Fixture() as f:
+                original = {'files':{'config':{'data':base64.b64encode(b'{}').decode()}},
+                            'service':{'ActiveState':'inactive'}, 'runtime':expected}
+                with patch.object(f.writer, 'rpc') as rpc:
+                    with self.assertRaisesRegex(n.Refusal, 'RUNTIME_BUNDLE_DRIFT|RUNTIME_RESTORE_READBACK'):
+                        f.writer.restore_runtime(f.profile, original)
+                    rpc.assert_not_called()
+                self.assertEqual(f.system.events, [])
+                self.assertFalse(f.path(n.RESTORE_STATE).exists())
+
+    def test_nonempty_vless_users_restore_and_partial_rpc_refusal_remain_exact(self):
+        from unittest.mock import patch
+        # Only RPC/systemd/physical authority is modeled; capture, bundle pins,
+        # held locks, users parsing and restoration are the actual implementation.
+        for drop_add in (False, True):
+            with self.subTest(drop_add=drop_add), Fixture() as f:
+                configured = {'email':'config@example.test', 'id':'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', 'flow':'', 'level':0}
+                dynamic = {'email':'rpc@example.test', 'id':'11111111-2222-4333-8444-555555555555',
+                           'flow':'xtls-rprx-vision', 'level':0}
+                expected = {'mode':'rpc', 'inbounds':{'subscription':[configured, dynamic]}}
+                config = {'api':{'tag':'API', 'services':['HandlerService']},
+                          'inbounds':[{'tag':'API_INBOUND', 'listen':'127.0.0.1', 'port':10085,
+                                       'protocol':'dokodemo-door'},
+                                      {'tag':'subscription', 'protocol':'vless', 'settings':{'clients':[configured]}}],
+                          'routing':{'rules':[{'inboundTag':['API_INBOUND'], 'outboundTag':'API'}]}}
+                f.original = n.canonical(config)
+                f.put(f.config, f.original)
+                f.accepted['profiles'][f.profile].update(files=f.writer_files(), runtimeSha256=n.sha(n.canonical(expected)))
+                f.put(n.ACCEPTED, n.canonical(f.accepted))
+                f.writer = n.NodeOriginals(f.engine, f.module, fixture=f.fixture)
+                current, calls = copy.deepcopy([configured, dynamic]), []
+                action = f.system.action
+                def service_action(verb, service=None, locks=()):
+                    action(verb, service, locks)
+                    if verb == 'stop':
+                        current.clear()
+                    elif verb == 'restart':
+                        current[:] = copy.deepcopy(json.loads(f.path(f.config).read_bytes())['inbounds'][1]['settings']['clients'])
+                f.system.action = service_action
+                def rpc(writer, args, data=None):
+                    calls.append(args[0])
+                    self.assertEqual(args[1], '--server=127.0.0.1:10085')
+                    if args[0] == 'inbounduser':
+                        self.assertEqual(args[2:], ['-tag=subscription'])
+                        return n.canonical({'users':[{'email':u['email'], 'level':u['level'],
+                            'account':{'_TypedMessage_':'xray.proxy.vless.Account', 'id':u['id'], 'flow':u['flow']}} for u in current]})
+                    if args[0] == 'rmu':
+                        self.assertEqual(args[2:], ['-tag=subscription', configured['email']])
+                        current.clear()
+                    elif args[0] == 'adu':
+                        self.assertEqual(args[2:], ['/dev/stdin'])
+                        additions = n.decode(data)['inbounds'][0]['settings']['clients']
+                        self.assertEqual(additions, expected['inbounds']['subscription'])
+                        if not drop_add:
+                            current[:] = copy.deepcopy(additions)
+                    else:
+                        self.fail('Unexpected modeled RPC')
+                    return b''
+                with patch.object(n.NodeOriginals, 'rpc', rpc):
+                    receipt = f.writer.capture()
+                    original = f.fs.read_json(n.BUNDLE)['profiles'][f.profile]
+                    self.assertEqual(original['runtime'], expected)
+                    f.mutate_and_admit(receipt)
+                    state = f.system.states[n.service_name(f.profile)]
+                    state['ActiveState'] = 'active'
+                    f.restore_pins['profiles'][f.profile]['service'] = copy.deepcopy(state)
+                    f.put(n.RESTORE_ACCEPTED, n.canonical(f.restore_pins))
+                    writer = n.NodeOriginals(f.engine, f.module, fixture=f.fixture)
+                    if drop_add:
+                        with self.assertRaisesRegex(n.Refusal, 'RUNTIME_RESTORE_READBACK_FAILED'):
+                            writer.restore()
+                        self.assertEqual(f.fs.read_json(n.RESTORE_STATE)['phase'], 'restoring-retained')
+                    else:
+                        with writer.restoration_hold() as held:
+                            held.restore()
+                            held.verify()
+                        self.assertEqual(writer.snapshot(f.profile), original)
+                        self.assertEqual(current, expected['inbounds']['subscription'])
+                        self.assertEqual(f.fs.read_json(n.RESTORE_STATE)['phase'], 'verified-retained')
+                self.assertIn('rmu', calls)
+                self.assertIn('adu', calls)
+                self.assertIn(('restart', n.service_name(f.profile)), f.system.events)
+                self.assertEqual(f.fs.read_json(n.ADMISSION)['state'], 'closed')
+
+
 class SafetyTests(unittest.TestCase):
     def test_capture_is_one_shot_and_independent_pin_drift_never_adopts(self):
         with Fixture() as f:
