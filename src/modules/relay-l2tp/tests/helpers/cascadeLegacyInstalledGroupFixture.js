@@ -134,16 +134,29 @@ function installedGroupFixture(context = TEST) {
         };
         const record = (method, filter = {}, options = {}, update) => events.push({ name, method,
             filter: bson(filter), options: { ...options }, ...(update ? { update: bson(update) } : {}), held });
-        const matches = (row, filter) => Object.entries(filter).every(([k, v]) => k.startsWith('$') || k.includes('.')
+        // The driver serializes cast filters before Mongo sees them. In
+        // particular, a Mongoose SingleNested is a BSON document, not its raw
+        // internal $-fields. Keep native ignoreUndefined:false by default (the
+        // standalone BSON codec defaults to true); never JSON-clone predicates.
+        const driverFilter = (filter, options) => mongoose.mongo.BSON.deserialize(mongoose.mongo.BSON.serialize(filter,
+            { ignoreUndefined: options?.ignoreUndefined ?? false }));
+        const matches = (row, filter) => Object.entries(filter).every(([k, v]) => k.startsWith('$') || k.includes('.') || v === null
             || v && typeof v === 'object' && Object.keys(v).some(field => field.startsWith('$'))
             ? sift({ [k]: v })(row) : same(row[k], v));
         Model.collection.buffer = false;
         Model.collection.collection = {
             async indexes() { record('indexes'); return schema.indexes().map(([key, options]) => ({ key, ...options })); },
             async insertOne(doc, options) { record('insertOne', {}, options); rows.push(bson(doc)); return { acknowledged: true, insertedId: doc._id }; },
-            async findOne(filter, options) { record('findOne', filter, options); return project(rows.find(row => matches(row, filter)), options); },
-            find(filter, options) { record('find', filter, options); return { toArray: async () => rows.filter(row => matches(row, filter)).map(row => project(row, options)) }; },
+            async findOne(filter, options) {
+                filter = driverFilter(filter, options);
+                record('findOne', filter, options); return project(rows.find(row => matches(row, filter)), options);
+            },
+            find(filter, options) {
+                filter = driverFilter(filter, options);
+                record('find', filter, options); return { toArray: async () => rows.filter(row => matches(row, filter)).map(row => project(row, options)) };
+            },
             async findOneAndUpdate(filter, update, options) {
+                filter = driverFilter(filter, options);
                 record('findOneAndUpdate', filter, options, update);
                 const row = rows.find(row => matches(row, filter)); if (!row) return null;
                 const before = bson(row);

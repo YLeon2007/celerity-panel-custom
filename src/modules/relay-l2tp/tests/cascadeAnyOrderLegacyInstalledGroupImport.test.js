@@ -282,6 +282,117 @@ for (const index of [0, 2]) test(`phase A grouped ${index === 0 ? 'P' : 'B'}: re
     rejectedWithoutCAS(f);
 });
 
+// Fixture regression only: unchanged public restoration, not worker rollback or
+// physical/Mongo acceptance. Positive owners always come from initialize/adopt.
+for (const context of [TEST, PROD]) test(`fixture BSON ${context.target}: public unchanged R handback preserves original private history`, async () => {
+    const f = installedGroupFixture(context), node = f.topology.nodes[1];
+    const protectedHash = sha(JSON.stringify({ physical: [...f.physical], inventory: f.inventory }));
+    const adopted = await f.adopt(node), start = f.events.length;
+    const returned = await f.transfer.handback({ node: node.id, profile: profileFor(node), generation: adopted.generation,
+        proofRef: 'modeled-unchanged-original-restoration' });
+    assert.equal(returned.owner, 'classic');
+    assert.notEqual(returned.generation, adopted.generation);
+    assert.equal(returned.handbackReceipt.fromGeneration, adopted.generation);
+    assert.equal(returned.handbackReceipt.toGeneration, returned.generation);
+    const durable = await f.Owner.findOne({ node: node.id, profile: profileFor(node) }).select('+legacyAppliedTopology').lean();
+    assert.deepEqual(durable.adoptionReceipt, adopted.adoptionReceipt);
+    assert.deepEqual(durable.originalSnapshot, adopted.originalSnapshot);
+    assert.deepEqual(durable.nodeIdentity, adopted.nodeIdentity);
+    assert.deepEqual(durable.legacyAppliedTopology, adopted.legacyAppliedTopology);
+    assert.deepEqual(durable.legacyAppliedTopology, f.topology);
+    assert.equal(durable.lastSettledOperation, undefined);
+    assert.equal(returned.legacyAppliedTopology, undefined, 'public default handback projection stays private');
+    const cas = f.events.slice(start).filter(event => event.method === 'findOneAndUpdate');
+    assert.equal(cas.length, 1);
+    assert.equal(cas[0].held, true);
+    assert.equal(cas[0].filter.generation, adopted.generation);
+    assert.deepEqual(cas[0].filter.adoptionReceipt, adopted.adoptionReceipt);
+    assert.deepEqual(cas[0].filter.originalSnapshot, adopted.originalSnapshot);
+    const confirmation = f.events.slice(start).find(event => event.method === 'findOne' && event.filter.owner === 'classic');
+    assert.equal(confirmation.held, true);
+    assert.equal(confirmation.options.readPreference.mode, 'primary');
+    assert.deepEqual(confirmation.options.readConcern, { level: 'majority' });
+    assert.equal(protectedHash, sha(JSON.stringify({ physical: [...f.physical], inventory: f.inventory })));
+    assert.equal(f.connection.readyState, 0);
+    assert.equal(f.data.TopologyOperation, undefined);
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.held(), false);
+});
+
+test('fixture BSON: cast embedded receipt matches by value in findOne and find without ignoring receipt or generation', async () => {
+    const f = installedGroupFixture(), node = f.topology.nodes[1], adopted = await f.adopt(node);
+    const before = sha(JSON.stringify(f.data)), start = f.events.length;
+    const filter = { node: node.id, profile: profileFor(node), generation: adopted.generation,
+        executionContext: adopted.executionContext, nodeIdentity: adopted.nodeIdentity,
+        originalSnapshot: adopted.originalSnapshot, adoptionReceipt: { ...adopted.adoptionReceipt,
+            verifiedAt: new Date(adopted.adoptionReceipt.verifiedAt.getTime()) } };
+    assert.equal((await f.Owner.findOne(filter).lean())?.generation, adopted.generation);
+    assert.equal((await f.Owner.find(filter).lean()).length, 1);
+    for (const bad of [
+        { ...filter, adoptionReceipt: { ...filter.adoptionReceipt, proofId: 'mismatching-proof' } },
+        { ...filter, adoptionReceipt: { ...filter.adoptionReceipt, verifiedAt: new Date(filter.adoptionReceipt.verifiedAt.getTime() + 1) } },
+        { ...filter, adoptionReceipt: { ...filter.adoptionReceipt, oldPid: filter.adoptionReceipt.oldPid + 1 } },
+        { ...filter, generation: adopted.adoptionReceipt.fromGeneration },
+        { ...filter, node: id(99) },
+    ]) {
+        assert.equal(await f.Owner.findOne(bad).lean(), null);
+        assert.deepEqual(await f.Owner.find(bad).lean(), []);
+    }
+    assert.equal(before, sha(JSON.stringify(f.data)));
+    assert.ok(f.events.slice(start).every(event => ['find', 'findOne'].includes(event.method)));
+});
+
+for (const [name, change] of [
+    ['receipt proof', row => { row.adoptionReceipt.proofId = 'modeled-competing-proof'; }],
+    ['receipt date', row => { row.adoptionReceipt.verifiedAt = new Date(row.adoptionReceipt.verifiedAt.getTime() + 1); }],
+    ['generation', row => { row.generation = row.adoptionReceipt.fromGeneration; }],
+]) test(`fixture BSON public handback: retains competing ${name} at the actual CAS boundary`, async () => {
+    const f = installedGroupFixture(), node = f.topology.nodes[1], adopted = await f.adopt(node);
+    const driver = f.Owner.collection.collection, original = driver.findOneAndUpdate;
+    const protectedHash = sha(JSON.stringify({ physical: [...f.physical], inventory: f.inventory }));
+    let calls = 0, competingHash;
+    driver.findOneAndUpdate = async function(...args) {
+        calls++;
+        // Deliberate modeled race on the publicly adopted row, never a seeded
+        // positive owner. A stale read must not overwrite the competing value.
+        change(f.data.TopologyConfigOwner[0]);
+        competingHash = sha(JSON.stringify(f.data));
+        return original.apply(this, args);
+    };
+    try {
+        await assert.rejects(f.transfer.handback({ node: node.id, profile: profileFor(node), generation: adopted.generation,
+            proofRef: 'modeled-stale-original-restoration' }), { code: 'CONFIG_OWNERSHIP_CONFLICT' });
+    } finally { driver.findOneAndUpdate = original; }
+    assert.equal(calls, 1, 'refusal must reach the actual receipt/generation CAS');
+    assert.equal(competingHash, sha(JSON.stringify(f.data)));
+    assert.equal(f.data.TopologyConfigOwner[0].owner, 'topology');
+    assert.equal(f.data.TopologyConfigOwner[0].handbackReceipt, undefined);
+    assert.equal(protectedHash, sha(JSON.stringify({ physical: [...f.physical], inventory: f.inventory })));
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.held(), false);
+});
+
+test('fixture BSON: native-boundary operators, ObjectId, null and undefined retain bounded driver semantics', async () => {
+    const f = installedGroupFixture(), node = f.topology.nodes[1], adopted = await f.adopt(node);
+    const driver = f.Owner.collection.collection, oid = new f.Owner.base.Types.ObjectId(node.id);
+    const filter = { $and: [{ node: { $in: [oid] } }, { 'adoptionReceipt.oldPid': { $gte: adopted.adoptionReceipt.oldPid } }],
+        generation: { $ne: adopted.adoptionReceipt.fromGeneration } };
+    const options = { session: f.session, projection: { node: 1, generation: 1, _id: 0 } };
+    const projected = await driver.findOne(filter, options);
+    assert.deepEqual(Object.keys(projected).sort(), ['generation', 'node']);
+    assert.ok(projected.node instanceof f.Owner.base.Types.ObjectId);
+    assert.equal(projected.generation, adopted.generation);
+    assert.ok(f.events.at(-1).options.session === f.session);
+    assert.equal(await driver.findOne({ ...filter, node: new f.Owner.base.Types.ObjectId(id(99)) }), null);
+    assert.ok(await driver.findOne({ node: oid, lastSettledOperation: null }), 'native null equality includes missing');
+    assert.ok(await driver.findOne({ node: oid, lastSettledOperation: undefined }), 'driver defaults undefined to null');
+    assert.equal(await driver.findOne({ node: oid, generation: null }), null);
+    assert.equal(await driver.findOne({ node: oid, generation: undefined }), null, 'undefined is not an omitted guard by default');
+    assert.ok(await driver.findOne({ node: oid, generation: undefined }, { ignoreUndefined: true }), 'explicit native omission remains opt-in');
+    assert.equal(await driver.findOne({ node: oid, generation: null }, { ignoreUndefined: true }), null);
+    assert.equal(await driver.findOne({ node: oid, generation: { $in: [adopted.adoptionReceipt.fromGeneration] } }), null);
+});
+
 test('phase A adoption never resolves transport, runs commands or accesses network', async () => {
     const f = installedGroupFixture(), net = require('node:net'), child = require('node:child_process');
     const guards = [[net.Socket.prototype, 'connect'], ...['spawn', 'spawnSync', 'exec', 'execFile', 'execFileSync', 'execSync', 'fork'].map(name => [child, name])];
