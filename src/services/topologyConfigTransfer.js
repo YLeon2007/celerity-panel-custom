@@ -25,6 +25,38 @@ function snapshot(readback) {
 }
 const { isDeepStrictEqual } = require('node:util');
 
+// This is observed ingress recognition only. Installed-owner/epoch joining is
+// a separate mandatory selected-admission boundary, not authority minted here.
+function supportedLegacyGroup(topology) {
+    const [group] = topology.groups;
+    const portal = topology.nodes.filter(node => node.role === 'portal');
+    const relay = topology.nodes.filter(node => node.role === 'relay');
+    const bridge = topology.nodes.filter(node => node.role === 'bridge');
+    if (topology.groups.length !== 1 || topology.nodes.length !== 3 || topology.links.length !== 2
+        || portal.length !== 1 || relay.length !== 1 || bridge.length !== 1
+        || group.mode !== 'reverse' || group.strategy !== 'priority-failover' || group.paths.length !== 1) return false;
+    const [path] = group.paths;
+    const upstream = topology.links.find(link => link.source === portal[0].id && link.target === relay[0].id);
+    const downstream = topology.links.find(link => link.source === relay[0].id && link.target === bridge[0].id);
+    const supportedClient = client => client && typeof client === 'object' && !Array.isArray(client)
+        && client.security === 'none' && (client.protocol === undefined || client.protocol === 'vless')
+        && (client.transport === undefined || client.transport === 'tcp');
+    if (!upstream || !downstream || path.enabled !== true
+        || typeof path.pathKey !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(path.pathKey)
+        || !Number.isFinite(path.priority) || path.priority <= 0
+        || path.linkIds.length !== 1 || path.linkIds[0] !== downstream.id
+        || topology.links.some(link => link.mode !== 'reverse' || link.geo === true || link.geoRouting?.enabled
+            || (link.tunnelProtocol !== undefined && link.tunnelProtocol !== 'vless')
+            || (link.tunnelTransport !== undefined && link.tunnelTransport !== 'tcp')
+            || (link.tunnelSecurity !== undefined && link.tunnelSecurity !== 'none'))
+        || topology.nodes.some(node => !supportedClient(node.xray)
+            || (node.xray.extraInbounds !== undefined && (!Array.isArray(node.xray.extraInbounds)
+                || !node.xray.extraInbounds.every(supportedClient))))) return false;
+    // Compare, never normalize an incorrect ID/tag/port or silently add defaults.
+    const { projectGroups } = require('../modules/relay-l2tp/domain/topologyDraft');
+    return isDeepStrictEqual(topology.groups, projectGroups(topology.groups));
+}
+
 // An import is an accepted descriptor inventory PLUS exact existing profile
 // bytes. The existing adoption readback binds those bytes; status/desired data
 // alone never supplies authority. No config is generated onto a node here.
@@ -72,9 +104,10 @@ function legacyAppliedTopology(input) {
         || (security === 'tls' && node.role === 'portal' && node.type === 'xray' && node.active === true
             && node.xray?.tlsSource === 'manual'
             && ['manualCert', 'manualKey'].every(key => typeof node.xray[key] === 'string' && node.xray[key].trim()));
-    // Groups/installed paths, TLS tunnels and mixed legacy-forward graphs keep
-    // their existing refusal. Exact generated metadata/readback checks follow.
-    if (!forward && (topology.groups.length || topology.links.some(link => link.mode !== 'reverse'
+    // Nonempty groups have exactly one bounded reverse G2 allowlist. Existing
+    // groupless none/REALITY/manual-client-TLS behavior remains unchanged.
+    if (topology.groups.length && !supportedLegacyGroup(topology)) invalid('CONFIG_LEGACY_IMPORT_LAYOUT_UNSUPPORTED');
+    if (!forward && (topology.links.some(link => link.mode !== 'reverse'
         || !['none', 'reality'].includes(link.tunnelSecurity || 'none'))
         || topology.nodes.some(node => !supportedReverseClient(node, node.xray?.security || 'none')
             || node.xray?.extraInbounds?.some(inbound => !supportedReverseClient(node, inbound.security || 'reality'))))) {
@@ -130,6 +163,7 @@ function legacyProfileArtifacts(input, nodeId) {
     const current = JSON.parse(node.profileConfig);
     const generated = [];
     const forward = topology.links[0].mode === 'forward';
+    const groupedRelay = topology.groups.length === 1 && node.role === 'relay';
     if (node.role === 'portal' || forward) {
         // Verify client listener/transport/key metadata too, without claiming
         // current runtime clients were generated from a mutable user catalog.
@@ -154,20 +188,37 @@ function legacyProfileArtifacts(input, nodeId) {
         } else generator.applyReversePortal(delta, outgoing, clientTags);
         generated.push(delta);
     } else if (node.role === 'relay') {
-        generated.push(JSON.parse(generator.generateRelayConfig(incoming[0], incoming[0].portalNode, outgoing)));
+        const relay = JSON.parse(generator.generateRelayConfig(incoming[0], incoming[0].portalNode, outgoing));
+        if (groupedRelay) {
+            const [path] = topology.groups[0].paths;
+            // The fourth generateRelayConfig argument changes guard order.
+            // Reproduce the observed classic writer sequence, not that variant.
+            generator.applyCascadePathIngress(relay, [{ pathKey: path.pathKey, port: path.cascadePathIngress.port,
+                egressTag: `portal-down-${outgoing[0].id.slice(-8)}` }]);
+            require('./classicL2tpConfigComposition').finishClassicConfigRouting(relay);
+        }
+        generated.push(relay);
     } else {
         generated.push(JSON.parse(generator.generateCombinedBridgeConfig(incoming)));
         if (incoming.length === 1) generated.push(JSON.parse(generator.generateBridgeConfig(incoming[0], incoming[0].portalNode)));
     }
-    const reserved = forward ? /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/
+    const reserved = forward || topology.groups.length ? /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-)/
         : /^(?:bridge-conn-|portal-|bridge-|tunnel-|conn-down-|fwd-|cascade-in-)/;
+    if (groupedRelay) {
+        const inbounds = current.inbounds || [];
+        if (new Set(inbounds.map(row => row.tag)).size !== inbounds.length
+            || new Set(inbounds.map(row => row.port)).size !== inbounds.length) {
+            throw failure('CONFIG_LEGACY_IMPORT_PROFILE_MISMATCH');
+        }
+    }
     const sections = config => [config.inbounds || [], config.outbounds || [], config.reverse?.portals || [],
         config.reverse?.bridges || [], config.routing.rules];
     const matched = generated.find(expected => {
         const actualSections = sections(current), expectedSections = sections(expected);
         const tags = new Set(expectedSections.slice(0, 4).flat().map(item => item.tag));
         const owns = item => reserved.test(item.tag || '') || tags.has(item.tag);
-        const ownsRule = item => tags.has(item.outboundTag) || tags.has(item.balancerTag)
+        const ownsRule = item => (groupedRelay && (!Array.isArray(item.inboundTag) || !item.inboundTag.length))
+            || tags.has(item.outboundTag) || tags.has(item.balancerTag)
             || item.inboundTag?.some(tag => tags.has(tag) || reserved.test(tag))
             || reserved.test(item.outboundTag || '') || (forward && reserved.test(item.balancerTag || ''));
         for (let i = 0; i < 4; i++) {
