@@ -305,9 +305,7 @@ test('selected V2 settlement joins exact owner pointers, node releases, scoped p
             commandIds: Object.fromEntries(['prepare', 'commit', 'verify', 'rollback', 'close'].map(command => [command, randomUUID()])) };
         const enrollmentId = `enrolled:${node.node}`;
         const extra = { ownerGeneration: owner.generation, nodeIdentity: structuredClone(owner.nodeIdentity), endpoint: { ip: '192.0.2.1', port: 22, username: 'fixture' } };
-        // Match the real store's immutable adoption-receipt binding; the new
-        // post-settlement majority reread independently checks this field too.
-        rows.push({ ...binding, ...extra, enrollmentId, ownerReceiptProofId: owner.adoptionReceipt.proofId });
+        rows.push({ ...binding, ...extra, enrollmentId });
         enrollments.push({ ...binding, ...extra, _id: enrollmentId });
         f.NodeOperationLock.rows.push({ node: node.node, generation: binding.generation, operationId: operation._id,
             owner: 'v2-worker', leaseUntil, remoteUncertain: true });
