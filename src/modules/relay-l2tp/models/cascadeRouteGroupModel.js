@@ -6,14 +6,10 @@ const routePathSchema = new mongoose.Schema({
     pathKey: { type: String, required: true, trim: true },
     linkIds: {
         type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'CascadeLink' }],
+        // Installed publication retains the owner's path when no exit remains.
+        // Public route-group CRUD separately requires a nonempty ordered path.
         required: true,
         default: undefined,
-        validate: {
-            validator(linkIds) {
-                return linkIds.length > 0;
-            },
-            message: 'linkIds must contain at least one cascade link',
-        },
     },
     priority: {
         type: Number,

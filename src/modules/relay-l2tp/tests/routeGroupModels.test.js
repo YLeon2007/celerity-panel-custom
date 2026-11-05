@@ -79,8 +79,8 @@ test('pathKey values are unique within a route group', () => {
     }).validateSync(), undefined);
 });
 
-test('each route group path requires nonempty ordered linkIds', () => {
-    for (const linkIds of [undefined, []]) {
+test('each route group path requires typed ordered linkIds', () => {
+    for (const linkIds of [undefined, null, ['not-an-object-id']]) {
         const error = routeGroup({
             paths: [{ pathKey: 'primary', linkIds, priority: 1 }],
         }).validateSync();
@@ -94,6 +94,22 @@ test('each route group path requires nonempty ordered linkIds', () => {
     });
     assert.equal(group.validateSync(), undefined);
     assert.deepEqual(group.paths[0].linkIds.map(String), linkIds.map(String));
+});
+
+test('route group persistence retains an enabled empty path without losing peer policy', () => {
+    const peerLinks = [objectId(), objectId()];
+    const group = routeGroup({ paths: [
+        { pathKey: 'mine', linkIds: [], priority: 4, enabled: true },
+        { pathKey: 'peer', linkIds: peerLinks, priority: 9, enabled: false },
+    ] });
+    assert.equal(group.validateSync(), undefined);
+    assert.equal(group.paths[0].pathKey, 'mine');
+    assert.deepEqual([...group.paths[0].linkIds], []);
+    assert.equal(group.paths[0].enabled, true);
+    assert.equal(group.paths[0].priority, 4);
+    assert.deepEqual(group.paths[1].linkIds.map(String), peerLinks.map(String));
+    assert.equal(group.paths[1].enabled, false);
+    assert.equal(group.paths[1].priority, 9);
 });
 
 test('each route group path requires a positive finite numeric priority', () => {

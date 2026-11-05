@@ -62,8 +62,8 @@ function stack(overrides = {}) {
         userManagementService: { createUser: forbidden, deleteUser: forbidden, importUser: forbidden },
         stateRepository: { getTopologyRevision: forbidden }, nodeSSHFactory: forbidden,
         topologyIngressGate: { async verifyPlan() { return { ok: true }; } },
-        topologyPppReadinessGate: { async verifyPlan() { return { ok: true, verifiedRelayCount: 1,
-            relayRevisions: [{ relayNode: id(1), credentialRevision: 41 }] }; } },
+        topologyPppReadinessGate: { async verifyPlan(plan) { return { ok: true, verifiedRelayCount: 1,
+            relayRevisions: [{ relayNode: plan.ownerNodeId, credentialRevision: plan.ownerCredentialRevision }] }; } },
     });
     const executor = {
         async prepare(input) { trace.push(['prepare', input.node.node]); return { backupId: 'modeled-external-backup', prepared: {} }; },
@@ -84,6 +84,7 @@ function stack(overrides = {}) {
     });
     const joined = draft.createIntentDraftWriter({ selectedTopologyRepository: deployment });
     const dependencies = { ...models, executionContext: context, prepareLink: prepareIntentLink,
+        deleteIntentWriter: models.CascadeLink.createDeleteIntentWriter({ CascadeLink: models.CascadeLink }),
         intentDraftWriter: { db: joined.db, createLink: joined.createLink,
             async updateLink(input) {
                 assert.equal(input.session.inTransaction(), true);
@@ -99,25 +100,25 @@ function stack(overrides = {}) {
         writes: new TopologyDraftWriteService({ repository: draft }),
         service: new TopologyIntentService(dependencies), consumer: new TopologyIntentConsumer(dependencies) };
 }
-async function apply(f) {
+async function apply(f, linkId = id(10)) {
     const queued = await f.coordinator.queue({ expectedTopologyRevision: await revision(),
-        scope: { kind: 'link.apply', linkId: id(10), linkIds: [id(10)] } });
+        scope: { kind: 'link.apply', linkId, linkIds: [linkId] } });
     const result = await f.worker.run(queued.operationId);
     assert.equal(result.status, 'succeeded', JSON.stringify(result));
     return operation(queued.operationId);
 }
-async function baseline() {
+async function baseline({ peer = false } = {}) {
     await mongo.reset();
     await models.CascadeTopologyState.create({ _id: 'singleton', revision: 7, deployedRevision: 3,
         remoteAdmissionCount: 0, topologyAdmissionCount: 0 });
-    await models.HyNode.create(['relay', 'bridge'].map((cascadeRole, index) => ({ _id: id(index + 1), name: `scratch-${cascadeRole}`,
+    await models.HyNode.create((peer ? ['relay', 'bridge', 'relay', 'bridge'] : ['relay', 'bridge']).map((cascadeRole, index) => ({ _id: id(index + 1), name: `scratch-${cascadeRole}-${index}`,
         cascadeRole, type: 'xray', active: true, ip: `192.0.2.${index + 1}`, port: 443, xray: { security: 'none', transport: 'tcp' } })));
     const transfer = new TopologyConfigTransfer({ executionContext: context, TopologyConfigOwner: models.TopologyConfigOwner,
         withVerifiedMaintenance: async ({ binding }, work) => work({ status: 'verified', authority: 'external-maintenance-v1', binding,
             proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
             oldBackend: { instanceId: 'MODELED-only', pid: 42, processStartTime: 'MODELED-only', processTree: 'stopped', dispatch: 'disabled' },
             readback: { source: 'node-readback', configSha256: sha('{}'), unitSha256: sha('modeled-unit'), serviceActive: 'active', serviceEnabled: 'enabled' } }) });
-    for (const number of [1, 2]) {
+    for (const number of (peer ? [1, 2, 3, 4] : [1, 2])) {
         const original = await transfer.initializeClassic({ node: id(number), profile: 'xray-bridge',
             nodeIdentity: { machineId: String(number).repeat(32), sshHostKeySha256: String(number).repeat(64) } });
         await transfer.adopt({ node: id(number), profile: original.profile, generation: original.generation, proofRef: 'MODELED-external-maintenance' });
@@ -129,12 +130,32 @@ async function baseline() {
         tunnelPort: 23410, tunnelSecurity: 'none', tunnelTransport: 'tcp', active: true } });
     await f.writes.createRouteGroup({ expectedTopologyRevision: await revision(), routeGroup: { _id: id(60), name: 'installed owned group',
         mode: 'reverse', strategy: 'priority-failover', paths: [] } });
+    if (peer) {
+        await f.writes.createLink({ expectedTopologyRevision: await revision(), link: { _id: id(13), name: 'preserved geo peer link',
+            portalNode: id(1), bridgeNode: id(4), tunnelUuid: '88888888-8888-4888-8888-888888888888',
+            tunnelPort: 23413, tunnelSecurity: 'none', tunnelTransport: 'tcp', active: true } });
+        await models.RelayL2tpState.create({ node: id(1), routeGroup: id(60), activePathKey: 'peer',
+            status: 'installed', desiredState: 'installed', secretRevision: 41, appliedTopologyRevision: 0,
+            pskEncrypted: 'dummy-encrypted-psk-preserved', clientCidr: '10.255.30.0/24', localAddress: '10.255.30.1',
+            poolStart: '10.255.30.10', poolEnd: '10.255.30.250', tproxyPort: 12345, fwmark: 100, routeTable: 100 });
+        await models.L2tpUser.create({ relayNode: id(1), login: 'kept-peer', passwordEncrypted: 'dummy-peer-password', ip: '10.255.30.11' });
+        await apply(f, id(13));
+        const group = await models.CascadeRouteGroup.findById(id(60)).lean();
+        assert.deepEqual(group.paths.find(path => path.pathKey === 'peer').linkIds.map(String), [id(13)]);
+        // Explicit modeled pre-existing MAIN selection, not a terminal seed.
+        // Publish peer bytes first; metadata alone cannot authorize an ingress.
+        await models.RelayL2tpState.updateOne({ node: id(1) }, { $set: { activePathKey: 'mine' } }, { runValidators: true });
+        await f.writes.updateLink({ expectedTopologyRevision: await revision(), linkId: id(13), changes: { geoRouting: policy().geoRouting } });
+        await apply(f, id(13));
+    }
     // Schema-valid pre-existing installed PPP inventory, explicitly MODELED.
     // No sync/topology operation or successful terminal status is seeded here.
-    await models.RelayL2tpState.create({ node: id(1), routeGroup: id(60), activePathKey: 'mine',
+    if (!peer) await models.RelayL2tpState.create({ node: id(1), routeGroup: id(60), activePathKey: 'mine',
         status: 'installed', desiredState: 'installed', secretRevision: 41, appliedTopologyRevision: 0,
         pskEncrypted: 'dummy-encrypted-psk-preserved', clientCidr: '10.255.30.0/24', localAddress: '10.255.30.1',
         poolStart: '10.255.30.10', poolEnd: '10.255.30.250', tproxyPort: 12345, fwmark: 100, routeTable: 100 });
+    // Pre-existing user inventory only: pending is not a fabricated sync proof.
+    await models.L2tpUser.create({ relayNode: id(1), login: 'kept-main', passwordEncrypted: 'dummy-main-password', ip: '10.255.30.10' });
     const published = await apply(f);
     assert.equal(published.status, 'succeeded');
     const group = await models.CascadeRouteGroup.findById(id(60)).lean();
@@ -155,9 +176,9 @@ async function http(f, work) {
         invalidateSubscriptions: async () => {}, invalidateTopology: async () => {} }));
     const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
     try {
-        await work(async (body, key) => {
-            const response = await fetch(`http://127.0.0.1:${server.address().port}/links/${id(10)}`, {
-                method: 'PUT', headers: { 'content-type': 'application/json', ...(key ? { 'idempotency-key': key } : {}) }, body: JSON.stringify(body) });
+        await work(async (body, key, { method = 'PUT', linkId = id(10) } = {}) => {
+            const response = await fetch(`http://127.0.0.1:${server.address().port}/links${method === 'POST' ? '' : `/${linkId}`}`, {
+                method, headers: { 'content-type': 'application/json', ...(key ? { 'idempotency-key': key } : {}) }, body: JSON.stringify(body) });
             return { status: response.status, body: await response.json() };
         });
     } finally { await new Promise(resolve => server.close(resolve)); }
@@ -171,9 +192,22 @@ async function inventory() {
         owners: await models.TopologyConfigOwner.find({}).sort({ _id: 1 }).lean(),
         operations: await models.TopologyOperation.find({}).select(privateOperation).sort({ _id: 1 }).lean(),
         relay: await models.RelayL2tpState.find({}).select('+pskEncrypted').lean(),
+        users: await models.L2tpUser.find({}).select('+passwordEncrypted').sort({ _id: 1 }).lean(),
         groups: await models.CascadeRouteGroup.find({}).sort({ _id: 1 }).lean() };
 }
-const publication = value => Object.fromEntries(['owners', 'operations', 'relay', 'groups'].map(key => [key, value[key]]));
+const publication = value => Object.fromEntries(['owners', 'operations', 'relay', 'groups', 'users'].map(key => [key, value[key]]));
+function assertBlockedCandidate(op) {
+    const node = op.nodes.find(row => String(row.node) === op.installedPath.ownerNodeId);
+    const bytes = Buffer.from(node.candidate.bytes), config = JSON.parse(bytes);
+    assert.equal(sha(bytes), node.candidateHash);
+    const { cascadePathIngressPort } = require('../domain/cascadePathIngress');
+    assert.equal(config.inbounds.filter(row => row.tag === 'cascade-mine' && row.protocol === 'socks'
+        && row.listen === '127.0.0.1' && row.port === cascadePathIngressPort(id(60), 'mine')).length, 1);
+    const rules = config.routing.rules.filter(row => row.inboundTag?.includes('cascade-mine'));
+    assert.deepEqual(rules, [{ type: 'field', inboundTag: ['cascade-mine'], outboundTag: 'block' }]);
+    assert.equal(config.routing.rules.indexOf(rules[0]), 0, 'no-exit block must preempt global/reverse selectors');
+    assert.equal(config.outbounds.find(row => row.tag === 'block').protocol, 'blackhole');
+}
 function transactionEvidence(commands, terminal) {
     const ended = commands.filter(row => row.name === terminal); assert.equal(ended.length, 1);
     const key = row => `${row.lsid}:${row.txnNumber}`;
@@ -254,6 +288,18 @@ for (const geo of [false, true]) test(`installed ${geo ? 'geo-only blocked path 
     assert.equal((await stack().service.get(accepted.jobId)).status, 'succeeded');
     const published = await inventory();
     assert.equal(published.relay[0].secretRevision, 41); assert.equal(published.relay[0].pskEncrypted, before.relay[0].pskEncrypted);
+    assert.deepEqual(published.users, before.users);
+    const op = published.operations.find(row => String(row._id) === queued.operationId);
+    const path = published.groups[0].paths.find(row => row.pathKey === 'mine');
+    assert.deepEqual(path.linkIds.map(String), geo ? [] : [id(10)]);
+    assert.equal(path.enabled, true);
+    assert.equal(path.priority, before.groups[0].paths[0].priority);
+    assert.equal(op.heldTopologyAdmission, false);
+    assert.equal(published.state.topologyAdmissionCount, 0);
+    if (geo) {
+        assert.deepEqual(op.installedPath.newPathLinkIds, []);
+        assertBlockedCandidate(op);
+    }
     assert.ok(published.owners.every(row => String(row.lastSettledOperation) === queued.operationId));
     const read = await f.deployment.readSelected({ snapshot: await f.draft.readDraft(),
         scope: { kind: 'link.apply', linkId: id(10) }, executionContext: context });
@@ -341,3 +387,105 @@ for (const [field, value] of [['tunnelUuid', 'different-key'], ['tunnelTransport
         assert.deepEqual(await inventory(), before);
     });
 }
+
+test('real Mongo retained-empty publication still rejects malformed path updates without changing the group', async () => {
+    await baseline();
+    const before = await models.CascadeRouteGroup.findById(id(60)).lean();
+    const path = { pathKey: 'mine', linkIds: [], priority: 1, enabled: true };
+    const cases = [
+        [{ ...path, linkIds: undefined }], [{ ...path, linkIds: null }],
+        [{ ...path, linkIds: ['not-an-object-id'] }], [{ ...path, pathKey: '' }],
+        [{ ...path, priority: 0 }], [{ ...path, priority: -1 }], [{ ...path, priority: Infinity }],
+        [path, { ...path, priority: 2 }],
+    ];
+    for (const paths of cases) {
+        await assert.rejects(models.CascadeRouteGroup.updateOne({ _id: id(60) }, { $set: { paths } }, { runValidators: true }));
+        assert.deepEqual(await models.CascadeRouteGroup.findById(id(60)).lean(), before);
+    }
+});
+
+test('real Mongo late installed publication failure rolls back owner/group/epoch and retains admission and locks', async () => {
+    const f = await baseline(), before = await inventory(); let accepted;
+    await http(f, async request => {
+        const response = await request(policy({ expectedTopologyRevision: before.state.revision }), 'late-publication-abort');
+        assert.equal(response.status, 202, JSON.stringify(response)); accepted = response.body.job;
+    });
+    const claimed = await f.consumer.claim(), queued = await f.consumer.consumeVersioned(claimed);
+    const original = models.CascadeRouteGroup.updateOne; let injected = 0;
+    models.CascadeRouteGroup.updateOne = async function (filter, update, options) {
+        const result = await original.call(this, filter, update, options);
+        if (options?.session?.inTransaction() && update.$set?.paths) {
+            assert.equal(result.matchedCount, 1);
+            const inside = await this.findById(id(60)).session(options.session).lean();
+            assert.deepEqual(inside.paths.find(path => path.pathKey === 'mine').linkIds, []);
+            assert.deepEqual(await this.findById(id(60)).lean(), before.groups[0]);
+            injected++; throw Error('INJECTED after actual validated empty-path write, before commit');
+        }
+        return result;
+    };
+    const start = mongo.commands.length; let result;
+    try { result = await f.worker.run(queued.operationId); }
+    finally { models.CascadeRouteGroup.updateOne = original; }
+    assert.equal(injected, 1); assert.equal(result.status, 'committing');
+    const after = await inventory(), op = after.operations.find(row => String(row._id) === queued.operationId);
+    assert.deepEqual(after.owners, before.owners); assert.deepEqual(after.groups, before.groups);
+    assert.deepEqual(after.relay, before.relay); assert.deepEqual(after.users, before.users);
+    assert.equal(op.heldTopologyAdmission, true);
+    assert.equal(after.state.topologyAdmissionCount, 1);
+    assert.equal(await models.NodeOperationLock.countDocuments({ operationId: queued.operationId }), 2);
+    assert.equal((await f.service.get(accepted.jobId)).status, 'admitted');
+    assertBlockedCandidate(op);
+    assert.ok(mongo.commands.slice(start).some(row => row.name === 'abortTransaction'));
+});
+
+test('real public DELETE to retained empty path and fresh POST recreate preserve nonempty peer and users', async () => {
+    const f = await baseline({ peer: true }), before = await inventory();
+    const peer = before.groups[0].paths.find(path => path.pathKey === 'peer');
+    assert.deepEqual(peer.linkIds.map(String), [id(13)]);
+    const peerBytes = f.files.get(id(4));
+    let deleted, created;
+    async function consume(job) {
+        const claimed = await f.consumer.claim(); assert.equal(String(claimed._id), job.jobId);
+        const queued = await f.consumer.consumeVersioned(claimed);
+        assert.equal((await operation(queued.operationId)).heldTopologyAdmission, true);
+        const result = await f.worker.run(queued.operationId);
+        assert.equal(result.status, 'succeeded', JSON.stringify(result));
+        assert.equal(await f.consumer.settle(await models.TopologyCreateIntent.findById(job.jobId).lean()), true);
+        const op = await operation(queued.operationId);
+        assert.equal(op.heldTopologyAdmission, false); assert.equal(await models.NodeOperationLock.countDocuments(), 0);
+        assert.equal((await models.CascadeTopologyState.findById('singleton').lean()).topologyAdmissionCount, 0);
+        return op;
+    }
+    await http(f, async request => {
+        const response = await request({ expectedTopologyRevision: await revision() }, 'delete-to-empty', { method: 'DELETE' });
+        assert.equal(response.status, 202, JSON.stringify(response)); deleted = response.body.job;
+    });
+    const retained = await models.CascadeLink.findById(id(10)).lean();
+    assert.equal(retained.lifecycle.state, 'deleting'); assert.equal(String(retained.lifecycle.deleteJobId), deleted.jobId);
+    assert.deepEqual((await inventory()).groups, before.groups, 'accepted deletion cannot publish early');
+    const deletion = await consume(deleted); assertBlockedCandidate(deletion);
+    assert.equal(await models.CascadeLink.findById(id(10)).lean(), null);
+    const empty = await inventory();
+    assert.deepEqual(empty.groups[0].paths.find(path => path.pathKey === 'mine').linkIds, []);
+    assert.deepEqual(empty.groups[0].paths.find(path => path.pathKey === 'peer'), peer);
+    const old = before.links.find(row => String(row._id) === id(10));
+    await http(f, async request => {
+        const response = await request({ expectedTopologyRevision: await revision(), autoDeploy: true,
+            name: 'fresh recreated exit', portalNodeId: id(1), bridgeNodeId: id(2), mode: 'reverse',
+            tunnelPort: old.tunnelPort, tunnelUuid: old.tunnelUuid, tunnelSecurity: 'none', tunnelTransport: 'tcp' },
+        'recreate-after-empty', { method: 'POST' });
+        assert.equal(response.status, 202, JSON.stringify(response)); created = response.body.job;
+    });
+    assert.notEqual(created.jobId, deleted.jobId); assert.notEqual(created.linkId, id(10));
+    const recreated = await consume(created), after = await inventory();
+    assert.deepEqual(recreated.installedPath.oldPathLinkIds, []);
+    assert.deepEqual(after.groups[0].paths.find(path => path.pathKey === 'mine').linkIds.map(String), [created.linkId]);
+    assert.deepEqual(after.groups[0].paths.find(path => path.pathKey === 'peer'), peer);
+    assert.equal(f.files.get(id(4)), peerBytes);
+    assert.deepEqual(after.users, before.users);
+    const state = after.relay.find(row => String(row.node) === id(1)), prior = before.relay.find(row => String(row.node) === id(1));
+    for (const key of ['pskEncrypted', 'secretRevision', 'clientCidr', 'localAddress', 'poolStart', 'poolEnd',
+        'dnsServers', 'routeGroup', 'activePathKey', 'status', 'desiredState']) assert.deepEqual(state[key], prior[key]);
+    assert.equal(after.links.find(row => String(row._id) === created.linkId).tunnelUuid, old.tunnelUuid);
+    assert.equal(after.counters[0].outstanding, 0);
+});
