@@ -34,9 +34,11 @@ def verify(run):
     traffic = [r for r in rows if r['kind'] == 'traffic']
     controls = [r for r in rows if r['kind'] == 'no-reader-control']
     imports = [r for r in rows if r['kind'] == 'public-import']
-    assert len(imports) == 1 and len(imports[0]['pins']) == 2
-    assert {p['targetProfile'] for p in imports[0]['pins']} == {'xray-main', 'xray-bridge'}
-    assert {p['role'] for p in imports[0]['pins']} == {'portal', 'bridge'}
+    assert len(imports) == 1 and len(imports[0]['owners']) == 2
+    assert {p['profile'] for p in imports[0]['owners']} == {'xray-main', 'xray-bridge'}
+    imported = load('public-import.private.json')
+    assert len(imported) == 2 and all('profileTargetPin' not in owner for owner in imported)
+    assert {(o['node'], o['profile'], o['generation']) for o in imported} == {(o['node'], o['profile'], o['generation']) for o in imports[0]['owners']}
     assert len(controls) == 1 and controls[0]['dispatch'] == 0 and controls[0]['code'] == 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN'
     assert [r['label'] for r in plans] == matrix['planStages'] == ['apply', 'noop', 'delete', 'recreate']
     assert len({r['operationId'] for r in plans}) == len(plans) == result['planExecutions'] == 4
@@ -59,7 +61,7 @@ def verify(run):
     assert len(terminals) == 8 and all(p['terminalOutcome'] == 'verified' and p['ownershipRetained'] and p['terminal'] for p in terminals)
     noops = [p for p in plans if p['noop']]
     assert len(noops) == 1 and all(e['before'] == e['after'] for p in noops for e in p['evidence'])
-    assert all(e['profileTargetPin'] in imports[0]['pins'] for p in plans for e in p['evidence'])
+    assert all('profileTargetPin' not in e for p in plans for e in p['evidence'])
     for node in ['p', 'b']:
         observations = [e for p in plans for e in p['evidence'] if e['node'] == node]
         assert len(observations) == 4
@@ -149,7 +151,7 @@ def verify(run):
     summary = {'run': str(run), 'security': matrix['security'], 'variant': matrix['variant'], 'plans': len(plans), 'terminalProofs': len(terminals),
         'runnerCommands': dict(counts), 'trafficProbes': len(traffic), 'positiveProbes': len(traffic) - len(blocked),
         'blockedNoDirect': len(blocked), 'byteNoopNodes': sum(len(p['evidence']) for p in noops),
-        'preservedSelectedProfiles': 2, 'preservedIndependentProfiles': 2, 'recreations': 1, 'publicProducedPins': len(imports[0]['pins']),
+        'preservedSelectedProfiles': 2, 'preservedIndependentProfiles': 2, 'recreations': 1, 'publicImportedOwners': len(imported), 'publicOwners': 4,
         'sourceCommit': pins['sourceCommit'], 'sourceTree': pins['sourceTree'], 'productBase': pins['productBaseCommit'],
         'authority': result['authorityAdapter'], 'cleanupVerified': True, 'notProved': result['notProved']}
     (run / 'verified-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
@@ -163,6 +165,6 @@ if __name__ == '__main__':
     if len(summaries) == 2:
         assert {s['security'] for s in summaries} == {'none', 'reality'}
         assert len({s['sourceCommit'] for s in summaries}) == 1
-        aggregate['totals'] = {key: sum(s[key] for s in summaries) for key in ['plans', 'terminalProofs', 'trafficProbes', 'positiveProbes', 'blockedNoDirect', 'byteNoopNodes', 'preservedSelectedProfiles', 'preservedIndependentProfiles', 'recreations', 'publicProducedPins']}
+        aggregate['totals'] = {key: sum(s[key] for s in summaries) for key in ['plans', 'terminalProofs', 'trafficProbes', 'positiveProbes', 'blockedNoDirect', 'byteNoopNodes', 'preservedSelectedProfiles', 'preservedIndependentProfiles', 'recreations', 'publicImportedOwners', 'publicOwners']}
         (ROOT / 'verified-summary.json').write_text(json.dumps(aggregate, indent=2) + '\n')
     print(json.dumps(aggregate, indent=2))

@@ -10,9 +10,9 @@ const {model} = require('./owner-model.cjs');
 const root = process.env.C3_CANDIDATE_ROOT, work = process.env.C3_FIXTURE_WORK;
 const candidate = name => require(path.join(root, name));
 const generator = candidate('src/services/configGenerator');
-const {TopologyConfigTransfer} = candidate('src/services/topologyConfigTransfer');
+const {TopologyConfigTransfer, verifyLegacyAppliedProfile} = candidate('src/services/topologyConfigTransfer');
 const {TEST_TOPOLOGY_EXECUTION_CONTEXT: context} = candidate('src/modules/relay-l2tp/domain/topologyExecutionContext');
-const {verifyImportedProfileTargetPin} = candidate('src/modules/relay-l2tp/services/topologyProfileTarget');
+
 const {TopologyOperationPlanMaterializer} = candidate('src/modules/relay-l2tp/services/topologyOperationPlanMaterializer');
 const {compileTopology} = candidate('src/modules/relay-l2tp/domain/topologyCompiler');
 const {TopologyOperationExecutor, isTopologyTerminalProof} = candidate('src/modules/relay-l2tp/services/topologyOperationExecutor');
@@ -102,7 +102,7 @@ async function execute(plan, name, noop) {
     const records = new Map(contexts.map(c => [c.node.node, freeze({operationId: op, nodeId: c.node.node,
         topologyRevision: sequence, priorDeployedRevision: sequence - 1, candidateHash: `sha256:${c.node.candidateHash}`,
         backupId: `topology-${sha([op, c.node.node, `sha256:${c.node.candidateHash}`, c.node.targetProfile].join('\0'))}`,
-        targetProfile: c.node.targetProfile, profileTargetPin: copy(c.node.profileTargetPin), executionContext: context.hostIdentity, ...fence,
+        targetProfile: c.node.targetProfile, executionContext: context.hostIdentity, ...fence,
         attemptId: `attempt-${sequence}`, predecessorGeneration: heads.get(c.node.node) || 'none',
         bootId: cfg.nodes[short(c.node.node)].bootId, maintenanceId: cfg.runId,
         commandIds: Object.fromEntries(['prepare', 'commit', 'verify', 'rollback', 'close'].map(command => [command, `${command}-${sequence}-${short(c.node.node)}`]))})]));
@@ -115,7 +115,8 @@ async function execute(plan, name, noop) {
     const before = new Map();
     for (const c of contexts) {
         assert.equal(c.node.targetProfile, target(short(c.node.node)));
-        assert.deepEqual(c.node.profileTargetPin, selectedOwners.find(o => o.node === c.node.node).profileTargetPin);
+        assert.equal(Object.hasOwn(c.node, 'profileTargetPin'), false, 'reverse uses native role-default targets, not forward pins');
+        assert.equal(c.node.targetProfile, selectedOwners.find(o => o.node === c.node.node).profile);
         before.set(c.node.node, await profile(short(c.node.node), selected(short(c.node.node))));
     }
     const lifecycle = [];
@@ -298,7 +299,9 @@ async function main() {
         const confirmed = await Owner.findOne({node: node.id, profile: profileName}).select('+legacyAppliedTopology +profileTargetPin').lean();
         assert.deepEqual(confirmed, adopted); allOwners.push(freeze(copy(confirmed)));
         if (name === selected(id)) {
-            assert.deepEqual(verifyImportedProfileTargetPin({owner: confirmed, profileTargetPin: confirmed.profileTargetPin, executionContext: context}), confirmed.profileTargetPin);
+            assert.equal(Object.hasOwn(confirmed, 'profileTargetPin'), false);
+            assert.deepEqual(verifyLegacyAppliedProfile(confirmed.legacyAppliedTopology, {node: node.id,
+                profile: profileName, originalSnapshot: confirmed.originalSnapshot}), confirmed.legacyAppliedTopology);
             owners.push(freeze(copy(confirmed)));
         }
         assert.deepEqual(await profile(id, name), originals.get(id)[name], 'adoption wrote profile');
@@ -306,7 +309,9 @@ async function main() {
     selectedOwners = freeze(owners.map(({legacyAppliedTopology, ...pin}) => copy(pin)));
     const immutable = sha(JSON.stringify(owners));
     save('public-import.private.json', owners); save('all-owners.private.json', allOwners);
-    ledger({kind: 'public-import', pins: selectedOwners.map(o => o.profileTargetPin), authority: 'synthetic-external-hold/local-query-model', status: 'passed'});
+    ledger({kind: 'public-import', owners: selectedOwners.map(o => ({node: o.node, profile: o.profile, generation: o.generation,
+        originalSnapshot: o.originalSnapshot, adoptionReceiptSha256: sha(JSON.stringify(o.adoptionReceipt))})),
+        authority: 'synthetic-external-hold/local-query-model', status: 'passed'});
     save('matrix.json', {security: cfg.security, stages: ['baseline', 'apply', 'noop', 'delete', 'recreate'], planStages: ['apply', 'noop', 'delete', 'recreate'], probesPerStage: cfg.variant === 'extra' ? 6 : 5, variant: cfg.variant});
     await probes('baseline'); await artifacts('baseline', link);
     await transition([link], 'apply'); await probes('apply'); await artifacts('apply', link);
