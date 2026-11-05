@@ -52,6 +52,39 @@ function ownerVeto(rows, nodeId, context, ObjectId) {
     return rows.some(row => row.owner === 'topology');
 }
 
+// A completed V2 settlement already carries the checked permanent-owner fence.
+// Handback invalidates that generation for future binding-store dispatch. Only
+// its exact settled rows become history; a classic label/receipt alone never
+// retires pending, uncertain, legacy or foreign-generation execution evidence.
+function handedBackHistory(operation, owners, nodeId, context) {
+    const { isDeepStrictEqual: same } = require('node:util');
+    const { validTerminalReceipt } = require('../modules/relay-l2tp/models/topologyExecutionBindingContract');
+    const terminal = operation?.v2Terminal;
+    if (operation?.status !== 'succeeded' || operation.heldTopologyAdmission !== false
+        || !matchesTopologyExecutionContext(operation.executionContext, context)
+        || terminal?.state !== 'proven' || terminal.sideEffects?.usersVerified !== true
+        || !Array.isArray(operation.nodes) || !Array.isArray(terminal.bindings)
+        || !Array.isArray(terminal.proofs) || !Array.isArray(terminal.ownerFences)
+        || [terminal.bindings, terminal.proofs, terminal.ownerFences].some(rows => rows.length !== operation.nodes.length)) return false;
+    const nodes = operation.nodes.filter(entry => String(entry.node) === nodeId);
+    if (nodes.length !== 1) return false;
+    const node = nodes[0], owner = owners.find(row => row.profile === node.targetProfile);
+    if (node.state !== 'committed' || owner?.owner !== 'classic' || !owner.handbackReceipt) return false;
+    const index = terminal.bindings.findIndex(binding => binding.nodeId === nodeId && binding.targetProfile === node.targetProfile);
+    if (index < 0 || terminal.bindings.filter(binding => binding.nodeId === nodeId).length !== 1) return false;
+    const binding = terminal.bindings[index], proof = terminal.proofs[index];
+    const expectedFence = { node: nodeId, profile: owner.profile, executionContext: context, owner: 'topology',
+        generation: owner.handbackReceipt.fromGeneration, nodeIdentity: owner.nodeIdentity,
+        originalSnapshot: owner.originalSnapshot, adoptionReceipt: owner.adoptionReceipt };
+    return same(terminal.ownerFences[index], expectedFence)
+        && binding.operationId === String(operation._id) && binding.executionContext === context?.hostIdentity
+        && binding.owner === operation.leaseOwner && binding.attempt === operation.attempts
+        && binding.topologyRevision === operation.topologyRevision && binding.priorDeployedRevision === operation.priorDeployedRevision
+        && binding.candidateHash === `sha256:${node.candidateHash}` && binding.backupId === node.backupId
+        && uuid(binding.generation) && uuid(binding.attemptId) && uuid(binding.commandIds?.close)
+        && validTerminalReceipt(proof, binding) && proof.terminalOutcome === 'verified';
+}
+
 const APPLIED_LINK_STATUSES = Object.freeze(['staged', 'deployed', 'online']);
 
 // Compatibility for the already topology-managed TEST installation only.
@@ -69,27 +102,21 @@ async function topologyManagesNodeConfig(node, env = process.env) {
     const releaseEnv = Object.freeze({ PANEL_DOMAIN: env.PANEL_DOMAIN,
         TOPOLOGY_TEST_EXECUTION_ENABLED: env.TOPOLOGY_TEST_EXECUTION_ENABLED,
         TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: env.TOPOLOGY_PRODUCTION_EXECUTION_ENABLED });
+    let historicalVeto = false, historyQuery, TopologyOperation;
     if (node?._id) {
-        const TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
-        // A server-persisted plan is a conservative veto of classic writes,
-        // even after execution is disabled or link metadata/roles are edited.
-        // This is NOT authority to adopt/mutate legacy PROD nodes: operation
-        // history has no durable paired per-node adoption/handback contract.
-        if (await TopologyOperation.exists({ $or: [
+        TopologyOperation = require('../modules/relay-l2tp/models/topologyOperationModel');
+        historyQuery = { $or: [
             { 'nodes.node': node._id, status: { $in: ['queued', 'preparing', 'committing', 'rolling_back'] } },
             { nodes: { $elemMatch: { node: node._id, state: { $in: ['prepared', 'committed', 'failed'] } } } },
             { 'nodes.node': node._id, heldTopologyAdmission: true },
-        ] })) {
-            // Never waive active or retained operations. Original history query
-            // stays intact; only the exact finite TEST receipt may retire it.
-            if (await TopologyOperation.exists({ 'nodes.node': node._id, $or: [
-                { status: { $in: ['queued', 'preparing', 'committing', 'rolling_back'] } },
-                { heldTopologyAdmission: true },
-            ] })) return true;
-            const { hasTestLegacyTopologyRelease } = require('./testLegacyTopologyRelease');
-            if (!await hasTestLegacyTopologyRelease({ db: require('mongoose').connection.db,
-                nodeId: String(node._id), env: releaseEnv })) return true;
-        }
+        ] };
+        historicalVeto = !!await TopologyOperation.exists(historyQuery);
+        // Handback never waives active or retained work, including pending rows
+        // with no terminal receipt. Preserve the independent finite TEST path.
+        if (historicalVeto && await TopologyOperation.exists({ 'nodes.node': node._id, $or: [
+            { status: { $in: ['queued', 'preparing', 'committing', 'rolling_back'] } },
+            { heldTopologyAdmission: true },
+        ] })) return true;
     }
     if (node?._id) {
         // Native read only: importing the owner model here would register an
@@ -100,6 +127,30 @@ async function topologyManagesNodeConfig(node, env = process.env) {
         }, { readPreference: 'primary', readConcern: { level: 'majority' },
             maxTimeMS: 5000, timeoutMS: 5000, limit: 3 }).toArray();
         if (ownerVeto(rows, String(node._id), context, mongoose.Types.ObjectId)) return true;
+        const handedBack = rows.some(row => row.handbackReceipt);
+        if (historicalVeto || handedBack) {
+            let settled = false;
+            if (handedBack) {
+                // A receipt is not evidence about a pending/unknown resource.
+                // Check every operation touching this node, not only the older
+                // prepared/committed compatibility veto. No history remains a
+                // valid pre-native handback; contradictory nonempty evidence
+                // must not disappear between the existence and full reads.
+                const operations = await TopologyOperation.find({ 'nodes.node': node._id })
+                    .read('primary').readConcern('majority').maxTimeMS(5000).lean();
+                settled = Array.isArray(operations) && (!historicalVeto || operations.length > 0)
+                    && operations.every(operation => handedBackHistory(operation, rows, String(node._id), context));
+            }
+            if (!settled) {
+                if (!historicalVeto) return true;
+                const { hasTestLegacyTopologyRelease } = require('./testLegacyTopologyRelease');
+                if (!await hasTestLegacyTopologyRelease({ db: mongoose.connection.db,
+                    nodeId: String(node._id), env: releaseEnv })) return true;
+            }
+        }
+        // The TEST role/status heuristic predates paired ownership. It cannot
+        // re-adopt a profile just restored and handed back by the public CAS.
+        if (handedBack) return false;
     }
     if (!testCompatibility) return false;
     const CascadeLink = require('../models/cascadeLinkModel');

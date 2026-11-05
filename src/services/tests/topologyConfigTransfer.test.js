@@ -46,6 +46,50 @@ let connection, child, directory, Model;
 const NODE = '507f1f77bcf86cd799439011';
 const IDENTITY = Object.freeze({ machineId: '1'.repeat(32), sshHostKeySha256: '2'.repeat(64) });
 const SNAPSHOT = Object.freeze({ configSha256: '3'.repeat(64), unitSha256: '4'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' });
+// Public transfer contract exercised without starting Mongo or a node. The
+// maintenance attestor reads this modeled transport map; it is NOT operational
+// exclusion/systemd proof. Keep these controls runnable in the LOCAL-only slice.
+for (const context of [TEST, PROD]) test(`${context.target}: modeled original readback is required after settlement metadata`, async () => {
+    const { isDeepStrictEqual: same } = require('node:util');
+    let row, observed = { config: 'original-config', unit: 'original-unit', active: 'active', enabled: 'enabled' };
+    const matches = filter => row && Object.entries(filter).every(([key, value]) => same(row[key], value));
+    const Model = { collection: { indexes: async () => [{ key: { node: 1, profile: 1 }, unique: true }] },
+        db: { transaction: async work => work({ modeledTransaction: true }) },
+        create: async rows => { assert.equal(row, undefined); row = structuredClone(rows[0]); },
+        findOne(filter) { const q = { read: () => q, readConcern: () => q, maxTimeMS: () => q,
+            lean: async () => structuredClone(matches(filter) ? row : null) }; return q; },
+        async findOneAndUpdate(filter, update) {
+            if (!matches(filter)) return null;
+            Object.assign(row, structuredClone(update.$set));
+            for (const key of Object.keys(update.$unset || {})) delete row[key];
+            return structuredClone(row);
+        } };
+    const service = new contract.TopologyConfigTransfer({ executionContext: context, TopologyConfigOwner: Model,
+        withVerifiedMaintenance: async ({ binding }, work) => work({ binding: structuredClone(binding), status: 'verified', authority: 'external-maintenance-v1',
+            proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
+            oldBackend: { instanceId: 'modeled', pid: 42, processStartTime: 'modeled-start', processTree: 'stopped', dispatch: 'disabled' },
+            readback: { source: 'node-readback', configSha256: createHash('sha256').update(observed.config).digest('hex'),
+                unitSha256: createHash('sha256').update(observed.unit).digest('hex'), serviceActive: observed.active, serviceEnabled: observed.enabled } }) });
+    const initial = await service.initializeClassic({ node: NODE, profile: 'xray-main', nodeIdentity: IDENTITY });
+    const adopted = await service.adopt({ node: NODE, profile: 'xray-main', generation: initial.generation, proofRef: 'modeled-originals' });
+    // Metadata preservation control only, not fabricated execution evidence;
+    // actual worker settlement is covered in the assembled handback suite.
+    Object.assign(row, { lastSettledOperation: 'settlement-preservation-control', lastSettledGeneration: randomUUID(), lastSettledRevision: 9, lastSettledCloseId: randomUUID() });
+    const unchanged = structuredClone(row);
+    for (const [field, value] of [['config', 'native-config'], ['unit', 'different-unit'], ['active', 'inactive'], ['enabled', 'disabled']]) {
+        const original = observed[field]; observed[field] = value;
+        await assert.rejects(service.handback({ node: NODE, profile: 'xray-main', generation: adopted.generation, proofRef: 'incomplete-restoration' }), { code: 'CONFIG_RESTORATION_MISMATCH' });
+        assert.deepEqual(row, unchanged); observed[field] = original;
+    }
+    const returned = await service.handback({ node: NODE, profile: 'xray-main', generation: adopted.generation, proofRef: 'checked-originals' });
+    for (const key of ['originalSnapshot', 'adoptionReceipt', 'lastSettledOperation', 'lastSettledGeneration', 'lastSettledRevision', 'lastSettledCloseId']) assert.deepEqual(returned[key], unchanged[key]);
+    assert.equal(returned.handbackReceipt.fromGeneration, adopted.generation);
+    assert.equal(returned.handbackReceipt.toGeneration, returned.generation);
+    await assert.rejects(service.adopt({ node: NODE, profile: 'xray-main', generation: initial.generation, proofRef: 'stale-classic' }), { code: 'CONFIG_OWNERSHIP_CONFLICT' });
+    await assert.rejects(service.handback({ node: NODE, profile: 'xray-main', generation: adopted.generation, proofRef: 'stale-native' }), { code: 'CONFIG_OWNERSHIP_CONFLICT' });
+    assert.deepEqual(row, returned);
+});
+
 async function until(work) {
     let error;
     for (let i = 0; i < 120; i++) {

@@ -75,6 +75,11 @@ function stubSync(t, { connected = true, linkStatuses = ['deployed'], links = []
     } };
     t.after(() => { TopologyOperation.db.db = priorDb; });
     t.mock.method(TopologyOperation, 'exists', async query => operations.find(sift(query)) || null);
+    t.mock.method(TopologyOperation, 'find', query => {
+        const chain = { read: () => chain, readConcern: () => chain, maxTimeMS: () => chain,
+            lean: async () => structuredClone(operations.filter(sift(query))) };
+        return chain;
+    });
     t.mock.method(CascadeLink, 'exists', async query => {
         calls.queries.push(query);
         return connected && linkStatuses.some(status => !query.status || query.status.$in?.includes(status))
@@ -650,6 +655,107 @@ for (const writer of ['sync', 'cascade']) {
         });
     }
 }
+
+// Predicate controls only. The assembled compatible-handback suite separately
+// produces these fields through the actual executor/worker/terminal settlement.
+function settledHistory(owner) {
+    const binding = { operationId: '507f1f77bcf86cd799439099', nodeId: String(owner.node),
+        targetProfile: owner.profile, executionContext: owner.executionContext.hostIdentity,
+        candidateHash: `sha256:${'a'.repeat(64)}`, backupId: 'checked-backup', owner: 'worker', attempt: 1,
+        topologyRevision: 9, priorDeployedRevision: 8, generation: randomUUID(), attemptId: randomUUID(),
+        bootId: randomUUID(), maintenanceId: randomUUID(), predecessorGeneration: 'none',
+        commandIds: Object.fromEntries(['prepare', 'commit', 'verify', 'rollback', 'close'].map(key => [key, randomUUID()])) };
+    const proof = Object.fromEntries(['operationId', 'nodeId', 'targetProfile', 'executionContext', 'candidateHash',
+        'backupId', 'generation', 'attemptId', 'predecessorGeneration', 'bootId'].map(key => [key, binding[key]]));
+    Object.assign(proof, { ok: true, command: 'status', commandId: binding.commandIds.close, protocolVersion: 2,
+        completion: 'completed', phase: 'closed', terminal: true, ownershipRetained: true, terminalOutcome: 'verified',
+        systemdJob: 'completed', serviceState: 'active:running', completedCommand: 'close' });
+    const fence = Object.fromEntries(['node', 'profile', 'executionContext', 'owner', 'generation', 'nodeIdentity',
+        'originalSnapshot', 'adoptionReceipt'].map(key => [key, structuredClone(owner[key])]));
+    return { _id: binding.operationId, executionContext: owner.executionContext, status: 'succeeded', heldTopologyAdmission: false,
+        attempts: 1, leaseOwner: 'worker', topologyRevision: 9, priorDeployedRevision: 8,
+        nodes: [{ node: String(owner.node), targetProfile: owner.profile, state: 'committed', candidateHash: 'a'.repeat(64), backupId: 'checked-backup' }],
+        v2Terminal: { state: 'proven', bindings: [binding], proofs: [proof], ownerFences: [fence],
+            sideEffects: { usersVerified: true, attachVerified: false, pppProof: [] } } };
+}
+for (const context of [TEST, PROD]) test(`checked ${context.target} handback resumes ordinary Sync after its generation's terminal history`, async t => {
+    const owners = [], operations = [];
+    const calls = stubSync(t, { connected: true, owners, operations });
+    const service = fakeTransfer(owners, context);
+    const classic = await service.initializeClassic({ node: node()._id, profile: 'xray-main', nodeIdentity: adoptedOwner().nodeIdentity });
+    const adopted = await service.adopt({ node: node()._id, profile: 'xray-main', generation: classic.generation, proofRef: 'originals' });
+    operations.push(settledHistory(adopted));
+    operations.push({ status: 'failed', heldTopologyAdmission: true, nodes: [{ node: '507f1f77bcf86cd799439098', state: 'pending' }] });
+    const history = structuredClone(operations);
+    await service.handback({ node: node()._id, profile: 'xray-main', generation: adopted.generation, proofRef: 'checked-originals' });
+    await withFlags([true, true, true], () => withEnv({ PANEL_DOMAIN: context.hostIdentity }, async () => {
+        assert.equal(await syncService._topologyManagesNode(node()), false);
+        assert.equal(await writeClassic('sync', node()), true);
+    }));
+    assert.equal(calls.generated, 1);
+    assert.equal(calls.uploads.length, 1);
+    assert.deepEqual(operations, history, 'handback recognition never edits historical operation rows');
+});
+
+for (const [name, mutate] of [
+    ['in-flight pending successor', (op, ops) => ops.push({ status: 'preparing', nodes: [{ node: node()._id, state: 'pending' }] })],
+    ['queued successor', (op, ops) => ops.push({ status: 'queued', nodes: [{ node: node()._id, state: 'pending' }] })],
+    ['retained terminal', op => { op.heldTopologyAdmission = true; }],
+    ['unknown terminal', op => { op.status = 'failed'; }],
+    ['terminal pending resource', op => { op.nodes[0].state = 'pending'; }],
+    ['unknown pending resource', op => { op.status = 'failed'; op.nodes[0].state = 'pending'; delete op.v2Terminal; }],
+    ['unknown pending neighbor history', (op, ops) => ops.push({ status: 'failed', heldTopologyAdmission: false, nodes: [{ node: node()._id, state: 'pending' }] })],
+    ['prepared local node', op => { op.nodes[0].state = 'prepared'; }],
+    ['failed local node', op => { op.nodes[0].state = 'failed'; }],
+    ['legacy committed history', op => { delete op.v2Terminal; }],
+    ['foreign old history alongside settled generation', (op, ops) => ops.push({ status: 'succeeded', nodes: [{ node: node()._id, state: 'committed' }] })],
+    ['missing owner fence', op => { delete op.v2Terminal.ownerFences; }],
+    ['foreign owner generation', op => { op.v2Terminal.ownerFences[0].generation = randomUUID(); }],
+    ['foreign adoption receipt', op => { op.v2Terminal.ownerFences[0].adoptionReceipt.proofId = randomUUID(); }],
+    ['foreign original snapshot', op => { op.v2Terminal.ownerFences[0].originalSnapshot.configSha256 = '9'.repeat(64); }],
+    ['foreign physical identity', op => { op.v2Terminal.ownerFences[0].nodeIdentity.machineId = '9'.repeat(32); }],
+    ['foreign canonical context', op => { op.executionContext = TEST; }],
+    ['missing held-admission completion', op => { delete op.heldTopologyAdmission; }],
+    ['unproven close', op => { op.v2Terminal.state = 'closing'; }],
+    ['missing status readback', op => { op.v2Terminal.proofs = []; }],
+    ['wrong close ID', op => { op.v2Terminal.proofs[0].commandId = randomUUID(); }],
+    ['nonverified outcome', op => { op.v2Terminal.proofs[0].terminalOutcome = 'rolledback'; }],
+    ['foreign binding operation', op => { op.v2Terminal.bindings[0].operationId = 'foreign-operation'; }],
+    ['foreign profile', op => { op.nodes[0].targetProfile = 'xray-bridge'; }],
+    ['foreign candidate', op => { op.nodes[0].candidateHash = 'b'.repeat(64); }],
+    ['foreign attempt', op => { op.attempts++; }],
+    ['foreign generation in other local node', (op, ops) => ops.push({ status: 'failed', nodes: [
+        { node: node()._id, state: 'prepared' }, { node: 'foreign', state: 'committed' }] })],
+]) test(`paired handback never waives ${name}`, async t => {
+    const owners = [], operations = [];
+    const calls = stubSync(t, { connected: false, owners, operations });
+    const transfer = fakeTransfer(owners);
+    const original = await transfer.initializeClassic({ node: node()._id, profile: 'xray-main', nodeIdentity: adoptedOwner().nodeIdentity });
+    const adopted = await transfer.adopt({ node: node()._id, profile: 'xray-main', generation: original.generation, proofRef: 'originals' });
+    operations.push(settledHistory(adopted));
+    await transfer.handback({ node: node()._id, profile: 'xray-main', generation: adopted.generation, proofRef: 'restored' });
+    mutate(operations[0], operations);
+    const history = structuredClone(operations);
+    await withEnv({ PANEL_DOMAIN: PROD.hostIdentity }, async () => {
+        assert.equal(await syncService._topologyManagesNode(node()), true);
+        await writeClassic('sync');
+    });
+    assert.equal(calls.generated, 0); assert.deepEqual(calls.uploads, []);
+    assert.deepEqual(operations, history);
+});
+
+test('a checked handback cannot mask a later unreadable history scan', async t => {
+    const owners = [], operations = [];
+    const calls = stubSync(t, { connected: false, owners, operations });
+    const transfer = fakeTransfer(owners);
+    const original = await transfer.initializeClassic({ node: node()._id, profile: 'xray-main', nodeIdentity: adoptedOwner().nodeIdentity });
+    const adopted = await transfer.adopt({ node: node()._id, profile: 'xray-main', generation: original.generation, proofRef: 'originals' });
+    operations.push(settledHistory(adopted));
+    await transfer.handback({ node: node()._id, profile: 'xray-main', generation: adopted.generation, proofRef: 'restored' });
+    t.mock.method(TopologyOperation, 'find', () => { throw new Error('history unavailable'); });
+    await withEnv({ PANEL_DOMAIN: PROD.hostIdentity }, () => assert.rejects(writeClassic('sync'), /history unavailable/));
+    assert.equal(calls.generated, 0); assert.deepEqual(calls.uploads, []);
+});
 
 // Reader wiring only: live receipt validation/retirement and actual guard are
 // exercised in testLegacyTopologyRelease.test.js. No physical authority here.
