@@ -1,9 +1,11 @@
 # Native TEST package — только preparation, shared-node v2
 
 Этот producer делает **один настоящий native artifact**, а не installer/capture/
-controller. Product source: `2b1fb3ec194ebc8b141e0173be230f1457fd18c8`, tree
-`cef048754830081aa9893f2dd012136992d65454`. Этот candidate требует отдельного
-independent review/deploy approval. Producer commit записывается отдельно.
+controller. Product source: `e9e51e0a43ca6b98aeadfd2158e78430d6a44148`, tree
+`398998b7dba14e72e342a7f8872db2db60f939b9` — accepted compatibility source.
+Producer commit записывается отдельно; product `app/scripts/anyorder-test-stand/`
+сохраняет старые producer blobs из product pin, не текущий producer checkout.
+Новый artifact проверяется отдельно; это не native activation approval.
 Старые fixed source packs, config v2, `accepted-test-v1`, Fence/runner/store
 и application source не меняются. Wave49/v3 не применяется.
 
