@@ -8,9 +8,9 @@ import stat
 import sys
 
 PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': '73cc0ea1bff662ca6b2239b175841a74bed397f8559317e723112bcfb2c20c80',
+    '/usr/local/libexec/c3-test-fresh-network.py': '22a4238add87683b14f78ad284a2b9bef385638b14544d420808c24fe60cf147',
     '/usr/local/libexec/c3-test-fresh-network-control.py': 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
-    '/usr/local/libexec/c3-test-fresh-network-client.py': '17f12336f5d8f0cabca6399ca5f0bbcc6cca5c1acf238188cac7492a8256795f',
+    '/usr/local/libexec/c3-test-fresh-network-client.py': '5e3445e292d89f3062a6216f99a693917bca55caf8a61fef84362a825d5f6132',
 }
 
 

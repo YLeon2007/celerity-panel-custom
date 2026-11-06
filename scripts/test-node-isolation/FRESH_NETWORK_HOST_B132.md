@@ -76,25 +76,77 @@ symlink adoption. This network grants no general DNS/Internet egress and makes n
 outbound application TLS readiness promise. `/run/netns` remains the unit's
 explicit trusted-directory install precondition; it is not auto-created here.
 
-## Concrete remaining boundary — not combined PASS
+## Published-loopback return binding (wave84, source-only)
 
-Host-layout optional `return` now refuses explicitly with
-`HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED`, before reading a return pin or
-contacting DNS/HTTP. The existing bridge return proves Docker embedded DNS and
-an old backend PID-owned TCP tuple. Actual B132 uses a host-loopback published
-endpoint and a bridge backend (wave82 Docker-IP172.19.0.5). A direct backend-IP
-probe or equal HTTP body cannot substitute for a PID-bound proof of that
-published loopback path. No such authority is invented here. **Do not perform
-host-layout cutover on the strength of this candidate; combined reversible
-cutover/handback remains blocked on that one concrete proof contract.** Existing
-bridge return and checked config loads/restoration are unchanged. Prepared-only
-observe/abandon is covered through actual current loaders/holder/control entry.
+The current optional **version1 return file** stays at
+`/etc/c3-test-fresh-network-return.json`. Its original fields remain mandatory:
+`version, context, generation, container, inspectSha256, address, serving`.
+Only host-Caddy additionally requires this closed `published` object:
 
-Tests use redacted wave82 measured config/peer/network records from
-`fixtures/network_b132_wave82.json`, with origin hash. Generation/deadline/p2p
-subnets are explicitly synthetic test inputs. Real file/codec/pidfd/child/socket
-execution is distinct from modeled kernel/Docker/HTTP observations: **no live
-setns, route, firewall, namespace, service, application or database operation**
-is exercised. Kernel NAT syntax/packet delivery and physical host eligibility
-remain unverified. Causal baseline REDs and final natural-exit suite receipts are
-outside Git at `test-network-layout-wave83` in the parent's execution directory.
+```json
+{"pid":582004,"start":"10493593","listenerInode":"1882662","executableSha256":"98272bbbd6c1c35bd27d0d089252c710107f5334125cd37eb22d5415a077ae09"}
+```
+
+These are **observed B132 values, not an accepted input or permission to act**.
+The independently held input/old-writer owner must accept and revalidate them for
+its actual boot/generation/deadline; this consumer never creates that authority.
+Missing published proof still refuses
+`HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED`; bridge files reject the extra
+field and keep their unchanged DNS→original-PID tuple proof.
+
+A bounded read-only inspection found the actual host listener is Docker's
+userland proxy PID582004/start10493593, owned socket1882662 on127.0.0.1:3000.
+Its exact argv is:
+
+```
+/usr/bin/docker-proxy -proto tcp -host-ip 127.0.0.1 -host-port 3000 -container-ip 172.19.0.5 -container-port 3000 -use-listen-fd
+```
+
+Installed regular root-owned mode0755 executable SHA256 is shown above. Docker's actual configured and effective
+3000/tcp bindings both equal127.0.0.1:3000; all other effective ports are null.
+The inspected OUTPUT nat jump explicitly excludes127/8: a DOCKER DNAT rule also
+exists, but its mere presence is **not** evidence that loopback uses kernel NAT.
+
+A single nonmutating GET provided both actual proxy-owned new ESTABLISHED
+sockets: client127.0.0.1:45524→proxy127.0.0.1:3000, and proxy172.19.0.1:39658→
+backend172.19.0.5:3000. The reversed second tuple is an IPv4-mapped TCP6 socket
+owned by original backend PID581974/start10493548. Its original owned LISTEN is
+TCP6 wildcard port3000 (socket1883585), not the IPv4-exact listener assumed by
+the bridge helper. Container/image/restart/nsfs pins remain independently checked.
+
+Host return now retains that proxy's pidfd/nsfd in the **existing target hold**
+alongside original container/serving processes. Every held check brackets a
+fresh loopback keepalive with exact proxy root principal/cgroup/host namespace,
+argv, installed/running executable inode+digest, original listener inode and
+Docker port bindings. The actual new inbound socket must match the probe's
+client tuple; exactly one new outbound socket must target the original backend,
+and its reversed tuple must intersect that backend PID's owned socket FDs.
+Both graph edges are rechecked before closing the connection. Preexisting,
+foreign, missing, wrong-port/peer, ambiguous concurrent and changed sockets
+refuse; no direct-IP or same-body fallback exists. Kernel-NAT-only publishing is
+unsupported and refuses. The normal existing held/lease checks run before and
+after exact Caddy restoration and all final observations; drift is sticky.
+No controller/daemon, new authority family, host firewall writer or proxy is added.
+
+### Independent readiness blocker retained — not combined PASS
+
+The actual one-shot B132 GET `/classic-ready` returned **HTTP404**, with keepalive,
+15 response bytes, SHA256
+`2d857a3660e0240bac3ae9f98e2287f46eb6aebf724775fe130af2a6c7dfc3c4`.
+The existing return readiness predicate remains **HTTP200 plus exact READY bytes**;
+this change does not reinterpret404 or matching response bodies as readiness.
+Therefore an actual return is still refused with
+`ACTUAL_KEEPALIVE_READINESS_REQUIRED`. Resolving that original-backend HTTP
+contract is separate work, not permission to deploy, restore Caddy or alter the
+working panel. Public HTTPS also retains its original exact readiness predicate.
+
+Tests cover actual return-consumer lifecycle/journal/retained local PID/nsfds and
+real current entry loaders. Captured tuple projections are replayed through the
+real socket parser/FD-owner predicates over explicitly synthetic proc files;
+positive HTTP200/READY, Docker and physical host metadata are **modeled**, not
+physical acceptance. Exact baseline9ef8 refusal→source GREEN and the complete
+current suite are recorded under `test-network-return-wave84` outside Git.
+No live setns, namespace/veth/route/firewall/service/application/DB write, lease,
+hold, import, deployment or cutover is performed. Fresh kernel NAT packet proof
+and complete host eligibility remain unverified. Wave82 facts and wave83 evidence
+and author checkout remain unchanged.

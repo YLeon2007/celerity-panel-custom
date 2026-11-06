@@ -344,6 +344,83 @@ def bound_probe(pid, expected_start, ip=PUBLIC, port=3000):
         conn.close()
 
 
+def owned_sockets(pid):
+    result = set()
+    for fd in Path('/proc', str(pid), 'fd').iterdir():
+        try:
+            link = os.readlink(fd)
+        except FileNotFoundError:
+            continue
+        match = re.fullmatch(r'socket:\[([0-9]+)\]', link)
+        if match:
+            result.add(match[1])
+    return result
+
+
+def tcp_sockets(pid):
+    """Kernel rows, including the measured Node dual-stack IPv4-mapped sockets."""
+    result = set()
+    for table in ('tcp', 'tcp6'):
+        def endpoint(raw):
+            address, port = raw.split(':')
+            data = bytes.fromhex(address)
+            data = b''.join(data[n:n+4][::-1] for n in range(0, len(data), 4))
+            ip = ipaddress.ip_address(data)
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            return str(ip), int(port, 16)
+        for row in Path('/proc', str(pid), 'net', table).read_text().splitlines()[1:]:
+            r = row.split()
+            result.add((endpoint(r[1]), endpoint(r[2]), r[3], r[9]))
+    return result
+
+
+def bound_published_probe(pid, start, address, published):
+    """Exact new proxy inbound -> outbound -> original PID socket, not body equivalence.
+
+    Only the measured host userland-proxy path is supported. Kernel NAT, missing
+    pairs and concurrent ambiguous new connections refuse, never fall back to a
+    direct container-IP probe. The existing readiness response remains mandatory.
+    """
+    proxy, proxy_start = published['pid'], published['start']
+    def live():
+        need(proc_start(pid) == start and proc_start(proxy) == proxy_start, 'RETURN_PUBLISHED_PID_DRIFT')
+    live()
+    before = owned_sockets(proxy)
+    listeners = {r[3] for r in tcp_sockets(proxy) if r[0] == ('127.0.0.1', 3000) and r[2] == '0A'}
+    need(listeners == {published['listenerInode']} and listeners <= before,
+         'RETURN_PUBLISHED_LISTENER_DRIFT')
+    backend_listeners = {r[3] for r in tcp_sockets(pid) if r[0] in ((address, 3000), ('::', 3000)) and r[2] == '0A'}
+    need(len(backend_listeners & owned_sockets(pid)) == 1, 'EXACT_SERVING_LISTENER_REQUIRED')
+    conn = http.client.HTTPConnection('127.0.0.1', 3000, timeout=2)
+    try:
+        conn.request('GET', '/classic-ready', headers={'Connection': 'keep-alive'})
+        reply = conn.getresponse(); body = reply.read(65537)
+        need(reply.status == 200 and body == READY, 'ACTUAL_KEEPALIVE_READINESS_REQUIRED')
+        channel = conn.sock
+        if channel is None:
+            raise Refusal('ACTUAL_KEEPALIVE_READINESS_REQUIRED')
+        client = channel.getsockname()
+        new = owned_sockets(proxy)-before
+        rows = {r for r in tcp_sockets(proxy) if r[3] in new and r[2] == '01'}
+        inbound = {r for r in rows if r[0] == ('127.0.0.1', 3000) and r[1] == client}
+        outbound = {r for r in rows if r[1] == (address, 3000)}
+        need(len(inbound) == len(outbound) == 1 and len(rows) == 2 and inbound.isdisjoint(outbound),
+             'RETURN_PUBLISHED_PROXY_TUPLE_REQUIRED')
+        forward = next(iter(outbound))
+        backend = {r for r in tcp_sockets(pid) if r[0] == forward[1] and r[1] == forward[0] and
+                   r[2] == '01' and r[3] in owned_sockets(pid)}
+        need(len(backend) == 1, 'RETURN_PUBLISHED_BACKEND_TUPLE_REQUIRED')
+        # Recheck both graph edges while the exact keepalive connection is open.
+        need(rows <= tcp_sockets(proxy) and {r[3] for r in rows} <= owned_sockets(proxy) and
+             backend <= tcp_sockets(pid) and {r[3] for r in backend} <= owned_sockets(pid),
+             'RETURN_PUBLISHED_SOCKET_DRIFT')
+        live()
+        return {'pid': pid, 'start': start, 'bodySha256': digest(body)}
+    finally:
+        conn.close()
+
+
 def docker_backend_addresses():
     """Ask Docker's namespace-local embedded DNS, not the host resolv.conf."""
     token = os.urandom(2)
@@ -872,25 +949,62 @@ class Linux:
         return in_namespace(self.fds['caddy'], probe)
 
     def return_probe(self):
-        # The bridge return authority proves Docker DNS -> an owned backend
-        # socket. B132's host 127.0.0.1 published path has no such PID proof;
-        # neither a direct Docker-IP probe nor a same-body response substitutes.
-        need(not host_caddy(self.p), 'HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED')
         path = '/etc/c3-test-fresh-network-return.json'
         raw = trusted_read(path)
         value = decode(raw)
-        keys(value, 'version context generation container inspectSha256 address serving')
+        fields = 'version context generation container inspectSha256 address serving'
+        if not isinstance(value, dict):
+            raise Refusal('SCHEMA_KEYS_REFUSED')
+        if host_caddy(self.p):
+            need('published' in value, 'HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED')
+            fields += ' published'
+        keys(value, fields)
         need(type(value['version']) is int and value['version'] == 1 and value['context'] == CONTEXT and
              value['generation'] == self.p['generation'], 'INDEPENDENT_RETURN_AUTHORITY_REQUIRED')
         pin(value['container']); pin(value['inspectSha256'])
         keys(value['serving'], 'pid start')
         integer(value['serving']['pid'])
         need(type(value['serving']['start']) is str and value['serving']['start'].isdigit(), 'RETURN_PID_PIN_REQUIRED')
+        processes = []
+        if host_caddy(self.p):
+            published = value['published']
+            keys(published, 'pid start executableSha256 listenerInode')
+            integer(published['pid']); pin(published['executableSha256'])
+            need(all(type(published[x]) is str and re.fullmatch('[1-9][0-9]*', published[x])
+                     for x in ('start', 'listenerInode')), 'RETURN_PUBLISHED_PIN_REQUIRED')
+            processes.append((published['pid'], published['start']))
         projection = self.return_container(value)
         serving = value['serving']['pid']
         self.hold_target(path, raw, [(projection['pid'], projection['start']),
-                                    (serving, value['serving']['start'])])
+                                    (serving, value['serving']['start']), *processes])
         return self.check_hold()
+
+    def check_published_proxy(self, value):
+        published = value['published']; pid = published['pid']
+        base = Path('/proc', str(pid))
+        need(proc_start(pid) == published['start'] and
+             identity(str(base/'ns/net')) == self.p['hostNetns'] and
+             Path(base/'cgroup').read_text() == '0::/system.slice/docker.service\n' and
+             'Uid:\t0\t0\t0\t0' in Path(base/'status').read_text().splitlines(),
+             'RETURN_PUBLISHED_PROXY_IDENTITY_DRIFT')
+        argv = ['/usr/bin/docker-proxy', '-proto', 'tcp', '-host-ip', '127.0.0.1', '-host-port', '3000',
+                '-container-ip', value['address'], '-container-port', '3000', '-use-listen-fd']
+        need(Path(base/'cmdline').read_bytes() == b'\0'.join(x.encode() for x in argv)+b'\0',
+             'RETURN_PUBLISHED_PROXY_COMMAND_DRIFT')
+        fd = trusted_fd('/usr/bin/docker-proxy')
+        try:
+            s = os.fstat(fd)
+            need(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and not s.st_mode & 0o6022 and
+                 identity(str(base/'exe')) == [s.st_dev, s.st_ino], 'RETURN_PUBLISHED_PROXY_EXECUTABLE_DRIFT')
+            h = hashlib.sha256()
+            while True:
+                block = os.read(fd, 65536)
+                if not block: break
+                h.update(block)
+            need(h.hexdigest() == published['executableSha256'], 'RETURN_PUBLISHED_PROXY_EXECUTABLE_DRIFT')
+        finally:
+            os.close(fd)
+        need(proc_start(pid) == published['start'], 'RETURN_PUBLISHED_PROXY_IDENTITY_DRIFT')
 
     def return_container(self, value):
         c = decode(request(UnixHTTP('localhost'), 'GET', '/containers/'+value['container']+'/json'))
@@ -906,6 +1020,14 @@ class Linux:
              identity('/proc/'+str(serving)+'/ns/net') == projection['netns'] and
              Path('/proc', str(serving), 'cgroup').read_bytes() == Path('/proc', str(pid), 'cgroup').read_bytes(),
              'RETURN_CONTAINER_IDENTITY_DRIFT')
+        if host_caddy(self.p):
+            binding = [{'HostIp': '127.0.0.1', 'HostPort': '3000'}]
+            ports = c['NetworkSettings'].get('Ports', {})
+            need(projection['netns'] != self.p['hostNetns'] and
+                 c.get('HostConfig', {}).get('PortBindings') == {'3000/tcp': binding} and
+                 ports.get('3000/tcp') == binding and
+                 all(v is None for k, v in ports.items() if k != '3000/tcp'),
+                 'RETURN_PUBLISHED_PORT_BINDING_DRIFT')
         return projection
 
     def hold_target(self, path, raw, processes):
@@ -941,13 +1063,20 @@ class Linux:
         pid, start = value['serving']['pid'], value['serving']['start']
         if 'container' in value:
             self.return_container(value)
-            def probe():
-                need(docker_backend_addresses() == [value['address']], 'RETURN_UPSTREAM_DNS_DRIFT')
-                return bound_probe(pid, start, value['address'], 3000)
-            result = in_namespace(self.fds['caddy'], probe)
+            if host_caddy(self.p):
+                self.check_published_proxy(value)
+                result = in_namespace(self.fds['caddy'], lambda:
+                    bound_published_probe(pid, start, value['address'], value['published']))
+                self.check_published_proxy(value)
+            else:
+                def probe():
+                    need(docker_backend_addresses() == [value['address']], 'RETURN_UPSTREAM_DNS_DRIFT')
+                    return bound_probe(pid, start, value['address'], 3000)
+                result = in_namespace(self.fds['caddy'], probe)
             self.return_container(value)
-            need(in_namespace(self.fds['caddy'], docker_backend_addresses) == [value['address']],
-                 'RETURN_UPSTREAM_DNS_DRIFT')
+            if not host_caddy(self.p):
+                need(in_namespace(self.fds['caddy'], docker_backend_addresses) == [value['address']],
+                     'RETURN_UPSTREAM_DNS_DRIFT')
         else:
             need(identity('/proc/'+str(pid)+'/ns/net') == identity(NETNS), 'SERVING_IDENTITY_DRIFT')
             result = in_namespace(self.fds['fresh'], lambda: bound_probe(pid, start))

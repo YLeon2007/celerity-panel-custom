@@ -203,12 +203,13 @@ class HostLayoutTests(unittest.TestCase):
             with self.subTest(fault=fault), self.assertRaisesRegex(m.Refusal, 'EXACT_ONE_CADDY_UPSTREAM_CHANGE_REQUIRED'):
                 m.validate_plan(p)
 
-    def test_host_return_does_not_use_bridge_dns_or_weaken_pid_binding(self):
+    def test_host_return_missing_published_pin_does_not_use_bridge_dns(self):
         k = m.Linux.__new__(m.Linux); k.p = host_plan()
-        with patch.object(m, 'trusted_read') as read, patch.object(m, 'docker_backend_addresses') as dns:
+        with patch.object(m, 'trusted_read', return_value=m.encode({})) as read, \
+             patch.object(m, 'docker_backend_addresses') as dns:
             with self.assertRaisesRegex(m.Refusal, 'HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED'):
                 k.return_probe()
-        read.assert_not_called(); dns.assert_not_called()
+        read.assert_called_once_with('/etc/c3-test-fresh-network-return.json'); dns.assert_not_called()
 
 
     def test_host_route_and_private_nat_steps_keep_existing_expiry_fence(self):
