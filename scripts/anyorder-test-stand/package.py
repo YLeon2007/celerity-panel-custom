@@ -15,8 +15,8 @@ import sys
 import tarfile
 import urllib.request
 
-SOURCE = 'e9e51e0a43ca6b98aeadfd2158e78430d6a44148'
-TREE = '398998b7dba14e72e342a7f8872db2db60f939b9'
+SOURCE = '5623f82245bfff4e8fbf65d80d24652552f1c896'
+TREE = '701c613bd4fb2632984fef985194547bf66e76d9'
 NODE = '20.20.2'
 NODE_ARCHIVE = f'node-v{NODE}-linux-x64.tar.xz'
 NODE_SHA256 = 'df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d'

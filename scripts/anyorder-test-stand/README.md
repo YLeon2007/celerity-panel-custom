@@ -1,8 +1,9 @@
 # Native TEST package — только preparation, shared-node v2
 
 Этот producer делает **один настоящий native artifact**, а не installer/capture/
-controller. Product source: `e9e51e0a43ca6b98aeadfd2158e78430d6a44148`, tree
-`398998b7dba14e72e342a7f8872db2db60f939b9` — accepted compatibility source.
+controller. Product source: `5623f82245bfff4e8fbf65d80d24652552f1c896`, tree
+`701c613bd4fb2632984fef985194547bf66e76d9` — accepted existing-v2 return/completion
+source (wave73); только explicit product-pin rollover.
 Producer commit записывается отдельно; product `app/scripts/anyorder-test-stand/`
 сохраняет старые producer blobs из product pin, не текущий producer checkout.
 Новый artifact проверяется отдельно; это не native activation approval.
