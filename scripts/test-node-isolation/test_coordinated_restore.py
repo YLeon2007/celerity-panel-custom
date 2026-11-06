@@ -73,11 +73,14 @@ from types import SimpleNamespace
 
 class cfixture:
     """Real subprocess channels and files; UID/SSH/physical/systemd/kernel simulated."""
-    def __init__(self, c, *, maintenance_id=None):
+    def __init__(self, c, *, maintenance_id=None, v2=False):
         self.c = c
         self.maintenance_id = maintenance_id
+        self.v2 = v2
 
     def __enter__(self):
+        import isolation
+        from typing import cast
         c = self.c
         self.stack = ExitStack()
         self.fixtures, self.children = [], []
@@ -89,10 +92,29 @@ class cfixture:
         self.config = {'version': 1, 'context': 'test.infograd.online', 'lifetimeSeconds': 80,
                        'origin': {k:v for k,v in self.origin.items() if k not in ('pid', 'start')},
                        'keySha256': 'f'*64, 'nodes': {}}
-        for index, (node, (endpoint, profile)) in enumerate(c.NODES.items()):
-            f = self.stack.enter_context(t.DualFixture() if endpoint in ('104.143.201.72', '212.119.42.100') else t.Fixture())
+        nodes = {'6aecd36265572a55acf7c677': ('10.203.61.2', 'xray-main'),
+                 '6aed089795ea4b863887d717': ('10.203.61.1', 'xray-bridge')} if self.v2 else c.NODES
+        shared = '6aed089795ea4b863887d717' if self.v2 else c.SHARED_NODE
+        if self.v2:
+            self.inventory = {'version': 1, 'profile': 'accepted-test-v1',
+                'executionContext': {'target': 'test', 'hostIdentity': 'test.infograd.online'},
+                'sharedNodeId': shared, 'nodes': []}
+            for index, (node, (ip, profile)) in enumerate(nodes.items()):
+                key = struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + bytes([index+1])*32
+                self.inventory['nodes'].append({'nodeId': node, 'targetProfile': profile,
+                    'endpoint': {'ip': ip, 'port': 2222, 'username': 'c3-test-runner'},
+                    'physical': {'machineId': c.sha(node.encode())[:32], 'bootId': '01234567-89ab-cdef-0123-456789abcdef', 'sshHostKeySha256': c.sha(key)},
+                    'profiles': ['xray-main', 'xray-bridge'] if node == shared else ['xray-main']})
+            isolation.validate_inventory(self.inventory)
+            self.config.update(version=2, inventorySha256=c.sha(c.canonical(self.inventory)))
+            self.origin.update(self.inventory['nodes'][-1]['physical'])
+            self.origin.pop('sshHostKeySha256')
+            self.config['origin'] = {k:v for k,v in self.origin.items() if k not in ('pid', 'start')}
+        for index, (node, (endpoint, profile)) in enumerate(nodes.items()):
+            dual = node == shared or (not self.v2 and endpoint == '104.143.201.72')
+            f = self.stack.enter_context(t.DualFixture() if dual else t.Fixture())
             f.node, f.profile = node, profile
-            if node == c.SHARED_NODE:
+            if node == shared:
                 f.path(t.n.runner_lock('xray-main')).unlink()
             if self.maintenance_id is not None:
                 f.plan['maintenanceId'] = self.maintenance_id
@@ -107,21 +129,34 @@ class cfixture:
                 state = f.system.states['xray-bridge.service']
                 state.update(Id='xray.service', FragmentPath=f.unit)
                 f.system.states['xray.service'] = state
+            if self.v2:
+                cast(dict, f.plan).update(version=2, inventorySha256=self.config['inventorySha256'])
+                f.module.inventory_node = isolation.inventory_node
+                f.put(isolation.INVENTORY, c.canonical(self.inventory))
+                f.put(t.n.HELPER, (HERE/'isolation.py').read_bytes())
+                f.accepted['isolationSha256'] = c.sha(f.fs.read(t.n.HELPER)[0])
             f.accepted.update(t.n.identity(f.engine))
-            profiles = ['xray-main','xray-bridge'] if endpoint in ('104.143.201.72', '212.119.42.100') else [profile]
+            profiles = ['xray-main','xray-bridge'] if dual else [profile]
             f.accepted['profiles'] = {p: {'files': {k:f.fs.info(path) for k,path in zip(('config','unit'),t.n.profile_paths(p))},
                   'service': f.system.unit(t.n.service_name(p)), 'runtimeSha256': c.sha(c.canonical({'mode':'none','inbounds':{}}))} for p in profiles}
             f.put(t.n.ACCEPTED, c.canonical(f.accepted))
             f.writer = t.n.NodeOriginals(f.engine, f.module, fixture=f.fixture)
             receipt = f.writer.capture()
-            f.mutate_and_admit(receipt)
+            if self.v2 and node == shared:
+                t.Fixture.mutate_and_admit(f, receipt)
+                f.restore_pins['profiles']['xray-main'] = {
+                    'files': copy.deepcopy(f.accepted['profiles']['xray-main']['files']),
+                    'service': copy.deepcopy(f.accepted['profiles']['xray-main']['service']), 'journalSha256': None}
+                f.put(t.n.RESTORE_ACCEPTED, c.canonical(f.restore_pins))
+            else:
+                f.mutate_and_admit(receipt)
             f.put(c.SELF, (HERE / 'coordinated_restore.py').read_bytes())
             f.put(c.ORIGINALS, (HERE / 'node_originals.py').read_bytes())
             pin = {'identity': t.n.identity(f.engine), 'profiles': profiles, 'guard': f.guard,
                    'hostKey': base64.b64encode(key).decode(),
                    'files': {name: c.sha(f.fs.read(path)[0]) for name,path in {'self':c.SELF, 'originals':c.ORIGINALS,
                         'isolation':t.n.HELPER, 'accepted':t.n.ACCEPTED, 'restoreAccepted':t.n.RESTORE_ACCEPTED}.items()}}
-            if node == '6ab189dc63913ebd4a917399':
+            if node == shared:
                 for name, path in (('shared', c.SHARED), ('freezer', c.FREEZER)):
                     f.put(path, ('independently pinned SIMULATED ' + name).encode())
                     pin['files'][name] = c.sha(f.fs.read(path)[0])
@@ -134,6 +169,15 @@ class cfixture:
         path = self.root / c.CONFIG.lstrip('/')
         path.parent.mkdir(parents=True, mode=0o700)
         path.write_bytes(c.canonical(self.config)); path.chmod(0o600)
+        if self.v2:
+            for name, raw in ((isolation.INVENTORY, c.canonical(self.inventory)),
+                              (t.n.HELPER, (HERE/'isolation.py').read_bytes())):
+                target = self.root/name.lstrip('/')
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                target.write_bytes(raw); target.chmod(0o600)
+                for parent in target.parents:
+                    if parent == self.root.parent: break
+                    parent.chmod(0o700)
         directory = self.root / c.STATE.lstrip('/')
         directory.mkdir(parents=True, mode=0o700)
         for leaf in (path.parent, directory):
@@ -175,6 +219,7 @@ fs=n.Files(fixture)
 accepted=fs.read_json(n.ACCEPTED)
 bundle=fs.read_json(n.BUNDLE)
 plan={k:accepted[k] for k in n.IDENTITY}
+if 'inventorySha256' in accepted: plan.update(version=2,inventorySha256=accepted['inventorySha256'])
 engine=SimpleNamespace(plan=plan,plan_hash=accepted['planHash'])
 def held():
     n.need(fs.read_json('/fixture-live.json')['held'], 'SIMULATED_GUARD_LOST')
@@ -199,7 +244,11 @@ def action(*args,**kwargs):
             blocked.read(1)
     return original_action(*args,**kwargs)
 system.action=action
-writer=n.NodeOriginals(engine,SimpleNamespace(RESTORE_ADMISSION_VERSION=1),fixture=fixture)
+import isolation
+module=SimpleNamespace(RESTORE_ADMISSION_VERSION=1,inventory_node=isolation.inventory_node)
+writer=n.NodeOriginals(engine,module,fixture=fixture)
+if plan.get('version')==2:
+ c.trusted_read=lambda path: fs.read(path)[0]
 shared=SimpleNamespace(check_hold=lambda *_:{'candidateClosure':{'group':'SIMULATED'}} if fs.read_json('/fixture-live.json')['candidateFrozen'] else {})
 try:
     c.NodeServer(writer,n,fs.read_json(c.CONFIG),c.Wire(0,1,time.monotonic()+80),shared=shared).serve()

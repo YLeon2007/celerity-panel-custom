@@ -632,14 +632,15 @@ class Platform:
 
 
 def settlement(held, proof):
-    # Same current all-five ownership contract as the existing irreversible path;
+    # Same accepted inventory as the existing irreversible path;
     # distinct activation set. No existing-backend permit is accepted or relabeled.
     need(type(proof) is dict and set(proof) == {'context','revision','deployedRevision','quietSha256','nodes'} and
          proof['context'] == held.config['context'] and type(proof['quietSha256']) is str and c.DIGEST.fullmatch(proof['quietSha256']) and
          all(type(proof[k]) is int and proof[k] >= 0 for k in ('revision','deployedRevision')), 'SETTLEMENT_REQUIRED')
-    need(type(proof['nodes']) is list and len(proof['nodes']) == 5 and
+    need(type(proof['nodes']) is list and len(proof['nodes']) == len(held.config['nodes']) and
          all(type(n) is dict and type(n.get('nodeId')) is str for n in proof['nodes']) and
-         {n['nodeId'] for n in proof['nodes']} == set(c.NODES), 'EXACT_FIVE_OWNERS_REQUIRED')
+         {n['nodeId'] for n in proof['nodes']} == set(held.config['nodes']),
+         'EXACT_ACCEPTED_OWNERS_REQUIRED' if held.config['version'] == 2 else 'EXACT_FIVE_OWNERS_REQUIRED')
     for item in proof['nodes']:
         need(set(item) == {'nodeId','targetProfile','enrollmentId','enrollmentSha256','priorOwnerGeneration','owner'} and
              type(item['enrollmentSha256']) is str and type(item['owner']) is dict and
@@ -986,7 +987,11 @@ def supervise(listener, fs, platform=None, *, fault=None):
                      commit['context'] == 'test.infograd.online' and commit['freshPolicySha256'] == pin and
                      commit['supervisor'] == {'pid':os.getpid(),'start':start(os.getpid())} and
                      commit['restoreIntent']['origin']['pid'] == pid and commit['restoreIntent']['origin']['start'] == start(pid) and
-                     set(commit['nodePeers']) == set(c.NODES),'SAME_HELD_PEER_FRESH_COMMIT_REQUIRED')
+                     set(commit['nodePeers']) == set(commit['nodePins']) ==
+                     {n['nodeId'] for n in commit['settlement']['nodes']} and
+                     len(commit['settlement']['nodes']) == len(commit['nodePins']), 'SAME_HELD_PEER_FRESH_COMMIT_REQUIRED')
+                if not any('inventorySha256' in p['identity'] for p in commit['nodePins'].values()):
+                    need(set(commit['nodePeers']) == set(c.NODES), 'SAME_HELD_PEER_FRESH_COMMIT_REQUIRED')
                 need(commit['configSha256'] == policy['inventory']['coordinatorSha256'], 'ACCEPTED_COORDINATOR_REQUIRED')
                 committed=True
             platform.check(policy)

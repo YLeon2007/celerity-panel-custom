@@ -8,13 +8,14 @@ const { randomBytes, randomUUID, createHash } = require('node:crypto');
 const { isDeepStrictEqual: same } = require('node:util');
 const { TEST_TOPOLOGY_EXECUTION_CONTEXT: TEST } = require('../modules/relay-l2tp/domain/topologyExecutionContext');
 const { exact, freeze } = require('../modules/relay-l2tp/models/topologyExecutionBindingContract');
-const { NODES } = require('./heldTestOwnerSettlement');
+const { NODES, settlementInventory } = require('./heldTestOwnerSettlement');
 const CONFIG = '/etc/celerity/topology-test-owner-settlement.json';
 const BRIDGE = '/usr/local/libexec/c3-test-owner-restoration-channel.py';
 const COORDINATOR = '/usr/local/libexec/c3-test-coordinated-restore.py';
 const FRESH_CONFIG = '/etc/celerity/topology-test-fresh-owner-settlement.json';
 const FRESH_BRIDGE = '/usr/local/libexec/c3-test-fresh-owner-restoration-channel.py';
 const RESTORE_CONFIG = '/etc/c3-test-coordinated-restore.json';
+const INVENTORY = '/etc/celerity/topology-test-inventory.json';
 function need(ok) { if (!ok) throw new Error('HELD_OWNER_RESTORATION_UNKNOWN_RETAINED'); }
 const sha = raw => createHash('sha256').update(raw).digest('hex');
 function trustedRead(file) {
@@ -32,11 +33,24 @@ function readOperationalInputs(fresh) {
     need(process.getuid() === 0);
     const configPath = fresh ? FRESH_CONFIG : CONFIG;
     const raw = trustedRead(configPath), config = JSON.parse(raw), restoreRaw = trustedRead(RESTORE_CONFIG), restore = JSON.parse(restoreRaw);
-    need(exact(config, ['version', 'mongoUri', 'bridgeSha256', 'coordinatorSha256', 'plan', 'acceptedOriginalsBase64', 'oldBackend', ...(fresh ? ['freshBridgeSha256'] : [])])
-        && config.version === 1 && typeof config.mongoUri === 'string' && config.mongoUri.startsWith('mongodb://')
+    need([1, 2].includes(config.version) && config.version === restore.version
+        && exact(config, ['version', 'mongoUri', 'bridgeSha256', 'coordinatorSha256', 'plan', 'acceptedOriginalsBase64', 'oldBackend',
+            ...(fresh ? ['freshBridgeSha256'] : []), ...(config.version === 2 ? ['inventorySha256'] : [])]));
+    const inventoryRaw = config.version === 2 ? trustedRead(INVENTORY) : undefined;
+    const inventory = inventoryRaw ? settlementInventory(JSON.parse(inventoryRaw), config.inventorySha256) : undefined;
+    const nodes = inventory ? Object.fromEntries(inventory.nodes.map(p => [p.nodeId, p.targetProfile])) : NODES;
+    need(typeof config.mongoUri === 'string' && config.mongoUri.startsWith('mongodb://')
         && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256
-        && restore.context === TEST.hostIdentity && same(Object.keys(restore.nodes).sort(), Object.keys(NODES).sort())
-        && same(Object.keys(config.acceptedOriginalsBase64).sort(), Object.keys(NODES).sort()));
+        && restore.context === TEST.hostIdentity && same(Object.keys(restore.nodes).sort(), Object.keys(nodes).sort())
+        && same(Object.keys(config.acceptedOriginalsBase64).sort(), Object.keys(nodes).sort())
+        && Array.isArray(config.plan?.nodes) && config.plan.nodes.length === Object.keys(nodes).length
+        && new Set(config.plan.nodes.map(n => n.nodeId)).size === config.plan.nodes.length
+        && config.plan.nodes.every(n => Object.hasOwn(nodes, n.nodeId) && n.targetProfile === nodes[n.nodeId]));
+    if (inventory) {
+        const shared = inventory.nodes.find(p => p.nodeId === inventory.sharedNodeId);
+        need(restore.inventorySha256 === config.inventorySha256 && restore.origin?.machineId === shared.physical.machineId
+            && restore.origin.bootId === shared.physical.bootId);
+    }
     if (fresh) need(sha(trustedRead(FRESH_BRIDGE)) === config.freshBridgeSha256);
     const old = config.oldBackend;
     need(exact(old, ['instanceId', 'pid', 'processStartTime']) && typeof old.instanceId === 'string' && old.instanceId
@@ -47,8 +61,15 @@ function readOperationalInputs(fresh) {
         const acceptedRaw = Buffer.from(encoded, 'base64');
         need(acceptedRaw.toString('base64') === encoded && sha(acceptedRaw) === pin.files.accepted
             && pin.files.self === config.coordinatorSha256 && pin.identity.nodeId === n.nodeId && pin.identity.targetProfile === n.targetProfile);
+        if (inventory) {
+            const p = inventory.nodes.find(p => p.nodeId === n.nodeId);
+            need(pin.identity.inventorySha256 === config.inventorySha256 && same(pin.profiles, p.profiles)
+                && pin.identity.endpointIp === p.endpoint.ip
+                && Object.entries(p.physical).every(([k, v]) => pin.identity[k] === v));
+        }
         const accepted = JSON.parse(acceptedRaw);
         for (const [key, value] of Object.entries(pin.identity)) need(same(accepted[key], value));
+        if (inventory) need(same(Object.keys(accepted.profiles).sort(), [...pin.profiles].sort()));
         const p = accepted.profiles[n.targetProfile];
         need(p && /^[a-f0-9]{64}$/.test(p.files?.config?.sha256) && /^[a-f0-9]{64}$/.test(p.files?.unit?.sha256)
             && ['active', 'inactive'].includes(p.service?.ActiveState) && ['enabled', 'disabled'].includes(p.service?.UnitFileState));
@@ -58,7 +79,8 @@ function readOperationalInputs(fresh) {
             originalSnapshot: { configSha256: p.files.config.sha256, unitSha256: p.files.unit.sha256,
                 serviceActive: p.service.ActiveState, serviceEnabled: p.service.UnitFileState } });
     });
-    return { config: freeze(config), pins: freeze(pins), assertPins() { need(trustedRead(configPath).equals(raw) && trustedRead(RESTORE_CONFIG).equals(restoreRaw)
+    return { config: freeze(config), pins: freeze(pins), inventory, assertPins() { need(trustedRead(configPath).equals(raw) && trustedRead(RESTORE_CONFIG).equals(restoreRaw)
+        && (!inventoryRaw || trustedRead(INVENTORY).equals(inventoryRaw))
         && sha(trustedRead(BRIDGE)) === config.bridgeSha256 && sha(trustedRead(COORDINATOR)) === config.coordinatorSha256
         && (!fresh || sha(trustedRead(FRESH_BRIDGE)) === config.freshBridgeSha256)); } };
 }

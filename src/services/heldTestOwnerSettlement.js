@@ -16,9 +16,38 @@ const NODES = Object.freeze({
 const OPT = { maxTimeMS: 5000, timeoutMS: 5000 };
 function need(ok) { if (!ok) throw Object.assign(new Error('TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED'), { code: 'TEST_OWNER_SETTLEMENT_UNKNOWN_RETAINED' }); }
 const uuid = value => typeof value === 'string' && UUID.test(value);
+// Consume the EXISTING accepted-test-v1 inventory (same canonical digest as
+// isolation/capture). Only trusted root inputs supply it, never the plan/env.
+function settlementInventory(inventory, inventorySha256) {
+    if (inventory === undefined && inventorySha256 === undefined) return undefined;
+    const canonical = value => JSON.stringify(value, (_key, v) => v && !Array.isArray(v) && typeof v === 'object'
+        ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v);
+    const digest = (value, size) => typeof value === 'string' && new RegExp(`^[a-f0-9]{${size}}$`).test(value);
+    need(digest(inventorySha256, 64) && exact(inventory, ['version', 'profile', 'executionContext', 'nodes', 'sharedNodeId'])
+        && inventory.version === 1 && inventory.profile === 'accepted-test-v1' && same(inventory.executionContext, TEST)
+        && Array.isArray(inventory.nodes) && inventory.nodes.length >= 1 && inventory.nodes.length <= 5
+        && createHash('sha256').update(canonical(inventory)).digest('hex') === inventorySha256);
+    const ids = new Set(), machines = new Set(), keys = new Set(), endpoints = new Set();
+    for (const p of inventory.nodes) {
+        need(exact(p, ['nodeId', 'targetProfile', 'endpoint', 'physical', 'profiles']) && digest(p.nodeId, 24) && !ids.has(p.nodeId)
+            && ['xray-main', 'xray-bridge'].includes(p.targetProfile)); ids.add(p.nodeId);
+        const ip = p.endpoint?.ip;
+        need(exact(p.endpoint, ['ip', 'port', 'username']) && typeof ip === 'string' && require('node:net').isIPv4(ip)
+            && (ip.startsWith('10.') || ip.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip))
+            && p.endpoint.port === 2222 && p.endpoint.username === 'c3-test-runner' && !endpoints.has(ip)); endpoints.add(ip);
+        need(exact(p.physical, ['machineId', 'bootId', 'sshHostKeySha256']) && digest(p.physical.machineId, 32)
+            && uuid(p.physical.bootId) && digest(p.physical.sshHostKeySha256, 64)
+            && !machines.has(p.physical.machineId) && !keys.has(p.physical.sshHostKeySha256));
+        machines.add(p.physical.machineId); keys.add(p.physical.sshHostKeySha256);
+        need(same(p.profiles, [p.targetProfile]) || same(p.profiles, ['xray-main', 'xray-bridge']));
+    }
+    const shared = inventory.nodes.find(p => p.nodeId === inventory.sharedNodeId);
+    need(shared?.targetProfile === 'xray-bridge' && same(shared.profiles, ['xray-main', 'xray-bridge']));
+    return freeze(structuredClone(inventory));
+}
 class HeldTestOwnerSettlement {
-    #models; #authority; #journal; #freshUsed = false;
-    constructor({ withRestorationScope, models, journal } = {}) {
+    #models; #authority; #journal; #freshUsed = false; #inventory; #nodes;
+    constructor({ withRestorationScope, models, journal, inventory, inventorySha256 } = {}) {
         if (typeof withRestorationScope !== 'function') throw new TypeError('Trusted continuously-live restoration scope required');
         const names = ['Owner', 'Enrollment', 'Binding', 'Operation', 'Lock', 'Topology', 'Intent', 'Queue', 'Link', 'L2tpOperation'];
         need(models && names.every(name => models[name]?.db && typeof models[name].findOne === 'function')
@@ -26,6 +55,8 @@ class HeldTestOwnerSettlement {
         const client = models.Owner.db.getClient();
         need(!client.options.directConnection && client.topology?.description?.type === 'ReplicaSetWithPrimary');
         need(journal && ['start', 'beforeNode', 'afterNode', 'complete'].every(key => typeof journal[key] === 'function'));
+        this.#inventory = settlementInventory(inventory, inventorySha256);
+        this.#nodes = this.#inventory ? Object.fromEntries(this.#inventory.nodes.map(p => [p.nodeId, p.targetProfile])) : NODES;
         this.#models = Object.freeze({ ...models }); this.#authority = withRestorationScope; this.#journal = journal;
     }
     async settle(input) { return this.#run(input, false); }
@@ -37,10 +68,10 @@ class HeldTestOwnerSettlement {
     }
     async #run(input, combined) {
         need(exact(input, ['nodes', 'revision', 'deployedRevision'])
-            && Array.isArray(input.nodes) && input.nodes.length === 5
-            && new Set(input.nodes.map(n => n.nodeId)).size === 5
+            && Array.isArray(input.nodes) && input.nodes.length === Object.keys(this.#nodes).length
+            && new Set(input.nodes.map(n => n.nodeId)).size === input.nodes.length
             && input.nodes.every(n => exact(n, ['nodeId', 'targetProfile', 'enrollmentId', 'ownerGeneration'])
-                && Object.hasOwn(NODES, n.nodeId) && n.targetProfile === NODES[n.nodeId]
+                && Object.hasOwn(this.#nodes, n.nodeId) && n.targetProfile === this.#nodes[n.nodeId]
                 && uuid(n.enrollmentId) && uuid(n.ownerGeneration))
             && [input.revision, input.deployedRevision].every(n => Number.isSafeInteger(n) && n >= 0));
         const plan = freeze(structuredClone(input));
@@ -96,6 +127,11 @@ class HeldTestOwnerSettlement {
                         && owners.length === 1 && same(owner.executionContext, TEST) && owner.owner === 'topology'
                         && owner.generation === n.ownerGeneration && same(e.nodeIdentity, owner.nodeIdentity)
                         && owner.adoptionReceipt?.toGeneration === n.ownerGeneration && owner.handbackReceipt === undefined);
+                    if (this.#inventory) {
+                        const p = this.#inventory.nodes.find(p => p.nodeId === n.nodeId);
+                        need(same(e.endpoint, p.endpoint) && e.bootId === p.physical.bootId
+                            && same(e.nodeIdentity, { machineId: p.physical.machineId, sshHostKeySha256: p.physical.sshHostKeySha256 }));
+                    }
                     await awaited(scope.verifyEnrollment(e));
                     enrollments.push(e); originals.push(owner);
                 }
@@ -129,7 +165,7 @@ class HeldTestOwnerSettlement {
                     need(currentEnrollment.length === 1 && same(currentEnrollment[0], enrollments[i]));
                 }
                 await awaited(this.#journal.complete());
-                result = freeze({ code: 'TEST_DB_SETTLED_ALL_EXTERNAL_HOLDS_RETAINED', ownerCount: 5,
+                result = freeze({ code: 'TEST_DB_SETTLED_ALL_EXTERNAL_HOLDS_RETAINED', ownerCount: plan.nodes.length,
                     outstandingLocks: 0, topologyAdmissionCount: 0, remoteAdmissionCount: 0,
                     handbackAllowed: false, externalAdmission: 'closed' });
                 await check();
@@ -150,7 +186,7 @@ class HeldTestOwnerSettlement {
                             const commitSha256 = await scope.freshHandback(freeze(proof));
                             need(typeof commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(commitSha256));
                             await this.#journal.committed(commitSha256);
-                            result = freeze({ code: 'COMMITTED_FRESH_ACTIVATION_CONFIRMED', ownerCount: 5,
+                            result = freeze({ code: 'COMMITTED_FRESH_ACTIVATION_CONFIRMED', ownerCount: plan.nodes.length,
                                 externalAdmission: 'closed', activationSet: ['fresh-classic-process'],
                                 retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256 });
                             finished = true; return result;
@@ -171,7 +207,7 @@ class HeldTestOwnerSettlement {
                         await scope.activateClassic();
                         await check();
                         await scope.completeHandoff();
-                        result = freeze({ code: 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED', ownerCount: 5,
+                        result = freeze({ code: 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED', ownerCount: plan.nodes.length,
                             externalAdmission: 'closed', activationSet: ['existing-classic-backend'],
                             retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256 });
                     } catch (error) {
@@ -188,4 +224,4 @@ class HeldTestOwnerSettlement {
         finally { open = false; if (pending) await pending.catch(() => {}); }
     }
 }
-module.exports = { HeldTestOwnerSettlement, NODES };
+module.exports = { HeldTestOwnerSettlement, NODES, settlementInventory };

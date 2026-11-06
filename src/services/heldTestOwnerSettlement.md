@@ -1,5 +1,9 @@
 # Held TEST owner settlement (internal, not global handback)
 
+The original sections below describe legacy v1. The final **Accepted inventory v2**
+section documents the bounded v2 adaptation and its remaining operational blocker;
+this document is not deployment authorization.
+
 `HeldTestOwnerSettlement.settle(plan)` is the explicit final DB owner step after
 **all five** nodes have been physically restored under the existing coordinator's
 actual `NodeOriginals.restoration_hold()` scopes. It calls the **unchanged public**
@@ -126,3 +130,52 @@ real codec; physical/kernel/systemd/SSH and UID authority are **SIMULATED**.
 It proves the flocks are still held at acknowledgement, one-node loss revokes,
 and the bridge cannot finish/release. None of these tests is a live GO, deployed
 physical attestation, combined host handback or production activation proof.
+
+## Accepted inventory v2 (source-only adaptation)
+
+- `coordinated_restore` accepts the already captured configuration `version: 2`,
+  with `inventorySha256` at its root and in each node identity. It delegates to
+  the **existing pinned isolation inventory reader** before using membership,
+  physical identity, endpoints or profile membership. The fixed accepted file is
+  `/etc/celerity/topology-test-inventory.json`, still inventory format version 1,
+  `accepted-test-v1`. No new schema or configuration-v3 exists.
+- Both existing owner configs use `version: 2` plus the same canonical
+  `inventorySha256`; the fresh config retains its existing `freshBridgeSha256`.
+  Plan IDs/profile pairs, accepted-original manifests, restore pins, physical
+  enrollment and the shared origin must agree with that root-loaded inventory.
+  The plan, argv and environment cannot choose alternative membership. Version 1
+  still uses the original fixed-five source-owned IDs and schema.
+- Both fixed CLI callers forward the root-loaded inventory/digest into
+  `HeldTestOwnerSettlement`. Public initialize/adopt/handback CAS, quiet fences,
+  immutable enrollment/binding history and missing-counter/singleton refusals are
+  unchanged. No owner row/receipt is manufactured to satisfy the new cardinality.
+- Restoration, owner channel, durable terminal COMMIT and bounded activation still
+  belong to the **same live Coordinator** and every accepted original holder.
+  Classic activation uses the accepted shared node; fresh activation remains its
+  distinct existing activation set. Commit/activation uncertainty retains the
+  existing intent and replay refusal; neither a file nor a later process is GO.
+
+**Operational blocker outside this source slice:** the unchanged
+`heldOwnerSettlementJournal.complete()` still requires `settled.length === 5`.
+The actual journal test confirms that two public handbacks leave a durable
+`settling-held` checkpoint with two confirmed rows, then refuse **before COMMIT**.
+Its owner must bind completion to the exact already validated `plan.nodes`
+(cardinality **and** membership), preserving in-flight checks, no-overwrite,
+file/parent fsync and irreversible/no-replay behavior. Do not deploy the v2 CLI
+until that narrow consumer adaptation and its positive/negative tests are joined.
+
+`test_v2_terminal_restore.py` exercises actual local original bytes, flock OFDs,
+NodeServer subprocesses, owner UDS codec and durable COMMIT/no replay. The JS v2
+suite runs the actual private parser, both CLI call chains and public owner APIs;
+DB queries/transactions, independent physical/root facts and the terminal-positive
+journal facade are **modeled**. It separately exercises the actual production
+journal (v1 positive; v2 retained blocker). This is not real Mongo or live-node
+proof. Existing real-Mongo suites need a separately assigned isolated replica set.
+
+The fresh-positive fixture models its sealed-root/UID/ingress prerequisites. An
+ordinary native build artifact is **not** an accepted sealed fresh-classic root.
+Adapting the ordinary artifact and accepting a B132-specific launch policy remain
+separate downstream work; frozen source-pack profiles and pins are unchanged.
+Installing refreshed helpers/source hashes, accepted capture/restore/owner pins
+and any launch policy requires independent deployment authorization. This slice
+performs none of those operations.

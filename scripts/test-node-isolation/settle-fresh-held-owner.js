@@ -27,6 +27,7 @@ async function main() {
         };
         const journal = new HeldOwnerSettlementJournal();
         const service = new HeldTestOwnerSettlement({ models, journal,
+            inventory: inputs.inventory, inventorySha256: inputs.config.inventorySha256,
             withRestorationScope: work => withFreshOperationalRestoration(inputs, work) });
         result = await service.freshHandback(inputs.config.plan);
     } catch (error) { failure = error; }

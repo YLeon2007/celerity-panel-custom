@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Finite root-only five-node restoration, irreversible commit and bounded activation.
+"""Finite root-only accepted-node restoration, commit and bounded activation.
 
 Only main() builds operational authority from fixed root-owned accepted pins.
 Programmatic constructor injection is for explicitly simulated local tests.
@@ -103,9 +103,26 @@ def local_origin(config):
     return {**actual, 'pid': os.getpid(), 'start': proc_start(os.getpid())}
 
 
+def accepted_inventory(config):
+    # Same authority as coordinated_capture: pin the installed isolation source
+    # BEFORE executing its existing accepted-inventory validator and fixed reader.
+    pins = [pin['files']['isolation'] for pin in config['nodes'].values()]
+    need(pins and len(set(pins)) == 1, 'ISOLATION_PIN_MISMATCH')
+    module = load_module('c3_restore_inventory', '/usr/local/libexec/c3-test-node-isolation', pins[0])
+    return module.accepted_inventory(config, read=trusted_read)
+
+
+def shared_node(config):
+    return accepted_inventory(config)['sharedNodeId'] if config['version'] == 2 else SHARED_NODE
+
+
 def validate(config):
-    need(isinstance(config, dict) and set(config) == {'version', 'context', 'lifetimeSeconds', 'origin', 'nodes', 'keySha256'})
-    need(type(config['version']) is int and config['version'] == 1 and config['context'] == 'test.infograd.online')
+    need(isinstance(config, dict) and set(config) == {'version', 'context', 'lifetimeSeconds', 'origin', 'nodes', 'keySha256'} |
+         ({'inventorySha256'} if config.get('version') == 2 else set()))
+    need(type(config['version']) is int and config['version'] in (1, 2) and config['context'] == 'test.infograd.online')
+    inventory = accepted_inventory(config) if config['version'] == 2 else None
+    nodes = {p['nodeId']: (p['endpoint']['ip'], p['targetProfile']) for p in inventory['nodes']} if inventory else NODES
+    shared = inventory['sharedNodeId'] if inventory else SHARED_NODE
     need(type(config['lifetimeSeconds']) is int and 80 <= config['lifetimeSeconds'] <= 120)
     need(set(config['origin']) == {'machineId', 'bootId', 'cgroup', 'uid'} and type(config['origin']['uid']) is int
          and config['origin']['uid'] == 0 and isinstance(config['origin']['cgroup'], str)
@@ -113,22 +130,31 @@ def validate(config):
     need(re.fullmatch('[a-f0-9]{32}', config['origin']['machineId']) and
          re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', config['origin']['bootId']))
     need(isinstance(config['keySha256'], str) and DIGEST.fullmatch(config['keySha256']))
-    need(set(config['nodes']) == set(NODES), 'EXACT_FIVE_NODES_REQUIRED')
+    if inventory:
+        physical = next(p['physical'] for p in inventory['nodes'] if p['nodeId'] == shared)
+        need(all(config['origin'][k] == physical[k] for k in ('machineId', 'bootId')), 'COORDINATOR_SHARED_HOST_MISMATCH')
+    need(set(config['nodes']) == set(nodes), 'EXACT_ACCEPTED_NODES_REQUIRED' if inventory else 'EXACT_FIVE_NODES_REQUIRED')
     machines, keys = set(), set()
     for node, pin in config['nodes'].items():
         need(set(pin) == {'identity', 'profiles', 'guard', 'files', 'hostKey'})
         ident = pin['identity']
         need(set(ident) == {'context', 'nodeId', 'endpointIp', 'targetProfile', 'machineId', 'bootId',
-                            'sshHostKeySha256', 'maintenanceId', 'planHash'})
+                            'sshHostKeySha256', 'maintenanceId', 'planHash'} | ({'inventorySha256'} if inventory else set()))
         need(ident['context'] == config['context'] and ident['nodeId'] == node and
-             (ident['endpointIp'], ident['targetProfile']) == NODES[node])
-        profiles = ['xray-main', 'xray-bridge'] if ident['endpointIp'] == '104.143.201.72' or node == SHARED_NODE else [ident['targetProfile']]
+             (ident['endpointIp'], ident['targetProfile']) == nodes[node])
+        if inventory:
+            accepted = next(p for p in inventory['nodes'] if p['nodeId'] == node)
+            need(ident['inventorySha256'] == config['inventorySha256'] and
+                 all(ident[k] == v for k, v in accepted['physical'].items()), 'ACCEPTED_PHYSICAL_DRIFT')
+            profiles = accepted['profiles']
+        else:
+            profiles = ['xray-main', 'xray-bridge'] if ident['endpointIp'] == '104.143.201.72' or node == shared else [ident['targetProfile']]
         need(pin['profiles'] == profiles and isinstance(pin['guard'], dict) and pin['guard'])
         need(re.fullmatch('[a-f0-9]{32}', ident['machineId']) and
              re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', ident['bootId']) and
              re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,127}', ident['maintenanceId']))
         files = {'self', 'originals', 'isolation', 'accepted', 'restoreAccepted'}
-        if node == '6ab189dc63913ebd4a917399':
+        if node == shared:
             files |= {'shared', 'freezer'}
         need(set(pin['files']) == files)
         need(all(isinstance(v, str) and DIGEST.fullmatch(v) for v in [*pin['files'].values(), ident['planHash'], ident['sshHostKeySha256']]))
@@ -217,6 +243,9 @@ class NodeServer:
     def __init__(self, writer, originals, config, wire, *, shared=None):
         self.writer, self.n, self.config, self.wire, self.shared = writer, originals, validate(config), wire, shared
         self.node = writer.engine.plan['nodeId']
+        self.shared_node = shared_node(config)
+        if config['version'] == 2:
+            need(writer.engine.plan.get('version') == 2 and writer.engine.plan.get('inventorySha256') == config['inventorySha256'], 'NODE_INVENTORY_DRIFT')
         self.pin = config['nodes'][self.node]
         self.nonce = secrets.token_hex(32)
         self.busy = False
@@ -231,12 +260,12 @@ class NodeServer:
         need(self.writer.engine.host.operator_session() == self.session, 'OPERATOR_SESSION_DRIFT_RETAINED')
         paths = {'self': SELF, 'originals': ORIGINALS, 'isolation': n.HELPER,
                  'accepted': n.ACCEPTED, 'restoreAccepted': n.RESTORE_ACCEPTED}
-        if self.node == '6ab189dc63913ebd4a917399':
+        if self.node == self.shared_node:
             paths.update(shared=SHARED, freezer=FREEZER)
         for name, path in paths.items():
             need(sha(fs.read(path)[0]) == self.pin['files'][name], 'ACCEPTED_FILE_PIN_DRIFT_RETAINED')
         need(canonical(fs.read_json(CONFIG)) == canonical(self.config), 'COORDINATOR_PIN_DRIFT_RETAINED')
-        if self.node == '6ab189dc63913ebd4a917399':
+        if self.node == self.shared_node:
             need(self.shared is not None, 'SHARED_CANDIDATE_HOLD_REQUIRED')
             assert self.shared is not None
             current = self.shared.check_hold(self.writer.engine.plan, STATE, self.writer.module)
@@ -276,7 +305,7 @@ class NodeServer:
                     self.busy = True
                     held.check()
                     if op == 'activation-preflight':
-                        need(self.node == SHARED_NODE and restored and not committed)
+                        need(self.node == self.shared_node and restored and not committed)
                         assert self.shared is not None
                         self.shared.check_hold(self.writer.engine.plan, STATE, self.writer.module, command='prepare-classic')
                     if op == 'commit-phase':
@@ -284,7 +313,7 @@ class NodeServer:
                         held.verify()
                         committed = frame['commitSha256']
                     if op == 'activate-classic':
-                        need(committed == frame['commitSha256'] and self.node == SHARED_NODE and restored, 'SHARED_COMMITTED_ACTIVATION_ONLY')
+                        need(committed == frame['commitSha256'] and self.node == self.shared_node and restored, 'SHARED_COMMITTED_ACTIVATION_ONLY')
                         held.verify()
                         assert self.shared is not None
                         raw = self.writer.fs.read(COMMIT)[0]
@@ -362,7 +391,7 @@ class Channel:
         frame = {'version': 1, 'op': op, 'nodeId': self.node, 'nodeNonce': self.hello['nodeNonce'],
                  'coordinatorNonce': self.nonce, 'seq': self.seq, 'challenge': secrets.token_hex(32), 'origin': self.origin}
         if op in ('activate-classic', 'commit-phase'):
-            need((op != 'activate-classic' or self.node == SHARED_NODE) and isinstance(commit_sha, str) and DIGEST.fullmatch(commit_sha))
+            need((op != 'activate-classic' or 'shared' in self.pin['files']) and isinstance(commit_sha, str) and DIGEST.fullmatch(commit_sha))
             frame['commitSha256'] = commit_sha
         self.wire.send(frame)
         return frame
@@ -425,6 +454,7 @@ class Coordinator:
     """Trusted root orchestrator API: live object, never JSON GO or app callback."""
     def __init__(self, config, fs, spawn, *, origin):
         self.config, self.fs, self.spawn, self.origin = validate(config), fs, spawn, origin
+        self.shared_node = shared_node(config)
         need({k: origin[k] for k in config['origin']} == config['origin'])
         self.nodes = []
         self.deadline = time.monotonic() + config['lifetimeSeconds']
@@ -471,6 +501,8 @@ class Coordinator:
 
     def live(self):
         need(self.active and time.monotonic() < self.deadline, 'RESTORATION_CAPABILITY_REVOKED')
+        if self.config['version'] == 2:
+            accepted_inventory(self.config)  # drift revokes, never refreshes authority
         need(canonical(self.fs.read_json(CONFIG)) == canonical(self.config), 'LOCAL_ACCEPTED_PIN_DRIFT_RETAINED')
         need(self.fs.read_json(INTENT) == self.intent, 'COORDINATOR_INTENT_DRIFT_RETAINED')
         if self.fs.fixture is None:
@@ -496,7 +528,8 @@ class Coordinator:
     def check(self):
         try:
             self.live()
-            need(len(self.nodes) == 5, 'EXACT_FIVE_ACTIVE_HOLDS_REQUIRED')
+            need(len(self.nodes) == len(self.config['nodes']) and {c.node for c in self.nodes} == set(self.config['nodes']),
+                 'EXACT_ACCEPTED_ACTIVE_HOLDS_REQUIRED' if self.config['version'] == 2 else 'EXACT_FIVE_ACTIVE_HOLDS_REQUIRED')
             self._check_channels(self.nodes)
             self.live()
         except BaseException:
@@ -504,13 +537,14 @@ class Coordinator:
             raise
 
     def commit_handoff(self, proof):
-        """Same root peer, current all-five holds; not a bearer receipt or retry."""
+        """Same root peer, every accepted hold; not a bearer receipt or retry."""
         need(not self.commit_attempted and self.commit_sha is None, 'HANDOFF_REPLAY_FORBIDDEN')
         self.check()
         need(set(proof) == {'context', 'revision', 'deployedRevision', 'quietSha256', 'nodes'} and
              proof['context'] == self.config['context'] and DIGEST.fullmatch(proof['quietSha256']) and
              all(type(proof[k]) is int and proof[k] >= 0 for k in ('revision','deployedRevision')))
-        need(len(proof['nodes']) == 5 and {n['nodeId'] for n in proof['nodes']} == set(NODES))
+        need(isinstance(proof['nodes'], list) and len(proof['nodes']) == len(self.config['nodes']) and
+             {n['nodeId'] for n in proof['nodes']} == set(self.config['nodes']))
         for item in proof['nodes']:
             need(set(item) == {'nodeId','targetProfile','enrollmentId','enrollmentSha256','priorOwnerGeneration','owner'})
             pin, owner = self.config['nodes'][item['nodeId']], item['owner']
@@ -526,7 +560,7 @@ class Coordinator:
                'nodePins': self.config['nodes'], 'nodePeers': {c.node: {'pid': c.hello['pid'], 'start': c.hello['start']} for c in self.nodes},
                'settlement': proof, 'activationSet': ['existing-classic-backend']}
         self.check()
-        shared = next(c for c in self.nodes if c.node == SHARED_NODE)
+        shared = next(c for c in self.nodes if c.node == self.shared_node)
         shared.request('activation-preflight', self.watch(shared))
         self.check()
         self.commit_attempted = True  # unknown file/parent fsync must NEVER activate
@@ -544,13 +578,13 @@ class Coordinator:
         for c in self.nodes:
             c.request('commit-phase', self.watch(c), commit_sha=self.commit_sha)
         self.check()
-        row = {'version': 1, 'commitSha256': self.commit_sha, 'attempted': [SHARED_NODE], 'confirmed': []}
+        row = {'version': 1, 'commitSha256': self.commit_sha, 'attempted': [self.shared_node], 'confirmed': []}
         self.fs.atomic(ACTIVATION, canonical(row), new=True)
         self.check()
-        channel = next(c for c in self.nodes if c.node == SHARED_NODE)
+        channel = next(c for c in self.nodes if c.node == self.shared_node)
         channel.request('activate-classic', self.watch(channel), commit_sha=self.commit_sha)
         self.check()
-        row['confirmed'] = [SHARED_NODE]
+        row['confirmed'] = [self.shared_node]
         self.fs.atomic(ACTIVATION, canonical(row))
         need(self.fs.read_json(ACTIVATION) == row)
         self.check()
@@ -714,7 +748,7 @@ class Coordinator:
                         return
                     continue
                 next_nonce = secrets.token_hex(32)
-                wire.send({**frame, 'op': 'restoration-held', 'nodeCount': 5,
+                wire.send({**frame, 'op': 'restoration-held', 'nodeCount': len(self.config['nodes']),
                            'handbackAllowed': False, 'nextNonce': next_nonce})
                 nonce = next_nonce
         except BaseException as error:
@@ -767,7 +801,7 @@ class RestorationChannel:
             self.config = validate(self.fs.read_json(CONFIG))
             self.intent = self.fs.read_json(INTENT)
             need(self.intent['phase'] == 'restored-held' and self.intent['inFlightNode'] is None and
-                 len(self.intent['restoredNodes']) == 5 and set(self.intent['restoredNodes']) == set(NODES) and
+                 len(self.intent['restoredNodes']) == len(self.config['nodes']) and set(self.intent['restoredNodes']) == set(self.config['nodes']) and
                  self.intent['configSha256'] == sha(canonical(self.config)), 'LIVE_RESTORATION_INTENT_REQUIRED')
             if self.fs.fixture is None:
                 # Descriptor-validate parents separately; socket is not a regular file.
@@ -803,7 +837,7 @@ class RestorationChannel:
             self.wire.send(request)
             reply = self.wire.receive()
             need(set(reply) == {*request, 'nodeCount', 'handbackAllowed', 'nextNonce'} and
-                 type(reply['version']) is int and type(reply['nodeCount']) is int and reply['nodeCount'] == 5 and
+                 type(reply['version']) is int and type(reply['nodeCount']) is int and reply['nodeCount'] == len(self.config['nodes']) and
                  {k: reply[k] for k in request} == {**request, 'op': 'restoration-held'} and
                  reply['handbackAllowed'] is False and isinstance(reply['nextNonce'], str) and
                  DIGEST.fullmatch(reply['nextNonce']) and reply['nextNonce'] != self.nonce, 'OWNER_REPLY_INVALID')
@@ -958,7 +992,7 @@ def main(*, fresh=False):
         proposed = n.decode(fs.read(module.CONFIG)[0])
         need(proposed.get('nodeId') == accepted['nodeId'], 'NODE_CONFIG_IDENTITY_DRIFT')
         shared = None
-        if accepted['nodeId'] == '6ab189dc63913ebd4a917399':
+        if accepted['nodeId'] == shared_node(config):
             need(sha(fs.read(FREEZER)[0]) == pin['files']['freezer'])
             shared = load_module('c3_shared_host', SHARED, pin['files']['shared'])
             plan = shared.validate_plan(proposed, module)

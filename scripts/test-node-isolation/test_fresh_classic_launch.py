@@ -102,12 +102,14 @@ class FreshLaunchTests(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def launch_fixture(m, fault=None, *, bridge=False, startup_fault=None):
+def launch_fixture(m, fault=None, *, bridge=False, startup_fault=None, v2=False):
     """Disposable Node source/settings, no credentials or physical operations."""
     import types
     import test_coordinated_restore as ct
     import coordinated_restore as c
-    with ct.cfixture(c, maintenance_id='12345678-1234-4234-8234-123456789abc' if bridge else None) as outer:
+    from unittest.mock import patch
+    with ct.cfixture(c, maintenance_id='12345678-1234-4234-8234-123456789abc' if bridge else None, v2=v2) as outer, \
+            (patch.object(c, 'trusted_read', lambda path: outer.fs.read(path)[0]) if v2 else contextlib.nullcontext()):
         root = outer.root/'fresh'
         root.mkdir()
         (outer.root/'state').mkdir(mode=0o700)
