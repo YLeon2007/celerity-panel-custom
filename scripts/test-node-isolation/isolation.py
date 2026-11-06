@@ -460,8 +460,16 @@ class Host:
                 need(name in p['isolateUnits'], 'UNREVIEWED_ACTIVATION_UNIT')
             if name.endswith('.timer') and not held:
                 need(set(item.get('Triggers', '').split()) <= set(p['isolateUnits']), 'TIMER_CHILD_NOT_ISOLATED')
-            for path in [item.get('FragmentPath', ''), *item.get('DropInPaths', '').split()]:
+            for index, path in enumerate([item.get('FragmentPath', ''), *item.get('DropInPaths', '').split()]):
                 if path and path != '/dev/null':
+                    # systemd can report the lexical mask as FragmentPath, not
+                    # /dev/null. It has no regular-file bytes to pin. Recognize
+                    # only a direct mask for a masked fragment, never a drop-in
+                    # or an arbitrary symlink resolving through other paths.
+                    if index == 0 and item.get('LoadState') == 'masked':
+                        mask = pathlib.Path(path)
+                        if mask.is_symlink() and os.readlink(mask) == '/dev/null':
+                            continue
                     need(path in p['unitFilePins'] and inventory['unitFilePins'].get(path) == p['unitFilePins'][path],
                          'UNREVIEWED_UNIT_FILE')
         stopgroups = {self.unit(u).get('ControlGroup') for u in p['isolateUnits']} - {'', None}

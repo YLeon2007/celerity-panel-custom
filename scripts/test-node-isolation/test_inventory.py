@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from contextlib import contextmanager
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 import coordinated_capture as capture
@@ -286,6 +287,264 @@ class HostInventoryTests(unittest.TestCase):
                 with patch.object(m.subprocess, 'run', side_effect=run), \
                      self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
                     host.inventory()
+
+
+class MaskedFragmentTests(unittest.TestCase):
+    # wave66 P/B maintenance-inventory + masked-unit-contract-witness: exact show
+    # fields/values, with only FragmentPath rebased into our disposable filesystem.
+    # Listings, physical identity and process/cgroup authority are MODELED. No host
+    # systemctl runs, scheduler reads, mask changes or authority acceptance here.
+    MASKS = {
+        'cryptdisks-early.service': '/usr/lib/systemd/system/cryptdisks-early.service',
+        'cryptdisks.service': '/usr/lib/systemd/system/cryptdisks.service',
+        'hwclock.service': '/usr/lib/systemd/system/hwclock.service',
+        'multipath-tools-boot.service': '/usr/lib/systemd/system/multipath-tools-boot.service',
+        'screen-cleanup.service': '/usr/lib/systemd/system/screen-cleanup.service',
+        'sudo.service': '/usr/lib/systemd/system/sudo.service',
+        'ufw.service': '/etc/systemd/system/ufw.service',
+        'x11-common.service': '/usr/lib/systemd/system/x11-common.service',
+    }
+
+    @staticmethod
+    def captured_show(name, fragment):
+        return {'MainPID': '0', 'ControlGroup': '', 'User': '', 'Group': '',
+                'RuntimeDirectoryPreserve': 'no', 'RuntimeDirectoryMode': '0755',
+                'RuntimeDirectory': '', 'KillMode': 'control-group', 'Id': name,
+                'Triggers': '', 'TriggeredBy': '', 'LoadState': 'masked',
+                'ActiveState': 'inactive', 'SubState': 'dead', 'FragmentPath': fragment,
+                'DropInPaths': '', 'UnitFileState': 'masked', 'Job': ''}
+
+    @contextmanager
+    def host(self, physical='P'):
+        with tempfile.TemporaryDirectory(prefix='masked-fragment-') as directory:
+            root = Path(directory)
+            real_path = type(root)
+            paths = dict(self.MASKS)
+            if physical == 'B':
+                paths['xl2tpd.service'] = '/etc/systemd/system/xl2tpd.service'
+            states = {}
+            for name, lexical in paths.items():
+                path = root / lexical.lstrip('/')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to('/dev/null')
+                states[name] = self.captured_show(name, str(path))
+            plan = ti.PlanTests().plan()
+            shows = {name: {'LoadState': 'not-found', 'ActiveState': 'inactive'}
+                     for name in plan['isolateUnits']}
+            shows.update(states)
+            replies = {'list-units': '', 'list-unit-files': ''.join(
+                name + ' masked -\n' for name in states), 'list-jobs': ''}
+            processes = []
+            def run(argv, **kwargs):
+                self.assertEqual(argv[0], '/usr/bin/systemctl')
+                self.assertEqual(kwargs, {'env': m.CLEAN_ENV, 'stdin': subprocess.DEVNULL,
+                    'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'timeout': 40})
+                if argv[1] == 'show':
+                    self.assertEqual(argv[:-1], HostInventoryTests.TEMPLATE_SHOW[:-1])
+                    self.assertIn(argv[-1], shows, 'unexpected unit observation')
+                    reply = shows[argv[-1]]
+                    if isinstance(reply, subprocess.CompletedProcess):
+                        return reply
+                    raw = ''.join(k + '=' + v + '\n' for k, v in reply.items())
+                else:
+                    self.assertIn(argv[1], replies)
+                    raw = replies[argv[1]]
+                return subprocess.CompletedProcess(argv, 0, raw.encode(), b'')
+            def observed_path(value):
+                value = str(value)
+                # Host.inventory's scheduler scan is unrelated; never inspect the
+                # real host's scheduler files. All unit paths remain REAL paths.
+                if value.startswith(('/etc/cron', '/var/spool/', '/etc/letsencrypt/')):
+                    return SimpleNamespace(is_file=lambda: False, is_dir=lambda: False)
+                return real_path(value)
+            with patch.object(m.subprocess, 'run', side_effect=run) as execute, \
+                 patch.object(m.pathlib, 'Path', side_effect=observed_path), \
+                 patch.object(m.Host, 'physical', return_value={'modeled': True}), \
+                 patch.object(m.Host, 'processes', side_effect=lambda: list(processes)):
+                yield SimpleNamespace(host=m.Host(), root=root, states=states, shows=shows,
+                    plan=plan, replies=replies, processes=processes, execute=execute)
+
+    def test_fresh_same_process_inventory_accepts_captured_masked_lexical_fragments(self):
+        for physical in ('P', 'B'):
+            with self.subTest(physical=physical), self.host(physical) as f:
+                observed = f.host.inventory()
+                self.assertEqual(observed['units'], f.states)
+                self.assertEqual(observed['unitFilePins'], {})
+                f.plan['unitFilePins'] = dict(observed['unitFilePins'])
+                for held in (False, True):
+                    with self.subTest(held=held):
+                        checked = f.host.check_inventory(f.plan, held=held)
+                        self.assertEqual(checked['units'], observed['units'])
+                        self.assertEqual(checked['unitFilePins'], {})
+                        self.assertIs(checked['diagnosticOnly'], True)
+                        self.assertIs(checked['notAuthority'], True)
+                        for state in f.states.values():
+                            path = type(f.root)(state['FragmentPath'])
+                            self.assertTrue(path.is_symlink())
+                            self.assertEqual(m.os.readlink(path), '/dev/null')
+
+
+    def test_mask_retarget_type_change_or_disappearance_is_not_reviewed(self):
+        for fault in ('wrong-device', 'indirect-null', 'nonliteral-null', 'regular', 'directory', 'missing'):
+            with self.subTest(fault=fault), self.host() as f:
+                f.plan['unitFilePins'] = dict(f.host.inventory()['unitFilePins'])
+                f.host.check_inventory(f.plan)
+                path = type(f.root)(f.states['cryptdisks-early.service']['FragmentPath'])
+                path.unlink()
+                if fault == 'wrong-device':
+                    path.symlink_to('/dev/zero')
+                elif fault == 'indirect-null':
+                    alias = f.root / 'alias'
+                    alias.symlink_to('/dev/null')
+                    path.symlink_to(alias)
+                elif fault == 'nonliteral-null':
+                    path.symlink_to('/dev/./null')
+                elif fault == 'regular':
+                    path.write_bytes(b'[Service]\nExecStart=/bin/true\n')
+                elif fault == 'directory':
+                    path.mkdir()
+                for held in (False, True):
+                    with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                        f.host.check_inventory(f.plan, held=held)
+
+    def test_mask_symlink_requires_masked_load_state_not_only_file_state(self):
+        for load in ('loaded', 'not-found', 'error'):
+            with self.subTest(load=load), self.host() as f:
+                f.host.check_inventory(f.plan)
+                f.states['cryptdisks-early.service']['LoadState'] = load
+                for held in (False, True):
+                    with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                        f.host.check_inventory(f.plan, held=held)
+
+    def test_regular_dormant_fragment_still_requires_exact_reviewed_bytes(self):
+        with self.host() as f:
+            state = f.states['cryptdisks-early.service']
+            path = type(f.root)(state['FragmentPath'])
+            path.unlink()
+            path.write_bytes(b'[Service]\nExecStart=/bin/true\n')
+            state.update(LoadState='loaded', UnitFileState='static')
+            observed = f.host.inventory()
+            self.assertEqual(observed['unitFilePins'], {str(path): m.digest(path.read_bytes())})
+            with self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                f.host.check_inventory(f.plan)
+            f.plan['unitFilePins'] = dict(observed['unitFilePins'])
+            for held in (False, True):
+                f.host.check_inventory(f.plan, held=held)
+            path.write_bytes(b'[Service]\nExecStart=/bin/false\n')
+            for held in (False, True):
+                with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                    f.host.check_inventory(f.plan, held=held)
+
+    def test_mask_fragment_never_exempts_unreviewed_or_changed_dropin(self):
+        with self.host() as f:
+            f.host.check_inventory(f.plan)
+            state = f.states['cryptdisks-early.service']
+            dropin = f.root / '10-override.conf'
+            dropin.write_bytes(b'[Service]\nRestart=no\n')
+            state['DropInPaths'] = str(dropin)
+            with self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                f.host.check_inventory(f.plan)
+            f.plan['unitFilePins'] = dict(f.host.inventory()['unitFilePins'])
+            self.assertEqual(f.plan['unitFilePins'], {str(dropin): m.digest(dropin.read_bytes())})
+            for held in (False, True):
+                f.host.check_inventory(f.plan, held=held)
+            dropin.write_bytes(b'[Service]\nRestart=always\n')
+            for held in (False, True):
+                with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                    f.host.check_inventory(f.plan, held=held)
+            dropin.unlink()
+            for held in (False, True):
+                with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                    f.host.check_inventory(f.plan, held=held)
+
+    def test_null_symlink_dropin_or_device_is_not_a_mask_fragment(self):
+        for fault in ('null-dropin', 'fragment-as-dropin', 'device-fragment'):
+            with self.subTest(fault=fault), self.host() as f:
+                f.host.check_inventory(f.plan)
+                state = f.states['cryptdisks-early.service']
+                if fault == 'device-fragment':
+                    state['FragmentPath'] = '/dev/zero'
+                elif fault == 'fragment-as-dropin':
+                    state['DropInPaths'] = state['FragmentPath']
+                else:
+                    dropin = f.root / '10-mask.conf'
+                    dropin.symlink_to('/dev/null')
+                    state['DropInPaths'] = str(dropin)
+                for held in (False, True):
+                    with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_UNIT_FILE$'):
+                        f.host.check_inventory(f.plan, held=held)
+
+    def test_literal_null_fragment_compatibility_is_retained(self):
+        with self.host() as f:
+            f.states['cryptdisks-early.service']['FragmentPath'] = '/dev/null'
+            self.assertEqual(f.host.inventory()['unitFilePins'], {})
+            for held in (False, True):
+                self.assertIn('cryptdisks-early.service', f.host.check_inventory(f.plan, held=held)['units'])
+
+    def test_masked_running_unit_is_not_mistaken_for_a_stopped_writer(self):
+        with self.host() as f:
+            name = 'cryptdisks-early.service'
+            group = '/system.slice/' + name
+            f.states[name].update(ActiveState='active', SubState='running', MainPID='42', ControlGroup=group)
+            f.processes.append({'pid': 42, 'start': '7', 'cgroup': group, 'exe': '/usr/bin/modeled-daemon'})
+            for held in (False, True):
+                with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNCLASSIFIED_PROCESS_CGROUP$'):
+                    f.host.check_inventory(f.plan, held=held)
+            # Masking is not stopping. Existing policy may keep an active unit;
+            # do not impose a new global inactive-only policy on masked units.
+            f.plan['keepCgroups'].append(group)
+            for held in (False, True):
+                f.host.check_inventory(f.plan, held=held)
+            with self.assertRaisesRegex(m.Refusal, '^WRITER_UNIT_NOT_DRAINED$'):
+                f.host.assert_stopped(name, group)
+
+    def test_held_mask_fragment_does_not_allow_legacy_or_old_ssh_executable(self):
+        with self.host() as f:
+            for exe, code in (('/usr/sbin/cron', 'LEGACY_WRITER_EXECUTABLE_REMAINS'),
+                              ('/usr/sbin/sshd', 'OLD_SSH_EXECUTABLE_REMAINS')):
+                with self.subTest(exe=exe):
+                    f.processes[:] = [{'cgroup': '/system.slice/xray.service', 'exe': exe}]
+                    f.host.check_inventory(f.plan)
+                    with self.assertRaisesRegex(m.Refusal, '^' + code + '$'):
+                        f.host.check_inventory(f.plan, held=True)
+
+    def test_masked_activation_units_and_timer_children_still_require_isolation(self):
+        for name in ('unreviewed.timer', 'certbot-extra.service', 'ssh-extra.socket'):
+            with self.subTest(name=name), self.host() as f:
+                f.host.check_inventory(f.plan)
+                state = dict(f.states['cryptdisks-early.service'], Id=name)
+                f.shows[name] = state
+                f.replies['list-unit-files'] += name + ' masked -\n'
+                for held in (False, True):
+                    with self.subTest(held=held), self.assertRaisesRegex(m.Refusal, '^UNREVIEWED_ACTIVATION_UNIT$'):
+                        f.host.check_inventory(f.plan, held=held)
+        with self.host() as f:
+            name = 'certbot.timer'
+            f.shows[name] = dict(f.states['cryptdisks-early.service'], Id=name, Triggers='unreviewed.service')
+            f.replies['list-unit-files'] += name + ' masked -\n'
+            with self.assertRaisesRegex(m.Refusal, '^TIMER_CHILD_NOT_ISOLATED$'):
+                f.host.check_inventory(f.plan)
+            f.plan['isolateUnits'].append('unreviewed.service')
+            f.shows['unreviewed.service'] = {'LoadState': 'not-found', 'ActiveState': 'inactive'}
+            f.host.check_inventory(f.plan)
+
+    def test_masked_show_failure_and_pending_job_stay_fatal(self):
+        with self.host() as f:
+            f.host.check_inventory(f.plan)
+            f.replies['list-jobs'] = '1 cryptdisks-early.service start waiting\n'
+            with self.assertRaisesRegex(m.Refusal, '^SYSTEMD_JOB_PENDING$'):
+                f.host.check_inventory(f.plan)
+            f.replies['list-jobs'] = ''
+            f.shows['cryptdisks-early.service'] = subprocess.CompletedProcess([], 5, b'', b'unexpected show failure\n')
+            with self.assertRaisesRegex(m.Refusal, '^HOST_COMMAND_FAILED$'):
+                f.host.check_inventory(f.plan)
+
+    def test_mask_link_read_error_is_not_converted_to_reviewed_file(self):
+        with self.host() as f:
+            f.host.check_inventory(f.plan)
+            with patch.object(m.os, 'readlink', side_effect=OSError('modeled readlink failure')), \
+                 self.assertRaisesRegex(OSError, 'modeled readlink failure'):
+                f.host.check_inventory(f.plan)
 
 
 if __name__=='__main__': unittest.main()
