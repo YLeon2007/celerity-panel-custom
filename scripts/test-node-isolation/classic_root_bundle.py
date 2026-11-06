@@ -3,14 +3,16 @@
 
 Committed app and explicitly pinned supervisor sources, lock-exact installed
 snapshot bytes (including dereferenced within-root aliases), private fixed TEST
-settings and optional reviewed runtime-input proposal. Entire candidate stages
-privately and publishes with Linux RENAME_NOREPLACE only after final byte checks.
+settings, optional reviewed runtime proposal and explicit fixed B132 /etc data.
+The entire candidate stages privately and publishes with Linux RENAME_NOREPLACE
+only after final byte checks.
 Outer directory is 0700; payload directories 0755 and regular files 0644/0755.
 No live authority, root ownership, namespace or mount acceptance is inferred.
 """
 
 import argparse
 import base64
+from contextlib import ExitStack
 import ctypes
 import errno
 import importlib.util
@@ -30,6 +32,9 @@ MAX_FILE_BYTES = 256 * 1024 * 1024
 FIXED_EXECUTABLE = "/runtime/node"
 FIXED_SOURCE = "/app/index.js"
 FIXED_SETTINGS = "/etc/classic.json"
+ETC_TARGETS = frozenset(('/etc/hosts', '/etc/nsswitch.conf', '/etc/resolv.conf',
+                         '/etc/ssl/certs/ca-certificates.crt'))
+MAX_ETC_BYTES = 2 * 1024 * 1024
 DEP_ROOT = "/app/node_modules"
 ELF_ROOT = "/runtime/lib"  # legacy explicitly pinned input, not a complete runtime
 SUPERVISORS = {
@@ -487,6 +492,71 @@ def materialize_runtime(path, image_root):
         raise Refusal('RUNTIME_INPUTS_REFUSED') from None
 
 
+def read_etc_input(path, limit):
+    """Read explicit private bytes, no symlink hops or frozen-input atime writes."""
+    need(type(path) is str and path.startswith('/') and '\x00' not in path and
+         str(Path(path)) == path and '..' not in Path(path).parts and path != '/',
+         'INVALID_ETC_SOURCE_PATH')
+    try:
+        with ExitStack() as stack:
+            fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, fd)
+            parts = Path(path).parts[1:]
+            for part in parts[:-1]:
+                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                stack.callback(os.close, fd)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+                         os.O_CLOEXEC | os.O_NOATIME, dir_fd=fd)
+            stack.callback(os.close, fd)
+            before = os.fstat(fd)
+            need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                 stat.S_IMODE(before.st_mode) == 0o600 and 0 < before.st_size <= limit and
+                 not os.listxattr(fd), 'INVALID_ETC_SOURCE_FILE')
+            chunks = []; left = limit + 1
+            while left:
+                raw = os.read(fd, min(CHUNK, left))
+                if not raw:
+                    break
+                chunks.append(raw); left -= len(raw)
+            raw = b''.join(chunks)
+            need(len(raw) == before.st_size and identity(before) == identity(os.fstat(fd)),
+                 'ETC_INPUT_READ_DRIFT')
+            return raw
+    except OSError:
+        raise Refusal('ETC_INPUT_READ_REFUSED') from None
+
+
+def materialize_etc(path, image_root):
+    """Fixed B132 TEST data inputs only; never harvest ambient host /etc."""
+    try:
+        proposal = json.loads(read_etc_input(str(path), 16384).decode('utf-8'))
+    except (ValueError, UnicodeError):
+        raise Refusal('INVALID_ETC_INPUTS') from None
+    need(type(proposal) is dict and set(proposal) == {'version', 'context', 'layout', 'files'} and
+         type(proposal['version']) is int and proposal['version'] == 1 and
+         proposal['context'] == 'test.infograd.online' and proposal['layout'] == 'b132-test',
+         'INVALID_ETC_INPUTS')
+    files = proposal['files']
+    if type(files) is not dict or set(files) != ETC_TARGETS:
+        raise Refusal('FIXED_ETC_INPUTS_REQUIRED')
+    entries = {}; metadata = {}
+    for target, spec in sorted(files.items()):
+        need(type(spec) is dict and set(spec) == {'source', 'sha256', 'size', 'mode'} and
+             type(spec['sha256']) is str and re.fullmatch('[a-f0-9]{64}', spec['sha256']) and
+             type(spec['size']) is int and 0 < spec['size'] <= MAX_ETC_BYTES and
+             type(spec['mode']) is int and spec['mode'] == 0o644, 'INVALID_ETC_INPUT_ENTRY')
+        raw = read_etc_input(spec['source'], MAX_ETC_BYTES)
+        pin = hashlib.sha256(raw).hexdigest()
+        need(pin == spec['sha256'] and len(raw) == spec['size'], 'ETC_INPUT_DIGEST_OR_SIZE_DRIFT')
+        dest = checked_image_path(image_root, target)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(raw)
+        os.chmod(dest, 0o644)
+        entries[target] = pin
+        metadata[target] = {key: spec[key] for key in ('sha256', 'size', 'mode')}
+    return entries, metadata
+
+
 def copy_pinned(source, dest, pin, code, executable=False):
     source = Path(source)
     raw, _ = read_beneath(Path('/'), source.absolute().relative_to('/'))
@@ -546,6 +616,8 @@ def build(args):
         runtime_path = getattr(args, 'runtime_inputs', None)
         runtime = materialize_runtime(runtime_path, image_root) if runtime_path else {}
         need(not set(runtime) & set(elf), 'RUNTIME_TARGET_COLLISION')
+        etc_path = getattr(args, 'etc_inputs', None)
+        etc, etc_metadata = materialize_etc(etc_path, image_root) if etc_path is not None else ({}, {})
         settings_raw, settings_meta = settings_bytes(args.settings)
         need(type(args.node_digest) is str and re.fullmatch('[a-f0-9]{64}', args.node_digest),
              'INVALID_NODE_DIGEST')
@@ -565,7 +637,7 @@ def build(args):
         settings_dest.write_bytes(settings_raw)
         os.chmod(settings_dest, 0o644)
         entries = {}
-        for section in (sources,dependencies,elf,runtime):
+        for section in (sources,dependencies,elf,runtime,etc):
             need(not entries.keys() & section.keys(), 'IMAGE_SECTION_COLLISION')
             entries.update(section)
         entries[FIXED_EXECUTABLE] = args.node_digest
@@ -604,6 +676,9 @@ def build(args):
                 'owner':'integration/coordinator/platform'},
             'limitations':['Snapshot pins prove installed bytes, not npm archive integrity.',
                            'Offline candidate only; no live settings, authority, mounts or ownership accepted.']}
+        if etc_path is not None:
+            report['etcInputs'] = {'layout': 'b132-test', 'files': etc_metadata}
+            report['counts']['etcFiles'] = len(etc)
         for name, document in (('manifest.json',manifest),('report.json',report)):
             with open(stage/name, 'x', encoding='utf-8') as stream:
                 json.dump(document, stream, indent=2, sort_keys=True)
@@ -631,6 +706,7 @@ def main(argv=None):
     parser.add_argument("--snapshot-index", required=True)
     parser.add_argument("--elf-allowlist", required=True)
     parser.add_argument("--runtime-inputs", help="explicit offline candidate runtime proposal, not accepted inventory")
+    parser.add_argument("--etc-inputs", help="explicit hash/size/mode-bound B132 TEST data inputs; all four fixed paths required")
     parser.add_argument("--node-executable", required=True)
     parser.add_argument("--node-digest", required=True)
     parser.add_argument("--settings", required=True)

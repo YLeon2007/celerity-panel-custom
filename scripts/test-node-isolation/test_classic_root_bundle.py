@@ -20,7 +20,8 @@ from unittest.mock import patch
 HERE = pathlib.Path(__file__).resolve().parent
 MODULE_PATH = HERE / "classic_root_bundle.py"
 SCRATCH = pathlib.Path("/home/leon/.hermes/cache/scratch")
-LOCK_SOURCE = SCRATCH / "c3-lock-exact-20261021/source"
+LOCK_SOURCE = pathlib.Path(os.environ.get('C3_ROOT_BUNDLE_LOCK_SOURCE',
+                            str(SCRATCH / 'c3-lock-exact-20261021/source')))
 NODE = "/home/leon/.hermes/node/bin/node"
 FIXTURE_COMMIT = "675ac7d014d0b1bb4a982943293b6feddfe8d66f"
 
@@ -512,7 +513,8 @@ class RuntimeAndPublicationTests(unittest.TestCase):
               'files':['/app/index.js', *targets], 'pins':pins})
         output = self.fx.path('out/candidate')
         args = self.fx.build_args(output, source_allowlist=str(allow),
-            runtime_inputs='/home/leon/celerity-prod-release-20261019/active-enable-20261021/runtime-inputs/actual-runtime-inputs.json',
+            runtime_inputs=os.environ.get('C3_ROOT_BUNDLE_RUNTIME_INPUTS',
+                '/home/leon/celerity-prod-release-20261019/active-enable-20261021/runtime-inputs/actual-runtime-inputs.json'),
             node_executable=NODE, node_digest=sha256(NODE))
         manifest = json.loads(m.build(args).read_bytes())
         self.assertIn('/lib64/ld-linux-x86-64.so.2', manifest)
@@ -553,6 +555,183 @@ class RuntimeAndPublicationTests(unittest.TestCase):
             allow = self.fx.json('inputs/source-allowlist.json', {'repo':str(HERE.parents[1]),
                  'commit':FIXTURE_COMMIT, 'files':['/app/index.js',name]})
             with self.assertRaises(m.Refusal): m.load_source_allowlist(allow)
+
+
+class RuntimeEtcInputsTests(unittest.TestCase):
+    """Tiny bundle, real supplied data bytes; not the 11114-entry root."""
+    TARGETS = ('/etc/hosts', '/etc/nsswitch.conf', '/etc/resolv.conf',
+               '/etc/ssl/certs/ca-certificates.crt')
+
+    def setUp(self):
+        self.fx = Fixture(self); self.fx.dependency_tree()
+        supplied = os.environ.get('C3_ROOT_BUNDLE_ETC_INPUTS')
+        data = {}
+        if supplied:
+            with os.fdopen(os.open(supplied, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME), 'rb') as stream:
+                data = json.load(stream)
+            sources = {target: data['files'][target]['source'] for target in self.TARGETS}
+        else:
+            # Read real public local data only for disposable unit fixtures. The
+            # producer never implicitly reads host /etc; B132 replay supplies the
+            # independently captured upstream resolver and CA via the env input.
+            sources = {target: target for target in self.TARGETS}
+        self.entries = {}
+        for index, target in enumerate(self.TARGETS):
+            if supplied:
+                with os.fdopen(os.open(sources[target], os.O_RDONLY | os.O_NOFOLLOW | os.O_NOATIME), 'rb') as stream:
+                    raw = stream.read()
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), data['files'][target]['sha256'])
+                self.assertEqual(len(raw), data['files'][target]['size'])
+            else:
+                raw = pathlib.Path(sources[target]).read_bytes()
+            source = self.fx.write('inputs/etc-data-' + str(index), raw, mode=0o600)
+            self.entries[target] = {'source': str(source), 'sha256': sha256(source),
+                                    'size': len(raw), 'mode': 0o644}
+        self.proposal = {'version': 1, 'context': 'test.infograd.online',
+                         'layout': 'b132-test', 'files': self.entries}
+        self.input = self.fx.json('inputs/etc-inputs.json', self.proposal, mode=0o600)
+
+    def tearDown(self):
+        shutil.rmtree(self.fx.base, ignore_errors=True)
+
+    def test_explicit_empty_etc_input_cannot_downgrade_to_legacy_layout(self):
+        self.fx.expect_refusal('INVALID_ETC_SOURCE_PATH', etc_inputs='')
+
+    def refuse_proposal(self, code):
+        self.fx.json('inputs/etc-inputs.json', self.proposal, mode=0o600)
+        self.fx.expect_refusal(code, etc_inputs=str(self.input))
+
+    def test_missing_each_mandatory_etc_target_refuses_without_publication(self):
+        for target in self.TARGETS:
+            with self.subTest(target=target):
+                self.proposal['files'] = {k: v for k, v in self.entries.items() if k != target}
+                self.refuse_proposal('FIXED_ETC_INPUTS_REQUIRED')
+
+    def test_missing_etc_source_refuses_without_publication(self):
+        pathlib.Path(self.entries['/etc/hosts']['source']).unlink()
+        self.fx.expect_refusal('ETC_INPUT_READ_REFUSED', etc_inputs=str(self.input))
+
+    def test_wrong_etc_hash_or_size_refuses_without_publication(self):
+        for key, value in [('sha256', '0'*64), ('size', 1)]:
+            with self.subTest(field=key):
+                old = self.entries['/etc/hosts'][key]
+                self.entries['/etc/hosts'][key] = value
+                self.refuse_proposal('ETC_INPUT_DIGEST_OR_SIZE_DRIFT')
+                self.entries['/etc/hosts'][key] = old
+
+    def test_etc_allowlist_cannot_overwrite_settings_policy_or_arbitrary_files(self):
+        for target in ['/etc/classic.json', m.POLICY_PATH, '/etc/passwd',
+                       '/etc/hosts/../hosts', '/usr/lib/ssl/cert.pem']:
+            with self.subTest(target=target):
+                self.proposal['files'] = {**self.entries, target: self.entries['/etc/hosts']}
+                self.refuse_proposal('FIXED_ETC_INPUTS_REQUIRED')
+
+    def test_non_regular_or_linked_etc_sources_refuse(self):
+        source = pathlib.Path(self.entries['/etc/hosts']['source'])
+        saved = source.read_bytes()
+        source.unlink(); source.symlink_to(self.entries['/etc/resolv.conf']['source'])
+        self.fx.expect_refusal('ETC_INPUT_READ_REFUSED', etc_inputs=str(self.input))
+        source.unlink(); source.write_bytes(saved); source.chmod(0o600)
+        os.link(source, self.fx.path('inputs/hardlink'))
+        self.fx.expect_refusal('INVALID_ETC_SOURCE_FILE', etc_inputs=str(self.input))
+        source.unlink(); os.mkfifo(source, 0o600)
+        self.fx.expect_refusal('INVALID_ETC_SOURCE_FILE', etc_inputs=str(self.input))
+
+    def test_symlink_parent_and_noncanonical_source_refuse(self):
+        source = self.entries['/etc/hosts']['source']
+        self.fx.path('alias').symlink_to(self.fx.path('inputs'), target_is_directory=True)
+        self.entries['/etc/hosts']['source'] = str(self.fx.path('alias', pathlib.Path(source).name))
+        self.refuse_proposal('ETC_INPUT_READ_REFUSED')
+        self.entries['/etc/hosts']['source'] = str(self.fx.path('inputs/../inputs', pathlib.Path(source).name))
+        self.refuse_proposal('INVALID_ETC_SOURCE_PATH')
+
+    def test_exact_private_source_and_nonexecutable_payload_modes_required(self):
+        source = pathlib.Path(self.entries['/etc/hosts']['source'])
+        source.chmod(0o644)
+        self.fx.expect_refusal('INVALID_ETC_SOURCE_FILE', etc_inputs=str(self.input))
+        source.chmod(0o600)
+        for field, value in [('mode', 0o755), ('mode', 420.0), ('size', True), ('sha256', 'F'*64)]:
+            with self.subTest(field=field, value=value):
+                old = self.entries['/etc/hosts'][field]
+                self.entries['/etc/hosts'][field] = value
+                self.refuse_proposal('INVALID_ETC_INPUT_ENTRY')
+                self.entries['/etc/hosts'][field] = old
+
+    def test_etc_proposal_requires_closed_b132_test_layout(self):
+        for field, value in [('version', True), ('layout', 'other'), ('context', 'other'), ('extra', True)]:
+            with self.subTest(field=field):
+                original = dict(self.proposal)
+                self.proposal[field] = value
+                self.refuse_proposal('INVALID_ETC_INPUTS')
+                self.proposal = original
+
+    def test_etc_input_reads_preserve_frozen_metadata(self):
+        paths = [self.input, *(pathlib.Path(spec['source']) for spec in self.entries.values())]
+        for path in paths:
+            os.utime(path, ns=(1_000_000_000, path.stat().st_mtime_ns))
+        def metadata(path):
+            s = path.stat()
+            return (s.st_dev, s.st_ino, s.st_mode, s.st_nlink, s.st_size,
+                    s.st_atime_ns, s.st_mtime_ns, s.st_ctime_ns)
+        before = [metadata(path) for path in paths]
+        m.build(self.fx.build_args(self.fx.path('out/candidate'), etc_inputs=str(self.input)))
+        self.assertEqual([metadata(path) for path in paths], before)
+
+    def test_explicit_etc_cli_manifest_roundtrip_and_no_replace(self):
+        output = self.fx.path('out/candidate')
+        # Args stores fixture inputs as class attributes.
+        inputs = self.fx.build_args(output)
+        args = {key: getattr(inputs, key) for key in (
+            'source_allowlist', 'node_modules', 'package_lock', 'snapshot_index',
+            'elf_allowlist', 'node_executable', 'node_digest', 'settings', 'output')}
+        args['etc_inputs'] = str(self.input)
+        argv = [value for key, value in args.items() for value in ('--'+key.replace('_', '-'), str(value))]
+        result = subprocess.run([sys.executable, '-I', '-B', str(MODULE_PATH), *argv],
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        manifest = json.loads((output/'manifest.json').read_bytes())
+        sys.path.insert(0, str(HERE))
+        import fresh_classic_launch as consumer
+        consumer.verify_files({'files': manifest}, lambda name: output/'root'/name.lstrip('/'))
+        report = json.loads((output/'report.json').read_bytes())
+        self.assertEqual(report['etcInputs']['files'],
+            {target: {key: spec[key] for key in ('sha256', 'size', 'mode')} for target, spec in self.entries.items()})
+        self.assertEqual(report['counts']['etcFiles'], 4)
+        self.assertNotIn(str(self.fx.base), json.dumps(report))
+        before = (output/'manifest.json').read_bytes()
+        result = subprocess.run([sys.executable, '-I', '-B', str(MODULE_PATH), *argv],
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), b'REFUSAL OUTPUT_EXISTS_FAIL_CLOSED')
+        self.assertEqual((output/'manifest.json').read_bytes(), before)
+
+    def test_etc_files_are_not_general_committed_source_allowlist_targets(self):
+        for target in self.TARGETS:
+            with self.subTest(target=target):
+                allow = self.fx.json('inputs/source-allowlist.json', {
+                    'repo': str(HERE.parents[1]), 'commit': FIXTURE_COMMIT,
+                    'files': ['/app/index.js', target]})
+                with self.assertRaisesRegex(m.Refusal, '^INVALID_SOURCE_ALLOWLIST_FILES$'):
+                    m.load_source_allowlist(allow)
+
+    def test_explicit_runtime_etc_bytes_reach_actual_file_checker(self):
+        output = self.fx.path('out/candidate')
+        manifest = json.loads(m.build(self.fx.build_args(output, etc_inputs=str(self.input))).read_bytes())
+        sys.path.insert(0, str(HERE))
+        import fresh_classic_launch as consumer
+        expected = {target: spec['sha256'] for target, spec in self.entries.items()}
+        try:
+            consumer.verify_files({'files': {**manifest, **expected}}, lambda name: output/'root'/name.lstrip('/'))
+        except FileNotFoundError:
+            self.fail('actual file checker cannot read required runtime /etc input')
+        self.assertTrue(set(self.TARGETS) <= manifest.keys(), 'required runtime /etc inputs missing from producer manifest')
+        consumer.verify_files({'files': manifest}, lambda name: output/'root'/name.lstrip('/'))
+        for target, spec in self.entries.items():
+            dest = output/'root'/target.lstrip('/')
+            self.assertEqual(dest.read_bytes(), pathlib.Path(spec['source']).read_bytes())
+            self.assertEqual(manifest[target], spec['sha256'])
+            self.assertEqual(stat.S_IMODE(dest.stat().st_mode), spec['mode'])
+        self.assertFalse(json.loads((output/'report.json').read_bytes())['physicalAccepted'])
 
 
 class OutputSafetyFaultTests(unittest.TestCase):
