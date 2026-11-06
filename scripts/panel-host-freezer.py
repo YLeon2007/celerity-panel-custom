@@ -754,12 +754,13 @@ class Fence:
         self.dead = False
         self.phase = 'new'
         self.pending = None
+        self.return_started = False
 
     def record(self, phase, **extra):
         self.phase = phase
         if phase == 'intent':
             self.pending = copy.deepcopy(extra)
-        elif phase not in ('unknown', 'committed-activation-unknown'):
+        elif phase not in ('unknown', 'committed-activation-unknown', 'return-unknown'):
             self.pending = None
         self.journal.save({'phase': phase, 'owner': self.owner, 'pending': self.pending,
                            'originalExpected': self.original, 'expected': self.expected, 'frozen': self.frozen[:],
@@ -767,7 +768,8 @@ class Fence:
 
     def unknown(self):
         # Never thaw in any failure path, including signals, EOF or journal failure.
-        phase = 'committed-activation-unknown' if 'classicActivation' in self.expected else 'unknown'
+        phase = ('return-unknown' if self.return_started else
+                 'committed-activation-unknown' if 'classicActivation' in self.expected else 'unknown')
         self.phase = phase
         self.record(phase)
 
@@ -886,23 +888,35 @@ class Fence:
             self.record('committed-activation-unknown')
             raise
 
-    def restore(self, owner):
+    def restore(self, owner, *, checkpoint=None):
         need('candidateClosure' not in self.expected, 'candidate closure forbids restore')
         self.require(('held',), owner)
         self.check()
         try:
+            if checkpoint:
+                checkpoint()
+            # A release can enable OLD before its acknowledgement. Never claim
+            # retained exclusion or retry after this boundary.
+            self.return_started = True
+            self.record('returning')
             # Control-plane APIs can resume pending work once thawed; restoration
             # is allowed ONLY before destructive work / node mutation.
             self.kernel.restore_proxies(self.expected, self.record)
+            if checkpoint:
+                checkpoint()
             replacement = self.kernel.restore_relaunch(self.expected, self.record)
             if replacement:
                 self.frozen.remove(replacement)
             need(self.expected == self.original, 'original state projection mismatch')
             for group in reversed(self.expected['freezeOrder']):
+                if checkpoint:
+                    checkpoint()
                 self.record('intent', action='thaw', group=group)
                 self.kernel.freeze(group, False)
                 self.frozen.remove(group)
                 self.kernel.verify(self.expected, self.frozen, self.dead)
+            if checkpoint:
+                checkpoint()
             self.record('restored')
             return {'hostFence': 'released', 'nodeState': 'unknown', 'owner': self.owner}
         except BaseException:
@@ -973,7 +987,9 @@ def serve(fence, infd=0):
     except BaseException as error:
         fence.unknown()
         reason = str(error) if type(error) is RuntimeError else type(error).__name__
-        emit({'hostFence': 'unknown', 'holdRequired': True, 'nodeState': 'unknown', 'owner': fence.owner, 'reason': reason})
+        emit({'hostFence': 'unknown', 'holdRequired': not fence.return_started, 'nodeState': 'unknown',
+              'owner': fence.owner, 'reason': reason,
+              **({'returnState': 'UNKNOWN'} if fence.return_started else {})})
         return 2
 
 

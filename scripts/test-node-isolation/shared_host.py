@@ -1,6 +1,6 @@
 """Bounded shared TEST host mode. Loaded only from a fixed trusted install path.
 
-No authority export, Docker payload wildcard, thaw, restore, or host-root override.
+No authority export, Docker payload wildcard or host-root override.
 The original freezer owns all kernel freeze operations and retains unknown on loss.
 """
 import copy
@@ -276,6 +276,34 @@ def make_host(directory, p, m):
 
 def make_engine(directory, p, m, host=None):
     class SharedEngine(m.Engine):
+        def apply(self, guard):
+            if p.get('version') == 2:
+                # Register BEFORE the first node journal/mutation, on this live
+                # Fence. A later process may not adopt its partial journal.
+                early_request(p, directory, m, 'begin-isolation', self._outer_lock_fd)
+            try:
+                return super().apply(guard)
+            except m.KnownIsolationRefusal as error:
+                # A known pure preflight refusal has no node journal/effects.
+                # Return now, while the registered apply peer is still alive.
+                if p.get('version') == 2 and self._early is None and self.read() is None:
+                    return {**self.abort_return(self._outer_lock_fd), 'isolationRefusal': str(error)}
+                raise
+
+        def abort_return(self, lock_fd):
+            if self._early is not None:
+                return super().abort_return(lock_fd)
+            m.need(self.read() is None, 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+            self.require_early_lock(lock_fd)
+            try:
+                return early_request(p, directory, m, 'abort-return', lock_fd)
+            except (m.Refusal, OSError, RuntimeError) as error:
+                raise m.EarlyReturnUnknown('HOST_RETURN_OUTCOME_UNKNOWN') from error
+
+        def finish_early_return(self, lock_fd):
+            return early_request(p, directory, m, 'abort-return', lock_fd,
+                                 node_return_sha=m.digest(m.secure_file(pathlib.Path(directory) / 'journal.json')))
+
         def evidence(self, state):
             value = super().evidence(state)
             value['scope'] = 'shared-test-node-maintenance-v1'
@@ -303,11 +331,86 @@ def make_engine(directory, p, m, host=None):
                         validator=lambda value: validate_plan(value, m))
 
 
+def early_request(p, directory, m, command, lock_fd, *, node_return_sha=None):
+    """Finite same-live-owner extension of the existing root UDS channel.
+
+    Transfer the ALREADY held outer OFD; never unlock/reacquire around return.
+    No disk token authorizes adoption, retry, capture, DB writes or handback.
+    """
+    import array
+    import socket
+    m.need(p.get('version') == 2 and command in ('begin-isolation', 'abort-return'), 'V2_EARLY_RETURN_ONLY')
+    identity = m.decode_json(m.secure_file(pathlib.Path(directory) / 'host-guard.json'))
+    check_identity(identity, p, directory, m)
+    nonce = os.urandom(32).hex()
+    frame = {'nonce': nonce, 'command': command, 'owner': identity['owner'],
+             'planHash': identity['planHash'], 'nodeReturnSha256': node_return_sha}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(120)
+        conn.connect(identity['socket'])
+        pid, uid, _ = peer_identity(conn)
+        m.need(pid == identity['pid'] and uid == 0, 'HOST_GUARD_PEER_MISMATCH')
+        raw = (m.json.dumps(frame) + '\n').encode()
+        sent = conn.sendmsg([raw], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [lock_fd]))])
+        m.need(sent == len(raw), 'HOST_RETURN_SEND_UNKNOWN_RETAINED')
+        reply = b''
+        while not reply.endswith(b'\n') and len(reply) <= 8192:
+            part = conn.recv(8192)
+            m.need(bool(part), 'HOST_RETURN_OUTCOME_UNKNOWN')
+            reply += part
+        m.need(len(reply) <= 8192 and reply.endswith(b'\n'), 'HOST_GUARD_FRAME_LIMIT')
+        answer = m.decode_json(reply)
+        keys = {'nonce', 'identity', 'recordSha256'} | ({'returnState'} if command == 'abort-return' else set())
+        m.need(set(answer) == keys and answer['nonce'] == nonce and answer['identity'] == identity,
+               'HOST_GUARD_CHALLENGE_MISMATCH')
+        raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
+        m.need(m.digest(raw) == answer['recordSha256'], 'HOST_RECORD_CHANGED')
+        row = read_record(directory, m)
+        if command == 'abort-return':
+            m.need(answer['returnState'] == 'OLD' and row == {
+                'phase': 'restored', 'owner': identity['owner'], 'pending': None,
+                'originalExpected': p['hostHold']['expected'], 'expected': p['hostHold']['expected'],
+                'frozen': [], 'dead': False}, 'HOST_RETURN_OUTCOME_UNKNOWN')
+            return {'returnState': 'OLD', 'hostFence': 'released', 'notApplicationAuthority': True}
+        m.need(row['phase'] == 'held', 'HOST_STATE_UNKNOWN_RETAINED')
+        return {}
+
+
+def receive_request(conn, m):
+    """Close every transferred FD once, including malformed/extra rights."""
+    import array
+    import contextlib
+    import socket
+    @contextlib.contextmanager
+    def receive():
+        rights = []
+        try:
+            conn.settimeout(3)
+            request, ancillary, flags, _ = conn.recvmsg(1025, socket.CMSG_SPACE(16 * array.array('i').itemsize))
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    values = array.array('i'); values.frombytes(data)
+                    rights.extend(values)
+                else:
+                    m.need(False, 'INVALID_HOST_RIGHTS')
+            m.need(not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC), 'INVALID_HOST_RIGHTS')
+            while not request.endswith(b'\n') and len(request) <= 1024:
+                chunk = conn.recv(1025)
+                m.need(bool(chunk), 'HOST_CLIENT_LOST')
+                request += chunk
+            m.need(len(request) <= 1024 and request.endswith(b'\n'), 'HOST_GUARD_FRAME_LIMIT')
+            yield request, rights
+        finally:
+            for fd in rights:
+                os.close(fd)
+    return receive()
+
+
 def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
     """Foreground owner of the REAL Fence; EOF/signal retains candidate/control holds.
 
     Injectable adapters are Python-only local test seams. CLI has no fake root.
-    No destructive kill, legacy restore, journal adoption or mask restore API.
+    No destructive kill, journal adoption or general mask restore API.
     Only the same-peer committed bridge may enable the accepted classic backend.
     """
     import select
@@ -329,6 +432,7 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
     identity = {k: m.proc_identity(os.getpid())[k] for k in ('pid', 'start')}
     identity.update(socket=str(pathlib.Path(directory) / 'host.sock'), owner=p['hostHold']['owner'],
                     planHash=plan_hash(p, m), session=session)
+    isolation_peer = None  # Process-local only, never reconstructed from a journal.
 
     def interrupted(*args):
         raise InterruptedError('host guard interrupted')
@@ -338,6 +442,11 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
         host.guard_check(recovery, session)
         fence.check()
         verify_record(read_record(directory, m), p, kernel, m)
+
+    def return_check():
+        check_identity(identity, p, directory, m)
+        host.guard_check(recovery, session)
+        m.need(not select.select([infd], [], [], 0)[0], 'HOST_CONTROLLER_CHANNEL_LOST')
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, interrupted)
@@ -359,28 +468,55 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     raise m.Refusal('HOST_CONTROLLER_CHANNEL_LOST')
                 if server not in ready:
                     continue
-                with server.accept()[0] as conn:
+                with server.accept()[0] as conn, receive_request(conn, m) as (request, rights):
                     conn.settimeout(3)
                     peer_pid, uid, _ = peer_identity(conn)
                     m.need(uid == 0, 'ROOT_HOST_GUARD_CLIENT_REQUIRED')
-                    request = b''
-                    while not request.endswith(b'\n') and len(request) <= 1024:
-                        chunk = conn.recv(1025)
-                        m.need(bool(chunk), 'HOST_CLIENT_LOST')
-                        request += chunk
-                    m.need(len(request) <= 1024 and request.endswith(b'\n'), 'HOST_GUARD_FRAME_LIMIT')
                     frame = {}
                     if re.fullmatch(rb'[a-f0-9]{64}\n', request):
                         nonce = request.decode().strip()
                         command = 'check'
                     else:
                         frame = m.decode_json(request)
-                        m.need(isinstance(frame, dict) and set(frame) == ({'nonce', 'command', 'owner', 'planHash', 'commitSha256'} if frame.get('command') == 'activate-classic' else {'nonce', 'command', 'owner', 'planHash'})
-                               and frame['command'] in ('close-candidate', 'activate-classic', 'prepare-classic') and frame['owner'] == identity['owner']
-                               and frame['planHash'] == identity['planHash'] and isinstance(frame['nonce'], str)
-                               and re.fullmatch('[a-f0-9]{64}', frame['nonce']), 'INVALID_HOST_CHALLENGE')
+                        early = frame.get('command') in ('begin-isolation', 'abort-return')
+                        keys = {'nonce', 'command', 'owner', 'planHash'}
+                        keys |= {'nodeReturnSha256'} if early else {'commitSha256'} if frame.get('command') == 'activate-classic' else set()
+                        m.need(isinstance(frame, dict) and set(frame) == keys
+                               and frame['command'] in ('close-candidate', 'activate-classic', 'prepare-classic', 'begin-isolation', 'abort-return')
+                               and frame['owner'] == identity['owner'] and frame['planHash'] == identity['planHash']
+                               and isinstance(frame['nonce'], str) and re.fullmatch('[a-f0-9]{64}', frame['nonce']), 'INVALID_HOST_CHALLENGE')
                         nonce, command = frame['nonce'], frame['command']
+                    m.need(len(rights) == (1 if command in ('begin-isolation', 'abort-return') else 0), 'INVALID_HOST_RIGHTS')
                     check()
+                    if command in ('begin-isolation', 'abort-return'):
+                        m.need(p.get('version') == 2, 'V2_EARLY_RETURN_ONLY')
+                        engine = m.Engine(directory, p, host, validator=lambda value: validate_plan(value, m))
+                        engine.require_early_lock(rights[0])
+                        engine.assert_before_capture()
+                        host.guard_check(recovery, host.operator_session())
+                        peer = {k: m.proc_identity(peer_pid)[k] for k in ('pid', 'start')}
+                        state = engine.read()
+                        if command == 'begin-isolation':
+                            m.need(isolation_peer is None and state is None and frame['nodeReturnSha256'] is None,
+                                   'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+                            isolation_peer = peer
+                        else:
+                            if isolation_peer is None:
+                                m.need(state is None and frame['nodeReturnSha256'] is None, 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+                            else:
+                                m.need(peer == isolation_peer and (
+                                       (state is None and frame['nodeReturnSha256'] is None) or
+                                       (state is not None and state['phase'] == 'early-returned'
+                                        and state['dispatchCount'] == 0 and state['dispatchInFlight'] is None
+                                        and m.digest(m.secure_file(pathlib.Path(directory) / 'journal.json')) == frame['nodeReturnSha256'])),
+                                       'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+                            # All checks precede the first enable. Never adopt a
+                            # disk Fence, capture state or terminal ownership COMMIT.
+                            fence.restore(identity['owner'], checkpoint=return_check)
+                            raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
+                            conn.sendall((m.json.dumps({'nonce': nonce, 'identity': identity,
+                                                      'recordSha256': m.digest(raw), 'returnState': 'OLD'}) + '\n').encode())
+                            return
                     if command == 'close-candidate':
                         fence.close_candidate(identity['owner'])
                         check()

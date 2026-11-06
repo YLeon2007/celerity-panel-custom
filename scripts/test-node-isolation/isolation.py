@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
 """TEST-only node maintenance. Root operator is TCB; no app authority export.
 
-No CLI fake-root, shell passthrough, automatic retry, unfreeze or old-service start.
+No CLI fake-root, shell passthrough, automatic retry or historical journal adoption.
+V2 early return restores only the same live apply's known pre-capture effects.
 Use only after independent review/install; see README.md.
 """
 import base64
@@ -50,6 +51,14 @@ CLEAN_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'
 
 class Refusal(Exception):
     pass
+
+
+class EarlyReturnUnknown(Refusal):
+    """Return was attempted; journal retention does not prove writer exclusion."""
+
+
+class KnownIsolationRefusal(Refusal):
+    """A local inventory predicate refused; NOT an unknown read/guard/effect."""
 
 
 def need(condition, code):
@@ -316,8 +325,10 @@ def parse_sshd_effective(raw):
 class Host:
     """Real Linux adapter. No environment-selected root or command executable."""
     def run(self, argv):
+        remaining = getattr(self, 'return_deadline', float('inf')) - time.monotonic()
+        need(remaining > 0, 'EARLY_RETURN_DEADLINE_RETAINED')
         result = subprocess.run(argv, env=CLEAN_ENV, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=min(40, remaining))
         need(result.returncode == 0, 'HOST_COMMAND_FAILED')
         return result.stdout.decode()
 
@@ -450,6 +461,11 @@ class Host:
         # Reject every unreviewed timer/socket/service activation unit, including
         # dormant ACME variants. Pins are the exact audited unit bytes, not DB rows.
         inventory = self.inventory()
+        # Brand only our pure predicates, never transport/read failures, guard
+        # loss or arbitrary error codes supplied by an adapter.
+        def need(condition, code):
+            if not condition:
+                raise KnownIsolationRefusal(code)
         need(not inventory['jobsPresent'], 'SYSTEMD_JOB_PENDING')
         for name, item in inventory['units'].items():
             present = item.get('LoadState') != 'not-found' or item.get('ActiveState') not in ('inactive', 'failed')
@@ -617,6 +633,11 @@ class Host:
         os.replace(temporary, path)
         self.sync_masks()
 
+    def mask_identity(self, name):
+        info = (pathlib.Path(MASK_ROOT) / name).lstat()
+        need(stat.S_ISLNK(info.st_mode), 'EARLY_RETURN_MASK_DRIFT_RETAINED')
+        return info.st_dev, info.st_ino
+
     def sync_masks(self):
         fd = os.open(MASK_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -657,6 +678,15 @@ class Host:
         state = self.unit(name)
         if state.get('ActiveState') not in ('inactive', 'failed'):
             self.run(['/usr/bin/systemctl', 'stop', '--', name])
+
+    def start(self, name):
+        self.run(['/usr/bin/systemctl', 'start', '--', name])
+
+    def assert_runner_virgin(self, p):
+        for profile in inventory_node(p)['profiles']:
+            root = pathlib.Path(RUNNER_FENCES) / profile
+            need(not any(os.path.lexists(root / name) for name in ('lock', 'journal.json', 'journal.next')),
+                 'EARLY_RETURN_RUNNER_HISTORY_RETAINED')
 
     def prepare_ssh_drain(self, name, item):
         # Sole exception to control-group/mixed: distro's normal SSH service.
@@ -813,6 +843,9 @@ class Engine:
         self.plan = validator(plan)
         self.host = host
         self.plan_hash = digest(json.dumps(plan, sort_keys=True, separators=(',', ':')).encode())
+        # Deliberately NOT reconstructed from disk. Only this live apply may
+        # unwind its completed effects; pending/unknown effects poison return.
+        self._early = None
 
     def read(self):
         need(not (self.directory / 'journal.json.next').exists(), 'JOURNAL_UNCERTAIN_RETAINED')
@@ -823,7 +856,8 @@ class Engine:
         need(isinstance(value, dict) and set(value) == {'version', 'phase', 'plan', 'planHash', 'guard', 'saved',
                                                        'initialProcesses', 'dispatchInFlight', 'dispatchCount', 'accessBoundary'}, 'JOURNAL_CORRUPT_RETAINED')
         need(type(value['version']) is int and value['version'] == 1 and
-             value['phase'] in ('isolating', 'awaiting-fresh-login', 'held', 'restoring', 'masks-restored-no-restart') and
+             value['phase'] in ('isolating', 'awaiting-fresh-login', 'held', 'restoring', 'masks-restored-no-restart',
+                                'early-returning', 'early-returned', 'early-return-unknown') and
              type(value['dispatchCount']) is int and value['dispatchCount'] >= 0 and
              isinstance(value['initialProcesses'], list) and isinstance(value['saved'], dict) and
              set(value['saved']) == set(self.plan['isolateUnits']), 'JOURNAL_CORRUPT_RETAINED')
@@ -837,7 +871,7 @@ class Engine:
                  isinstance(pin, dict) and set(pin) == {'device', 'inode'} and
                  all(type(v) is int and v >= 0 for v in pin.values())), 'JOURNAL_CORRUPT_RETAINED')
         boundary = value['accessBoundary']
-        need((value['phase'] == 'isolating' and boundary is None) or
+        need((value['phase'] in ('isolating', 'early-returning', 'early-returned', 'early-return-unknown') and boundary is None) or
              (isinstance(boundary, dict) and set(boundary) == {'session', 'ticks'} and
               isinstance(boundary['session'], dict) and
               isinstance(boundary['ticks'], str) and boundary['ticks'].isdecimal()), 'JOURNAL_CORRUPT_RETAINED')
@@ -849,6 +883,8 @@ class Engine:
 
     def apply(self, guard):
         need(self.read() is None, 'EXISTING_MAINTENANCE_RETAINED')
+        if self.plan['version'] == 2:
+            self.assert_before_capture()
         self.host.check_prerequisites(self.plan)
         session = self.host.operator_session()
         self.host.guard_check(guard, session)
@@ -856,6 +892,12 @@ class Engine:
         saved = {}
         for name in self.plan['isolateUnits']:
             item = self.host.unit(name)
+            if self.plan['version'] == 2:
+                need(item.get('ActiveState') in ('active', 'inactive', 'failed') and item.get('Job') in ('', '0'),
+                     'UNRESTORABLE_INITIAL_UNIT_STATE')
+                if item['ActiveState'] == 'active' and not name.endswith('.scope'):
+                    substate = 'listening' if name.endswith('.socket') else 'waiting' if name.endswith('.timer') else 'running'
+                    need(item.get('SubState') == substate, 'UNRESTORABLE_INITIAL_UNIT_STATE')
             ssh_drain = None
             if (name.endswith('.service') and item.get('KillMode') not in ('control-group', 'mixed') and
                     item.get('ActiveState') not in ('inactive', 'failed')):
@@ -868,26 +910,172 @@ class Engine:
                              for keep in self.plan['keepCgroups']), 'WRITER_CGROUP_OVERLAPS_RECOVERY_OR_DATA_PLANE')
             saved[name] = {'mask': self.host.snapshot_mask(name), 'unit': item,
                            'oldCgroup': item.get('ControlGroup', ''), 'sshDrain': ssh_drain}
+            if self.plan['version'] == 2 and item['ActiveState'] == 'active':
+                need(not (saved[name]['mask'].get('kind') == 'symlink' and saved[name]['mask'].get('target') == '/dev/null'),
+                     'UNRESTORABLE_INITIAL_UNIT_STATE')
         state = {'version': 1, 'phase': 'isolating', 'plan': self.plan, 'planHash': self.plan_hash,
                  'guard': guard, 'saved': saved, 'initialProcesses': inventory['processes'],
                  'dispatchInFlight': None, 'dispatchCount': 0, 'accessBoundary': None}
         self.save(state)  # All touched config and states durable before first mutation.
-        for name in saved:
-            self.host.write_mask(name)
-        self.host.reload()
-        # Stopping socket/timer activation first prevents a restart during drain.
-        ordered = sorted(saved, key=lambda u: (not u.endswith(('.socket', '.timer')), u))
-        for name in ordered:
-            self.host.stop(name)
-        for name, item in saved.items():
-            if item['sshDrain'] is not None:
-                self.host.drain_ssh(name, item)
-        self.verify_exclusion(state)
-        self.host.guard_check(guard, session)
-        state['accessBoundary'] = {'session': session, 'ticks': self.host.boot_ticks()}
-        state['phase'] = 'awaiting-fresh-login'
-        self.save(state)
-        return self.evidence(state)
+        early = self.plan['version'] == 2
+        if early:
+            self._early = {'state': state, 'owner': {k: proc_identity(os.getpid())[k] for k in ('pid', 'start')}, 'pending': False,
+                           'active': True, 'masks': {}, 'maskPins': {}, 'stopped': []}
+        live = self._early or {}
+
+        def effect(work):
+            if early:
+                live['pending'] = True
+            work()
+            if early:
+                live['pending'] = False
+
+        def checkpoint():
+            if early:
+                self.host.guard_check(guard, session)
+                self.host.check_prerequisites(self.plan)
+                self.host.check_inventory(self.plan)
+
+        try:
+            for name in saved:
+                def mask():
+                    self.host.write_mask(name)
+                    if early:
+                        pin = self.host.snapshot_mask(name)
+                        need(pin.get('kind') == 'symlink' and pin.get('target') == '/dev/null', 'MASK_WRITE_UNKNOWN_RETAINED')
+                        live['masks'][name] = pin
+                        live['maskPins'][name] = self.host.mask_identity(name)
+                effect(mask)
+                checkpoint()
+            effect(self.host.reload)
+            # Stop activation first. Keep only acknowledged effects in live memory.
+            ordered = sorted(saved, key=lambda u: (not u.endswith(('.socket', '.timer')), u))
+            for name in ordered:
+                def stop():
+                    self.host.stop(name)
+                    if early:
+                        current = self.host.unit(name)
+                        need(current.get('ActiveState') in ('inactive', 'failed') and current.get('Job') in ('', '0'),
+                             'STOP_OUTCOME_UNKNOWN_RETAINED')
+                        live['stopped'].append(name)
+                effect(stop)
+                checkpoint()
+            for name, item in saved.items():
+                if item['sshDrain'] is not None:
+                    effect(lambda: self.host.drain_ssh(name, item))
+            self.verify_exclusion(state)
+            self.host.guard_check(guard, session)
+            state['accessBoundary'] = {'session': session, 'ticks': self.host.boot_ticks()}
+            state['phase'] = 'awaiting-fresh-login'
+            effect(lambda: self.save(state))
+            return self.evidence(state)
+        except BaseException as error:
+            if not early:
+                raise
+            if type(error) is not KnownIsolationRefusal or live['pending']:
+                live['active'] = False
+                raise
+            # Only a branded local predicate can request a known-partial unwind.
+            # Fresh checks must still prove ownership and no downstream work.
+            result = self.abort_return(getattr(self, '_outer_lock_fd', None))
+            return {**result, 'isolationRefusal': str(error)}
+
+    def assert_before_capture(self):
+        need(self.plan['version'] == 2, 'V2_EARLY_RETURN_ONLY')
+        # Any capture attempt (including an empty/unfinished store), durable
+        # admission close or coordinator intent is beyond this local return.
+        names = ('originals', 'restore-admission.json', 'restore-admission.json.next',
+                 'coordinated-capture.json', 'coordinated-capture.json.next',
+                 'coordinated-restore.json', 'coordinated-restore.json.next',
+                 'handoff-commit.json', 'handoff-commit.json.next',
+                 'handoff-activation.json', 'handoff-activation.json.next')
+        need(not any(os.path.lexists(self.directory / name) for name in names), 'EARLY_RETURN_DOWNSTREAM_UNKNOWN_RETAINED')
+        self.host.assert_runner_virgin(self.plan)
+
+    def require_early_lock(self, lock_fd):
+        # require_outer_lock alone may acquire an unlocked OFD. Early return
+        # must instead prove continuous exclusion, never repair a lost lock.
+        probe = os.open(self.directory / 'lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                raise Refusal('EARLY_RETURN_OUTER_LOCK_LOST_RETAINED')
+        finally:
+            os.close(probe)
+        self.require_outer_lock(lock_fd)
+
+    def abort_return(self, lock_fd):
+        """Same-live apply only; never replay/adopt an isolating disk journal.
+
+        OLD means original masks and service activation state, not resurrected
+        drained SSH/session PIDs. No Xray/profile or DB mutation is performed.
+        """
+        live = self._early
+        need(live is not None and live['active'], 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+        assert live is not None
+        live['active'] = False  # Consume even a refused check; no repaired-unknown retry.
+        need(not live['pending'], 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+        self.require_early_lock(lock_fd)
+        self.assert_before_capture()
+        state = self.read()
+        need(state is not None and live['owner'] == {k: proc_identity(os.getpid())[k] for k in ('pid', 'start')} and state == live['state'] and
+             state['phase'] in ('isolating', 'awaiting-fresh-login', 'held') and
+             state['dispatchCount'] == 0 and state['dispatchInFlight'] is None,
+             'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+        session = self.host.operator_session()
+        self.host.guard_check(state['guard'], session)
+        self.host.check_prerequisites(self.plan)
+        for name, saved in state['saved'].items():
+            need(self.host.snapshot_mask(name) == live['masks'].get(name, saved['mask']), 'EARLY_RETURN_MASK_DRIFT_RETAINED')
+            if name in live['masks']:
+                need(self.host.mask_identity(name) == live['maskPins'][name], 'EARLY_RETURN_MASK_DRIFT_RETAINED')
+            current = self.host.unit(name)
+            expected = ('inactive', 'failed') if name in live['stopped'] else (saved['unit']['ActiveState'],)
+            need(current.get('ActiveState') in expected and current.get('Job') in ('', '0'), 'EARLY_RETURN_UNIT_DRIFT_RETAINED')
+        assert state is not None
+        self.host.return_deadline = time.monotonic() + 120
+        try:
+            state['phase'] = 'early-returning'
+            self.save(state)
+            for name in reversed(live['masks']):
+                self.host.guard_check(state['guard'], session)
+                need(self.host.mask_identity(name) == live['maskPins'][name], 'EARLY_RETURN_MASK_DRIFT_RETAINED')
+                self.host.restore_mask(name, state['saved'][name]['mask'])
+            self.host.reload()
+            # Services first, sockets/timers last; never enable/disable, restart
+            # inactive units, or attempt to recreate a drained login scope.
+            for name in sorted(live['stopped'], key=lambda u: (u.endswith(('.socket', '.timer')), u)):
+                saved = state['saved'][name]['unit']
+                self.host.guard_check(state['guard'], session)
+                if not name.endswith('.scope') and saved['ActiveState'] == 'active' and self.host.unit(name).get('ActiveState') != 'active':
+                    self.host.start(name)
+            for name, saved in state['saved'].items():
+                need(self.host.snapshot_mask(name) == saved['mask'], 'EARLY_RETURN_MASK_READBACK_FAILED')
+                if not name.endswith('.scope'):
+                    current = self.host.unit(name)
+                    need(all(current.get(key) == saved['unit'].get(key) for key in ('ActiveState', 'SubState', 'UnitFileState'))
+                         and current.get('Job') in ('', '0'), 'EARLY_RETURN_SERVICE_READBACK_FAILED')
+            self.host.guard_check(state['guard'], session)
+            state['phase'] = 'early-returned'
+            self.save(state)
+            result = self.finish_early_return(lock_fd)
+            return {**self.evidence(state), **result, 'returnState': 'OLD',
+                    'drainedSessionScopes': [u for u in live['stopped'] if u.endswith('.scope')]}
+        except BaseException as error:
+            state['phase'] = 'early-return-unknown'
+            try:
+                self.save(state)
+            finally:
+                raise EarlyReturnUnknown('EARLY_RETURN_OUTCOME_UNKNOWN') from error
+        finally:
+            del self.host.return_deadline
+
+    def finish_early_return(self, lock_fd):
+        return {'nodeIsolation': 'returned', 'notApplicationAuthority': True}
 
     def confirm_access(self):
         state = self.read()
@@ -899,6 +1087,8 @@ class Engine:
         need(session != boundary['session'] and int(session['start']) > int(boundary['ticks']),
              'POST_DRAIN_FRESH_LOGIN_REQUIRED')
         self.host.guard_check(state['guard'], session)
+        if self._early is not None and self._early['active'] and state == self._early['state']:
+            self._early['state'] = state
         state['phase'] = 'held'
         self.save(state)
         return self.evidence(state)
@@ -1072,7 +1262,7 @@ def select_mode(plan):
 
 def main():
     need(os.geteuid() == 0, 'ROOT_REQUIRED')
-    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'host-hold', 'apply', 'confirm-access', 'status', 'dispatch', 'close-dispatch', 'close-candidate', 'restore-masks'), 'INVALID_CLI')
+    need(len(sys.argv) == 2 and sys.argv[1] in ('inventory', 'guard', 'host-hold', 'apply', 'confirm-access', 'status', 'dispatch', 'close-dispatch', 'close-candidate', 'restore-masks', 'abort-return'), 'INVALID_CLI')
     command = sys.argv[1]
     host = Host()
     if command == 'inventory':
@@ -1094,10 +1284,12 @@ def main():
         shared.serve_hold(plan, directory, sys.modules[__name__])
         return
     lock = os.open(directory / 'lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    primary = engine = output = None
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         engine = (shared.make_engine(directory, plan, sys.modules[__name__]) if shared else
                   Engine(directory, plan, host))
+        engine._outer_lock_fd = lock
         if command == 'apply':
             guard = decode_json(secure_file(directory / 'guard.json'))
             output = engine.apply(guard)
@@ -1112,16 +1304,49 @@ def main():
             output = engine.close_candidate(lock)
         elif command == 'restore-masks':
             output = engine.restore()
+        elif command == 'abort-return':
+            # A new CLI process may request only a virgin shared Fence return.
+            # Partial node effects belong exclusively to the original apply.
+            need(shared is not None, 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+            output = engine.abort_return(lock)
         else:
             payload = sys.stdin.buffer.read(4194305)
             result = engine.dispatch(os.environ.get('SSH_ORIGINAL_COMMAND', ''), payload, lock)
-            sys.stdout.buffer.write(result)
-            return
-        print(json.dumps(output, sort_keys=True))
-        if output.get('status') == 'partial-unknown-retained':
-            raise SystemExit(75)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        os.close(lock)
+        # Retire both the owned FD and Engine's borrowed reference before the
+        # one close attempt: acknowledgement loss must never close a reused FD.
+        closing, lock = lock, None
+        if engine is not None:
+            engine._outer_lock_fd = None
+        try:
+            os.close(closing)
+        except BaseException as cleanup:
+            if primary is None:
+                if output is not None and output.get('returnState') == 'OLD':
+                    unknown = EarlyReturnUnknown('EARLY_RETURN_OUTCOME_UNKNOWN')
+                    unknown.cleanup_errors = [cleanup]
+                    raise unknown from cleanup
+                raise
+            primary.cleanup_errors = [*getattr(primary, 'cleanup_errors', ()), cleanup]
+            primary.add_note('Outer lock cleanup failed: ' + repr(cleanup))
+    # No completion is delivered before the owned lock's checked disposal.
+    # OLD has already enabled writers/released the host Fence; delivery failure
+    # cannot assert retained exclusion or make that one-shot return retryable.
+    try:
+        if command == 'dispatch':
+            sys.stdout.buffer.write(result)
+            sys.stdout.buffer.flush()
+            return
+        print(json.dumps(output, sort_keys=True), flush=True)
+    except BaseException as error:
+        if output is not None and output.get('returnState') == 'OLD':
+            raise EarlyReturnUnknown('EARLY_RETURN_OUTCOME_UNKNOWN') from error
+        raise
+    if output.get('status') == 'partial-unknown-retained':
+        raise SystemExit(75)
 
 
 if __name__ == '__main__':
@@ -1129,5 +1354,7 @@ if __name__ == '__main__':
         main()
     except (Refusal, OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         code = str(error) if isinstance(error, Refusal) else 'NODE_MAINTENANCE_UNKNOWN_RETAINED'
-        print(json.dumps({'ok': False, 'code': code, 'ownershipRetained': True}), file=sys.stderr)
+        print(json.dumps({'ok': False, 'code': code, **(
+            {'returnState': 'UNKNOWN', 'exclusion': 'unknown', 'retryAllowed': False} if isinstance(error, EarlyReturnUnknown)
+            else {'ownershipRetained': True})}), file=sys.stderr)
         raise SystemExit(75)
