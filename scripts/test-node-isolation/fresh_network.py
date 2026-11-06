@@ -22,6 +22,7 @@ import time
 
 CONTEXT = 'test.infograd.online'
 TEST_MACHINE = '7fa266f995fe4aa69e96cf7d01359e34'
+B132_MACHINE = '03ab697936cc4040aa9357936e136744'
 NETNS = '/run/netns/c3-test-fresh-classic'
 INPUT = '/etc/c3-test-fresh-network.json'
 LEASE = '/etc/c3-test-fresh-network-lease.json'
@@ -140,7 +141,7 @@ def validate_plan(p):
     keys(p, 'version context machine boot hostNetns generation deadline daemon peers executables hostsSha256 oldConfig newConfig')
     need(type(p['version']) is int and p['version'] == 1 and p['context'] == CONTEXT,
          'FIXED_TEST_ONLY')
-    need(p['machine'] == TEST_MACHINE and type(p['boot']) is str and
+    need(type(p['machine']) is str and p['machine'] in (TEST_MACHINE, B132_MACHINE) and type(p['boot']) is str and
          re.fullmatch('[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', p['boot']), 'FIXED_TEST_MACHINE_BOOT_REQUIRED')
     need(type(p['generation']) is str and re.fullmatch('[a-f0-9]{32}', p['generation']), 'GENERATION_REQUIRED')
     integer(p['deadline'])
@@ -563,8 +564,14 @@ class Linux:
         self.check()
         need(not os.path.lexists(NETNS), 'EXISTING_NETNS_REFUSED')
         snapshots = {role: self.snapshot(role) for role in ('host', *ROLES)}
+        # Physical placement only; PUBLIC remains the private fresh lo/32 ingress.
+        if self.p['machine'] == B132_MACHINE:
+            host_address = '132.243.230.19'
+        else:
+            need(self.p['machine'] == TEST_MACHINE, 'FIXED_TEST_MACHINE_BOOT_REQUIRED')
+            host_address = PUBLIC
         public = [(a['ifname'], x.get('prefixlen')) for a in snapshots['host']['addresses']
-                  for x in a.get('addr_info', []) if x.get('family') == 'inet' and x.get('local') == PUBLIC]
+                  for x in a.get('addr_info', []) if x.get('family') == 'inet' and x.get('local') == host_address]
         need(public == [('eth0', 24)], 'FIXED_TEST_PUBLIC_ADDRESS_REQUIRED')
         names = {n for pair in NAMES.values() for n in pair}
         for role, snap in snapshots.items():
