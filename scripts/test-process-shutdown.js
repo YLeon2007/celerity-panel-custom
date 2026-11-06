@@ -42,7 +42,7 @@ function harness({ httpPending = false, httpError = null, realPool = false } = {
         sshPool: poolModule.exports,
         require: createRequire(path.join(root, 'index.js')),
         process, setTimeout: timer.setTimeout, clearTimeout: timer.clearTimeout,
-        logger: { info() {}, error(...args) { calls.push(`error:${args.join(' ')}`); }, warn() {} },
+        logger: { info() {}, debug() {}, error(...args) { calls.push(`error:${args.join(' ')}`); }, warn() {} },
         l2tpRootLifecycle: { stop() { calls.push('worker-stop'); return drain.promise; } },
         cacheService: { isConnected: () => true, redis: { async quit() { calls.push('redis-quit'); } } },
         mongoose: { models: {}, async disconnect() { calls.push('mongo-disconnect'); } },
@@ -63,6 +63,19 @@ function harness({ httpPending = false, httpError = null, realPool = false } = {
         await flush();
     } };
 }
+function setupClassicJobs(h, services = {}) {
+    const jobs = [];
+    h.context.cron = { schedule(expression, work) {
+        const job = { expression, work, stop() { h.calls.push('cron-stop'); } };
+        jobs.push(job); return job;
+    } };
+    h.context.syncService = services.syncService || {};
+    h.context.statsService = services.statsService || {};
+    vm.runInContext(source.slice(source.indexOf('function setupCronJobs()'), source.indexOf('/**\n * Clean logs older')), h.context);
+    h.context.setupCronJobs();
+    return jobs;
+}
+
 test('SIGTERM does not force exit at the old 10-second deadline while worker drain is pending', async () => {
     const h = harness(); h.process.emit('SIGTERM'); await flush();
     assert.equal(h.calls.filter(c => c === 'worker-stop').length, 1);
@@ -305,4 +318,81 @@ test('startup failure joins the supervised shutdown instead of bypassing a pendi
     assert.equal(h.calls.includes('worker-stop'), true);
     h.drain.resolve(); await start; await flush();
     assert.equal(h.calls.at(-1), 'exit:1');
+});
+
+test('both actual telemetry cron callbacks remain admitted through their final cache writes', async () => {
+    const h = harness(); const online = deferred(), stats = deferred();
+    const jobs = setupClassicJobs(h, { syncService: {
+        async collectXrayAgentOnlineStates() { h.calls.push('online-poll'); await online.promise; h.calls.push('online-cache-write'); },
+        async collectAllStats() { h.calls.push('stats-poll'); await stats.promise; h.calls.push('stats-cache-write'); },
+    } });
+    const runs = [jobs[0].work(), jobs[1].work()]; await flush();
+    h.process.emit('SIGTERM'); h.process.emit('SIGINT'); h.drain.resolve(); await flush();
+    assert.equal(h.calls.filter(c => c === 'cron-stop').length, jobs.length);
+    assert.equal(h.calls.includes('pool-close'), false);
+    assert.equal(h.calls.includes('redis-quit'), false);
+    await jobs[0].work(); h.context.setupCronJobs(); await flush();
+    assert.equal(h.calls.filter(c => c === 'online-poll').length, 1, 'queued tick must not pass the admission fence');
+    online.resolve(); await flush();
+    assert.equal(h.calls.includes('redis-quit'), false, 'second admitted callback still owns Redis');
+    stats.resolve(); await Promise.all(runs); await flush();
+    assert.ok(h.calls.indexOf('online-cache-write') < h.calls.indexOf('redis-quit'));
+    assert.ok(h.calls.indexOf('stats-cache-write') < h.calls.indexOf('pool-close'));
+    assert.equal(h.calls.at(-1), 'exit:0'); assert.equal(h.timers.size, 0);
+});
+
+test('a classic scheduler stop error still drains admitted work and stops sibling schedules before exit1', async () => {
+    const h = harness(); const pending = deferred();
+    const jobs = setupClassicJobs(h, { syncService: { collectXrayAgentOnlineStates: () => pending.promise } });
+    jobs[0].stop = () => { h.calls.push('cron-stop'); throw Error('scheduler stop failed'); };
+    const run = jobs[0].work(); await flush();
+    h.process.emit('SIGTERM'); h.drain.resolve(); await flush();
+    assert.equal(h.calls.filter(c => c === 'cron-stop').length, jobs.length);
+    assert.equal(h.calls.some(c => c.startsWith('exit:')), false);
+    pending.resolve(); await run; await flush();
+    assert.equal(h.calls.at(-1), 'exit:1'); assert.equal(h.calls.includes('redis-quit'), false);
+});
+
+test('a rejected admitted cron callback cannot abandon a pending sibling or become exit0', async () => {
+    const h = harness(); const first = deferred(), second = deferred();
+    h.context.first = () => first.promise; h.context.second = () => second.promise;
+    vm.runInContext('runCronJob(first); runCronJob(second);', h.context); await flush();
+    h.process.emit('SIGTERM'); h.drain.resolve(); first.reject(Error('admitted callback failed')); await flush();
+    assert.equal(h.calls.some(c => c.startsWith('exit:')), false);
+    second.resolve(); await flush();
+    assert.equal(h.calls.at(-1), 'exit:1'); assert.equal(h.calls.includes('redis-quit'), false);
+});
+
+test('a stuck classic callback retains the unchanged nonzero hard deadline and dependency ordering', async () => {
+    const h = harness(); const pending = deferred(); h.context.pending = () => pending.promise;
+    vm.runInContext('runCronJob(pending);', h.context); await flush();
+    h.process.emit('SIGTERM'); h.drain.resolve(); await flush(); await h.advance(30 * 60 * 1000);
+    assert.equal(h.calls.at(-1), 'exit:1'); assert.equal(h.calls.includes('redis-quit'), false);
+    assert.equal(h.calls.includes('pool-close'), false);
+    pending.resolve(); await flush();
+    assert.equal(h.calls.filter(c => c.startsWith('exit:')).length, 1);
+});
+
+test('initial delayed classic check is cancelled before starting and joined if already admitted', async () => {
+    for (const started of [false, true]) {
+        const h = harness(); const pending = deferred();
+        setupClassicJobs(h, { syncService: { async healthCheck() { h.calls.push('initial-check'); await pending.promise; } },
+            statsService: { async saveHourlySnapshot() { h.calls.push('initial-snapshot'); } } });
+        if (started) await h.advance(5000);
+        h.process.emit('SIGTERM'); h.drain.resolve(); await flush();
+        if (started) {
+            assert.equal(h.calls.includes('redis-quit'), false); pending.resolve(); await flush();
+            assert.ok(h.calls.indexOf('initial-snapshot') < h.calls.indexOf('redis-quit'));
+        } else {
+            await h.advance(5000); assert.equal(h.calls.includes('initial-check'), false);
+        }
+        assert.equal(h.calls.at(-1), 'exit:0'); assert.equal(h.timers.size, 0);
+    }
+});
+
+test('an independent Redis QUIT failure is still exit1, never globally masked by the cron repair', async () => {
+    const h = harness();
+    h.context.cacheService.redis.quit = async () => { throw Error('independent Redis close failure'); };
+    h.process.emit('SIGTERM'); h.drain.resolve(); await flush();
+    assert.equal(h.calls.at(-1), 'exit:1'); assert.equal(h.calls.includes('mongo-disconnect'), false);
 });

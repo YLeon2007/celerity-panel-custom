@@ -1092,9 +1092,10 @@ function setupWebSocketServer(server) {
 }
 
 function setupCronJobs() {
+    if (classicCronStopping) return;
     // Poll lightweight cc-agent /online every 5s. The agent itself applies the
     // 45s no-event timeout, so this cron only mirrors node state into Redis for UI.
-    cron.schedule('*/5 * * * * *', async () => {
+    scheduleCronJob('*/5 * * * * *', async () => {
         try {
             await syncService.collectXrayAgentOnlineStates();
         } catch (error) {
@@ -1104,7 +1105,7 @@ function setupCronJobs() {
 
     // Collect traffic stats separately; this is heavier and must not gate the
     // users-list online lamp.
-    cron.schedule('*/30 * * * * *', async () => {
+    scheduleCronJob('*/30 * * * * *', async () => {
         try {
             logger.debug('[Cron] Collecting live stats');
             await syncService.collectAllStats();
@@ -1114,7 +1115,7 @@ function setupCronJobs() {
     });
 
     // Save stats snapshot for charts every 5 minutes
-    cron.schedule('*/5 * * * *', async () => {
+    scheduleCronJob('*/5 * * * *', async () => {
         try {
             await statsService.saveHourlySnapshot();
         } catch (error) {
@@ -1123,7 +1124,7 @@ function setupCronJobs() {
     });
     
     // Health check every minute
-    cron.schedule('* * * * *', async () => {
+    scheduleCronJob('* * * * *', async () => {
         try {
             await syncService.healthCheck();
         } catch (error) {
@@ -1148,7 +1149,7 @@ function setupCronJobs() {
     // PEM stays in sync. No-op for setups without a panel domain.
     // Also runs the expire-scheduler watchdog as a safety net in case the
     // in-process timer was dropped by an unexpected fault.
-    cron.schedule('*/5 * * * *', async () => {
+    scheduleCronJob('*/5 * * * *', async () => {
         try {
             await syncService.checkPanelCertRotation();
         } catch (error) {
@@ -1165,7 +1166,7 @@ function setupCronJobs() {
     });
     
     // Save daily snapshot every hour
-    cron.schedule('0 * * * *', async () => {
+    scheduleCronJob('0 * * * *', async () => {
         try {
             logger.debug('[Cron] Saving daily stats snapshot');
             await statsService.saveDailySnapshot();
@@ -1175,7 +1176,7 @@ function setupCronJobs() {
     });
     
     // Save monthly snapshot and cleanup at 00:05
-    cron.schedule('5 0 * * *', async () => {
+    scheduleCronJob('5 0 * * *', async () => {
         try {
             logger.info('[Cron] Saving monthly stats snapshot');
             await statsService.saveMonthlySnapshot();
@@ -1186,7 +1187,7 @@ function setupCronJobs() {
     });
 
     // Flush yesterday's UA client stats from Redis to MongoDB at 00:15
-    cron.schedule('15 0 * * *', async () => {
+    scheduleCronJob('15 0 * * *', async () => {
         try {
             const uaStatsService = require('./src/services/uaStatsService');
             await uaStatsService.flushYesterday();
@@ -1200,7 +1201,7 @@ function setupCronJobs() {
     // access_events table (set via settings), so the panel runs no retention job.
 
     // Clean inactive HWID device rows (daily 03:30)
-    cron.schedule('30 3 * * *', async () => {
+    scheduleCronJob('30 3 * * *', async () => {
         try {
             const Settings = require('./src/models/settingsModel');
             const hwidDeviceService = require('./src/services/hwidDeviceService');
@@ -1213,7 +1214,7 @@ function setupCronJobs() {
     });
     
     // Clean old logs daily at 3:00
-    cron.schedule('0 3 * * *', () => {
+    scheduleCronJob('0 3 * * *', () => {
         try {
             logger.info('[Cron] Cleaning old logs');
             cleanOldLogs(30);
@@ -1223,7 +1224,7 @@ function setupCronJobs() {
     });
     
     // Check for scheduled backup every hour
-    cron.schedule('0 * * * *', async () => {
+    scheduleCronJob('0 * * * *', async () => {
         try {
             await backupService.scheduledBackup();
         } catch (error) {
@@ -1232,7 +1233,7 @@ function setupCronJobs() {
     });
     
     // Initial health check and stats snapshot after 5 seconds
-    setTimeout(async () => {
+    initialCheckTimer = setTimeout(() => runCronJob(async () => {
         try {
             logger.info('[Startup] Checking nodes status');
             await syncService.healthCheck();
@@ -1243,7 +1244,7 @@ function setupCronJobs() {
         } catch (error) {
             logger.error(`[Startup] Initial checks failed: ${error.message}`);
         }
-    }, 5000);
+    }), 5000);
 }
 
 /**
@@ -1293,6 +1294,40 @@ function cleanOldLogs(days) {
 }
 
 // Graceful shutdown
+// node-cron.stop() cancels future ticks, not callbacks already awaiting node I/O.
+// Admit the complete callback before it starts and join it before SSH/Redis/Mongo
+// close, including a Redis write reached only after that node I/O completes.
+const classicCronTasks = new Set();
+const classicCronRuns = new Set();
+let classicCronStopping = false;
+let classicCronStopPromise;
+let initialCheckTimer;
+function runCronJob(work) {
+    if (classicCronStopping) return Promise.resolve();
+    const run = Promise.resolve().then(work);
+    classicCronRuns.add(run);
+    const settled = () => classicCronRuns.delete(run);
+    run.then(settled, settled);
+    return run;
+}
+function scheduleCronJob(expression, work) {
+    if (classicCronStopping) return;
+    classicCronTasks.add(cron.schedule(expression, () => runCronJob(work)));
+}
+function stopCronJobs() {
+    if (classicCronStopPromise !== undefined) return classicCronStopPromise;
+    classicCronStopping = true;
+    clearTimeout(initialCheckTimer);
+    // All stop attempts and admitted callbacks settle before a failure escapes.
+    classicCronStopPromise = Promise.allSettled([
+        ...[...classicCronTasks].map(task => Promise.resolve().then(() => task.stop())),
+        ...classicCronRuns,
+    ]).then(results => {
+        const failed = results.find(result => result.status === 'rejected');
+        if (failed) throw failed.reason;
+    });
+    return classicCronStopPromise;
+}
 const activeServers = [];
 // The HTTP grace period is NOT a worker-drain deadline. Remote commands can
 // take 120-600s, with multiple commands per operation. The outer supervisor's
@@ -1320,6 +1355,7 @@ function shutdown(signal) {
     // handle, and must not permit a silent successful exit before the drain.
     shutdownPromise = Promise.resolve().then(async () => {
         sshPool.beginDrain();
+        const cronStopped = stopCronJobs();
         const serversClosed = Promise.all(activeServers.map(server => new Promise((resolve, reject) => {
             const grace = setTimeout(() => {
                 shutdownExitCode = 1;
@@ -1341,7 +1377,7 @@ function shutdown(signal) {
         // Stop worker admission immediately, not after HTTP keepalives or WS
         // clients close. Keep Mongo/Redis open until the supervised drain joins.
         const drains = await Promise.allSettled([
-            serversClosed, l2tpRootLifecycle.stop(), Promise.allSettled(admittedInits),
+            serversClosed, l2tpRootLifecycle.stop(), Promise.allSettled(admittedInits), cronStopped,
         ]);
         if (expired) return;
         // SSH is a dependency of the worker drain, not an independent signal
