@@ -500,6 +500,62 @@ INSTALLED_SOURCES = {
 }
 
 
+class ObserverSourcePinTests(unittest.TestCase):
+    """Exercise main's actual pin guard; never load/launch operational modules."""
+
+    def check_entry(self, pins=None, altered=None, accepted=False):
+        from contextlib import ExitStack
+        o = load('fresh_physical_observe')
+        snapshots = {}
+        for path, name in INSTALLED_SOURCES.items():
+            source = HERE/name
+            info = source.stat()
+            snapshots[path] = (source.read_bytes(),
+                               (info.st_dev, info.st_ino, info.st_size,
+                                info.st_mtime_ns, info.st_ctime_ns))
+        if altered is not None:
+            raw, identity = snapshots[altered]
+            snapshots[altered] = (raw+b'\n# local wrong-source control\n', identity)
+
+        class PinGuardPassed(Exception):
+            pass
+
+        with ExitStack() as stack:
+            if pins is not None:
+                stack.enter_context(patch.dict(o.SOURCE_PINS, pins))
+            stack.enter_context(patch.object(sys, 'argv', [str(HERE/'fresh_physical_observe.py')]))
+            # Only fixed entry identity and installed-path/ownership IO are modeled.
+            # SHA256 and the decision in main() are real, over current source bytes.
+            for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
+                stack.enter_context(patch.object(os, name, return_value=0))
+            stack.enter_context(patch.object(os, 'readlink', return_value='modeled-host-namespace'))
+            read = stack.enter_context(patch.object(o, 'source_snapshot', side_effect=snapshots.__getitem__))
+            module = stack.enter_context(patch.object(o.types, 'ModuleType', side_effect=PinGuardPassed))
+            if accepted:
+                with self.assertRaises(PinGuardPassed): o.main()
+                module.assert_called_once_with('physical')
+            else:
+                with self.assertRaisesRegex(RuntimeError, '^OBSERVATION_SOURCE_PIN_REQUIRED$'): o.main()
+                module.assert_not_called()
+            self.assertEqual([call.args[0] for call in read.call_args_list], list(INSTALLED_SOURCES))
+
+    def test_actual_main_accepts_current_source_bytes_before_module_loading(self):
+        self.check_entry(accepted=True)
+
+    def test_actual_main_rejects_each_stale_pin_before_module_loading(self):
+        for path, stale in (
+                ('/usr/local/libexec/c3-test-coordinated-restore.py',
+                 '8b8f8565b1d337a1f44a6554115b0e60f0a3d86dd24bfc3853e003dd481b2a76'),
+                ('/usr/local/libexec/c3-test-fresh-classic.py',
+                 '3bbc1c708fb89da5f8048e7f6c1af4da00e7ceaa05d66fc9da0f3f7ee63cb85e')):
+            with self.subTest(path=path): self.check_entry(pins={path: stale})
+
+    def test_actual_main_rejects_each_changed_source_before_module_loading(self):
+        for path in ('/usr/local/libexec/c3-test-coordinated-restore.py',
+                     '/usr/local/libexec/c3-test-fresh-classic.py'):
+            with self.subTest(path=path): self.check_entry(altered=path)
+
+
 class ObserverEntryTests(unittest.TestCase):
     def test_exact_runtime_source_closure_matches_current_sources_without_old_pack_repin(self):
         m = load('fresh_physical_observe')
