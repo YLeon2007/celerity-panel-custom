@@ -8,7 +8,7 @@ import stat
 import sys
 
 PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': '22a4238add87683b14f78ad284a2b9bef385638b14544d420808c24fe60cf147',
+    '/usr/local/libexec/c3-test-fresh-network.py': '2d63a3f29f4d0ee5b496936112c78d00ee79fabf240d879e8062213eea3306be',
     '/usr/local/libexec/c3-test-fresh-network-control.py': 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
 }
 
@@ -30,7 +30,11 @@ def load(path):
         if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1 or s.st_size > 131072:
             raise RuntimeError('INSTALLED_REGULAR_SOURCE_REQUIRED')
         raw = os.read(fd, 131073)
-        if os.fstat(fd) != s or hashlib.sha256(raw).hexdigest() != PINS[path]:
+        after = os.fstat(fd)
+        # Reading may change atime, never identity or stable nanosecond metadata.
+        stable = lambda x: (x.st_dev, x.st_ino, x.st_mode, x.st_uid, x.st_gid,
+                            x.st_nlink, x.st_size, x.st_mtime_ns, x.st_ctime_ns)
+        if stable(after) != stable(s) or hashlib.sha256(raw).hexdigest() != PINS[path]:
             raise RuntimeError('INSTALLED_SOURCE_PIN_REQUIRED')
     finally:
         os.close(fd)

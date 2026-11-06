@@ -150,3 +150,78 @@ No live setns, namespace/veth/route/firewall/service/application/DB write, lease
 hold, import, deployment or cutover is performed. Fresh kernel NAT packet proof
 and complete host eligibility remain unverified. Wave82 facts and wave83 evidence
 and author checkout remain unchanged.
+
+## Finite selected node-control egress (wave94, source-only candidate)
+
+This optional extension is in the same constructor and original held lease. It
+does not add request permissions, an authority service, a controller daemon or a
+terminal ownership-transfer protocol. Omission (or an explicit empty endpoint
+list) keeps legacy firewall/routes unchanged. No active input is published.
+
+The additive ROOT-trusted plan field is a closed object:
+
+```json
+"nodeControlEgress": {
+  "endpoints": [
+    {"nodeId":"6aecd36265572a55acf7c677","address":"10.203.61.2","protocol":"tcp","port":2222},
+    {"nodeId":"6aecd36265572a55acf7c677","address":"10.203.61.2","protocol":"tcp","port":62080},
+    {"nodeId":"6aed089795ea4b863887d717","address":"10.203.61.1","protocol":"tcp","port":2222}
+  ],
+  "hostRulesetSha256": "INDEPENDENTLY_ACCEPTED_64_LOWER_HEX_DIGEST_REQUIRED"
+}
+```
+
+The placeholder is deliberately **not a valid executable plan**. The complete
+nonempty set above is the only currently source-supported set: no missing,
+duplicate, other IP/port/protocol, hostname, range or request-selected tuple.
+Fixtures/provenance are in `fixtures/node_control_wave94.json`. Retained actual
+selected worker records (wave66 final rollback-check SHA466aa1ef...) and the
+unchanged wave82/92 accepted inventory both select **WireGuard** .2/.1:2222.
+P104's public104.143.201.72 maintenance identity is not that worker endpoint.
+P is Xray, with an agent token present and agentPort62080/TLS; B is Xray without
+an agent token. The actual `nodeSSH` and `syncService` consumers therefore need
+the three TCP tuples, not guessed22/8080/9999 or B62080. Both records' statsPort9999
+does not select Hysteria HTTP because their type is Xray. No selected hostname
+requires DNS; no public resolver or CA/environment change is introduced.
+These are retained observations, **not fresh live endpoint acceptance**; the
+independent operator must revalidate their current configuration before use.
+
+Actor/hops: the temporary backend's explicit worker SSH and selected agent
+health/stats/online requests originate in the fresh namespace, pass only the
+three exact OUTPUT accepts and two /32 routes over existing c3nc→c3pc, then enter
+the already-pinned host namespace. B10.203.61.1:2222 is host-local INPUT; replies
+use the connected p2p return path. P10.203.61.2 uses the already-existing
+`c3test61` /32 route. The fresh source is not an accepted remote WG peer return
+address, so exactly those two P TCP tuples receive host postrouting SNAT to
+10.203.61.1, scoped by c3pc, c3test61, fresh source, destination and dport. Replies
+reverse that conntrack mapping and reach fresh via the existing p2p link. There
+is no new default/main host route, global sysctl write, forwarding-policy write,
+masquerade, proxy, application flag/schema/credential change or public-address
+assignment. The scoped optional SNAT is the sole exception to the older
+sections' no-host-NAT description; numeric DB DNAT/SNAT and Caddy selectors stay
+byte-for-byte equivalent apart from the three additional private OUTPUT lines.
+
+The host table `ip c3nodecontrol` must be absent. Atomic `create table` refuses
+adoption; a generation comment and exact observed table seal remain checked at
+every dispatch. Cleanup deletes only that table under the original intent,
+holder/pidfd/lease fences and evolving seals. Missing/replaced/extended owned
+tables or foreign-policy drift retain all uncertain resources. No flush or
+foreign filter-rule deletion exists. Existing host WG address/route and
+ip_forward=1 must already exist and remain checked; the constructor never
+enables forwarding. Current server/holder/entry source pins close together; no
+historical immutable producer pins change.
+
+**New independent trust input / partial physical RED:** retained packets do not
+contain a current accepted host forwarding firewall. `hostRulesetSha256` must
+come from independent review of the actual preexisting host ruleset which
+already permits both directions of these exact forwards and B INPUT/replies.
+Hash the `encode({"nftables": rows})` result of fixed `nft -s -j list ruleset`,
+excluding tool metainfo only, with c3nodecontrol absent. The constructor rechecks
+that exact stateless foreign policy throughout; adding its own table is the only
+allowed delta. A matching digest is an integrity check, **not a semantic proof
+that a foreign Docker/FORWARD DROP permits the traffic**. NAT accept does not
+override filter drop. No permission to weaken that policy is implied; if the
+actual accepted host cannot forward, this candidate remains physically blocked.
+Host firewall acceptance, privileged namespace/NAT/reply packet proof, combined
+freeze ordering and post-lease terminal ownership remain separate unmet gates.
+Model tests are not physical/server acceptance, PPP evidence or deployment GO.

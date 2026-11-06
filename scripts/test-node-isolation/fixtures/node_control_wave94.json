@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "kind": "retained actual observations; not live acceptance",
+    "nodeRecordSource": "test-transport-physical-inputs-wave66/private/db-rollback-check-20261106T004817Z.json",
+    "nodeRecordSha256": "466aa1efa0608248523b2fb46f3663f09ddae0741db8e9b99f153734f4796b7b",
+    "inventorySource": "test-physical-inputs-wave82/private/static/topology-test-inventory.candidate.json",
+    "networkSource": "test-physical-input-refresh-wave92/private/B-current-measurement-v2.json",
+    "networkSourceSha256": "6810211c698a7c60bd373b3b75a9da83425d3608d5ea793b203381a94e7d5d91"
+  },
+  "endpoints": [
+    {"nodeId": "6aecd36265572a55acf7c677", "address": "10.203.61.2", "protocol": "tcp", "port": 2222},
+    {"nodeId": "6aecd36265572a55acf7c677", "address": "10.203.61.2", "protocol": "tcp", "port": 62080},
+    {"nodeId": "6aed089795ea4b863887d717", "address": "10.203.61.1", "protocol": "tcp", "port": 2222}
+  ],
+  "hostReturnSource": "10.203.61.1",
+  "hostInterface": "c3test61",
+  "notes": [
+    "P104 public maintenance identity 104.143.201.72 is not its accepted worker endpoint.",
+    "Both selected worker endpoints use the retained accepted WireGuard inventory at port 2222.",
+    "P is Xray with agentToken present and agentPort 62080/TLS; B is Xray without agentToken.",
+    "statsPort 9999 does not select Hysteria HTTP for type xray; neither 9999 nor B62080 is required.",
+    "No selected endpoint is a hostname; no DNS egress is needed.",
+    "Host forwarding ruleset/permission is NOT present in retained evidence; it needs independent acceptance."
+  ]
+}

@@ -17,9 +17,9 @@ CONTROL = '/usr/local/libexec/c3-test-fresh-network-control.py'
 SERVER_ENTRY = '/usr/local/libexec/c3-test-fresh-network-exec.py'
 CLIENT = '/usr/local/libexec/c3-test-fresh-network-client.py'
 SOURCE_PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': '22a4238add87683b14f78ad284a2b9bef385638b14544d420808c24fe60cf147',
+    '/usr/local/libexec/c3-test-fresh-network.py': '2d63a3f29f4d0ee5b496936112c78d00ee79fabf240d879e8062213eea3306be',
     CONTROL: 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
-    SERVER_ENTRY: '919b2b7a516df2a6bc104cf9ff0c12e1d899245bfe327c6efe0133b87c859372',
+    SERVER_ENTRY: 'fff1d126c65f265512fcc497f132dff54ab53c71ef1befffbbceaa4b8fe7a54b',
 }
 OPERATIONS = ('observe', 'cutover', 'return', 'abandon')
 IO_SECONDS = 3

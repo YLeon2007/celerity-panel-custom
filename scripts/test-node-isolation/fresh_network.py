@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
 """Fixed TEST private point-to-point construction. Never an acceptance/GO producer.
 
-No Docker writes, bridge/IPAM allocation, host NAT or public-address ARP.
+No Docker writes, bridge/IPAM allocation or public-address ARP.
+Optional accepted TEST node control uses only tuple-scoped owned host SNAT.
 Endpoint mutations are owned veths plus one exact Caddy table/rule (host on B132).
 CLI entry is separate; injected seams below are for unprivileged tests only.
 """
@@ -42,6 +43,16 @@ TABLE = '39303'
 PRIORITY = '10303'
 LIMIT = 1024 * 1024
 CLONE_NEWNET = 0x40000000
+NODE_TABLE = 'c3nodecontrol'
+# Retained selected worker records + accepted inventory (fixture provenance).
+# Public maintenance IPs are NOT the worker endpoints. No DNS/default ports.
+NODE_ENDPOINTS = frozenset((
+    ('6aecd36265572a55acf7c677', '10.203.61.2', 'tcp', 2222),
+    ('6aecd36265572a55acf7c677', '10.203.61.2', 'tcp', 62080),
+    ('6aed089795ea4b863887d717', '10.203.61.1', 'tcp', 2222),
+))
+NODE_SOURCE = '10.203.61.1'
+NODE_INTERFACE = 'c3test61'
 
 
 class Refusal(RuntimeError):
@@ -160,8 +171,36 @@ def runtime_endpoints(raw):
         raise Refusal('EXACT_RUNTIME_DATA_ENDPOINTS_REQUIRED') from None
 
 
+def node_control(p) -> list[dict]:
+    """Optional ROOT plan authority only; never a control/request permission."""
+    if 'nodeControlEgress' not in p:
+        return []
+    value = p['nodeControlEgress']
+    keys(value, 'endpoints hostRulesetSha256')
+    pin(value['hostRulesetSha256'])
+    endpoints: list[dict] = value['endpoints']
+    need(type(endpoints) is list and len(endpoints) <= len(NODE_ENDPOINTS), 'FINITE_NODE_ENDPOINTS_REQUIRED')
+    observed = set()
+    for ep in endpoints:
+        keys(ep, 'nodeId address protocol port')
+        need(all(type(ep[k]) is str for k in ('nodeId', 'address', 'protocol')) and
+             type(ep['port']) is int, 'EXACT_NODE_ENDPOINT_TYPES_REQUIRED')
+        row = (ep['nodeId'], ep['address'], ep['protocol'], ep['port'])
+        need(row in NODE_ENDPOINTS and row not in observed, 'SELECTED_NODE_ENDPOINT_REQUIRED')
+        observed.add(row)
+    if endpoints:
+        need(host_caddy(p) and observed == NODE_ENDPOINTS, 'COMPLETE_SELECTED_NODE_EGRESS_REQUIRED')
+        for ep in endpoints:
+            need(not any(ipaddress.IPv4Address(ep['address']) in ipaddress.IPv4Network(peer['subnet'])
+                         for peer in p['peers'].values()), 'NODE_P2P_OVERLAP')
+    return endpoints
+
+
 def validate_plan(p):
-    keys(p, 'version context machine boot hostNetns generation deadline daemon peers executables hostsSha256 oldConfig newConfig')
+    fields = 'version context machine boot hostNetns generation deadline daemon peers executables hostsSha256 oldConfig newConfig'
+    if type(p) is dict and 'nodeControlEgress' in p:
+        fields += ' nodeControlEgress'
+    keys(p, fields)
     need(type(p['version']) is int and p['version'] == 1 and p['context'] == CONTEXT,
          'FIXED_TEST_ONLY')
     need(type(p['machine']) is str and p['machine'] in (TEST_MACHINE, B132_MACHINE) and type(p['boot']) is str and
@@ -200,6 +239,7 @@ def validate_plan(p):
              str(address) == peer['address'] and address != ipaddress.IPv4Address(PUBLIC), 'PRIVATE_P2P_REQUIRED')
         need(not any(net.overlaps(x) for x in networks), 'P2P_OVERLAP')
         networks.append(net)
+    node_control(p)
     # Full independently accepted config bytes, never a URL/command selected by a request.
     old = encode(p['oldConfig']); new = encode(p['newConfig'])
     need(old != new and len(old) <= LIMIT and len(new) <= LIMIT, 'DISTINCT_CONFIGS_REQUIRED')
@@ -249,6 +289,8 @@ def nft_policy(p):
              'oifname "lo" accept', 'ct state established,related accept']
     for role in ('mongo', 'redis'):
         lines.append(f'oifname "{NAMES[role][0]}" ip daddr {p["peers"][role]["address"]} tcp dport {PORTS[role]} accept')
+    for ep in node_control(p):
+        lines.append(f'oifname "c3nc" ip daddr {ep["address"]} tcp dport {ep["port"]} accept')
     lines.append('}')
     if host_caddy(p):
         # Only the new fresh namespace. Preserve accepted numeric settings and
@@ -261,6 +303,20 @@ def nft_policy(p):
             lines.append(f'oifname "{NAMES[role][0]}" ip saddr 127.0.0.1 ip daddr {p["peers"][role]["address"]} tcp dport {PORTS[role]} snat ip to {addresses(p, role)[0]}')
         lines.append('}')
     return ('\n'.join(lines+['}'])+'\n').encode()
+
+
+def node_nft_policy(p):
+    """Return path only: no host filter-policy, default-route or sysctl write."""
+    endpoints = node_control(p)
+    need(endpoints, 'ACCEPTED_NODE_EGRESS_REQUIRED')
+    fresh_ip, _ = addresses(p, 'caddy')
+    lines = [f'create table ip {NODE_TABLE} {{', f'comment "c3:{p["generation"]}"',
+             'chain source { type nat hook postrouting priority 100; policy accept;']
+    for ep in endpoints:
+        if ep['address'] != NODE_SOURCE:  # Host-local B replies on the connected veth.
+            lines.append(f'iifname "c3pc" oifname "{NODE_INTERFACE}" ip saddr {fresh_ip} '
+                         f'ip daddr {ep["address"]} tcp dport {ep["port"]} snat ip to {NODE_SOURCE}')
+    return ('\n'.join(lines+['}', '}'])+'\n').encode()
 
 
 def move_message(index, namespace_fd, sequence):
@@ -536,6 +592,8 @@ def request(conn, method, path, raw=None):
 
 class Linux:
     """Real privileged seam. Source tests never instantiate this against a daemon."""
+    node_table_seal: dict | None
+
     def __init__(self, p):
         self.p = p
         self.fds = {}
@@ -627,6 +685,7 @@ class Linux:
     def check_targets(self):
         self.check_hold()
         self.check_loopback_links()
+        self.check_node_control()
         if getattr(self, 'runtime_settings', None) is not None:
             need(trusted_read('/var/lib/c3-test-fresh-input/root/etc/classic.json') == self.runtime_settings,
                  'RUNTIME_DATA_SETTINGS_DRIFT')
@@ -894,6 +953,79 @@ class Linux:
                           'src', peer_ip, 'table', TABLE)
             self.write_ip(endpoint, 'rule', 'add', 'priority', PRIORITY, 'to', PUBLIC+'/32',
                           'ipproto', 'tcp', 'dport', '3000', 'table', TABLE)
+            for address in sorted({ep['address'] for ep in node_control(self.p)}):
+                self.write_ip('fresh', 'route', 'add', address+'/32', 'via', peer_ip,
+                              'dev', own, 'src', fresh_ip)
+
+    def node_host_rules(self):
+        def read():
+            c = subprocess.run([NFT, '-s', '-j', 'list', 'ruleset'], env={'LC_ALL': 'C'},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=3, check=True)
+            need(len(c.stdout) <= LIMIT, 'NODE_HOST_NFT_OVERFLOW')
+            value = decode(c.stdout)
+            keys(value, 'nftables')
+            need(type(value['nftables']) is list, 'NODE_HOST_NFT_REQUIRED')
+            # -s omits counters/state, not rules. Only tool metainfo is not policy.
+            return {'nftables': [r for r in value['nftables'] if 'metainfo' not in r]}
+        return in_namespace(self.fds['host'], read)
+
+    def node_host_parts(self):
+        rows = self.node_host_rules()['nftables']
+        owned, other = [], []
+        for row in rows:
+            need(type(row) is dict and len(row) == 1, 'NODE_HOST_NFT_REQUIRED')
+            kind, value = next(iter(row.items()))
+            need(type(value) is dict, 'NODE_HOST_NFT_REQUIRED')
+            target = value.get('name') if kind == 'table' else value.get('table')
+            (owned if value.get('family') == 'ip' and target == NODE_TABLE else other).append(row)
+        return {'nftables': owned}, {'nftables': other}
+
+    def node_forwarding(self):
+        return in_namespace(self.fds['host'], lambda: Path('/proc/sys/net/ipv4/ip_forward').read_text().strip())
+
+    def check_node_control(self):
+        if not node_control(self.p):
+            return
+        # The accepted stateless host ruleset must ALREADY permit these forwards.
+        # A NAT accept is not a filter accept; never override Docker/foreign DROP.
+        need(self.node_forwarding() == '1', 'EXISTING_NODE_FORWARDING_REQUIRED')
+        snap = self.snapshot('host')
+        need(any(a['ifname'] == NODE_INTERFACE and any(x.get('local') == NODE_SOURCE and
+                 x.get('prefixlen') == 32 for x in a.get('addr_info', [])) for a in snap['addresses']) and
+             any(r.get('dev') == NODE_INTERFACE and r.get('dst') in ('10.203.61.2', '10.203.61.2/32') and
+                 not r.get('gateway') for r in snap['routes']), 'EXISTING_SELECTED_NODE_PATH_REQUIRED')
+        owned, other = self.node_host_parts()
+        need(digest(encode(other)) == self.p['nodeControlEgress']['hostRulesetSha256'],
+             'ACCEPTED_HOST_FORWARDING_POLICY_DRIFT')
+        expected = getattr(self, 'node_table_seal', None)
+        need(encode(owned) == encode(expected if expected is not None else {'nftables': []}),
+             'OWNED_NODE_NAT_IDENTITY_LOST')
+
+    def node_nft_apply(self, raw):
+        def apply():
+            self.boundary()
+            subprocess.run([NFT, '-f', '-'], input=raw, env={'LC_ALL': 'C'},
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3, check=True)
+            return True
+        return self.invoke('host', apply)
+
+    def install_node_control(self):
+        if not node_control(self.p):
+            return
+        def installed():
+            owned, _ = self.node_host_parts()
+            tables = [r['table'] for r in owned['nftables'] if 'table' in r]
+            need(len(tables) == 1 and tables[0].get('comment') == 'c3:'+self.p['generation'],
+                 'NEW_NODE_NAT_UNCONFIRMED')
+            self.node_table_seal = owned
+        self.step('nft-node-control-create', lambda: self.node_nft_apply(node_nft_policy(self.p)), installed)
+
+    def remove_node_control(self):
+        if node_control(self.p):
+            self.step('nft-node-control-delete', lambda: self.node_nft_apply(
+                ('delete table ip '+NODE_TABLE+'\n').encode()),
+                after=lambda: setattr(self, 'node_table_seal', None))
 
     def firewall(self):
         def apply():
@@ -901,6 +1033,7 @@ class Linux:
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3, check=True)
             return True
         self.step('nft-private-policy', lambda: self.invoke('fresh', apply))
+        self.install_node_control()
 
     def nft_observation(self):
         def read():
@@ -1119,6 +1252,7 @@ class Linux:
                  b[0].get('ifalias') == 'c3:'+self.p['generation']+':'+role+':peer' and
                  a[0].get('link_index') == b[0]['ifindex'] and b[0].get('link_index') == a[0]['ifindex'],
                  'OWNED_VETH_IDENTITY_LOST')
+        self.remove_node_control()
         # Keep the seal live, evolving only the exact expected owned deletion.
         rules = [x for x in self.sealed['caddy']['rules'] if str(x.get('priority')) == PRIORITY]
         routes = [x for x in self.sealed['caddy']['routes'] if str(x.get('table')) == TABLE]
@@ -1229,6 +1363,9 @@ class Journal:
 class Controller:
     def __init__(self, p, kernel, journal, clock=time.monotonic, guard=lambda: None):
         self.p, self.k, self.j = p, kernel, journal
+        # Existing external Lease binds ALL raw plan bytes. Also freeze this new
+        # capability in memory; do not change legacy constructor test/entry ABI.
+        self.node_plan_bytes = encode({k: p[k] for k in ('nodeControlEgress',) if k in p})
         self.guard = guard
         self.clock = clock
         self.phase = 'new'
@@ -1241,6 +1378,8 @@ class Controller:
 
     def authority(self):
         need(not self.failed, 'UNKNOWN_RETAINED_NO_MUTATION')
+        need(encode({k: self.p[k] for k in ('nodeControlEgress',) if k in self.p}) == self.node_plan_bytes,
+             'ACCEPTED_PLAN_MUTATED')
         self.guard()
         need(self.clock() < self.end and time.time() < self.p['deadline'], 'NETWORK_LEASE_EXPIRED')
 
