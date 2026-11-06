@@ -1,9 +1,10 @@
 # Native TEST package — только preparation, shared-node v2
 
 Этот producer делает **один настоящий native artifact**, а не installer/capture/
-controller. Product source: `5623f82245bfff4e8fbf65d80d24652552f1c896`, tree
-`701c613bd4fb2632984fef985194547bf66e76d9` — accepted existing-v2 return/completion
-source (wave73); только explicit product-pin rollover.
+controller. Product source: `b2f2d046f91d3a8fb885dac144a0dba413148dd9`, tree
+`bb404a6856581d9cbc301dac585313f2f0b30b68` — accepted shutdown fix и observer
+closure (wave77); только explicit product-pin rollover. Pending standalone B132
+network helper slice в этот product не входит и здесь не принимается.
 Producer commit записывается отдельно; product `app/scripts/anyorder-test-stand/`
 сохраняет старые producer blobs из product pin, не текущий producer checkout.
 Новый artifact проверяется отдельно; это не native activation approval.
