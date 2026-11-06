@@ -64,7 +64,14 @@ class HeldOwnerSettlementJournal {
         this.#write({ ...this.#expected, phase: 'irreversibly-committed', commitSha256 });
     }
     complete() {
-        need(this.#expected?.phase === 'settling-held' && this.#expected.inFlightNode === null && this.#expected.settled.length === 5);
+        need(this.#expected?.phase === 'settling-held' && this.#expected.inFlightNode === null);
+        // The caller validated this saved plan before the first owner CAS;
+        // completion must cover that exact set, not a fixed or caller-supplied count.
+        const planned = this.#expected.plan.nodes.map(n => n.nodeId);
+        const settled = this.#expected.settled.map(n => n.nodeId);
+        need(planned.length > 0 && settled.length === planned.length
+            && new Set(planned).size === planned.length && new Set(settled).size === settled.length
+            && settled.every(nodeId => planned.includes(nodeId)));
         this.#write({ ...this.#expected, phase: 'settled-held' });
     }
 }

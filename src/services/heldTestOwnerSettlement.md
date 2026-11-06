@@ -155,22 +155,25 @@ physical attestation, combined host handback or production activation proof.
   distinct existing activation set. Commit/activation uncertainty retains the
   existing intent and replay refusal; neither a file nor a later process is GO.
 
-**Operational blocker outside this source slice:** the unchanged
-`heldOwnerSettlementJournal.complete()` still requires `settled.length === 5`.
-The actual journal test confirms that two public handbacks leave a durable
-`settling-held` checkpoint with two confirmed rows, then refuse **before COMMIT**.
-Its owner must bind completion to the exact already validated `plan.nodes`
-(cardinality **and** membership), preserving in-flight checks, no-overwrite,
-file/parent fsync and irreversible/no-replay behavior. Do not deploy the v2 CLI
-until that narrow consumer adaptation and its positive/negative tests are joined.
+**Resolved durable-journal consumer:** `heldOwnerSettlementJournal.complete()`
+now requires exact cardinality and unique membership of its saved validated
+`plan.nodes`, never an argv/env/count override. Phase/in-flight guards,
+no-overwrite, file/parent fsync, poisoned unknown state, irreversible commit and
+existing-journal replay refusal are unchanged. The former fixed-five refusal
+characterization is now a genuine two-node public-settlement/real-journal positive;
+legacy-five remains positive. Historical Wave70 evidence is retained, with fresh
+causal RED→GREEN and missing/duplicate/foreign/in-flight/unknown controls in Wave71.
+This source-only closure does not authorize deployment or activation.
 
 `test_v2_terminal_restore.py` exercises actual local original bytes, flock OFDs,
 NodeServer subprocesses, owner UDS codec and durable COMMIT/no replay. The JS v2
 suite runs the actual private parser, both CLI call chains and public owner APIs;
-DB queries/transactions, independent physical/root facts and the terminal-positive
-journal facade are **modeled**. It separately exercises the actual production
-journal (v1 positive; v2 retained blocker). This is not real Mongo or live-node
-proof. Existing real-Mongo suites need a separately assigned isolated replica set.
+DB queries/transactions and independent physical/root facts are **modeled**, as
+are journal facades in the remaining parser/channel/CLI fixtures. The v1-five and
+v2-two public-settlement positives, partial owner-confirmation and terminal-unknown
+controls use the actual journal and filesystem IO. This is not real Mongo or
+live-node proof. Existing real-Mongo suites need a separately assigned isolated
+replica set.
 
 The fresh-positive fixture models its sealed-root/UID/ingress prerequisites. An
 ordinary native build artifact is **not** an accepted sealed fresh-classic root.

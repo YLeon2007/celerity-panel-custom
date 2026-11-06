@@ -1,7 +1,7 @@
 'use strict';
 // MODELED replica-set queries/transactions + independent physical/UID facts.
-// A journal facade is used in terminal positives and is explicitly distinguished
-// from the real production-journal v1 positive / v2 retained-blocker control.
+// Most terminal fixtures use a modeled journal facade, explicitly distinguished
+// from the real durable journal in the v1/v2 public-settlement positives below.
 // Actual public initializeClassic/adopt/handback, Python originals, flocks,
 // NodeServers, root-peer channel, durable COMMIT and natural process cleanup.
 // This does NOT prove Mongo atomicity, operational enrollment, or deployment.
@@ -320,30 +320,55 @@ test('plans cannot select two-node membership without root accepted inventory', 
         withRestorationScope: async () => {}, inventory: meta.inventory, inventorySha256: 'f'.repeat(64) }));
 });
 
-test('existing production journal retains the two-owner checkpoint: fixed-five completion is a separate owned handoff', async t => {
+test('v2 public settlement with the real durable journal commits exactly the two saved-plan owners', async t => {
     const { HeldOwnerSettlementJournal } = require('../heldOwnerSettlementJournal');
     const root = fs.mkdtempSync(path.join(process.env.TMPDIR, 'v2-terminal-journal-'));
     const directory = path.join(root, 'journal'); fs.mkdirSync(directory, { mode: 0o700 });
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const f = await prepare(meta);
     f.journal = new HeldOwnerSettlementJournal({ directory, uid: process.getuid(), fixtureRoot: root });
-    const x = modeledScope(f);
-    await assert.rejects(x.service().handback(f.config.plan), /OWNER_SETTLEMENT_JOURNAL_UNKNOWN_RETAINED/);
+    const x = modeledScope(f), enrollments = structuredClone(f.models.Enrollment.rows);
+    // Genuine public initializeClassic/adopt/handback and real journal/fs IO;
+    // persistence and the terminal physical authority remain explicitly modeled.
+    const result = await x.service().handback(f.config.plan);
+    assert.equal(result.code, 'COMMITTED_BOUNDED_ACTIVATION_CONFIRMED'); assert.equal(result.ownerCount, 2);
     const row = JSON.parse(fs.readFileSync(path.join(directory, 'owner-settlement.json')));
-    assert.equal(row.phase, 'settling-held'); assert.equal(row.settled.length, 2); assert.equal(row.inFlightNode, null);
-    assert.deepEqual(x.events, []); assert.equal(f.events.filter(e => e === 'classic').length, 2);
-    // No fabricated "complete" receipt: this is the ACTUAL current operational
-    // blocker outside this slice's two owned services, not end-to-end success.
+    assert.equal(row.phase, 'irreversibly-committed'); assert.equal(row.inFlightNode, null);
+    assert.deepEqual(row.plan, f.config.plan); assert.equal(row.settled.length, 2);
+    assert.deepEqual(row.settled, f.config.plan.nodes.map(n => {
+        const owner = f.models.Owner.rows.find(o => o.node === n.nodeId);
+        assert.equal(owner.owner, 'classic'); assert.equal(owner.handbackReceipt.fromGeneration, n.ownerGeneration);
+        return { nodeId: n.nodeId, generation: owner.generation };
+    }));
+    assert.equal(row.commitSha256, result.commitSha256);
+    assert.deepEqual(x.events, ['commit', 'activate', 'complete']); assert.equal(f.events.filter(e => e === 'classic').length, 2);
+    assert.deepEqual(f.models.Enrollment.rows, enrollments);
+    const bytes = fs.readFileSync(path.join(directory, 'owner-settlement.json'));
+    await assert.rejects(x.service().handback(f.config.plan));
+    assert.deepEqual(x.events, ['commit', 'activate', 'complete']); assert.equal(f.events.filter(e => e === 'classic').length, 2);
+    assert.deepEqual(fs.readFileSync(path.join(directory, 'owner-settlement.json')), bytes);
 });
 
-test('v2 terminal unknown results retain owner history and fresh invocation cannot reopen', async () => {
+test('v2 terminal unknown results retain real durable journal and owner history; fresh invocation cannot reopen', async t => {
+    const { HeldOwnerSettlementJournal } = require('../heldOwnerSettlementJournal');
     for (const fault of ['commit', 'activate', 'complete', 'fresh']) {
-        const f = await prepare(meta), x = modeledScope(f, { terminalFault: fault }), service = x.service();
+        const root = fs.mkdtempSync(path.join(process.env.TMPDIR, 'v2-unknown-journal-'));
+        const directory = path.join(root, 'journal'); fs.mkdirSync(directory, { mode: 0o700 });
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+        const f = await prepare(meta);
+        f.journal = new HeldOwnerSettlementJournal({ directory, uid: process.getuid(), fixtureRoot: root });
+        const x = modeledScope(f, { terminalFault: fault }), service = x.service();
         const enrollments = structuredClone(f.models.Enrollment.rows);
         const method = fault === 'fresh' ? 'freshHandback' : 'handback';
         await assert.rejects(service[method](f.config.plan), { code: fault === 'commit' ? 'COMMIT_UNKNOWN_NO_ACTIVATION' : 'COMMITTED_ACTIVATION_UNKNOWN' });
         assert.equal(f.events.filter(e => e === 'classic').length, 2);
         assert.deepEqual(f.models.Enrollment.rows, enrollments);
-        const events = [...x.events]; await assert.rejects(service[method](f.config.plan)); assert.deepEqual(x.events, events);
+        const file = path.join(directory, 'owner-settlement.json'), bytes = fs.readFileSync(file), row = JSON.parse(bytes);
+        assert.equal(row.phase, ['commit', 'fresh'].includes(fault) ? 'settled-held' : 'irreversibly-committed');
+        assert.equal(row.inFlightNode, null); assert.equal(row.settled.length, 2);
+        const events = [...x.events];
+        await assert.rejects(service[method](f.config.plan));
+        await assert.rejects(x.service()[method](f.config.plan));
+        assert.deepEqual(x.events, events); assert.deepEqual(fs.readFileSync(file), bytes);
     }
 });
