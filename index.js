@@ -291,7 +291,11 @@ app.use((req, res, next) => {
 // A separate opt-in serving witness: never replace the ordinary dynamic /health.
 // Pinned body bytes prove serving + completed boot + current DB/cache replies,
 // not node/dataplane health, physical isolation, or ownership handback.
-if (classicSettings) app.get('/classic-ready', async (req, res) => {
+// Ordinary TEST must explicitly opt in using trusted server configuration; never
+// expose this by default on production or derive the opt-in from a request.
+const ordinaryTestReadiness = process.env.C3_TEST_CLASSIC_READY === 'true'
+    && config.PANEL_DOMAIN === 'test.infograd.online';
+if (classicSettings || ordinaryTestReadiness) app.get('/classic-ready', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     try {
         if (!classicStartupComplete || shutdownPromise !== undefined
