@@ -280,7 +280,10 @@ class B132Tests(unittest.TestCase):
                  ('fresh_network_client_exec', '/usr/local/libexec/c3-test-fresh-network-client.py', 'fresh_network_client.py'))
         for name, installed, local in cases:
             with self.subTest(entry=name, source=local), tempfile.TemporaryDirectory() as d:
-                entry = load(name); raw = (HERE/local).read_bytes()
+                # Historical rejection remains on frozen original entry bytes;
+                # current entries have a separate genuine loader-positive suite.
+                entry = load('test_fresh_network_entry').frozen_module(name)
+                raw = (HERE/local).read_bytes()
                 self.assertNotEqual(entry.PINS[installed], m.digest(raw))
                 root = Path(d); target = root/installed.lstrip('/')
                 target.parent.mkdir(parents=True); target.write_bytes(raw); target.chmod(0o644)
