@@ -1,8 +1,8 @@
 #!/usr/bin/python3 -I
 """Fixed TEST private point-to-point construction. Never an acceptance/GO producer.
 
-No Docker writes, bridge/IPAM allocation, host routes, NAT or public-address ARP.
-The only endpoint mutations are newly owned veths plus one private Caddy table/rule.
+No Docker writes, bridge/IPAM allocation, host NAT or public-address ARP.
+Endpoint mutations are owned veths plus one exact Caddy table/rule (host on B132).
 CLI entry is separate; injected seams below are for unprivileged tests only.
 """
 import ctypes
@@ -19,6 +19,7 @@ import stat
 import struct
 import subprocess
 import time
+from urllib.parse import parse_qsl, urlsplit
 
 CONTEXT = 'test.infograd.online'
 TEST_MACHINE = '7fa266f995fe4aa69e96cf7d01359e34'
@@ -29,7 +30,7 @@ LEASE = '/etc/c3-test-fresh-network-lease.json'
 STATE = '/var/lib/c3-test-fresh-network'
 SOCKET = '/run/c3-test-fresh-network.sock'
 LIB = '/usr/local/libexec/c3-test-fresh-network.py'
-IP = '/usr/sbin/ip'
+IP = '/usr/bin/ip'  # Measured installed regular binary; never follow /usr/sbin/ip.
 NFT = '/usr/sbin/nft'
 DOCKER = '/run/docker.sock'
 PUBLIC = '212.119.42.100'
@@ -137,6 +138,28 @@ def trusted_read(path):
         os.close(fd)
 
 
+def host_caddy(p):
+    # Existing closed plan: this exact address denotes B132's measured host peer,
+    # not a Docker address, wildcard mode or permission for any other host peer.
+    return p['machine'] == B132_MACHINE and p['peers']['caddy']['address'] == '127.0.0.1'
+
+
+def runtime_endpoints(raw):
+    """Preserve private settings; refuse RS discovery rather than guess aliases."""
+    try:
+        environment = decode(raw)['environment']
+        mongo = urlsplit(environment['MONGO_URI'])
+        redis = urlsplit(environment['REDIS_URL'])
+        query = parse_qsl(mongo.query, keep_blank_values=True, strict_parsing=True)
+        need(mongo.scheme == 'mongodb' and mongo.hostname == '127.0.0.1' and mongo.port == 27017 and
+             bool(mongo.path.strip('/')) and not mongo.fragment and
+             len(query) == 3 and dict(query) == {'authSource': 'admin', 'replicaSet': 'rs0', 'directConnection': 'true'} and
+             redis.scheme == 'redis' and redis.hostname == '127.0.0.1' and redis.port == 6379 and
+             not redis.query and not redis.fragment, 'EXACT_RUNTIME_DATA_ENDPOINTS_REQUIRED')
+    except (KeyError, TypeError, ValueError):
+        raise Refusal('EXACT_RUNTIME_DATA_ENDPOINTS_REQUIRED') from None
+
+
 def validate_plan(p):
     keys(p, 'version context machine boot hostNetns generation deadline daemon peers executables hostsSha256 oldConfig newConfig')
     need(type(p['version']) is int and p['version'] == 1 and p['context'] == CONTEXT,
@@ -188,7 +211,8 @@ def validate_plan(p):
                 upstreams = value.get('upstreams')
                 if type(upstreams) is list:
                     for upstream in upstreams:
-                        if type(upstream) is dict and upstream.get('dial') == 'backend:3000':
+                        if type(upstream) is dict and upstream.get('dial') == (
+                                '127.0.0.1:3000' if host_caddy(p) else 'backend:3000'):
                             upstream['dial'] = PUBLIC+':3000'
                             count[0] += 1
             for child in value.values():
@@ -225,7 +249,18 @@ def nft_policy(p):
              'oifname "lo" accept', 'ct state established,related accept']
     for role in ('mongo', 'redis'):
         lines.append(f'oifname "{NAMES[role][0]}" ip daddr {p["peers"][role]["address"]} tcp dport {PORTS[role]} accept')
-    return ('\n'.join(lines+['}', '}'])+'\n').encode()
+    lines.append('}')
+    if host_caddy(p):
+        # Only the new fresh namespace. Preserve accepted numeric settings and
+        # give their packets a routable p2p return source, never host NAT/proxying.
+        lines.append('chain loopback_data { type nat hook output priority -100; policy accept;')
+        for role in PORTS:
+            lines.append(f'ip daddr 127.0.0.1 tcp dport {PORTS[role]} dnat ip to {p["peers"][role]["address"]}:{PORTS[role]}')
+        lines.extend(['}', 'chain data_source { type nat hook postrouting priority 100; policy accept;'])
+        for role in PORTS:
+            lines.append(f'oifname "{NAMES[role][0]}" ip saddr 127.0.0.1 ip daddr {p["peers"][role]["address"]} tcp dport {PORTS[role]} snat ip to {addresses(p, role)[0]}')
+        lines.append('}')
+    return ('\n'.join(lines+['}'])+'\n').encode()
 
 
 def move_message(index, namespace_fd, sequence):
@@ -489,8 +524,14 @@ class Linux:
                       'netns': identity('/proc/'+str(pid)+'/ns/net'), 'image': c['Image'],
                       'restartCount': c['RestartCount'], 'networks': c['NetworkSettings']['Networks']}
         need(digest(encode(projection)) == self.p['peers'][role]['inspectSha256'], 'CONTAINER_IDENTITY_DRIFT')
-        need(self.p['peers'][role]['address'] in
-             {x.get('IPAddress') for x in c['NetworkSettings']['Networks'].values()}, 'DATA_ENDPOINT_ADDRESS_DRIFT')
+        if role == 'caddy' and host_caddy(self.p):
+            networks = c['NetworkSettings']['Networks']
+            need(c.get('HostConfig', {}).get('NetworkMode') == 'host' and
+                 set(networks) == {'host'} and networks['host'].get('IPAddress') == '' and
+                 projection['netns'] == self.p['hostNetns'], 'EXACT_HOST_CADDY_REQUIRED')
+        else:
+            need(self.p['peers'][role]['address'] in
+                 {x.get('IPAddress') for x in c['NetworkSettings']['Networks'].values()}, 'DATA_ENDPOINT_ADDRESS_DRIFT')
         return projection
 
     def check_peer(self, role):
@@ -499,7 +540,8 @@ class Linux:
         s = os.fstat(fd)
         need(current['pid'] == self.pids[role] and current['netns'] == [s.st_dev, s.st_ino] and
              not select.select([self.pidfds[role]], [], [], 0)[0] and
-             current['netns'] != self.p['hostNetns'], 'PEER_NAMESPACE_DRIFT')
+             ((current['netns'] == self.p['hostNetns']) if role == 'caddy' and host_caddy(self.p)
+              else current['netns'] != self.p['hostNetns']), 'PEER_NAMESPACE_DRIFT')
 
     def check(self):
         self.check_host()
@@ -507,6 +549,10 @@ class Linux:
 
     def check_targets(self):
         self.check_hold()
+        self.check_loopback_links()
+        if getattr(self, 'runtime_settings', None) is not None:
+            need(trusted_read('/var/lib/c3-test-fresh-input/root/etc/classic.json') == self.runtime_settings,
+                 'RUNTIME_DATA_SETTINGS_DRIFT')
         if self.path_state == 'underlay':
             need(identity(NETNS) == self.path_identity, 'NETNS_MOUNTPOINT_REPLACED')
         for role in ROLES:
@@ -556,9 +602,20 @@ class Linux:
         return in_namespace(self.fds[where], call)
 
     def snapshot(self, where):
-        return {kind: decode(self.ip(where, *args).encode()) for kind, args in
+        result = {kind: decode(self.ip(where, *args).encode()) for kind, args in
                 {'links': ('-details', 'link', 'show'), 'addresses': ('address', 'show'),
                  'routes': ('route', 'show', 'table', 'all'), 'rules': ('rule', 'show')}.items()}
+        # ip -details reports live bridge countdowns as floats. They change with
+        # no writer and are not configuration. Keep every other key/type exact.
+        for link in result['links']:
+            info = link.get('linkinfo', {})
+            for kind, marker, keys_ in (
+                    ('info_data', 'info_kind', ('gc_timer', 'hello_timer', 'tcn_timer', 'topology_change_timer')),
+                    ('info_slave_data', 'info_slave_kind', ('forward_delay_timer', 'hold_timer', 'message_age_timer'))):
+                if info.get(marker) == 'bridge':
+                    for key in keys_:
+                        info.get(kind, {}).pop(key, None)
+        return result
 
     def preflight(self):
         self.check()
@@ -602,6 +659,10 @@ class Linux:
         need(encode(self.config()) == encode(self.p['oldConfig']), 'CADDY_BASELINE_DRIFT')
         need(digest(trusted_read('/var/lib/c3-test-fresh-input/root/etc/hosts')) == self.p['hostsSha256'],
              'INDEPENDENT_RUNTIME_HOSTS_REQUIRED')
+        if host_caddy(self.p):
+            raw = trusted_read('/var/lib/c3-test-fresh-input/root/etc/classic.json')
+            runtime_endpoints(raw)
+            self.runtime_settings = raw
         rp = in_namespace(self.fds['caddy'], lambda: Path('/proc/sys/net/ipv4/conf/all/rp_filter').read_text().strip())
         need(rp in ('0', '2'), 'CADDY_STRICT_GLOBAL_RPF_UNSUPPORTED')
         return snapshots
@@ -689,8 +750,23 @@ class Linux:
         for name in (own, peer):
             self.owned['host', name] = {k: rows[name].get(k) for k in ('ifindex', 'ifalias', 'link_index')}
 
+    def endpoint(self, role):
+        return 'host' if role == 'caddy' and host_caddy(self.p) else role
+
+    def check_loopback_links(self):
+        for name in getattr(self, 'loopback_links', ()):
+            value = in_namespace(self.fds['fresh'], lambda: Path(
+                '/proc/sys/net/ipv4/conf', name, 'route_localnet').read_text().strip())
+            need(value == '1', 'PRIVATE_LOOPBACK_ROUTE_DRIFT')
+
+    def expected_rows(self, expected, where, kind, rows):
+        # host/caddy are two observation labels for the same retained namespace.
+        for label in (('host', 'caddy') if host_caddy(self.p) and where in ('host', 'caddy') else (where,)):
+            expected[label][kind] = rows
+
     def connect(self, role):
         own, peer = NAMES[role]
+        endpoint = self.endpoint(role)
         for where in ('host', 'fresh', *ROLES):
             need(not any(x['ifname'] in (own, peer) for x in self.snapshot(where)['links']),
                  'EXISTING_INTERFACE_REFUSED')
@@ -701,7 +777,9 @@ class Linux:
                 self.owned['host', name]['ifalias'] = alias
             self.write_ip('host', *command, after=tagged)
         # Exact indices come from the exclusively created pair, never a fresh name lookup.
-        for name, where in ((own, 'fresh'), (peer, role)):
+        for name, where in ((own, 'fresh'), (peer, endpoint)):
+            if where == 'host':
+                continue  # Already retained here; same-netns RTM_NEWLINK is not a move.
             index = self.owned['host', name]['ifindex']
             def moved(name=name, where=where):
                 self.owned[where, name] = self.owned.pop(('host', name))
@@ -709,7 +787,7 @@ class Linux:
                       lambda index=index, where=where: self.invoke('host', lambda: move_link(index, self.fds[where], self.boundary)),
                       moved)
         fresh_ip, peer_ip = addresses(self.p, role)
-        for where, name, address in (('fresh', own, fresh_ip), (role, peer, peer_ip)):
+        for where, name, address in (('fresh', own, fresh_ip), (endpoint, peer, peer_ip)):
             self.write_ip(where, 'link', 'set', name, 'addrgenmode', 'none')
             def rpf(name=name):
                 path = Path('/proc/sys/net/ipv4/conf')/name/'rp_filter'
@@ -717,15 +795,27 @@ class Linux:
                 need(path.read_text().strip() == '0', 'PRIVATE_LINK_RPF_WRITE_FAILED')
                 return True
             self.step('sysctl-rpf:'+where+':'+name, lambda where=where: self.invoke(where, rpf))
+            if where == 'fresh' and role in PORTS and host_caddy(self.p):
+                def loopback_route(name=name):
+                    # Only this newly owned private data interface; never all,
+                    # default, host, Caddy, Mongo or Redis namespace sysctls.
+                    path = Path('/proc/sys/net/ipv4/conf')/name/'route_localnet'
+                    path.write_text('1\n')
+                    need(path.read_text().strip() == '1', 'PRIVATE_LOOPBACK_ROUTE_WRITE_FAILED')
+                    return True
+                if not hasattr(self, 'loopback_links'):
+                    self.loopback_links = set()
+                self.step('sysctl-loopback:fresh:'+name, lambda: self.invoke('fresh', loopback_route),
+                          after=lambda: self.loopback_links.add(name))
             self.write_ip(where, 'address', 'add', address+'/30', 'dev', name)
             self.write_ip(where, 'link', 'set', name, 'up')
         if role in PORTS:
             self.write_ip('fresh', 'route', 'add', self.p['peers'][role]['address']+'/32', 'via', peer_ip,
                           'dev', own, 'src', fresh_ip)
         else:
-            self.write_ip(role, 'route', 'add', PUBLIC+'/32', 'via', fresh_ip, 'dev', peer,
+            self.write_ip(endpoint, 'route', 'add', PUBLIC+'/32', 'via', fresh_ip, 'dev', peer,
                           'src', peer_ip, 'table', TABLE)
-            self.write_ip(role, 'rule', 'add', 'priority', PRIORITY, 'to', PUBLIC+'/32',
+            self.write_ip(endpoint, 'rule', 'add', 'priority', PRIORITY, 'to', PUBLIC+'/32',
                           'ipproto', 'tcp', 'dport', '3000', 'table', TABLE)
 
     def firewall(self):
@@ -782,6 +872,10 @@ class Linux:
         return in_namespace(self.fds['caddy'], probe)
 
     def return_probe(self):
+        # The bridge return authority proves Docker DNS -> an owned backend
+        # socket. B132's host 127.0.0.1 published path has no such PID proof;
+        # neither a direct Docker-IP probe nor a same-body response substitutes.
+        need(not host_caddy(self.p), 'HOST_CADDY_RETURN_LOOPBACK_PID_BINDING_REQUIRED')
         path = '/etc/c3-test-fresh-network-return.json'
         raw = trusted_read(path)
         value = decode(raw)
@@ -900,22 +994,24 @@ class Linux:
         rules = [x for x in self.sealed['caddy']['rules'] if str(x.get('priority')) == PRIORITY]
         routes = [x for x in self.sealed['caddy']['routes'] if str(x.get('table')) == TABLE]
         need(len(rules) == len(routes) == 1, 'OWNED_CADDY_SELECTORS_LOST')
-        self.delete_expected('caddy', 'rules', rules[0],
+        self.delete_expected(self.endpoint('caddy'), 'rules', rules[0],
                              ('rule', 'del', 'priority', PRIORITY, 'to', PUBLIC+'/32',
                               'ipproto', 'tcp', 'dport', '3000', 'table', TABLE))
         fresh_ip, peer_ip = addresses(self.p, 'caddy')
-        self.delete_expected('caddy', 'routes', routes[0],
+        self.delete_expected(self.endpoint('caddy'), 'routes', routes[0],
                              ('route', 'del', PUBLIC+'/32', 'via', fresh_ip, 'dev', NAMES['caddy'][1],
                               'src', peer_ip, 'table', TABLE))
         for role in ROLES:
             expected = decode(encode(self.sealed))
-            for where, name in (('fresh', NAMES[role][0]), (role, NAMES[role][1])):
+            for where, name in (('fresh', NAMES[role][0]), (self.endpoint(role), NAMES[role][1])):
                 for kind in ('links', 'addresses', 'routes'):
-                    expected[where][kind] = [x for x in expected[where][kind]
-                                             if x.get('ifname') != name and x.get('dev') != name]
+                    self.expected_rows(expected, where, kind, [x for x in expected[where][kind]
+                                             if x.get('ifname') != name and x.get('dev') != name])
             def deleted(role=role, expected=expected):
-                for where, name in (('fresh', NAMES[role][0]), (role, NAMES[role][1])):
+                for where, name in (('fresh', NAMES[role][0]), (self.endpoint(role), NAMES[role][1])):
                     self.owned.pop((where, name))
+                if hasattr(self, 'loopback_links'):
+                    self.loopback_links.discard(NAMES[role][0])
                 self.sealed = expected
             self.write_ip('fresh', 'link', 'del', NAMES[role][0], after=deleted)
         for role in ('host', *ROLES):
@@ -939,7 +1035,7 @@ class Linux:
 
     def delete_expected(self, where, kind, row, command):
         expected = decode(encode(self.sealed))
-        expected[where][kind] = [x for x in expected[where][kind] if encode(x) != encode(row)]
+        self.expected_rows(expected, where, kind, [x for x in expected[where][kind] if encode(x) != encode(row)])
         self.write_ip(where, *command, after=lambda: setattr(self, 'sealed', expected))
 
     def require_empty_namespace(self):
