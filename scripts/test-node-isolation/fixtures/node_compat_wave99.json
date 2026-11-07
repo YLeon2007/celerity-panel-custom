@@ -1,0 +1,127 @@
+{
+  "canonicalObservation": {
+    "ipv4": "*raw\n:PREROUTING ACCEPT\n:OUTPUT ACCEPT\n-A PREROUTING -d 172.19.0.2/32 '!' -i br-bdc639b58573 -j DROP\n-A PREROUTING -d 172.19.0.3/32 '!' -i br-bdc639b58573 -j DROP\n-A PREROUTING -d 172.19.0.4/32 '!' -i br-bdc639b58573 -j DROP\n-A PREROUTING -d 127.0.0.1/32 '!' -i lo -p tcp -m tcp --dport 27017 -j DROP\n-A PREROUTING -d 127.0.0.1/32 '!' -i lo -p tcp -m tcp --dport 6379 -j DROP\n-A PREROUTING -d 172.19.0.5/32 '!' -i br-bdc639b58573 -j DROP\n-A PREROUTING -d 127.0.0.1/32 '!' -i lo -p tcp -m tcp --dport 3000 -j DROP\nCOMMIT\n*filter\n:INPUT ACCEPT\n:FORWARD DROP\n:OUTPUT ACCEPT\n:DOCKER -\n:DOCKER-BRIDGE -\n:DOCKER-CT -\n:DOCKER-FORWARD -\n:DOCKER-INTERNAL -\n:DOCKER-USER -\n-A INPUT '!' -i lo -p tcp -m tcp --dport 3001 -m comment --comment c3-test-native-wave61-tcp3001 -j DROP\n-A INPUT -s 212.119.42.100/32 -p tcp -m tcp --dport 62080 -j ACCEPT\n-A INPUT -p udp -m udp --dport 443 -j ACCEPT\n-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A DOCKER -d 172.19.0.5/32 '!' -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 3000 -j ACCEPT\n-A DOCKER -d 172.19.0.3/32 '!' -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 6379 -j ACCEPT\n-A DOCKER -d 172.19.0.2/32 '!' -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 27017 -j ACCEPT\n-A DOCKER '!' -i docker0 -o docker0 -j DROP\n-A DOCKER '!' -i br-bed4e62c6d47 -o br-bed4e62c6d47 -j DROP\n-A DOCKER '!' -i br-bdc639b58573 -o br-bdc639b58573 -j DROP\n-A DOCKER-BRIDGE -o docker0 -j DOCKER\n-A DOCKER-BRIDGE -o br-bed4e62c6d47 -j DOCKER\n-A DOCKER-BRIDGE -o br-bdc639b58573 -j DOCKER\n-A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A DOCKER-CT -o br-bed4e62c6d47 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A DOCKER-CT -o br-bdc639b58573 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n-A DOCKER-FORWARD -j DOCKER-CT\n-A DOCKER-FORWARD -j DOCKER-INTERNAL\n-A DOCKER-FORWARD -j DOCKER-BRIDGE\n-A DOCKER-FORWARD -i docker0 -j ACCEPT\n-A DOCKER-FORWARD -i br-bed4e62c6d47 -j ACCEPT\n-A DOCKER-FORWARD -i br-bdc639b58573 -j ACCEPT\nCOMMIT\n*nat\n:PREROUTING ACCEPT\n:INPUT ACCEPT\n:OUTPUT ACCEPT\n:POSTROUTING ACCEPT\n:DOCKER -\n-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n-A OUTPUT '!' -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER\n-A POSTROUTING -s 172.19.0.0/16 '!' -o br-bdc639b58573 -j MASQUERADE\n-A POSTROUTING -s 172.18.0.0/16 '!' -o br-bed4e62c6d47 -j MASQUERADE\n-A POSTROUTING -s 172.17.0.0/16 '!' -o docker0 -j MASQUERADE\n-A DOCKER -d 127.0.0.1/32 '!' -i br-bdc639b58573 -p tcp -m tcp --dport 27017 -j DNAT --to-destination 172.19.0.2:27017\n-A DOCKER -d 127.0.0.1/32 '!' -i br-bdc639b58573 -p tcp -m tcp --dport 6379 -j DNAT --to-destination 172.19.0.3:6379\n-A DOCKER -d 127.0.0.1/32 '!' -i br-bdc639b58573 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.19.0.5:3000\nCOMMIT\n",
+    "ipv6": "*nat\n:PREROUTING ACCEPT\n:INPUT ACCEPT\n:OUTPUT ACCEPT\n:POSTROUTING ACCEPT\n:DOCKER -\n-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n-A OUTPUT '!' -d ::1/128 -m addrtype --dst-type LOCAL -j DOCKER\nCOMMIT\n*filter\n:INPUT ACCEPT\n:FORWARD ACCEPT\n:OUTPUT ACCEPT\n:DOCKER -\n:DOCKER-BRIDGE -\n:DOCKER-CT -\n:DOCKER-FORWARD -\n:DOCKER-INTERNAL -\n:DOCKER-USER -\n-A INPUT '!' -i lo -p tcp -m tcp --dport 3001 -m comment --comment c3-test-native-wave61-tcp3001 -j DROP\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A DOCKER-FORWARD -j DOCKER-CT\n-A DOCKER-FORWARD -j DOCKER-INTERNAL\n-A DOCKER-FORWARD -j DOCKER-BRIDGE\nCOMMIT\n",
+    "legacy4": "",
+    "legacy6": ""
+  },
+  "provenance": {
+    "canonicalCompatSha256": "4cbb267aacdf73bb1789668b603079373b3f3b03628f545120aeaff7c74cb725",
+    "canonicalIPv6Sha256": "9aef5acc8cf5c57ba108bc44d27183d81ebe6bb5f8156480190be32496e02bcc",
+    "captureManifestSha256": "fe342e2dfecbdf422acdde716bfbef291443dabc6ef366606f477717a270581c",
+    "captureRoot": "/home/leon/c3-anyorder-execution-20261104/test-owner-platform-preflight-wave99",
+    "commands": [
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "iptables-save",
+          "-c"
+        ],
+        "rc": 0,
+        "stdoutBytes": 3743,
+        "stdoutSha256": "d8f4b1a1a5ec95f1695fc02888830bc31c48e55665045f4c0641612074aa7380"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "ip6tables-save",
+          "-c"
+        ],
+        "rc": 0,
+        "stdoutBytes": 996,
+        "stdoutSha256": "9dbe32a3c333f2ee42a8c3d4e88b64b993551fb26915059bea84a12b7d8f1e88"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-legacy-multi",
+          "iptables-save",
+          "-c"
+        ],
+        "rc": 0,
+        "stdoutBytes": 0,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-legacy-multi",
+          "ip6tables-save",
+          "-c"
+        ],
+        "rc": 0,
+        "stdoutBytes": 0,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "iptables-save",
+          "-c",
+          "-t",
+          "raw"
+        ],
+        "rc": 0,
+        "stdoutBytes": 692,
+        "stdoutSha256": "de4b4344b04a6384375fee92b128b5ad8c8e85e04ee160615d5ec4e12049bac2"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "iptables-save",
+          "-c",
+          "-t",
+          "filter"
+        ],
+        "rc": 0,
+        "stdoutBytes": 2044,
+        "stdoutSha256": "96e54d487e5afcecbb066306c983c3b2f34394a56cdef0bf69aa0123cb4905f9"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "iptables-save",
+          "-c",
+          "-t",
+          "nat"
+        ],
+        "rc": 0,
+        "stdoutBytes": 1007,
+        "stdoutSha256": "fdda40c17efb04d95b63ea195a423e5272234effeebe2c033ebafb0bd8a1180a"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "ip6tables-save",
+          "-c",
+          "-t",
+          "nat"
+        ],
+        "rc": 0,
+        "stdoutBytes": 365,
+        "stdoutSha256": "ebf5c2d069df5b9681ea4af3bbc3c872339968afcaf057f9ee5bd414bab56bd2"
+      },
+      {
+        "argv": [
+          "/usr/sbin/xtables-nft-multi",
+          "ip6tables-save",
+          "-c",
+          "-t",
+          "filter"
+        ],
+        "rc": 0,
+        "stdoutBytes": 631,
+        "stdoutSha256": "369e8473c8c0b291f5ee92424161203786a0487acc70d24fae2e695e4e6caa11"
+      }
+    ],
+    "kernelReplayModeled": true,
+    "normalization": "Only exact generated/completed timestamp headers and numeric chain/rule counters; shell-token quoting canonicalized. Every policy, chain, rule, parameter, comment and order retained. Per-table order follows the actual reader: IPv4 raw/filter/nat; IPv6 nat/filter.",
+    "observationsNotAcceptedRootPlanOrBinaryPinAuthority": true,
+    "realHostCapture": true,
+    "sourceCommit": "ef5ef38e52b4b00d4deed0c613e40f9ccb286ca5"
+  },
+  "raw": {
+    "ipv4": "# Generated by iptables-save v1.8.10 (nf_tables) on Sat Nov  7 09:50:09 2026\n*raw\n:PREROUTING ACCEPT [7548741:2432384779]\n:OUTPUT ACCEPT [0:0]\n[0:0] -A PREROUTING -d 172.19.0.2/32 ! -i br-bdc639b58573 -j DROP\n[0:0] -A PREROUTING -d 172.19.0.3/32 ! -i br-bdc639b58573 -j DROP\n[0:0] -A PREROUTING -d 172.19.0.4/32 ! -i br-bdc639b58573 -j DROP\n[0:0] -A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 27017 -j DROP\n[0:0] -A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 6379 -j DROP\n[0:0] -A PREROUTING -d 172.19.0.5/32 ! -i br-bdc639b58573 -j DROP\n[0:0] -A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 3000 -j DROP\nCOMMIT\n# Completed on Sat Nov  7 09:50:09 2026\n# Generated by iptables-save v1.8.10 (nf_tables) on Sat Nov  7 09:50:09 2026\n*filter\n:INPUT ACCEPT [1545005:1634954344]\n:FORWARD DROP [0:0]\n:OUTPUT ACCEPT [826511:1362464542]\n:DOCKER - [0:0]\n:DOCKER-BRIDGE - [0:0]\n:DOCKER-CT - [0:0]\n:DOCKER-FORWARD - [0:0]\n:DOCKER-INTERNAL - [0:0]\n:DOCKER-USER - [0:0]\n[19:960] -A INPUT ! -i lo -p tcp -m tcp --dport 3001 -m comment --comment c3-test-native-wave61-tcp3001 -j DROP\n[0:0] -A INPUT -s 212.119.42.100/32 -p tcp -m tcp --dport 62080 -j ACCEPT\n[7:5362] -A INPUT -p udp -m udp --dport 443 -j ACCEPT\n[4070:430248] -A INPUT -p tcp -m tcp --dport 443 -j ACCEPT\n[1424718:316591872] -A FORWARD -j DOCKER-USER\n[1424718:316591872] -A FORWARD -j DOCKER-FORWARD\n[0:0] -A DOCKER -d 172.19.0.5/32 ! -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 3000 -j ACCEPT\n[0:0] -A DOCKER -d 172.19.0.3/32 ! -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 6379 -j ACCEPT\n[0:0] -A DOCKER -d 172.19.0.2/32 ! -i br-bdc639b58573 -o br-bdc639b58573 -p tcp -m tcp --dport 27017 -j ACCEPT\n[0:0] -A DOCKER ! -i docker0 -o docker0 -j DROP\n[0:0] -A DOCKER ! -i br-bed4e62c6d47 -o br-bed4e62c6d47 -j DROP\n[0:0] -A DOCKER ! -i br-bdc639b58573 -o br-bdc639b58573 -j DROP\n[0:0] -A DOCKER-BRIDGE -o docker0 -j DOCKER\n[0:0] -A DOCKER-BRIDGE -o br-bed4e62c6d47 -j DOCKER\n[0:0] -A DOCKER-BRIDGE -o br-bdc639b58573 -j DOCKER\n[41508:106285672] -A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n[61514:8157460] -A DOCKER-CT -o br-bed4e62c6d47 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n[606359:82734592] -A DOCKER-CT -o br-bdc639b58573 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n[1424718:316591872] -A DOCKER-FORWARD -j DOCKER-CT\n[715337:119414148] -A DOCKER-FORWARD -j DOCKER-INTERNAL\n[715337:119414148] -A DOCKER-FORWARD -j DOCKER-BRIDGE\n[30037:1846144] -A DOCKER-FORWARD -i docker0 -j ACCEPT\n[59587:10200800] -A DOCKER-FORWARD -i br-bed4e62c6d47 -j ACCEPT\n[625713:107367204] -A DOCKER-FORWARD -i br-bdc639b58573 -j ACCEPT\nCOMMIT\n# Completed on Sat Nov  7 09:50:09 2026\n# Generated by iptables-save v1.8.10 (nf_tables) on Sat Nov  7 09:50:09 2026\n*nat\n:PREROUTING ACCEPT [5016396:697981757]\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [3336:216094]\n:POSTROUTING ACCEPT [3336:216094]\n:DOCKER - [0:0]\n[136243:6930025] -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n[0:0] -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER\n[80724:4843440] -A POSTROUTING -s 172.19.0.0/16 ! -o br-bdc639b58573 -j MASQUERADE\n[7598:455880] -A POSTROUTING -s 172.18.0.0/16 ! -o br-bed4e62c6d47 -j MASQUERADE\n[32:1952] -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE\n[0:0] -A DOCKER -d 127.0.0.1/32 ! -i br-bdc639b58573 -p tcp -m tcp --dport 27017 -j DNAT --to-destination 172.19.0.2:27017\n[0:0] -A DOCKER -d 127.0.0.1/32 ! -i br-bdc639b58573 -p tcp -m tcp --dport 6379 -j DNAT --to-destination 172.19.0.3:6379\n[0:0] -A DOCKER -d 127.0.0.1/32 ! -i br-bdc639b58573 -p tcp -m tcp --dport 3000 -j DNAT --to-destination 172.19.0.5:3000\nCOMMIT\n# Completed on Sat Nov  7 09:50:09 2026\n",
+    "ipv6": "# Generated by ip6tables-save v1.8.10 (nf_tables) on Sat Nov  7 09:50:09 2026\n*nat\n:PREROUTING ACCEPT [0:0]\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\n:DOCKER - [0:0]\n[0:0] -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n[0:0] -A OUTPUT ! -d ::1/128 -m addrtype --dst-type LOCAL -j DOCKER\nCOMMIT\n# Completed on Sat Nov  7 09:50:09 2026\n# Generated by ip6tables-save v1.8.10 (nf_tables) on Sat Nov  7 09:50:09 2026\n*filter\n:INPUT ACCEPT [20947:3700801]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:DOCKER - [0:0]\n:DOCKER-BRIDGE - [0:0]\n:DOCKER-CT - [0:0]\n:DOCKER-FORWARD - [0:0]\n:DOCKER-INTERNAL - [0:0]\n:DOCKER-USER - [0:0]\n[0:0] -A INPUT ! -i lo -p tcp -m tcp --dport 3001 -m comment --comment c3-test-native-wave61-tcp3001 -j DROP\n[0:0] -A FORWARD -j DOCKER-USER\n[0:0] -A FORWARD -j DOCKER-FORWARD\n[0:0] -A DOCKER-FORWARD -j DOCKER-CT\n[0:0] -A DOCKER-FORWARD -j DOCKER-INTERNAL\n[0:0] -A DOCKER-FORWARD -j DOCKER-BRIDGE\nCOMMIT\n# Completed on Sat Nov  7 09:50:09 2026\n",
+    "legacy4": "",
+    "legacy6": ""
+  }
+}

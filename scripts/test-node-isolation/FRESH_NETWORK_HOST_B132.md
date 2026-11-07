@@ -225,3 +225,134 @@ actual accepted host cannot forward, this candidate remains physically blocked.
 Host firewall acceptance, privileged namespace/NAT/reply packet proof, combined
 freeze ordering and post-lease terminal ownership remain separate unmet gates.
 Model tests are not physical/server acceptance, PPP evidence or deployment GO.
+
+## Exact existing-DROP-path permission (wave98, source-only; supersedes wave94's host-forward prerequisite)
+
+The observed wave95 host **denies** P forwarding: `ip filter FORWARD`, handle2,
+filter hook priority0, policyDROP. Its DOCKER-USER and DOCKER-FORWARD branches return
+for c3pc↔c3test61. POSTROUTING SNAT and an earlier separate base-chain ACCEPT cannot
+bypass this DROP. This revision implements one bounded mechanism: insert **four
+iptables-nft compatibility rules at position1 of that existing FORWARD chain**.
+No foreign rule, chain, hook, default policy or Docker object is edited/flushed.
+
+For each remote P port2222/62080, the owned outbound ACCEPT matches TCP, exact
+accepted fresh p2p source/32, destination10.203.61.2/32, ingressc3pc,
+egressc3test61 and conntrack NEW/ESTABLISHED. Its reply ACCEPT matches TCP,
+source10.203.61.2/32, exact fresh destination/32 after reverse-SNAT,
+ingressc3test61, egressc3pc, corresponding source port and ESTABLISHED only.
+No RELATED, unsolicited reverse NEW, wrong interface/IP/port or arbitrary veth
+traffic is granted. B10.203.61.1:2222 remains host INPUT with **no new grant**.
+The existing scoped SNAT, private three OUTPUT rules and two /32 routes remain.
+There is no ip_forward enable, default route, DNS/9999 grant or new daemon.
+
+### Independently accepted ROOT inputs, never observation-as-authority
+
+Nonempty `nodeControlEgress` can additionally contain this closed field:
+
+```json
+"forwardPolicy": {
+  "mode": "docker-forward-v1",
+  "compatPolicySha256": "INDEPENDENT_COMPLETE_CANONICAL_SAVE_DIGEST_REQUIRED",
+  "executables": {
+    "/usr/sbin/xtables-nft-multi": "INDEPENDENT_EXECUTABLE_DIGEST_REQUIRED",
+    "/usr/sbin/xtables-legacy-multi": "INDEPENDENT_EXECUTABLE_DIGEST_REQUIRED"
+  },
+  "wireguardLinkSha256": "INDEPENDENT_COMPLETE_LINK_ROW_DIGEST_REQUIRED"
+}
+```
+
+These invalid placeholders deliberately create **no executable ROOT plan/lease**.
+The existing raw-plan lease and in-memory immutable capability cover this whole
+object. The literal regular multicall binaries are nofollow/hash checked, with
+backend exactly `iptables v1.8.10 (nf_tables)`; common symlink aliases are not
+followed. The existing IP/NFT executable pins remain unchanged in shape. The WG
+pin hashes `encode` of the complete existing `snapshot('host').links` row for
+c3test61, including ifindex/type; the existing .1/32, .2 route and ip_forward=1
+readbacks remain required. The accepted generation still owns its newly created
+c3pc/c3nc pair and retains original host/peer nsfds and pidfds.
+
+`hostRulesetSha256` continues to hash the complete stateless foreign nft JSON,
+excluding **metainfo only** at collection and subtracting only fully measured
+owned effects. It retains all foreign handles, chain identities, hook priorities,
+order, expressions and all families. A second finite shape pin admits only the
+captured wave95 ruleset structure (ignoring handles for recognition, not acceptance).
+The fixed IPv4 complete-save semantic pin admits only the captured raw/filter/nat
+policy. Changed/unknown hooks/tables/parameters refuse, not generalize.
+
+`compatPolicySha256` hashes `encode` of the closed object with string fields
+`ipv4, ipv6, legacy4, legacy6`. The collector uses fixed multicall argv:
+`xtables-nft-multi iptables-save -c -t raw`, then filter/nat;
+`xtables-nft-multi ip6tables-save -c -t nat`, then filter; and both full legacy
+saves through xtables-legacy-multi (required empty). The canonical codec removes
+only numeric rule/chain counters and exact v1.8.10 generated timestamp headers,
+then losslessly canonicalizes shell-token quoting. It retains every option and
+operand, NAT/addrtype/conntrack parameters, comment bytes, policy and rule order.
+Only the precisely measured owned IPv4 FORWARD prefix is subtracted. In particular,
+identical opaque nft JSON with changed hidden compat parameters is rejected.
+The companion IPv6 grammar is fixed to the matching Docker structure; only its
+nonsemantic comment operand varies and is still bound by the complete ROOT pin.
+
+The original wave95 capture did not include ip6tables-save, and its former
+synthetic incomplete IPv6 fixture was rejected in the wave99 review. Wave100
+retains that RED evidence and replaces only the fixture input with the exact
+canonical projection of real TEST wave99 v1.8.10 `(nf_tables)` per-table saves.
+The finite `node_compat_wave99.json` fixture also retains their actual raw stdout,
+including numeric counters and C-locale generated/completed timestamps. The
+closed IPv6 recognizer now requires all producer chains, including empty ACCEPT
+`nat/INPUT`, `nat/POSTROUTING` and `filter/OUTPUT`; it does not drop them or admit
+missing/unknown chains, altered policies or extra rules. Header normalization
+requires the literal backend/version and a complete C-locale ctime timestamp;
+arbitrary comments or trailing header text refuse.
+
+The wave99 IPv4 canonical digest still matches the fixed policy; both actual
+legacy saves are empty. Capture provenance/digests are observations, **not accepted
+ROOT plan or executable-pin authority**. A real caller must independently review
+and accept those inputs. No observation digest has been inserted into an active
+ROOT plan. Missing `forwardPolicy` still leaves
+old nonopaque fixture behavior alone, but cannot authorize opaque xt policy:
+it refuses `COMPLETE_COMPAT_BINDING_REQUIRED`. Absent/empty endpoint lists retain
+legacy byte-equivalent private policy/routes with no host compatibility IO.
+
+### Ownership, readback, intent and cleanup
+
+Each insertion has its own original dispatcher durable intent, guard/lease check
+after fsync, joined-child check immediately before exec, readback and confirmation.
+It uses fixed `iptables -w 1 -t filter -I FORWARD 1 ... -m comment --comment
+c3:<generation>:P:<port><out|reply> -j ACCEPT` via the pinned multicall binary.
+Readback correlates the one new head rule's **unique table-scoped nft handle** to
+the exact full compatibility rule (the comment may be opaque in nft JSON).
+Subtracting that measured rule plus prior owned rules must restore both accepted
+foreign projections exactly before registering the new seal. Comment-only
+adoption, an existing generation collision, unmeasured insertion or second
+installation is not accepted. The existing outer competing-network-writer
+exclusion contract is mandatory throughout; these readers do not mint it.
+
+Cleanup first removes the sealed FORWARD prefix **one measured handle at a time**
+with `delete rule ip filter FORWARD handle N`, then deletes the still-exact owned
+SNAT table. It never deletes foreign rules by index/comment/guess. Every guard
+checks complete foreign projections, full owned nft rows and complete compat
+rows; each successful readback advances only that exact deletion's expected seal.
+Missing/replaced/extended/reordered rules, changed comments/compat parameters,
+partial cleanup drift, lost ACK, lost holder or failed journal confirmation are
+sticky unknown-retained, with no next mutation, retry, adoption or cleanup.
+No changes to Controller lease/Fence, freeze protocol, public settlement or durable
+ordinary-network ownership are made here. Post-lease ownership remains separately
+owned work, not an indefinite new process or implied permission to release fences.
+
+### Evidence qualification
+
+The new focused suite first evaluated the exact baseline SNAT-only proposal
+against real captured Docker tokens and failed **DROP != ACCEPT**, not a schema
+error. The same captured policy plus actual generated four-rule proposal models
+ACCEPT for both P flows and established replies, DROP for the negative tuple/state
+matrix, and preservation of unrelated foreign Docker behavior. It exercises actual
+command builders/dispatcher/journal/readers/cleanup with explicitly modeled kernel
+and root trust seams, plus ordinary files/processes/pidfds/loaders. These are
+**not real kernel packets** or physical forwarding/NAT/endpoint authentication.
+
+No deployment, privileged network/service command, new login/remote API/SSH,
+installation, active plan/lease or GO occurred. The historical two TEST login
+POSTs wrote lastLogin/session metadata; that exception remains historical and was
+not repeated or reclassified. Independent source review, complete actual trust
+inputs, combined freeze/ordinary-owner design and privileged request/reply proof
+are still required before any operational use.
