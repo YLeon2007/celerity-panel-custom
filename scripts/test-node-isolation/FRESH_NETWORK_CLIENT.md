@@ -16,10 +16,15 @@ Only these new sources are proposed for a later separately accepted installation
 | --- | --- |
 | `fresh_network_client.py` | `/usr/local/libexec/c3-test-fresh-network-client.py` |
 | `fresh_network_client_exec.py` | `/usr/local/libexec/c3-test-fresh-network-client-exec.py` |
+| `fresh_network_invocation.py` | `/usr/local/libexec/c3-test-fresh-network-invocation.py` |
 
 The fixed invocation is `/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-network-client-exec.py`,
-with NO arguments. This is a manual invocation contract, not an installed command
-or a new unit. The entry descriptor-walks root-controlled non-symlink ancestors,
+with NO arguments. For the selected `ordinaryOwner` workflow, its original parent
+is now the finite no-argument root entry
+`/usr/bin/python3 -I -B /usr/local/libexec/c3-test-fresh-network-invocation.py`.
+Invoke that parent with the trusted operator pipes below, not the client directly
+from an arbitrary SSH/shell reaper. These are source contracts, not installed
+commands or new units. The client entry descriptor-walks root-controlled non-symlink ancestors,
 checks bounded regular single-link source bytes against literal SHA256 pins and
 executes those checked buffers, not reopened pathnames. It loads the existing
 network/control helpers and this one client; no import path or callback is chosen
@@ -86,6 +91,47 @@ to drain it refuses; it is not an acceptance channel.
    elevated into an invented accepted server-PID schema. The existing accepted
    root socket/installation/exclusion is the authority. The peer must execute the
    exact fixed server Python argv and remain root in host PID/mount/net views.
+
+### Selected ordinary finite invocation / original reaping owner
+
+The new invocation entry checks the unchanged network module's literal digest
+from noatime/nofollow checked buffers. It reads the independently installed plan
+only to validate the existing ordinary selection and capture its original
+<=600-second monotonic ceiling **before Popen**. It creates the exact client argv
+above with fresh anonymous stdin/stdout/stderr pipes, registers that actual child
+before PID/start/pidfd pinning can fail, and forwards its unaccepted identity and
+prepared observation to the trusted operator. It never issues a lease or accepts
+that observation as policy. The separate issuer and server/Coordinator start
+steps above remain external, independently trusted operations.
+
+Its fd0 grammar is only `observe`, precommit `abandon`, or terminal `handoff`.
+`handoff` is sent once to the original client, then the **same original parent**
+invokes the existing no-argument public operator entry at the fixed argv
+`/usr/bin/node /opt/celerity-fresh-owner/scripts/test-node-isolation/settle-fresh-held-owner.js`.
+That existing entry performs `freshHandback`, the same-Coordinator terminal
+operation, public ACK/readback, bridge completion and DB close. This is the actual
+invoked completion boundary, not a supplied done flag or guessed holder message.
+The Node tree, dependencies, interpreter and trusted installation/exclusion must
+be independently accepted; the wrapper does not install or authorize them.
+
+The parent keeps SIGCHLD at default (refusing inherited auto-reap), stays alive,
+and never polls/waits/communicates/waitpids the holder during this operation.
+The owner still reads its own original held proc-stat descriptor and requires
+authentic status zero. Only natural successful public-entry completion permits
+the parent to reap its exact child. On public failure/timeout, caller exit alone
+does **not** establish remote settlement: retention continues to the original
+plan's monotonic ceiling before bounded exact-own-child terminate/wait/kill/reap.
+No renewal or wall-clock rollback extends that ceiling. SIGTERM/INT/HUP cancel
+work without bypassing retention; uncontrolled parent SIGKILL/death and competing
+reapers remain excluded by the trusted invocation/physical prerequisites.
+
+Both child channels are drained with bounded buffers; all waits share the original
+deadline. Only owned local processes/descriptors are disposed. No serving app,
+grant, journal, namespace or resource is cleaned up on uncertainty. Required
+creator disposal and operator-pipe restoration precede forwarding a successful
+public result. No terminal retry, new status authority, daemon, target or generic
+process manager is introduced. Direct client invocation remains a low-level
+legacy interface; it is not the selected ordinary completion workflow.
 
 Before each dispatch and after each ACK the client rechecks retained raw plan,
 lease and installed sources, inode/mtime-ns/ctime-ns/ownership/modes/xattrs through

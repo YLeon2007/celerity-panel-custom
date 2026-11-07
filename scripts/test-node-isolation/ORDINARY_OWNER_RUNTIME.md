@@ -134,21 +134,32 @@ Nonzero, signalled, already reaped, unreadable or unknown status prevents termin
 success. The finish attempt is one-shot, and the unchanged absolute terminal
 deadline is rechecked after the final ordinary readback before `finished=True`.
 
-Two concrete prerequisites are explicit, not supplied by this source:
+The physical status-reader prerequisite remains external; original-parent
+retention is now implemented by the finite invocation source below:
 
 - Linux proc stat filters `exit_code` under its ptrace access check. The reader
   must be actual root with effective `CAP_SYS_PTRACE` in the original holder's
   host user namespace; acquisition and final observation enforce that authority.
   A masked zero is not accepted as exit success.
-- The holder's **original creator must leave the exited child unreaped until the
-  finite finish observation completes**. A held proc descriptor does not preserve
-  status after reaping; that case is terminal-unknown. There is no new reaper,
-  controller, durable status authority or automatic recovery, and no claim that
-  an arbitrary external operator/SSH launcher already satisfies this prerequisite.
+- The selected `fresh_network_invocation.Invocation` is the actual holder creator
+  and reaping owner. Its no-argument root entry creates the unchanged fixed client
+  command, retains its original Popen/PID/start/pidfd without early poll/wait,
+  relays trusted anonymous operator pipes and, on literal `handoff`, invokes the
+  existing fixed `settle-fresh-held-owner.js` public operator. Only that entry's
+  natural success after the actual terminal operation/public ACK permits holder
+  reap. A failed caller is not a remote-settlement witness: the parent retains
+  status until the original plan ceiling, then disposes/reaps exact own children
+  boundedly. It publishes no authority and does not replace the owner's kernel
+  status check. No new reaper/controller/status service or automatic recovery is
+  introduced. Arbitrary direct client/SSH launchers remain unsupported here.
 
-The genuine local fixture's original Popen creator retains the child until the
-owner finishes. Its checked-loader → actual client/Holder → same Coordinator →
-original Fence/OFD → public ACK positive remains required. Causal negative tests
+The genuine local fixture now uses this source creator for both the actual client
+and the real public JS consumer, not fixture-owned delayed Popen reaping. It
+asserts real zombie status/original-parent identity at the held-stat observation,
+then observes the creator's first wait only after natural public success (or the
+unchanged original deadline on uncertainty). Its checked-loader → actual
+client/Holder → same Coordinator → original Fence/OFD → public ACK → parent reap
+positive remains required. Causal negative tests
 inject the post-message socket-close error **after real close**, and pipe-restore
 error **after real restoration**, through actual `run()` and the public consumer.
 Both must yield `COMMITTED_ACTIVATION_UNKNOWN`, no success ACK, one COMMIT/exec,
@@ -160,6 +171,14 @@ validation. No guard is weakened to hide this expected unknown state.
 
 Wave111 evidence is in
 `/home/leon/c3-anyorder-execution-20261104/test-terminal-disposal-wave111/`.
+The finite-creator source and new evidence are separately scoped under
+`/home/leon/c3-anyorder-execution-20261104/test-finite-creator-wave113/`.
+`test_fresh_network_invocation` covers the invoked pipe workflow, held zombie
+interval, ignored-SIGCHLD refusal, immediate child registration on pin failure,
+later operator-pin failure, original-deadline expiry and stubborn-child bounded
+reap. The genuine public fixture preserves natural success, both required-client
+cleanup faults, no success ACK/replay, and the separate native control. Absolute
+installed paths/root/ptrace authority remain modeled, not physically established.
 Host pidfd death still has its existing meaning; this repair does not claim a
 separately reproduced host-final-cleanup result or broaden the review scope.
 

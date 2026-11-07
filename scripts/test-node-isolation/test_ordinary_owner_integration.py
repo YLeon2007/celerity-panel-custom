@@ -40,6 +40,7 @@ import coordinated_restore as restore
 import fresh_classic_launch as fresh
 import fresh_network as network
 import fresh_network_control as control
+import fresh_network_invocation as creator
 import isolation
 import shared_host as shared
 import test_coordinated_restore as ct
@@ -214,6 +215,7 @@ def prepared_v2(ordinary, expected_failure=False):
     original_dual=originals.DualFixture
     configuration={}
     p=network_plan()
+    if expected_failure: p['deadline']=int(time.time())+30
     p['ordinaryOwner']={'version':1,'stopConfigSha256':network.digest(network.encode(network.stopped_config(p)))}
     raw=network.encode(p)
     sources={name:read_noatime(path) for name,path in source_map().items()}
@@ -497,8 +499,16 @@ def receiver(f, ledger, holder_fault=None):
     producer_fd=os.pidfd_open(producer_pid)
     holder_path=root/'h.sock'; holder_server=socket.socket(socket.AF_UNIX)
     holder_server.bind(str(holder_path)); holder_path.chmod(0o600); holder_server.listen(1); holder_server.settimeout(5)
-    holder=subprocess.Popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--holder',str(root),*([holder_fault] if holder_fault else [])],
-                            cwd=HERE,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    original_popen=subprocess.Popen
+    def fixed_holder(argv,**kwargs):
+        assert tuple(argv)==creator.HOLDER_ARGV
+        return original_popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--holder',str(root),
+                               *([holder_fault] if holder_fault else [])],cwd=HERE,**kwargs)
+    with patch.object(subprocess,'Popen',fixed_holder), \
+         patch.object(network,'trusted_read',return_value=network.encode(p)):
+        invocation=creator.Invocation(network)
+    holder=invocation.holder
+    assert holder is not None
     holder_channel=None
     (root/'receiver-peer.json').write_text(json.dumps({'pid':os.getpid()}))
     store=ModeledStore(p['generation']); journal=network.Journal(root/'network-generation',p)
@@ -620,8 +630,7 @@ def receiver(f, ledger, holder_fault=None):
             prepared_reply=read_holder_line(holder)
             assert prepared_reply==initial
             ledger.record('actual-holder-prepared',value=prepared_reply)
-            assert holder.stdin is not None
-            holder.stdin.write(b'handoff\n'); holder.stdin.flush()
+            invocation.begin_handoff()
             # Close the candidate through the actual original host protocol.
             identity=host.identity
             with RootSocket(socket.AF_UNIX) as conn:
@@ -638,7 +647,10 @@ def receiver(f, ledger, holder_fault=None):
                 fields=control.holder_stat(network,raw,lease.holder)
                 ledger.record('original-holder-kernel-exit',holder=lease.holder,state=fields[0].decode(),
                               waitStatus=int(fields[49]),pidfdReadable=bool(select.select([lease.pidfd],[],[],0)[0]),
-                              statSha256=network.digest(raw),privilegedPtraceAccess='modeled')
+                              statSha256=network.digest(raw),privilegedPtraceAccess='modeled',
+                              originalCreator=os.getpid(),holderParent=int(fields[1]),
+                              creatorHasNotReaped=holder.returncode is None)
+                assert int(fields[1])==os.getpid() and holder.returncode is None
             def serve():
                 conn=None; request=None
                 try:
@@ -689,7 +701,7 @@ def receiver(f, ledger, holder_fault=None):
                         error.add_note('input observation also failed: '+str(observation))
                     ledger.record('receiver-error',error=str(error),traceback=traceback.format_exc())
             thread=threading.Thread(target=serve,daemon=True); thread.start()
-            yield owner,errors,producer_fd,holder
+            yield owner,errors,producer_fd,invocation
             if holder_fault:
                 assert len(errors)==1 and str(errors[0])=='ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN',errors
                 assert not owner.finished and owner.finish_attempted
@@ -720,7 +732,11 @@ def receiver(f, ledger, holder_fault=None):
             else:
                 if errors: raise errors[0]
                 assert owner.finished, 'original temporary scope did not finish'
-            holder_out,holder_err=holder.communicate(timeout=3)
+            # The actual creator, not this fixture, owns the retention/reap
+            # boundary. Unknown settlement waits for the ORIGINAL 30s test plan.
+            invocation.close()
+            holder_out=bytes(invocation.buffers['holderStdout'])
+            holder_err=bytes(invocation.buffers['holderStderr'])
             assert holder.returncode==(75 if holder_fault else 0),holder_err.decode()
             handed_off=json.loads(holder_out)
             assert owner.pending is not None
@@ -728,6 +744,10 @@ def receiver(f, ledger, holder_fault=None):
             disposal={'requiredCleanupFault':holder_fault,'stderr':holder_err.decode()} if holder_fault else json.loads(holder_err)
             if not holder_fault: assert disposal['actualClientRunReturned'] and disposal['ownedDescriptorsDisposed']
             ledger.record('actual-holder-natural-exit',exit=holder.returncode,reply=handed_off,disposal=disposal)
+            with unittest.TestCase().assertRaises(ChildProcessError): os.waitpid(holder.pid,os.WNOHANG)
+            ledger.record('original-creator-reaped',pid=holder.pid,exit=holder.returncode,
+                          afterPublicSettlement=True,retentionSource='fresh_network_invocation.Invocation',
+                          uncertainDeadlineBarrier=bool(holder_fault))
             waited,status=os.waitpid(producer_pid,0); assert waited==producer_pid and status==0
             producer_pid=None
             ledger.record('natural-temporary-disposal',host=True,holder=True,holderExit=holder.returncode)
@@ -756,8 +776,9 @@ def receiver(f, ledger, holder_fault=None):
         if 'lease' in locals(): lease.close()
         if holder_channel: holder_channel.close()
         holder_server.close()
-        if holder.poll() is None: holder.kill()
-        holder_out,holder_err=holder.communicate(timeout=3)
+        invocation.close()
+        holder_out=bytes(invocation.buffers['holderStdout'])
+        holder_err=bytes(invocation.buffers['holderStderr'])
         if holder.returncode:
             ledger.record('actual-holder-failure',exit=holder.returncode,stdout=holder_out.decode(),stderr=holder_err.decode())
         os.close(fdwrite)
@@ -784,8 +805,35 @@ class NativeControl(unittest.TestCase):
                 environment={**os.environ,'NODE_PATH':os.environ.get('NODE_PATH','/home/leon/c3-anyorder-integration-20261104/node_modules')}
                 peers=contextlib.nullcontext() if not ordinary else receiver(f,ledger,holder_fault)
                 with peers as receiving:
-                    child=subprocess.Popen(['node',str(REPO/'tests/ordinaryOwnerRuntime.integration.test.js'),str(data)],
-                        cwd=REPO,env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                    if ordinary:
+                        invocation=receiving[3]
+                        original_wait=invocation.holder.wait
+                        def observed_reap(*args,**kwargs):
+                            self.assertIsNotNone(invocation.settlement.returncode)
+                            if holder_fault:
+                                self.assertGreaterEqual(time.monotonic(),invocation.end)
+                            else:
+                                self.assertTrue(receiving[0].finished)
+                                self.assertEqual(invocation.settlement.returncode,0)
+                                public=json.loads(read_noatime(Path(os.environ['C3_ORDINARY_EVIDENCE'])/ledger.name/'node-runtime.json')) if os.environ.get('C3_ORDINARY_EVIDENCE') else None
+                                if public: self.assertEqual(public['bridgeExit'],{'code':0,'signal':None})
+                            ledger.record('creator-reap-start',holderPid=invocation.holder.pid,
+                                          publicOperationExit=invocation.settlement.returncode,
+                                          ownerFinished=receiving[0].finished,
+                                          originalDeadlineExpired=time.monotonic()>=invocation.end)
+                            return original_wait(*args,**kwargs)
+                        invocation.holder.wait=observed_reap
+                        original_popen=subprocess.Popen
+                        def fixed_settlement(argv,**kwargs):
+                            assert tuple(argv)==creator.SETTLEMENT_ARGV
+                            kwargs['env']=environment
+                            return original_popen(['node',str(REPO/'tests/ordinaryOwnerRuntime.integration.test.js'),str(data)],
+                                                  cwd=REPO,**kwargs)
+                        with patch.object(subprocess,'Popen',fixed_settlement): invocation.start_settlement()
+                        child=invocation.settlement
+                    else:
+                        child=subprocess.Popen(['node',str(REPO/'tests/ordinaryOwnerRuntime.integration.test.js'),str(data)],
+                            cwd=REPO,env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                     try:
                         if holder_fault:
                             with self.assertRaises(Exception) as failure:
@@ -796,9 +844,15 @@ class NativeControl(unittest.TestCase):
                             f.held.serve_fresh_owner(listener,platform=f.platform,socket_path=f.socket)
                         listener.close()
                         f.held.complete_fresh_owner()
-                        out,err=child.communicate(timeout=8)
+                        if ordinary:
+                            if holder_fault:
+                                with self.assertRaisesRegex(network.Refusal,'PUBLIC_SETTLEMENT_UNKNOWN_RETAINED'):
+                                    invocation.finish_settlement()
+                            else: invocation.finish_settlement()
+                            out=bytes(invocation.buffers['settlementStdout']); err=bytes(invocation.buffers['settlementStderr'])
+                        else: out,err=child.communicate(timeout=8)
                         ledger.record('public-consumer',exit=child.returncode,stdout=out.decode(),stderr=err.decode())
-                        self.assertEqual(child.returncode,0,err.decode())
+                        self.assertEqual(child.returncode,75 if holder_fault else 0,err.decode())
                         result=json.loads(out)
                         commit=f.fs.read(restore.COMMIT)[0]
                         self.assertEqual(result['commitSha256'],hashlib.sha256(commit).hexdigest())
@@ -808,7 +862,7 @@ class NativeControl(unittest.TestCase):
                                          'COMMITTED_FRESH_NETWORK_OWNED' if ordinary else 'COMMITTED_FRESH_ACTIVATION_CONFIRMED')
                         self.assertEqual('networkHandoff' in json.loads(commit),ordinary)
                         if ordinary:
-                            owner,failures,hostfd,holder=receiving
+                            owner,failures,hostfd,invocation=receiving
                             if holder_fault:
                                 self.assertEqual([str(e) for e in failures],['ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN'])
                                 self.assertFalse(owner.finished)
@@ -817,7 +871,7 @@ class NativeControl(unittest.TestCase):
                                 self.assertEqual(result['networkOwnershipSha256'],network.digest(network.encode(owner.receipt)))
                                 self.assertTrue(owner.finished)
                             self.assertTrue(select.select([hostfd],[],[],0)[0])
-                            self.assertIsNotNone(holder.poll())
+                            if not holder_fault: self.assertEqual(invocation.holder.returncode,0)
                         ledger.record('same-original-commit',sha256=hashlib.sha256(commit).hexdigest(),executions=f.count())
                     except BaseException as primary:
                         if ordinary:
@@ -831,8 +885,12 @@ class NativeControl(unittest.TestCase):
                         listener.close()
                         if holder_fault and getattr(f.held,'network',None) is not None:
                             f.held.network.close(); f.held.network=None  # fixture transport disposal, never grant release
-                        if child.poll() is None: child.kill()
-                        out,err=child.communicate(timeout=5)
+                        if ordinary:
+                            invocation.close()
+                            out=bytes(invocation.buffers['settlementStdout']); err=bytes(invocation.buffers['settlementStderr'])
+                        else:
+                            if child.poll() is None: child.kill()
+                            out,err=child.communicate(timeout=5)
                         if child.returncode: ledger.record('consumer-failure',exit=child.returncode,stdout=out.decode(),stderr=err.decode())
         except BaseException as caught:
             error=caught; raise

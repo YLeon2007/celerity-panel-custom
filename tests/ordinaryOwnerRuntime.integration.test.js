@@ -129,7 +129,9 @@ async function main(file) {
                 ownersRetained: true, replayRefused: true, bridgeExit: exit };
             if (description.evidenceDirectory) fs.writeFileSync(path.join(description.evidenceDirectory, 'public-unknown.json'),
                 JSON.stringify({ ...result, replies, requests }, null, 2)+'\n', { flag: 'wx', mode: 0o600 });
-            process.stdout.write(JSON.stringify(result)+'\n'); return;
+            // Match the fixed operational entry's unknown/nonzero boundary;
+            // exit zero would falsely authorize the original creator to reap.
+            process.stdout.write(JSON.stringify(result)+'\n'); process.exitCode = 75; return;
         }
         const result = await service.freshHandback(config.plan);
         assert.equal(result.code, description.ordinary ? 'COMMITTED_FRESH_NETWORK_OWNED' : 'COMMITTED_FRESH_ACTIVATION_CONFIRMED');
