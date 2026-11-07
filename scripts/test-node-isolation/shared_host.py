@@ -493,6 +493,9 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
     successor = None
     network_binding = None
     coordinator_binding = None
+    old_returned = False
+    old_node_sha = None
+    return_end = None
     primary = None
 
     def interrupted(*args):
@@ -505,9 +508,21 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
         verify_record(read_record(directory, m), p, kernel, m)
 
     def return_check():
+        if return_end is not None:
+            m.need(m.time.monotonic() < return_end, 'FINITE_NETWORK_RETURN_EXPIRED')
         check_identity(identity, p, directory, m)
         host.guard_check(recovery, session)
         m.need(not select.select([infd], [], [], 0)[0], 'HOST_CONTROLLER_CHANNEL_LOST')
+
+    def begin_network_return():
+        nonlocal return_end
+        m.need(return_end is None, 'NETWORK_RETURN_REPLAY_REFUSED')
+        network_raw = m.secure_file('/etc/c3-test-fresh-network.json')
+        network_plan = m.decode_json(network_raw)
+        m.need(m.digest(network_raw) == p['hostHold']['networkPlanSha256'],
+               'ACCEPTED_NETWORK_PLAN_REQUIRED')
+        return_end = m.time.monotonic()+min(120,max(0,network_plan['deadline']-m.time.time()))
+        return_check()
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, interrupted)
@@ -524,7 +539,7 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                 print(m.json.dumps({'hostHoldReady': True, 'owner': fence.owner,
                                    'notApplicationAuthority': True}), flush=True)
             while True:
-                if armed: check()
+                if armed and not old_returned: check()
                 else: return_check()
                 ready, _, _ = select.select([server, infd], [], [], .2)
                 if infd in ready:
@@ -543,7 +558,7 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     else:
                         frame = m.decode_json(request)
                         if type(frame) is dict and frame.get('command') in ('network-check','stage-network-successor',
-                                'surrender-network-successor','finish-network-successor'):
+                                'surrender-network-successor','finish-network-successor','restore-network-old'):
                             op = frame['command']
                             fields = {'nonce','command','owner','planHash','network'}
                             fields |= {'coordinator'} if op == 'stage-network-successor' else set()
@@ -554,6 +569,31 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                             association = network_peer(conn, p, m, frame['network'])
                             if network_binding is None: network_binding = association
                             m.need(association == network_binding, 'NETWORK_SUCCESSOR_REPLACED')
+                            if op == 'restore-network-old':
+                                m.need(armed and successor is None and coordinator_binding is None and
+                                       not fence.passive and not fence.escrow and 'candidateClosure' not in fence.expected,
+                                       'KNOWN_OLD_PRECAPTURE_ONLY')
+                                engine = m.Engine(directory,p,host,validator=lambda value:validate_plan(value,m))
+                                engine.assert_before_capture()
+                                state = engine.read()
+                                if old_returned:
+                                    m.need(return_end is not None and (state is None and old_node_sha is None or
+                                           state is not None and state['phase'] == 'early-returned' and
+                                           m.digest(m.secure_file(pathlib.Path(directory)/'journal.json')) == old_node_sha),
+                                           'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+                                else:
+                                    m.need(isolation_peer is None and state is None, 'EARLY_RETURN_LIVE_OWNER_REQUIRED')
+                                    begin_network_return()
+                                    fence.restore(identity['owner'],checkpoint=return_check)
+                                    old_returned = True
+                                return_check()
+                                m.need(fence.phase == 'restored' and not fence.frozen and fence.expected == fence.original,
+                                       'HOST_RETURN_OUTCOME_UNKNOWN')
+                                kernel.verify(fence.expected,[],False)
+                                conn.sendall((m.json.dumps({'nonce':frame['nonce'],'identity':identity,'returnState':'OLD',
+                                    'recordSha256':m.digest(m.secure_file(pathlib.Path(directory)/'host/hold.json'))})+'\n').encode())
+                                return
+                            m.need(not old_returned,'KNOWN_OLD_AWAITING_NETWORK_ABANDON')
                             if not armed:
                                 m.need(op == 'network-check', 'PREARM_RENDEZVOUS_REQUIRED')
                                 fence.arm(); armed = True; check()
@@ -627,11 +667,17 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                                        'EARLY_RETURN_LIVE_OWNER_REQUIRED')
                             # All checks precede the first enable. Never adopt a
                             # disk Fence, capture state or terminal ownership COMMIT.
+                            if network_selected:
+                                m.need(successor is None and network_binding is not None, 'KNOWN_OLD_PRECAPTURE_ONLY')
+                                begin_network_return()
                             fence.restore(identity['owner'], checkpoint=return_check)
+                            old_returned = network_selected
+                            old_node_sha = frame['nodeReturnSha256']
                             raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
                             conn.sendall((m.json.dumps({'nonce': nonce, 'identity': identity,
                                                       'recordSha256': m.digest(raw), 'returnState': 'OLD'}) + '\n').encode())
-                            return
+                            if not network_selected: return
+                            continue
                     if command == 'close-candidate':
                         fence.close_candidate(identity['owner'])
                         check()

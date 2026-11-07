@@ -8,8 +8,8 @@ import stat
 import sys
 
 PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': '0565e205fbd8bbf5c3da9a972d43ff7ecb934f1777168abe207781fb027af1cd',
-    '/usr/local/libexec/c3-test-fresh-network-control.py': '71377f830691d5c1f3b19231c59c108458a5518992d063c524d41b81877deaff',
+    '/usr/local/libexec/c3-test-fresh-network.py': 'faa21dcfb3ca5f8d339ce8934893dc0d1b90790ee09d208b2e305b627bc31518',
+    '/usr/local/libexec/c3-test-fresh-network-control.py': '0b20bafdd74ee7f92957bd8e2c6b0d853375c876afb66f41235ef38de3a0721c',
 }
 
 

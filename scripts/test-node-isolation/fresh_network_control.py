@@ -156,34 +156,78 @@ class PID1Store:
             self.barrier(); current.remove(binding); self.verify(current)
         return current
 
-    def inherited(self, bindings):
-        """Own all PID1-inherited descriptors before checking names/grant semantics."""
-        count_raw = os.environ.get('LISTEN_FDS','')
-        self.m.need(count_raw.isdecimal() and len(count_raw) <= 5 and int(count_raw) <= 16384,
-                    'FDSTORE_INHERITANCE_REQUIRED')
-        owned = list(range(3, 3+int(count_raw)))
+    def inherited(self, bindings, inherited=None):
+        rights = inherited if inherited is not None else InheritedRights(self.m)
         try:
-            for fd in owned: os.set_inheritable(fd, False)
-            self.m.need(os.environ.get('LISTEN_PID') == str(os.getpid()), 'EXACT_LISTEN_PID_REQUIRED')
-            names = os.environ.get('LISTEN_FDNAMES','').split(':')
-            self.m.need(len(names) == len(owned) == len(bindings) and len(set(names)) == len(names) and
-                        set(names) == {b['name'] for b in bindings}, 'FDSTORE_FOREIGN_OR_MISSING_RIGHTS')
-            by_name = dict(zip(names, owned))
-            for binding in bindings:
-                fd = by_name[binding['name']]; row = binding['capability']; s = os.fstat(fd)
-                import fcntl
-                self.m.need((s.st_dev,s.st_ino,s.st_mode,s.st_rdev,fcntl.fcntl(fd,fcntl.F_GETFL),
-                             os.readlink('/proc/self/fd/'+str(fd))) ==
-                            (row['dev'],row['ino'],row['mode'],row['rdev'],row['flags'],row['path']),
-                            'FDSTORE_ORIGINAL_CAPABILITY_LOST')
+            fds = rights.match(bindings)
             self.verify(bindings)
-            return [by_name[b['name']] for b in bindings]
+            if inherited is None: rights.release()
+            return fds
         except BaseException as primary:
-            for fd in owned:
-                try: os.close(fd)
-                except BaseException as error:
-                    primary.cleanup_errors = (*getattr(primary,'cleanup_errors',()), error)
+            rights.close(primary)
             raise
+
+
+class InheritedRights:
+    """Acquire the entire installed range before any grant/source/manager read."""
+    def __init__(self, m):
+        self.m, self.owned = m, []
+        count = os.environ.get('LISTEN_FDS','')
+        m.need(count.isascii() and count.isdecimal() and len(count) <= 5 and int(count) <= 16384,
+               'FDSTORE_INHERITANCE_REQUIRED')
+        self.owned = list(range(3,3+int(count)))
+        try:
+            for fd in self.owned: os.set_inheritable(fd,False)
+            m.need(os.environ.get('LISTEN_PID') == str(os.getpid()),'EXACT_LISTEN_PID_REQUIRED')
+            self.names = os.environ.get('LISTEN_FDNAMES','').split(':') if self.owned else []
+        except BaseException as primary:
+            self.close(primary); raise
+
+    def match(self, bindings):
+        import fcntl
+        m = self.m
+        m.need(len(self.names) == len(self.owned) == len(bindings) and len(set(self.names)) == len(self.names) and
+               set(self.names) == {b['name'] for b in bindings},'FDSTORE_FOREIGN_OR_MISSING_RIGHTS')
+        by_name = dict(zip(self.names,self.owned))
+        for binding in bindings:
+            fd = by_name[binding['name']]; row = binding['capability']; s = os.fstat(fd)
+            m.need((s.st_dev,s.st_ino,s.st_mode,s.st_rdev,fcntl.fcntl(fd,fcntl.F_GETFL),os.readlink('/proc/self/fd/'+str(fd))) ==
+                   (row['dev'],row['ino'],row['mode'],row['rdev'],row['flags'],row['path']),
+                   'FDSTORE_ORIGINAL_CAPABILITY_LOST')
+        return [by_name[b['name']] for b in bindings]
+
+    def release(self):
+        self.owned = []
+
+    def close(self, primary=None):
+        owned,self.owned = self.owned,[]  # retire numbers before the single close attempt
+        errors = []
+        for fd in owned:
+            try: os.close(fd)
+            except BaseException as error: errors.append(error)
+        if errors:
+            if primary is not None:
+                primary.cleanup_errors = (*getattr(primary,'cleanup_errors',()),*errors)
+            else: raise errors[0]
+
+
+def cleanup_bindings(bindings):
+    return [b for b in bindings if b['capability']['role'] == 'network.ns.fresh' or
+            b['capability']['role'].startswith('serving.')]
+
+
+def reconcile_cleanup(m, store, pending):
+    """Read-only classification; partial/foreign Dump is never a retry permit."""
+    m.keys(pending,'before after remove')
+    before,after,remove = (pending[k] for k in ('before','after','remove'))
+    m.need(m.encode(remove) == m.encode(cleanup_bindings(before)) and remove and
+           m.encode(after) == m.encode([b for b in before if b not in remove]),'EXACT_PENDING_CLEANUP_REQUIRED')
+    try:
+        store.verify(before)
+        return before
+    except m.Refusal:
+        store.verify(after)
+        return after
 
 
 def fixed_module(m, path, pin):
@@ -232,7 +276,7 @@ class HostFenceChannel:
                m.identity(self.identity['socket']) == self.socket_identity and
                m.trusted_read(ISOLATION_PLAN) == self.plan_raw, 'ORIGINAL_HOST_PRODUCER_LOST')
         with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as conn:
-            conn.settimeout(min(3, max(.001,self.p['deadline']-time.time())))
+            conn.settimeout(min(120 if op == 'restore-network-old' else 3, max(.001,self.p['deadline']-time.time())))
             conn.connect(self.identity['socket'])
             pid,uid,gid = struct.unpack('3i',conn.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
             m.need((pid,uid,gid) == (self.identity['pid'],0,0), 'ORIGINAL_HOST_PEER_REQUIRED')
@@ -247,9 +291,16 @@ class HostFenceChannel:
             while not raw.endswith(b'\n') and len(raw) <= 8192:
                 part = conn.recv(8193-len(raw)); m.need(part,'HOST_SUCCESSION_REPLY_LOST'); raw += part
             value = m.decode(raw)
-            expected = {'nonce','identity','recordSha256'} | ({'transcriptSha256'} if op == 'surrender-network-successor' else set())
+            expected = {'nonce','identity','recordSha256'} | ({'transcriptSha256'} if op == 'surrender-network-successor' else
+                       {'returnState'} if op == 'restore-network-old' else set())
+            record_raw = m.trusted_read(HOST_STATE+'/host/hold.json')
             m.need(set(value) == expected and value['nonce'] == nonce and value['identity'] == self.identity and
-                   m.digest(m.trusted_read(HOST_STATE+'/host/hold.json')) == value['recordSha256'], 'HOST_SUCCESSION_REPLY_DRIFT')
+                   m.digest(record_raw) == value['recordSha256'], 'HOST_SUCCESSION_REPLY_DRIFT')
+            if op == 'restore-network-old':
+                original = self.plan['hostHold']['expected']
+                m.need(value['returnState'] == 'OLD' and m.decode(record_raw) == {
+                    'phase':'restored','owner':self.identity['owner'],'pending':None,'originalExpected':original,
+                    'expected':original,'frozen':[],'dead':False}, 'HOST_RETURN_OUTCOME_UNKNOWN')
             self.lease.check()
             return value
 
@@ -327,88 +378,148 @@ class OwnerRuntime:
     def __init__(self,m,controller,lease,host,store):
         self.m,self.c,self.lease,self.host,self.store = m,controller,lease,host,store
         self.offer = self.fence = self.preparation = self.receipt = None
-        self.bindings = []; self.pending = None; self.coordinator = None
+        self.bindings = []; self.accepted_bindings = None; self.pending_cleanup = None
+        self.pending = None; self.coordinator = None
         self.coordinator_pidfd = None; self.finished = False
         self.terminal_deadline = None
 
     @classmethod
-    def recover(cls,m,p,raw,store):
+    def recover(cls,m,p,raw,store,inherited=None):
         """Read-only same-generation reconstruction ONLY from PID1 inheritance."""
+        rights = inherited if inherited is not None else InheritedRights(m)
+        try:
+            result = cls._recover(m,p,raw,store,rights)
+            rights.release()  # exact offer/kernel/journal now own the descriptors
+            return result
+        except BaseException as primary:
+            rights.close(primary)
+            raise
+
+    @classmethod
+    def _recover(cls,m,p,raw,store,inherited):
         root = Path(m.STATE)/p['generation']
         state = m.decode(m.trusted_read(str(root/'ordinary-state.json')))
         receipt = m.decode(m.trusted_read(str(root/'ordinary-owned.json')))
-        m.need(state['version'] == 1 and state['phase'] in ('ordinary-owned','parked-serving') and
+        residual = state['phase'] in ('network-removed-host-held','network-cleanup-pending')
+        m.need(state['version'] == 1 and state['phase'] in ('ordinary-owned','parked-serving',
+               'network-removed-host-held','network-cleanup-pending') and
                state['receiptSha256'] == m.digest(m.encode(receipt)) and receipt['authorityPhase'] == 'ordinary-owned' and
                receipt['networkPlanSha256'] == m.digest(raw) and receipt['generation'] == p['generation'] and
                receipt['boot'] == p['boot'], 'EXACT_ACCEPTED_RECOVERY_GRANT_REQUIRED')
-        bindings = state['bindings']
-        m.need(m.digest(m.encode(bindings)) == receipt['acceptedFdStoreManifestSha256'], 'RECOVERY_CLOSED_MANIFEST_REQUIRED')
-        fds = store.inherited(bindings)  # all ownership precedes capability interpretation
+        accepted = state.get('acceptedBindings',state['bindings'])
+        m.need(m.digest(m.encode(accepted)) == receipt['acceptedFdStoreManifestSha256'], 'RECOVERY_CLOSED_MANIFEST_REQUIRED')
+        pending = state.get('pendingCleanup')
+        if residual:
+            after = [b for b in accepted if b not in cleanup_bindings(accepted)]
+            if state['phase'] == 'network-cleanup-pending':
+                m.need(pending is not None and m.encode(state['bindings']) == m.encode(accepted) and
+                       m.encode(pending['before']) == m.encode(accepted) and
+                       m.encode(pending['after']) == m.encode(after), 'EXACT_PENDING_CLEANUP_REQUIRED')
+                bindings = reconcile_cleanup(m,store,pending)
+            else:
+                m.need(pending is None and m.encode(state['bindings']) == m.encode(after), 'EXACT_RESIDUAL_MANIFEST_REQUIRED')
+                bindings = after
+        else:
+            m.need(pending is None and m.encode(state['bindings']) == m.encode(accepted), 'RECOVERY_CLOSED_MANIFEST_REQUIRED')
+            bindings = accepted
+        fds = store.inherited(bindings,inherited)
         by_role = {b['capability']['role']:fd for b,fd in zip(bindings,fds)}
-        owned = list(fds)
+        shared_raw = m.trusted_read(ISOLATION_PLAN); shared_plan = m.decode(shared_raw)
+        m.need(m.digest(shared_raw) == receipt['isolationPlanSha256'] and
+               shared_plan['hostHold']['networkPlanSha256'] == m.digest(raw), 'RECOVERY_INPUT_DRIFT')
+        freezer = fixed_module(m,'/usr/local/libexec/c3-panel-host-freezer.py',receipt['hostFence']['freezerSha256'])
+        original = state['hostOffer']; host_rows = original['manifest']
+        offer = freezer.LiveFenceOffer(original['state'],host_rows,[by_role[r['role']] for r in host_rows],received=True)
+        m.need(offer.sha256 == receipt['hostFence']['liveOfferSha256'], 'RECOVERY_ORIGINAL_OFFER_REQUIRED')
+        kernel = freezer.LinuxKernel(); kernel.barrier = freezer.SystemdRelaunchBarrier()
+        fence = freezer.Fence.accept_live(offer,kernel)
+        fence.consume_live(receipt['commitSha256'],receipt['hostFenceHandoffTranscriptSha256'])
+        journal = object.__new__(m.Journal); journal.fd = by_role['network.journal']; journal.path = root
+        s = os.fstat(journal.fd); journal.identity = (s.st_dev,s.st_ino); journal.counter = state['counter']
+        m.need(m.identity(root) == [s.st_dev,s.st_ino] and
+               not any(name.endswith('.next') for name in os.listdir(journal.fd)), 'RECOVERY_PENDING_IO_RETAINED')
+        numbered = sorted(name for name in os.listdir(journal.fd) if len(name) == 11 and name[:6].isdigit() and name.endswith('.json'))
+        m.need(numbered == ['%06d.json'%i for i in range(journal.counter)], 'RECOVERY_JOURNAL_OUTCOME_UNKNOWN')
+        k = object.__new__(m.Linux); snapshot = state['network']; k.p = p
+        k.fds = {r.removeprefix('network.ns.'):fd for r,fd in by_role.items()
+                 if r.startswith('network.ns.') and (not residual or r != 'network.ns.fresh')}
+        k.pidfds = {r.removeprefix('network.pid.'):fd for r,fd in by_role.items() if r.startswith('network.pid.')}
+        k.peer_exes = {r.removeprefix('network.exe.'):fd for r,fd in by_role.items() if r.startswith('network.exe.')}
+        k.host_fd = k.fds.get('host'); k.netns_fd = k.fds.get('fresh'); k.pids = snapshot['pids']; k.peer_pins = snapshot['peerPins']
+        m.need(residual or k.host_fd is not None and k.netns_fd is not None,'RECOVERY_NETWORK_FDS_REQUIRED')
+        k.residual_only = residual
+        k.path_identity = snapshot['pathIdentity']; k.path_state = snapshot['pathState']
+        k.sealed = snapshot['sealed']; k.firewall_seal = snapshot['firewallSeal']; k.node_table_seal = snapshot['nodeTableSeal']
+        k.node_forward_seal = snapshot['nodeForwardSeal']; k.owned = {(a,b):v for a,b,v in snapshot['owned']}
+        k.loopback_links = set(snapshot['loopbackLinks']); k.target_hold = None
+        k.runtime_settings = snapshot['runtimeSettings'].encode() if snapshot['runtimeSettings'] is not None else None
+        k.verification_mode = 'succeeded-original-fence'; k.original_fence_check = fence.check
+        k.serving_live = None if residual else {'serving':snapshot['serving'],'rows':snapshot['servingRows'],
+            'fds':[by_role[r['role']] for r in snapshot['servingRows']],'freezer':freezer,'empty':False}
+        if residual:
+            m.need(k.sealed is None and k.firewall_seal is None and not k.owned and k.path_state == 'absent' and
+                   snapshot['serving'] is None and snapshot['servingRows'] == [],'RECOVERY_REMOVAL_NOT_CONFIRMED')
+        def no_temporary_authority(): m.need(False,'TEMPORARY_RECOVERY_FORBIDDEN')
+        controller = m.Controller(p,k,journal,guard=no_temporary_authority)
+        controller.end = state['originalMonotonicEnd']; controller.seq = state['sequence']; controller.baseline = state['baseline']
+        controller.phase = 'network-removed-host-held' if residual else state['phase']
+        result = cls(m,controller,None,None,store)
+        result.offer = offer; result.fence = fence; result.receipt = receipt; result.preparation = receipt
+        result.bindings = bindings; result.accepted_bindings = accepted; result.finished = True
+        controller.ordinary_authority = OrdinaryAuthority(m,controller,fence,store,bindings,receipt)
+        m.need((residual or m.digest(m.encode(result.resources())) == receipt['resourceSealSha256']) and
+               m.digest(m.encode(controller.baseline)) == receipt['baselineSha256'], 'RECOVERY_RESOURCE_SEAL_DRIFT')
+        commit_raw = m.trusted_read(HOST_STATE+'/handoff-commit.json')
+        m.need(m.digest(commit_raw) == receipt['commitSha256'] and
+               m.decode(commit_raw)['networkHandoff']['preparationSha256'] == m.digest(m.encode({
+                   key:receipt[key] for key in ('version context machine boot generation networkPlanSha256 isolationPlanSha256 '
+                   'hostPlanHash ownerUnit ownerInvocationId ownerPid ownerStart coordinator temporaryHolder holderSequence '
+                   'leaseSha256 originalDeadline originalMonotonicEnd hostFence freshNetns resourceSealSha256 baselineSha256 '
+                   'fdManifestSha256 stopConfigSha256').split()})), 'RECOVERY_SAME_COMMIT_REQUIRED')
+        result.read_ordinary()
+        if pending is not None:
+            # Only the exact pre-Dump permits named subtraction; exact post
+            # skips it. Network/resource effects are NEVER replayed here.
+            if m.encode(bindings) == m.encode(pending['before']):
+                result.bindings = store.remove(pending['remove'],bindings)
+                controller.ordinary_authority.bindings = result.bindings
+                retired = {by_role[b['capability']['role']] for b in pending['remove']}
+                inherited.owned = [fd for fd in inherited.owned if fd not in retired]
+                errors = []
+                for fd in retired:
+                    try: os.close(fd)
+                    except BaseException as error: errors.append(error)
+                m.need(not errors,'NETWORK_FD_DISPOSAL_UNKNOWN')
+            store.verify(result.bindings)
+        association = {'version':1,'grantSha256':state['receiptSha256'],'originalInvocationId':state['originalInvocationId'],
+            'newInvocationId':store.invocation,'ownerUnit':UNIT,'ownerPid':os.getpid(),'ownerStart':m.proc_start(os.getpid()),
+            'closedNames':[b['name'] for b in result.bindings],'snapshotSha256':m.digest(m.encode(result.bindings)),
+            'originalMonotonicEnd':state['originalMonotonicEnd']}
+        journal.append({'kind':'recovery-association','value':association})
+        publish(m,journal,'recovery-association.json',association,new=False)
+        result.persist_state()
+        return result
+
+    def abandon_temporary(self,request):
+        """Finite explicit pre-capture OLD return; never a post-COMMIT fallback."""
+        m,c,k = self.m,self.c,self.c.k
+        m.keys(request,'generation sequence operation')
+        m.need(not c.failed and not getattr(self,'old_return_started',False) and c.phase == 'prepared' and
+               self.pending is None and self.preparation is None and self.receipt is None and self.offer is None and
+               request == {'generation':c.p['generation'],'sequence':c.seq+1,'operation':'abandon'},
+               'KNOWN_OLD_PRECAPTURE_ONLY')
+        self.old_return_started = True  # uncertain release/ACK is not replayable
         try:
-            shared_raw = m.trusted_read(ISOLATION_PLAN); shared_plan = m.decode(shared_raw)
-            m.need(m.digest(shared_raw) == receipt['isolationPlanSha256'] and
-                   shared_plan['hostHold']['networkPlanSha256'] == m.digest(raw), 'RECOVERY_INPUT_DRIFT')
-            freezer = fixed_module(m,'/usr/local/libexec/c3-panel-host-freezer.py',receipt['hostFence']['freezerSha256'])
-            original = state['hostOffer']; host_rows = original['manifest']
-            offer = freezer.LiveFenceOffer(original['state'],host_rows,[by_role[r['role']] for r in host_rows],received=True)
-            m.need(offer.sha256 == receipt['hostFence']['liveOfferSha256'], 'RECOVERY_ORIGINAL_OFFER_REQUIRED')
-            kernel = freezer.LinuxKernel(); kernel.barrier = freezer.SystemdRelaunchBarrier()
-            fence = freezer.Fence.accept_live(offer,kernel)
-            fence.consume_live(receipt['commitSha256'],receipt['hostFenceHandoffTranscriptSha256'])
-            journal = object.__new__(m.Journal); journal.fd = by_role['network.journal']; journal.path = root
-            s = os.fstat(journal.fd); journal.identity = (s.st_dev,s.st_ino); journal.counter = state['counter']
-            m.need(m.identity(root) == [s.st_dev,s.st_ino] and
-                   not any(name.endswith('.next') for name in os.listdir(journal.fd)), 'RECOVERY_PENDING_IO_RETAINED')
-            numbered = sorted(name for name in os.listdir(journal.fd) if len(name) == 11 and name[:6].isdigit() and name.endswith('.json'))
-            m.need(numbered == ['%06d.json'%i for i in range(journal.counter)], 'RECOVERY_JOURNAL_OUTCOME_UNKNOWN')
-            k = object.__new__(m.Linux); snapshot = state['network']; k.p = p
-            k.fds = {r.removeprefix('network.ns.'):fd for r,fd in by_role.items() if r.startswith('network.ns.')}
-            k.pidfds = {r.removeprefix('network.pid.'):fd for r,fd in by_role.items() if r.startswith('network.pid.')}
-            k.peer_exes = {r.removeprefix('network.exe.'):fd for r,fd in by_role.items() if r.startswith('network.exe.')}
-            k.host_fd = k.fds['host']; k.netns_fd = k.fds['fresh']; k.pids = snapshot['pids']; k.peer_pins = snapshot['peerPins']
-            k.path_identity = snapshot['pathIdentity']; k.path_state = snapshot['pathState']
-            k.sealed = snapshot['sealed']; k.firewall_seal = snapshot['firewallSeal']; k.node_table_seal = snapshot['nodeTableSeal']
-            k.node_forward_seal = snapshot['nodeForwardSeal']; k.owned = {(a,b):v for a,b,v in snapshot['owned']}
-            k.loopback_links = set(snapshot['loopbackLinks']); k.target_hold = None
-            k.runtime_settings = snapshot['runtimeSettings'].encode() if snapshot['runtimeSettings'] is not None else None
-            k.verification_mode = 'succeeded-original-fence'; k.original_fence_check = fence.check
-            k.serving_live = {'serving':snapshot['serving'],'rows':snapshot['servingRows'],
-                'fds':[by_role[r['role']] for r in snapshot['servingRows']],'freezer':freezer,'empty':False}
-            def no_temporary_authority(): m.need(False,'TEMPORARY_RECOVERY_FORBIDDEN')
-            controller = m.Controller(p,k,journal,guard=no_temporary_authority)
-            controller.end = state['originalMonotonicEnd']; controller.seq = state['sequence']; controller.baseline = state['baseline']
-            controller.phase = 'ordinary-owned'
-            result = cls(m,controller,None,None,store)
-            result.offer = offer; result.fence = fence; result.receipt = receipt; result.preparation = receipt
-            result.bindings = bindings; result.finished = True
-            controller.ordinary_authority = OrdinaryAuthority(m,controller,fence,store,bindings,receipt)
-            m.need(m.digest(m.encode(result.resources())) == receipt['resourceSealSha256'] and
-                   m.digest(m.encode(controller.baseline)) == receipt['baselineSha256'], 'RECOVERY_RESOURCE_SEAL_DRIFT')
-            commit_raw = m.trusted_read(HOST_STATE+'/handoff-commit.json')
-            m.need(m.digest(commit_raw) == receipt['commitSha256'] and
-                   m.decode(commit_raw)['networkHandoff']['preparationSha256'] == m.digest(m.encode({
-                       key:receipt[key] for key in ('version context machine boot generation networkPlanSha256 isolationPlanSha256 '
-                       'hostPlanHash ownerUnit ownerInvocationId ownerPid ownerStart coordinator temporaryHolder holderSequence '
-                       'leaseSha256 originalDeadline originalMonotonicEnd hostFence freshNetns resourceSealSha256 baselineSha256 '
-                       'fdManifestSha256 stopConfigSha256').split()})), 'RECOVERY_SAME_COMMIT_REQUIRED')
-            result.read_ordinary()
-            association = {'version':1,'grantSha256':state['receiptSha256'],'originalInvocationId':state['originalInvocationId'],
-                'newInvocationId':store.invocation,'ownerUnit':UNIT,'ownerPid':os.getpid(),'ownerStart':m.proc_start(os.getpid()),
-                'closedNames':[b['name'] for b in bindings],'snapshotSha256':m.digest(m.encode(bindings)),
-                'originalMonotonicEnd':state['originalMonotonicEnd']}
-            journal.append({'kind':'recovery-association','value':association})
-            publish(m,journal,'recovery-association.json',association,new=False)
-            result.persist_state()
-            owned = []  # ownership now distributed to exact kernel/offer/journal owners
-            return result
-        finally:
-            errors=[]
-            for fd in owned:
-                try: os.close(fd)
-                except BaseException as error: errors.append(error)
-            if errors: raise errors[0]
+            self.lease.check()
+            self.host.request('restore-network-old')  # authenticated original holder/Fence roundtrip
+            # OLD has been confirmed. Do not call the held-Fence checker again.
+            c.guard = self.lease.check
+            k.leave_fence_rendezvous()
+            c.live()
+            return c.command(request)
+        except BaseException:
+            c.failed = True; c.phase = 'unknown-retained'
+            raise
 
     def park_holder(self, request):
         m,c = self.m,self.c
@@ -531,7 +642,7 @@ class OwnerRuntime:
         self.lease.check()
         receipt_sha = publish(m,c.j,'ordinary-owned.json',receipt)
         # A visible receipt after failed publication is NOT a successful grant.
-        self.receipt = receipt; c.phase = 'ordinary-owned'
+        self.receipt = receipt; self.accepted_bindings = list(self.bindings); c.phase = 'ordinary-owned'
         c.ordinary_authority = OrdinaryAuthority(m,c,self.fence,self.store,self.bindings,receipt)
         k.verification_mode = 'succeeded-original-fence'; k.original_fence_check = self.fence.check
         self.persist_state()
@@ -556,10 +667,18 @@ class OwnerRuntime:
         return {'commitSha256':self.receipt['commitSha256'],'networkOwnershipSha256':m.digest(m.encode(self.receipt))}
 
     def stop(self):
+        try:
+            return self._stop()
+        except BaseException:
+            self.c.failed = True; self.c.phase = 'unknown-retained'
+            raise
+
+    def _stop(self):
         """No app kill, no OLD return. Proven EMPTY alone permits exact removal."""
         m,c,k = self.m,self.c,self.c.k
         c.stop_deadline = time.monotonic()+25
-        m.need(self.receipt is not None, 'STOP_WITHOUT_ACCEPTED_GRANT_RETAINED')
+        m.need(self.receipt is not None and not c.failed and c.phase in
+               ('ordinary-owned','parked-serving','network-removed-host-held'), 'STOP_WITHOUT_ACCEPTED_GRANT_RETAINED')
         if c.phase == 'network-removed-host-held':
             self.fence.check(); self.store.verify(self.bindings)
             return {'status':'NETWORK_REMOVED_HOST_HOLDS_RETAINED'}
@@ -585,8 +704,13 @@ class OwnerRuntime:
         k.stopped_probe()
         c.effect('remove-owned-ordinary-network',lambda:k.remove(c.baseline,ordinary=True))
         # Named subtraction retains every original host Fence capability.
-        remove = [b for b in self.bindings if b['capability']['role'].startswith(('network.ns.fresh','serving.'))]
+        remove = cleanup_bindings(self.bindings)
         c.j.append({'kind':'intent','effect':'fdstore-network-subtraction','names':[b['name'] for b in remove]})
+        self.pending_cleanup = {'before':list(self.bindings),'after':[b for b in self.bindings if b not in remove],
+                                'remove':remove}
+        k.residual_only = True; k.sealed = None; k.firewall_seal = None
+        c.phase = 'network-cleanup-pending'
+        self.persist_state()  # durable exact pre/post endpoints BEFORE the first remove
         self.bindings = self.store.remove(remove,self.bindings)
         c.ordinary_authority.bindings = self.bindings
         # Retire every own fresh namespace and serving duplicate before one close.
@@ -598,11 +722,11 @@ class OwnerRuntime:
             except BaseException as error: errors.append(error)
         m.need(not errors,'NETWORK_FD_DISPOSAL_UNKNOWN')
         k.serving_live = None; k.sealed = None; k.firewall_seal = None
+        self.pending_cleanup = None
         c.phase = 'network-removed-host-held'
         self.fence.check(); self.store.verify(self.bindings)
-        # Keep a terminal residual state, never replay deletion on restart.
-        publish(m,c.j,'ordinary-state.json',{'version':1,'phase':c.phase,'bindings':self.bindings,
-                'receiptSha256':m.digest(m.encode(self.receipt))},new=False)
+        # Full residual checkpoint retains the exact original offer and grant.
+        self.persist_state()
         return {'status':'NETWORK_REMOVED_HOST_HOLDS_RETAINED'}
 
     def finish_temporary_scope(self,holder):
@@ -628,13 +752,15 @@ class OwnerRuntime:
     def persist_state(self):
         k,c = self.c.k,self.c
         state = {'version':1,'receiptSha256':self.m.digest(self.m.encode(self.receipt)),
-            'phase':c.phase,'bindings':self.bindings,'hostOffer':{'state':self.offer.state,'manifest':self.offer.rows},
+            'phase':c.phase,'bindings':self.bindings,'acceptedBindings':self.accepted_bindings or self.bindings,
+            'pendingCleanup':self.pending_cleanup,'hostOffer':{'state':self.offer.state,'manifest':self.offer.rows},
             'network':{'pids':k.pids,'peerPins':k.peer_pins,'sealed':k.sealed,'firewallSeal':k.firewall_seal,
              'nodeTableSeal':getattr(k,'node_table_seal',None),'nodeForwardSeal':getattr(k,'node_forward_seal',[]),
              'owned':[[a,b,v] for (a,b),v in sorted(k.owned.items())],'pathIdentity':k.path_identity,
              'pathState':k.path_state,'loopbackLinks':sorted(getattr(k,'loopback_links',[])),
              'runtimeSettings':getattr(k,'runtime_settings',None).decode() if getattr(k,'runtime_settings',None) is not None else None,
-             'serving':k.serving_live['serving'],'servingRows':k.serving_live['rows']},
+             'serving':k.serving_live['serving'] if k.serving_live is not None and not getattr(k,'residual_only',False) else None,
+             'servingRows':k.serving_live['rows'] if k.serving_live is not None and not getattr(k,'residual_only',False) else []},
              'baseline':c.baseline,'sequence':c.seq,'counter':c.j.counter,'originalMonotonicEnd':c.end,
              'originalInvocationId':self.preparation['ownerInvocationId']}
         publish(self.m,c.j,'ordinary-state.json',state,new=False)
@@ -835,7 +961,18 @@ def _listener(m,path):
         listener.close(); raise
 
 
-def run_ordinary(m,p,raw):
+def run_ordinary(m,p,raw,inherited=None):
+    rights = inherited if inherited is not None else (InheritedRights(m) if os.environ.get('LISTEN_FDS') else None)
+    try:
+        return _run_ordinary(m,p,raw,rights)
+    except BaseException as primary:
+        if rights is not None: rights.close(primary)
+        raise
+    finally:
+        if rights is not None: rights.close()
+
+
+def _run_ordinary(m,p,raw,inherited):
     """The existing Type=exec unit remains main and owns every ordinary check."""
     import signal
     store = PID1Store(m,p['generation'])  # active existing anchor before escrow or acceptance
@@ -845,8 +982,8 @@ def run_ordinary(m,p,raw):
     previous = {sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT)}
     for sig in previous: signal.signal(sig,lambda *_:stopping.__setitem__(0,True))
     try:
-        if os.environ.get('LISTEN_FDS'):
-            owner = OwnerRuntime.recover(m,p,raw,store)
+        if inherited is not None:
+            owner = OwnerRuntime.recover(m,p,raw,store,inherited)
             controller,kernel,journal = owner.c,owner.c.k,owner.c.j
         else:
             store.verify([])
@@ -862,7 +999,9 @@ def run_ordinary(m,p,raw):
             kernel.enter_fence_rendezvous(host.check)
             controller.guard = TemporaryAuthority(lease,host).check
             send(holder,initial,m)
-        terminal_server = _listener(m,TERMINAL)
+        # A reconstructed owner has no original temporary caller to serve.
+        # Do not adopt/unlink stale sockets or reopen a terminal channel.
+        if inherited is None: terminal_server = _listener(m,TERMINAL)
         parked = False
         while True:
             if stopping[0]:
@@ -887,7 +1026,7 @@ def run_ordinary(m,p,raw):
                             if request.get('operation') == 'handoff': owner.park_holder(request)
                             else:
                                 m.need(request.get('operation') in ('observe','abandon'),'TERMINAL_OWNS_FRESH_CUTOVER')
-                                result = controller.command(request)
+                                result = owner.abandon_temporary(request) if request['operation'] == 'abandon' else controller.command(request)
                                 send(holder,result,m)
                                 if controller.phase == 'abandoned':
                                     unlink_owned_control(m,controller,m.identity(m.SOCKET))
@@ -895,6 +1034,8 @@ def run_ordinary(m,p,raw):
                     if controller.phase == 'new': continue
                 else:
                     owner.read_ordinary()
+                    if terminal_server is None:
+                        time.sleep(.2); continue
                 if terminal_peer is None:
                     if not select.select([terminal_server],[],[],.1)[0]: continue
                     terminal_peer,_ = terminal_server.accept(); terminal_peer.settimeout(3)
@@ -936,6 +1077,17 @@ def run_ordinary(m,p,raw):
 
 
 def run(m):
+    rights = InheritedRights(m) if os.environ.get('LISTEN_FDS') else None
+    try:
+        return _run(m,rights)
+    except BaseException as primary:
+        if rights is not None: rights.close(primary)
+        raise
+    finally:
+        if rights is not None: rights.close()
+
+
+def _run(m,inherited):
     m.need(os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 0,
            'ROOT_ONLY_FIXED_NETWORK_ENTRY')
     m.need(m.identity('/proc/self/ns/mnt') == m.identity('/proc/1/ns/mnt') and
@@ -943,7 +1095,8 @@ def run(m):
     raw = m.trusted_read(m.INPUT)
     p = m.validate_plan(m.decode(raw))
     if 'ordinaryOwner' in p:
-        return run_ordinary(m,p,raw)
+        return run_ordinary(m,p,raw,inherited)
+    m.need(inherited is None,'LEGACY_INHERITANCE_REFUSED')
     lease = Lease(m, p, raw)
     kernel = journal = listener = None
     socket_identity = None

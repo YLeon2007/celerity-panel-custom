@@ -856,6 +856,16 @@ class Linux:
         self.verification_mode = 'original-fence-held'
         self.check()
 
+    def leave_fence_rendezvous(self):
+        """Internal: caller has just confirmed original live producer's OLD ACK."""
+        need(self.verification_mode == 'original-fence-held', 'HELD_PRECAPTURE_RETURN_REQUIRED')
+        self.verification_mode = 'docker-live'
+        self.original_fence_check = None
+        try: self.check()  # fresh daemon + original exact peers before any removal
+        except BaseException:
+            self.verification_mode = 'return-unknown'
+            raise
+
     def check_peer(self, role):
         if getattr(self, 'verification_mode', 'docker-live') == 'docker-live':
             current = self.inspect(role)
@@ -876,6 +886,11 @@ class Linux:
               else current['netns'] != self.p['hostNetns']), 'PEER_NAMESPACE_DRIFT')
 
     def check(self):
+        if getattr(self,'residual_only',False):
+            need(self.verification_mode == 'succeeded-original-fence' and callable(self.original_fence_check),
+                 'RESIDUAL_ORIGINAL_FENCE_REQUIRED')
+            self.original_fence_check()
+            return
         self.check_host()
         self.check_targets()
 
@@ -1815,6 +1830,7 @@ class Controller:
             raise
 
     def effect(self, label, fn):
+        need(not getattr(self.k,'residual_only',False),'RESIDUAL_NO_RESOURCE_REPLAY')
         self.live()
         # Poison before journal IO as well as dispatch; uncertain intent is not replayable.
         previous = self.phase

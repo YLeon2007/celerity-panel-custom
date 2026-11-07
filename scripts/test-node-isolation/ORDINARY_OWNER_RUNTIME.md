@@ -45,27 +45,42 @@ The anchor must remain active while any owned or unknown store entries remain.
 No reset-failed, automatic restart, store clean or administrative fallback is
 part of this implementation.
 
-## Verified scope and remaining finish-only work
+## Runtime finish: verified local scope
 
-Focused evidence exercises real files, journal flock/OFD sharing, AF_UNIX,
-SCM_RIGHTS, pidfds, real legacy Coordinator/prepared supervisor/bridge consumers
-and current fixed loaders. Cgroup/netns/Docker/PID1 facts are explicitly modeled;
-no physical source acceptance is claimed. The joined ordinary path has **not**
-yet been exercised from its genuine producer through the same Coordinator.
+- The control entry takes inherited PID1 descriptors into close-once owned state
+  before its first plan, grant or manager read. Rejected parsing/association closes only those
+  owned local numbers, preserving the primary error and PID1's retained copies.
+- Stop writes a full residual checkpoint retaining the original grant, accepted
+  full manifest and original live host offer. Residual restart checks only that
+  original Fence/OFD plus exact PID1 custody; it neither needs a fresh namespace,
+  serving process, Docker RPC, holder nor the old temporary sockets/deadline.
+- A durable `network-cleanup-pending` snapshot precedes the first named PID1
+  subtraction. Restart accepts only the exact full pre-Dump or exact residual
+  post-Dump: pre completes only the proven-unperformed named subtraction, post
+  skips it. Partial/foreign Dump, incomplete journal or other unknown state
+  refuses. Network/resource removal is never replayed. EMPTY and exact stopped
+  Caddy config plus public 503 are still required before initial cleanup.
+- Explicit holder abandon before preparation/capture/COMMIT authenticates the
+  original network unit to the still-live original host producer. A virgin host
+  may restore immediately; a partial node must first complete its existing
+  same-live-engine `abort-return`. Its host waits finitely for the original
+  network consumer. Only the authenticated exact restored OLD reply permits
+  switching back to fresh Docker-live checks and then holder resource abandon.
+  Lost restoration ACK, changed peer, downstream/candidate work or failed Docker
+  readback is unknown/nonreplayable, never a post-COMMIT OLD fallback. The bound
+  is the original network deadline and at most 120 seconds; no implicit thaw.
 
-Finish-only ownership split:
+`test_ordinary_owner_runtime.py` exercises real journal/OFD sharing, inherited
+FD disposal, pidfds, AF_UNIX framing, original live `Fence.restore`, the real
+host dispatcher/peer association and the existing partial-node apply/return
+consumer. Root UID/path authority, manager/cgroup/netns/Docker/HTTPS physical
+facts are explicitly modeled. Recovery state/grant snapshots are fixtures,
+not evidence of genuine producer-to-COMMIT acceptance. The first RED logs and
+focused natural-exit results are in the separately owned wave109 evidence.
+Legacy no-network selected paths and historical fixed pins remain unchanged.
 
-1. `fresh_network_control.py`, `fresh_network.py`: take inherited descriptors
-   into ownership before reading grant semantics; complete residual-only restart
-   after network removal and exact pending cleanup pre/post reconciliation.
-2. `shared_host.py`, `fresh_network_control.py`, `fresh_network.py`: close and
-   exercise authenticated finite known-OLD restoration -> Docker-live -> holder
-   abandon. Current fresh succession is not an OLD fallback.
-3. A separate new focused integration-test file can independently exercise the
-   genuine original producer -> same Coordinator -> receiving owner -> natural
-   host/holder disposal, expiry-independent checks and terminal ACK, with only
-   privileged/PID1 seams modeled. No seeded COMMIT/grant or loader substitute
-   qualifies. Existing source ownership need not overlap this test writer.
-
-These are remaining implementation/acceptance gaps, not new platform research.
-Do not describe this checkpoint as full ordinary-owner GO.
+The independently owned **new integration-test file** remains responsible for
+the genuine original producer -> same Coordinator -> receiving owner -> natural
+host/holder disposal -> terminal ACK positive, without seeded COMMIT/grant or a
+loader substitute. These local runtime tests do not claim that acceptance or
+physical/PID1 installation. No service/network/deployment action was performed.
