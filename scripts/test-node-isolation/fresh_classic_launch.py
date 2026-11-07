@@ -488,8 +488,8 @@ class Platform:
         validate(policy)
         p = Path('/proc/self')
         inv = policy['inventory']
-        need(set(inv) == {'supervisor','root','namespaces','mountinfoSha256','routesSha256',
-                         'coordinatorSha256','sourceSha256','unitSha256','fdPins','hostNamespaces'}, 'INDEPENDENT_RESOURCE_INVENTORY_REQUIRED')
+        # validate() owns the closed inventory shape and optional ordinary-plan
+        # digest. A second legacy-only key set would reject that accepted policy.
         need(os.geteuid() == os.getegid() == 65531 and not os.getgroups(), 'DEDICATED_SUPERVISOR_IDENTITY_REQUIRED')
         status = dict(line.split(':',1) for line in (p/'status').read_text().splitlines() if ':' in line)
         need(all(int(status[k],16) == 0 for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')) and

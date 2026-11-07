@@ -114,6 +114,31 @@ inventory are simulated; executable invocation and success are not. Existing
 irreversible and coordinator regression tests are also run. RED and final GREEN
 logs and hashes are recorded in the external `fresh-launch/result.json`.
 
+## Ordinary policy inventory parity
+
+`Platform.check` uses the existing `validate` contract as its single closed
+inventory-shape check: the original ten fields, plus only the optional
+`networkPlanSha256` lowercase hex64 field. Absence retains native behavior;
+presence does not select ordinary ownership on its own. The independently
+selected v2 public inputs and network COMMIT consumer still require that pin to
+match the accepted raw network plan. Unknown keys and malformed pins refuse.
+
+`test_ordinary_policy_parity.py` feeds identical canonical policy bytes through
+the unchanged public JS parser, real `Platform.check` (also through default
+`supervise` before actual listen), and the network consumer's real same-COMMIT
+and fixed-inode guards over SCM_RIGHTS. Privileged ownership, mount/namespace,
+capability and PID1 resource facts are modeled explicitly; no ordinary grant or
+physical activation is claimed. Run from this directory with repository Node
+dependencies resolvable: `python3 -B -m unittest test_ordinary_policy_parity -v`.
+
+Changed runtime installation targets are only
+`/usr/local/libexec/c3-test-fresh-classic.py` and the current hash-loader closure
+`/usr/local/libexec/c3-test-fresh-physical-observe.py`. A later bounded rebuild
+must carry the new launcher into the sealed root and applicable host helper
+set, update independently accepted file manifests, and carry the observer's
+current pin. No frozen source-pack profile/proof is repinned, and this source
+repair performs no rebuild, installation, deployment or acceptance publication.
+
 ## Controller-only accepted-netns observation
 
 This is a later **source-only** correction to the reachable `FreshLaunch._run`
