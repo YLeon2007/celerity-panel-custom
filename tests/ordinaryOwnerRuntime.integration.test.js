@@ -116,6 +116,15 @@ async function main(file) {
         assert.equal(row.settled.length, description.nodes.length);
         if (description.ordinary) assert.deepEqual(Object.keys(result).filter(k => k.endsWith('Sha256')).sort(), ['commitSha256', 'networkOwnershipSha256']);
         else assert.equal(Object.hasOwn(result, 'networkOwnershipSha256'), false);
+        if (description.evidenceDirectory) {
+            const sources = {};
+            for (const name of ['heldTestOwnerSettlement', 'heldRestorationChannel', 'topologyConfigTransfer', 'heldOwnerSettlementJournal']) {
+                const file = require.resolve('../src/services/'+name); sources[file] = sha(noatime(file));
+            }
+            const receipt = { nodePath: process.execPath, nodeVersion: process.version, nodeSha256: sha(noatime(process.execPath)),
+                mongoosePath: require.resolve('mongoose'), sources, bridgeExit: await children[0].closed, bridgeKills: children[0].kills };
+            fs.writeFileSync(path.join(description.evidenceDirectory, 'node-runtime.json'), JSON.stringify(receipt, null, 2)+'\n', { flag: 'wx', mode: 0o600 });
+        }
         process.stdout.write(JSON.stringify(result)+'\n');
     } finally {
         for (const { child, closed } of children) {

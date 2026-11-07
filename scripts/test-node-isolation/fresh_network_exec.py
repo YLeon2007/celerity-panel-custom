@@ -9,7 +9,7 @@ import sys
 
 PINS = {
     '/usr/local/libexec/c3-test-fresh-network.py': 'faa21dcfb3ca5f8d339ce8934893dc0d1b90790ee09d208b2e305b627bc31518',
-    '/usr/local/libexec/c3-test-fresh-network-control.py': '0b20bafdd74ee7f92957bd8e2c6b0d853375c876afb66f41235ef38de3a0721c',
+    '/usr/local/libexec/c3-test-fresh-network-control.py': 'e069050d35c63b2f123e0a3fe277b7a2a40071eba9c20768cba98f751115f38a',
 }
 
 

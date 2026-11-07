@@ -1,8 +1,9 @@
-# Existing TEST ordinary network owner: source checkpoint
+# Existing TEST ordinary network owner: verified source integration
 
-This checkpoint implements the selected path inside the existing freezer,
-Coordinator and `c3-test-fresh-network.service`; it is **not end-to-end ordinary
-ownership acceptance or permission to install/start it**. Legacy operation stays
+This source integration closes the local ordinary positive through the actual
+original producer/Fence, same Coordinator COMMIT, receiving owner, finite
+`fresh_network_client.run`/Holder disposal and public ownership ACK. It is **not
+physical/PID1 acceptance or permission to install/start it**. Legacy operation stays
 selected when the accepted fresh v2 root input has no `networkPlanSha256`.
 
 ## Implemented source
@@ -79,8 +80,44 @@ not evidence of genuine producer-to-COMMIT acceptance. The first RED logs and
 focused natural-exit results are in the separately owned wave109 evidence.
 Legacy no-network selected paths and historical fixed pins remain unchanged.
 
-The independently owned **new integration-test file** remains responsible for
-the genuine original producer -> same Coordinator -> receiving owner -> natural
-host/holder disposal -> terminal ACK positive, without seeded COMMIT/grant or a
-loader substitute. These local runtime tests do not claim that acceptance or
-physical/PID1 installation. No service/network/deployment action was performed.
+## Genuine local positive and exact-byte repair
+
+`test_ordinary_owner_integration.py` now joins the real `shared_host.serve_hold`
+producer, original locked Fence/OFD and SCM_RIGHTS succession, same Coordinator,
+prepared supervisor and Python HTTP witness, receiving `OwnerRuntime`, Python
+restoration bridge, and public JS initialize/adopt/freshHandback consumer. Neither
+COMMIT nor ordinary grant is seeded. The native no-network control is separate.
+
+The assembled RED reproduced `SAME_COMMIT_SERVING_BINDING_REQUIRED`: the original
+canonical fixed policy has no LF, whereas `network.encode(policy)` adds LF. The
+receiver now hashes the exact received `policy_raw` bytes. All COMMIT, nonce,
+Coordinator, plan, confirmed attempt, serving identity, ownership and fixed-inode
+guards remain unchanged; no global codec/proof/grant semantics changed. A focused
+regression rejects same-object/different-byte input and every other binding
+substitution before the fixed-input check. Only current loader/client pins were
+closed; historical source-pack pins remain unchanged.
+
+The first byte-fix positive used the inherited modeled holder and is only a
+phased checkpoint. The final positive instead launches the actual finite client
+with the unchanged checked source loader, real operator pipes, immutable Input
+pins, real lease, socket, peer PID/start, pidfds, protocol parser and
+`run`/`Holder.dispatch`/`Holder.close`. It validates the real prepared reply,
+sends literal `handoff`, and naturally emits its exact reply, disposes owned
+inputs/descriptors, sends `holder-disposed`, closes the channel and exits zero.
+The receiver waits for original host and holder pidfd death before its terminal
+ACK. Public success is followed by exact receipt readback with both temporary
+peers dead, modeled expired monotonic/wall deadlines, and temporary checks forced
+to fail if consulted. The original plan bytes are not edited or renewed.
+
+Evidence is under the separately owned
+`/home/leon/c3-anyorder-execution-20261104/test-ordinary-join-wave110/` directory;
+failed runs are retained. Source manifests, same-COMMIT/grant bindings, natural
+exit receipts and Node executable/resolution pins accompany the final runs.
+
+Privileged root/installed path/cmdline facts, PID1 FDSTORE/Dump completion,
+cgroup/freezer/netns/network/Caddy observations, independent recovery authority,
+and JS persistence/replica-set semantics remain explicit test models. The
+network receiver is driven through its actual runtime methods, not an installed
+systemd service loop. The serving process is a Python witness, not the bundled
+panel. No real Mongo atomicity, physical network/systemd, installation, deployment
+or operational approval is claimed. Shared integration is untouched.

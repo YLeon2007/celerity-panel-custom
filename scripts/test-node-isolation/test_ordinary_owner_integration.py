@@ -5,7 +5,7 @@ producer/Coordinator/receiver/bridge implementations, COMMIT, journals, flocks,
 UDS, SCM_RIGHTS, pidfds, Popen, serving HTTP and natural exits are real. No COMMIT
 or ordinary grant is inserted by this fixture; failures remain failing tests.
 
-Run native plumbing control separately from the unfinished ordinary positive:
+Run native plumbing control separately from the ordinary positive:
   python3 -B -m unittest test_ordinary_owner_integration.NativeControl -v
   python3 -B -m unittest test_ordinary_owner_integration.OrdinaryPositive -v
 Set C3_ORDINARY_EVIDENCE to a fresh owned directory to retain receipts.
@@ -73,7 +73,9 @@ def source_map():
             '/usr/local/libexec/c3-test-node-isolation': HERE/'isolation.py',
             '/usr/local/libexec/c3-test-fresh-network.py': HERE/'fresh_network.py',
             '/usr/local/libexec/c3-test-fresh-network-control.py': HERE/'fresh_network_control.py',
-            '/usr/local/libexec/c3-test-fresh-network-exec.py': HERE/'fresh_network_exec.py'}
+            '/usr/local/libexec/c3-test-fresh-network-exec.py': HERE/'fresh_network_exec.py',
+            '/usr/local/libexec/c3-test-fresh-network-client.py': HERE/'fresh_network_client.py',
+            '/usr/local/libexec/c3-test-fresh-network-client-exec.py': HERE/'fresh_network_client_exec.py'}
 
 
 class Ledger:
@@ -82,8 +84,14 @@ class Ledger:
         self.path = Path(parent)/name if parent else None
         if self.path: self.path.mkdir(parents=True, exist_ok=False)
         self.rows = []
+        paths=set(source_map().values())|{Path(__file__).resolve(),REPO/'tests/ordinaryOwnerRuntime.integration.test.js',
+            HERE/'owner_restoration_channel.py'}
+        for module in tuple(sys.modules.values()):
+            file=getattr(module,'__file__',None)
+            if isinstance(file,str) and Path(file).resolve().parent==HERE:
+                paths.add(Path(file).resolve())
         self.sources = {str(p.relative_to(REPO)): hashlib.sha256(read_noatime(p)).hexdigest()
-                        for p in source_map().values()}
+                        for p in sorted(paths)}
     def record(self, stage, **values):
         row = {'stage': stage, **values}; self.rows.append(row)
         if self.path:
@@ -165,7 +173,12 @@ class ModeledNetwork(network.Linux):
     def firewall(self): self.firewall_seal={'modeledDefaultDrop':True}
     def connect(self, role): self.owned[('fresh',role)]={'modeled':True}
     def seal(self): self.sealed={'modeledPrivateNetwork':True}
-    def observation(self): return {'modeled':True}
+    def observation(self):
+        # Topology/snapshots are privileged models, in the actual protocol shape.
+        return {'namespace':network.identity('/proc/self/ns/net'),
+                'snapshots':{role:{key:[] for key in ('links','addresses','routes','rules')}
+                             for role in ('host','fresh','caddy','mongo','redis')},
+                'configSha256':network.digest(network.encode(self.current))}
     def check_serving_live(self):
         live=self.serving_live
         if live is None: return
@@ -307,11 +320,101 @@ def js_input(fixture, path, ordinary):
     value={'ordinary':ordinary,'nodes':nodes,'inventory':fixture.outer.inventory,
            'inventorySha256':fixture.held.config['inventorySha256'],'root':str(fixture.outer.root),
            'socket':str(path),'python':sys.executable,'bridgeSource':BRIDGE,'cwd':str(HERE),
+           'evidenceDirectory':str(Path(os.environ['C3_ORDINARY_EVIDENCE'])/('ordinary' if ordinary else 'native'))
+                               if os.environ.get('C3_ORDINARY_EVIDENCE') else None,
            'bridgeSources':{str(HERE/name):hashlib.sha256(read_noatime(HERE/name)).hexdigest()
                             for name in ('coordinated_restore.py','owner_restoration_channel.py')},
            'networkPlanSha256':network.digest(network.encode(fixture.network_plan)) if ordinary else None}
     target=fixture.outer.root/'consumer.json'; target.write_text(json.dumps(value))
     return target
+
+
+def holder_process(root):
+    """Real checked client loader + run/Holder, only installed-root/host facts modeled."""
+    import fresh_network_client_exec as entry
+    root=Path(root); real_open=os.open; real_stat=os.stat; real_lstat=os.lstat; real_fstat=os.fstat
+    real_text=Path.read_text; real_bytes=Path.read_bytes
+    p=network.decode(read_noatime(root/network.INPUT.lstrip('/')))
+    server=os.getppid()
+    def mapped(path):
+        text=os.fspath(path)
+        if text=='/': return str(root)
+        if text.startswith(('/etc/','/usr/local/')): return str(root/text.lstrip('/'))
+        return path
+    def opened(path,flags,*args,**kwargs):
+        return real_open(mapped(path) if kwargs.get('dir_fd') is None else path,flags,*args,**kwargs)
+    def root_stat(value):
+        class AcceptedRoot:
+            def __getattr__(self,key):
+                return 0 if key in ('st_uid','st_gid') else getattr(value,key)
+        return AcceptedRoot()
+    def trusted_fd(path,directory=False):
+        return real_open(mapped(path),os.O_RDONLY|os.O_NOATIME|os.O_NOFOLLOW|os.O_CLOEXEC|
+                         (os.O_DIRECTORY if directory else 0))
+    def trusted_read(path):
+        fd=trusted_fd(path)
+        try: return os.read(fd,network.LIMIT+1)
+        finally: os.close(fd)
+    def text(path,*args,**kwargs):
+        name=str(path)
+        if name=='/etc/machine-id': return p['machine']+'\n'
+        if name=='/proc/sys/kernel/random/boot_id': return p['boot']+'\n'
+        value=real_text(path,*args,**kwargs)
+        if name.startswith('/proc/') and name.endswith('/status'):
+            value='\n'.join('Uid:\t0\t0\t0\t0' if line.startswith('Uid:') else
+                            'Gid:\t0\t0\t0\t0' if line.startswith('Gid:') else line
+                            for line in value.splitlines())+'\n'
+        return value
+    def cmdline(path,*args,**kwargs):
+        if str(path)=='/proc/'+str(server)+'/cmdline':
+            return b'/usr/bin/python3\0-I\0-B\0/usr/local/libexec/c3-test-fresh-network-exec.py\0'
+        return real_bytes(path,*args,**kwargs)
+    def peer(channel):
+        pid,uid,gid=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+        assert pid==server and (uid,gid)==(os.getuid(),os.getgid())
+        return pid,0,0
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(os,'open',opened))
+        stack.enter_context(patch.object(os,'fstat',lambda fd:root_stat(real_fstat(fd))))
+        stack.enter_context(patch.object(os,'stat',lambda path,*a,**kw:root_stat(real_stat(mapped(path) if kw.get('dir_fd') is None else path,*a,**kw))))
+        stack.enter_context(patch.object(os,'lstat',lambda path,*a,**kw:root_stat(real_lstat(mapped(path) if kw.get('dir_fd') is None else path,*a,**kw))))
+        stack.enter_context(patch.object(os,'getresuid',lambda:(0,0,0)))
+        stack.enter_context(patch.object(os,'getresgid',lambda:(0,0,0)))
+        stack.enter_context(patch.object(Path,'read_text',text))
+        stack.enter_context(patch.object(Path,'read_bytes',cmdline))
+        # The actual checked loader hashes the installed copies; no loader shim
+        # or substituted run/Holder/receive/dispatch/close implementation.
+        m=entry.load('/usr/local/libexec/c3-test-fresh-network.py')
+        c=entry.load('/usr/local/libexec/c3-test-fresh-network-control.py')
+        client=entry.load('/usr/local/libexec/c3-test-fresh-network-client.py')
+        original_identity=m.identity
+        def identity(path):
+            if str(path) in {f'/proc/{pid}/ns/net' for pid in ('self','1',str(server))}: return p['hostNetns']
+            if str(path) in ('/proc/1/ns/pid','/proc/1/ns/mnt'):
+                return original_identity('/proc/self/ns/'+str(path).rsplit('/',1)[1])
+            if str(path)=='/usr/bin/python3': return original_identity('/proc/'+str(server)+'/exe')
+            return original_identity(path)
+        stack.enter_context(patch.object(m,'identity',identity))
+        stack.enter_context(patch.object(m,'trusted_fd',trusted_fd))
+        stack.enter_context(patch.object(m,'trusted_read',trusted_read))
+        stack.enter_context(patch.object(m,'SOCKET',str(root/'h.sock')))
+        stack.enter_context(patch.object(client,'_peercred',peer))
+        before=set(os.listdir('/proc/self/fd'))
+        client.run(m,c)  # genuine operator pipes, input pins, handoff and disposal
+        assert set(os.listdir('/proc/self/fd'))==before,'actual holder leaked descriptors'
+        os.write(2,json.dumps({'actualClientRunReturned':True,'ownedDescriptorsDisposed':True,
+                              'clientSha256':client.__source_sha256__,'loaderPins':entry.PINS}).encode()+b'\n')
+
+
+def read_holder_line(child):
+    end=time.monotonic()+5; raw=bytearray()
+    while not raw.endswith(b'\n'):
+        assert select.select([child.stdout],[],[],max(0,end-time.monotonic()))[0], 'actual holder output timeout'
+        block=os.read(child.stdout.fileno(),1)
+        if not block:
+            raise AssertionError('actual holder premature EOF: '+child.stderr.read().decode())
+        raw.extend(block)
+    return json.loads(raw)
 
 
 @contextlib.contextmanager
@@ -365,18 +468,11 @@ def receiver(f, ledger):
             finally: os._exit(73)
     os.close(fdread)
     producer_fd=os.pidfd_open(producer_pid)
-    holder_code='''import os,socket,sys
-import fresh_network as n, fresh_network_control as c
-s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); c.send(s,{'generation':sys.argv[2],'sequence':1,'operation':'handoff'},n)
-r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
-'''
-    holder_path=root/'h.sock'; holder_server=socket.socket(socket.AF_UNIX); holder_server.bind(str(holder_path)); holder_server.listen(1)
-    holder=subprocess.Popen([sys.executable,'-B','-c',holder_code,str(holder_path),p['generation']],cwd=HERE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    holder_channel=holder_server.accept()[0]; holder_server.close()
-    lease_raw=network.encode({'version':1,'context':network.CONTEXT,'generation':p['generation'],'boot':p['boot'],
-        'planSha256':network.digest(network.encode(p)),'holder':{'pid':holder.pid,'start':network.proc_start(holder.pid)},
-        'deadline':p['deadline'],'operations':['observe','cutover','return','abandon','handoff']})
-    f.fs.atomic(network.LEASE,lease_raw,new=True)
+    holder_path=root/'h.sock'; holder_server=socket.socket(socket.AF_UNIX)
+    holder_server.bind(str(holder_path)); holder_path.chmod(0o600); holder_server.listen(1); holder_server.settimeout(5)
+    holder=subprocess.Popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--holder',str(root)],
+                            cwd=HERE,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    holder_channel=None
     (root/'receiver-peer.json').write_text(json.dumps({'pid':os.getpid()}))
     store=ModeledStore(p['generation']); journal=network.Journal(root/'network-generation',p)
     kernel=ModeledNetwork(p,root,f.port)
@@ -428,7 +524,7 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
             result=super().getsockopt(level,opt,*args)
             if (level,opt)==(socket.SOL_SOCKET,socket.SO_PEERCRED):
                 names=(self.getsockname(),self.getpeername())
-                if any(str(name) in (str(root/'n.sock'),str(hostroot/'host.sock')) for name in names):
+                if any(str(name) in (str(root/'n.sock'),str(root/'h.sock'),str(hostroot/'host.sock')) for name in names):
                     pid,uid,gid=struct.unpack('3i',result); return struct.pack('3i',pid,0,0)
             return result
     def text_root(path,*args,**kwargs):
@@ -448,6 +544,13 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
             return SimpleNamespace(stdout=('MainPID='+str(os.getpid())+'\nExecMainPID='+str(os.getpid())+'\nControlGroup=/system.slice/'+control.UNIT+'\nActiveState=active\nSubState=running\nDropInPaths=\nInvocationID='+'e'*32+'\n').encode())
         return real_run(args,**kwargs)
     try:
+        observation=read_holder_line(holder)
+        assert observation['holder']=={'pid':holder.pid,'start':network.proc_start(holder.pid)}
+        ledger.record('actual-holder-observation',value=observation)
+        lease_raw=network.encode({'version':1,'context':network.CONTEXT,'generation':p['generation'],'boot':p['boot'],
+            'planSha256':network.digest(network.encode(p)),'holder':observation['holder'],
+            'deadline':p['deadline'],'operations':['observe','cutover','return','abandon','handoff']})
+        f.fs.atomic(network.LEASE,lease_raw,new=True)
         deadline=time.monotonic()+5
         while not (hostroot/'host-guard.json').exists():
             if host_errors.exists(): raise AssertionError(host_errors.read_text())
@@ -481,7 +584,15 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
                 def verify(self,expected,frozen,dead=False): self.frozen=list(frozen); super().verify(expected,frozen,dead)
             stack.enter_context(patch.object(host.freezer,'LinuxKernel',AcceptedKernel))
             controller=network.Controller(p,kernel,journal,guard=lease.check)
-            controller.prepare(); host.check()
+            initial=controller.prepare(); host.check()
+            holder_channel=holder_server.accept()[0]; holder_server.close()
+            lease.peer(holder_channel)
+            control.send(holder_channel,initial,network)
+            prepared_reply=read_holder_line(holder)
+            assert prepared_reply==initial
+            ledger.record('actual-holder-prepared',value=prepared_reply)
+            assert holder.stdin is not None
+            holder.stdin.write(b'handoff\n'); holder.stdin.flush()
             # Close the candidate through the actual original host protocol.
             identity=host.identity
             with RootSocket(socket.AF_UNIX) as conn:
@@ -511,6 +622,16 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
                             elif op=='finish-temporary-scope': result=owner.finish_temporary_scope(holder_channel)
                             else: raise AssertionError(op)
                             ledger.record(op,result=result)
+                            if op=='accept-ordinary':
+                                assert owner.c.k.serving_live is not None and owner.fence is not None
+                                commit_raw,policy_raw,attempt_raw=[os.pread(fd,8*1024*1024+1,0)
+                                    for fd in owner.c.k.serving_live['fds'][4:7]]
+                                commit=network.decode(commit_raw)
+                                assert commit['freshPolicySha256']==network.digest(policy_raw)
+                                ledger.record('accepted-same-commit',commit=commit,grant=owner.receipt,
+                                    commitSha256=network.digest(commit_raw),policyRawSha256=network.digest(policy_raw),
+                                    networkEncodedPolicySha256=network.digest(network.encode(network.decode(policy_raw))),
+                                    attempt=network.decode(attempt_raw),receiverFencePhase=owner.fence.phase)
                             control.send(conn,result,network)
                             if op=='read-ordinary' and owner.finished: return
                 except BaseException as error:
@@ -533,7 +654,14 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
             yield owner,errors,producer_fd,holder
             if errors: raise errors[0]
             assert owner.finished, 'original temporary scope did not finish'
-            assert holder.wait(timeout=3)==0
+            holder_out,holder_err=holder.communicate(timeout=3)
+            assert holder.returncode==0,holder_err.decode()
+            handed_off=json.loads(holder_out)
+            assert owner.pending is not None
+            assert handed_off=={**owner.pending,**owner.read_ordinary()}
+            disposal=json.loads(holder_err)
+            assert disposal['actualClientRunReturned'] and disposal['ownedDescriptorsDisposed']
+            ledger.record('actual-holder-natural-exit',exit=holder.returncode,reply=handed_off,disposal=disposal)
             waited,status=os.waitpid(producer_pid,0); assert waited==producer_pid and status==0
             producer_pid=None
             ledger.record('natural-temporary-disposal',host=True,holder=True)
@@ -541,8 +669,13 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
             # dead original peer, lease or Docker. Actual pidfds are readable.
             controller.end=time.monotonic()-1
             assert select.select([producer_fd,lease.pidfd],[],[],0)[0]==[producer_fd,lease.pidfd]
-            assert owner.read_ordinary()==f.held.network_receipt
-            ledger.record('expired-temporary-authority-independent-readback')
+            # Model elapsed wall time too, without editing the fixed plan bytes.
+            # Any accidental temporary-authority consultation must fail loudly.
+            with patch.object(time,'time',return_value=p['deadline']+1), \
+                 patch.object(lease,'check',side_effect=AssertionError('expired holder consulted')), \
+                 patch.object(host,'check',side_effect=AssertionError('disposed producer consulted')):
+                assert owner.read_ordinary()==f.held.network_receipt
+            ledger.record('expired-temporary-authority-independent-readback',monotonicExpired=True,wallExpired=True)
     finally:
         stop.set()
         if terminal: terminal.close()
@@ -551,9 +684,12 @@ r=c.receive(s,n); c.send(s,{'op':'holder-disposed',**r},n); s.close()
         if owner and owner.coordinator_pidfd is not None: os.close(owner.coordinator_pidfd)
         if owner and owner.offer: owner.offer.close()
         if 'lease' in locals(): lease.close()
-        holder_channel.close()
+        if holder_channel: holder_channel.close()
+        holder_server.close()
         if holder.poll() is None: holder.kill()
-        holder.communicate(timeout=3)
+        holder_out,holder_err=holder.communicate(timeout=3)
+        if holder.returncode:
+            ledger.record('actual-holder-failure',exit=holder.returncode,stdout=holder_out.decode(),stderr=holder_err.decode())
         os.close(fdwrite)
         if producer_pid is not None:
             if not select.select([producer_fd],[],[],2)[0]: signal.pidfd_send_signal(producer_fd,signal.SIGTERM)
@@ -626,4 +762,6 @@ class OrdinaryPositive(NativeControl):
         self.run_path(True)
 
 
-if __name__ == '__main__': unittest.main()
+if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[1]=='--holder': holder_process(sys.argv[2])
+    else: unittest.main()

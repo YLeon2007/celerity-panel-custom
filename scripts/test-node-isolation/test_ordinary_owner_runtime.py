@@ -108,6 +108,57 @@ class CompositionTests(unittest.TestCase):
             with self.assertRaisesRegex(restore.Refusal,'NETWORK_COMPOSITION_BINDING_REQUIRED'):
                 restore.network_composition(Files(),config,root,policy)
 
+class PolicyByteBindingTests(unittest.TestCase):
+    def test_received_policy_bytes_not_network_reencoding_bind_the_same_commit(self):
+        from types import SimpleNamespace
+        import copy
+        # Unit-only input fixtures; genuine COMMIT production is exercised by the
+        # integration test. Stop at the next fixed-inode guard, never mint a grant.
+        class FixedInputReached(Exception): pass
+        with tempfile.TemporaryDirectory() as directory:
+            policy = {'inventory': {'networkPlanSha256': 'a'*64}}
+            raw_policy = json.dumps(policy,sort_keys=True,separators=(',',':')).encode()
+            self.assertNotEqual(raw_policy,n.encode(policy))
+            preparation = dict(networkPlanSha256='a'*64, generation='g', ownerInvocationId='i',
+                               resourceSealSha256='b'*64, fdManifestSha256='c'*64)
+            kernel = SimpleNamespace(accept_serving_live=lambda *args:None)
+            owner = c.OwnerRuntime(n,SimpleNamespace(k=kernel,phase='prepared',live=lambda:None),None,
+                                   SimpleNamespace(freezer=None),None)
+            owner.preparation=preparation; owner.coordinator={'nonce':'n','pid':os.getpid()}
+            serving={'pid':os.getpid(),'start':n.proc_start(os.getpid())}
+            commit={'networkHandoff':owner.handoff_binding(),'nonce':'n',
+                    'restoreIntent':{'origin':{'pid':os.getpid()}},'freshPolicySha256':n.digest(raw_policy)}
+            for fault in (None,'policy-bytes','commit','handoff','nonce','origin','plan','attempt','serving'):
+                with self.subTest(fault=fault):
+                    value=copy.deepcopy(commit); raw=raw_policy
+                    if fault=='handoff': value['networkHandoff']['generation']='other'
+                    if fault=='nonce': value['nonce']='other'
+                    if fault=='origin': value['restoreIntent']['origin']['pid']+=1
+                    if fault=='policy-bytes': raw=n.encode(policy)  # same object, different exact bytes
+                    if fault=='plan': raw=json.dumps({'inventory':{'networkPlanSha256':'f'*64}}).encode(); value['freshPolicySha256']=n.digest(raw)
+                    commit_raw=n.encode(value); commit_sha=n.digest(commit_raw)
+                    attempt={'commitSha256':commit_sha,'phase':'confirmed','serving':serving}
+                    if fault=='attempt': attempt['phase']='pending'
+                    if fault=='serving': attempt['serving']={**serving,'start':'0'}
+                    request={'commitSha256':'0'*64 if fault=='commit' else commit_sha,'serving':serving,'manifest':[]}
+                    fds=[]
+                    try:
+                        for index,data in enumerate((b'',b'',b'',b'',commit_raw,raw,n.encode(attempt))):
+                            path=Path(directory)/str(index); path.write_bytes(data); path.chmod(0o600)
+                            fds.append(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC))
+                        real_stat=os.fstat
+                        def root(fd):
+                            s=real_stat(fd)
+                            return SimpleNamespace(st_mode=s.st_mode,st_uid=0,st_gid=0)
+                        with patch.object(c,'receive_rights',return_value=fds),patch.object(os,'fstat',root),\
+                             patch.object(n,'trusted_fd',side_effect=FixedInputReached):
+                            expected=self.assertRaises(FixedInputReached) if fault is None else self.assertRaisesRegex(
+                                n.Refusal,'^SAME_COMMIT_SERVING_BINDING_REQUIRED$')
+                            with expected: owner.accept_ordinary(None,request)
+                    finally:
+                        for fd in fds: os.close(fd)
+
+
 class CustodyTests(unittest.TestCase):
     def test_full_dump_named_subtraction_and_dead_original_pidfd(self):
         self.assertTrue(hasattr(c, 'PID1Store'), 'product main has no PID1 custody implementation')

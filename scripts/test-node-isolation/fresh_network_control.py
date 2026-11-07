@@ -606,7 +606,7 @@ class OwnerRuntime:
         attempt = m.decode(os.pread(fds[6],131073,0))
         m.need(commit_sha == request['commitSha256'] and commit['networkHandoff'] == self.handoff_binding() and
                commit['nonce'] == self.coordinator['nonce'] and commit['restoreIntent']['origin']['pid'] == self.coordinator['pid'] and
-               commit['freshPolicySha256'] == m.digest(m.encode(policy)) and
+               commit['freshPolicySha256'] == m.digest(policy_raw) and
                policy['inventory']['networkPlanSha256'] == self.preparation['networkPlanSha256'] and
                attempt == {'commitSha256':commit_sha,'phase':'confirmed','serving':request['serving']}, 'SAME_COMMIT_SERVING_BINDING_REQUIRED')
         for fd,path in ((fds[4],HOST_STATE+'/handoff-commit.json'),(fds[5],'/etc/c3-test-fresh-classic.json'),
