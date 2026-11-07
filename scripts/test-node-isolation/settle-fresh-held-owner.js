@@ -36,7 +36,8 @@ async function main() {
             // Cleanup after committed completion cannot become a precommit
             // retained-exclusion claim or mask an earlier precise failure.
             failure ||= error;
-            if (result?.code === 'COMMITTED_FRESH_ACTIVATION_CONFIRMED') failure.code = 'COMMITTED_ACTIVATION_UNKNOWN';
+            if (['COMMITTED_FRESH_ACTIVATION_CONFIRMED', 'COMMITTED_FRESH_NETWORK_OWNED'].includes(result?.code))
+                failure.code = 'COMMITTED_ACTIVATION_UNKNOWN';
         }
     }
     if (failure) throw failure;

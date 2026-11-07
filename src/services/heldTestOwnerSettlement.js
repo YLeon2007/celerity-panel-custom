@@ -183,12 +183,19 @@ class HeldTestOwnerSettlement {
                         // One terminal capability after the unchanged all-five CAS/readbacks.
                         // It releases h: NO subsequent check/legacy activation/complete call.
                         try {
-                            const commitSha256 = await scope.freshHandback(freeze(proof));
+                            // Selection comes from the trusted root scope, never
+                            // from public request keys or the returned shape.
+                            const networkOwned = scope.freshNetworkOwnershipRequired === true;
+                            const terminal = await scope.freshHandback(freeze(proof));
+                            const commitSha256 = networkOwned ? terminal?.commitSha256 : terminal;
                             need(typeof commitSha256 === 'string' && /^[a-f0-9]{64}$/.test(commitSha256));
+                            if (networkOwned) need(exact(terminal, ['commitSha256', 'networkOwnershipSha256'])
+                                && typeof terminal.networkOwnershipSha256 === 'string' && /^[a-f0-9]{64}$/.test(terminal.networkOwnershipSha256));
                             await this.#journal.committed(commitSha256);
-                            result = freeze({ code: 'COMMITTED_FRESH_ACTIVATION_CONFIRMED', ownerCount: plan.nodes.length,
+                            result = freeze({ code: networkOwned ? 'COMMITTED_FRESH_NETWORK_OWNED' : 'COMMITTED_FRESH_ACTIVATION_CONFIRMED', ownerCount: plan.nodes.length,
                                 externalAdmission: 'closed', activationSet: ['fresh-classic-process'],
-                                retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256 });
+                                retained: ['node-masks', 'candidate', 'docker', 'containerd', 'updater', 'relaunch-barriers'], commitSha256,
+                                ...(networkOwned ? { networkOwnershipSha256: terminal.networkOwnershipSha256 } : {}) });
                             finished = true; return result;
                         } catch (error) {
                             error.code = 'COMMITTED_ACTIVATION_UNKNOWN';

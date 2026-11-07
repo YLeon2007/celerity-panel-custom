@@ -182,3 +182,88 @@ separate downstream work; frozen source-pack profiles and pins are unchanged.
 Installing refreshed helpers/source hashes, accepted capture/restore/owner pins
 and any launch policy requires independent deployment authorization. This slice
 performs none of those operations.
+
+## Root-selected fresh ordinary-network receipt (source-only consumer)
+
+The fixed fresh private config may additionally contain **only**
+`networkPlanSha256` (lowercase hex64), and only with config `version: 2`.
+Version 1 and the non-fresh private config refuse this key. Its absence preserves
+legacy fresh activation and the legacy string-return protocol. Neither public
+plan/proof keys, constructor extras, environment nor the reply shape select this
+contract. `ordinaryOwner` in a network plan alone does not select it either.
+
+Before opening the bridge, the actual root parser reads these fixed trusted files:
+
+- `/etc/c3-test-fresh-network.json`: its **raw-byte** SHA must equal the private
+  selector; version/context/shared machine/boot must agree, with exact
+  `ordinaryOwner:{version:1,stopConfigSha256:<hex64>}`.
+- `/etc/c3-test-node-isolation.json`: shared-v2 membership, endpoint, physical
+  identity and inventory must agree with accepted inventory/restore pins;
+  `hostHold.networkPlanSha256` must match the raw network digest, its original
+  host identity/freezer pin must agree, and its canonical plan hash must match the
+  accepted shared node's `identity.planHash`.
+- `/etc/c3-test-fresh-classic.json`: inventory's network digest must agree.
+  Preserve the existing policy meanings: `inventory.coordinatorSha256` is the
+  **canonical restore configuration** digest; `inventory.sourceSha256` and
+  `files['/usr/local/libexec/c3-test-coordinated-restore.py']` pin coordinator
+  **source**. `files['/usr/local/libexec/c3-test-fresh-classic.py']` independently
+  pins the fresh implementation, not that coordinator source.
+
+Installed shared/isolation/freezer sources are checked against the accepted
+restore pins, fresh source against policy, and the existing coordinator/bridge
+pins remain mandatory. `assertPins` retains all these raw inputs/source bytes for
+fresh checks through terminal dispatch. JSON duplicate keys (including escaped
+aliases) refuse. This is input/source crossbinding, not a substitute for the
+Python producer's complete policy, resource and live-ownership validation.
+
+The unchanged public terminal request is:
+
+```json
+{"version":1,"op":"fresh-handback","nonce":"<fresh hex64>","proof":{"context":"...","revision":7,"deployedRevision":6,"quietSha256":"<hex64>","nodes":[]}}
+```
+
+The new branch requires exactly this reply (no omitted, extra or duplicate keys):
+
+```json
+{"version":1,"op":"fresh-handback-ack","nonce":"<same nonce>","commitSha256":"<hex64>","networkOwnershipSha256":"<hex64>"}
+```
+
+The legacy ACK remains exactly the same **without** `networkOwnershipSha256`;
+receiving that extra key on legacy refuses. `check`/`checked` remain the exact
+three-field protocol. Missing network hash on the new branch is committed
+uncertainty, never a legacy fallback. The root-created frozen scope privately
+sets `freshNetworkOwnershipRequired:true`; its `freshHandback` returns exactly
+`{commitSha256,networkOwnershipSha256}` only on this selected branch, otherwise
+the legacy commit string. No callback or bearer receipt grants terminal authority.
+
+The real public `HeldTestOwnerSettlement.freshHandback` still performs every
+existing quiet/enrollment/history check, one genuine generation-fenced public
+handback CAS per node, final primary-majority readbacks and the existing durable
+no-replay journal. It sends the same five-field proof, not a caller-extended one.
+Only the selected new terminal result **and actual natural bridge exit/required
+scope cleanup** permit `COMMITTED_FRESH_NETWORK_OWNED`. That result retains the
+actual `networkOwnershipSha256` beside `commitSha256`; the existing journal
+records that same COMMIT, not a second ownership COMMIT/collection/generation.
+Legacy `COMMITTED_FRESH_ACTIVATION_CONFIRMED` is unchanged.
+
+A valid ACK cannot erase later malformed/partial stdout, stderr, failed natural
+exit or disposal. These faults remain `COMMITTED_ACTIVATION_UNKNOWN`, with the
+original exception preserved and secondary scope-cleanup failures attached. The
+fixed fresh CLI also classifies DB disposal after either success code as committed
+uncertainty and prints no success. No owner rollback, fresh replay, OLD activation,
+post-terminal all-node check or deadline extension is added. Success leaves node
+masks and the explicitly listed Docker/containerd/candidate/updater/relaunch holds
+retained under the contract; it does not mean network removal or host thaw.
+
+`heldFreshNetworkOwner.test.js` uses the actual parser, public initialize/adopt/
+handback CAS/readbacks, real durable journal and actual Node parent/child stdio
+with natural exits. Independent root/private reads and replica-set persistence
+are modeled. Its **transport producer is explicitly modeled Node code**, because
+the new Python ordinary-owner producer is not in this worktree. It does not seed
+an ownership COMMIT, replace the public transfer, or manually return a terminal
+receipt from a settlement spy. Producer-generated receipts are consumed through
+the real wire parser. This proves the scoped JS consumer, **not** combined new
+Python→public acceptance, real Mongo atomicity, installed PID1/FD-store custody,
+physical ordinary networking, deployment or PROD GO. Parent integration must run
+the assembled real Python positive and independent review with refreshed current
+source pins; historical pinned artifacts remain unchanged.
