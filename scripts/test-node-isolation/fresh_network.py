@@ -326,10 +326,36 @@ def node_control(p) -> list[dict]:
     return endpoints
 
 
+def stopped_config(p):
+    """The accepted new config with precisely its unique serving handler replaced."""
+    result = decode(encode(p['newConfig']))
+    count = 0
+    def visit(value):
+        nonlocal count
+        if type(value) is dict:
+            if value.get('handler') == 'reverse_proxy':
+                upstreams = value.get('upstreams')
+                if type(upstreams) is list and any(type(u) is dict and u.get('dial') == PUBLIC+':3000' for u in upstreams):
+                    need(len(upstreams) == 1 and type(upstreams[0]) is dict and
+                         upstreams[0].get('dial') == PUBLIC+':3000', 'AMBIGUOUS_STOP_HANDLER')
+                    count += 1
+                    value.clear(); value.update(handler='static_response', status_code=503,
+                                                body='c3-classic-stopped-v1\n')
+                    return
+            for child in value.values(): visit(child)
+        elif type(value) is list:
+            for child in value: visit(child)
+    visit(result)
+    need(count == 1, 'UNIQUE_STOP_HANDLER_REQUIRED')
+    return result
+
+
 def validate_plan(p):
     fields = 'version context machine boot hostNetns generation deadline daemon peers executables hostsSha256 oldConfig newConfig'
     if type(p) is dict and 'nodeControlEgress' in p:
         fields += ' nodeControlEgress'
+    if type(p) is dict and 'ordinaryOwner' in p:
+        fields += ' ordinaryOwner'
     keys(p, fields)
     need(type(p['version']) is int and p['version'] == 1 and p['context'] == CONTEXT,
          'FIXED_TEST_ONLY')
@@ -392,6 +418,13 @@ def validate_plan(p):
                 visit(child)
     visit(transformed)
     need(count == [1] and encode(transformed) == new, 'EXACT_ONE_CADDY_UPSTREAM_CHANGE_REQUIRED')
+    if 'ordinaryOwner' in p:
+        keys(p['ordinaryOwner'], 'version stopConfigSha256')
+        need(type(p['ordinaryOwner']['version']) is int and p['ordinaryOwner']['version'] == 1,
+             'ORDINARY_OWNER_VERSION_REQUIRED')
+        pin(p['ordinaryOwner']['stopConfigSha256'])
+        need(digest(encode(stopped_config(p))) == p['ordinaryOwner']['stopConfigSha256'],
+             'DETERMINISTIC_STOP_CONFIG_REQUIRED')
     return p
 
 
@@ -737,6 +770,10 @@ class Linux:
         self.path_state = 'absent'
         self.owned = {}
         self.target_hold = None
+        self.verification_mode = 'docker-live'
+        self.original_fence_check = None
+        self.peer_pins = {}
+        self.peer_exes = {}
         self.dispatch = held_dispatch_required
         self.boundary = held_dispatch_required
         self.host_fd = os.open('/proc/1/ns/net', os.O_RDONLY | os.O_CLOEXEC)
@@ -749,6 +786,8 @@ class Linux:
             self.pidfds[role] = pidfd
             fd = os.open('/proc/'+str(current['pid'])+'/ns/net', os.O_RDONLY | os.O_CLOEXEC)
             self.fds[role] = fd
+            self.peer_pins[role] = current
+            self.peer_exes[role] = os.open('/proc/'+str(current['pid'])+'/exe', os.O_RDONLY|os.O_CLOEXEC)
             self.check_peer(role)
         need(len({tuple(identity('/proc/'+str(x)+'/ns/net')) for x in self.pids.values()}) == 3,
              'SHARED_PEER_NAMESPACES_UNSUPPORTED')
@@ -759,11 +798,16 @@ class Linux:
              identity('/proc/1/ns/net') == self.p['hostNetns'] and
              identity('/proc/self/ns/net') == self.p['hostNetns'] and
              identity('/proc/self/ns/mnt') == identity('/proc/1/ns/mnt'), 'WRONG_TEST_HOST_OR_NAMESPACE')
-        need(identity(DOCKER) == self.p['daemon']['socket'] and stat.S_ISSOCK(os.lstat(DOCKER).st_mode) and
-             os.stat(DOCKER).st_uid == 0 and not os.stat(DOCKER).st_mode & 0o002, 'DOCKER_SOCKET_DRIFT')
-        info = decode(request(UnixHTTP('localhost'), 'GET', '/info'))
-        need(identity(DOCKER) == self.p['daemon']['socket'] and info.get('ID') == self.p['daemon']['id'] and info.get('DockerRootDir') == self.p['daemon']['root'],
-             'WRONG_DOCKER_DAEMON')
+        if getattr(self, 'verification_mode', 'docker-live') == 'docker-live':
+            need(identity(DOCKER) == self.p['daemon']['socket'] and stat.S_ISSOCK(os.lstat(DOCKER).st_mode) and
+                 os.stat(DOCKER).st_uid == 0 and not os.stat(DOCKER).st_mode & 0o002, 'DOCKER_SOCKET_DRIFT')
+            info = decode(request(UnixHTTP('localhost'), 'GET', '/info'))
+            need(identity(DOCKER) == self.p['daemon']['socket'] and info.get('ID') == self.p['daemon']['id'] and info.get('DockerRootDir') == self.p['daemon']['root'],
+                 'WRONG_DOCKER_DAEMON')
+        else:
+            need(self.verification_mode in ('original-fence-held', 'succeeded-original-fence') and
+                 callable(self.original_fence_check), 'ORIGINAL_LIVE_FENCE_REQUIRED')
+            self.original_fence_check()
         for path, pin_ in self.p['executables'].items():
             fd = trusted_fd(path)
             try:
@@ -800,8 +844,30 @@ class Linux:
                  {x.get('IPAddress') for x in c['NetworkSettings']['Networks'].values()}, 'DATA_ENDPOINT_ADDRESS_DRIFT')
         return projection
 
+    def enter_fence_rendezvous(self, check):
+        need(self.verification_mode == 'docker-live' and self.sealed is not None and callable(check),
+             'SERIALIZED_PREARM_RENDEZVOUS_REQUIRED')
+        self.check()
+        # This main process has synchronously drained all owned joined children.
+        # No Docker method is callable between this latch and the original arm ACK.
+        self.verification_mode = 'rendezvous'
+        self.original_fence_check = check
+        check()
+        self.verification_mode = 'original-fence-held'
+        self.check()
+
     def check_peer(self, role):
-        current = self.inspect(role)
+        if getattr(self, 'verification_mode', 'docker-live') == 'docker-live':
+            current = self.inspect(role)
+        else:
+            need(self.verification_mode in ('original-fence-held', 'succeeded-original-fence'),
+                 'NETWORK_RENDEZVOUS_NOT_COMPLETE')
+            current = self.peer_pins[role]
+            pid = self.pids[role]
+            need(proc_start(pid) == current['start'], 'ORIGINAL_PEER_PID_REPLACED')
+            s = os.fstat(self.peer_exes[role]); now = os.stat('/proc/'+str(pid)+'/exe')
+            need((s.st_dev,s.st_ino) == (now.st_dev,now.st_ino), 'ORIGINAL_PEER_EXE_REPLACED')
+            need(identity('/proc/'+str(pid)+'/ns/net') == current['netns'], 'ORIGINAL_PEER_NETNS_REPLACED')
         fd = self.fds[role]
         s = os.fstat(fd)
         need(current['pid'] == self.pids[role] and current['netns'] == [s.st_dev, s.st_ino] and
@@ -1337,7 +1403,41 @@ class Linux:
         self.firewall_seal = self.nft_observation()
         self.check()
 
+    def accept_serving_live(self, serving, fds, rows, freezer):
+        need(getattr(self, 'serving_live', None) is None and len(fds) == len(rows) == 7,
+             'ONE_ACTUAL_SERVING_TRANSFER_REQUIRED')
+        self.serving_live = {'serving':serving,'fds':list(fds),'rows':rows,'freezer':freezer,'empty':False}
+        need([r['role'] for r in rows] == ['serving.pid','serving.net','serving.exe','serving.cgroup',
+                                        'serving.commit','serving.policy','serving.attempt'], 'CLOSED_SERVING_ROLES_REQUIRED')
+        self.check_serving_live()
+
+    def check_serving_live(self):
+        live = getattr(self, 'serving_live', None)
+        if live is None: return
+        fds, rows, serving = live['fds'], live['rows'], live['serving']
+        for fd, row in zip(fds, rows):
+            need(live['freezer'].capability(fd,row['role'],row['kind'],**row['binding']) == row,
+                 'LIVE_SERVING_CAPABILITY_DRIFT')
+        if live['empty']:
+            need(select.select([fds[0]],[],[],0)[0], 'ORIGINAL_SERVING_NOT_DEAD')
+            return
+        pid = serving['pid']
+        need(not select.select([fds[0]],[],[],0)[0] and proc_start(pid) == serving['start'], 'ORIGINAL_SERVING_LOST')
+        for index, path in ((1,'ns/net'),(2,'exe')):
+            s = os.stat('/proc/'+str(pid)+'/'+path); held = os.fstat(fds[index])
+            need((s.st_dev,s.st_ino) == (held.st_dev,held.st_ino), 'ORIGINAL_SERVING_REPLACED')
+        need(identity('/proc/'+str(pid)+'/ns/net') == identity(NETNS) and
+             Path('/proc',str(pid),'cgroup').read_text() == '0::/system.slice/c3-test-fresh-classic.service\n' and
+             'Uid:\t65531\t65531\t65531\t65531' in Path('/proc',str(pid),'status').read_text().splitlines(),
+             'FIXED_SERVING_PRINCIPAL_REQUIRED')
+        need(os.stat('/sys/fs/cgroup/system.slice/c3-test-fresh-classic.service').st_ino == os.fstat(fds[3]).st_ino,
+             'SERVING_CGROUP_REPLACED')
+
     def serving_pin(self):
+        if getattr(self, 'serving_live', None) is not None:
+            self.check_serving_live()
+            value = self.serving_live['serving']
+            return value['pid'], value['start']
         path = '/etc/c3-test-fresh-network-serving.json'
         raw = trusted_read(path)
         value = decode(raw)
@@ -1474,6 +1574,7 @@ class Linux:
                  'HELD_TARGET_PROCESS_OR_NAMESPACE_DRIFT')
 
     def check_hold(self):
+        self.check_serving_live()
         hold = getattr(self, 'target_hold', None)
         if hold is None:
             return
@@ -1505,13 +1606,16 @@ class Linux:
         return result
 
     def close_holds(self):
-        hold = getattr(self, 'target_hold', None)
+        hold, self.target_hold = getattr(self, 'target_hold', None), None
+        errors = []
         if hold is not None:
             for x in hold['processes']:
                 for key in ('pidfd', 'nsfd'):
-                    if key in x:
-                        os.close(x[key])
-            self.target_hold = None
+                    fd = x.pop(key, None)
+                    if fd is not None:
+                        try: os.close(fd)
+                        except BaseException as error: errors.append(error)
+        if errors: raise errors[0]
 
     def public_probe(self):
         # Standard verified TLS, fixed hostname/port/path, no proxy/environment use.
@@ -1524,11 +1628,23 @@ class Linux:
         return {'namespace': identity(NETNS), 'snapshots': {x: self.snapshot(x) for x in ('host', 'fresh', *ROLES)},
                 'configSha256': digest(encode(self.config()))}
 
-    def remove(self, baseline):
+    def stopped_probe(self):
+        conn = http.client.HTTPSConnection(CONTEXT,443,timeout=3)
+        try:
+            conn.request('GET','/classic-ready'); response = conn.getresponse(); body = response.read(4097)
+            need(response.status == 503 and body == b'c3-classic-stopped-v1\n','PUBLIC_STOPPED_503_REQUIRED')
+            return digest(body)
+        finally: conn.close()
+
+    def remove(self, baseline, *, ordinary=False):
         self.check()
         # Do not destroy a namespace occupied by a supervisor/controller/application.
         self.require_empty_namespace()
-        need(encode(self.config()) == encode(self.p['oldConfig']), 'CADDY_NOT_RETURNED')
+        expected_config = stopped_config(self.p) if ordinary else self.p['oldConfig']
+        if ordinary:
+            need(getattr(self,'serving_live',None) is not None and self.serving_live['empty'] is True and
+                 self.verification_mode == 'succeeded-original-fence', 'ACCEPTED_ORDINARY_EMPTY_REQUIRED')
+        need(encode(self.config()) == encode(expected_config), 'CADDY_NOT_RETURNED')
         for role in ROLES:
             # Verify exact aliases and one veth peer pair before deleting anything.
             own, peer = NAMES[role]
@@ -1600,9 +1716,17 @@ class Linux:
                 continue
 
     def close(self):
-        self.close_holds()
-        for fd in set(self.fds.values()) | set(self.pidfds.values()):
-            os.close(fd)
+        errors = []
+        try: self.close_holds()
+        except BaseException as error: errors.append(error)
+        live, self.serving_live = getattr(self,'serving_live',None),None
+        owned = set(self.fds.values()) | set(self.pidfds.values()) | set(getattr(self,'peer_exes',{}).values())
+        if live is not None: owned.update(live['fds']); live['fds'] = []
+        self.fds = {}; self.pidfds = {}; self.peer_exes = {}
+        for fd in owned:
+            try: os.close(fd)
+            except BaseException as error: errors.append(error)
+        if errors: raise errors[0]
 
 
 class Journal:
@@ -1667,8 +1791,12 @@ class Controller:
         need(not self.failed, 'UNKNOWN_RETAINED_NO_MUTATION')
         need(encode({k: self.p[k] for k in ('nodeControlEgress',) if k in self.p}) == self.node_plan_bytes,
              'ACCEPTED_PLAN_MUTATED')
-        self.guard()
-        need(self.clock() < self.end and time.time() < self.p['deadline'], 'NETWORK_LEASE_EXPIRED')
+        ordinary = getattr(self, 'ordinary_authority', None)
+        if ordinary is not None:
+            ordinary.check()
+        else:
+            self.guard()
+            need(self.clock() < self.end and time.time() < self.p['deadline'], 'NETWORK_LEASE_EXPIRED')
 
     def dispatch_live(self):
         # Child is already in the retained target netns; host self-netns is not applicable.

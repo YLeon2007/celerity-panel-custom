@@ -240,7 +240,16 @@ def inventory_node(p, read=None, *, inventory=None):
     return pin
 
 
-def validate_common_plan(p):
+NETWORK_RUNTIME_PINS = {
+    '/usr/local/libexec/c3-test-node-isolation',
+    '/usr/local/libexec/c3-test-shared-host.py',
+    '/usr/local/libexec/c3-test-fresh-network.py',
+    '/usr/local/libexec/c3-test-fresh-network-control.py',
+    '/usr/local/libexec/c3-test-fresh-network-exec.py',
+}
+
+
+def validate_common_plan(p, *, network_bound=False):
     # Shared mode uses this shape/policy check, never the dedicated node allowlist.
     need(isinstance(p, dict) and set(p) == plan_keys(p), 'INVALID_PLAN_FIELDS')
     need(type(p['version']) is int and p['version'] in (1, 2) and p['context'] == 'test.infograd.online', 'TEST_ONLY')
@@ -251,7 +260,9 @@ def validate_common_plan(p):
         need(isinstance(p[name], str) and re.fullmatch(pattern, p[name]) is not None, 'INVALID_IDENTITY')
     for name in ('sshHostKeySha256', 'runnerSha256', 'maintenanceConfigSha256', 'maintenanceUnitSha256'):
         need(isinstance(p[name], str) and re.fullmatch(r'[a-f0-9]{64}', p[name]) is not None, 'INVALID_DIGEST')
-    need(isinstance(p['runtimePins'], dict) and set(p['runtimePins']) == {'/bin/bash', '/usr/bin/python3'}, 'RUNTIME_PINS_REQUIRED')
+    need(not network_bound or p['version'] == 2, 'NETWORK_SHARED_V2_REQUIRED')
+    need(isinstance(p['runtimePins'], dict) and set(p['runtimePins']) ==
+         {'/bin/bash', '/usr/bin/python3'} | (NETWORK_RUNTIME_PINS if network_bound else set()), 'RUNTIME_PINS_REQUIRED')
     for pins in (p['runtimePins'], p['unitFilePins']):
         need(isinstance(pins, dict), 'INVALID_PINS')
         for path, sha in pins.items():
@@ -293,7 +304,18 @@ def secure_file(path, allow_symlink=False):
         if stat.S_ISLNK(info.st_mode):
             need(allow_symlink, 'SYMLINK_PATH')
     need(path.resolve().is_file(), 'NOT_REGULAR_FILE')
-    return path.read_bytes()
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOATIME |
+                 (0 if allow_symlink else os.O_NOFOLLOW))
+    try:
+        info = os.fstat(fd)
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+             'UNTRUSTED_PATH')
+        data = bytearray()
+        while block := os.read(fd, 65536):
+            data.extend(block)
+            need(len(data) <= 16*1024*1024, 'SECURE_FILE_LIMIT')
+        return bytes(data)
+    finally: os.close(fd)
 
 
 def atomic_json(directory, name, obj):
@@ -1250,12 +1272,11 @@ SHARED_MODULE = '/usr/local/libexec/c3-test-shared-host.py'
 
 def select_mode(plan):
     if isinstance(plan, dict) and plan.get('mode') == 'shared-test':
-        import importlib.util
-        secure_file(SHARED_MODULE)
-        spec = importlib.util.spec_from_file_location('c3_shared_host', SHARED_MODULE)
-        need(spec is not None and spec.loader is not None, 'SHARED_MODULE_UNAVAILABLE')
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        import types
+        raw = secure_file(SHARED_MODULE)
+        module = types.ModuleType('c3_shared_host')
+        module.__file__ = SHARED_MODULE
+        exec(compile(raw, SHARED_MODULE, 'exec'), module.__dict__)
         return module.validate_plan(plan, sys.modules[__name__]), module
     return validate_plan(plan), None
 

@@ -143,6 +143,75 @@ class LinuxKernel:
     def restore_relaunch(self, expected, persist):
         return self.barrier.restore(expected, self, persist) if self.barrier and 'relaunch' in expected else None
 
+    def live_capabilities(self, expected):
+        """Acquire on the original live Fence, never by a recovery JSON reader."""
+        retained = getattr(self, '_live', None)
+        if retained is None:
+            retained = self._live = []
+        roles = {row['role'] for row, fd in retained}
+        def add(role, kind, opener, **binding):
+            if role not in roles:
+                fd = opener()
+                # Register ownership before fstat/hash/ioctl can fail.
+                retained.append(({'role': role, 'kind': kind, 'binding': binding}, fd))
+                retained[-1] = (capability(fd, role, kind, **binding), fd)
+                roles.add(role)
+        for index, (name, pin) in enumerate(sorted(expected['groups'].items())):
+            add('host.cgroup.'+str(index), 'cgroup', lambda name=name: os.open(
+                self.group(name), os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC),
+                name=name, inode=pin['inode'])
+        processes = {}
+        for pin in expected['groups'].values():
+            for row in pin['members']: processes[row['pid']] = row
+        for container in expected['containers']: processes[container['init']['pid']] = container['init']
+        for index, (pid, row) in enumerate(sorted(processes.items())):
+            base = self.proc/str(pid)
+            add('host.pid.'+str(index), 'pidfd', lambda pid=pid: os.pidfd_open(pid),
+                pid=pid, start=row['startTicks'], group=row['cgroup'])
+            add('host.exe.'+str(index), 'exe', lambda base=base: os.open(base/'exe', os.O_RDONLY|os.O_CLOEXEC),
+                pid=pid, start=row['startTicks'])
+            for namespace in ('pid', 'mnt', 'net', 'ipc', 'uts'):
+                add('host.ns.'+str(index)+'.'+namespace, 'nsfs', lambda base=base, namespace=namespace:
+                    os.open(base/'ns'/namespace, os.O_RDONLY|os.O_CLOEXEC), pid=pid,
+                    start=row['startTicks'], namespace=namespace)
+        self.check_live_capabilities()
+        return retained
+
+    def check_live_capabilities(self):
+        import hashlib
+        import ctypes
+        for row, fd in getattr(self, '_live', []):
+            need(capability(fd, row['role'], row['kind'], **row['binding']) == row,
+                 'retained original capability drift')
+            b = row['binding']
+            if row['kind'] == 'cgroup':
+                need(self.group(b['name']).stat().st_ino == b['inode'] == row['ino'], 'original cgroup replaced')
+                # fstatfs authenticates cgroup2, not just an ordinary directory.
+                buffer = ctypes.create_string_buffer(256)
+                libc = ctypes.CDLL(None, use_errno=True)
+                need(libc.fstatfs(fd, buffer) == 0 and int.from_bytes(buffer.raw[:8], sys.byteorder) == 0x63677270,
+                     'cgroup2 capability required')
+            elif row['kind'] == 'pidfd':
+                need(not select.select([fd], [], [], 0)[0] and self.pid(b['pid'])['startTicks'] == b['start'],
+                     'original process lost')
+            elif row['kind'] == 'exe':
+                s = os.stat(self.proc/str(b['pid'])/'exe')
+                need((s.st_dev, s.st_ino) == (row['dev'], row['ino']), 'original executable replaced')
+                sha = hashlib.sha256(); offset = 0
+                while True:
+                    block = os.pread(fd, 65536, offset)
+                    if not block: break
+                    offset += len(block); sha.update(block)
+                prior = b.get('sha256')
+                if prior is None: b['sha256'] = sha.hexdigest()
+                else: need(prior == sha.hexdigest(), 'original executable bytes changed')
+            elif row['kind'] == 'nsfs':
+                import fcntl
+                types = {'net':0x40000000, 'mnt':0x20000, 'pid':0x20000000, 'ipc':0x8000000, 'uts':0x4000000}
+                need(fcntl.ioctl(fd, 0xb703) == types[b['namespace']], 'original nsfs type changed')
+                s = os.stat(self.proc/str(b['pid'])/'ns'/b['namespace'])
+                need((s.st_dev, s.st_ino) == (row['dev'], row['ino']), 'original namespace replaced')
+
     def host(self):
         return {'machineId': self.machine.read_text().strip(),
                 'bootId': (self.proc / 'sys/kernel/random/boot_id').read_text().strip()}
@@ -707,6 +776,132 @@ def capture(kernel):
     return result
 
 
+def live_encode(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def live_sha(raw):
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()
+
+
+def capability(fd, role, kind, **binding):
+    s = os.fstat(fd)
+    return {'role': role, 'kind': kind, 'dev': s.st_dev, 'ino': s.st_ino,
+            'type': stat.S_IFMT(s.st_mode), 'mode': s.st_mode, 'rdev': s.st_rdev,
+            'flags': fcntl.fcntl(fd, fcntl.F_GETFL), 'path': os.readlink('/proc/self/fd/'+str(fd)),
+            'binding': binding}
+
+
+class LiveFenceOffer:
+    """Closed, live SCM_RIGHTS transfer. Serialized state alone cannot instantiate it.
+
+    Every installed right becomes owned before ANY framing/credential validation.
+    FD numbers are never serialized. The sender keeps its original copies/lock.
+    """
+    LIMIT = 8*1024*1024
+    MAX_FDS = 16384
+    BATCH = 253
+
+    def __init__(self, state, rows, fds, *, received=False):
+        self.state, self.rows, self.fds = state, rows, list(fds)
+        self.received = received
+        self.closed = False
+        self.raw = live_encode({'version': 1, 'state': state, 'manifest': rows})
+        self.sha256 = live_sha(self.raw)
+
+    def check(self):
+        need(not self.closed and len(self.fds) == len(self.rows) and
+             0 < len(self.rows) <= self.MAX_FDS, 'live capability count changed')
+        need(len({r['role'] for r in self.rows}) == len(self.rows), 'duplicate live role')
+        for fd, row in zip(self.fds, self.rows):
+            need(capability(fd, row['role'], row['kind'], **row['binding']) == row,
+                 'original capability changed')
+        need(self.rows[0]['role'] == 'host.journal' and self.rows[0]['kind'] == 'journal',
+             'original journal capability required')
+        # On the received SAME OFD this succeeds without LOCK_UN. No reopen.
+        fcntl.flock(self.fds[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def send(self, conn):
+        import array
+        import socket
+        import struct
+        self.check()
+        need(len(self.raw) <= self.LIMIT, 'live offer size')
+        conn.sendall(struct.pack('!I', len(self.raw))+self.raw)
+        for offset in range(0, len(self.fds), self.BATCH):
+            part = self.fds[offset:offset+self.BATCH]
+            data = struct.pack('!II', offset, len(part))
+            need(conn.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                 array.array('i', part))]) == len(data), 'live rights send unknown')
+
+    @classmethod
+    def receive(cls, conn, *, expected_peer):
+        import array
+        import socket
+        import struct
+        owned = []
+        try:
+            peer, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            need(peer == expected_peer and uid == os.geteuid(), 'live original peer required')
+            def exact(count):
+                raw = b''
+                while len(raw) < count:
+                    block = conn.recv(count-len(raw)); need(block, 'live offer EOF')
+                    raw += block
+                return raw
+            size = struct.unpack('!I', exact(4))[0]
+            need(0 < size <= cls.LIMIT, 'live offer size')
+            raw = exact(size)
+            def pairs(items):
+                out = {}
+                for k, v in items:
+                    need(k not in out, 'duplicate live key'); out[k] = v
+                return out
+            value = json.loads(raw, object_pairs_hook=pairs)
+            need(type(value) is dict and set(value) == {'version', 'state', 'manifest'} and
+                 type(value['version']) is int and value['version'] == 1, 'live offer grammar')
+            rows = value['manifest']
+            need(type(rows) is list and 0 < len(rows) <= cls.MAX_FDS, 'live offer count')
+            while len(owned) < len(rows):
+                data, anc, flags, _ = conn.recvmsg(8, socket.CMSG_SPACE(cls.BATCH*array.array('i').itemsize),
+                                                 socket.MSG_CMSG_CLOEXEC)
+                before = len(owned); invalid = False
+                for level, kind, body in anc:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        values = array.array('i')
+                        usable = len(body)-len(body) % values.itemsize
+                        values.frombytes(body[:usable]); owned.extend(values)
+                        invalid |= usable != len(body)
+                    else:
+                        invalid = True
+                need(not invalid and not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC), 'live rights truncated')
+                need(len(data) == 8 and len(owned) > before and len(owned) <= len(rows), 'live rights count')
+                offset, count = struct.unpack('!II', data)
+                need(offset == before and count == len(owned)-before and count <= cls.BATCH,
+                     'live rights batch binding')
+            for fd in owned: os.set_inheritable(fd, False)
+            result = cls(value['state'], rows, owned, received=True)
+            result.check()
+            return result
+        except BaseException as primary:
+            for fd in owned:
+                try: os.close(fd)
+                except BaseException as error:
+                    primary.cleanup_errors = (*getattr(primary, 'cleanup_errors', ()), error)
+            raise
+
+    def close(self):
+        if self.closed: return
+        self.closed = True
+        owned, self.fds = self.fds, []  # retire numbers BEFORE the one close attempt
+        errors = []
+        for fd in owned:
+            try: os.close(fd)
+            except BaseException as error: errors.append(error)
+        if errors: raise errors[0]
+
+
 class Journal:
     """Private durable journal. flock only prevents duplicate controllers;
     actual dispatch exclusion is cgroup.freeze, never this lock."""
@@ -755,8 +950,84 @@ class Fence:
         self.phase = 'new'
         self.pending = None
         self.return_started = False
+        self.passive = False
+        self.live_offer = None
+        self.escrow = False
+
+    def stage_live(self, association_sha256):
+        self.require(('held', 'empty'), self.owner)
+        need(not self.passive and self.live_offer is None and HEX64.fullmatch(association_sha256),
+             'live succession already staged')
+        self.check()
+        held = self.kernel.live_capabilities(self.expected)
+        rows = [capability(self.journal.fd, 'host.journal', 'journal')]+[row for row, fd in held]
+        fds = [self.journal.fd]+[fd for row, fd in held]
+        state = {'original': self.original, 'expected': self.expected, 'owner': self.owner,
+                 'frozen': self.frozen, 'dead': self.dead, 'phase': self.phase,
+                 'pending': self.pending, 'returnStarted': self.return_started,
+                 'associationSha256': association_sha256}
+        self.live_offer = LiveFenceOffer(copy.deepcopy(state), copy.deepcopy(rows), fds)
+        self.live_offer.check()
+        return self.live_offer
+
+    def surrender_live(self, offer_sha256, commit_sha256):
+        need(self.live_offer is not None and not self.passive and
+             self.live_offer.sha256 == offer_sha256 and HEX64.fullmatch(commit_sha256), 'live succession binding')
+        self.check(); self.live_offer.check()
+        # Separate durable intent, not a replacement host hold / second COMMIT.
+        row = live_encode({'liveOfferSha256': offer_sha256, 'commitSha256': commit_sha256})
+        fd = os.open('succession-intent.json', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,
+                     0o600, dir_fd=self.journal.fd)
+        self.passive = True  # even a failed fsync must forbid a second journal writer
+        try:
+            view = memoryview(row)
+            while view:
+                count = os.write(fd, view); need(count > 0, 'succession short write'); view = view[count:]
+            os.fsync(fd)
+        finally: os.close(fd)
+        os.fsync(self.journal.fd)
+        fd = os.open('succession-intent.json', os.O_RDONLY|os.O_NOFOLLOW, dir_fd=self.journal.fd)
+        try: need(os.read(fd, len(row)+1) == row, 'succession intent unknown')
+        finally: os.close(fd)
+        return live_sha(row)
+
+    @classmethod
+    def accept_live(cls, offer, kernel):
+        need(type(offer) is LiveFenceOffer and offer.received and not offer.closed, 'actual live receive required')
+        offer.check()
+        state = offer.state
+        need(set(state) == {'original','expected','owner','frozen','dead','phase','pending','returnStarted',
+                           'associationSha256'} and state['phase'] in ('held','empty') and
+             state['pending'] is None and state['returnStarted'] is False, 'live Fence state refused')
+        # Never Journal.__init__ / Fence(expected-from-disk). Both would acquire NEW authority.
+        journal = object.__new__(Journal)
+        journal.fd = offer.fds[0]; journal.path = Path(offer.rows[0]['path'])
+        result = object.__new__(cls)
+        result.original = copy.deepcopy(state['original']); result.expected = copy.deepcopy(state['expected'])
+        result.owner = state['owner']; result.frozen = list(state['frozen']); result.dead = state['dead']
+        result.phase = state['phase']; result.pending = None; result.return_started = False
+        result.kernel = kernel; result.journal = journal; result.passive = False
+        result.escrow = True; result.live_offer = offer
+        kernel._live = list(zip(offer.rows[1:], offer.fds[1:]))
+        kernel.pins = {g: pin['inode'] for g, pin in result.expected['groups'].items()}
+        result.check()
+        return result
+
+    def consume_live(self, commit_sha256, transcript_sha256):
+        need(self.escrow and HEX64.fullmatch(commit_sha256) and HEX64.fullmatch(transcript_sha256),
+             'live Fence escrow required')
+        self.check()
+        raw = live_encode({'liveOfferSha256': self.live_offer.sha256, 'commitSha256': commit_sha256})
+        fd = os.open('succession-intent.json', os.O_RDONLY|os.O_NOFOLLOW, dir_fd=self.journal.fd)
+        try: need(os.read(fd, len(raw)+1) == raw and live_sha(raw) == transcript_sha256, 'passive surrender required')
+        finally: os.close(fd)
+        self.escrow = False
+        # No post-fresh thaw authority is ever added to this object.
+        self.passive = True
+        return self.check()
 
     def record(self, phase, **extra):
+        need(not self.passive and not self.escrow, 'passive original Fence cannot write')
         self.phase = phase
         if phase == 'intent':
             self.pending = copy.deepcopy(extra)
@@ -767,6 +1038,9 @@ class Fence:
                            'dead': self.dead, **extra})
 
     def unknown(self):
+        if self.passive or self.escrow:
+            # A passive exporter or staged receiver is not a second journal writer.
+            return
         # Never thaw in any failure path, including signals, EOF or journal failure.
         phase = ('return-unknown' if self.return_started else
                  'committed-activation-unknown' if 'classicActivation' in self.expected else 'unknown')
@@ -802,8 +1076,12 @@ class Fence:
     def check(self):
         self.require(('held', 'empty', 'committed-backend-active'))
         try:
+            if getattr(self.kernel, '_live', None) is not None:
+                self.kernel.check_live_capabilities()
             self.kernel.verify(self.expected, self.frozen, self.dead)
         except BaseException:
+            if self.passive or self.escrow:
+                raise  # never write the original journal from a passive copy
             if 'classicActivation' in self.expected:
                 self.record('committed-activation-unknown')
             else:

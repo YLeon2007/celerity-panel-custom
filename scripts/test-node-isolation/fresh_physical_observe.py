@@ -19,8 +19,8 @@ SOURCE_PINS = {
     '/usr/local/libexec/c3-test-fresh-physical.py': 'f2d0622c796a6e4e549d76bf3a6abb36218ee0402005957bfb7c6cc4b7877d6f',
     '/usr/local/libexec/c3-test-fresh-physical-exec.py': '05e17f363e52e0c7cb0010999fbd4f8157de8ac95e74dad618f6e0f18a281fda',
     '/usr/local/libexec/c3-test-fresh-physical-watch.py': 'edd33f724b390aeb763bf4c8125a287367657019463946675d5eebdbb4aa4b0e',
-    '/usr/local/libexec/c3-test-coordinated-restore.py': '774da46f751a3f19492982af08aaf64cc7a3e25e473b739d1b438c81119e6183',
-    '/usr/local/libexec/c3-test-fresh-classic.py': '2e028400b9067fcddb17e0a7599f1032b23436517d2e3a4424e56c7f306ea53a',
+    '/usr/local/libexec/c3-test-coordinated-restore.py': '651c3f6d5acd63c06ec55408d7a0ac47fc17d3f43ccee692de5156699aed8b6c',
+    '/usr/local/libexec/c3-test-fresh-classic.py': '5a2ba4c114cc04f1b3879d78bf00667a611c46838cfac97669f62527c660c4a5',
     '/etc/systemd/system/c3-test-fresh-prepare-watch.service': '97b16b9583f7da3a59ae0569e05006384a07aaa7bac6973c43052350505e92f7',
     '/etc/systemd/system/c3-test-fresh-classic.service': '03009f943c76e1675c7f2488962c9a223c9ba0901d302fa11fc4873f63812c6d',
 }

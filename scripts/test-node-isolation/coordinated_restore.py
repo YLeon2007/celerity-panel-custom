@@ -166,6 +166,13 @@ def validate(config):
     return config
 
 
+def fresh_root_input(fs):
+    try: return fs.read_json('/etc/celerity/topology-test-fresh-owner-settlement.json')
+    except FileNotFoundError:
+        if fs.fixture is None: raise
+        return {}  # preserved legacy disposable fixtures have no root composition
+
+
 class Wire:
     """Bounded newline codec: no text buffering, credentials or permissive fields."""
     def __init__(self, reader, writer, deadline):
@@ -590,8 +597,30 @@ class Coordinator:
         self.check()
         self.activation_confirmed = True
 
+    def prepare_fresh_network(self, policy):
+        root = fresh_root_input(self.fs)
+        selected = 'networkPlanSha256' in root
+        need(selected == ('networkPlanSha256' in policy['inventory']), 'ROOT_POLICY_NETWORK_SELECTION_MISMATCH')
+        if not selected: return None
+        need(root.get('version') == 2 and self.config['version'] == 2 and
+             type(root['networkPlanSha256']) is str and DIGEST.fullmatch(root['networkPlanSha256']) and
+             root['networkPlanSha256'] == policy['inventory']['networkPlanSha256'], 'ROOT_V2_NETWORK_SELECTION_REQUIRED')
+        shared = network_composition(self.fs,self.config,root,policy)
+        path = '/usr/local/libexec/c3-test-fresh-network-control.py'
+        import types
+        raw = self.fs.read(path)[0]
+        need(sha(raw) == shared['runtimePins'][path], 'NETWORK_CONTROL_SOURCE_PIN_REQUIRED')
+        module = types.ModuleType('c3_fresh_network_control'); module.__file__ = path
+        exec(compile(raw,path,'exec'),module.__dict__)
+        self.network = module.coordinator_network(self,policy)
+        self.network_receipt = None
+        return self.network.prepare_ordinary()
+
     def finish_handoff(self):
         need(self.activation_confirmed and not self.handoff_completed, 'COMMITTED_ACTIVATION_UNKNOWN')
+        if getattr(self,'network',None) is not None:
+            need(self.network_receipt is not None and self.network.read_ordinary() == self.network_receipt,
+                 'ORDINARY_NETWORK_ACCEPTANCE_REQUIRED')
         self.check()
         for index, channel in enumerate(self.nodes):
             remaining = self.nodes[index:]
@@ -672,6 +701,12 @@ class Coordinator:
         try:
             if primary is None:
                 need(self.handoff_completed and not self.active, 'FRESH_COMPLETION_REQUIRED')
+                if getattr(self,'network',None) is not None:
+                    current = self.network.read_ordinary()
+                    need(current == self.network_receipt and current['commitSha256'] == self.commit_sha,
+                         'FRESH_ORDINARY_READBACK_REQUIRED')
+                    reply['networkOwnershipSha256'] = current['networkOwnershipSha256']
+                    self.network.close(); self.network = None
                 wire.send(reply)
         except BaseException as error:
             primary = error
@@ -849,22 +884,34 @@ class RestorationChannel:
             raise
 
     def fresh_handoff(self, proof):
-        """One terminal send. Lost reply may have executed: never replay/check."""
+        """One terminal send. Root-selected grammar, no public proof switch."""
         try:
             self.state()
             need(not self.fresh_attempted and not self.commit_attempted, 'FRESH_REPLAY_FORBIDDEN')
+            root = fresh_root_input(self.fs)
+            network = 'networkPlanSha256' in root
+            if network:
+                need(root.get('version') == 2 and self.config['version'] == 2 and
+                     type(root['networkPlanSha256']) is str and DIGEST.fullmatch(root['networkPlanSha256']),
+                     'ROOT_V2_NETWORK_SELECTION_REQUIRED')
+                policy = self.fs.read_json('/etc/c3-test-fresh-classic.json')
+                network_composition(self.fs,self.config,root,policy)
             request = {**self.frame('fresh-handback'), 'proof': proof}
             self.fresh_attempted = True
             self.wire.send(request)
             reply = self.wire.receive()
             expected = {k: v for k, v in request.items() if k != 'proof'}
-            need(set(reply) == set(expected) | {'commitSha256', 'nextNonce'} and
+            need(set(reply) == set(expected) | {'commitSha256', 'nextNonce'} |
+                 ({'networkOwnershipSha256'} if network else set()) and
                  {k: reply[k] for k in expected} == {**expected, 'op': 'fresh-handback-ack'} and
                  isinstance(reply['commitSha256'], str) and DIGEST.fullmatch(reply['commitSha256']) and
                  isinstance(reply['nextNonce'], str) and DIGEST.fullmatch(reply['nextNonce']))
+            if network:
+                need(type(reply['networkOwnershipSha256']) is str and DIGEST.fullmatch(reply['networkOwnershipSha256']),
+                     'EXACT_NETWORK_OWNERSHIP_ACK_REQUIRED')
             self.committed = True
             self.close()  # terminal; no state()/h.check after released holds
-            return reply['commitSha256']
+            return {key:reply[key] for key in ('commitSha256','networkOwnershipSha256')} if network else reply['commitSha256']
         except BaseException as error:
             if self.fresh_attempted:
                 error.code = 'COMMITTED_ACTIVATION_UNKNOWN'
@@ -918,15 +965,38 @@ class RestorationChannel:
             self.close(primary)
 
 
+def network_composition(fs,config,root,policy):
+    """Same fixed root/source/physical bindings for both terminal consumers."""
+    raw = fs.read('/etc/c3-test-fresh-network.json')[0]; network = decode(raw)
+    shared = fs.read_json('/etc/c3-test-node-isolation.json')
+    inv = policy['inventory']; accepted = config['nodes'][shared_node(config)]
+    source = sha(fs.read(SELF)[0]); fresh = sha(fs.read(FRESH)[0])
+    need(type(root.get('version')) is int and root['version'] == config['version'] == 2 and
+         type(root.get('networkPlanSha256')) is str and DIGEST.fullmatch(root['networkPlanSha256']) and
+         sha(raw) == root['networkPlanSha256'] == inv.get('networkPlanSha256') ==
+         shared['hostHold'].get('networkPlanSha256') and shared.get('version') == 2 and
+         type(network.get('ordinaryOwner',{}).get('version')) is int and network['ordinaryOwner']['version'] == 1 and
+         inv['coordinatorSha256'] == sha(canonical(config)) and
+         inv['sourceSha256'] == policy['files'][SELF] == root['coordinatorSha256'] == source and
+         policy['files'][FRESH] == fresh and
+         sha(canonical(shared)) == accepted['identity']['planHash'] and
+         all(network[n] == shared[s] == config['origin'][s] for n,s in (('machine','machineId'),('boot','bootId'))) and
+         sha(fs.read(SHARED)[0]) == accepted['files']['shared'] and
+         sha(fs.read('/usr/local/libexec/c3-test-node-isolation')[0]) == accepted['files']['isolation'] and
+         sha(fs.read(FREEZER)[0]) == accepted['files']['freezer'] == shared['hostHold']['freezerSha256'],
+         'NETWORK_COMPOSITION_BINDING_REQUIRED')
+    return shared
+
+
 def trusted_read(path):
     """Bootstrap without importing user-writable Python on a privileged path."""
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOATIME | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         parts = Path(path).parts[1:]
         for index, part in enumerate(parts):
-            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME | os.O_CLOEXEC |
                             (os.O_DIRECTORY if index < len(parts)-1 else 0), dir_fd=fd)
-            os.close(fd); fd = child
+            previous,fd = fd,child; os.close(previous)
             info = os.fstat(fd)
             need(info.st_uid == 0 and info.st_gid == 0 and not info.st_mode & 0o022)
             need(stat.S_ISDIR(info.st_mode) if index < len(parts)-1 else stat.S_ISREG(info.st_mode) and info.st_nlink == 1)

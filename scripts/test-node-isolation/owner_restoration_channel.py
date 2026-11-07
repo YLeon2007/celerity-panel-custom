@@ -28,14 +28,14 @@ def need(ok):
 
 
 def trusted_read(path):
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOATIME | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         parts = Path(path).parts[1:]
         for i, part in enumerate(parts):
-            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME | os.O_CLOEXEC |
                             (os.O_DIRECTORY if i < len(parts)-1 else 0), dir_fd=fd)
-            os.close(fd)
-            fd = child
+            previous,fd = fd,child
+            os.close(previous)
             st = os.fstat(fd)
             need(st.st_uid == 0 and st.st_gid == 0 and not st.st_mode & 0o022)
             need(stat.S_ISDIR(st.st_mode) if i < len(parts)-1 else stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
@@ -81,7 +81,12 @@ def serve(channel, reader=0, writer=1, *, lifetime=115, fresh=False):
             answer = {**request, 'op': 'checked'}
         else:
             digest = channel.fresh_handoff(request['proof']) if fresh else channel.handoff(request['op'], request.get('proof'))
-            answer = {k: v for k, v in {**request, 'op': request['op']+'-ack', 'commitSha256': digest}.items() if k != 'proof'}
+            if type(digest) is dict:
+                need(fresh and request['op'] == 'fresh-handback' and set(digest) == {'commitSha256','networkOwnershipSha256'} and
+                     all(type(v) is str and len(v) == 64 and all(c in '0123456789abcdef' for c in v) for v in digest.values()))
+                answer = {k:v for k,v in {**request,'op':'fresh-handback-ack',**digest}.items() if k != 'proof'}
+            else:
+                answer = {k: v for k, v in {**request, 'op': request['op']+'-ack', 'commitSha256': digest}.items() if k != 'proof'}
         reply = json.dumps(answer, separators=(',', ':')).encode() + b'\n'
         need(os.write(writer, reply) == len(reply))
         if request['op'] in ('complete-handoff', 'fresh-handback'):

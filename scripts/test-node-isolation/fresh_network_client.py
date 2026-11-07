@@ -17,9 +17,9 @@ CONTROL = '/usr/local/libexec/c3-test-fresh-network-control.py'
 SERVER_ENTRY = '/usr/local/libexec/c3-test-fresh-network-exec.py'
 CLIENT = '/usr/local/libexec/c3-test-fresh-network-client.py'
 SOURCE_PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': 'c19502319007c64068f4dcb986e85717a456487a63ee8ca2c21a64df20a2fb76',
-    CONTROL: 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
-    SERVER_ENTRY: '3b446fb433991cdb3e74c28d3023e1e75cb2ba2f2fa3536b26ba319e0ec3362a',
+    '/usr/local/libexec/c3-test-fresh-network.py': '0565e205fbd8bbf5c3da9a972d43ff7ecb934f1777168abe207781fb027af1cd',
+    CONTROL: '71377f830691d5c1f3b19231c59c108458a5518992d063c524d41b81877deaff',
+    SERVER_ENTRY: '46fc7929615f1c32d09d70fc2eb2c09071ae85b25cbcf28d441ecc2beea1c450',
 }
 OPERATIONS = ('observe', 'cutover', 'return', 'abandon')
 IO_SECONDS = 3
@@ -213,7 +213,7 @@ class Holder:
             m.keys(value['holder'], 'pid start')
             m.need(type(value['holder']['pid']) is int and value['holder']['pid'] == self.pid and
                    type(value['holder']['start']) is str and value['holder']['start'] == self.start and
-                   value['operations'] == list(OPERATIONS), 'EXACT_CURRENT_PID_LEASE_REQUIRED')
+                   value['operations'] == list(OPERATIONS)+(['handoff'] if 'ordinaryOwner' in self.p else []), 'EXACT_CURRENT_PID_LEASE_REQUIRED')
             self.lease = self.control.Lease(m, self.p, self.plan.raw)
             while True:
                 self.check()
@@ -265,7 +265,7 @@ class Holder:
 
     def receive(self, phase, sequence):
         m = self.m
-        end = time.monotonic()+IO_SECONDS
+        end = self.terminal_end if phase == 'handed-off' else time.monotonic()+IO_SECONDS
         def exact(size):
             raw = bytearray()
             while len(raw) < size:
@@ -278,7 +278,13 @@ class Holder:
         m.need(0 < size <= m.LIMIT, 'BOUNDED_REPLY_REQUIRED')
         result = m.decode(exact(size).decode('utf-8'))
         _json_types(m, result)
-        if phase == 'abandoned':
+        if phase == 'handed-off':
+            m.keys(result,'generation sequence operation commitSha256 networkOwnershipSha256')
+            m.need({k:result[k] for k in ('generation','sequence','operation')} ==
+                   {'generation':self.p['generation'],'sequence':sequence,'operation':'handoff'}, 'EXACT_HANDOFF_REPLY_REQUIRED')
+            m.pin(result['commitSha256']); m.pin(result['networkOwnershipSha256'])
+            self.handoff_reply = result
+        elif phase == 'abandoned':
             m.keys(result, 'phase operationalGO')  # actual server's deliberately small ACK
             m.need(type(result['phase']) is str and result['phase'] == phase and
                    result['operationalGO'] is False, 'ABANDON_ACK_REQUIRED')
@@ -314,12 +320,14 @@ class Holder:
         m = self.m
         try:
             self.check()
-            m.need(type(operation) is str and operation in OPERATIONS and
+            operations = (*OPERATIONS,'handoff') if 'ordinaryOwner' in self.p else OPERATIONS
+            m.need(type(operation) is str and operation in operations and
                    self.phase in ('prepared', 'cutover', 'returned') and
                    self.sequence < MAX_REQUESTS, 'FINITE_CLOSED_OPERATION_REQUIRED')
             phase = self.phase if operation == 'observe' else {
                 ('prepared', 'cutover'): 'cutover', ('cutover', 'return'): 'returned',
                 ('prepared', 'abandon'): 'abandoned', ('returned', 'abandon'): 'abandoned',
+                ('prepared', 'handoff'): 'handed-off',
             }.get((self.phase, operation))
             m.need(phase is not None, 'PHASE_TRANSITION_REFUSED')
             self.quiet()
@@ -328,6 +336,7 @@ class Holder:
             m.need(len(raw) <= 4096, 'BOUNDED_REQUEST_REQUIRED')
             self.channel.settimeout(self.budget(time.monotonic()+IO_SECONDS))
             self.check()
+            if operation == 'handoff': self.terminal_end = min(self.end,time.monotonic()+115)
             self.channel.sendall(struct.pack('!I', len(raw))+raw)
             result = self.receive(phase, self.sequence+1)
             self.sequence += 1; self.phase = phase
@@ -341,6 +350,28 @@ class Holder:
         # Continue owned descriptor disposal after a close fault, but never hide it.
         errors = []
         if self.closed: return
+        if self.phase == 'handed-off' and getattr(self,'handoff_reply',None) is not None:
+            self.closed = True
+            owned,self.inputs = self.inputs,[]
+            lease,self.lease = self.lease,None
+            fds = [getattr(self,key) for key in ('socketfd','serverfd','pidfd')]
+            self.socketfd = self.serverfd = self.pidfd = None
+            for item in [lease,*reversed(owned),*fds]:
+                if item is not None:
+                    try: os.close(item) if type(item) is int else item.close()
+                    except BaseException as error: errors.append(error)
+            channel,self.channel = self.channel,None
+            try:
+                self.m.need(not errors and time.monotonic() < self.terminal_end and time.time() < self.p['deadline'],
+                            'HOLDER_REQUIRED_DISPOSAL_UNKNOWN')
+                channel.settimeout(max(.001,min(IO_SECONDS,self.terminal_end-time.monotonic())))
+                self.control.send(channel,{'op':'holder-disposed',**self.handoff_reply},self.m)
+            except BaseException as error: errors.append(error)
+            finally:
+                try: channel.close()
+                except BaseException as error: errors.append(error)
+            if errors: raise errors[0]
+            return
         if self.phase != 'abandoned' or not self.abandon_ack: self.poison()
         self.closed = True
         for item in [self.channel, self.lease, *reversed(self.inputs)]:
@@ -397,7 +428,7 @@ def run(m, control):
         _emit(holder, holder.connect())
         heartbeat = time.monotonic()+HEARTBEAT_SECONDS
         line = bytearray(); line_end = None; commands = 0
-        while holder.phase != 'abandoned':
+        while holder.phase not in ('abandoned','handed-off'):
             holder.check()
             m.need(pins == (_pipe(m, 0, os.O_RDONLY), _pipe(m, 1, os.O_WRONLY)), 'OPERATOR_PIPE_DRIFT')
             now = time.monotonic()
@@ -414,12 +445,12 @@ def run(m, control):
                 m.need(len(line) <= 8, 'CLOSED_OPERATOR_VERB_REQUIRED')
                 if byte == b'\n':
                     operation = bytes(line[:-1]).decode('ascii')
-                    m.need(operation in OPERATIONS and commands < 64, 'FINITE_OPERATOR_SELECTION_REQUIRED')
+                    m.need(operation in ((*OPERATIONS,'handoff') if 'ordinaryOwner' in holder.p else OPERATIONS) and commands < 64, 'FINITE_OPERATOR_SELECTION_REQUIRED')
                     commands += 1
                     _emit(holder, holder.dispatch(operation))
                     line.clear(); line_end = None
                     heartbeat = time.monotonic()+HEARTBEAT_SECONDS
-            if holder.phase != 'abandoned' and time.monotonic() >= heartbeat:
+            if holder.phase not in ('abandoned','handed-off') and time.monotonic() >= heartbeat:
                 _emit(holder, holder.dispatch('observe'))  # read-only heartbeat, never renewal
                 heartbeat = time.monotonic()+HEARTBEAT_SECONDS
         holder.check()

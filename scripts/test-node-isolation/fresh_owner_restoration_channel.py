@@ -10,13 +10,13 @@ import types
 sys.dont_write_bytecode = True
 
 def trusted_read(path):
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOATIME | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         for index, part in enumerate(Path(path).parts[1:]):
             final = index == len(Path(path).parts[1:]) - 1
-            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK |
+            child = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME | os.O_CLOEXEC |
                             (0 if final else os.O_DIRECTORY), dir_fd=fd)
-            os.close(fd); fd = child
+            previous,fd = fd,child; os.close(previous)
             s = os.fstat(fd)
             if s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
                 raise RuntimeError('UNTRUSTED_FRESH_ROOT_SOURCE')

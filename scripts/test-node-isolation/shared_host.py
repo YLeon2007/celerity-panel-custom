@@ -28,9 +28,17 @@ def validate_plan(p, m):
         m.need(p['mode'] == 'shared-test' and p['nodeId'] == NODE and
                p['endpointIp'] == ENDPOINT and p['targetProfile'] == 'xray-bridge' and
                p['machineId'] == MACHINE, 'SHARED_TEST_IDENTITY_REQUIRED')
-    m.validate_common_plan({k: p[k] for k in m.plan_keys(p)})
     hold = p['hostHold']
-    m.need(isinstance(hold, dict) and set(hold) == {'owner', 'freezerSha256', 'expected'}, 'HOST_HOLD_REQUIRED')
+    network = isinstance(hold, dict) and 'networkPlanSha256' in hold
+    common = {k:p[k] for k in m.plan_keys(p)}
+    if network: m.validate_common_plan(common,network_bound=True)
+    else: m.validate_common_plan(common)
+    m.need(isinstance(hold, dict) and set(hold) == {'owner', 'freezerSha256', 'expected'} |
+           ({'networkPlanSha256'} if network else set()), 'HOST_HOLD_REQUIRED')
+    if network:
+        m.need(p.get('version') == 2 and type(hold['networkPlanSha256']) is str and
+               re.fullmatch('[a-f0-9]{64}', hold['networkPlanSha256']) and
+               '/system.slice/c3-test-fresh-network.service' in p['keepCgroups'], 'NETWORK_SUCCESSOR_BINDING_REQUIRED')
     m.need(isinstance(hold['owner'], str) and str(uuid.UUID(hold['owner'])) == hold['owner'], 'HOST_OWNER_REQUIRED')
     m.need(isinstance(hold['freezerSha256'], str) and re.fullmatch('[a-f0-9]{64}', hold['freezerSha256']), 'FREEZER_PIN_REQUIRED')
     e = hold['expected']
@@ -166,8 +174,13 @@ def load_freezer(p, m):
         # caller validation or forward the plan's machineId as authority.
         validate_plan(p, m)
         expected_machine_id = m.inventory_node(p)['physical']['machineId']
-    m.need(m.digest(m.secure_file(FREEZER)) == p['hostHold']['freezerSha256'], 'FREEZER_SOURCE_DRIFT')
+    raw = m.secure_file(FREEZER)
+    m.need(m.digest(raw) == p['hostHold']['freezerSha256'], 'FREEZER_SOURCE_DRIFT')
     spec = importlib.util.spec_from_file_location('c3_host_freezer', FREEZER)
+    m.need(spec is not None and spec.loader is not None, 'FIXED_FREEZER_LOADER_REQUIRED')
+    # Keep the existing loader seam, but execute only the verified buffer: no
+    # second source read, timestamp race or bytecode cache acceptance.
+    spec.loader.get_code = lambda _name: compile(raw, FREEZER, 'exec')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     kernel = module.LinuxKernel()
@@ -387,13 +400,16 @@ def receive_request(conn, m):
         try:
             conn.settimeout(3)
             request, ancillary, flags, _ = conn.recvmsg(1025, socket.CMSG_SPACE(16 * array.array('i').itemsize))
+            invalid = False
             for level, kind, data in ancillary:
                 if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                    values = array.array('i'); values.frombytes(data)
-                    rights.extend(values)
+                    values = array.array('i')
+                    usable = len(data)-len(data) % values.itemsize
+                    values.frombytes(data[:usable]); rights.extend(values)
+                    invalid |= usable != len(data)
                 else:
-                    m.need(False, 'INVALID_HOST_RIGHTS')
-            m.need(not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC), 'INVALID_HOST_RIGHTS')
+                    invalid = True
+            m.need(not invalid and not flags & (socket.MSG_CTRUNC | socket.MSG_TRUNC), 'INVALID_HOST_RIGHTS')
             while not request.endswith(b'\n') and len(request) <= 1024:
                 chunk = conn.recv(1025)
                 m.need(bool(chunk), 'HOST_CLIENT_LOST')
@@ -404,6 +420,45 @@ def receive_request(conn, m):
             for fd in rights:
                 os.close(fd)
     return receive()
+
+
+def network_peer(conn, p, m, frame):
+    """Authenticate the preaccepted existing unit, never a caller-selected helper."""
+    import subprocess
+    peer, uid, gid = peer_identity(conn)
+    m.need(uid == gid == 0 and 'networkPlanSha256' in p['hostHold'], 'NETWORK_SUCCESSOR_NOT_SELECTED')
+    raw = m.secure_file('/etc/c3-test-fresh-network.json')
+    plan = m.decode_json(raw)
+    m.need(m.digest(raw) == p['hostHold']['networkPlanSha256'] and plan.get('ordinaryOwner',{}).get('version') == 1 and
+           plan['machine'] == p['machineId'] and plan['boot'] == p['bootId'], 'ACCEPTED_NETWORK_PLAN_REQUIRED')
+    lease_raw = m.secure_file('/etc/c3-test-fresh-network-lease.json'); lease = m.decode_json(lease_raw)
+    m.need(lease['planSha256'] == m.digest(raw) and lease['generation'] == plan['generation'] and
+           lease['operations'] == ['observe','cutover','return','abandon','handoff'] and
+           type(lease['deadline']) is int and m.time.time() < lease['deadline'] == plan['deadline'], 'LIVE_NETWORK_LEASE_REQUIRED')
+    unit = 'c3-test-fresh-network.service'
+    output = subprocess.run(['/usr/bin/systemctl','show','--all',unit,
+        *['--property='+key for key in ('Id','Names','MainPID','ExecMainPID','InvocationID','ControlGroup',
+                                      'FragmentPath','DropInPaths','LoadState','ActiveState','SubState','Job')]],
+        check=True,timeout=3,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout
+    m.need(len(output) <= 65536, 'NETWORK_UNIT_REPLY_LIMIT')
+    row = dict(line.split('=',1) for line in output.decode().splitlines() if '=' in line)
+    m.need(row.get('Id') == unit and row.get('Names','').split() == [unit] and
+           row.get('MainPID') == row.get('ExecMainPID') == str(peer) and
+           row.get('ControlGroup') == '/system.slice/'+unit and
+           row.get('FragmentPath') == '/etc/systemd/system/'+unit and not row.get('DropInPaths') and
+           row.get('LoadState') == 'loaded' and row.get('ActiveState') == 'active' and
+           row.get('SubState') == 'running' and row.get('Job','') in ('','0'), 'EXACT_NETWORK_UNIT_PEER_REQUIRED')
+    for path in ('/usr/local/libexec/c3-test-fresh-network-exec.py',
+                 '/usr/local/libexec/c3-test-fresh-network-control.py', '/usr/local/libexec/c3-test-fresh-network.py'):
+        m.need(path in p['runtimePins'] and m.digest(m.secure_file(path)) == p['runtimePins'][path], 'NETWORK_SOURCE_ASSOCIATION_REQUIRED')
+    unit_path = '/etc/systemd/system/'+unit
+    m.need(unit_path in p['unitFilePins'] and m.digest(m.secure_file(unit_path)) == p['unitFilePins'][unit_path],
+           'NETWORK_UNIT_SOURCE_REQUIRED')
+    current = m.proc_identity(peer)
+    m.need(pathlib.Path('/proc', str(peer), 'cgroup').read_text() == '0::/system.slice/'+unit+'\n' and
+           frame == {'pid':peer,'start':current['start'],'invocation':row['InvocationID'],
+                     'networkPlanSha256':m.digest(raw),'leaseSha256':m.digest(lease_raw)}, 'NETWORK_PEER_ASSOCIATION_DRIFT')
+    return frame
 
 
 def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
@@ -433,6 +488,12 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
     identity.update(socket=str(pathlib.Path(directory) / 'host.sock'), owner=p['hostHold']['owner'],
                     planHash=plan_hash(p, m), session=session)
     isolation_peer = None  # Process-local only, never reconstructed from a journal.
+    network_selected = 'networkPlanSha256' in p['hostHold']
+    armed = False
+    successor = None
+    network_binding = None
+    coordinator_binding = None
+    primary = None
 
     def interrupted(*args):
         raise InterruptedError('host guard interrupted')
@@ -451,17 +512,20 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, interrupted)
     try:
-        fence.arm()
-        check()
+        if not network_selected:
+            fence.arm(); armed = True
+            check()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
             server.bind(identity['socket'])  # Never replace/adopt a prior socket.
             os.chmod(identity['socket'], 0o600)
             server.listen(4)
             m.atomic_json(directory, 'host-guard.json', identity)
-            print(m.json.dumps({'hostHoldReady': True, 'owner': fence.owner,
-                               'notApplicationAuthority': True}), flush=True)
+            if armed:
+                print(m.json.dumps({'hostHoldReady': True, 'owner': fence.owner,
+                                   'notApplicationAuthority': True}), flush=True)
             while True:
-                check()
+                if armed: check()
+                else: return_check()
                 ready, _, _ = select.select([server, infd], [], [], .2)
                 if infd in ready:
                     # The supervising SSH channel must stay open; no stdin commands.
@@ -478,6 +542,57 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                         command = 'check'
                     else:
                         frame = m.decode_json(request)
+                        if type(frame) is dict and frame.get('command') in ('network-check','stage-network-successor',
+                                'surrender-network-successor','finish-network-successor'):
+                            op = frame['command']
+                            fields = {'nonce','command','owner','planHash','network'}
+                            fields |= {'coordinator'} if op == 'stage-network-successor' else set()
+                            fields |= {'commitSha256'} if op in ('surrender-network-successor','finish-network-successor') else set()
+                            m.need(network_selected and not rights and set(frame) == fields and
+                                   frame['owner'] == identity['owner'] and frame['planHash'] == identity['planHash'] and
+                                   type(frame['nonce']) is str and re.fullmatch('[a-f0-9]{64}',frame['nonce']), 'INVALID_NETWORK_CHALLENGE')
+                            association = network_peer(conn, p, m, frame['network'])
+                            if network_binding is None: network_binding = association
+                            m.need(association == network_binding, 'NETWORK_SUCCESSOR_REPLACED')
+                            if not armed:
+                                m.need(op == 'network-check', 'PREARM_RENDEZVOUS_REQUIRED')
+                                fence.arm(); armed = True; check()
+                                print(m.json.dumps({'hostHoldReady':True,'owner':fence.owner,
+                                                   'notApplicationAuthority':True}), flush=True)
+                            check()
+                            if op == 'stage-network-successor':
+                                m.need(successor is None and 'candidateClosure' in fence.expected, 'ONE_CLOSED_CANDIDATE_SUCCESSION_REQUIRED')
+                                intent = m.decode_json(m.secure_file(pathlib.Path(directory)/'coordinated-restore.json'))
+                                coordinator_binding = frame['coordinator']
+                                m.need(set(coordinator_binding) == {'pid','start','nonce'} and
+                                       {k:coordinator_binding[k] for k in ('pid','start')} ==
+                                       {k:intent['origin'][k] for k in ('pid','start')} and
+                                       coordinator_binding['nonce'] == intent['nonce'] and intent['phase'] == 'restored-held' and
+                                       m.proc_identity(coordinator_binding['pid'])['start'] == coordinator_binding['start'], 'SAME_COORDINATOR_REQUIRED')
+                                successor = fence.stage_live(m.digest(freezer.live_encode({'network':association,'coordinator':coordinator_binding})))
+                                successor.send(conn)
+                                continue
+                            transcript = None
+                            if op in ('surrender-network-successor','finish-network-successor'):
+                                commit_raw = m.secure_file(pathlib.Path(directory)/'handoff-commit.json')
+                                commit = m.decode_json(commit_raw)
+                                m.need(successor is not None and m.digest(commit_raw) == frame['commitSha256'] and
+                                       commit['nonce'] == coordinator_binding['nonce'] and
+                                       commit['networkHandoff']['recipientInvocationId'] == association['invocation'] and
+                                       commit['networkHandoff']['networkPlanSha256'] == p['hostHold']['networkPlanSha256'], 'ORIGINAL_NETWORK_COMMIT_REQUIRED')
+                                if op == 'surrender-network-successor':
+                                    transcript = fence.surrender_live(successor.sha256, frame['commitSha256'])
+                                else:
+                                    intent = m.decode_json(m.secure_file(pathlib.Path(directory)/'coordinated-restore.json'))
+                                    m.need(fence.passive and intent['phase'] == 'handoff-completed' and
+                                           intent['nonce'] == coordinator_binding['nonce'], 'ACTUAL_NODE_CLEANUP_REQUIRED')
+                            answer = {'nonce':frame['nonce'],'identity':identity,
+                                      'recordSha256':m.digest(m.secure_file(pathlib.Path(directory)/'host/hold.json'))}
+                            if transcript is not None: answer['transcriptSha256'] = transcript
+                            conn.sendall((m.json.dumps(answer)+'\n').encode())
+                            if op == 'finish-network-successor': return
+                            continue
+                        m.need(armed, 'PREARM_RENDEZVOUS_REQUIRED')
                         early = frame.get('command') in ('begin-isolation', 'abort-return')
                         keys = {'nonce', 'command', 'owner', 'planHash'}
                         keys |= {'nodeReturnSha256'} if early else {'commitSha256'} if frame.get('command') == 'activate-classic' else set()
@@ -543,8 +658,19 @@ def serve_hold(p, directory, m, freezer=None, kernel=None, host=None, infd=0):
                     raw = m.secure_file(pathlib.Path(directory) / 'host/hold.json')
                     conn.sendall((m.json.dumps({'nonce': nonce, 'identity': identity,
                                               'recordSha256': m.digest(raw)}) + '\n').encode())
-    except BaseException:
-        fence.unknown()  # No finally-thaw; candidate/control dispatch stays fenced.
+    except BaseException as error:
+        primary = error
+        try: fence.unknown()  # No finally-thaw; candidate/control dispatch stays fenced.
+        except BaseException as cleanup: error.cleanup_errors = (*getattr(error,'cleanup_errors',()),cleanup)
         raise
     finally:
-        os.close(journal.fd)
+        held = getattr(kernel,'_live',[])
+        if kernel is not None: kernel._live = []
+        errors = []
+        for fd in [*(fd for row,fd in held),journal.fd]:
+            try: os.close(fd)
+            except BaseException as error: errors.append(error)
+        if errors:
+            failure = primary if primary is not None else errors[0]
+            failure.cleanup_errors = (*getattr(failure,'cleanup_errors',()),*errors)
+            if primary is None: raise failure

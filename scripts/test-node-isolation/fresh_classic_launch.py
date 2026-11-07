@@ -153,7 +153,10 @@ def validate(policy):
          type(ingress['bodySha256']) is str and ingress['bodySha256'] == READY_BODY_SHA256, 'FIXED_TEST_INGRESS_REQUIRED')
     inv=policy['inventory']
     need(type(inv) is dict and set(inv) == {'supervisor','root','namespaces','mountinfoSha256','routesSha256',
-         'coordinatorSha256','sourceSha256','unitSha256','fdPins','hostNamespaces'}, 'INDEPENDENT_RESOURCE_INVENTORY_REQUIRED')
+         'coordinatorSha256','sourceSha256','unitSha256','fdPins','hostNamespaces'} |
+         ({'networkPlanSha256'} if 'networkPlanSha256' in inv else set()), 'INDEPENDENT_RESOURCE_INVENTORY_REQUIRED')
+    if 'networkPlanSha256' in inv:
+        need(type(inv['networkPlanSha256']) is str and c.DIGEST.fullmatch(inv['networkPlanSha256']), 'INVALID_NETWORK_POLICY_PIN')
     need(all(type(inv[k]) is str and c.DIGEST.fullmatch(inv[k]) for k in
          ('mountinfoSha256','routesSha256','coordinatorSha256','sourceSha256','unitSha256')), 'INVALID_INVENTORY_PIN')
     supervisor=inv['supervisor']
@@ -743,6 +746,10 @@ class FreshLaunch:
             policy=validate(fs.read_json(POLICY)); pin=digest(c.canonical(policy))
             need(policy['inventory']['coordinatorSha256'] == digest(c.canonical(h.config)),
                  'ACCEPTED_COORDINATOR_REQUIRED')
+            if prepared: network_binding = h.prepare_fresh_network(policy)
+            else:
+                need('networkPlanSha256' not in policy['inventory'],'FIXED_PREPARED_NETWORK_PATH_REQUIRED')
+                network_binding = None
             if fs.fixture is None:
                 with fs.opened('/run',directory=True) as fd:
                     s=os.stat(Path(SOCKET).name,dir_fd=fd,follow_symlinks=False)
@@ -775,6 +782,7 @@ class FreshLaunch:
                  'configSha256':c.sha(c.canonical(h.config)), 'restoreIntent':h.intent,
                  'nodePins':h.config['nodes'], 'nodePeers':{x.node:{'pid':x.hello['pid'],'start':x.hello['start']} for x in h.nodes},
                  'settlement':proof, 'activationSet':ACTIVATION, 'freshPolicySha256':pin,'supervisor':supervisor}
+            if network_binding is not None: row['networkHandoff'] = network_binding
             h.commit_attempted=True
             fs.atomic(c.COMMIT,c.canonical(row),new=True)
             need(fs.read_json(c.COMMIT) == row,'COMMIT_UNKNOWN_NO_ACTIVATION')
@@ -798,15 +806,21 @@ class FreshLaunch:
             fs.atomic(ATTEMPT,c.canonical(attempt)); need(fs.read_json(ATTEMPT) == attempt,'CONFIRMATION_FSYNC_UNKNOWN')
             target.check(); h.check()
             need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
+            if network_binding is not None:
+                h.network_receipt = h.network.accept_ordinary(serving)
+                need(h.network.read_ordinary() == h.network_receipt, 'ORDINARY_NETWORK_ACCEPTANCE_UNKNOWN')
+                need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
             if lifetime is not None:
                 fd=lifetime; lifetime=None; os.close(fd)
             target.close(); target=None
             need(time.monotonic() < deadline,'CONTROLLER_CONFIRMATION_TIMEOUT')
             h.activation_confirmed=True; h.finish_handoff()
+            if network_binding is not None:
+                need(h.network.finish_temporary_scope() == h.network_receipt, 'TEMPORARY_SCOPE_DISPOSAL_UNKNOWN')
             wire.send({'op':'complete','commitSha256':h.commit_sha})
             need(wire.receive() == {'op':'complete-ack'}, 'SUPERVISOR_COMPLETION_UNKNOWN')
             conn.close(); conn=None
-            return {'code':'COMMITTED_FRESH_ACTIVATION_CONFIRMED','activationSet':ACTIVATION,
+            return {'code':'COMMITTED_FRESH_NETWORK_OWNED' if network_binding is not None else 'COMMITTED_FRESH_ACTIVATION_CONFIRMED','activationSet':ACTIVATION,
                     'candidate':'closed','serving':serving}
         except BaseException as error:
             primary=error; error.code=h.failure_code()
@@ -993,6 +1007,15 @@ def supervise(listener, fs, platform=None, *, fault=None):
                 if not any('inventorySha256' in p['identity'] for p in commit['nodePins'].values()):
                     need(set(commit['nodePeers']) == set(c.NODES), 'SAME_HELD_PEER_FRESH_COMMIT_REQUIRED')
                 need(commit['configSha256'] == policy['inventory']['coordinatorSha256'], 'ACCEPTED_COORDINATOR_REQUIRED')
+                if 'networkPlanSha256' in policy['inventory']:
+                    handoff = commit.get('networkHandoff')
+                    need(type(handoff) is dict and set(handoff) == {'version','preparationSha256','generation',
+                         'networkPlanSha256','recipientInvocationId','resourceSealSha256','fdManifestSha256','disposition'} and
+                         type(handoff['version']) is int and handoff['version'] == 1 and handoff['disposition'] == 'ordinary-fresh' and
+                         handoff['networkPlanSha256'] == policy['inventory']['networkPlanSha256'] and
+                         all(type(handoff[key]) is str and c.DIGEST.fullmatch(handoff[key]) for key in
+                             ('preparationSha256','resourceSealSha256','fdManifestSha256')), 'REQUIRED_NETWORK_COMMIT_BINDING')
+                else: need('networkHandoff' not in commit,'LEGACY_NETWORK_COMMIT_REFUSED')
                 committed=True
             platform.check(policy)
             row={'phase':'exec-attempted','commitSha256':req['commitSha256'],'serving':None}

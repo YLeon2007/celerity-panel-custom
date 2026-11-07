@@ -8,21 +8,21 @@ import stat
 import sys
 
 PINS = {
-    '/usr/local/libexec/c3-test-fresh-network.py': 'c19502319007c64068f4dcb986e85717a456487a63ee8ca2c21a64df20a2fb76',
-    '/usr/local/libexec/c3-test-fresh-network-control.py': 'ced8d6264424f65f5f9d6f5c9b1f9de731953d196026e513ed6e3f13a0cd88ac',
+    '/usr/local/libexec/c3-test-fresh-network.py': '0565e205fbd8bbf5c3da9a972d43ff7ecb934f1777168abe207781fb027af1cd',
+    '/usr/local/libexec/c3-test-fresh-network-control.py': '71377f830691d5c1f3b19231c59c108458a5518992d063c524d41b81877deaff',
 }
 
 
 def load(path):
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOATIME | os.O_NOFOLLOW)
     try:
         parts = Path(path).parts[1:]
         for i, part in enumerate(parts):
-            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOATIME
             if i < len(parts)-1:
                 flags |= os.O_DIRECTORY
             child = os.open(part, flags, dir_fd=fd)
-            os.close(fd); fd = child
+            previous,fd = fd,child; os.close(previous)
             s = os.fstat(fd)
             if s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022 or os.listxattr(fd):
                 raise RuntimeError('UNTRUSTED_INSTALLED_SOURCE')
@@ -53,12 +53,12 @@ def main():
     try:
         network = load('/usr/local/libexec/c3-test-fresh-network.py')
         control = load('/usr/local/libexec/c3-test-fresh-network-control.py')
-        control.run(network)
+        result = control.run(network)
     except BaseException:
         # Never expose plan/config/credential bytes, arbitrary OS errors or traceback.
         print('NETWORK_REFUSED_UNKNOWN_RESOURCES_RETAINED', file=sys.stderr)
         return 1
-    print('NETWORK_ABANDONED_NO_GO')
+    print('NETWORK_OWNER_STOPPED_HOST_HOLDS_RETAINED' if type(result) is dict else 'NETWORK_ABANDONED_NO_GO')
     return 0
 
 

@@ -62,7 +62,7 @@ class OwnerRestorationBridgeTests(unittest.TestCase):
                         # Prove original open-file-description locks are STILL
                         # held during the actual bridge acknowledgement.
                         for fixture in f.fixtures:
-                            for path in (t.n.OUTER_LOCK, *(t.n.runner_lock(p) for p in fixture.writer.profiles)):
+                            for path in fixture.writer.lock_paths:
                                 with open(fixture.path(path), 'rb') as competitor:
                                     with self.assertRaises(BlockingIOError):
                                         fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
