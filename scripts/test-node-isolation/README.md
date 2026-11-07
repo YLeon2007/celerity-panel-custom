@@ -343,6 +343,29 @@ omit only local key/known_hosts paths, which parent must supply explicitly.
    separately after confirming no retained owner/writer. Archive state; helper
    will not start another maintenance lifecycle over its existing journal.
 
+### V2 finite caller: original-owner return after fresh confirmation
+
+Keep the original `Engine.apply` process/object and its continuously held outer
+OFD alive. After `awaiting-fresh-login`, enter
+`with engine.fresh_confirmation(lock_fd) as confirmation_fd:` and transfer that
+borrowed confirmation FD **and the same locked OFD** to the genuinely fresh
+operator ancestry. There call
+`fresh_engine.confirm_access(lock_fd=received_lock, confirmation_fd=received_fd)`.
+Exit the original owner's context before waiting/reaping the confirmer: its
+bounded ACK waits for the owner's exact journal-transition hash, kernel sender
+credentials, actual fresh ancestry, guard and still-held lock checks. Only then
+does the Engine reconcile its own live state; the caller must not edit `_early`
+or adopt a disk journal. Reap the confirmer before continuing selected work or
+calling the unchanged `engine.abort_return(lock_fd)` for pre-capture OLD.
+
+This optional Engine seam is not a new CLI recovery verb or authority receipt.
+Existing `confirm_access()` callers and success-only terminal handback are
+unchanged. New owners, missing/stale confirmation, drift, capture/dispatch/COMMIT
+and unknown/replay remain refused; a failed confirmation scope consumes early
+return eligibility. Local `test_owner_confirm_return.py` uses real processes,
+ancestry, SCM_RIGHTS, flock and mask IO, but models root/SSH authentication,
+systemd and physical/recovery authority. It is not physical lifecycle acceptance.
+
 **Unknown/partial recovery:** inspect root-only `journal.json`/`.next`, snapshots,
 old PID/start/cgroups, inherited lock holders, V2 fence/journal and current jobs via
 independent operator or console. Do not delete journals, clear in-flight fields,

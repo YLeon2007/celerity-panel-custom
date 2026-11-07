@@ -530,12 +530,16 @@ class Host:
         return str(int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf('SC_CLK_TCK')))
 
     def operator_session(self):
+        return self._operator_session(os.getpid())
+
+    def _operator_session(self, pid):
+        # The confirmation receiver supplies only a kernel SCM_CREDENTIALS PID;
+        # confirm_access itself always inspects its own actual ancestry.
         import pwd
         need(os.environ.get('SUDO_USER') == OPERATOR and
              os.environ.get('SUDO_UID') == str(pwd.getpwnam(OPERATOR).pw_uid), 'INDEPENDENT_OPERATOR_SSH_REQUIRED')
         main = int(self.unit(MAINT_UNIT).get('MainPID', '0'))
         chain = []
-        pid = os.getpid()
         while pid > 1 and len(chain) < 64:
             ident = proc_identity(pid)
             if ident['ppid'] == main:
@@ -1099,7 +1103,72 @@ class Engine:
     def finish_early_return(self, lock_fd):
         return {'nodeIsolation': 'returned', 'notApplicationAuthority': True}
 
-    def confirm_access(self):
+    @contextmanager
+    def fresh_confirmation(self, lock_fd):
+        """Lend one confirmation FD, alongside the SAME held outer OFD.
+
+        On scope exit the original owner checks the live fresh sender and exact
+        phase-only transition, then ACKs it. Wait/reap the confirmer AFTER scope
+        exit, before continuing or abort_return. No disk-journal adoption and no
+        return ownership are granted to the confirmer.
+        """
+        live = self._early
+        code = 'EARLY_RETURN_LIVE_OWNER_REQUIRED'
+        need(live is not None and live['active'] and not live['pending'] and
+             live['owner'] == {k: proc_identity(os.getpid())[k] for k in ('pid', 'start')} and
+             'confirmation' not in live, code)
+        assert live is not None
+        try:
+            self.require_early_lock(lock_fd)
+            self.assert_before_capture()
+            state = self.read()
+            need(state is not None and state == live['state'] and state['phase'] == 'awaiting-fresh-login' and
+                 state['dispatchCount'] == 0 and state['dispatchInFlight'] is None, code)
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            with receiver, sender:
+                receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+                live['confirmation'] = receiver
+                try:
+                    yield sender.fileno()
+                    need(live['active'] and not live['pending'] and
+                         live['owner'] == {k: proc_identity(os.getpid())[k] for k in ('pid', 'start')}, code)
+                    self.require_early_lock(lock_fd)
+                    self.assert_before_capture()
+                    state = self.read()
+                    self._confirmed_early_state(state, live)
+                    assert state is not None
+                    live['state'] = state
+                finally:
+                    live.pop('confirmation', None)
+        except BaseException:
+            live['active'] = False
+            raise
+
+    def _confirmed_early_state(self, state, live):
+        # Only an exact phase-only transition of THIS live apply can qualify.
+        # A matching disk journal alone (or an arbitrary receipt) is insufficient.
+        code = 'EARLY_RETURN_LIVE_OWNER_REQUIRED'
+        need(live['state']['phase'] == 'awaiting-fresh-login' and
+             state == {**live['state'], 'phase': 'held'} and 'confirmation' in live, code)
+        conn = live.pop('confirmation')
+        conn.settimeout(2)
+        raw, ancillary, flags, _ = conn.recvmsg(33, socket.CMSG_SPACE(12))
+        need(not flags and len(ancillary) == 1 and
+             ancillary[0][:2] == (socket.SOL_SOCKET, socket.SCM_CREDENTIALS) and
+             len(ancillary[0][2]) == 12, code)
+        pid, uid, _gid = struct.unpack('3i', ancillary[0][2])
+        need(pid != live['owner']['pid'] and uid == os.getuid(), code)
+        session = self.host._operator_session(pid)
+        boundary = live['state']['accessBoundary']
+        need(session != boundary['session'] and int(session['start']) > int(boundary['ticks']) and
+             raw == hashlib.sha256(json.dumps(state, sort_keys=True, separators=(',', ':')).encode()).digest(), code)
+        self.host.guard_check(state['guard'], self.host.operator_session())
+        need(self.read() == state, code)
+        conn.sendall(b'confirmed')
+
+    def confirm_access(self, *, lock_fd=None, confirmation_fd=None):
+        if confirmation_fd is not None:
+            self.require_early_lock(lock_fd)
         state = self.read()
         need(state is not None and state['phase'] == 'awaiting-fresh-login' and
              state['dispatchInFlight'] is None, 'MAINTENANCE_UNKNOWN_RETAINED')
@@ -1113,6 +1182,13 @@ class Engine:
             self._early['state'] = state
         state['phase'] = 'held'
         self.save(state)
+        if confirmation_fd is not None:
+            self.require_early_lock(lock_fd)
+            need(self.read() == state, 'MAINTENANCE_UNKNOWN_RETAINED')
+            with socket.socket(fileno=os.dup(confirmation_fd)) as conn:
+                conn.settimeout(2)
+                conn.sendall(hashlib.sha256(json.dumps(state, sort_keys=True, separators=(',', ':')).encode()).digest())
+                need(conn.recv(10) == b'confirmed', 'MAINTENANCE_UNKNOWN_RETAINED')
         return self.evidence(state)
 
     def verify_exclusion(self, state):
