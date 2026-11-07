@@ -9,8 +9,8 @@ import sys
 
 PINS = {
     '/usr/local/libexec/c3-test-fresh-network.py': 'faa21dcfb3ca5f8d339ce8934893dc0d1b90790ee09d208b2e305b627bc31518',
-    '/usr/local/libexec/c3-test-fresh-network-control.py': 'e069050d35c63b2f123e0a3fe277b7a2a40071eba9c20768cba98f751115f38a',
-    '/usr/local/libexec/c3-test-fresh-network-client.py': 'b2559a7d2b1dae64924a1c7e26d4a687a91a526bd16b5fd6ac77e545ffd8372f',
+    '/usr/local/libexec/c3-test-fresh-network-control.py': '2d99353fc36ac74a7b5eb17092cc393549518ccbc8c51b599b1addf209eb289f',
+    '/usr/local/libexec/c3-test-fresh-network-client.py': '8ecbec0a3e43dfe582a1872553afdc2bdaaa3d3d76a64713216bfbdd2928ef69',
 }
 
 
@@ -59,7 +59,7 @@ def main():
     except BaseException:
         # No secret traceback, unbounded diagnostic pipe or automatic recovery.
         return 1
-    # Only a confirmed abandon and checked local disposal can reach zero.
+    # Only confirmed abandon/handoff and checked caller disposal can reach zero.
     # This does not acknowledge the server's later unlink/terminal journal.
     return 0
 

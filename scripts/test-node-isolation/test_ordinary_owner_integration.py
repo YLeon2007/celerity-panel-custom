@@ -80,6 +80,7 @@ def source_map():
 
 class Ledger:
     def __init__(self, name):
+        self.name = name
         parent = os.environ.get('C3_ORDINARY_EVIDENCE')
         self.path = Path(parent)/name if parent else None
         if self.path: self.path.mkdir(parents=True, exist_ok=False)
@@ -206,7 +207,7 @@ class ModeledNetwork(network.Linux):
 
 
 @contextlib.contextmanager
-def prepared_v2(ordinary):
+def prepared_v2(ordinary, expected_failure=False):
     """Reuse supported prepared fixture; alter only independently modeled inputs."""
     original_factory=ct.cfixture
     original_validate=isolation.validate_inventory
@@ -277,7 +278,7 @@ def prepared_v2(ordinary):
          patch.object(ct,'cfixture',factory), \
          patch.object(Path,'mkdir',prepared_directory), \
          patch('test_fresh_classic_launch.inventory_fixture',inventory):
-        manager=prepared.prepared_fixture()
+        manager=prepared.prepared_fixture(fault='expected-refusal' if expected_failure else None)
         fixture=manager.__enter__()
         fixture.network_plan=p; fixture.shared_plan=configuration['plan']
         try:
@@ -306,7 +307,7 @@ finally: channel.close()
 '''
 
 
-def js_input(fixture, path, ordinary):
+def js_input(fixture, path, ordinary, ledger, holder_fault=None):
     nodes=[]
     for node,pin in fixture.held.config['nodes'].items():
         accepted=fixture.fixtures[list(fixture.held.config['nodes']).index(node)].accepted
@@ -317,10 +318,10 @@ def js_input(fixture, path, ordinary):
                       'originalSnapshot':{'configSha256':original['files']['config']['sha256'],
                           'unitSha256':original['files']['unit']['sha256'],'serviceActive':original['service']['ActiveState'],
                           'serviceEnabled':original['service']['UnitFileState']}})
-    value={'ordinary':ordinary,'nodes':nodes,'inventory':fixture.outer.inventory,
+    value={'ordinary':ordinary,'expectUnknown':bool(holder_fault),'nodes':nodes,'inventory':fixture.outer.inventory,
            'inventorySha256':fixture.held.config['inventorySha256'],'root':str(fixture.outer.root),
            'socket':str(path),'python':sys.executable,'bridgeSource':BRIDGE,'cwd':str(HERE),
-           'evidenceDirectory':str(Path(os.environ['C3_ORDINARY_EVIDENCE'])/('ordinary' if ordinary else 'native'))
+           'evidenceDirectory':str(Path(os.environ['C3_ORDINARY_EVIDENCE'])/ledger.name)
                                if os.environ.get('C3_ORDINARY_EVIDENCE') else None,
            'bridgeSources':{str(HERE/name):hashlib.sha256(read_noatime(HERE/name)).hexdigest()
                             for name in ('coordinated_restore.py','owner_restoration_channel.py')},
@@ -329,7 +330,7 @@ def js_input(fixture, path, ordinary):
     return target
 
 
-def holder_process(root):
+def holder_process(root, fault=None):
     """Real checked client loader + run/Holder, only installed-root/host facts modeled."""
     import fresh_network_client_exec as entry
     root=Path(root); real_open=os.open; real_stat=os.stat; real_lstat=os.lstat; real_fstat=os.fstat
@@ -387,10 +388,12 @@ def holder_process(root):
         m=entry.load('/usr/local/libexec/c3-test-fresh-network.py')
         c=entry.load('/usr/local/libexec/c3-test-fresh-network-control.py')
         client=entry.load('/usr/local/libexec/c3-test-fresh-network-client.py')
+        # Local fixture models root ptrace capability, never kernel exit status.
+        stack.enter_context(patch.object(c,'holder_exit_access',lambda *args:None,create=True))
         original_identity=m.identity
         def identity(path):
             if str(path) in {f'/proc/{pid}/ns/net' for pid in ('self','1',str(server))}: return p['hostNetns']
-            if str(path) in ('/proc/1/ns/pid','/proc/1/ns/mnt'):
+            if str(path) in ('/proc/1/ns/pid','/proc/1/ns/mnt','/proc/1/ns/user'):
                 return original_identity('/proc/self/ns/'+str(path).rsplit('/',1)[1])
             if str(path)=='/usr/bin/python3': return original_identity('/proc/'+str(server)+'/exe')
             return original_identity(path)
@@ -399,8 +402,32 @@ def holder_process(root):
         stack.enter_context(patch.object(m,'trusted_read',trusted_read))
         stack.enter_context(patch.object(m,'SOCKET',str(root/'h.sock')))
         stack.enter_context(patch.object(client,'_peercred',peer))
+        sent=[]
+        real_send=c.send; real_close=socket.socket.close; real_fcntl=fcntl.fcntl
+        def sent_frame(channel,value,m):
+            result=real_send(channel,value,m)
+            if value.get('op')=='holder-disposed': sent.append(channel)
+            return result
+        def closed(channel):
+            required=channel in sent and channel.fileno()!=-1
+            real_close(channel)
+            if fault=='channel-close' and required:
+                os.write(2,b'required channel close failed after actual close\n')
+                raise OSError('required channel close failed after actual close')
+        def flags(fd,op,*args):
+            result=real_fcntl(fd,op,*args)
+            if fault=='pipe-restore' and sent and fd==0 and op==fcntl.F_SETFL:
+                os.write(2,b'required operator pipe flags restore failed after actual restore\n')
+                raise OSError('required operator pipe flags restore failed after actual restore')
+            return result
+        stack.enter_context(patch.object(c,'send',sent_frame))
+        stack.enter_context(patch.object(socket.socket,'close',closed))
+        stack.enter_context(patch.object(fcntl,'fcntl',flags))
         before=set(os.listdir('/proc/self/fd'))
-        client.run(m,c)  # genuine operator pipes, input pins, handoff and disposal
+        try: client.run(m,c)  # genuine operator pipes, input pins, handoff and disposal
+        except OSError:
+            if fault and sent: raise SystemExit(75)
+            raise
         assert set(os.listdir('/proc/self/fd'))==before,'actual holder leaked descriptors'
         os.write(2,json.dumps({'actualClientRunReturned':True,'ownedDescriptorsDisposed':True,
                               'clientSha256':client.__source_sha256__,'loaderPins':entry.PINS}).encode()+b'\n')
@@ -418,7 +445,7 @@ def read_holder_line(child):
 
 
 @contextlib.contextmanager
-def receiver(f, ledger):
+def receiver(f, ledger, holder_fault=None):
     """Actual receiver and original Fence with real producer child and rights."""
     root=f.outer.root; hostroot=root/control.HOST_STATE.lstrip('/')
     # Coordinator owns this directory already; original host shares it, no copy.
@@ -470,7 +497,7 @@ def receiver(f, ledger):
     producer_fd=os.pidfd_open(producer_pid)
     holder_path=root/'h.sock'; holder_server=socket.socket(socket.AF_UNIX)
     holder_server.bind(str(holder_path)); holder_path.chmod(0o600); holder_server.listen(1); holder_server.settimeout(5)
-    holder=subprocess.Popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--holder',str(root)],
+    holder=subprocess.Popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--holder',str(root),*([holder_fault] if holder_fault else [])],
                             cwd=HERE,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     holder_channel=None
     (root/'receiver-peer.json').write_text(json.dumps({'pid':os.getpid()}))
@@ -503,6 +530,7 @@ def receiver(f, ledger):
         return RootStat()
     def stat_root(path,*args,**kwargs):
         target=mapped(path) if kwargs.get('dir_fd') is None else path
+        if str(target)=='/proc/1/ns/user': target='/proc/self/ns/user'  # privileged host-userns observation modeled
         value=real_stat(target,*args,**kwargs)
         return root_metadata(value,Path(target) in root.parents) if str(target).startswith(str(root)) or Path(target) in root.parents else value
     def lstat_root(path,*args,**kwargs):
@@ -561,6 +589,7 @@ def receiver(f, ledger):
             stack.enter_context(patch.object(network,'trusted_fd',trusted_fd))
             stack.enter_context(patch.object(network,'NETNS','/proc/self/ns/net'))
             stack.enter_context(patch.object(control,'HOST_STATE',str(hostroot)))
+            stack.enter_context(patch.object(control,'holder_exit_access',lambda *args:None,create=True))
             stack.enter_context(patch.object(os,'open',open_root))
             f.fs.uid=f.fs.gid=0
             stack.callback(setattr,f.fs,'uid',original_fs_uid)
@@ -604,6 +633,12 @@ def receiver(f, ledger):
             owner.park_holder(control.receive(holder_channel,network))
             ledger.record('original-producer-prepared',pid=producer_pid,holderPid=holder.pid)
             terminal=real_socket(socket.AF_UNIX); terminal.bind(str(root/'n.sock')); terminal.listen(1); terminal.settimeout(.2)
+            def exit_witness():
+                raw=os.pread(lease.exit_stat_fd,8193,0)
+                fields=control.holder_stat(network,raw,lease.holder)
+                ledger.record('original-holder-kernel-exit',holder=lease.holder,state=fields[0].decode(),
+                              waitStatus=int(fields[49]),pidfdReadable=bool(select.select([lease.pidfd],[],[],0)[0]),
+                              statSha256=network.digest(raw),privilegedPtraceAccess='modeled')
             def serve():
                 conn=None; request=None
                 try:
@@ -619,7 +654,9 @@ def receiver(f, ledger):
                             if op=='prepare-ordinary': result=owner.prepare_ordinary(request['coordinator'])
                             elif op=='accept-ordinary': result=owner.accept_ordinary(conn,request)
                             elif op=='read-ordinary': result=owner.read_ordinary()
-                            elif op=='finish-temporary-scope': result=owner.finish_temporary_scope(holder_channel)
+                            elif op=='finish-temporary-scope':
+                                result=owner.finish_temporary_scope(holder_channel)
+                                exit_witness()
                             else: raise AssertionError(op)
                             ledger.record(op,result=result)
                             if op=='accept-ordinary':
@@ -636,6 +673,7 @@ def receiver(f, ledger):
                             if op=='read-ordinary' and owner.finished: return
                 except BaseException as error:
                     errors.append(error)
+                    if request and request.get('op')=='finish-temporary-scope': exit_witness()
                     try:
                         live=owner.c.k.serving_live
                         if live is not None:
@@ -652,19 +690,51 @@ def receiver(f, ledger):
                     ledger.record('receiver-error',error=str(error),traceback=traceback.format_exc())
             thread=threading.Thread(target=serve,daemon=True); thread.start()
             yield owner,errors,producer_fd,holder
-            if errors: raise errors[0]
-            assert owner.finished, 'original temporary scope did not finish'
+            if holder_fault:
+                assert len(errors)==1 and str(errors[0])=='ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN',errors
+                assert not owner.finished and owner.finish_attempted
+                # An uncertain finish cannot send/replay disposal or replace the
+                # original committed grant, Fence/OFD, custody or serving task.
+                with unittest.TestCase().assertRaisesRegex(network.Refusal,'FINITE_TERMINAL_COMPLETION_REQUIRED'):
+                    owner.finish_temporary_scope(holder_channel)
+                owner.fence.check()
+                expected=[owner.store.row(b['name'],b['capability']) for b in owner.bindings]
+                actual=owner.store.dump()
+                # FreshLaunch records committed-activation-unknown by replacing
+                # ATTEMPT. The held original inode remains, its proc link gains
+                # '(deleted)'; the strict product Dump verifier must NOT waive it.
+                for row in actual:
+                    before=next(r for r in expected if r[0]==row[0])
+                    if before[7].endswith('/fresh-launch-attempt.json'):
+                        assert row==[*before[:7],before[7]+' (deleted)',*before[8:]],(row,before)
+                    else: assert row==before,(row,before)
+                assert len(actual)==len(expected)
+                with unittest.TestCase().assertRaisesRegex(network.Refusal,'FDSTORE_CUSTODY_UNKNOWN'):
+                    owner.store.verify(owner.bindings)
+                live=owner.c.k.serving_live
+                assert not select.select([live['fds'][0]],[],[],0)[0]
+                assert network.proc_start(live['serving']['pid'])==live['serving']['start']
+                assert network.digest(network.encode(owner.receipt))==f.held.network_receipt['networkOwnershipSha256']
+                ledger.record('terminal-unknown-retained',originalFenceHeld=True,originalCustodyDescriptorsRetained=True,
+                              strictDumpReadback='FDSTORE_CUSTODY_UNKNOWN',servingAlive=True,finished=owner.finished)
+            else:
+                if errors: raise errors[0]
+                assert owner.finished, 'original temporary scope did not finish'
             holder_out,holder_err=holder.communicate(timeout=3)
-            assert holder.returncode==0,holder_err.decode()
+            assert holder.returncode==(75 if holder_fault else 0),holder_err.decode()
             handed_off=json.loads(holder_out)
             assert owner.pending is not None
-            assert handed_off=={**owner.pending,**owner.read_ordinary()}
-            disposal=json.loads(holder_err)
-            assert disposal['actualClientRunReturned'] and disposal['ownedDescriptorsDisposed']
+            assert handed_off=={**owner.pending,**f.held.network_receipt}
+            disposal={'requiredCleanupFault':holder_fault,'stderr':holder_err.decode()} if holder_fault else json.loads(holder_err)
+            if not holder_fault: assert disposal['actualClientRunReturned'] and disposal['ownedDescriptorsDisposed']
             ledger.record('actual-holder-natural-exit',exit=holder.returncode,reply=handed_off,disposal=disposal)
             waited,status=os.waitpid(producer_pid,0); assert waited==producer_pid and status==0
             producer_pid=None
-            ledger.record('natural-temporary-disposal',host=True,holder=True)
+            ledger.record('natural-temporary-disposal',host=True,holder=True,holderExit=holder.returncode)
+            if holder_fault:
+                assert f.supervisor.wait(timeout=3)==1
+                ledger.record('prepared-supervisor-unknown-natural-exit',exit=f.supervisor.returncode)
+                return
             # Do not reset/renew deadlines: checks must no longer consult either
             # dead original peer, lease or Docker. Actual pidfds are readable.
             controller.end=time.monotonic()-1
@@ -702,21 +772,28 @@ def receiver(f, ledger):
 class NativeControl(unittest.TestCase):
     def test_real_supported_native_coordinator_bridge_public_consumer(self):
         self.run_path(False)
-    def run_path(self, ordinary):
-        ledger=Ledger('ordinary' if ordinary else 'native')
+    def run_path(self, ordinary, holder_fault=None):
+        ledger=Ledger('ordinary-'+holder_fault if holder_fault else 'ordinary' if ordinary else 'native')
         error=None
         try:
-            with prepared_v2(ordinary) as f:
+            with prepared_v2(ordinary,expected_failure=bool(holder_fault)) as f:
                 path=f.outer.root/'o.sock'; listener=socket.socket(socket.AF_UNIX)
+                self.addCleanup(listener.close)
                 listener.bind(str(path)); listener.listen(1)
-                data=js_input(f,path,ordinary)
+                data=js_input(f,path,ordinary,ledger,holder_fault)
                 environment={**os.environ,'NODE_PATH':os.environ.get('NODE_PATH','/home/leon/c3-anyorder-integration-20261104/node_modules')}
-                peers=contextlib.nullcontext() if not ordinary else receiver(f,ledger)
+                peers=contextlib.nullcontext() if not ordinary else receiver(f,ledger,holder_fault)
                 with peers as receiving:
                     child=subprocess.Popen(['node',str(REPO/'tests/ordinaryOwnerRuntime.integration.test.js'),str(data)],
                         cwd=REPO,env=environment,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                     try:
-                        f.held.serve_fresh_owner(listener,platform=f.platform,socket_path=f.socket)
+                        if holder_fault:
+                            with self.assertRaises(Exception) as failure:
+                                f.held.serve_fresh_owner(listener,platform=f.platform,socket_path=f.socket)
+                            self.assertEqual(failure.exception.code,'COMMITTED_ACTIVATION_UNKNOWN')
+                            self.assertIsNone(f.held.fresh_reply)  # no public success ACK queued
+                        else:
+                            f.held.serve_fresh_owner(listener,platform=f.platform,socket_path=f.socket)
                         listener.close()
                         f.held.complete_fresh_owner()
                         out,err=child.communicate(timeout=8)
@@ -727,13 +804,18 @@ class NativeControl(unittest.TestCase):
                         self.assertEqual(result['commitSha256'],hashlib.sha256(commit).hexdigest())
                         self.assertEqual(f.count(),1)
                         self.assertTrue(f.held.handoff_completed)
-                        self.assertEqual(result['code'],'COMMITTED_FRESH_NETWORK_OWNED' if ordinary else 'COMMITTED_FRESH_ACTIVATION_CONFIRMED')
+                        self.assertEqual(result['code'],'COMMITTED_ACTIVATION_UNKNOWN' if holder_fault else
+                                         'COMMITTED_FRESH_NETWORK_OWNED' if ordinary else 'COMMITTED_FRESH_ACTIVATION_CONFIRMED')
                         self.assertEqual('networkHandoff' in json.loads(commit),ordinary)
                         if ordinary:
                             owner,failures,hostfd,holder=receiving
-                            self.assertEqual(failures,[])
-                            self.assertEqual(result['networkOwnershipSha256'],network.digest(network.encode(owner.receipt)))
-                            self.assertTrue(owner.finished)
+                            if holder_fault:
+                                self.assertEqual([str(e) for e in failures],['ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN'])
+                                self.assertFalse(owner.finished)
+                            else:
+                                self.assertEqual(failures,[])
+                                self.assertEqual(result['networkOwnershipSha256'],network.digest(network.encode(owner.receipt)))
+                                self.assertTrue(owner.finished)
                             self.assertTrue(select.select([hostfd],[],[],0)[0])
                             self.assertIsNotNone(holder.poll())
                         ledger.record('same-original-commit',sha256=hashlib.sha256(commit).hexdigest(),executions=f.count())
@@ -747,6 +829,8 @@ class NativeControl(unittest.TestCase):
                         raise
                     finally:
                         listener.close()
+                        if holder_fault and getattr(f.held,'network',None) is not None:
+                            f.held.network.close(); f.held.network=None  # fixture transport disposal, never grant release
                         if child.poll() is None: child.kill()
                         out,err=child.communicate(timeout=5)
                         if child.returncode: ledger.record('consumer-failure',exit=child.returncode,stdout=out.decode(),stderr=err.decode())
@@ -762,6 +846,14 @@ class OrdinaryPositive(NativeControl):
         self.run_path(True)
 
 
+class OrdinaryDisposalFailure(NativeControl):
+    test_real_supported_native_coordinator_bridge_public_consumer = None
+    def test_actual_client_channel_close_failure_has_no_public_success_ack(self):
+        self.run_path(True,'channel-close')
+    def test_actual_client_pipe_restore_failure_has_no_public_success_ack(self):
+        self.run_path(True,'pipe-restore')
+
+
 if __name__ == '__main__':
-    if len(sys.argv)==3 and sys.argv[1]=='--holder': holder_process(sys.argv[2])
+    if len(sys.argv) in (3,4) and sys.argv[1]=='--holder': holder_process(sys.argv[2],sys.argv[3] if len(sys.argv)==4 else None)
     else: unittest.main()

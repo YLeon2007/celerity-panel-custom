@@ -159,6 +159,109 @@ class PolicyByteBindingTests(unittest.TestCase):
                         for fd in fds: os.close(fd)
 
 
+class HolderExitTests(unittest.TestCase):
+    def test_only_original_unreaped_zero_exit_is_success(self):
+        import select
+        import signal
+        from types import SimpleNamespace
+        for outcome in ('zero','nonzero','signal','reaped'):
+            with self.subTest(outcome=outcome):
+                reader,writer=os.pipe()
+                child=subprocess.Popen([sys.executable,'-B','-c',
+                    'import os,sys; os.read(int(sys.argv[1]),1); raise SystemExit(int(sys.argv[2]))',
+                    str(reader),'75' if outcome=='nonzero' else '0'],pass_fds=(reader,))
+                os.close(reader)
+                pidfd=os.pidfd_open(child.pid)
+                statfd=os.open('/proc/'+str(child.pid)+'/stat',os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+                identity={'pid':child.pid,'start':n.proc_start(child.pid)}
+                owner=c.OwnerRuntime(n,None,SimpleNamespace(holder=identity,pidfd=pidfd,
+                    exit_stat_fd=statfd,exit_userns=n.identity('/proc/self/ns/user')),None,None)
+                try:
+                    if outcome=='signal': child.terminate()
+                    os.close(writer); writer=None
+                    self.assertTrue(select.select([pidfd],[],[],3)[0])
+                    if outcome=='reaped': self.assertEqual(child.wait(timeout=3),0)
+                    # Root capability is modeled; every status is a real kernel
+                    # read through an FD acquired before original-task death.
+                    with patch.object(c,'holder_exit_access'):
+                        if outcome=='zero': owner.lease_exit_success()
+                        else:
+                            with self.assertRaisesRegex(n.Refusal,'ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN'):
+                                owner.lease_exit_success()
+                    self.assertEqual(child.wait(timeout=3),75 if outcome=='nonzero' else -signal.SIGTERM if outcome=='signal' else 0)
+                finally:
+                    if writer is not None: os.close(writer)
+                    os.close(statfd); os.close(pidfd)
+                    if child.poll() is None: child.kill()
+                    child.wait(timeout=3)
+
+    def test_ptrace_filtered_zero_is_not_an_exit_success_witness(self):
+        userns=n.identity('/proc/self/ns/user')
+        with patch.object(os,'getresuid',return_value=(0,0,0)),patch.object(os,'getresgid',return_value=(0,0,0)), \
+             patch.object(Path,'read_text',return_value='CapEff:\t0000000000000000\n'):
+            with self.assertRaisesRegex(n.Refusal,'HOLDER_EXIT_STATUS_ACCESS_REQUIRED'):
+                c.holder_exit_access(n,userns)
+
+    def test_post_holder_disposed_close_failure_is_terminal_unknown(self):
+        import select
+        import time
+        from types import SimpleNamespace
+        import fresh_network_client as client
+        # Exact review counterexample: actual Holder.close, socket, birth pidfds
+        # and wait status. Prior grant/host/root observations are phase fixtures.
+        left,right=socket.socketpair()
+        host_pid=os.fork()
+        if host_pid==0:
+            left.close(); right.close(); os._exit(0)
+        host_fd=os.pidfd_open(host_pid)
+        pid=os.fork()
+        if pid==0:
+            left.close()
+            result=c.receive(right,n)
+            class CloseFailure:
+                def settimeout(self,*args): return right.settimeout(*args)
+                def sendall(self,*args): return right.sendall(*args)
+                def close(self):
+                    right.close()
+                    raise OSError('required holder channel close failed after real close')
+            holder=object.__new__(client.Holder)
+            holder.m=n; holder.control=c; holder.closed=False
+            holder.phase='handed-off'; holder.handoff_reply=result
+            holder.inputs=[]; holder.lease=None
+            holder.socketfd=holder.serverfd=holder.pidfd=None
+            holder.channel=CloseFailure(); holder.terminal_end=time.monotonic()+5
+            holder.p={'deadline':int(time.time())+10}
+            try: holder.close()
+            except OSError: os._exit(75)
+            os._exit(76)
+        right.close()
+        holder_fd=os.pidfd_open(pid)
+        start=n.proc_start(pid)
+        stat_fd=os.open('/proc/'+str(pid)+'/stat',os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+        result={'commitSha256':'a'*64,'networkOwnershipSha256':'b'*64}
+        owner=c.OwnerRuntime(n,SimpleNamespace(),SimpleNamespace(pidfd=holder_fd,
+            holder={'pid':pid,'start':start},exit_stat_fd=stat_fd,exit_userns=n.identity('/proc/self/ns/user')),
+            SimpleNamespace(pidfd=host_fd,request=lambda *a,**k:None),None)
+        owner.receipt={'commitSha256':result['commitSha256']}
+        owner.terminal_deadline=time.monotonic()+5; owner.coordinator={'nonce':'c'*64}
+        owner.pending={'generation':'d'*32,'sequence':1,'operation':'handoff'}
+        owner.read_ordinary=lambda:result
+        try:
+            with patch.object(n,'trusted_read',return_value=n.encode({'phase':'handoff-completed','nonce':'c'*64})), \
+                 patch.object(c,'holder_exit_access'):  # root/CAP_SYS_PTRACE modeled; wait status is real
+                with self.assertRaisesRegex(n.Refusal,'ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN'):
+                    owner.finish_temporary_scope(left)
+            self.assertFalse(owner.finished)
+            _,status=os.waitpid(pid,0); pid=None
+            self.assertEqual(os.waitstatus_to_exitcode(status),75)
+            self.assertEqual(os.waitpid(host_pid,0)[1],0); host_pid=None
+        finally:
+            left.close()
+            for fd in (stat_fd,holder_fd,host_fd): os.close(fd)
+            for child in (pid,host_pid):
+                if child is not None: os.waitpid(child,0)
+
+
 class CustodyTests(unittest.TestCase):
     def test_full_dump_named_subtraction_and_dead_original_pidfd(self):
         self.assertTrue(hasattr(c, 'PID1Store'), 'product main has no PID1 custody implementation')

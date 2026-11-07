@@ -83,13 +83,21 @@ async function main(file) {
     // fabricated terminal producer, manually returned receipt or seeded COMMIT.
     const inputs = { config, pins, inventory: description.inventory,
         assertPins() { for (const [file, expected] of Object.entries(description.bridgeSources)) assert.equal(sha(noatime(file)), expected); } };
-    const children = [], requests = [];
+    const children = [], requests = [], replies = [];
     const service = new HeldTestOwnerSettlement({ models: f.models, journal, inventory: inputs.inventory,
         inventorySha256: config.inventorySha256,
         withRestorationScope: work => withFreshOperationalRestoration(inputs, work, { openBridge() {
             const child = spawn(description.python, ['-B', '-c', description.bridgeSource, description.root, description.socket],
                 { cwd: description.cwd, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
             child.stderr.on('data', raw => fs.appendFileSync(path.join(description.root, 'bridge-stderr.log'), raw));
+            let replyBuffer = '';
+            child.stdout.on('data', raw => {
+                replyBuffer += raw.toString();
+                while (replyBuffer.includes('\n')) {
+                    const end = replyBuffer.indexOf('\n');
+                    replies.push(JSON.parse(replyBuffer.slice(0, end))); replyBuffer = replyBuffer.slice(end + 1);
+                }
+            });
             const write = child.stdin.write.bind(child.stdin), kills = [];
             child.stdin.write = (...args) => { requests.push(JSON.parse(args[0])); return write(...args); };
             const kill = child.kill.bind(child); child.kill = signal => {
@@ -100,6 +108,29 @@ async function main(file) {
             children.push({ child, closed, kills }); return child;
         } }) });
     try {
+        if (description.expectUnknown) {
+            await assert.rejects(service.freshHandback(config.plan), { code: 'COMMITTED_ACTIVATION_UNKNOWN' });
+            assert.equal(children.length, 1);
+            const exit = await children[0].closed;
+            assert.equal(replies.some(r => r.op === 'fresh-handback-ack'), false);
+            assert.equal(requests.filter(r => r.op === 'fresh-handback').length, 1);
+            const commit = noatime(path.join(description.root, 'var/lib/c3-test-node-isolation/handoff-commit.json'));
+            const rowBytes = noatime(path.join(directory, 'owner-settlement.json'));
+            const row = JSON.parse(rowBytes);
+            assert.equal(row.phase, 'settled-held'); assert.equal(row.settled.length, description.nodes.length);
+            assert.equal(f.events.filter(e => e === 'classic').length, description.nodes.length);
+            const owners = structuredClone(f.models.Owner.rows);
+            await assert.rejects(service.freshHandback(config.plan));
+            assert.equal(children.length, 1); assert.deepEqual(f.models.Owner.rows, owners);
+            assert.deepEqual(noatime(path.join(directory, 'owner-settlement.json')), rowBytes);
+            assert.deepEqual(noatime(path.join(description.root, 'var/lib/c3-test-node-isolation/handoff-commit.json')), commit);
+            const result = { code: 'COMMITTED_ACTIVATION_UNKNOWN', commitSha256: sha(commit),
+                noSuccessAck: true, terminalRequests: 1, journalPhase: row.phase, ownerCount: owners.length,
+                ownersRetained: true, replayRefused: true, bridgeExit: exit };
+            if (description.evidenceDirectory) fs.writeFileSync(path.join(description.evidenceDirectory, 'public-unknown.json'),
+                JSON.stringify({ ...result, replies, requests }, null, 2)+'\n', { flag: 'wx', mode: 0o600 });
+            process.stdout.write(JSON.stringify(result)+'\n'); return;
+        }
         const result = await service.freshHandback(config.plan);
         assert.equal(result.code, description.ordinary ? 'COMMITTED_FRESH_NETWORK_OWNED' : 'COMMITTED_FRESH_ACTIVATION_CONFIRMED');
         assert.equal(children.length, 1);

@@ -18,8 +18,8 @@ SERVER_ENTRY = '/usr/local/libexec/c3-test-fresh-network-exec.py'
 CLIENT = '/usr/local/libexec/c3-test-fresh-network-client.py'
 SOURCE_PINS = {
     '/usr/local/libexec/c3-test-fresh-network.py': 'faa21dcfb3ca5f8d339ce8934893dc0d1b90790ee09d208b2e305b627bc31518',
-    CONTROL: 'e069050d35c63b2f123e0a3fe277b7a2a40071eba9c20768cba98f751115f38a',
-    SERVER_ENTRY: 'ce1b06807807644014c3711be13ce3a99d0b9b222d24fea6cbc3f9319699e1c8',
+    CONTROL: '2d99353fc36ac74a7b5eb17092cc393549518ccbc8c51b599b1addf209eb289f',
+    SERVER_ENTRY: '2c980a68067a9f57912ba254e44a8f83396ab4a835708230bbde8ba8a411cb1c',
 }
 OPERATIONS = ('observe', 'cutover', 'return', 'abandon')
 IO_SECONDS = 3
@@ -365,6 +365,8 @@ class Holder:
                 self.m.need(not errors and time.monotonic() < self.terminal_end and time.time() < self.p['deadline'],
                             'HOLDER_REQUIRED_DISPOSAL_UNKNOWN')
                 channel.settimeout(max(.001,min(IO_SECONDS,self.terminal_end-time.monotonic())))
+                # Provisional only: required channel close and run's pipe flag
+                # restoration still follow. The owner must check actual exit 0.
                 self.control.send(channel,{'op':'holder-disposed',**self.handoff_reply},self.m)
             except BaseException as error: errors.append(error)
             finally:

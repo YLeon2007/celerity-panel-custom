@@ -1,6 +1,6 @@
 # Existing TEST ordinary network owner: verified source integration
 
-This source integration closes the local ordinary positive through the actual
+This source integration exercises the local ordinary positive through the actual
 original producer/Fence, same Coordinator COMMIT, receiving owner, finite
 `fresh_network_client.run`/Holder disposal and public ownership ACK. It is **not
 physical/PID1 acceptance or permission to install/start it**. Legacy operation stays
@@ -103,9 +103,11 @@ with the unchanged checked source loader, real operator pipes, immutable Input
 pins, real lease, socket, peer PID/start, pidfds, protocol parser and
 `run`/`Holder.dispatch`/`Holder.close`. It validates the real prepared reply,
 sends literal `handoff`, and naturally emits its exact reply, disposes owned
-inputs/descriptors, sends `holder-disposed`, closes the channel and exits zero.
-The receiver waits for original host and holder pidfd death before its terminal
-ACK. Public success is followed by exact receipt readback with both temporary
+inputs/descriptors, sends provisional `holder-disposed`, closes the required
+channel, restores operator-pipe flags and exits zero. The receiver waits for
+original host/holder pidfd death and additionally checks the original holder's
+actual successful exit status before its terminal ACK. Public success is followed
+by exact receipt readback with both temporary
 peers dead, modeled expired monotonic/wall deadlines, and temporary checks forced
 to fail if consulted. The original plan bytes are not edited or renewed.
 
@@ -114,7 +116,54 @@ Evidence is under the separately owned
 failed runs are retained. Source manifests, same-COMMIT/grant bindings, natural
 exit receipts and Node executable/resolution pins accompany the final runs.
 
-Privileged root/installed path/cmdline facts, PID1 FDSTORE/Dump completion,
+## R110-1: actual holder final cleanup, not death-only completion
+
+The independent wave110 **NO-GO** and its counterexample remain valid historical
+evidence. On base `9109208`, an actual required socket-close failure after
+`holder-disposed` produced holder exit 75, while the owner set `finished=True`.
+The same boundary includes `run()`'s later required pipe-flag restoration. Neither
+is harmless acknowledgement-transport disposal, and neither is reclassified here.
+
+The ordinary lease now opens and retains the original holder's `/proc/PID/stat`
+descriptor while its original pidfd is still live, checking the exact PID/start
+before and after acquisition. After provisional disposal, original pidfd death
+and EOF, the owner reads **only that held descriptor** and requires the same
+PID/start, zombie state and kernel wait status zero. No historical PID is reopened,
+no child status receipt is seeded, and no replacement task gains authority.
+Nonzero, signalled, already reaped, unreadable or unknown status prevents terminal
+success. The finish attempt is one-shot, and the unchanged absolute terminal
+deadline is rechecked after the final ordinary readback before `finished=True`.
+
+Two concrete prerequisites are explicit, not supplied by this source:
+
+- Linux proc stat filters `exit_code` under its ptrace access check. The reader
+  must be actual root with effective `CAP_SYS_PTRACE` in the original holder's
+  host user namespace; acquisition and final observation enforce that authority.
+  A masked zero is not accepted as exit success.
+- The holder's **original creator must leave the exited child unreaped until the
+  finite finish observation completes**. A held proc descriptor does not preserve
+  status after reaping; that case is terminal-unknown. There is no new reaper,
+  controller, durable status authority or automatic recovery, and no claim that
+  an arbitrary external operator/SSH launcher already satisfies this prerequisite.
+
+The genuine local fixture's original Popen creator retains the child until the
+owner finishes. Its checked-loader → actual client/Holder → same Coordinator →
+original Fence/OFD → public ACK positive remains required. Causal negative tests
+inject the post-message socket-close error **after real close**, and pipe-restore
+error **after real restoration**, through actual `run()` and the public consumer.
+Both must yield `COMMITTED_ACTIVATION_UNKNOWN`, no success ACK, one COMMIT/exec,
+unchanged public owner/journal history and no replay. The original Fence, grant,
+custody descriptors and serving process remain retained. The existing launcher's
+unknown-attempt write replaces its attempt inode; the strict full-Dump verifier
+then refuses that deleted-path readback rather than inventing successful custody
+validation. No guard is weakened to hide this expected unknown state.
+
+Wave111 evidence is in
+`/home/leon/c3-anyorder-execution-20261104/test-terminal-disposal-wave111/`.
+Host pidfd death still has its existing meaning; this repair does not claim a
+separately reproduced host-final-cleanup result or broaden the review scope.
+
+Privileged root/installed path/cmdline/user-namespace/ptrace-access facts, PID1 FDSTORE/Dump completion,
 cgroup/freezer/netns/network/Caddy observations, independent recovery authority,
 and JS persistence/replica-set semantics remain explicit test models. The
 network receiver is driven through its actual runtime methods, not an installed

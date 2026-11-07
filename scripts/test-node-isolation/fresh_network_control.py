@@ -381,6 +381,7 @@ class OwnerRuntime:
         self.bindings = []; self.accepted_bindings = None; self.pending_cleanup = None
         self.pending = None; self.coordinator = None
         self.coordinator_pidfd = None; self.finished = False
+        self.finish_attempted = False
         self.terminal_deadline = None
 
     @classmethod
@@ -731,8 +732,9 @@ class OwnerRuntime:
 
     def finish_temporary_scope(self,holder):
         m,c = self.m,self.c
-        m.need(not self.finished and self.receipt is not None and time.monotonic() < self.terminal_deadline,
+        m.need(not self.finished and not self.finish_attempted and self.receipt is not None and time.monotonic() < self.terminal_deadline,
                'FINITE_TERMINAL_COMPLETION_REQUIRED')
+        self.finish_attempted = True  # disposal uncertainty is never a second finish/COMMIT permit
         intent = m.decode(m.trusted_read(HOST_STATE+'/coordinated-restore.json'))
         m.need(intent['phase'] == 'handoff-completed' and intent['nonce'] == self.coordinator['nonce'],
                'SAME_COORDINATOR_CLEANUP_REQUIRED')
@@ -746,8 +748,23 @@ class OwnerRuntime:
         remaining = self.terminal_deadline-time.monotonic()
         m.need(remaining > 0 and select.select([self.lease.pidfd],[],[],remaining)[0] and holder.recv(1) == b'',
                'ORIGINAL_HOLDER_NATURAL_DISPOSAL_UNKNOWN')
+        # holder-disposed is provisional: Holder.close's channel close AND run's
+        # operator-pipe restoration still follow it. EOF/death cannot attest them.
+        self.lease_exit_success()
+        result = self.read_ordinary()
+        m.need(time.monotonic() < self.terminal_deadline,'FINITE_TERMINAL_COMPLETION_REQUIRED')
         self.finished = True
-        return self.read_ordinary()
+        return result
+
+    def lease_exit_success(self):
+        m,lease = self.m,self.lease
+        holder_exit_access(m,lease.exit_userns)
+        try: raw = os.pread(lease.exit_stat_fd,8193,0)
+        except OSError as error: raise m.Refusal('ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN') from error
+        fields = holder_stat(m,raw,lease.holder)
+        # An original, still-unreaped zombie exposes the kernel wait status.
+        # A reaped/unreadable task is UNKNOWN, never an inferred zero status.
+        m.need(fields[0] == b'Z' and fields[49] == b'0','ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN')
 
     def persist_state(self):
         k,c = self.c.k,self.c
@@ -898,6 +915,24 @@ def trusted_bootstrap(path):
     finally: os.close(fd)
 
 
+def holder_exit_access(m,userns):
+    # proc stat's exit_code is ptrace-filtered. Never accept its masked zero.
+    # Require actual root CAP_SYS_PTRACE in the original holder's host userns.
+    status = dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+    m.need(os.getresuid() == os.getresgid() == (0,0,0) and
+           m.identity('/proc/self/ns/user') == userns and
+           int(status['CapEff'].strip(),16) & (1 << 19), 'HOLDER_EXIT_STATUS_ACCESS_REQUIRED')
+
+
+def holder_stat(m,raw,holder):
+    # comm may contain spaces/parentheses; the final ')' bounds the fixed tail.
+    head,separator,tail = raw.rpartition(b') ')
+    fields = tail.split()
+    m.need(len(raw) <= 8192 and separator and head.split(b' (',1)[0] == str(holder['pid']).encode() and
+           len(fields) >= 50 and fields[19] == holder['start'].encode(), 'ORIGINAL_HOLDER_EXIT_STATUS_UNKNOWN')
+    return fields
+
+
 class Lease:
     def __init__(self, m, p, raw_plan):
         self.m, self.p, self.raw_plan = m, p, raw_plan
@@ -915,8 +950,23 @@ class Lease:
                value['operations'] == ['observe', 'cutover', 'return', 'abandon']+(['handoff'] if 'ordinaryOwner' in p else []), 'CLOSED_OWNER_LEASE_REQUIRED')
         self.holder = value['holder']
         self.pidfd = os.pidfd_open(self.holder['pid'])
+        self.exit_stat_fd = None
         self.revoked = False
-        self.check()
+        try:
+            self.check()
+            if 'ordinaryOwner' in p:
+                self.exit_userns = m.identity('/proc/'+str(self.holder['pid'])+'/ns/user')
+                m.need(self.exit_userns == m.identity('/proc/1/ns/user'),'HOLDER_HOST_USER_NAMESPACE_REQUIRED')
+                holder_exit_access(m,self.exit_userns)
+                self.exit_stat_fd = os.open('/proc/'+str(self.holder['pid'])+'/stat',
+                                           os.O_RDONLY|os.O_NOATIME|os.O_NOFOLLOW|os.O_CLOEXEC)
+                holder_stat(m,os.pread(self.exit_stat_fd,8193,0),self.holder)
+                self.check()  # bind the retained proc inode while the original pidfd is live
+        except BaseException as primary:
+            try: self.close()
+            except BaseException as error:
+                primary.cleanup_errors = (*getattr(primary,'cleanup_errors',()),error)
+            raise
 
     def check(self):
         m = self.m
@@ -938,7 +988,14 @@ class Lease:
         self.check()
 
     def close(self):
-        os.close(self.pidfd)
+        owned = (self.exit_stat_fd,self.pidfd)
+        self.exit_stat_fd = self.pidfd = None
+        errors = []
+        for fd in owned:
+            if fd is not None:
+                try: os.close(fd)
+                except BaseException as error: errors.append(error)
+        if errors: raise errors[0]
 
 
 def unlink_owned_control(m, controller, socket_identity):
