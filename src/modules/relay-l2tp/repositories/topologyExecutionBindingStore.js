@@ -588,24 +588,28 @@ class TopologyExecutionBindingStore {
             };
             const record = await check();
             if (!work) return record;
+            let active = true;
+            const ensureActive = () => { ensureOpen(); if (!active) throw failure(); };
             const assertCurrent = async () => {
-                ensureOpen();
+                ensureActive();
                 if (!isDeepStrictEqual(await check(), record)) throw failure();
-                ensureOpen();
+                ensureActive();
             };
-            ensureOpen();
-            // Reuse the same held authority for executor connection checks inside
-            // terminal callbacks; reacquiring a non-reentrant authority can release
-            // exclusion or deadlock. Async-local scope is private and cannot be
-            // reused after ensureOpen closes it, even by escaped async work.
-            return this.#held.run({ expected, record, assertCurrent, connection: freeze({
+            ensureActive();
+            // Keep only the lexical ancestry of independently held bindings, not
+            // historical or sibling scopes. Each frame retains its own authority
+            // and freshness check; escaped async contexts cannot revive a frame.
+            const scope = { expected, record, assertCurrent, ensureActive, parent: this.#held.getStore(), connection: freeze({
                 expectedEndpoint: { ...enrollment.endpoint },
                 expectedHostKeySha256: enrollment.nodeIdentity.sshHostKeySha256,
-            }) }, async () => {
-                const result = await work(record, assertCurrent);
-                await assertCurrent();
-                return result;
-            });
+            }) };
+            try {
+                return await this.#held.run(scope, async () => {
+                    const result = await work(record, assertCurrent);
+                    await assertCurrent();
+                    return result;
+                });
+            } finally { active = false; }
         }, predecessor);
         // The authority itself can await cleanup after its callback completes.
         assertFresh();
@@ -663,9 +667,17 @@ class TopologyExecutionBindingStore {
             || (Object.hasOwn(verifiedBinding, 'profileTargetPin') && !Object.isFrozen(verifiedBinding.profileTargetPin))) throw failure();
         const current = this.#held.getStore();
         if (current) {
-            if (!isDeepStrictEqual(expected, current.expected) || !isDeepStrictEqual(verifiedBinding, current.record)) throw failure();
-            await current.assertCurrent();
-            return freeze({ binding: current.record, connection: current.connection });
+            const ancestry = [];
+            for (let scope = current; scope; scope = scope.parent) {
+                scope.ensureActive();
+                ancestry.push(scope);
+                if (!isDeepStrictEqual(expected, scope.expected) || !isDeepStrictEqual(verifiedBinding, scope.record)) continue;
+                await scope.assertCurrent();
+                for (const held of ancestry) held.ensureActive();
+                return freeze({ binding: scope.record, connection: scope.connection });
+            }
+            // A foreign current scope cannot acquire replacement authority.
+            throw failure();
         }
         return this.#binding('connection', expected, async record => {
             if (!isDeepStrictEqual(record, verifiedBinding)) throw failure();

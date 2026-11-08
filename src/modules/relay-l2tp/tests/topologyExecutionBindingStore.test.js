@@ -147,7 +147,7 @@ async function assembled(store, { onResolved, onBootstrap, localRunner, onComman
         RunnerBootstrapper: LocalBootstrapper, ...(reader ? { executionBindingReader: reader } : {}) });
     return { executor, events, Node };
 }
-async function setup(authority = goodAuthority, { publicOwner = false } = {}) {
+async function setup(authority = goodAuthority, { publicOwner = false, nodes = [frozenNode] } = {}) {
     if (!models) {
         const bind = (name, location) => connection.model(name, require(location).schema);
         models = {
@@ -171,7 +171,7 @@ async function setup(authority = goodAuthority, { publicOwner = false } = {}) {
     const repository = new TopologyOperationRepository({ model: models.Operation });
     await connection.transaction(async session => repository.createFrozen({ operationId, executionContext: PROD,
         idempotencyKey: `topology:production:revision-17:host-${PROD.hostIdentity}:${randomUUID()}`,
-        topologyRevision: 17, priorDeployedRevision: 16, nodes: [frozenNode], heldTopologyAdmission: true,
+        topologyRevision: 17, priorDeployedRevision: 16, nodes, heldTopologyAdmission: true,
         admissionFingerprint: 'f'.repeat(64), session }));
     await repository.claim({ operationId, executionContext: PROD, owner: 'worker-17', now: new Date(), leaseMs: 120000 });
     await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: NODE, operationId,
@@ -211,6 +211,224 @@ async function setup(authority = goodAuthority, { publicOwner = false } = {}) {
     return { store, context, expected: freeze(expected), enrollment: freeze({ nodeId: NODE, targetProfile: 'xray-main',
         endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
+
+// Two fixed, independent LOCAL physical inventories; the requested endpoint or
+// identity never supplies its own attestation. Persistence below is real Mongo.
+const BRIDGE = '507f1f77bcf86cd799439012';
+const BRIDGE_IDENTITY = freeze({ machineId: '5'.repeat(32), sshHostKeySha256: '6'.repeat(64) });
+const BRIDGE_ENDPOINT = freeze({ ip: '192.0.2.18', port: 2222, username: 'bridge_fixture' });
+const bridgeNode = freeze({ ...frozenNode, node: BRIDGE, nodeRef: 'bridge', role: 'bridge', targetProfile: 'xray-bridge',
+    configPath: '/usr/local/etc/xray-bridge/config.json', serviceUnit: 'xray-bridge.service',
+    serviceUnitPath: '/etc/systemd/system/xray-bridge.service' });
+async function pairedScopes(afterWork) {
+    const held = new Set(), calls = [], inventory = new Map([
+        [NODE, { endpoint: ENDPOINT, identity: IDENTITY }],
+        [BRIDGE, { endpoint: BRIDGE_ENDPOINT, identity: BRIDGE_IDENTITY }],
+    ]);
+    let revoked = false;
+    const authority = async (challenge, work) => {
+        const id = challenge.enrollment.nodeId, fixed = inventory.get(id);
+        assert.ok(fixed, 'no authority for a foreign node');
+        assert.equal(held.has(id), false, 'external authority is not reentrant per node');
+        calls.push({ id, action: challenge.action }); held.add(id);
+        const proof = evidence(challenge, { physicalIdentity: { ...fixed.identity } });
+        proof.connectionAttestation.endpoint = { ...fixed.endpoint };
+        proof.connectionAttestation.physicalIdentity = { ...fixed.identity };
+        try {
+            const result = await work(proof);
+            await afterWork?.(challenge);
+            return result;
+        } finally { held.delete(id); }
+    };
+    const first = await setup(authority, { publicOwner: true, nodes: [frozenNode, bridgeNode] });
+    await models.HyNode.create({ _id: BRIDGE, ip: BRIDGE_ENDPOINT.ip, name: 'local-bridge', type: 'xray', active: true,
+        cascadeRole: 'bridge', ssh: { port: BRIDGE_ENDPOINT.port, username: BRIDGE_ENDPOINT.username,
+            privateKey: 'synthetic-local-fixture-not-a-key' } });
+    const { TopologyConfigTransfer } = require('../../../services/topologyConfigTransfer');
+    const originalSnapshot = { configSha256: '7'.repeat(64), unitSha256: '8'.repeat(64), serviceActive: 'active', serviceEnabled: 'enabled' };
+    const transfer = new TopologyConfigTransfer({ executionContext: PROD, TopologyConfigOwner: models.Owner,
+        async withVerifiedMaintenance({ binding, proofRef }, work) {
+            assert.equal(proofRef, 'SIMULATED-bridge-original');
+            assert.equal(binding.node, BRIDGE); assert.equal(binding.profile, 'xray-bridge');
+            assert.deepEqual(binding.nodeIdentity, BRIDGE_IDENTITY);
+            return work({ status: 'verified', authority: 'external-maintenance-v1', binding: structuredClone(binding),
+                proofId: randomUUID(), maintenanceId: randomUUID(), maintenance: 'held', allWriters: 'drained',
+                oldBackend: { instanceId: 'simulated-old-bridge', pid: 43, processStartTime: 'simulated-bridge-start',
+                    processTree: 'stopped', dispatch: 'disabled' }, readback: { source: 'node-readback', ...originalSnapshot } });
+        } });
+    const classic = await transfer.initializeClassic({ node: BRIDGE, profile: 'xray-bridge', nodeIdentity: BRIDGE_IDENTITY });
+    const adopted = await transfer.adopt({ node: BRIDGE, profile: 'xray-bridge', generation: classic.generation,
+        proofRef: 'SIMULATED-bridge-original' });
+    const context = { ...first.context, node: bridgeNode,
+        executionFence: freeze({ ...first.context.executionFence, generation: randomUUID() }) };
+    await new NodeOperationLockRepository({ model: models.Lock }).acquireLease({ node: BRIDGE,
+        operationId: context.operationId, owner: context.executionFence.owner, generation: context.executionFence.generation,
+        leaseUntil: new Date(Date.now() + 120000) });
+    const { attemptId: _a, predecessorGeneration: _p, commandIds: _c, bootId: _b, maintenanceId: _m, ...expected } = bindingRecord(context, PROD.hostIdentity);
+    const second = { context, expected: freeze(expected), enrollment: freeze({ nodeId: BRIDGE, targetProfile: 'xray-bridge',
+        endpoint: BRIDGE_ENDPOINT, nodeIdentity: BRIDGE_IDENTITY, ownerGeneration: adopted.generation,
+        predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
+    const store = new contract.TopologyExecutionBindingStore({ executionContext: PROD, withVerifiedAuthority: authority,
+        assertAuthorityHeld: async () => { assert.equal(revoked, false, 'external authority revoked'); assert.ok(held.size); }, ...models });
+    for (const state of [first, second]) {
+        await store.preEnroll(state.enrollment); state.binding = await store.createBinding(state.expected);
+    }
+    calls.length = 0;
+    return { store, states: [first, second], held, calls, revoke: () => { revoked = true; } };
+}
+
+test('nested independent node scopes resolve both exact held connections without external reentry in either order', async t => {
+    for (const reverse of [false, true]) await t.test(reverse ? 'bridge then portal' : 'portal then bridge', async () => {
+        const f = await pairedScopes(), states = reverse ? [...f.states].reverse() : f.states;
+        await f.store.withVerifiedBinding(states[0].expected, async () => {
+            await f.store.withVerifiedBinding(states[1].expected, async () => {
+                assert.equal(f.held.size, 2);
+                for (const state of states) {
+                    const result = await f.store.readVerifiedConnection(state.expected, state.binding);
+                    assert.deepEqual(result, { binding: state.binding, connection: {
+                        expectedEndpoint: state.enrollment.endpoint, expectedHostKeySha256: state.enrollment.nodeIdentity.sshHostKeySha256 } });
+                    assert.equal(Object.isFrozen(result.connection.expectedEndpoint), true);
+                }
+                assert.deepEqual(f.calls, states.map(state => ({ id: state.expected.nodeId, action: 'terminal' })));
+            });
+            assert.equal(f.held.size, 1);
+            assert.deepEqual((await f.store.readVerifiedConnection(states[0].expected, states[0].binding)).binding, states[0].binding);
+        });
+        assert.equal(f.held.size, 0);
+        assert.equal(await models.Lock.countDocuments(), 2);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+    });
+});
+
+test('multi-node held scope refuses cross-paired, changed, unfrozen and foreign bindings without reacquisition', async () => {
+    const f = await pairedScopes(), [p, b] = f.states;
+    const denied = { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+    await f.store.withVerifiedBinding(b.expected, async () => {
+        await assert.rejects(f.store.readVerifiedConnection(p.expected, p.binding), denied);
+        assert.equal(f.calls.length, 1, 'foreign current scope must not fall back to new authority');
+        await f.store.withVerifiedBinding(p.expected, async () => {
+            for (const [expected, binding] of [
+                [p.expected, b.binding], [b.expected, p.binding],
+                [freeze({ ...p.expected, generation: randomUUID() }), p.binding],
+                [p.expected, freeze({ ...p.binding, attemptId: randomUUID() })],
+                [p.expected, freeze({ ...p.binding, commandIds: { ...p.binding.commandIds, close: randomUUID() } })],
+                [p.expected, { ...p.binding }],
+                [freeze({ ...p.expected, nodeId: '507f1f77bcf86cd799439099' }), p.binding],
+            ]) await assert.rejects(f.store.readVerifiedConnection(expected, binding), denied);
+            assert.equal(f.calls.length, 2);
+        });
+    });
+});
+
+test('multi-node held scope closes lexical frames before authority cleanup and rejects escaped inner contexts', async () => {
+    const { AsyncLocalStorage } = require('node:async_hooks');
+    let inner, outer, checkedCleanup = false, f;
+    const denied = { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' };
+    f = await pairedScopes(async challenge => {
+        if (challenge.action !== 'terminal' || challenge.enrollment.nodeId !== BRIDGE) return;
+        checkedCleanup = true;
+        for (const state of f.states) await assert.rejects(inner(() => f.store.readVerifiedConnection(state.expected, state.binding)), denied);
+    });
+    const [p, b] = f.states;
+    await f.store.withVerifiedBinding(p.expected, async () => {
+        outer = AsyncLocalStorage.snapshot();
+        await f.store.withVerifiedBinding(b.expected, async () => { inner = AsyncLocalStorage.snapshot(); });
+        for (const state of f.states) await assert.rejects(inner(() => f.store.readVerifiedConnection(state.expected, state.binding)), denied);
+        assert.deepEqual((await f.store.readVerifiedConnection(p.expected, p.binding)).binding, p.binding);
+    });
+    assert.equal(checkedCleanup, true);
+    for (const state of f.states) await assert.rejects(outer(() => f.store.readVerifiedConnection(state.expected, state.binding)), denied);
+    assert.equal(f.calls.length, 2);
+});
+
+test('multi-node held scope refuses an outer read whose inner lexical frame closes during majority delivery', async () => {
+    const f = await pairedScopes(), [p, b] = f.states;
+    const find = models.HyNode.findOne;
+    let pending, release, reached, armed = false;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const delivered = new Promise(resolve => { reached = resolve; });
+    models.HyNode.findOne = function (...args) {
+        const query = find.apply(this, args), lean = query.lean;
+        query.lean = async function (...leanArgs) {
+            const row = await lean.apply(this, leanArgs);
+            if (armed && this.getOptions().readConcern?.level === 'majority' && String(this.getFilter()._id) === NODE) {
+                armed = false; reached(); await blocked;
+            }
+            return row;
+        };
+        return query;
+    };
+    try {
+        await f.store.withVerifiedBinding(p.expected, async () => {
+            await f.store.withVerifiedBinding(b.expected, async () => {
+                armed = true;
+                pending = f.store.readVerifiedConnection(p.expected, p.binding);
+                pending.catch(() => {});
+                await delivered;
+            });
+            release();
+            await assert.rejects(pending, { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+            assert.deepEqual((await f.store.readVerifiedConnection(p.expected, p.binding)).binding, p.binding);
+        });
+    } finally { release(); models.HyNode.findOne = find; }
+    assert.equal(f.calls.length, 2);
+});
+
+test('multi-node held scope isolates concurrent siblings while both external authorities remain held', async () => {
+    const f = await pairedScopes(), [p, b] = f.states;
+    let pReady, bReady;
+    const firstReady = new Promise(resolve => { pReady = resolve; });
+    const bothReady = new Promise(resolve => { bReady = resolve; });
+    const first = f.store.withVerifiedBinding(p.expected, async () => {
+        pReady(); await bothReady;
+        assert.equal(f.held.size, 2);
+        await assert.rejects(f.store.readVerifiedConnection(b.expected, b.binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.deepEqual((await f.store.readVerifiedConnection(p.expected, p.binding)).binding, p.binding);
+    });
+    await firstReady;
+    const second = f.store.withVerifiedBinding(b.expected, async () => {
+        bReady(); await first;
+        await assert.rejects(f.store.readVerifiedConnection(p.expected, p.binding), { code: 'TOPOLOGY_EXECUTION_BINDING_UNPROVEN' });
+        assert.deepEqual((await f.store.readVerifiedConnection(b.expected, b.binding)).binding, b.binding);
+    });
+    await Promise.all([first, second]);
+    assert.equal(f.calls.length, 2); assert.equal(f.held.size, 0);
+});
+
+test('multi-node held scope retains original revocation and outer ownership freshness refusals', async t => {
+    for (const fault of ['revoked', 'outer-lock', 'outer-lease', 'outer-endpoint']) await t.test(fault, async () => {
+        const f = await pairedScopes(), [p, b] = f.states;
+        const winner = randomUUID();
+        await assert.rejects(f.store.withVerifiedBinding(p.expected, async () => {
+            await f.store.withVerifiedBinding(b.expected, async () => {
+                if (fault === 'revoked') f.revoke();
+                if (fault === 'outer-lock') await models.Lock.collection.updateOne({ node: new mongoose.Types.ObjectId(NODE) }, { $set: { generation: winner } });
+                if (fault === 'outer-lease') await models.Operation.updateOne({}, { $set: { leaseUntil: new Date(0) } });
+                if (fault === 'outer-endpoint') await models.HyNode.updateOne({ _id: NODE }, { $set: { ip: '192.0.2.99' } });
+                await assert.rejects(f.store.readVerifiedConnection(p.expected, p.binding));
+            });
+        }));
+        assert.equal(f.calls.length, 2); assert.equal(f.held.size, 0);
+        assert.equal(await models.Lock.countDocuments(), 2);
+        assert.equal((await models.Operation.findOne().lean()).heldTopologyAdmission, true);
+        assert.equal((await models.Lock.findOne({ node: NODE }).lean()).generation, fault === 'outer-lock' ? winner : p.expected.generation);
+    });
+});
+
+test('multi-node held read-only recovery resolves both exact connections with zero Mongo mutations', async () => {
+    const f = await pairedScopes(), [p, b] = f.states;
+    const commands = [], observe = event => commands.push(event.commandName);
+    connection.getClient().on('commandStarted', observe);
+    try {
+        await f.store.withReadOnlyVerifiedBinding(p.expected, async () => {
+            await f.store.withReadOnlyVerifiedBinding(b.expected, async () => {
+                for (const state of f.states) assert.deepEqual((await f.store.readVerifiedConnection(state.expected, state.binding)).binding, state.binding);
+            });
+        });
+    } finally { connection.getClient().off('commandStarted', observe); }
+    assert.deepEqual(commands.filter(name => ['insert', 'update', 'delete', 'commitTransaction', 'abortTransaction'].includes(name)), []);
+    assert.deepEqual(f.calls.map(call => call.action), ['probe', 'probe']);
+});
 
 test('server-attested exact endpoint is snapshotted immutably with physical enrollment', async () => {
     const { expected, enrollment } = await setup();
