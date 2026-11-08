@@ -1066,6 +1066,47 @@ test('expired lease after final confirmation or awaited cleanup never returns bi
     });
 });
 
+test('Mongo IO budget is not a lease expiry during held authority cleanup', async t => {
+    for (const action of ['readVerified', 'withReadOnlyVerifiedBinding']) await t.test(action, async () => {
+        let armed = false;
+        const fixture = await pairedScopes(async () => {
+            if (armed) await new Promise(resolve => setTimeout(resolve, 5100));
+        });
+        const beforeOperation = await models.Operation.findOne().lean();
+        const beforeLocks = await models.Lock.find().lean();
+        const commands = [];
+        const observe = event => {
+            if (event.commandName === 'find') commands.push(event.command);
+        };
+        connection.getClient().on('commandStarted', observe);
+        armed = true;
+        try {
+            for (const state of fixture.states) {
+                const start = Date.now();
+                const result = action === 'readVerified'
+                    ? await fixture.store.readVerified(state.expected)
+                    : await fixture.store.withReadOnlyVerifiedBinding(state.expected, async binding => binding);
+                assert.ok(Date.now() - start >= 5100, 'actual cleanup must cross the Mongo IO budget');
+                assert.deepEqual(result, state.binding);
+            }
+        } finally { connection.getClient().off('commandStarted', observe); }
+        assert.ok(commands.length > 0);
+        assert.ok(commands.every(command => command.maxTimeMS > 0 && command.maxTimeMS <= 5000),
+            'authority cleanup cannot increase any actual Mongo read deadline');
+        const operation = await models.Operation.findOne().lean();
+        assert.deepEqual(operation.leaseUntil, beforeOperation.leaseUntil);
+        assert.ok(operation.leaseUntil.getTime() > Date.now());
+        for (const lock of await models.Lock.find().lean()) {
+            const before = beforeLocks.find(row => row.node.equals(lock.node));
+            assert.deepEqual(lock.leaseUntil, before.leaseUntil);
+            assert.equal(lock.generation, before.generation);
+            assert.ok(lock.leaseUntil.getTime() > Date.now());
+        }
+        assert.equal(operation.heldTopologyAdmission, true);
+        assert.equal(await models.Binding.countDocuments(), 2);
+    });
+});
+
 // Public Mongoose aggregation-pipeline updates bypass ordinary field casting,
 // even with runValidators:true. Scalar query equality alone matches array elements.
 test('malformed BSON authority arrays never authorize enrollment, binding creation or executor dispatch', async t => {

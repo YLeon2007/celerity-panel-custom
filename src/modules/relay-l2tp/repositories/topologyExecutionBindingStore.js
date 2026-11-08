@@ -495,9 +495,11 @@ class TopologyExecutionBindingStore {
                     const operation = await this.#majority(this.#models.Operation, this.#operationFilter(expected, new Date()), deadline);
                     this.#checkOperationRow(operation, expected);
                     if (!(operation?.leaseUntil instanceof Date)) throw failure();
+                    let leaseUntil = operation.leaseUntil.getTime();
                     deadline = Math.min(deadline, operation.leaseUntil.getTime());
                     const lock = await this.#majority(this.#models.Lock, this.#lockFilter(expected, new Date()), deadline);
                     if (!(lock?.leaseUntil instanceof Date)) throw failure();
+                    leaseUntil = Math.min(leaseUntil, lock.leaseUntil.getTime());
                     deadline = Math.min(deadline, lock.leaseUntil.getTime());
                     const owner = await this.#majority(this.#models.Owner, ownerFilter, deadline);
                     const evidence = this.#ownerEvidence(owner, enrollment);
@@ -515,7 +517,7 @@ class TopologyExecutionBindingStore {
                         const priorOperation = await this.#majority(this.#models.Operation, this.#terminalOperationFilter(predecessor), deadline);
                         this.#checkOperationRow(priorOperation, predecessor);
                     }
-                    validUntil = deadline;
+                    validUntil = leaseUntil;
                     await this.#assertAuthorityHeld?.();
                     assertFresh(); ensureOpen();
                     return recordProjection(current);
@@ -564,6 +566,7 @@ class TopologyExecutionBindingStore {
                     // Each filter is built immediately before its read, not before
                     // another awaited confirmation. Retain both exact expiration dates
                     // and bound all remaining readback by the earliest observed lease.
+                    let leaseUntil = Infinity;
                     for (const [Model, filter] of [[this.#models.Operation, () => this.#operationFilter(expected, new Date())],
                         [this.#models.Lock, () => this.#lockFilter(expected, new Date())], [this.#models.Owner, () => ownerFilter],
                         [this.#models.HyNode, () => nodeFilter]]) {
@@ -574,10 +577,14 @@ class TopologyExecutionBindingStore {
                         } else if (Model !== this.#models.HyNode) {
                             if (Model === this.#models.Operation) this.#checkOperationRow(current, expected);
                             if (!(current.leaseUntil instanceof Date) || !Number.isFinite(current.leaseUntil.getTime())) throw failure('UNCONFIRMED');
+                            leaseUntil = Math.min(leaseUntil, current.leaseUntil.getTime());
                             deadline = Math.min(deadline, current.leaseUntil.getTime());
                         }
                     }
-                    validUntil = deadline;
+                    // Mongo confirmation retains its cumulative I/O deadline.
+                    // Awaited external checks/cleanup do not extend that budget,
+                    // nor turn it into an earlier expiry of the confirmed leases.
+                    validUntil = leaseUntil;
                     assertFresh();
                     return recordProjection(confirmed);
                 }, ensureOpen);
