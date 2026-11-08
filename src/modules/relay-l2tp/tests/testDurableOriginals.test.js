@@ -191,7 +191,7 @@ test('DEFAULT root and actual owner entry refuse changed independent challenge w
     assert.equal(accesses, 0);
 });
 
-function setup(mode = '') {
+function setup(mode = '', timeoutMs = 100) {
     const children = [];
     return { children, capability: api.createDurableNodeOriginals({
         read(file) {
@@ -205,12 +205,16 @@ function setup(mode = '') {
             const child = spawn(process.execPath, ['-e', `
                 let text=''; process.stdin.on('data',b=>{ text+=b; let i; while((i=text.indexOf('\\n'))>=0){
                     const f=JSON.parse(text.slice(0,i)); text=text.slice(i+1);
-                    if(f.op==='finish') {process.exit(0);}
+                    if(f.op==='finish') {
+                        if(${JSON.stringify(mode)}==='slow-finish') {setTimeout(()=>process.exit(0),3500);return;}
+                        if(${JSON.stringify(mode)}==='stalled-finish') {setInterval(()=>{},1000);return;}
+                        process.exit(0);
+                    }
                     if(${JSON.stringify(mode)}==='silent') continue;
                     process.stdout.write(JSON.stringify({version:1,op:'capture-held',seq:f.seq,nonce:${JSON.stringify(mode)}==='nonce'?'foreign':f.nonce})+'\\n');
                 }});`], { stdio: ['pipe', 'pipe', 'pipe'] });
             children.push(child); return child;
-        }, timeoutMs: 100,
+        }, timeoutMs,
     }) };
 }
 test('fixed installed adapter awaits live challenges across callback and revokes escaped checker', async () => {
@@ -230,4 +234,25 @@ test('wrong nonce and timeout refuse before callback and permanently revoke adap
         assert.equal(writes, 0);
         assert.equal(f.children.length, 1);
     }
+});
+test('finite finish uses the preselected constructor IO budget, not an incidental three-second cap', async () => {
+    // Real child/protocol/creator close; delayed modeled cleanup is NOT physical
+    // authority. The external original owner still enforces its unchanged end.
+    const f = setup('slow-finish', 5000);
+    const result = await f.capability(challenge, async check => { await check(); return 17; });
+    assert.equal(result, 17);
+    assert.equal(f.children[0].exitCode, 0);
+    assert.equal(f.children[0].signalCode, null);
+    await assert.rejects(f.capability(challenge, () => assert.fail('no replay')));
+});
+test('finish still expires at the selected IO bound and revokes escaped checks without replay', async () => {
+    const f = setup('stalled-finish', 100);
+    let escaped;
+    const start = Date.now();
+    await assert.rejects(f.capability(challenge, async check => { escaped = check; await check(); }));
+    assert.ok(Date.now() - start < 1000, 'finish must use the selected 100ms, not a fresh 3000ms');
+    await assert.rejects(escaped());
+    await assert.rejects(f.capability(challenge, () => assert.fail('no replay')));
+    assert.equal(f.children.length, 1);
+    assert.equal(f.children[0].signalCode, 'SIGKILL');
 });

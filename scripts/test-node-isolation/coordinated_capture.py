@@ -100,7 +100,10 @@ def validate(config):
     if inventory:
         shared_physical = next(pin['physical'] for pin in inventory['nodes'] if pin['nodeId'] == shared)
         need(all(config['origin'][key] == shared_physical[key] for key in ('machineId','bootId')), 'COORDINATOR_SHARED_HOST_MISMATCH')
-    need(type(config['lifetimeSeconds']) is int and 80 <= config['lifetimeSeconds'] <= 120)
+    # Trusted preselected stage budget, NOT an original-owner lease. The caller
+    # must bound it by the original remaining lifetime and keep enforcing that
+    # unchanged outer deadline independently (including child restarts).
+    need(type(config['lifetimeSeconds']) is int and 80 <= config['lifetimeSeconds'] <= 600)
     need(set(config['origin']) == {'machineId','bootId','cgroup','uid'} and type(config['origin']['uid']) is int and config['origin']['uid'] == 0
          and isinstance(config['origin']['cgroup'], str) and config['origin']['cgroup'] and 'candidate' not in config['origin']['cgroup'])
     need(re.fullmatch('[a-f0-9]{32}',config['origin']['machineId']) and re.fullmatch('[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',config['origin']['bootId']))

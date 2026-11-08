@@ -90,7 +90,10 @@ function createDurableNodeOriginals({ read = readTrusted, spawn = spawnProcess, 
             // No permission after cleanup: finish deliberately has no GO reply.
             child.stdin.end(JSON.stringify({ version: 1, op: 'finish', seq: seq++, nonce: randomBytes(32).toString('hex'), ownerChallenge: challenge }) + '\n');
             let timer;
-            try { await Promise.race([exit, new Promise((_, reject) => { timer = setTimeout(() => reject(refusal()), 3000); })]); }
+            // Finish performs native held checks too. Reuse the IO budget
+            // selected at construction, not an unrelated three-second cap.
+            // The independently held original owner still bounds the instance.
+            try { await Promise.race([exit, new Promise((_, reject) => { timer = setTimeout(() => reject(refusal()), timeoutMs); })]); }
             finally { clearTimeout(timer); }
             need(exitCode === 0); return result;
         } catch { poison(); throw refusal(); }
