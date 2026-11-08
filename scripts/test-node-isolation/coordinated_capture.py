@@ -5,7 +5,7 @@ A manually started root coordinator holds five independent foreground SSH
 channels. The default app's fixed owner-channel client consumes only that live
 root-peer UDS capability, bound to the independently accepted owner challenge.
 """
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import base64
 import fcntl
 import hashlib
@@ -345,7 +345,19 @@ class NodeServer:
                         'backend':{'instanceId':backend['id'],'pid':backend['init']['pid'],'processStartTime':backend['init']['startTicks']}}
             need(observed == self.config['ownerChallenge']['host'], 'SHARED_HOST_PIN_DRIFT_RETAINED')
 
-    def serve(self):
+    def serve(self, *, capture_hold=None):
+        # A shared-node original apply owner enters its lexical hold BEFORE the
+        # Coordinator publishes intent. Continue that exact hold, not a new
+        # acquisition (whose pre-capture barrier must still reject the intent).
+        # The caller owns disposal; neither this server nor a receipt can extend
+        # the lifetime, adopt another writer/OFD, or replay a prior capture.
+        if capture_hold is not None:
+            need(type(capture_hold) is CaptureHold and capture_hold.writer is self.writer
+                 and capture_hold.n is self.n and self.outer_lock_fd is not None
+                 and capture_hold.outer_lock_fd == self.outer_lock_fd and capture_hold.active
+                 and not capture_hold.attempted and capture_hold.bundle is None,
+                 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED')
+            capture_hold.check()
         self.pins()
         self.wire.send({'version':1,'op':'hello','nodeId':self.node,'nodeNonce':self.nonce,'pinSha256':sha(canonical(self.pin)),**self.root})
         first = self.wire.receive()
@@ -354,7 +366,8 @@ class NodeServer:
         need(set(origin) == {*self.config['origin'],'pid','start'} and {k:origin[k] for k in self.config['origin']} == self.config['origin']
              and type(origin['pid']) is int and origin['pid'] > 1 and isinstance(origin['start'],str) and origin['start'].isdigit())
         need(isinstance(first['coordinatorNonce'],str) and DIGEST.fullmatch(first['coordinatorNonce']))
-        with CaptureHold(self.writer,self.n,outer_lock_fd=self.outer_lock_fd) as held:
+        with (nullcontext(capture_hold) if capture_hold is not None else
+              CaptureHold(self.writer,self.n,outer_lock_fd=self.outer_lock_fd)) as held:
             seq,frame = 0,first
             while True:
                 need(set(frame) == BASE | ({'predecessor'} if frame['op'] == 'observe' else set()) and type(frame['version']) is int and frame['version'] == 1 and frame['nodeId'] == self.node

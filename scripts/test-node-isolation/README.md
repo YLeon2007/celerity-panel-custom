@@ -437,5 +437,33 @@ borrowed descriptor. The caller retains its original owner lifetime. A failure
 before any downstream capture state exists may still qualify for the existing
 `abort_return(fd)`; a published bundle or even a partial originals store cannot.
 Capture/unknown state is retained, not deleted or converted into early OLD.
-This seam does not implement enrollment, Coordinator COMMIT, serving or terminal
-restoration, and is not installed/physical acceptance.
+This borrowed-FD seam alone does not implement enrollment, Coordinator COMMIT,
+serving or terminal restoration, and is not installed/physical acceptance.
+
+## Shared-node lexical capture through public enrollment
+
+For a Coordinator on the shared node's actual filesystem, enter the original
+`CaptureHold(writer, originals, outer_lock_fd=fd)` before starting
+`Coordinator.capture_scope()`. Keep that exact context open and run
+`NodeServer(..., outer_lock_fd=fd).serve(capture_hold=held)` in the same original
+owner. The server validates the exact live hold/writer/module/descriptor and
+refuses an inactive, foreign or already-attempted hold. It does not re-enter,
+close, unlock or extend the caller's context. Omitting `capture_hold` preserves
+the independent/default path.
+
+The Coordinator still publishes intent before opening its channels. A fresh
+borrowed hold opened after that intent still fails the unchanged Engine barrier;
+no intent deletion, retry, journal edit or early OLD is permitted. The retained
+hold spans actual capture, native observations and the default root factory's
+public `initializeClassic → adopt → preEnroll` consumer and final assertions.
+A finite local P/shared-B composition (both B profiles) exercises this path with
+real isolated loopback replica-set persistence. Root/SSH identity, service and
+freezer facts remain modeled; no installed pins or physical authority are issued.
+
+This is not a continuous-OFD selected-work/terminal bridge. Ordinary postcapture
+execution currently requires capture OFDs to close before ordinary observers
+acquire them; capture checks require zero dispatch. `restoration_hold()` also
+requests runner locks which the capture-only lock adapter refuses. Capture and
+restoration Coordinators remain distinct objects/protocols. No selected work,
+FINAL policy, ROOT acceptance, COMMIT, serving handoff or Invocation settlement
+is implied by a successful enrollment. Those owning contracts remain unchanged.

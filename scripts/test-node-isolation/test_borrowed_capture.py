@@ -160,5 +160,56 @@ class BorrowedCaptureTests(unittest.TestCase):
             self.assertFalse(fixture.path(n.STORE).exists())
 
 
+class LexicalNodeServerTests(unittest.TestCase):
+    assert_held = BorrowedCaptureTests.assert_held
+    # The assembled finite regression exercises the actual Coordinator/codec and
+    # public Mongo consumer. These narrow tests stop at the first pins read so
+    # invalid capabilities must refuse before touching that boundary.
+    def server(self, fixture, descriptor):
+        server = capture.NodeServer.__new__(capture.NodeServer)
+        server.writer, server.n, server.outer_lock_fd = fixture.writer, n, descriptor
+        def pins():
+            raise RuntimeError('EXPECTED_NATIVE_PINS_BOUNDARY')
+        server.pins = pins
+        return server
+
+    def test_same_lexical_hold_continues_after_shared_intent_without_reentry(self):
+        with original_owner() as (fixture, descriptor):
+            server = self.server(fixture, descriptor)
+            with capture.CaptureHold(fixture.writer, n, outer_lock_fd=descriptor) as held:
+                fixture.put(capture.INTENT, b'{"phase":"acquiring-retained"}')
+                # A fresh holder is still forbidden on the exact same filesystem.
+                with self.assertRaisesRegex(isolation.Refusal, 'EARLY_RETURN_DOWNSTREAM_UNKNOWN_RETAINED'):
+                    fixture.engine.assert_before_capture()
+                with self.assertRaisesRegex(RuntimeError, 'EXPECTED_NATIVE_PINS_BOUNDARY'):
+                    server.serve(capture_hold=held)
+                self.assertTrue(held.active)
+                self.assert_held(fixture, descriptor)
+            self.assert_held(fixture, descriptor)
+            with self.assertRaisesRegex(capture.Refusal, 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED'):
+                server.serve(capture_hold=held)
+
+    def test_foreign_writer_descriptor_or_attempted_hold_refuses_before_pins(self):
+        with original_owner() as (fixture, descriptor):
+            server = self.server(fixture, descriptor)
+            with capture.CaptureHold(fixture.writer, n, outer_lock_fd=descriptor) as held:
+                with self.assertRaisesRegex(capture.Refusal, 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED'):
+                    server.serve(capture_hold=object())
+                writer = server.writer
+                server.writer = object()
+                with self.assertRaisesRegex(capture.Refusal, 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED'):
+                    server.serve(capture_hold=held)
+                server.writer = writer
+                with fixture.fs.opened(n.OUTER_LOCK) as separate:
+                    server.outer_lock_fd = separate
+                    with self.assertRaisesRegex(capture.Refusal, 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED'):
+                        server.serve(capture_hold=held)
+                server.outer_lock_fd = descriptor
+                held.capture()
+                with self.assertRaisesRegex(capture.Refusal, 'SAME_LEXICAL_CAPTURE_HOLD_REQUIRED'):
+                    server.serve(capture_hold=held)
+                self.assert_held(fixture, descriptor)
+
+
 if __name__ == '__main__':
     unittest.main()
