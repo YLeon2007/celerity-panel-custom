@@ -421,3 +421,21 @@ positive operator recovery, data-plane connectivity, provisioning/owner restorat
 endpoint reservations, backend isolation or a complete live node lifecycle.
 Those remain parent review/install acceptance boundaries; none are hidden behind
 an authority-shaped wrapper or TEST boolean.
+# Retained original-owner capture
+
+`CaptureHold(writer, originals, outer_lock_fd=fd)` and
+`NodeServer(..., outer_lock_fd=fd)` explicitly borrow the original live v2
+apply Engine's continuously held outer descriptor. The owner must finish its
+real `fresh_confirmation(fd)` scope and wait for the fresh confirmer first.
+Admission checks the same Engine/process, its live apply state, held guard,
+zero dispatch, pre-capture boundary, and matching locked outer inode. No disk
+journal adoption or replacement lock acquisition is permitted. Without this
+keyword the existing independent acquisition is unchanged.
+
+Scope disposal restores the writer adapters but never closes/unlocks the
+borrowed descriptor. The caller retains its original owner lifetime. A failure
+before any downstream capture state exists may still qualify for the existing
+`abort_return(fd)`; a published bundle or even a partial originals store cannot.
+Capture/unknown state is retained, not deleted or converted into early OLD.
+This seam does not implement enrollment, Coordinator COMMIT, serving or terminal
+restoration, and is not installed/physical acceptance.

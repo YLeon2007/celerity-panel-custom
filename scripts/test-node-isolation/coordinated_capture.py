@@ -201,8 +201,9 @@ class CaptureHold:
     absence. The outer engine lock plus fresh dispatchCount=0/recovery guard is
     the existing dispatch exclusion authority, not a new runner journal.
     """
-    def __init__(self, writer, originals):
+    def __init__(self, writer, originals, *, outer_lock_fd=None):
         self.writer, self.n = writer, originals
+        self.outer_lock_fd = outer_lock_fd
         self.active = False
         self.attempted = False
         self.bundle = None
@@ -212,7 +213,13 @@ class CaptureHold:
         self.stack = ExitStack()
         self.real_lock, self.real_checkpoint = self.writer.fs.lock, self.writer.checkpoint
         try:
-            fd = self.stack.enter_context(self.real_lock(self.n.OUTER_LOCK))
+            if self.outer_lock_fd is None:
+                fd = self.stack.enter_context(self.real_lock(self.n.OUTER_LOCK))
+            else:
+                self.borrowed_owner()
+                self.writer.engine.assert_before_capture()
+                fd = self.outer_lock_fd
+                self.writer.fs.trusted(os.fstat(fd))
             self.locks = {self.n.OUTER_LOCK: fd}
             self.writer.locks = (fd,)
             self.writer.lock_paths = dict(self.locks)
@@ -233,9 +240,23 @@ class CaptureHold:
             self.__exit__(*sys.exc_info())
             raise
 
+    def borrowed_owner(self):
+        engine = self.writer.engine
+        live = getattr(engine, '_early', None)
+        need(type(self.outer_lock_fd) is int and
+             isinstance(engine, self.writer.module.Engine) and engine.plan.get('version') == 2 and
+             getattr(engine, '_outer_lock_fd', None) == self.outer_lock_fd and
+             live is not None and live['active'] and not live['pending'] and 'confirmation' not in live and
+             live['owner'] == {key:self.writer.module.proc_identity(os.getpid())[key] for key in ('pid','start')},
+             'CAPTURE_ORIGINAL_APPLY_OWNER_REQUIRED')
+        engine.require_early_lock(self.outer_lock_fd)
+        need(self.writer.held() == live['state'], 'CAPTURE_ORIGINAL_APPLY_STATE_REQUIRED')
+
     def check(self):
         try:
             need(self.active and self.locks, 'CAPTURE_HOLD_REVOKED')
+            if self.outer_lock_fd is not None:
+                self.borrowed_owner()
             state = self.writer.held(self.guard)
             need(state['dispatchCount'] == 0, 'CAPTURE_AFTER_DISPATCH_FORBIDDEN')
             for path, fd in self.locks.items():
@@ -288,9 +309,10 @@ class CaptureHold:
 
 
 class NodeServer:
-    def __init__(self, writer, originals, config, wire, protocol, *, shared=None, attestor=None):
+    def __init__(self, writer, originals, config, wire, protocol, *, shared=None, attestor=None, outer_lock_fd=None):
         self.writer, self.n, self.config, self.wire, self.c, self.shared = writer, originals, validate(config), wire, protocol, shared
         self.attestor = attestor
+        self.outer_lock_fd = outer_lock_fd
         self.node = writer.engine.plan['nodeId']
         self.shared_node = shared_node(config)
         if config['version'] == 2:
@@ -332,7 +354,7 @@ class NodeServer:
         need(set(origin) == {*self.config['origin'],'pid','start'} and {k:origin[k] for k in self.config['origin']} == self.config['origin']
              and type(origin['pid']) is int and origin['pid'] > 1 and isinstance(origin['start'],str) and origin['start'].isdigit())
         need(isinstance(first['coordinatorNonce'],str) and DIGEST.fullmatch(first['coordinatorNonce']))
-        with CaptureHold(self.writer,self.n) as held:
+        with CaptureHold(self.writer,self.n,outer_lock_fd=self.outer_lock_fd) as held:
             seq,frame = 0,first
             while True:
                 need(set(frame) == BASE | ({'predecessor'} if frame['op'] == 'observe' else set()) and type(frame['version']) is int and frame['version'] == 1 and frame['nodeId'] == self.node
