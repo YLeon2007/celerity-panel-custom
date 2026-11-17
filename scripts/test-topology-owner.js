@@ -225,8 +225,37 @@ async function inspectTestOwnerHandback({ env, models }) {
         if (!alias || alias.ownerGeneration !== owner.generation || owner.handbackReceipt !== undefined
             || alias.maintenanceId !== owner.adoptionReceipt?.maintenanceId) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
         return { nodeId: String(owner.node), targetProfile: owner.profile, ownerGeneration: owner.generation,
+            nodeIdentity: owner.nodeIdentity, originalSnapshot: owner.originalSnapshot, endpoint: alias.endpoint,
             proofRef: 'dedicated-' + alias.maintenanceId };
     }));
+}
+async function restoreTestBeforeimages({ models, nodes }) {
+    const NodeSSH = require('../src/services/nodeSSH');
+    const operations = await models.TopologyOperation.find({ executionContext: TEST, status:'succeeded', 'v2Terminal.state':'proven' })
+        .sort({ createdAt:1 }).read('primary').readConcern('majority').maxTimeMS(5000).lean();
+    const sessions = [];
+    try {
+        for (const pin of nodes) {
+            const node = await models.HyNode.findById(pin.nodeId).select('+ssh.privateKey +ssh.password').lean();
+            if (!node || !pin.endpoint) throw failure('TEST_ORIGINAL_BEFOREIMAGE_UNPROVEN');
+            const operation = operations.find(op => op.v2Terminal.ownerFences?.some(f => f.node === pin.nodeId
+                && f.profile === pin.targetProfile && f.generation === pin.ownerGeneration)
+                && op.nodes?.some(n => String(n.node) === pin.nodeId && n.targetProfile === pin.targetProfile && n.backupId));
+            const backupId = operation?.nodes.find(n => String(n.node) === pin.nodeId && n.targetProfile === pin.targetProfile).backupId;
+            if (backupId !== undefined && !/^topology-[a-f0-9]{64}$/.test(backupId)) throw failure('TEST_ORIGINAL_BEFOREIMAGE_UNPROVEN');
+            const ssh = new NodeSSH(node, { expectedEndpoint:pin.endpoint, expectedHostKeySha256:pin.nodeIdentity.sshHostKeySha256 });
+            await ssh.connect(); sessions.push({ ssh, pin, backupId });
+        }
+        const run = async ({ ssh,pin,backupId }, write) => {
+            const payload = { profile:pin.targetProfile, expected:pin.originalSnapshot, backupId:backupId ?? null, write };
+            const python = `import os,pathlib,json,hashlib,subprocess,stat\np=json.loads(${JSON.stringify(JSON.stringify(payload))})\nassert p['profile'] in ['xray-main','xray-bridge']\nmain=p['profile']=='xray-main'\ncfg=pathlib.Path('/usr/local/etc/xray/config.json' if main else '/usr/local/etc/xray-bridge/config.json')\nunit=pathlib.Path('/etc/systemd/system/xray.service' if main else '/etc/systemd/system/xray-bridge.service')\nsha=lambda b:hashlib.sha256(b).hexdigest()\nexpected=p['expected'];before=cfg.read_bytes();info=cfg.stat()\nassert sha(unit.read_bytes())==expected['unitSha256']\nif sha(before)==expected['configSha256']: print('already-original');raise SystemExit(0)\nassert p['backupId'] is not None\nbackup=pathlib.Path('/var/lib/celerity/topology/backups')/p['backupId']/p['profile']/'config.json'\noriginal=backup.read_bytes();assert sha(original)==expected['configSha256']\nif not p['write']: print('checked-existing-native-beforeimage');raise SystemExit(0)\nsubprocess.run(['/usr/local/bin/xray','run','-test','-config',str(backup)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\ntmp=cfg.with_name(cfg.name+'.classic-handback-upload');assert not tmp.exists()\nwith open(tmp,'xb') as f:f.write(original);f.flush();os.fsync(f.fileno())\nos.chmod(tmp,stat.S_IMODE(info.st_mode));os.chown(tmp,info.st_uid,info.st_gid);os.replace(tmp,cfg)\nservice='xray' if main else 'xray-bridge'\ntry:\n subprocess.run(['systemctl','restart',service],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n assert sha(cfg.read_bytes())==expected['configSha256']\n assert subprocess.check_output(['systemctl','is-active',service],text=True).strip()==expected['serviceActive']\n assert subprocess.check_output(['systemctl','is-enabled',service],text=True).strip()==expected['serviceEnabled']\nexcept BaseException:\n cfg.write_bytes(before);os.chmod(cfg,stat.S_IMODE(info.st_mode));os.chown(cfg,info.st_uid,info.st_gid);subprocess.run(['systemctl','restart',service],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);raise\nprint('restored-verified-native-beforeimage')\n`;
+            const quoted = "'" + python.replace(/'/g, "'\"'\"'") + "'";
+            const result = await ssh.exec('/usr/bin/python3 -I -B -c ' + quoted);
+            if (result.code !== 0) throw failure('TEST_ORIGINAL_BEFOREIMAGE_UNPROVEN');
+        };
+        for (const session of sessions) await run(session,false);
+        for (const session of sessions) await run(session,true);
+    } finally { for (const {ssh} of sessions) ssh.disconnect(); }
 }
 async function handbackTestOwners({ env, models, lifecycle, authority, expected }) {
     const { isDeepStrictEqual: same } = require('node:util');
@@ -234,10 +263,7 @@ async function handbackTestOwners({ env, models, lifecycle, authority, expected 
     if (!same(lifecycle.executionContext, TEST) || !same(nodes, expected)) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
     // Existing sole controller: drain, fresh actual journal/profile CURRENT,
     // all-participant prepare, exact original restoration, verified transfer.
-    authority.drainOriginals();
-    const current = await authority.readOriginalRestoreCurrent();
-    if (!same(Object.keys(current).sort(), nodes.map(row => row.nodeId).sort())) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
-    await authority.restoreOriginals(current);
+    await authority.restoreClassicSnapshots(nodes, () => restoreTestBeforeimages({ models, nodes }));
     const transfer = new (require('../src/services/topologyConfigTransfer').TopologyConfigTransfer)({
         executionContext: TEST, TopologyConfigOwner: models.TopologyConfigOwner,
         withVerifiedMaintenance: lifecycle.withVerifiedMaintenance.bind(lifecycle) });
@@ -248,7 +274,7 @@ async function handbackTestOwners({ env, models, lifecycle, authority, expected 
             .read('primary').readConcern('majority').maxTimeMS(5000).lean();
         if (owner?.owner !== 'classic' || owner.handbackReceipt?.fromGeneration !== row.ownerGeneration) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
     }
-    await authority.releaseOriginals();
+    await authority.releaseClassicSnapshots();
     return freeze({ status: 'handed-back', nodes: nodes.map(({ nodeId, targetProfile }) => ({ nodeId, targetProfile })) });
 }
 module.exports = { enrollTestOwners, initializeDedicatedTestState, initializePristineDedicatedRelayAbsence,

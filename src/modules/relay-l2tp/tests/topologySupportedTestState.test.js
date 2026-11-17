@@ -40,8 +40,7 @@ test('TEST handback restores before real transfer and retains alias/business his
  const empty={findOne:()=>query(null)},models={TopologyConfigOwner:Model,TopologyExecutionEnrollment:{find:()=>query(aliases)},
   CascadeTopologyState:{findById:()=>query({remoteAdmissionCount:0,topologyAdmissionCount:0})},NodeOperationLock:empty,RemoteAdmission:empty,TopologyOperation:empty,TopologyCreateIntent:empty};
  const expected=await inspectTestOwnerHandback({env,models}),before=structuredClone(aliases);restored=false;
- const authority={drainOriginals(){events.push('drain');},async readOriginalRestoreCurrent(){events.push('current');return {[node]:{journalSha256:'5'.repeat(64)}};},
-  async restoreOriginals(current){assert.ok(current[node]);events.push('restore');restored=true;},async releaseOriginals(){assert.equal(rows[0].owner,'classic');events.push('release');}};
+ const authority={async restoreClassicSnapshots(pins){assert.equal(pins[0].nodeId,node);events.push('restore');restored=true;},async releaseClassicSnapshots(){assert.equal(rows[0].owner,'classic');events.push('release');}};
  assert.equal((await handbackTestOwners({env,models,lifecycle,authority,expected})).status,'handed-back');
  assert.ok(events.indexOf('restore')<events.indexOf('handback'));assert.equal(events.at(-1),'release');
  assert.equal(rows[0].lastSettledOperation,'preserved-business-history');assert.deepEqual(aliases,before);

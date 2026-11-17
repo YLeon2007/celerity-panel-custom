@@ -97,6 +97,7 @@ function createDedicatedTestAuthority({ config: input, read = privateRead, open 
     // Ordinary dedicated startup keeps its prior per-invocation semantics.
     let retaining = false, dispatchClosed = false;
     const retainedChannels = new Map(), originals = new Map();
+    let classicRestore;
     return Object.freeze({ executionContext: TEST,
         async withHeldAuthority(context, work) {
             need(same(context, TEST) && !busy && !poisoned && absent()); busy = true;
@@ -317,6 +318,30 @@ function createDedicatedTestAuthority({ config: input, read = privateRead, open 
                         });
                         return callback(freeze({nodes}),refresh);
                     },
+                    async restoreClassicSnapshots(pins, restore) {
+                        await refresh();
+                        need(dispatchClosed && !classicRestore && originals.size === 0
+                            && pins.length === config.nodes.length);
+                        const accepted = new Map();
+                        for (const n of config.nodes) {
+                            const p = pins.find(p => p.nodeId === n.nodeId), v = observations.get(n.nodeId), g = v.journal?.generations?.[v.journal.head];
+                            need(p && p.targetProfile === n.targetProfile && UUID.test(p.ownerGeneration)
+                                && same(p.nodeIdentity, { machineId:n.machineId, sshHostKeySha256:n.hostKeySha256 })
+                                && same({ source:'node-readback', ...p.originalSnapshot }, v.provision.originalSnapshot)
+                                && v.runnerIdle === true && (!v.journal || g?.phase === 'closed'
+                                    && g.binding.candidateHash === 'sha256:' + v.current[n.targetProfile].configSha256));
+                            accepted.set(n.nodeId, { generation:p.ownerGeneration, handed:false });
+                        }
+                        await restore(); await refresh();
+                        for (const n of config.nodes) need(same(observations.get(n.nodeId).current[n.targetProfile], observations.get(n.nodeId).provision.originalSnapshot));
+                        classicRestore = accepted;
+                    },
+                    async releaseClassicSnapshots() {
+                        await refresh();
+                        need(dispatchClosed && classicRestore?.size === config.nodes.length);
+                        for (const n of config.nodes) need(classicRestore.get(n.nodeId)?.handed === true
+                            && same(observations.get(n.nodeId).current[n.targetProfile], observations.get(n.nodeId).provision.originalSnapshot));
+                    },
                     async withVerifiedMaintenance({ binding, proofRef }, callback) {
                         await refresh(); const n = pinFor(binding.node); const v = observations.get(n.nodeId);
                         need(['adopt','handback'].includes(binding.action) && binding.profile === n.targetProfile
@@ -333,7 +358,10 @@ function createDedicatedTestAuthority({ config: input, read = privateRead, open 
                                 // Cache bound BEFORE owner callback; a failed CAS is retained, not undone.
                                 original.generation=binding.nextGeneration;
                             }
-                        } else need(dispatchClosed && original?.restored && !original.handed
+                        } else if (classicRestore) need(dispatchClosed && !classicRestore.get(n.nodeId)?.handed
+                            && classicRestore.get(n.nodeId)?.generation === binding.generation
+                            && same(v.current[n.targetProfile],v.provision.originalSnapshot));
+                        else need(dispatchClosed && original?.restored && !original.handed
                             && original.generation===binding.generation && same(v.current[n.targetProfile],v.provision.originalSnapshot));
                         const check=async()=>{
                             await refresh(); need(same(observations.get(n.nodeId).current[n.targetProfile],v.provision.originalSnapshot));
@@ -343,7 +371,10 @@ function createDedicatedTestAuthority({ config: input, read = privateRead, open 
                         const result=await callback(freeze({ status: 'verified', authority: 'external-maintenance-v1', binding,
                             proofId: randomUUID(), maintenanceId: n.maintenanceId, maintenance: 'held',
                             allWriters: 'drained', oldBackend, readback: v.current[n.targetProfile] }), check);
-                        await check(); if(binding.action==='handback')original.handed=true;
+                        await check(); if(binding.action==='handback') {
+                            if (classicRestore) classicRestore.get(n.nodeId).handed=true;
+                            else original.handed=true;
+                        }
                         return result;
                     },
                     async withVerifiedAuthority(challenge, callback) {
@@ -399,6 +430,23 @@ function createDedicatedTestAuthority({ config: input, read = privateRead, open 
             need(!busy && !poisoned && !retaining && config.nodes.length===2
                 && new Set(config.nodes.map(n=>n.targetProfile)).size===2); retaining=true;
             return this.withHeldAuthority(TEST,c=>c.captureOriginals());
+        },
+        async restoreClassicSnapshots(pins, restore) {
+            if (retaining) {
+                this.drainOriginals();
+                const current = await this.readOriginalRestoreCurrent();
+                return this.restoreOriginals(current);
+            }
+            need(!busy && !poisoned && !dispatchClosed && originals.size === 0);
+            // This closes actual future dispatch in this same producer; no
+            // historical holder, boot ID or original epoch is reconstructed.
+            dispatchClosed=true; retaining=true;
+            return this.withHeldAuthority(TEST, c=>c.restoreClassicSnapshots(pins, restore));
+        },
+        async releaseClassicSnapshots() {
+            if (!classicRestore) return this.releaseOriginals();
+            await this.withHeldAuthority(TEST, c=>c.releaseClassicSnapshots());
+            this.close();
         },
         drainOriginals() {
             // Real admission closure in this sole controller; no boolean attestor.
