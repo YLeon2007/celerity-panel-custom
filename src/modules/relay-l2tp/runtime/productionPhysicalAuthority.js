@@ -172,6 +172,8 @@ function createProductionPhysicalAuthority({ config: input, read = privateRead, 
                             const held = await c.request(config.mode === 'enroll' ? 'capture' : 'attach', config.mode === 'enroll' ? null : n.originalScope);
                             need(UUID.test(held.epoch) && /^[a-f0-9]{64}$/.test(held.bundleSha256)
                                 && held.phase === 'captured-held' && held.ownerGeneration === (config.mode === 'enroll' ? null : n.acceptedOwner.generation));
+                            if (config.mode === 'runtime') need(held.epoch === n.originalScope.epoch
+                                && held.bundleSha256 === n.originalScope.bundleSha256);
                             originals.set(n.nodeId, { ...held, restored: false, handed: false, released: false });
                         }
                         await refresh();
