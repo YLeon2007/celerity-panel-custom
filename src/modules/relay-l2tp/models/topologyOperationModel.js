@@ -182,6 +182,7 @@ const topologyOperationSchema = new mongoose.Schema({
     resourceNodeIds: { type: [String], default: undefined, immutable: true, select: false },
     baselineTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     effectiveTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
+    fullTopology: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true, select: false },
     desiredVersion: { type: String, match: DIGEST_PATTERN, immutable: true, select: false },
     nodeActivation: { type: mongoose.Schema.Types.Mixed, default: undefined, immutable: true,
         validate(value) { if (value === undefined) return true; try { require('../services/topologyNodeActivation').nodeActivation(value); return this.kind === 'link.apply' && this.admissionScope === 'selected'; } catch { return false; } } },
@@ -232,6 +233,10 @@ const topologyOperationSchema = new mongoose.Schema({
 
 topologyOperationSchema.pre('validate', function validateScopedIdentity() {
     assertSelectedProfileTargets(this);
+    if (this.fullTopology !== undefined) {
+        if ((this.kind !== undefined && this.kind !== 'domain.reconcile') || this.admissionScope !== undefined) throw new Error('Full snapshot requires an unselected full reconcile');
+        require('../repositories/topologyOperationRepository').durableSelectedTopology(this.fullTopology);
+    }
     if (new Set(this.nodes.map(node => String(node.node))).size !== this.nodes.length) {
         throw new Error('Topology operation requires unique physical nodes');
     }

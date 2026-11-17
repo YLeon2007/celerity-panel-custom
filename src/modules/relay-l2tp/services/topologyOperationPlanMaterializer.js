@@ -2,6 +2,7 @@
 
 const {
     composeFrozenTopologyDeploymentPlan,
+    projectXrayConfig,
 } = require('./frozenTopologyDeploymentPlanComposer');
 const { projectGroups } = require('../domain/topologyDraft');
 const { isDeepStrictEqual } = require('node:util');
@@ -429,12 +430,25 @@ class TopologyOperationPlanMaterializer {
             );
         }
 
-        return composeFrozenTopologyDeploymentPlan({
+        const nodeMetadata = projectNodeMetadata(nodeRows);
+        const linkMetadata = projectLinkMetadata(linkRows);
+        const plan = composeFrozenTopologyDeploymentPlan({
             ...input,
             executionContext: topologyExecutionContext(target, hostIdentity),
-            nodeMetadata: projectNodeMetadata(nodeRows),
-            linkMetadata: projectLinkMetadata(linkRows),
+            nodeMetadata,
+            linkMetadata,
         });
+        if (operationKind !== undefined && operationKind !== 'domain.reconcile') return plan;
+        // Capture the exact same-session descriptors used above, BEFORE any
+        // dispatch. Full sync must not later reconstruct applied geometry from
+        // mutable desired rows or require a prior selected operation.
+        const fullTopology = JSON.parse(JSON.stringify({
+            nodes: nodeMetadata.map(node => ({ ...node, xray: projectXrayConfig(node) })),
+            links: linkMetadata.map(link => Object.fromEntries(Object.entries(link)
+                .filter(([key]) => link.tunnelSecurity === 'reality' || !key.startsWith('reality')))),
+            groups: input.snapshot.groups,
+        }));
+        return require('../models/topologyExecutionBindingContract').freeze({ ...plan, fullTopology });
     }
 }
 

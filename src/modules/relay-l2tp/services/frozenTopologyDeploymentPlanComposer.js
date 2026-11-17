@@ -2624,5 +2624,6 @@ function composeFrozenTopologyDeploymentPlan({
 module.exports = {
     FrozenTopologyDeploymentPlanError,
     TARGETS_BY_ROLE,
+    projectXrayConfig,
     composeFrozenTopologyDeploymentPlan,
 };

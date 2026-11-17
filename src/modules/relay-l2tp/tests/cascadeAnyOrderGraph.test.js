@@ -281,7 +281,10 @@ test('domain.reconcile preserves the supported source-less staged plan without c
         pinnedSnapshot: { revision: 7, topology, compiled: compileTopology(topology) },
     });
     const selected = (await materialize(data, ['rb1'])).plan;
-    assert.deepEqual(plan, selected, 'reconciliation uses the same supported staged composition');
+    const { fullTopology, ...dataPlane } = plan;
+    assert.deepEqual(dataPlane, selected, 'reconciliation uses the same supported staged composition');
+    assert.deepEqual(fullTopology.nodes.map(node => node.id).sort(), ['b1', 'r']);
+    assert.deepEqual(fullTopology.links.map(link => link.id), ['rb1']);
     assert.equal(plan.staged, true);
 });
 

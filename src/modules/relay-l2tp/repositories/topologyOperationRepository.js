@@ -58,7 +58,7 @@ const CLAIM_PROJECTION = Object.freeze({
     leaseUntil: 1,
     heldTopologyAdmission: 1,
     pppWait: 1,
-    admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1,
+    admissionScope: 1, resourceNodeIds: 1, baselineTopology: 1, effectiveTopology: 1, fullTopology: 1,
     desiredVersion: 1, selectedOwnerPins: 1, routeState: 1, admissionFingerprint: 1, deleteJobId: 1, installedPath: 1, nodeActivation: 1,
     'nodes.node': 1,
     'nodes.nodeRef': 1,
@@ -223,7 +223,7 @@ function selectedAdmissionFingerprint(operation) {
                 targetProfile: node.targetProfile, profileTargetPin: node.profileTargetPin }) : TARGET_BY_ROLE[node.role]) })).map(durableNodeMetadata);
     const fields = ['executionContext', 'idempotencyKey', 'topologyRevision', 'priorDeployedRevision', 'kind',
         'linkId', 'linkIds', 'staged', 'admissionScope', 'resourceNodeIds', 'baselineTopology', 'effectiveTopology',
-        'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath', 'nodeActivation'];
+        'selectedOwnerPins', 'desiredVersion', 'routeState', 'deleteJobId', 'installedPath', 'nodeActivation', 'fullTopology'];
     const value = { operationId: String(operation.operationId ?? operation._id), nodes: metadata,
         ...Object.fromEntries(fields.filter(key => operation[key] !== undefined).map(key => [key, operation[key]])) };
     return require('node:crypto').createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
@@ -270,6 +270,7 @@ class TopologyOperationRepository {
         resourceNodeIds,
         baselineTopology,
         effectiveTopology,
+        fullTopology,
         desiredVersion, selectedOwnerPins, routeState, deleteJobId, installedPath, nodeActivation,
         session,
     }) {
@@ -318,6 +319,12 @@ class TopologyOperationRepository {
             throw new TypeError('Invalid scoped topology operation identity');
         }
         const metadata = nodes.map(durableNodeMetadata);
+        if (fullTopology !== undefined) {
+            if ((kind !== undefined && kind !== 'domain.reconcile') || admissionScope !== undefined) throw new TypeError('Full snapshot requires an unselected full reconcile');
+            fullTopology = durableSelectedTopology(fullTopology);
+            if (fullTopology.nodes.length !== metadata.length || metadata.some(node => !fullTopology.nodes.some(row => row.id === operationId(node.node) && row.role === node.role))
+                || (kind !== undefined && (fullTopology.links.length !== linkIds.length || fullTopology.links.some(link => !linkIds.includes(link.id))))) throw new TypeError('Full snapshot must match the frozen domain');
+        }
         if (nodeActivation !== undefined) {
             nodeActivation = require('../services/topologyNodeActivation').nodeActivation(nodeActivation);
             if (kind !== 'link.apply' || admissionScope !== 'selected'
@@ -348,6 +355,7 @@ class TopologyOperationRepository {
             topologyRevision,
             priorDeployedRevision,
             ...selected,
+            ...(fullTopology !== undefined ? { fullTopology } : {}),
             ...(admissionScope === 'selected' ? { desiredVersion, selectedOwnerPins, routeState,
                 ...(nodeActivation ? { nodeActivation } : {}),
                 ...(kind === 'link.delete' ? { deleteJobId } : {}), ...(installedPath ? { installedPath } : {}) } : {}),
@@ -373,7 +381,7 @@ class TopologyOperationRepository {
             leaseUntil: null,
             nodes: metadata,
         };
-        if (metadata.some(node => Object.hasOwn(node, 'profileTargetPin'))
+        if ((fullTopology !== undefined || metadata.some(node => Object.hasOwn(node, 'profileTargetPin')))
             && (heldTopologyAdmission !== true || admissionFingerprint !== selectedAdmissionFingerprint(document))) {
             throw new TypeError('Imported topology operation requires its exact selected admission fingerprint');
         }

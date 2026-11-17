@@ -143,11 +143,11 @@ class TopologyIntentService {
             if (!link || linkDesiredVersion(link) !== row.desiredVersion || link.lifecycle) throw unproven();
             const observed = await intentOperationAdmission.inspectUnadmittedPreparation({ linkId: lid,
                 desiredVersion: row.desiredVersion, session });
-            // A corrected, never-admitted six-node first preparation can also
-            // be settled as failed. This is a fresh valid preflight, not a
-            // fabricated explanation of its historical unknown error.
+            // A corrected, never-admitted preparation can be settled as failed
+            // for the actual bounded inventory, not only the old six-node stand.
+            // The same exact revision/resource/no-operation fences apply below.
             const nowValid = observed?.status === 'valid' && row.attempts === 1 && row.generation === 1
-                && row.resourceNodeIds?.length === 6;
+                && row.resourceNodeIds?.length > 0 && row.resourceNodeIds.length <= 8;
             if ((!nowValid && (observed?.status !== 'refused' || observed.code !== 'INVALID_TOPOLOGY_DEPLOYMENT'
                 || observed.causeCode !== 'MULTIPLE_DEFAULT_EGRESS')) || observed.revision !== expectedTopologyRevision
                 || JSON.stringify(observed.resourceNodeIds) !== JSON.stringify(row.resourceNodeIds)) throw unproven();

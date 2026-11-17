@@ -9,6 +9,49 @@ const { durableSelectedTopology, selectedAdmissionFingerprint } = require('../re
 const plain = value => JSON.parse(JSON.stringify(value));
 const id = value => String(value?._id ?? value);
 const fail = () => { throw Object.assign(new Error('Settled full reconcile baseline unproven'), { code: 'APPLIED_BASELINE_REQUIRED' }); };
+// New full reconciles carry their own admission-time graph. No desired rows,
+// predecessor synthesis or read-time metadata hydration supplies this evidence.
+function recoverFrozenFullReconcile({ operation: op, owners }) {
+    const { selectedAdmissionFingerprint } = require('../repositories/topologyOperationRepository');
+    if (!op || (op.kind !== undefined && op.kind !== 'domain.reconcile') || op.admissionScope !== undefined || op.effectiveTopology !== undefined
+        || op.status !== 'succeeded' || op.heldTopologyAdmission !== false || op.v2Terminal?.state !== 'proven'
+        || op.admissionFingerprint !== selectedAdmissionFingerprint(op)) fail();
+    const topology = durableSelectedTopology(op.fullTopology);
+    const generated = require('./frozenTopologyDeploymentPlanComposer').composeFrozenTopologyDeploymentPlan({
+        snapshot: topology, staged: op.kind === 'domain.reconcile', executionContext: op.executionContext,
+        nodeMetadata: topology.nodes, linkMetadata: topology.links,
+        compiledTopology: require('../domain/topologyCompiler').compileTopology({ ...topology, healthByPathKey: {} }),
+    });
+    if (op.nodes.length !== topology.nodes.length || generated.nodes.length !== op.nodes.length
+        || (op.kind !== undefined && (topology.links.length !== op.linkIds?.length || topology.links.some(link => !op.linkIds.includes(link.id))))
+        || generated.nodes.some(entry => !op.nodes.some(row => id(row.node) === entry.node
+            && row.role === entry.role && row.targetProfile === entry.targetProfile && row.candidateHash === entry.candidate.sha256))) fail();
+    const pins = [];
+    for (const entry of op.nodes) {
+        const owner = owners.find(row => id(row.node) === id(entry.node) && row.profile === entry.targetProfile);
+        const bindings = op.v2Terminal.bindings?.filter(row => row.nodeId === id(entry.node));
+        const b = bindings?.[0];
+        const proofs = op.v2Terminal.proofs?.filter(row => row.commandId === b?.commandIds?.close);
+        const fences = op.v2Terminal.ownerFences?.filter(row => row.node === id(entry.node) && row.profile === entry.targetProfile);
+        if (!owner || owner.owner !== 'topology' || owner.handbackReceipt !== undefined
+            || owner.lastSettledOperation !== id(op) || owner.lastSettledRevision !== op.topologyRevision
+            || entry.state !== 'committed' || bindings?.length !== 1 || proofs?.length !== 1 || fences?.length !== 1
+            || b.operationId !== id(op) || b.targetProfile !== entry.targetProfile
+            || b.candidateHash !== 'sha256:' + entry.candidateHash || b.backupId !== entry.backupId
+            || b.owner !== op.leaseOwner || b.attempt !== op.attempts || b.topologyRevision !== op.topologyRevision
+            || b.priorDeployedRevision !== op.priorDeployedRevision || b.executionContext !== op.executionContext.hostIdentity
+            || b.generation !== owner.lastSettledGeneration || b.commandIds.close !== owner.lastSettledCloseId
+            || !validTerminalReceipt(proofs[0], b) || proofs[0].terminalOutcome !== 'verified'
+            || createHash('sha256').update(Buffer.from(entry.candidate.bytes)).digest('hex') !== entry.candidateHash
+            || entry.candidate.sha256 !== entry.candidateHash) fail();
+        const root = Object.fromEntries(['node','profile','executionContext','owner','generation','nodeIdentity','originalSnapshot','adoptionReceipt']
+            .map(key => [key, key === 'node' ? id(owner.node) : plain(owner[key])]));
+        if (!same(plain(fences[0]), root)) fail();
+        pins.push(root);
+    }
+    for (const [index, link] of [...topology.links].sort((a,b)=>a.id.localeCompare(b.id,'en')).entries()) link.artifactRef = `link-${index+1}`;
+    return { topology, pins };
+}
 function recoverSettledFullReconcile({ operation: op, predecessor: prior, owners, groups }) {
     if (op?.kind !== 'domain.reconcile' || op.admissionScope !== undefined || op.effectiveTopology !== undefined
         || op.status !== 'succeeded' || op.heldTopologyAdmission !== false || op.v2Terminal?.state !== 'proven'
@@ -69,4 +112,4 @@ function recoverSettledFullReconcile({ operation: op, predecessor: prior, owners
     for (const [index, link] of [...topology.links].sort((a,b)=>a.id.localeCompare(b.id,'en')).entries()) link.artifactRef = `link-${index+1}`;
     return topology;
 }
-module.exports = { recoverSettledFullReconcile };
+module.exports = { recoverSettledFullReconcile, recoverFrozenFullReconcile };

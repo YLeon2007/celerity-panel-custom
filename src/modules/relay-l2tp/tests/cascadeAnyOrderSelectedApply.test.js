@@ -429,4 +429,4 @@ test('installed empty owner path is not silently reported as a selected apply wi
     assert.equal(f.calls.length, 0);
     assert.equal(f.TopologyOperation.rows.length, 0);
 });
-module.exports = { fixture, id, sha };
+module.exports = { fixture, id, sha, model };

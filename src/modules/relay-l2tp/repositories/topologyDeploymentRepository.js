@@ -10,7 +10,7 @@ const { nodeActivation: normalizeNodeActivation, nodeDesiredVersion } = require(
 const { verifyImportedProfileTargetPin, resolveTopologyProfileTarget, assertSelectedProfileTargets } = require('../services/topologyProfileTarget');
 const { primaryReservePolicies } = require('../domain/primaryReservePolicy');
 const TOPOLOGY_STATE_SELECT = 'revision deployedRevision';
-const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
+const SELECTED_FIELDS = '+admissionScope +resourceNodeIds +baselineTopology +effectiveTopology +fullTopology +selectedOwnerPins +desiredVersion +deleteJobId +installedPath';
 const plain = value => JSON.parse(JSON.stringify(value));
 const ownerPin = row => plain(Object.fromEntries(['node', 'profile', 'executionContext', 'owner', 'generation',
     'nodeIdentity', 'originalSnapshot', 'adoptionReceipt', 'handbackReceipt', 'lastSettledOperation',
@@ -298,6 +298,10 @@ class TopologyDeploymentRepository {
                 continue;
             }
             let recovered = recoveredFull.get(String(operation?._id));
+            if (!recovered && operation?.fullTopology !== undefined) {
+                recovered = require('../services/topologySettledFullReconcile').recoverFrozenFullReconcile({ operation, owners: catalog });
+                recoveredFull.set(String(operation._id), recovered);
+            }
             if (!recovered && operation?.kind === 'domain.reconcile' && operation.admissionScope === undefined
                 && operation.effectiveTopology === undefined) {
                 const binding = operation.v2Terminal?.bindings?.find(row => row.nodeId === node);

@@ -324,7 +324,10 @@ test('materializes one deterministic frozen test plan from allowlisted snapshot 
     assert.equal(TEST_TOPOLOGY_TARGET, 'test');
     assert.equal(TEST_TOPOLOGY_HOST_IDENTITY, 'test.infograd.online');
     assert.equal(isDeepFrozen(plan), true);
-    assert.deepEqual(Object.keys(plan).sort(), ['mode', 'nodes', 'schemaVersion']);
+    assert.deepEqual(Object.keys(plan).sort(), ['fullTopology', 'mode', 'nodes', 'schemaVersion']);
+    assert.deepEqual(plan.fullTopology.nodes.map(node => node.id), ['bridge-1', 'portal-1', 'relay-1']);
+    assert.deepEqual(plan.fullTopology.links.map(link => link.id), ['portal-relay', 'relay-bridge']);
+    assert.equal(plan.fullTopology.groups[0].paths[0].pathKey, 'main');
     assert.deepEqual(plan.nodes.map(node => node.nodeRef), ['portal', 'relay-1', 'bridge']);
     assert.deepEqual(plan.nodes.map(node => node.role), ['portal', 'relay', 'bridge']);
     for (const node of plan.nodes) {

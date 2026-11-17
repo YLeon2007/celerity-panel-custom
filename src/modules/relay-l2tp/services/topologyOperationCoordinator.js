@@ -1002,7 +1002,8 @@ class TopologyOperationCoordinator {
                         resourceNodeIds: admitted.resourceNodeIds, desiredVersion: admitted.desiredVersion,
                         selectedOwnerPins: admitted.selectedOwnerPins, routeState: admitted.routeState,
                         ...(scope.kind === 'link.delete' ? { deleteJobId } : {}),
-                        ...(admitted.installedPath ? { installedPath: admitted.installedPath } : {}) } : {};
+                        ...(admitted.installedPath ? { installedPath: admitted.installedPath } : {}) }
+                        : admitted.frozenPlan.fullTopology !== undefined ? { fullTopology: admitted.frozenPlan.fullTopology } : {};
                     scopedIdentity = scope
                         ? { kind: admitted.attach ? 'link.attach' : scope.kind,
                             linkId: scope.linkId, linkIds: admitted.admissionScope === 'selected'
@@ -1028,7 +1029,7 @@ class TopologyOperationCoordinator {
                         idempotencyKey: effectiveRunIdempotencyKey,
                         ...scopedIdentity, ...selectedIdentity,
                     })).digest('hex');
-                    if (selectedIdentity.admissionScope === 'selected') admissionFingerprint = selectedAdmissionFingerprint({
+                    if (selectedIdentity.admissionScope === 'selected' || selectedIdentity.fullTopology !== undefined) admissionFingerprint = selectedAdmissionFingerprint({
                         operationId, executionContext: this.#executionContext, idempotencyKey: effectiveRunIdempotencyKey,
                         topologyRevision: admitted.revision, priorDeployedRevision: admitted.deployedRevision, nodes: plan.nodes,
                         ...scopedIdentity, ...selectedIdentity,
