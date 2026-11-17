@@ -140,6 +140,14 @@ test('preinstalled runtime selects finite user and PPP readiness without opening
     assert.equal(legacy.operationWorker.pppReadinessGate.readOnly, false);
 });
 
+test('host-supplied 30s lease gets SSH margin for production topology only', () => {
+    const deps = compositionDependencies();
+    const prod = createTopologyOperationRuntime({ ...deps, env: { ...deps.env, PANEL_DOMAIN: 'lm1.infograd.online',
+        TOPOLOGY_TEST_EXECUTION_ENABLED: 'false', TOPOLOGY_PRODUCTION_EXECUTION_ENABLED: 'true' } });
+    assert.equal(prod.operationWorker.leaseMs, 120_000);
+    assert.equal(createTopologyOperationRuntime(deps).operationWorker.leaseMs, 30_000);
+});
+
 test('test topology runtime requires all three exact opt-in flags', async () => {
     assert.deepEqual(REQUIRED_TEST_RUNTIME_FLAGS, [
         'L2TP_EXECUTION_ENABLED',

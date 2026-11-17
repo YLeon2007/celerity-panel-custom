@@ -655,7 +655,7 @@ class TopologyExecutionBindingStore {
         ].join('\0')).digest('hex')}`;
         if (backupId !== expected.backupId) throw failure();
     }
-    async #binding(action, input, work, predecessorId = null) {
+    async #binding(action, input, work, predecessorId = null, joinForWrite) {
         if (!validExpected(input, this.#context)) throw failure();
         const expected = freeze(structuredClone(input));
         await this.#indexes();
@@ -671,7 +671,22 @@ class TopologyExecutionBindingStore {
         if (action === 'successor' && !predecessor) throw failure();
         if (predecessor && (predecessor.operationId === expected.operationId
             || predecessor.generation === expected.generation)) throw failure();
-        let validUntil = 0;
+        let validUntil = 0, confirmedNonce;
+        // Physical checks may return after the first observed lease deadline.
+        // A timer alone is not proof: require the *same* checked operation and
+        // uncertain lock, both still live, with the transaction's exact nonce.
+        const confirmAfterWait = async () => {
+            if (joinForWrite && confirmedNonce && Date.now() >= validUntil) {
+                let limit = Date.now() + TIMEOUT_MS;
+                for (const [model, filter] of [[this.#models.Operation, this.#operationFilter], [this.#models.Lock, this.#lockFilter]]) {
+                    const row = await this.#majority(model, { ...filter.call(this, expected, new Date()), executionBindingCheck: confirmedNonce }, limit);
+                    if (!(row?.leaseUntil instanceof Date)) throw failure('UNCONFIRMED');
+                    limit = Math.min(limit, row.leaseUntil.getTime());
+                }
+                validUntil = limit;
+            }
+            assertFresh();
+        };
         const assertFresh = () => {
             if (Date.now() >= validUntil) throw failure('UNCONFIRMED');
         };
@@ -725,7 +740,9 @@ class TopologyExecutionBindingStore {
                     return recordProjection(current);
                 }
                 let ownerEvidence;
-                const confirmedRecord = await this.#transaction(async session => {
+                const hold = await joinForWrite?.();
+                let confirmedRecord;
+                try { confirmedRecord = await this.#transaction(async session => {
                     ensureOpen();
                     await this.#checkOperation(expected, session);
                     await this.#cas(this.#models.Operation, this.#operationFilter(expected, new Date()), nonce, session);
@@ -789,10 +806,12 @@ class TopologyExecutionBindingStore {
                     validUntil = leaseUntil;
                     assertFresh();
                     return recordProjection(confirmed);
-                }, ensureOpen, { retryKnownAborted: !creating });
+                }, ensureOpen, { retryKnownAborted: !creating && !joinForWrite });
+                } finally { hold?.release(); }
+                confirmedNonce = nonce;
                 // Session cleanup is awaited by #transaction's finally block.
                 await this.#assertAuthorityHeld?.();
-                assertFresh();
+                await confirmAfterWait();
                 return confirmedRecord;
             };
             const record = await check();
@@ -821,7 +840,7 @@ class TopologyExecutionBindingStore {
             } finally { active = false; }
         }, predecessor);
         // The authority itself can await cleanup after its callback completes.
-        assertFresh();
+        await confirmAfterWait();
         return result;
     }
     // Worker-followup interface (DORMANT; this store never settles/releases):
@@ -840,21 +859,21 @@ class TopologyExecutionBindingStore {
     //    the entire lifecycle, not merely echo a challenge or perform a DB scan.
     // Unknown commit/readback never releases anything; readVerified(expected)
     // recovers a durably committed exact row without retrying or minting new IDs.
-    async createSuccessor(expected, predecessorBindingId) {
+    async createSuccessor(expected, predecessorBindingId, joinForWrite) {
         if (!matches(predecessorBindingId, UUID)) throw failure();
-        return this.#binding('successor', expected, null, predecessorBindingId);
+        return this.#binding('successor', expected, null, predecessorBindingId, joinForWrite);
     }
     // Post-claim provisioning only. Reuse an exact durable binding; never retry
     // a failed read as creation. Select successors from privately joined settlement
     // metadata, not caller-selected IDs or a mutable runner/current-state scan.
-    async reserveBinding(expected) {
+    async reserveBinding(expected, joinForWrite) {
         if (!validExpected(expected, this.#context)) throw failure();
         const enrollment = await this.#enrollment(expected);
         const existing = await this.#majority(this.#models.Binding, { executionContext: this.#context.hostIdentity,
             operationId: expected.operationId, nodeId: expected.nodeId, targetProfile: expected.targetProfile });
-        if (existing) return this.readVerified(expected);
+        if (existing) return this.readVerified(expected, joinForWrite);
         const previous = await this.#majority(this.#models.Binding, { enrollmentId: enrollment._id });
-        if (!previous) return this.createBinding(expected);
+        if (!previous) return this.createBinding(expected, joinForWrite);
         const owner = await this.#majority(this.#models.Owner, this.#ownerFilter(enrollment));
         this.#ownerEvidence(owner, enrollment);
         if (!matches(owner?.lastSettledGeneration, UUID) || !matches(owner?.lastSettledCloseId, UUID)
@@ -868,7 +887,7 @@ class TopologyExecutionBindingStore {
         // native close, never delete/rebind the slot or rewrite lastSettled*.
         const child = await this.#majority(this.#models.Binding, { enrollmentId: enrollment._id,
             predecessorGeneration: predecessor.generation });
-        if (!child) return this.createSuccessor(expected, predecessor._id);
+        if (!child) return this.createSuccessor(expected, predecessor._id, joinForWrite);
         const cancelled = await this.#models.Operation.findOne({ _id: child.operationId })
             .select(OPERATION_PRIVATE_FIELDS + ' +undispatchedPreparationSettlement').read('primary').readConcern('majority').setOptions(OPTIONS).lean();
         if (this.#context.target !== 'test' || !require('./topologyCancelledReservation')
@@ -880,11 +899,11 @@ class TopologyExecutionBindingStore {
             || continuation.predecessorOperation !== child.operationId
             || !continuation.locks?.some(l => l.node === expected.nodeId && l.generation === expected.generation)
             || !continuation.predecessorProofs?.some(p => validTerminalReceipt(p,child) && p.terminalOutcome === 'cancelled')) throw failure();
-        return this.createSuccessor(expected, child._id);
+        return this.createSuccessor(expected, child._id, joinForWrite);
     }
     // No caller-selected attempt/command IDs, no update/adopt/release API.
-    async createBinding(expected) { return this.#binding('create', expected); }
-    async readVerified(expected) { return this.#binding('read', expected); }
+    async createBinding(expected, joinForWrite) { return this.#binding('create', expected, null, null, joinForWrite); }
+    async readVerified(expected, joinForWrite) { return this.#binding('read', expected, null, null, joinForWrite); }
     // Return only immutable enrolled evidence; the mutable node selects a
     // connection to compare, never the authority for that connection or SSH key.
     async readVerifiedConnection(expected, verifiedBinding) {

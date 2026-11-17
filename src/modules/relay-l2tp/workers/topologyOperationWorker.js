@@ -450,8 +450,30 @@ class TopologyOperationWorker {
             return leaseUntil;
         };
 
+        const joinForWrite = async () => {
+            if (stopped || paused) throw new LeaseLostError();
+            paused = true;
+            clear();
+            try {
+                if (inFlight) await inFlight;
+                assertOwned();
+                const leaseUntil = await this.renew(operationId);
+                await this.renewLocks(operationId, lockedNodeIds);
+                let joined = true;
+                return { leaseUntil, release: () => {
+                    if (!joined) return;
+                    joined = false;
+                    paused = false;
+                    if (!stopped && !renewalError) intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
+                } };
+            } catch (error) {
+                renewalError = new LeaseLostError();
+                throw error;
+            }
+        };
         intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
         return {
+            joinForWrite,
             run: async work => {
                 await renewOwned();
                 let result;
@@ -470,17 +492,9 @@ class TopologyOperationWorker {
             // No transaction retry or lease extension: the normal live lease
             // remains the deadline checked by the finalizer.
             exclusive: async work => {
-                paused = true;
-                clear();
-                if (inFlight) await inFlight;
-                assertOwned();
-                const leaseUntil = await this.renew(operationId);
-                await this.renewLocks(operationId, lockedNodeIds);
-                try { return await work(leaseUntil); }
-                finally {
-                    paused = false;
-                    if (!stopped && !renewalError) intervalId = this.timer.setInterval(tick, this.renewalIntervalMs);
-                }
+                const hold = await joinForWrite();
+                try { return await work(hold.leaseUntil); }
+                finally { hold.release(); }
             },
             stop: async () => {
                 stopped = true;
@@ -488,6 +502,10 @@ class TopologyOperationWorker {
                 if (inFlight) await inFlight;
             },
         };
+    }
+
+    reserveWithHeartbeat(store, expected, heartbeat) {
+        return heartbeat.run(() => store.reserveBinding(expected, heartbeat.joinForWrite));
     }
 
     async acquireLocks(operationId, nodes, acquiredNodeIds) {
@@ -1569,13 +1587,13 @@ class TopologyOperationWorker {
                         const candidateHash = `sha256:${node.candidateHash}`;
                         const backupId = `topology-${createHash('sha256').update([operationId, node.node,
                             candidateHash, node.targetProfile].join('\0')).digest('hex')}`;
-                        await heartbeat.exclusive(() => this.#bindingProvisioner.reserveBinding(Object.freeze({
+                        await this.reserveWithHeartbeat(this.#bindingProvisioner, Object.freeze({
                             executionContext: this.executionContext.hostIdentity, operationId, nodeId: node.node,
                             candidateHash, backupId, targetProfile: node.targetProfile,
                             ...(Object.hasOwn(node, 'profileTargetPin') ? { profileTargetPin: assertProfileTargetPin(node.profileTargetPin) } : {}),
                             topologyRevision: plan.topologyRevision, priorDeployedRevision: plan.priorDeployedRevision,
                             ...context.executionFence,
-                        })));
+                        }), heartbeat);
                     }
                 } catch (error) {
                     traceWorkerFailure(plan, operationId, 'worker.binding-reservation', error);

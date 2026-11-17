@@ -212,6 +212,44 @@ async function setup(authority = goodAuthority, { publicOwner = false, nodes = [
         endpoint: ENDPOINT, nodeIdentity: IDENTITY, ownerGeneration, predecessorGeneration: PREDECESSOR, bootId: BOOT }) };
 }
 
+// Local replica set; only the physical reply is delayed. A heartbeat cannot
+// resurrect an expired lease or accept a replacement lock generation.
+for (const loseLock of [false, true]) test(`reservation survives slow physical return only with original fences: lost=${loseLock}`, async () => {
+    const { TopologyOperationWorker: Worker } = require('../workers/topologyOperationWorker');
+    const { NodeOperationLockService } = require('../services/nodeOperationLockService');
+    const leaseMs = 1000;
+    let delay = true, during = 0;
+    const { store, expected, enrollment } = await setup(async (challenge, work) => {
+        const result = await work(evidence(challenge));
+        if (challenge.action === 'create' && delay) {
+            delay = false;
+            const getLease = async () => (await models.Operation.findById(expected.operationId).lean()).leaseUntil;
+            const initial = await getLease();
+            if (loseLock) await models.Lock.collection.updateOne({operationId:expected.operationId}, {$set:{generation:randomUUID()}});
+            await new Promise(resolve => setTimeout(resolve, leaseMs + 500));
+            during = (await getLease()) - initial;
+        }
+        return result;
+    });
+    await store.preEnroll(enrollment);
+    const clock = { now: () => new Date() };
+    const worker = Object.assign(Object.create(Worker.prototype), { operationRepository: new TopologyOperationRepository({model:models.Operation}),
+        lockService: new NodeOperationLockService({repository:new NodeOperationLockRepository({model:models.Lock}),clock}),
+        workerId:expected.owner, leaseMs, renewalIntervalMs:100, clock, timer:{setInterval,clearInterval} });
+    const hb = worker.createLeaseHeartbeat(expected.operationId, [{node:expected.nodeId,generation:expected.generation}]);
+    try {
+        const reserve = () => worker.reserveWithHeartbeat(store, expected, hb);
+        if (loseLock) await assert.rejects(reserve(), /lease|unconfirmed|unproven/i);
+        else {
+            const first = await reserve();
+            assert.ok(during >= leaseMs, 'original operation lease continuously renewed while the reply was delayed');
+            assert.deepEqual(await reserve(), first, 'same immutable command IDs on reread');
+        }
+        assert.equal(await models.Binding.countDocuments({operationId:expected.operationId}), 1);
+        assert.equal((await models.Operation.findById(expected.operationId).lean()).heldTopologyAdmission, true);
+    } finally { await hb.stop(); }
+});
+
 // Real public TEST enrollment/store/transfer on OWN scratch Mongo. Only physical
 // capture/maintenance IO is modeled; no supplied owner or enrollment success.
 async function zeroBusinessEnrollmentFixture() {

@@ -164,7 +164,7 @@ function createTopologyOperationRuntime(dependencies = {}) {
         transactionRunner,
         clock = DEFAULT_CLOCK,
         workerId = `topology-test-${process.pid}`,
-        leaseMs = DEFAULT_LEASE_MS,
+        leaseMs: requestedLeaseMs,
         SnapshotRepository = TopologyDraftRepository,
         DeploymentRepository = TopologyDeploymentRepository,
         PlanMaterializer = TopologyOperationPlanMaterializer,
@@ -187,6 +187,11 @@ function createTopologyOperationRuntime(dependencies = {}) {
         : executorFactoryOverride;
     const ownerEnrollmentEnv = Object.freeze({ ...env });
     const executionContext = resolveTopologyExecutionContext(ownerEnrollmentEnv);
+    // Allow several 15s SSH round trips while a tick or DB write is delayed.
+    // A slow reservation is covered by renewal, not by this margin alone.
+    const baseLease = requestedLeaseMs === undefined ? DEFAULT_LEASE_MS : requestedLeaseMs;
+    const leaseMs = executionContext?.target === 'production' && Number.isSafeInteger(baseLease) && baseLease >= 2
+        ? Math.max(120_000, baseLease) : baseLease;
     if (!executionContext || typeof executorFactory !== 'function') {
         return unavailableTopologyDeploymentService;
     }
