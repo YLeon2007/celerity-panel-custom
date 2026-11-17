@@ -358,6 +358,11 @@ function createTopologyOperationRuntime(dependencies = {}) {
                 TopologyIntentQueueState: require('../models/topologyIntentQueueStateModel') },
         });
         if (ownerEnrollmentEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1' && executionContext.target === 'test') {
+            const ownerEntry = require('../../../../scripts/test-topology-owner');
+            const ownerModels = { ...dependencies, TopologyCreateIntent: require('../models/topologyCreateIntentModel') };
+            coordinator.inspectTestOwnerHandback = () => ownerEntry.inspectTestOwnerHandback({ env: ownerEnrollmentEnv, models: ownerModels });
+            coordinator.handbackTestOwners = expected => ownerEntry.handbackTestOwners({ env: ownerEnrollmentEnv, models: ownerModels,
+                lifecycle: bindingLifecycle, authority: dependencies.topologyExecutionAuthority, expected });
             coordinator.settleUndispatchedPreparation = (operationId, onSettled) => require('../services/topologyUndispatchedPreparationSettlement')
                 .settleUndispatchedPreparation({ models: dependencies, selected: topologyRepository, lifecycle: bindingLifecycle, finalizer, operationId, onSettled });
             operationRepository.claimUndispatchedPreparation = input => require('../repositories/topologyUndispatchedPreparationContinuation')

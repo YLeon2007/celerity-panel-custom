@@ -203,4 +203,53 @@ async function initializePristineDedicatedRelayAbsence({ env, models, lifecycle,
         });
     });
 }
-module.exports = { enrollTestOwners, initializeDedicatedTestState, initializePristineDedicatedRelayAbsence, assertTestContext, main };
+async function inspectTestOwnerHandback({ env, models }) {
+    assertTestContext(env);
+    if (env.TOPOLOGY_TEST_STARTUP_MODE !== 'dedicated-runtime-v1') throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+    const read = query => query.read('primary').readConcern('majority').maxTimeMS(5000).lean();
+    const owners = await read(models.TopologyConfigOwner.find({ executionContext: TEST, owner: 'topology' }));
+    const aliases = await read(models.TopologyExecutionEnrollment.find({ executionContext: TEST.hostIdentity }));
+    if (!owners.length || owners.length !== aliases.length) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+    const ids = owners.map(row => String(row.node));
+    const state = await read(models.CascadeTopologyState.findById('singleton'));
+    if (!state || state.remoteAdmissionCount !== 0 || state.topologyAdmissionCount !== 0
+        || state.remoteDrain || state.replacementReservation || state.classicLifecycleAttempt
+        || await read(models.NodeOperationLock.findOne({ node: { $in: ids } }))
+        || await read(models.RemoteAdmission.findOne({ nodeId: { $in: ids }, phase: { $ne: 'completed' } }))
+        || await read(models.TopologyOperation.findOne({ heldTopologyAdmission: true }))
+        || await read(models.TopologyCreateIntent.findOne({ status: { $nin: ['succeeded','failed','cancelled'] } }))) {
+        throw failure('TEST_OWNER_HANDBACK_BUSY');
+    }
+    return freeze(owners.map(owner => {
+        const alias = aliases.find(row => row.nodeId === String(owner.node) && row.targetProfile === owner.profile);
+        if (!alias || alias.ownerGeneration !== owner.generation || owner.handbackReceipt !== undefined
+            || alias.maintenanceId !== owner.adoptionReceipt?.maintenanceId) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+        return { nodeId: String(owner.node), targetProfile: owner.profile, ownerGeneration: owner.generation,
+            proofRef: 'dedicated-' + alias.maintenanceId };
+    }));
+}
+async function handbackTestOwners({ env, models, lifecycle, authority, expected }) {
+    const { isDeepStrictEqual: same } = require('node:util');
+    const nodes = await inspectTestOwnerHandback({ env, models });
+    if (!same(lifecycle.executionContext, TEST) || !same(nodes, expected)) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+    // Existing sole controller: drain, fresh actual journal/profile CURRENT,
+    // all-participant prepare, exact original restoration, verified transfer.
+    authority.drainOriginals();
+    const current = await authority.readOriginalRestoreCurrent();
+    if (!same(Object.keys(current).sort(), nodes.map(row => row.nodeId).sort())) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+    await authority.restoreOriginals(current);
+    const transfer = new (require('../src/services/topologyConfigTransfer').TopologyConfigTransfer)({
+        executionContext: TEST, TopologyConfigOwner: models.TopologyConfigOwner,
+        withVerifiedMaintenance: lifecycle.withVerifiedMaintenance.bind(lifecycle) });
+    for (const row of nodes) await lifecycle.run(() => transfer.handback({ node: row.nodeId, profile: row.targetProfile,
+        generation: row.ownerGeneration, proofRef: row.proofRef }));
+    for (const row of nodes) {
+        const owner = await models.TopologyConfigOwner.findOne({ node: row.nodeId, profile: row.targetProfile })
+            .read('primary').readConcern('majority').maxTimeMS(5000).lean();
+        if (owner?.owner !== 'classic' || owner.handbackReceipt?.fromGeneration !== row.ownerGeneration) throw failure('TEST_OWNER_HANDBACK_UNPROVEN');
+    }
+    await authority.releaseOriginals();
+    return freeze({ status: 'handed-back', nodes: nodes.map(({ nodeId, targetProfile }) => ({ nodeId, targetProfile })) });
+}
+module.exports = { enrollTestOwners, initializeDedicatedTestState, initializePristineDedicatedRelayAbsence,
+    inspectTestOwnerHandback, handbackTestOwners, assertTestContext, main };

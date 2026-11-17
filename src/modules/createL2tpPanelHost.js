@@ -316,6 +316,7 @@ function createL2tpPanelHost({
     executionRuntime = createExecution();
     const dedicatedActivation = topologyEnv.TOPOLOGY_TEST_STARTUP_MODE === 'dedicated-runtime-v1';
     let dedicatedStarted = false, dedicatedStopped = false, dedicatedEnrollment, activationFailed = false, dedicatedResult, activationConfirmed = false, bootstrapOperationId;
+    let testHandback, testHandbackState;
     const activationId = require('node:crypto').randomUUID();
     const startConsumers = () => {
         if (dedicatedStopped) throw new Error('TEST_OWNER_STARTUP_MODE_CONFLICT');
@@ -377,10 +378,24 @@ function createL2tpPanelHost({
             this.enrollTestOwners({ resumeOnly }).catch(() => {});
             return { activationId, status: activationConfirmed && dedicatedStarted ? 'active' : activationFailed ? 'retained' : 'reconciling' };
         },
+        beginTestHandback() {
+            if (!dedicatedActivation || executionContext?.target !== 'test' || !activationConfirmed || activationFailed) throw Error('TEST_OWNER_HANDBACK_UNPROVEN');
+            if (!testHandback) {
+                testHandbackState = { status: 'handing_back' };
+                testHandback = Promise.resolve().then(async () => {
+                    const pins = await topologyDeploymentService.inspectTestOwnerHandback();
+                    const stopped = await this.stop();
+                    if (stopped?.running !== false || stopped.inFlight !== false || stopped.drainUncertain === true) throw Error('TEST_OWNER_HANDBACK_UNPROVEN');
+                    testHandbackState = await topologyDeploymentService.handbackTestOwners(pins);
+                }).catch(error => { testHandbackState = { status: 'retained', code: error.code || 'TEST_OWNER_HANDBACK_UNPROVEN' }; });
+            }
+            return { ...testHandbackState };
+        },
         async readTestActivationStatus() {
             // Bounded local snapshot: GET never starts remote/DB work. A fresh
             // process explicitly reports unreconciled, never prior HTTP success.
-            return { activationId, status: dedicatedStopped ? 'stopped' : activationConfirmed && dedicatedStarted ? 'active' : activationFailed ? 'retained' : dedicatedEnrollment ? 'reconciling' : 'reconciliation_required',
+            return { activationId, status: testHandbackState?.status ?? (dedicatedStopped ? 'stopped' : activationConfirmed && dedicatedStarted ? 'active' : activationFailed ? 'retained' : dedicatedEnrollment ? 'reconciling' : 'reconciliation_required'),
+                ...(testHandbackState ? { handback: testHandbackState } : {}),
                 durableStatus: dedicatedResult ? (bootstrapOperationId ? 'bootstrap_operation_settled' : 'enrollment_reconciled') : 'unreconciled',
                 ...(bootstrapOperationId ? { operationId: bootstrapOperationId } : {}),
                 nodes: dedicatedResult?.nodes ?? [] };

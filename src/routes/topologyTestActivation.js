@@ -21,6 +21,11 @@ function createTopologyTestActivationRouter({ env = process.env,
             statusUrl: '/api/cascade/topology-test/status' }); }
         catch { return res.status(409).json({ status: 'retained', code: 'TEST_BOOTSTRAP_CONTINUATION_UNPROVEN' }); }
     });
+    router.post('/handback', auth, auth.requireScope('nodes:write'), csrf, (req, res) => {
+        if (!req.body || Array.isArray(req.body) || Object.keys(req.body).length) return res.status(400).json({ code: 'INVALID_REQUEST' });
+        try { return res.status(202).json({ ...host().beginTestHandback(), statusUrl: '/api/cascade/topology-test/status' }); }
+        catch { return res.status(409).json({ code: 'TEST_OWNER_HANDBACK_UNPROVEN' }); }
+    });
     for (const action of ['activate', 'resume']) router.post('/' + action, auth, auth.requireScope('nodes:write'), csrf, async (req, res) => {
         if (!req.body || Object.keys(req.body).length !== 0 || Array.isArray(req.body)) return res.status(400).json({ code: 'INVALID_REQUEST', error: 'Используется только установленный TEST inventory.' });
         try {

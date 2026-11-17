@@ -8,11 +8,11 @@ test.after(() => require('../../../services/sshPoolService').closeAll());
 const { createTopologyTestActivationRouter } = require('../../../routes/topologyTestActivation');
 const env = { PANEL_DOMAIN: 'test.infograd.online', L2TP_EXECUTION_ENABLED: 'true', L2TP_MIGRATIONS_ENABLED: 'true', TOPOLOGY_TEST_EXECUTION_ENABLED: 'true', TOPOLOGY_TEST_STARTUP_MODE: 'dedicated-runtime-v1' };
 const next = (req,res,next) => next(); const auth = Object.assign(next, { requireScope: scope => { assert.ok(['nodes:write','nodes:read'].includes(scope)); return next; } });
-async function call(router, fn) {
+async function call(router, fn, endpoint='/activate') {
     const app = express(); app.use(express.json()); app.use(router);
     const server = app.listen(0, '127.0.0.1'); await new Promise(r => server.once('listening', r));
     try { return await fn(async body => {
-        const r = await fetch('http://127.0.0.1:' + server.address().port + '/activate', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body) });
+        const r = await fetch('http://127.0.0.1:' + server.address().port + endpoint, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body) });
         return { status:r.status, text:await r.text() };
     }); } finally { await new Promise(r => server.close(r)); }
 }
@@ -44,4 +44,20 @@ test('actual panel host delays consumers until enrollment, and shutdown joins en
         resolve({status:'enrolled',nodes:[]});await pending;
         if(stopEarly){await stopping;assert.equal(f.timer.callbacks.size,0);}else{assert.ok(f.timer.callbacks.size>0);await host.stop();assert.equal(f.timer.callbacks.size,0);}
     }
+});
+test('ordinary TEST handback API admits only fixed inventory; business reentry refuses before physical activation',async()=>{
+ let handbacks=0,activations=0;const host={beginTestHandback(){handbacks++;return{status:'handing_back'};},readBusinessReentryRestriction:async()=>({blocked:true,code:'TOPOLOGY_BUSINESS_REENTRY_BLOCKED'}),beginTestActivation(){activations++;throw Error('must not dispatch');}};
+ const router=createTopologyTestActivationRouter({env,auth,csrf:next,activeHostProvider:{getActiveHost:()=>host}});
+ await call(router,async request=>{assert.equal((await request({nodes:[]})).status,400);assert.equal((await request({})).status,202);},'/handback');
+ await call(router,async request=>{const r=await request({});assert.equal(r.status,409);assert.equal(JSON.parse(r.text).code,'TOPOLOGY_BUSINESS_REENTRY_BLOCKED');});
+ assert.equal(handbacks,1);assert.equal(activations,0);
+});
+test('same TEST host joins consumer drain before handback; duplicate intents never repeat restoration',async()=>{
+ const {fixture,moduleEntry}=require('./cascadeAnyOrderRuntimeFixture');const f=fixture({deploymentEnv:env});let handbacks=0;
+ const host=f.host({moduleEntry:{...moduleEntry,registerModels:()=>f.models,createTopologyDeploymentService(options){const service=moduleEntry.createTopologyDeploymentService(options);
+  service.enrollTestOwners=async options=>{const r={status:'enrolled',nodes:[]};options.onReconciled(r);return r;};service.inspectTestOwnerHandback=async()=>[];
+  service.handbackTestOwners=async()=>{assert.equal(f.timer.callbacks.size,0);handbacks++;return{status:'handed-back',nodes:[]};};return service;}}});
+ await host.enrollTestOwners();assert.ok(f.timer.callbacks.size>0);host.beginTestHandback();host.beginTestHandback();
+ for(let i=0;i<20&&(await host.readTestActivationStatus()).status==='handing_back';i++)await new Promise(r=>setImmediate(r));
+ assert.equal((await host.readTestActivationStatus()).status,'handed-back');assert.equal(handbacks,1);assert.equal(f.timer.callbacks.size,0);
 });
