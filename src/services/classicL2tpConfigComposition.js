@@ -24,8 +24,13 @@ function finishClassicConfigRouting(config) {
 
 // Only compose existing classic credentials. No deterministic topology UUIDs,
 // balancer inference, or direct/freedom fallback is permitted here.
-function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], mode } = {}) {
+function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], mode, materializedLinkIds = [] } = {}) {
     const generator = require('./configGenerator');
+    // Internal writer input: these IDs are present in the candidate being
+    // installed, not statuses supplied by a public request. Keep the ordinary
+    // status fence for every other suffix hop; a prefix before this ingress is
+    // not carrying packets that enter here.
+    const materialized = new Set(materializedLinkIds.map(String));
     const byId = new Map(links.map(link => [id(link), link]));
     const seenTags = new Set((config.inbounds || []).map(row => row.tag));
     const seenPorts = new Set((config.inbounds || []).map(row => row.port));
@@ -37,9 +42,21 @@ function applyClassicL2tpPathIngress(config, { nodeId, groups = [], links = [], 
             const pathLinks = (path.linkIds || []).map(linkId => byId.get(id(linkId)));
             const start = pathLinks.findIndex(link => link && id(link.portalNode) === id(nodeId));
             if (start < 0) continue;
-            if (pathLinks.some(link => !link || link.active !== true
-                || !['deployed', 'online'].includes(link.status) || (link.mode || 'reverse') !== mode
-                || typeof link.tunnelUuid !== 'string' || !link.tunnelUuid)) throw invalidPath();
+            if (pathLinks.some((link, index) => !link || link.active !== true
+                || (link.mode || 'reverse') !== mode
+                || typeof link.tunnelUuid !== 'string' || !link.tunnelUuid
+                || (index >= start && !['deployed', 'online'].includes(link.status)
+                    && !(index === start && mode === 'reverse' && materialized.has(id(link)))))) throw invalidPath();
+            if (mode === 'reverse' && materialized.has(id(pathLinks[start]))) {
+                const link = pathLinks[start], suffix = id(link).slice(-8);
+                const portals = (config.reverse?.portals || []).filter(row => row.tag === `portal-down-${suffix}`);
+                const tunnels = (config.inbounds || []).filter(row => row.tag === `conn-down-${suffix}`);
+                if (portals.length !== 1 || portals[0].domain !== (link.tunnelDomain || `${suffix}.reverse.tunnel.internal`)
+                    || tunnels.length !== 1 || tunnels[0].protocol !== 'vless'
+                    || tunnels[0].port !== (link.tunnelPort || 10086)
+                    || tunnels[0].settings?.clients?.length !== 1
+                    || tunnels[0].settings.clients[0].id !== link.tunnelUuid) throw invalidPath();
+            }
             const nodes = new Set([id(pathLinks[0].portalNode)]);
             for (let index = 0; index < pathLinks.length; index++) {
                 const link = pathLinks[index];

@@ -41,6 +41,38 @@ test('classic ingress refuses missing/unconfirmed/disconnected links, wrong egre
     assert.throws(() => applyClassicL2tpPathIngress(base(), { nodeId: 'relay', groups: [group, { ...group, _id: 'other-group' }], links: [first, second], mode: 'reverse' }), { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' });
 });
 
+test('first classic relay deploy materializes its exact local egress before status promotion without requiring an unused prefix', () => {
+    const prefix = { ...upstream, active: true, status: 'offline', mode: 'reverse' };
+    const pending = { ...first, status: 'pending' };
+    const full = { ...group, paths: [{ ...group.paths[0], linkIds: [prefix._id, first._id, second._id] }] };
+    const config = JSON.parse(generator.generateRelayConfig(prefix, { ip: '192.0.2.1' }, [pending]));
+    const links = [prefix, pending, second];
+    applyClassicL2tpPathIngress(config, { nodeId: 'relay', groups: [full], links, mode: 'reverse', materializedLinkIds: [first._id] });
+    assert.equal(links[0].status, 'offline');
+    assert.equal(links[1].status, 'pending', 'composition does not fake deployed/online status');
+    assert.deepEqual(config.routing.rules.filter(row => row.inboundTag?.includes('cascade-chosen')),
+        [{ type: 'field', inboundTag: ['cascade-chosen'], outboundTag: 'portal-down-down0001' }]);
+});
+
+test('materialized local egress cannot hide a changed UUID/domain/port, missing artifact or unknown downstream hop', () => {
+    const pending = { ...first, status: 'pending' };
+    const base = () => JSON.parse(generator.generateRelayConfig(upstream, { ip: '192.0.2.1' }, [pending]));
+    const args = { nodeId: 'relay', groups: [group], links: [pending, second], mode: 'reverse', materializedLinkIds: [first._id, second._id] };
+    for (const mutate of [
+        config => { config.inbounds.find(row => row.tag === 'conn-down-down0001').settings.clients[0].id = 'foreign'; },
+        config => { config.inbounds.find(row => row.tag === 'conn-down-down0001').port++; },
+        config => { config.reverse.portals[0].domain = 'foreign.invalid'; },
+        config => { config.reverse.portals = []; },
+    ]) {
+        const config = base(); mutate(config);
+        assert.throws(() => applyClassicL2tpPathIngress(config, args), { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' });
+    }
+    assert.throws(() => applyClassicL2tpPathIngress(base(), { ...args, links: [pending, { ...second, status: 'pending' }] }),
+        { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' }, 'local proof cannot authorize a remote suffix hop');
+    assert.throws(() => applyClassicL2tpPathIngress(base(), { ...args, materializedLinkIds: [] }),
+        { code: 'CLASSIC_L2TP_PATH_UNAVAILABLE' });
+});
+
 const { isIP } = require('node:net');
 
 // Fixed public-target first-match probe for the generator's actual field rules.

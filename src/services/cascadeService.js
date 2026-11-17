@@ -1132,7 +1132,8 @@ class CascadeService {
         }
 
         const relay = JSON.parse(configGenerator.generateRelayConfig(upstreamLink, upstreamPortal, downstreamLinks));
-        await this._applyClassicL2tpPathIngress(relay, node, { mode: 'reverse' });
+        await this._applyClassicL2tpPathIngress(relay, node, { mode: 'reverse',
+            appliedLinkIds: downstreamLinks.map(link => String(link._id)) });
         const relayConfig = JSON.stringify(relay, null, 2);
         const serviceUnit = configGenerator.generateBridgeSystemdService();
 
@@ -1582,7 +1583,8 @@ class CascadeService {
         if (groups.length === 0) return config;
         const ids = [...new Set(groups.flatMap(group => group.paths.flatMap(path => path.linkIds.map(String))))];
         const links = await CascadeLink.find({ _id: { $in: ids } }).populate('bridgeNode');
-        return applyClassicL2tpPathIngress(config, { nodeId: node._id, groups, links, mode });
+        return applyClassicL2tpPathIngress(config, { nodeId: node._id, groups, links, mode,
+            materializedLinkIds: applied ? [...applied] : [] });
     }
 
     /**
