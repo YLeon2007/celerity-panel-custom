@@ -18,15 +18,17 @@ function recoverFrozenFullReconcile({ operation: op, owners }) {
         || op.status !== 'succeeded' || op.heldTopologyAdmission !== false || op.v2Terminal?.state !== 'proven'
         || op.admissionFingerprint !== selectedAdmissionFingerprint(op)) fail();
     const topology = durableSelectedTopology(op.fullTopology);
+    const policy = require('../domain/primaryReservePolicy');
+    const compiledTopology = policy.compileConfiguredTopology({
+        nodes: projectNodes(topology.nodes), links: projectLinks(topology.links),
+        groups: projectGroups(topology.groups), healthByPathKey: {},
+    });
     const generated = require('./frozenTopologyDeploymentPlanComposer').composeFrozenTopologyDeploymentPlan({
         snapshot: topology, staged: op.kind === 'domain.reconcile', executionContext: op.executionContext,
         nodeMetadata: topology.nodes, linkMetadata: topology.links,
         // Identical compiler/projection to admission, including configured
         // relay ingress and geo branches. A bare compile changes actual bytes.
-        compiledTopology: require('../domain/primaryReservePolicy').compileConfiguredTopology({
-            nodes: projectNodes(topology.nodes), links: projectLinks(topology.links),
-            groups: projectGroups(topology.groups), healthByPathKey: {},
-        }),
+        compiledTopology,
     });
     if (op.nodes.length !== topology.nodes.length || generated.nodes.length !== op.nodes.length
         || (op.kind !== undefined && (topology.links.length !== op.linkIds?.length || topology.links.some(link => !op.linkIds.includes(link.id))))
@@ -55,7 +57,11 @@ function recoverFrozenFullReconcile({ operation: op, owners }) {
         if (!same(plain(fences[0]), root)) fail();
         pins.push(root);
     }
-    for (const [index, link] of [...topology.links].sort((a,b)=>a.id.localeCompare(b.id,'en')).entries()) link.artifactRef = `link-${index+1}`;
+    // Exactly the producer's configured-policy identity choice. Synthetic
+    // refs are regenerated and checked by the existing transition verifier.
+    if (policy.primaryReservePolicies(topology, compiledTopology).length === 0) {
+        for (const [index, link] of [...topology.links].sort((a,b)=>a.id.localeCompare(b.id,'en')).entries()) link.artifactRef = `link-${index+1}`;
+    }
     return { topology, pins };
 }
 function recoverSettledFullReconcile({ operation: op, predecessor: prior, owners, groups }) {
